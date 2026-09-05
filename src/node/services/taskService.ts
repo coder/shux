@@ -1683,6 +1683,22 @@ export class TaskService implements AgentTaskIntegration {
     if (!parentWorkspaceId) {
       return;
     }
+    // Every interrupted transition lands here right after the status commit. The child's queued
+    // incremental updates are superseded now: left in place as tool-end entries they would still
+    // cut the parent's active turn at its next step boundary before their admission probe refuses
+    // them. (A continuation owned by a different ancestor is cleaned by its settlement instead.)
+    const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
+      parentWorkspaceId,
+      agentReportProgressDedupePrefix(taskId),
+      { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON, skipCancelCallbacks: true }
+    );
+    if (!queuedProgressRemoval.success) {
+      log.warn("Failed to remove queued incremental sub-agent reports after interrupt", {
+        parentWorkspaceId,
+        childWorkspaceId: taskId,
+        error: queuedProgressRemoval.error,
+      });
+    }
     this.timelineRecorder.record(parentWorkspaceId, {
       kind: "task.interrupted",
       source: { system: "task" },

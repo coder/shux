@@ -13038,7 +13038,16 @@ describe("TaskService", () => {
     const stopStream = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const { aiService } = createAIServiceMocks(config, { isStreaming, stopStream });
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    // The stop supersedes the child's queued incremental updates in the parent's queue; left
+    // there as tool-end entries they would cut the parent's turn before being refused.
+    const removeQueuedMessagesByDedupeKeyPrefix = mock((): Result<number> => {
+      expect(findWorkspaceInConfig(config, childTaskId)?.taskStatus).toBe("interrupted");
+      return Ok(1);
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({
+      remove,
+      removeQueuedMessagesByDedupeKeyPrefix,
+    });
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     const terminalAttentionStore = new TerminalAttentionStore(config);
@@ -13056,6 +13065,14 @@ describe("TaskService", () => {
     expect(stopStream).toHaveBeenCalledWith(childTaskId, { abandonPartial: false });
     expect(remove).not.toHaveBeenCalled();
     expect(findWorkspaceInConfig(config, childTaskId)?.taskStatus).toBe("interrupted");
+    expect(removeQueuedMessagesByDedupeKeyPrefix).toHaveBeenCalledWith(
+      parentWorkspaceId,
+      `agent-report:${childTaskId}:`,
+      {
+        cancelReason: "Incremental sub-agent update superseded by the terminal report.",
+        skipCancelCallbacks: true,
+      }
+    );
   });
 
   test("removeInactiveDescendantAgentTask enforces scope, leaf order, and idempotency", async () => {
