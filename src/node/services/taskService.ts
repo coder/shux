@@ -8129,26 +8129,41 @@ export class TaskService implements AgentTaskIntegration {
         childWorkspaceId,
         activeExecution?.handleId
       );
-      // Superseded once this run's terminal outcome has landed: the settlement paths persist the
-      // child's status mirror (`reported`, or a terminal execution status for a continuation)
-      // BEFORE they remove queued updates, so an entry already dequeued into the parent's
-      // asynchronous PREPARING phase — invisible to that removal — is refused at admission
-      // instead of starting a stale "in progress" turn after the terminal report. Synchronous
-      // reads only: admission probes run inside the session's turn gates. As with peer sends,
-      // a probe-carrying send never resurrects an interrupted parent.
+      // Superseded once this run is over: the settlement paths persist the child's status mirror
+      // (`reported`/`interrupted`, or a terminal execution status for a continuation) BEFORE they
+      // remove queued updates, so an entry already dequeued into the parent's asynchronous
+      // PREPARING phase — invisible to that removal — is refused at admission instead of starting
+      // a stale "in progress" turn after the terminal outcome. Synchronous reads only: admission
+      // probes run inside the session's turn gates. As with peer sends, a probe-carrying send
+      // never resurrects an interrupted parent.
       const superseded = (): boolean => {
         const fresh = findWorkspaceEntry(this.config.loadConfigOrDefault(), childWorkspaceId);
         if (fresh == null) {
           return true;
         }
         if (activeExecution != null) {
+          // A successor generation claims the mirror only once this execution stopped being the
+          // live registration, and clearing it is part of this execution's own teardown — either
+          // way the update belongs to a finished generation.
           return (
-            fresh.workspace.taskExecutionId === activeExecution.handleId &&
+            fresh.workspace.taskExecutionId !== activeExecution.handleId ||
             !isActiveWorkspaceTurnTaskStatus(fresh.workspace.taskExecutionStatus)
           );
         }
-        return hasCompletedAgentReport(fresh.workspace);
+        return (
+          hasCompletedAgentReport(fresh.workspace) || fresh.workspace.taskStatus === "interrupted"
+        );
       };
+      // The mirror is written at continuation acceptance, before the child's turn can call
+      // agent_report; if it nevertheless lags the active record here, attaching the probe would
+      // refuse a live update at dispatch. Fall back to removal-only supersession instead.
+      const probeConsistent = !superseded();
+      if (!probeConsistent) {
+        log.debug("agent_report supersession probe unavailable: status mirror lags active run", {
+          childWorkspaceId,
+          executionId: activeExecution?.handleId,
+        });
+      }
       const wakeResult = await this.wakeParentWorkspaceWithSyntheticMessage({
         parentWorkspaceId,
         parentEntry,
@@ -8158,7 +8173,7 @@ export class TaskService implements AgentTaskIntegration {
         // ancestor-bound peer message (turn-end by default) at the head would otherwise hold this
         // report until the parent's turn ends — observed as 8–40 minute "delayed" updates.
         promoteAheadOfHiddenTurnEnd: true,
-        admissionStale: superseded,
+        ...(probeConsistent ? { admissionStale: superseded } : {}),
       });
       if (!wakeResult.success) {
         throw new Error(`agent_report failed to wake the parent workspace: ${wakeResult.error}`);

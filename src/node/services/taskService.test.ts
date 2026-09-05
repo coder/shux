@@ -18753,6 +18753,21 @@ describe("TaskService", () => {
     expect(sendMessage.mock.calls[0]?.[1]).toContain('"status": "in_progress"');
     expect(sendMessage.mock.calls[1]?.[1]).toContain("Found a second issue.");
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
+    // The probe re-checked at the parent's admission gates flips once the run is over — for an
+    // original run, on a terminal report or a stop without one.
+    const superseded = (sendMessage.mock.calls[1]?.[3] as { admissionStale?: () => boolean })
+      .admissionStale;
+    assert(superseded, "progress sends must carry a supersession probe");
+    expect(superseded()).toBe(false);
+    await config.editConfig((cfg) => {
+      const workspace = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((candidate) => candidate.id === childId);
+      assert(workspace, "child workspace must exist");
+      workspace.taskStatus = "interrupted";
+      return cfg;
+    });
+    expect(superseded()).toBe(true);
     expect(
       await readSubagentReportArtifact(path.join(config.sessionsDir, parentId), childId)
     ).toBeNull();
@@ -28796,6 +28811,27 @@ describe("TaskService", () => {
       ?.admissionStale;
     assert(superseded, "progress sends must carry a supersession probe");
     // Live execution: an entry still in PREPARING is admitted.
+    expect(superseded()).toBe(false);
+    // A successor generation that has claimed the execution mirror supersedes it as well.
+    await config.editConfig((cfg) => {
+      const workspace = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((candidate) => candidate.id === childTaskId);
+      assert(workspace, "child workspace must exist");
+      workspace.taskExecutionId = "wst_successor";
+      workspace.taskExecutionStatus = "running";
+      return cfg;
+    });
+    expect(superseded()).toBe(true);
+    await config.editConfig((cfg) => {
+      const workspace = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((candidate) => candidate.id === childTaskId);
+      assert(workspace, "child workspace must exist");
+      workspace.taskExecutionId = handleId;
+      workspace.taskExecutionStatus = "running";
+      return cfg;
+    });
     expect(superseded()).toBe(false);
 
     let removalsWhenWaiterResolved = -1;
