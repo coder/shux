@@ -7226,9 +7226,14 @@ export class AgentSession {
    * Whether an earlier queued, dequeued, or direct send supersedes a continuation.
    *
    * A predecessor with the same workspace-turn correlation remains part of the
-   * continuation chain and does not supersede the proposed report.
+   * continuation chain and does not supersede the proposed report. A send that will be
+   * enqueued with promoteAheadOfHiddenTurnEnd (see MessageQueue) never dispatches behind
+   * the trailing hidden turn-end entries, so those are not counted as predecessors.
    */
-  hasQueuedOrDispatchingEntry(continuationMetadata?: WorkspaceTurnMuxMetadata): boolean {
+  hasQueuedOrDispatchingEntry(
+    continuationMetadata?: WorkspaceTurnMuxMetadata,
+    options?: { promoteAheadOfHiddenTurnEnd?: boolean }
+  ): boolean {
     const hasDifferentPreparingSend =
       this.turnPhase === TurnPhase.PREPARING &&
       !hasSameWorkspaceTurnCorrelation(this.preparingWorkspaceTurnMetadata, continuationMetadata);
@@ -7249,11 +7254,17 @@ export class AgentSession {
       if (continuationMetadata == null) {
         return true;
       }
-      return !this.messageQueue.hasAllWorkspaceTurnContinuations(
-        continuationMetadata.taskHandleId,
-        continuationMetadata.ownerWorkspaceId,
-        continuationMetadata.turnId
-      );
+      return options?.promoteAheadOfHiddenTurnEnd === true
+        ? !this.messageQueue.hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
+            continuationMetadata.taskHandleId,
+            continuationMetadata.ownerWorkspaceId,
+            continuationMetadata.turnId
+          )
+        : !this.messageQueue.hasAllWorkspaceTurnContinuations(
+            continuationMetadata.taskHandleId,
+            continuationMetadata.ownerWorkspaceId,
+            continuationMetadata.turnId
+          );
     }
 
     return false;

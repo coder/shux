@@ -318,6 +318,47 @@ export class MessageQueue {
   }
 
   /**
+   * hasAllWorkspaceTurnContinuations for a tool-end entry about to be enqueued with
+   * promoteAheadOfHiddenTurnEnd: the trailing hidden turn-end entries it will overtake are not
+   * its predecessors, so only the entries that stay ahead of it must share the correlation
+   * (vacuously true when none do). Without this, WorkspaceService would strip the promoted
+   * entry's correlation for an entry it never dispatches behind, and its tool-end cut would
+   * then supersede the delegated turn it was meant to continue.
+   */
+  hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
+    taskHandleId: string,
+    ownerWorkspaceId: string,
+    turnId: string
+  ): boolean {
+    return this.entries.slice(0, this.trailingHiddenTurnEndRunStart()).every((entry) => {
+      const metadata = entry.muxMetadata;
+      return (
+        isWorkspaceTurnMetadata(metadata) &&
+        metadata.taskHandleId === taskHandleId &&
+        metadata.ownerWorkspaceId === ownerWorkspaceId &&
+        metadata.turnId === turnId
+      );
+    });
+  }
+
+  /**
+   * Index where the trailing run of hidden (non-user-authored) turn-end entries begins — the
+   * entries a promoteAheadOfHiddenTurnEnd add overtakes. Equals entries.length when the tail is
+   * user-authored or tool-end (nothing to overtake).
+   */
+  private trailingHiddenTurnEndRunStart(): number {
+    let start = this.entries.length;
+    while (start > 0) {
+      const predecessor = this.entries[start - 1];
+      if (predecessor.userAuthored || predecessor.dispatchMode !== "turn-end") {
+        break;
+      }
+      start -= 1;
+    }
+    return start;
+  }
+
+  /**
    * Whether the next entry continues the exact workspace turn correlation.
    */
   hasNextWorkspaceTurnContinuation(
@@ -690,19 +731,13 @@ export class MessageQueue {
       this.entries[currentIndex] === entry && entry.dispatchMode === "tool-end",
       "promoteAheadOfHiddenTurnEndPredecessors requires the tool-end tail entry"
     );
-    let insertIndex = currentIndex;
-    while (insertIndex > 0) {
-      const predecessor = this.entries[insertIndex - 1];
-      if (predecessor.userAuthored || predecessor.dispatchMode !== "turn-end") {
-        break;
-      }
-      insertIndex -= 1;
-    }
+    // The new entry is the tail, so the trailing run is measured over its predecessors.
+    this.entries.pop();
+    const insertIndex = this.trailingHiddenTurnEndRunStart();
+    this.entries.splice(insertIndex, 0, entry);
     if (insertIndex === currentIndex) {
       return;
     }
-    this.entries.splice(currentIndex, 1);
-    this.entries.splice(insertIndex, 0, entry);
     // The skipped entries now follow an unrelated predecessor (same as prioritizeNextUserEntry).
     this.revalidateWorkspaceTurnCorrelations();
   }

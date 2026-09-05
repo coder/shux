@@ -654,6 +654,58 @@ describe("MessageQueue", () => {
       expect(skipped.options?.muxMetadata).toEqual(turnMetadata);
       expect(skipped.internal?.onCanceled).toBe(peerCanceled);
     });
+
+    it("ignores the hidden turn-end entries a promoted report overtakes when judging its correlation", () => {
+      // A queued heartbeat (hidden, turn-end, uncorrelated) would make the plain check report a
+      // superseding predecessor and strip the report's correlation before enqueue — yet the
+      // promoted report dispatches ahead of it, so it must keep continuing the delegated turn.
+      const turnMetadata: MuxMessageMetadata = {
+        type: "workspace-turn-task",
+        taskHandleId: "wst_parent",
+        ownerWorkspaceId: "grandparent",
+        turnId: "turn-1",
+      };
+      const ahead = (): boolean =>
+        queue.hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
+          "wst_parent",
+          "grandparent",
+          "turn-1"
+        );
+
+      expect(ahead()).toBe(true);
+      queue.add(
+        "same-turn follow-up",
+        { ...validOptions, queueDispatchMode: "tool-end", muxMetadata: turnMetadata },
+        hidden
+      );
+      expect(ahead()).toBe(true);
+
+      queue.addOnce(
+        "heartbeat",
+        { ...validOptions, queueDispatchMode: "turn-end" },
+        "heartbeat-request",
+        hidden
+      );
+      expect(queue.hasAllWorkspaceTurnContinuations("wst_parent", "grandparent", "turn-1")).toBe(
+        false
+      );
+      expect(ahead()).toBe(true);
+
+      // An uncorrelated tool-end tail cannot be overtaken, so it (and everything before it) counts.
+      queue.add("unrelated tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
+      expect(ahead()).toBe(false);
+    });
+
+    it("counts a user-authored turn-end tail as a predecessor for a promoted report", () => {
+      queue.add("user wait for turn end", { ...validOptions, queueDispatchMode: "turn-end" });
+      expect(
+        queue.hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
+          "wst_parent",
+          "grandparent",
+          "turn-1"
+        )
+      ).toBe(false);
+    });
   });
 
   describe("workspace turn metadata", () => {

@@ -9546,6 +9546,44 @@ describe("WorkspaceService sendMessage status clearing", () => {
     );
   });
 
+  test("judges a promoted progress report's correlation against the entries it stays behind", async () => {
+    fakeSession.hasQueuedOrDispatchingEntry.mockReturnValue(false);
+    const onCanceled = mock(() => undefined);
+    const muxMetadata = {
+      type: "workspace-turn-task" as const,
+      taskHandleId: "wst_promoted_progress",
+      ownerWorkspaceId: "owner-workspace",
+      turnId: "turn-promoted-progress",
+    };
+
+    const result = await workspaceService.sendMessage(
+      "test-workspace",
+      "nested progress",
+      { model: "openai:gpt-4o-mini", agentId: "exec", muxMetadata },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        workspaceTurnContinuation: true,
+        queueDedupeKey: "agent-report:child:call-1",
+        removableQueueDedupeKey: true,
+        promoteAheadOfHiddenTurnEnd: true,
+        onCanceled,
+      }
+    );
+
+    expect(result.success).toBe(true);
+    // The session excludes the hidden turn-end entries the promotion will overtake (e.g. a
+    // queued heartbeat) when deciding whether a predecessor supersedes this continuation.
+    expect(fakeSession.hasQueuedOrDispatchingEntry).toHaveBeenCalledWith(muxMetadata, {
+      promoteAheadOfHiddenTurnEnd: true,
+    });
+    expect(fakeSession.queueMessage).toHaveBeenCalledWith(
+      "nested progress",
+      expect.objectContaining({ muxMetadata }),
+      expect.objectContaining({ onCanceled, promoteAheadOfHiddenTurnEnd: true })
+    );
+  });
+
   test("keeps workspace-turn correlation for the next queued continuation", async () => {
     fakeSession.hasQueuedOrDispatchingEntry.mockReturnValue(false);
     const onCanceled = mock(() => undefined);

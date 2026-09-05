@@ -8154,15 +8154,12 @@ export class TaskService implements AgentTaskIntegration {
           hasCompletedAgentReport(fresh.workspace) || fresh.workspace.taskStatus === "interrupted"
         );
       };
-      // The mirror is written at continuation acceptance, before the child's turn can call
-      // agent_report; if it nevertheless lags the active record here, attaching the probe would
-      // refuse a live update at dispatch. Fall back to removal-only supersession instead.
-      const probeConsistent = !superseded();
-      if (!probeConsistent) {
-        log.debug("agent_report supersession probe unavailable: status mirror lags active run", {
-          childWorkspaceId,
-          executionId: activeExecution?.handleId,
-        });
+      // A stop or settlement can land between the status checks above and here (neither shares
+      // this child's event lock), and the mirror is written at continuation acceptance, before
+      // the child's turn can call agent_report — so a probe that is already true means the run
+      // is over. Refuse now rather than wake the parent with an obsolete update.
+      if (superseded()) {
+        throw new Error("agent_report cannot send updates after the sub-agent's run has ended");
       }
       const wakeResult = await this.wakeParentWorkspaceWithSyntheticMessage({
         parentWorkspaceId,
@@ -8173,7 +8170,7 @@ export class TaskService implements AgentTaskIntegration {
         // ancestor-bound peer message (turn-end by default) at the head would otherwise hold this
         // report until the parent's turn ends — observed as 8–40 minute "delayed" updates.
         promoteAheadOfHiddenTurnEnd: true,
-        ...(probeConsistent ? { admissionStale: superseded } : {}),
+        admissionStale: superseded,
       });
       if (!wakeResult.success) {
         throw new Error(`agent_report failed to wake the parent workspace: ${wakeResult.error}`);
@@ -12510,6 +12507,26 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
+    // Drop queued incremental updates synchronously with the terminal commit: while they sit at
+    // the parent's queue head as tool-end entries, the parent's stream stops at its next step
+    // boundary for them, and a dispatch refused as superseded cannot restore that cut turn.
+    // skipCancelCallbacks: a parent running as a delegated workspace turn queues each report with
+    // continuation-failure callbacks; superseding the report must not interrupt that live turn.
+    const progressParentWorkspaceId = latestEntryBeforeReport?.workspace.parentWorkspaceId;
+    if (progressParentWorkspaceId) {
+      const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
+        progressParentWorkspaceId,
+        agentReportProgressDedupePrefix(childWorkspaceId),
+        { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON, skipCancelCallbacks: true }
+      );
+      if (!queuedProgressRemoval.success) {
+        log.warn("Failed to remove queued incremental sub-agent reports", {
+          parentWorkspaceId: progressParentWorkspaceId,
+          childWorkspaceId,
+          error: queuedProgressRemoval.error,
+        });
+      }
+    }
     eventSpine.emit("task.reported", { workspaceId: childWorkspaceId, taskId: childWorkspaceId });
 
     await this.emitWorkspaceMetadata(childWorkspaceId);
@@ -12614,21 +12631,6 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     await this.maybeStartPatchGenerationForReportedTask(childWorkspaceId);
-
-    // skipCancelCallbacks: a parent running as a delegated workspace turn queues each report with
-    // continuation-failure callbacks; superseding the report must not interrupt that live turn.
-    const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
-      parentWorkspaceId,
-      agentReportProgressDedupePrefix(childWorkspaceId),
-      { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON, skipCancelCallbacks: true }
-    );
-    if (!queuedProgressRemoval.success) {
-      log.warn("Failed to remove queued incremental sub-agent reports", {
-        parentWorkspaceId,
-        childWorkspaceId,
-        error: queuedProgressRemoval.error,
-      });
-    }
 
     await this.deliverReportToParent(
       parentWorkspaceId,

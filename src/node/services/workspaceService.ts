@@ -10869,10 +10869,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         return withoutCorrelation;
       };
+      // A promoted tool-end send (sub-agent progress) overtakes trailing hidden turn-end entries
+      // such as a queued heartbeat, so they must not count as superseding predecessors here — or
+      // the report would be stripped of the correlation it then dispatches ahead of them with.
+      const promotesAheadOfHiddenTurnEnd =
+        internal?.promoteAheadOfHiddenTurnEnd === true &&
+        (normalizedOptions.queueDispatchMode ?? "tool-end") === "tool-end";
       const getContinuationSendState = () => {
         const preserveCorrelation =
           !isWorkspaceTurnContinuation ||
-          !session.hasQueuedOrDispatchingEntry(workspaceTurnContinuationMetadata);
+          !session.hasQueuedOrDispatchingEntry(workspaceTurnContinuationMetadata, {
+            promoteAheadOfHiddenTurnEnd: promotesAheadOfHiddenTurnEnd,
+          });
         // Dropping callbacks on a superseded correlation protects the delegated-turn OWNER
         // (its onCanceled settles the owner's handle, which the superseded entry no longer
         // represents) — but a peer trigger's onCanceled is the sender's budget refund, tied to

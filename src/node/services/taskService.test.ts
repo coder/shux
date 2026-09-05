@@ -18773,6 +18773,60 @@ describe("TaskService", () => {
     ).toBeNull();
   });
 
+  test("agent_report refuses an update whose run ended before the wake was sent", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-late-progress";
+    const childId = "child-late-progress";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child", childId, {
+          name: "agent_explore_child",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // A stop that lands between the entry checks and the probe evaluation (the stop path does not
+    // share the child's event lock) must refuse the update instead of waking the parent with it.
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const realLoad = config.loadConfigOrDefault.bind(config);
+    let loads = 0;
+    const loadSpy = spyOn(config, "loadConfigOrDefault").mockImplementation(() => {
+      loads += 1;
+      const cfg = realLoad();
+      if (loads > 1) {
+        const workspace = cfg.projects
+          .get(projectPath)
+          ?.workspaces.find((candidate) => candidate.id === childId);
+        if (workspace) workspace.taskStatus = "interrupted";
+      }
+      return cfg;
+    });
+    try {
+      const failure: unknown = await taskService
+        .reportAgentProgress(childId, "progress-late", { reportMarkdown: "Obsolete finding." })
+        .then(
+          () => undefined,
+          (error: unknown) => error
+        );
+      expect(failure).toEqual(
+        new Error("agent_report cannot send updates after the sub-agent's run has ended")
+      );
+    } finally {
+      loadSpy.mockRestore();
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("terminal reports supersede queued incremental updates for the same child", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
@@ -18794,11 +18848,26 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const removeQueuedMessagesByDedupeKeyPrefix = mock((): Result<number> => Ok(1));
+    // Order matters: while a queued update sits at the parent's queue head as a tool-end entry,
+    // the parent's stream stops at its next step boundary for it. Removal must happen with the
+    // terminal status commit, before the report's slower follow-up work (artifacts, patch
+    // generation), and only once the supersession probe would already refuse a dequeued update.
+    const order: string[] = [];
+    const removeQueuedMessagesByDedupeKeyPrefix = mock((): Result<number> => {
+      order.push(`remove:${findWorkspaceInConfig(config, childId)?.taskStatus ?? "missing"}`);
+      return Ok(1);
+    });
     const { workspaceService } = createWorkspaceServiceMocks({
       removeQueuedMessagesByDedupeKeyPrefix,
     });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    spyOn(
+      taskService as unknown as { maybeStartPatchGenerationForReportedTask: () => Promise<void> },
+      "maybeStartPatchGenerationForReportedTask"
+    ).mockImplementation(() => {
+      order.push("patch");
+      return Promise.resolve();
+    });
 
     await handleTaskServiceStreamEndForTest(taskService, {
       type: "stream-end",
@@ -18816,6 +18885,7 @@ describe("TaskService", () => {
         skipCancelCallbacks: true,
       }
     );
+    expect(order).toEqual(["remove:reported", "patch"]);
   });
 
   test("workflow-owned agent_report updates do not wake the parent", async () => {
