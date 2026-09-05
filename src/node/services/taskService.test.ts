@@ -25554,6 +25554,70 @@ describe("TaskService", () => {
     });
   });
 
+  test("superseded nested agent progress is refused without settling the correlated workspace turn", async () => {
+    let progressInternal:
+      | {
+          admissionStale?: () => boolean;
+          onCanceled?: (reason: string) => Promise<void> | void;
+          onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
+        }
+      | undefined;
+    let sendCount = 0;
+    const sendMessage = mock((...args: unknown[]): Promise<Result<void, SendMessageError>> => {
+      sendCount += 1;
+      if (sendCount === 2) {
+        // Queued behind the busy parent: the session re-checks the probe at dispatch.
+        progressInternal = args[3] as typeof progressInternal;
+      }
+      return Promise.resolve(Ok(undefined));
+    });
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest({ sendMessage });
+
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(path.join(rootDir, "repo"));
+      assert(project, "test project must exist");
+      project.workspaces.push({
+        path: path.join(rootDir, "repo", "nested-progress-superseded"),
+        id: "nested-progress-superseded",
+        name: "nested-progress-superseded",
+        createdAt: "2026-06-19T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId: "childworkspace",
+        taskStatus: "running",
+        agentType: "explore",
+      });
+      return cfg;
+    });
+
+    await taskService.reportAgentProgress("nested-progress-superseded", "progress-call", {
+      reportMarkdown: "Partial findings.",
+    });
+    assert(progressInternal?.admissionStale, "progress sends must carry a supersession probe");
+    expect(progressInternal.admissionStale()).toBe(false);
+
+    // The grandchild's terminal report lands (handleAgentReport persists `reported` first).
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(path.join(rootDir, "repo"));
+      assert(project, "test project must exist");
+      const nested = project.workspaces.find(
+        (workspace) => workspace.id === "nested-progress-superseded"
+      );
+      assert(nested, "nested agent must exist");
+      nested.taskStatus = "reported";
+      nested.reportedAt = "2026-06-19T00:00:01.000Z";
+      return cfg;
+    });
+    expect(progressInternal.admissionStale()).toBe(true);
+
+    // The session refuses the stale entry through these hooks; the parent's live delegated turn
+    // must survive because the terminal delivery is its next wake.
+    await progressInternal.onCanceled?.("Send refused: the caller's admission became stale");
+    await progressInternal.onAcceptedPreStreamFailure?.({ type: "unknown", raw: "stale" });
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+      status: "running",
+    });
+  });
+
   test("workspace-turn tool-calls stream-end with superseding queued input settles interrupted", async () => {
     // Ordinary queued input (manual message, bare /compact) also cuts the
     // stream at a tool boundary, but it supersedes the delegated turn instead
@@ -28722,6 +28786,18 @@ describe("TaskService", () => {
     const activeRecord = await taskHandleStore.getWorkspaceTurn(parentWorkspaceId, handleId);
     assert(activeRecord, "reactivated workspace-turn record is required");
 
+    await taskService.reportAgentProgress(childTaskId, "progress-call", {
+      reportMarkdown: "Transcript rendering implemented; validating.",
+    });
+    const progressSend = sendMessage.mock.calls.find(
+      (call) => typeof call[1] === "string" && call[1].includes("Transcript rendering implemented")
+    );
+    const superseded = (progressSend?.[3] as { admissionStale?: () => boolean } | undefined)
+      ?.admissionStale;
+    assert(superseded, "progress sends must carry a supersession probe");
+    // Live execution: an entry still in PREPARING is admitted.
+    expect(superseded()).toBe(false);
+
     let removalsWhenWaiterResolved = -1;
     const waiter = workspaceTurnManagerFor(taskService)
       .waitForWorkspaceTurn(handleId, {
@@ -28759,6 +28835,8 @@ describe("TaskService", () => {
     expect(removalsWhenWaiterResolved).toBe(
       removeQueuedMessagesByDedupeKeyPrefix.mock.calls.length
     );
+    // An update that had already left the queue for PREPARING is refused at admission instead.
+    expect(superseded()).toBe(true);
   });
 
   test("reawakened child stays active through compaction and settles from its correlated follow-up", async () => {

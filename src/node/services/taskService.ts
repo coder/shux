@@ -8086,10 +8086,9 @@ export class TaskService implements AgentTaskIntegration {
       if (childEntry.workspace.taskStatus === "interrupted" && !continuationActive) {
         throw new Error("agent_report cannot send updates from an interrupted sub-agent");
       }
-      const parentWorkspaceId =
-        continuationActive && continuationRecord != null
-          ? continuationRecord.ownerWorkspaceId
-          : directParentWorkspaceId;
+      const activeExecution =
+        continuationActive && continuationRecord != null ? continuationRecord : null;
+      const parentWorkspaceId = activeExecution?.ownerWorkspaceId ?? directParentWorkspaceId;
 
       if (childEntry.workspace.workflowTask != null) {
         // Workflow-owned tasks deliver structured output through WorkflowRunner's journal/result
@@ -8128,8 +8127,28 @@ export class TaskService implements AgentTaskIntegration {
       // terminal settlement drops exactly the updates it superseded.
       const dedupePrefix = agentReportProgressDedupePrefix(
         childWorkspaceId,
-        continuationActive ? continuationRecord?.handleId : undefined
+        activeExecution?.handleId
       );
+      // Superseded once this run's terminal outcome has landed: the settlement paths persist the
+      // child's status mirror (`reported`, or a terminal execution status for a continuation)
+      // BEFORE they remove queued updates, so an entry already dequeued into the parent's
+      // asynchronous PREPARING phase — invisible to that removal — is refused at admission
+      // instead of starting a stale "in progress" turn after the terminal report. Synchronous
+      // reads only: admission probes run inside the session's turn gates. As with peer sends,
+      // a probe-carrying send never resurrects an interrupted parent.
+      const superseded = (): boolean => {
+        const fresh = findWorkspaceEntry(this.config.loadConfigOrDefault(), childWorkspaceId);
+        if (fresh == null) {
+          return true;
+        }
+        if (activeExecution != null) {
+          return (
+            fresh.workspace.taskExecutionId === activeExecution.handleId &&
+            !isActiveWorkspaceTurnTaskStatus(fresh.workspace.taskExecutionStatus)
+          );
+        }
+        return hasCompletedAgentReport(fresh.workspace);
+      };
       const wakeResult = await this.wakeParentWorkspaceWithSyntheticMessage({
         parentWorkspaceId,
         parentEntry,
@@ -8139,6 +8158,7 @@ export class TaskService implements AgentTaskIntegration {
         // ancestor-bound peer message (turn-end by default) at the head would otherwise hold this
         // report until the parent's turn ends — observed as 8–40 minute "delayed" updates.
         promoteAheadOfHiddenTurnEnd: true,
+        admissionStale: superseded,
       });
       if (!wakeResult.success) {
         throw new Error(`agent_report failed to wake the parent workspace: ${wakeResult.error}`);
@@ -8167,6 +8187,12 @@ export class TaskService implements AgentTaskIntegration {
     queueDedupeKey?: string;
     /** Queue ahead of hidden turn-end predecessors (see SendMessageInternalOptions). */
     promoteAheadOfHiddenTurnEnd?: boolean;
+    /**
+     * Synchronous "this wake has been superseded" probe, re-checked at the parent's turn-admission
+     * gates (even after the entry left the queue for PREPARING). A stale wake is refused rather
+     * than dispatched, and never settles the parent's own workspace turn as failed.
+     */
+    admissionStale?: () => boolean;
     queueDispatchMode?: TaskMessageQueueDispatchMode;
     /** Synthetic assistant rows persisted just before the wake's user row (family payloads). */
     preTurnMessages?: MuxMessage[];
@@ -8192,6 +8218,33 @@ export class TaskService implements AgentTaskIntegration {
       await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
         parentWorkspaceId
       );
+    // When the parent itself runs as a delegated workspace turn, this wake continues that turn,
+    // so a canceled/failed send normally settles the turn as failed. A wake whose source has been
+    // superseded (params.admissionStale, e.g. a sub-agent progress report outrun by the child's
+    // terminal outcome) is the exception: the parent's live turn is intact and the terminal
+    // delivery is its next wake, so refusing or dropping the stale wake must not interrupt it.
+    const settleContinuationFailure = async (
+      status: "interrupted" | "error",
+      message: string
+    ): Promise<void> => {
+      if (workspaceTurnMuxMetadata == null) {
+        return;
+      }
+      if (params.admissionStale?.() === true) {
+        log.debug("Superseded parent wake dropped without settling the parent's workspace turn", {
+          parentWorkspaceId,
+          status,
+          message,
+        });
+        return;
+      }
+      await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
+        parentWorkspaceId,
+        workspaceTurnMuxMetadata,
+        status,
+        message
+      );
+    };
 
     const sendResult = await this.workspaceService.sendMessage(
       parentWorkspaceId,
@@ -8223,23 +8276,14 @@ export class TaskService implements AgentTaskIntegration {
         ...(params.promoteAheadOfHiddenTurnEnd === true
           ? { promoteAheadOfHiddenTurnEnd: true }
           : {}),
+        ...(params.admissionStale != null ? { admissionStale: params.admissionStale } : {}),
         ...(workspaceTurnMuxMetadata != null
           ? {
               onCanceled: async (reason: string) => {
-                await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-                  parentWorkspaceId,
-                  workspaceTurnMuxMetadata,
-                  "interrupted",
-                  reason
-                );
+                await settleContinuationFailure("interrupted", reason);
               },
               onAcceptedPreStreamFailure: async (error: SendMessageError) => {
-                await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-                  parentWorkspaceId,
-                  workspaceTurnMuxMetadata,
-                  "error",
-                  formatSendMessageError(error).message
-                );
+                await settleContinuationFailure("error", formatSendMessageError(error).message);
               },
             }
           : {}),
@@ -8247,14 +8291,7 @@ export class TaskService implements AgentTaskIntegration {
     );
     if (!sendResult.success) {
       const formattedError = formatSendMessageError(sendResult.error);
-      if (workspaceTurnMuxMetadata != null) {
-        await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-          parentWorkspaceId,
-          workspaceTurnMuxMetadata,
-          "error",
-          formattedError.message
-        );
-      }
+      await settleContinuationFailure("error", formattedError.message);
       return Err(formattedError.message);
     }
     return Ok(undefined);
