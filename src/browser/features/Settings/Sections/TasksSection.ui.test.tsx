@@ -218,14 +218,27 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(within(card).queryByLabelText("Toggle intuition advisor")).toBeNull();
     expect(within(card).getAllByRole("switch")).toHaveLength(1);
     expect(within(card).getAllByRole("combobox")).toHaveLength(1);
-    expect(within(card).getAllByRole("button")).toHaveLength(1);
+    expect(within(card).getByRole("button", { name: "Reasoning" }).textContent).toContain("High");
     expect(
       within(getAgentCardByName(view, "Name Workspace")).getByLabelText(
         "Toggle name_workspace advisor"
       )
     ).toBeTruthy();
-    expect(within(card).queryByRole("button", { name: "Reasoning" })).toBeNull();
-    expect(within(card).queryByText("Reasoning")).toBeNull();
+    selectReasoningOption(card, "Medium");
+    await waitFor(() => {
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition).toMatchObject({
+        modelString: "openai:gpt-5.6-sol",
+        thinkingLevel: "medium",
+      });
+    });
+    expect(within(card).queryByRole("button", { name: /Pro mode/ })).toBeNull();
+    const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
+    fireEvent.click(within(listbox).getByRole("option", { name: "Inherit" }));
+    await waitFor(() => {
+      const settings = getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition;
+      expect(settings?.thinkingLevel).toBeUndefined();
+      expect(settings?.modelString).toBe("openai:gpt-5.6-sol");
+    });
     expect(
       within(getAgentCardByName(view, "Name Workspace")).getByRole("button", { name: "Reasoning" })
     ).toBeTruthy();

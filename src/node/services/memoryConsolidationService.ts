@@ -113,25 +113,25 @@ interface ModelFactoryLike {
 }
 
 /**
- * Resolve a headless agent model — the inherit cascade from PRD #3534
+ * Resolve headless agent settings — the inherit cascade from PRD #3534
  * (uniform with other agents): per-workspace agent override → global agent
  * default → definition AI defaults → pinned selected model (or legacy workspace
  * session fallback) → app default. Interactive callers supply their fully resolved model so unrelated
- * agent buckets cannot change the route. Shared with the debug CLI.
+ * agent buckets cannot change the route. Effort defaults to off rather than
+ * inheriting expensive parent-chat reasoning. Shared with the debug CLI.
  */
-export function resolveHeadlessAgentModelString(
+export function resolveHeadlessAgentSettings(
   config: Config,
   workspaceId: string,
   agentId: string,
   selectedModel?: string,
   definitionAiDefaults?: AgentDefinitionPackage["frontmatter"]["ai"]
-): string {
+) {
   const cfg = config.loadConfigOrDefault();
   const workspace = config.findWorkspace(workspaceId);
   const workspaceEntry = workspace
     ? cfg.projects.get(workspace.projectPath)?.workspaces.find((entry) => entry.id === workspaceId)
     : undefined;
-  // Model-only: headless runtimes ignore thinking and reasoning parameters.
   const agentBucket = workspaceEntry?.aiSettingsByAgent?.[agentId];
   // Route confinement (r31 security): absent an explicit agent override
   // (workspace bucket above, global agent default inside the resolver), the
@@ -155,10 +155,16 @@ export function resolveHeadlessAgentModelString(
     profile: "interactive",
     agentAiDefaults: cfg.agentAiDefaults,
     targetDefinitionAiDefaults: definitionAiDefaults,
-    targetWorkspaceSettings: agentBucket ? { model: agentBucket.model } : undefined,
+    targetWorkspaceSettings: agentBucket,
     fallbacks: fallbackModels.length > 0 ? fallbackModels.map((model) => ({ model })) : undefined,
     defaultModel,
-  }).selected.model;
+  }).selected;
+}
+
+export function resolveHeadlessAgentModelString(
+  ...args: Parameters<typeof resolveHeadlessAgentSettings>
+): string {
+  return resolveHeadlessAgentSettings(...args).model;
 }
 
 export { resolveHeadlessAgentDefinition };

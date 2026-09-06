@@ -309,7 +309,6 @@ interface AiDefaultsControlsProps {
   modelCapabilitiesDeferred?: boolean;
   /** Forwarded to the picker; false hides the Pro toggle (e.g. Dream, whose requests never apply reasoningMode). */
   allowProMode?: boolean;
-  modelOnly?: boolean;
   effectiveModel: string | undefined;
   models: string[];
   hiddenModelsForSelector: string[];
@@ -352,42 +351,40 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
         </div>
       </div>
 
-      {!props.modelOnly && (
-        <div className="space-y-1">
-          <div className="text-muted text-xs">Reasoning</div>
-          <div className="flex items-center gap-2">
-            {/* Shared composer picker so settings inherit the same features
-              (route-aware Pro mode, provider Fast mode) as the chat input. */}
-            <ThinkingSelectorControl
-              modelString={props.effectiveModel}
-              modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
-              thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
-              onThinkingLevelChange={(level) => props.onThinkingChange(level)}
-              reasoningMode={props.reasoningModeValue}
-              reasoningModeInherited={props.reasoningModeInherited}
-              onReasoningModeChange={props.onReasoningModeChange}
-              allowProMode={props.allowProMode}
-              variant="box"
-              inheritOption={{
-                label: inheritLabel,
-                selected: props.thinkingValue === INHERIT,
-                onSelect: () => props.onThinkingChange(INHERIT),
-              }}
-            />
-            {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="h-9 px-2"
-                onClick={() => props.onThinkingChange(INHERIT)}
-              >
-                Reset
-              </Button>
-            ) : null}
-          </div>
+      <div className="space-y-1">
+        <div className="text-muted text-xs">Reasoning</div>
+        <div className="flex items-center gap-2">
+          {/* Shared composer picker so settings inherit the same features
+            (route-aware Pro mode, provider Fast mode) as the chat input. */}
+          <ThinkingSelectorControl
+            modelString={props.effectiveModel}
+            modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
+            thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
+            onThinkingLevelChange={(level) => props.onThinkingChange(level)}
+            reasoningMode={props.reasoningModeValue}
+            reasoningModeInherited={props.reasoningModeInherited}
+            onReasoningModeChange={props.onReasoningModeChange}
+            allowProMode={props.allowProMode}
+            variant="box"
+            inheritOption={{
+              label: inheritLabel,
+              selected: props.thinkingValue === INHERIT,
+              onSelect: () => props.onThinkingChange(INHERIT),
+            }}
+          />
+          {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-9 px-2"
+              onClick={() => props.onThinkingChange(INHERIT)}
+            >
+              Reset
+            </Button>
+          ) : null}
         </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -870,7 +867,6 @@ export function TasksSection() {
 
   const renderAgentDefaults = (agent: AgentDefinitionDescriptor) => {
     const entry = agentAiDefaults[agent.id];
-    const modelOnly = agent.id === "intuition";
     const modelValue = entry?.modelString ?? INHERIT;
     const thinkingValue = entry?.thinkingLevel ?? INHERIT;
     const enabledOverride = entry?.enabled;
@@ -1004,7 +1000,7 @@ export function TasksSection() {
                 </Button>
               ) : null}
             </div>
-            {advisorToolEnabled && !modelOnly ? (
+            {advisorToolEnabled && agent.id !== "intuition" ? (
               <div className="flex items-center gap-3">
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -1040,8 +1036,6 @@ export function TasksSection() {
           thinkingValue={thinkingValue}
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
           allowProMode={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
-          // Intuition is model-only; persisted thinking values never affect its requests.
-          modelOnly={modelOnly}
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}

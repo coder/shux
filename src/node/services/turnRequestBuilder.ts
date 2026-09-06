@@ -3,7 +3,7 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { MEMORY_INTUITION_MAX_USES_PER_TURN } from "@/common/constants/memory";
 import {
   resolveHeadlessAgentDefinition,
-  resolveHeadlessAgentModelString,
+  resolveHeadlessAgentSettings,
 } from "@/node/services/memoryConsolidationService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
@@ -1468,6 +1468,15 @@ export class TurnRequestBuilder {
         agentId: "intuition",
         resolvedFrontmatter: intuitionDefinition.frontmatter,
       });
+    const intuitionSettings = intuitionToolEligible
+      ? resolveHeadlessAgentSettings(
+          this.dependencies.config,
+          workspaceId,
+          "intuition",
+          modelString,
+          intuitionDefinition.frontmatter.ai
+        )
+      : undefined;
     const buildStreamSystemContextForToolset = (
       toolset: {
         advisorToolAvailable: boolean;
@@ -2018,16 +2027,11 @@ export class TurnRequestBuilder {
             },
           }
         : {}),
-      ...(intuitionToolEligible
+      ...(intuitionSettings
         ? {
             intuitionRuntime: {
-              modelString: resolveHeadlessAgentModelString(
-                this.dependencies.config,
-                workspaceId,
-                "intuition",
-                modelString,
-                intuitionDefinition?.frontmatter.ai
-              ),
+              modelString: intuitionSettings.model,
+              thinkingLevel: intuitionSettings.thinkingLevel,
               maxUsesPerTurn: MEMORY_INTUITION_MAX_USES_PER_TURN,
               usesThisTurn: 0,
               createModel: createToolModel,

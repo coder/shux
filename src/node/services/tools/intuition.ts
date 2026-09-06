@@ -54,6 +54,7 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
           hooks,
           resolveAgentBody: () => runtime.resolveAgentBody(),
           modelString: model,
+          thinkingLevel: runtime.thinkingLevel,
           memoryService,
           ctx,
           cue,

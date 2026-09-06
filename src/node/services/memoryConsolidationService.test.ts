@@ -21,6 +21,7 @@ import {
   resolveDreamAgentBody,
   resolveDreamModelString,
   resolveHeadlessAgentModelString,
+  resolveHeadlessAgentSettings,
   resolveHeadlessAgentBody,
   resolveHeadlessAgentDefinition,
 } from "./memoryConsolidationService";
@@ -1536,6 +1537,38 @@ describe("MemoryConsolidationService", () => {
     });
     expect(resolve()).toBe("coder:workspace-intuition");
     expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("openai:dream-only");
+  });
+
+  it("resolves headless effort independently from model with workspace, global, definition, and off precedence", async () => {
+    using fixture = await createFixture();
+    const resolve = (definitionAiDefaults?: { thinkingLevel: "low" }) =>
+      resolveHeadlessAgentSettings(
+        fixture.config,
+        "ws-dream",
+        "intuition",
+        "coder:private-route",
+        definitionAiDefaults
+      );
+    expect(resolve().thinkingLevel).toBe("off");
+    expect(resolve({ thinkingLevel: "low" }).thinkingLevel).toBe("low");
+    await fixture.config.editConfig((cfg) => {
+      cfg.agentAiDefaults = { intuition: { thinkingLevel: "high" } };
+      return cfg;
+    });
+    expect(resolve({ thinkingLevel: "low" })).toMatchObject({
+      model: "coder:private-route",
+      thinkingLevel: "high",
+    });
+    await fixture.config.editConfig((cfg) => {
+      cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent = {
+        intuition: { model: "coder:workspace-recall", thinkingLevel: "off" },
+      };
+      return cfg;
+    });
+    expect(resolve({ thinkingLevel: "low" })).toMatchObject({
+      model: "coder:workspace-recall",
+      thinkingLevel: "off",
+    });
   });
 
   it.each([false, true])(

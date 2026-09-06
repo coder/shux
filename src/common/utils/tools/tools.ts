@@ -3,7 +3,11 @@ import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
-import { isGrokFrontierModel, type OpenAIReasoningMode } from "@/common/types/thinking";
+import {
+  isGrokFrontierModel,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import type { ProviderName } from "@/common/constants/providers";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
@@ -321,6 +325,7 @@ export interface ToolConfiguration {
   /** Pinned, host-only recall runtime; present only for eligible parent turns. */
   intuitionRuntime?: {
     modelString: string;
+    thinkingLevel?: ThinkingLevel;
     maxUsesPerTurn: number;
     /** Shared by every tool rebuild in this parent turn (including refusal fallback). */
     usesThisTurn: number;

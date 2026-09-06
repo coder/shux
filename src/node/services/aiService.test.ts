@@ -1731,7 +1731,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       await harness.config.editConfig((cfg) => {
         cfg.agentAiDefaults = {
           ...cfg.agentAiDefaults,
-          intuition: { modelString: KNOWN_MODELS.SONNET.id, enabled: scenario.agentEnabled },
+          intuition: {
+            modelString: KNOWN_MODELS.SONNET.id,
+            enabled: scenario.agentEnabled,
+            thinkingLevel: "high",
+          },
         };
         return cfg;
       });
@@ -1762,6 +1766,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(runtime !== undefined).toBe(scenario.eligible);
       if (runtime) {
         expect(runtime.modelString).toBe(KNOWN_MODELS.SONNET.id);
+        expect(runtime.thinkingLevel).toBe("high");
         if (frontmatterDisabled !== undefined) {
           await fs.writeFile(
             definitionPath,
@@ -1803,7 +1808,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         );
         await fs.writeFile(
           path.join(agents, "private-base.md"),
-          "---\nname: Private base\nai:\n  model: private:definition-route\n---\nPrivate guidance."
+          "---\nname: Private base\nai:\n  model: private:definition-route\n  thinkingLevel: low\n---\nPrivate guidance."
         );
       }
       await harness.config.editConfig((cfg) => {
@@ -1824,10 +1829,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         messages: [createMuxMessage("user", "user", "hello")],
         workspaceId: metadata.id,
         modelString: selected,
-        thinkingLevel: "off",
+        thinkingLevel: "high",
         experiments: { memory: true },
       });
       expect(result.success).toBe(true);
+      expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.thinkingLevel).toBe(
+        definitionOverride ? "low" : "off"
+      );
       expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.modelString).toBe(
         definitionOverride ? "private:definition-route" : selected
       );
