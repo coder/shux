@@ -542,13 +542,14 @@ export function AdvisorToolExperimentConfig() {
           <div className="text-foreground text-sm">Reasoning</div>
           <div className="text-muted text-xs">Applied to advisor requests.</div>
         </div>
-        <div className="w-40 shrink-0">
+        <div className="w-52 shrink-0">
           {/* Reuse the route-aware picker so advisor Pro has the same delivery gates as chat. */}
           <ThinkingSelectorControl
             modelString={advisorModelString || undefined}
             modelCapabilitiesDeferred={!advisorModelString}
             allowProMode={Boolean(advisorModelString)}
             allowFastMode={false}
+            applyMinimumThinkingLevel={false}
             thinkingLevel={advisorThinkingLevel}
             onThinkingLevelChange={setAdvisorThinkingLevel}
             reasoningMode={advisorReasoningMode}

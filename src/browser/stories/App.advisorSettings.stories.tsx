@@ -20,7 +20,7 @@ function setupAdvisorSettings() {
     "advisorModelString" | "advisorThinkingLevel" | "advisorReasoningMode"
   > = {
     advisorModelString: "openai:gpt-6-astra",
-    advisorThinkingLevel: "high",
+    advisorThinkingLevel: "low",
     advisorReasoningMode: "standard",
   };
   const getConfig = client.config.getConfig;
@@ -43,6 +43,7 @@ async function exerciseAdvisorMode(canvasElement: HTMLElement) {
   await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
   await userEvent.click(await canvas.findByRole("button", { name: "Experiments" }));
   const trigger = await canvas.findByRole("button", { name: "Reasoning" });
+  await expect(trigger).toHaveTextContent("Low");
   trigger.scrollIntoView({ block: "center" });
   await userEvent.click(trigger);
   const mode = canvas.getByRole("button", { name: /Pro mode/ });
@@ -55,9 +56,12 @@ async function exerciseAdvisorMode(canvasElement: HTMLElement) {
   await expect(trigger).toHaveTextContent("Max");
   await expect(trigger).toHaveTextContent("PRO");
   await waitFor(() => expect(mode).toHaveAttribute("aria-pressed", "true"));
+  const menu = canvas.getByRole("listbox", { name: "Reasoning effort" });
+  await expect(menu.getBoundingClientRect().right).toBeLessThanOrEqual(
+    trigger.getBoundingClientRect().right
+  );
   // The test runner ignores viewport globals, so bounds apply only to the pinned phone render.
   if (window.innerWidth < 768) {
-    const menu = canvas.getByRole("listbox", { name: "Reasoning effort" });
     await expect(menu.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
     await expect(trigger.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
     await expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
@@ -68,6 +72,13 @@ export const Desktop: AppStory = {
   globals: { viewport: { value: "desktop", isRotated: false } },
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["desktop"] } } },
   render: () => <AppWithMocks setup={setupAdvisorSettings} />,
+  play: async ({ canvasElement }) => exerciseAdvisorMode(canvasElement),
+};
+
+export const Tablet: AppStory = {
+  ...Desktop,
+  globals: { viewport: { value: "tablet", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["tablet"] } } },
   play: async ({ canvasElement }) => exerciseAdvisorMode(canvasElement),
 };
 

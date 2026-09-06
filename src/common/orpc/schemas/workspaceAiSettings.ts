@@ -17,7 +17,7 @@ export const WorkspaceAISettingsSchema = z.object({
   // Optional so legacy persisted settings without the field parse unchanged.
   reasoningMode: OpenAIReasoningModeSchema.optional().meta({
     description:
-      'OpenAI reasoning mode (orthogonal to effort). Currently applies only to OpenAI GPT-5.6 Sol/Terra; inert elsewhere. Absent = "standard".',
+      'OpenAI reasoning mode (orthogonal to effort). Applies to supported models on direct OpenAI Responses API routes; inert elsewhere. Absent = "standard".',
   }),
 });
 

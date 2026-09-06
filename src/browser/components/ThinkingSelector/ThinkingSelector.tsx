@@ -60,6 +60,8 @@ interface ThinkingSelectorControlProps {
   modelCapabilitiesDeferred?: boolean;
   /** Independent of effort/model inheritance; false denotes an explicit mode override. */
   reasoningModeInherited?: boolean;
+  /** Nested tools enforce model capabilities without the chat-specific effort floor. */
+  applyMinimumThinkingLevel?: boolean;
   thinkingLevel: ThinkingLevel;
   onThinkingLevelChange: (level: ThinkingLevel) => void;
   reasoningMode: OpenAIReasoningMode;
@@ -110,7 +112,8 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
       }
 
       assert(props.modelString, "A model is required unless capabilities are deferred");
-      const minimum = getMinimum(props.modelString);
+      const minimum =
+        props.applyMinimumThinkingLevel === false ? undefined : getMinimum(props.modelString);
       const resolvedRoute = routing.resolveRoute(normalizeToCanonical(props.modelString)).route;
       return {
         allowed: getAvailableThinkingLevels(props.modelString, minimum, providersConfig),

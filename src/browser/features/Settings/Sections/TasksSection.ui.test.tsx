@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
+import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 let advisorExperimentEnabled = false;
@@ -127,7 +128,11 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
   // Discovery only runs for a selected workspace's project.
   selectedWorkspaceMock = options.agents ? { projectPath: "/proj", workspaceId: "ws-1" } : null;
 
-  const view = render(<TasksSection />);
+  const view = render(
+    <PolicyProvider>
+      <TasksSection />
+    </PolicyProvider>
+  );
   return { ...view, getConfig, saveConfig };
 }
 

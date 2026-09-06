@@ -41,6 +41,7 @@ interface MockAPIClient {
 
 let mockApi: MockAPIClient;
 let providersConfig: ProvidersConfigMap | null = null;
+let minimumThinkingLevel: ThinkingLevel = THINKING_LEVEL_OFF;
 let experimentValues: Record<string, boolean>;
 
 void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
@@ -98,7 +99,7 @@ void mock.module("@/browser/hooks/useTelemetry", () => ({
 }));
 
 void mock.module("@/browser/hooks/useMinThinkingLevels", () => ({
-  useMinThinkingLevels: () => ({ getMinimum: () => THINKING_LEVEL_OFF }),
+  useMinThinkingLevels: () => ({ getMinimum: () => minimumThinkingLevel }),
 }));
 void mock.module("@/browser/hooks/useProvidersConfig", () => ({
   useProvidersConfig: () => ({ config: providersConfig }),
@@ -162,6 +163,7 @@ describe("ExperimentsSection advisor config", () => {
     window.api = { platform: "linux", versions: {} };
     experimentValues = {};
     providersConfig = null;
+    minimumThinkingLevel = THINKING_LEVEL_OFF;
   });
 
   afterEach(() => {
@@ -251,6 +253,31 @@ describe("ExperimentsSection advisor config", () => {
       expect(view.getByText("Advisor Model")).toBeDefined();
       expect(view.getByText("Max Uses / Turn")).toBeDefined();
     });
+  });
+
+  test("shows and saves advisor effort without applying the chat minimum", async () => {
+    minimumThinkingLevel = "high";
+    const { view, saveConfigMock } = renderExperimentsSection({
+      configOverrides: { advisorModelString: "openai:gpt-6-astra", advisorThinkingLevel: "low" },
+    });
+    const trigger = await view.findByRole("button", { name: "Reasoning" });
+    expect(trigger.textContent).toContain("Low");
+    fireEvent.click(trigger);
+    expect(view.getByRole("option", { name: "Low" }).getAttribute("aria-selected")).toBe("true");
+    fireEvent.click(view.getByRole("button", { name: /Pro mode/ }));
+    await waitFor(() =>
+      expect(saveConfigMock.mock.calls.at(-1)?.[0]).toMatchObject({
+        advisorThinkingLevel: "low",
+        advisorReasoningMode: "pro",
+      })
+    );
+    fireEvent.click(view.getByRole("option", { name: "Medium" }));
+    await waitFor(() =>
+      expect(saveConfigMock.mock.calls.at(-1)?.[0]).toMatchObject({
+        advisorThinkingLevel: "medium",
+        advisorReasoningMode: "pro",
+      })
+    );
   });
 
   test.each(["openai:gpt-6-astra", "openai:team-astra"])(
