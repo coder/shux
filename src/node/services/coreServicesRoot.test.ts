@@ -234,7 +234,10 @@ describe("createCoreServices", () => {
     await closeScopeBounded(root.appFiberScope);
 
     expect(abortReasons).toEqual(["system"]);
-    expect(await started.data.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(await started.data.completion).toMatchObject({
+      status: "aborted",
+      abortReason: "system",
+    });
     expect(root.streamManager.isStreaming(workspaceId)).toBe(false);
     expect(await root.historyService.readPartial(workspaceId)).toBeNull();
     const history = await root.historyService.getHistoryFromLatestBoundary(workspaceId);

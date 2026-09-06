@@ -1,3 +1,5 @@
+import type { TurnStreamHandle } from "./streamManager";
+import type { StreamEndEvent } from "@/common/types/stream";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import type { AIService } from "./aiService";
@@ -1155,10 +1157,10 @@ describe("AgentSession goal safety hooks", () => {
     aiService: AIService & EventEmitter,
     workspaceId: string,
     messageId: string,
-    parts: unknown[],
+    parts: StreamEndEvent["parts"],
     options?: { finishReason?: string }
-  ): void {
-    aiService.emit("stream-end", {
+  ): TurnStreamHandle {
+    const payload: StreamEndEvent = {
       type: "stream-end",
       workspaceId,
       messageId,
@@ -1172,7 +1174,16 @@ describe("AgentSession goal safety hooks", () => {
         // exercise truncated / non-stop paths.
         finishReason: options?.finishReason ?? "stop",
       },
+    };
+    aiService.emit("stream-start", {
+      type: "stream-start",
+      workspaceId,
+      messageId,
+      model: "openai:gpt-4o",
+      startTime: Date.now(),
     });
+    aiService.emit("stream-end", payload);
+    return { messageId, completion: Promise.resolve({ status: "completed", streamEnd: payload }) };
   }
 
   test("text-only stream-end during a goal_continuation turn auto-completes the goal", async () => {
@@ -1183,10 +1194,10 @@ describe("AgentSession goal safety hooks", () => {
     await setGoalOk(goalService, { workspaceId, objective: "Wrap things up" });
 
     aiService.streamMessage = mock(() => {
-      emitStreamEnd(aiService, workspaceId, "assistant-silent", [
+      const handle = emitStreamEnd(aiService, workspaceId, "assistant-silent", [
         { type: "text", text: "I believe everything is done already." },
       ]);
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(handle));
     }) as unknown as AIService["streamMessage"];
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
@@ -1222,7 +1233,7 @@ describe("AgentSession goal safety hooks", () => {
     await setGoalOk(goalService, { workspaceId, objective: "Keep working" });
 
     aiService.streamMessage = mock(() => {
-      emitStreamEnd(aiService, workspaceId, "assistant-acted", [
+      const handle = emitStreamEnd(aiService, workspaceId, "assistant-acted", [
         { type: "text", text: "Let me check the file first." },
         {
           type: "dynamic-tool",
@@ -1233,7 +1244,7 @@ describe("AgentSession goal safety hooks", () => {
           output: { ok: true },
         },
       ]);
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(handle));
     }) as unknown as AIService["streamMessage"];
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
@@ -1255,10 +1266,10 @@ describe("AgentSession goal safety hooks", () => {
     await setGoalOk(goalService, { workspaceId, objective: "Keep going" });
 
     aiService.streamMessage = mock(() => {
-      emitStreamEnd(aiService, workspaceId, "assistant-text-only", [
+      const handle = emitStreamEnd(aiService, workspaceId, "assistant-text-only", [
         { type: "text", text: "Just thinking out loud." },
       ]);
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(handle));
     }) as unknown as AIService["streamMessage"];
 
     // Manual user messages now pause active goals because the goal mode is
@@ -1289,14 +1300,14 @@ describe("AgentSession goal safety hooks", () => {
     await setGoalOk(goalService, { workspaceId, objective: "Keep working" });
 
     aiService.streamMessage = mock(() => {
-      emitStreamEnd(
+      const handle = emitStreamEnd(
         aiService,
         workspaceId,
         "assistant-truncated",
         [{ type: "text", text: "Mid-sentence, then cut off by the token limit" }],
         { finishReason: "length" }
       );
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(handle));
     }) as unknown as AIService["streamMessage"];
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
@@ -1325,10 +1336,10 @@ describe("AgentSession goal safety hooks", () => {
     });
 
     aiService.streamMessage = mock(() => {
-      emitStreamEnd(aiService, workspaceId, "assistant-paused-silent", [
+      const handle = emitStreamEnd(aiService, workspaceId, "assistant-paused-silent", [
         { type: "text", text: "All wrapped up." },
       ]);
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(handle));
     }) as unknown as AIService["streamMessage"];
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {

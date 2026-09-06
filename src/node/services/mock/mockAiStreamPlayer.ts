@@ -25,6 +25,7 @@ import type {
   StreamStartEvent,
   StreamDeltaEvent,
   StreamEndEvent,
+  StreamAbortEvent,
   UsageDeltaEvent,
 } from "@/common/types/stream";
 import type { ToolCallStartEvent, ToolCallEndEvent } from "@/common/types/stream";
@@ -242,21 +243,26 @@ export class MockAiStreamPlayer {
     active.cancelled = true;
 
     // Emit stream-abort event to mirror real streaming behavior before we await disk cleanup.
-    this.deps.aiService.emit("stream-abort", {
+    const streamAbort: StreamAbortEvent = {
       type: "stream-abort",
       workspaceId,
       messageId: active.messageId,
       abortReason: "user",
-    });
+    };
+    this.deps.aiService.emit("stream-abort", streamAbort);
 
     this.cleanup(workspaceId);
 
     // User-initiated mock interrupts should not leave behind resumable partial state.
-    const deletePartialResult = await this.deps.historyService.deletePartial(workspaceId);
-    if (!deletePartialResult.success) {
-      log.error(
-        `Failed to clear mock partial on stop for ${active.messageId}: ${deletePartialResult.error}`
-      );
+    try {
+      const deletePartialResult = await this.deps.historyService.deletePartial(workspaceId);
+      if (!deletePartialResult.success) {
+        log.error(
+          `Failed to clear mock partial on stop for ${active.messageId}: ${deletePartialResult.error}`
+        );
+      }
+    } finally {
+      active.settleCompletion({ status: "aborted", abortReason: "user", streamAbort });
     }
   }
 
@@ -883,8 +889,8 @@ export class MockAiStreamPlayer {
         if (!this.isCurrentActiveStream(workspaceId, active)) return;
 
         this.deps.aiService.emit("stream-end", payload);
-        active.settleCompletion({ status: "completed" });
         this.cleanup(workspaceId);
+        active.settleCompletion({ status: "completed", streamEnd: payload });
         break;
       }
     }
@@ -895,8 +901,6 @@ export class MockAiStreamPlayer {
     if (!active) return;
 
     active.cancelled = true;
-    // Settle-once backstop: terminal events settled above; cancels settle here.
-    active.settleCompletion({ status: "aborted", abortReason: "user" });
 
     if (active.partialWriteTimer) {
       clearTimeout(active.partialWriteTimer);

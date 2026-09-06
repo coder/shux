@@ -1343,7 +1343,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     expect(terminal.map((event) => event.type)).toEqual(["stream-abort"]);
     expect((terminal[0] as StreamAbortEvent).abortReason).toBe("system");
     // ... and the turn handle plus the registry were settled before the close resolved.
-    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "system" });
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
     expect(streamManager.isStreaming(workspaceId)).toBe(false);
   });
@@ -1374,7 +1374,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
 
     const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
 
-    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "system" });
     expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
   });
@@ -1432,7 +1432,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
       expect(terminalEvents(events)).toEqual([]);
 
       releaseFinalWrite.resolve();
-      expect(await handle.completion).toEqual({ status: "completed" });
+      expect(await handle.completion).toMatchObject({ status: "completed" });
       expect(await stopPromise).toEqual(Ok(undefined));
       await completionObserved;
 
@@ -1485,7 +1485,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     expect(aborts[0].abortReason).toBe("user");
     expect(terminalEvents(events)).toHaveLength(1);
     expect(settleCount).toBe(1);
-    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "user" });
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
   });
 
@@ -1533,7 +1533,10 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     const result = await startPromise;
     expect(result.success).toBe(true);
     if (!result.success) throw new Error("expected Ok");
-    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(await result.data.completion).toMatchObject({
+      status: "aborted",
+      abortReason: "system",
+    });
     expect(events.filter((event) => event.type === "stream-start")).toHaveLength(0);
     expect(terminalEvents(events)).toHaveLength(1);
     expect(streamManager.isStreaming(workspaceId)).toBe(false);
@@ -1564,7 +1567,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
       Ok(undefined)
     );
 
-    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "user" });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
@@ -1581,7 +1584,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     );
     for (let i = 1; i <= 50; i++) {
       const handle = await startSupervisedStreamForTests(streamManager, workspaceId, i);
-      expect(await handle.completion).toEqual({ status: "completed" });
+      expect(await handle.completion).toMatchObject({ status: "completed" });
     }
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
     expect(events.filter((event) => event.type === "stream-end")).toHaveLength(50);
@@ -2751,6 +2754,7 @@ describe("StreamManager - turn completion", () => {
     createStreamResult?: (request: unknown, abortController: AbortController) => unknown;
     sink?: (event: TurnEngineEvent) => void | Promise<void>;
     events?: TurnEngineEvent[];
+    systemMessageTokens?: number;
   }) {
     const streamManager = new StreamManager(
       historyService,
@@ -2775,6 +2779,7 @@ describe("StreamManager - turn completion", () => {
         messageId: input.messageId,
         model: createTestLanguageModel(),
         providedRuntimeTempDir: "",
+        initialMetadata: { systemMessageTokens: input.systemMessageTokens },
       })
     );
     expect(result.success).toBe(true);
@@ -2807,7 +2812,10 @@ describe("StreamManager - turn completion", () => {
     );
     expect(aborted.success).toBe(true);
     if (!aborted.success) throw new Error("Expected aborted startup handle");
-    expect(await aborted.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
+    expect(await aborted.data.completion).toMatchObject({
+      status: "aborted",
+      abortReason: "startup",
+    });
   });
 
   test("completed, failed, and debug-injected turns settle once after their terminal event", async () => {
@@ -2826,7 +2834,7 @@ describe("StreamManager - turn completion", () => {
     void completed.handle.completion.then(() => {
       completedSettlements += 1;
     });
-    expect(await completed.handle.completion).toEqual({ status: "completed" });
+    expect(await completed.handle.completion).toMatchObject({ status: "completed" });
     await Promise.resolve();
     expect(completedEvents.at(-1)?.type).toBe("stream-end");
     expect(completedSettlements).toBe(1);
@@ -2879,6 +2887,7 @@ describe("StreamManager - turn completion", () => {
     const { streamManager, handle } = await startWithStreamResult({
       workspaceId,
       messageId: "completion-abort-message",
+      systemMessageTokens: 733,
       createStreamResult: (_request, controller) =>
         createStreamResultForTests(
           (async function* () {
@@ -2922,7 +2931,13 @@ describe("StreamManager - turn completion", () => {
       expect(settled).toBe(false);
 
       releaseAbortDelivery.resolve();
-      expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
+      expect(await handle.completion).toMatchObject({
+        status: "aborted",
+        abortReason: "user",
+        systemMessageTokens: 733,
+        streamAbort: { type: "stream-abort", workspaceId, messageId: handle.messageId },
+      });
+      expect(streamManager.getStreamInfo(workspaceId)).toBeUndefined();
       const observed = await completionObserved;
       expect(observed.partial).toBeNull();
       expect(observed.history.success).toBe(true);
@@ -3223,7 +3238,10 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
     const result = await startPromise;
     expect(result.success).toBe(true);
     if (!result.success) throw new Error("Expected aborted startup handle");
-    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
+    expect(await result.data.completion).toMatchObject({
+      status: "aborted",
+      abortReason: "startup",
+    });
     expect(createCalled).toBe(false);
     expect(cleanupCalled).toBe(true);
     expect(processCalled).toBe(false);

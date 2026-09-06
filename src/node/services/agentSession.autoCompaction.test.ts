@@ -1,3 +1,5 @@
+import type { StreamEndEvent } from "@/common/types/stream";
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 
@@ -823,7 +825,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         usage,
       });
 
-      aiEmitter.emit("stream-end", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-end",
         workspaceId,
         messageId: "assistant-providers-config",
@@ -1055,7 +1057,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     const stopStream = mock((_workspaceId: string) => {
-      aiEmitter.emit("stream-abort", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-abort",
         workspaceId,
         messageId: "assistant-mid-stream",
@@ -1206,7 +1208,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     const stopStream = mock((_workspaceId: string) => {
-      aiEmitter.emit("stream-abort", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-abort",
         workspaceId,
         messageId: "assistant-mid-stream",
@@ -1369,7 +1371,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
         outputTokens: 10,
         totalTokens: 52,
       };
-      aiEmitter.emit("stream-end", {
+      const streamEnd: StreamEndEvent = {
         type: "stream-end",
         workspaceId,
         messageId: `assistant-${streamHistories.length}`,
@@ -1379,9 +1381,14 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
           usage,
           contextUsage: usage,
         },
-      });
-
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      };
+      aiEmitter.emit("stream-end", streamEnd);
+      return Promise.resolve(
+        Ok({
+          messageId: streamEnd.messageId,
+          completion: Promise.resolve({ status: "completed" as const, streamEnd }),
+        })
+      );
     });
 
     const harness = await createAgentSessionHarness({

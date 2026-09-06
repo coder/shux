@@ -255,6 +255,8 @@ export interface StreamMessageOptions {
   acpPromptId?: string;
   /** Invoked with each fatal pre-start error event this call emits before returning Err. */
   onPreStartError?: (event: ErrorEvent) => void;
+  /** Synchronous registration of the facade's handleless startup notification identity. */
+  onStreamStarting?: (messageId: string) => void;
   /** Tool names that should be delegated back to ACP clients for this request. */
   delegatedToolNames?: string[];
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
@@ -488,7 +490,7 @@ interface TurnRequestBuilderDependencies {
   lastLlmRequestByWorkspace: Map<string, DebugLlmRequestSnapshot>;
   bindings: TurnRequestBuilderBindings;
   emit: (event: string, ...args: unknown[]) => boolean;
-  createAbortedTurnHandle: (messageId: string) => TurnStreamHandle;
+  createAbortedTurnHandle: (messageId: string, signal?: AbortSignal) => TurnStreamHandle;
   createSettledTurnHandle: (messageId: string, completion: TurnCompletion) => TurnStreamHandle;
   getWorkspaceMetadata: (workspaceId: string) => Promise<Result<WorkspaceMetadata>>;
   createWorkspaceRuntimeContext: (
@@ -1131,7 +1133,9 @@ export class TurnRequestBuilder {
     if (combinedAbortSignal.aborted) {
       return {
         type: "finished",
-        result: Ok(this.dependencies.createAbortedTurnHandle(syntheticMessageId)),
+        result: Ok(
+          this.dependencies.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal)
+        ),
       };
     }
 
@@ -2576,7 +2580,9 @@ export class TurnRequestBuilder {
     if (combinedAbortSignal.aborted) {
       return {
         type: "finished",
-        result: Ok(this.dependencies.createAbortedTurnHandle(assistantMessageId)),
+        result: Ok(
+          this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+        ),
       };
     }
 
@@ -2641,7 +2647,7 @@ export class TurnRequestBuilder {
           ),
         };
       }
-      await simulateToolPolicyNoop(
+      const streamEnd = await simulateToolPolicyNoop(
         simulationCtx,
         effectiveToolPolicy,
         this.dependencies.historyService
@@ -2649,7 +2655,10 @@ export class TurnRequestBuilder {
       return {
         type: "finished",
         result: Ok(
-          this.dependencies.createSettledTurnHandle(assistantMessageId, { status: "completed" })
+          this.dependencies.createSettledTurnHandle(assistantMessageId, {
+            status: "completed",
+            streamEnd,
+          })
         ),
       };
     }
@@ -2700,7 +2709,9 @@ export class TurnRequestBuilder {
       await deleteAbortedPlaceholder(assistantMessageId);
       return {
         type: "finished",
-        result: Ok(this.dependencies.createAbortedTurnHandle(assistantMessageId)),
+        result: Ok(
+          this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+        ),
       };
     }
 

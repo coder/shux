@@ -1,3 +1,4 @@
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import {
@@ -719,7 +720,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(scheduleCalls).toBe(1);
 
     aiStreaming = false;
-    aiEmitter.emit("stream-abort", {
+    void runSessionTerminalPolicy(session, aiEmitter, {
       type: "stream-abort",
       workspaceId,
       messageId: "assistant-1",
@@ -1757,7 +1758,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     privateSession.activeStreamUserMessageId = "user-1";
     privateSession.setTurnPhase("preparing");
 
-    aiEmitter.emit("stream-abort", {
+    void runSessionTerminalPolicy(session, aiEmitter, {
       type: "stream-abort",
       workspaceId,
       messageId: "assistant-1",

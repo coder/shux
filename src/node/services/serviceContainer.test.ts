@@ -683,7 +683,10 @@ describe("ServiceContainer", () => {
 
     expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
     expect(steps).toEqual(["stream-abort:system", "bridge-stop"]);
-    expect(await started.data.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(await started.data.completion).toMatchObject({
+      status: "aborted",
+      abortReason: "system",
+    });
     expect(services.streamManager.isStreaming(workspaceId)).toBe(false);
     // Durable outcome at the moment the bridge stopped: partial.json gone, the
     // interrupted assistant message (still flagged partial, as every

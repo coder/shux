@@ -733,7 +733,10 @@ describe("MockAiStreamPlayer", () => {
       muxMetadata,
     });
     expect(playResult.success).toBe(true);
-    await waitForCondition(() => !player.isStreaming(workspaceId), 2000);
+    if (!playResult.success || !playResult.data) throw new Error("Expected mock handle");
+    const completion = await playResult.data.completion;
+    expect(completion).toMatchObject({ status: "completed", streamEnd });
+    expect(player.isStreaming(workspaceId)).toBe(false);
 
     expect(streamStart).toMatchObject({ agentId: "explore", thinkingLevel: "high" });
     expect(streamEnd?.metadata).toMatchObject({
@@ -809,4 +812,59 @@ describe("MockAiStreamPlayer", () => {
     if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
     expect(await playResult.data.completion).toMatchObject({ status: "aborted" });
   });
+  test.each([false, true])(
+    "abort completion waits for partial deletion (reject=%s)",
+    async (rejectDelete) => {
+      const emitter = new EventEmitter();
+      const player = new MockAiStreamPlayer({
+        historyService,
+        aiService: emitter as unknown as AIService,
+      });
+      const workspaceId = "mock-abort-completion-barrier";
+      const delta = Promise.withResolvers<void>();
+      emitter.once("stream-delta", () => delta.resolve());
+      const played = await player.play(
+        [createMuxMessage("user", "user", "[force] keep streaming")],
+        workspaceId
+      );
+      if (!played.success || !played.data) throw new Error("Expected mock handle");
+      await delta.promise;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const deletePartial = historyService.deletePartial.bind(historyService);
+      const deletion = spyOn(historyService, "deletePartial").mockImplementationOnce(async (id) => {
+        entered.resolve();
+        await release.promise;
+        if (rejectDelete) throw new Error("partial delete failed");
+        return deletePartial(id);
+      });
+      let settled = false;
+      const observed = played.data.completion.then(() => {
+        settled = true;
+      });
+      let terminal: unknown;
+      emitter.once("stream-abort", (payload) => {
+        terminal = payload;
+      });
+      const stop = player.stop(workspaceId).catch((error) => error as unknown);
+      try {
+        await entered.promise;
+        expect(player.isStreaming(workspaceId)).toBe(false);
+        expect(settled).toBe(false);
+        expect(terminal).toBeDefined();
+        release.resolve();
+        await stop;
+        expect(await played.data.completion).toMatchObject({
+          status: "aborted",
+          streamAbort: terminal,
+        });
+        await observed;
+        if (!rejectDelete) expect(await historyService.readPartial(workspaceId)).toBeNull();
+      } finally {
+        release.resolve();
+        await stop;
+        deletion.mockRestore();
+      }
+    }
+  );
 });

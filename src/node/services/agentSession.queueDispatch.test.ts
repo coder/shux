@@ -1,3 +1,5 @@
+import type { StreamAbortEvent } from "@/common/types/stream";
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 
 import type { MuxMessageMetadata } from "@/common/types/message";
@@ -36,10 +38,7 @@ function streamStartEvent(workspaceId: string): Record<string, unknown> {
   };
 }
 
-function streamAbortEvent(
-  workspaceId: string,
-  abortReason: "system" | "user"
-): Record<string, unknown> {
+function streamAbortEvent(workspaceId: string, abortReason: "system" | "user"): StreamAbortEvent {
   return {
     type: "stream-abort",
     workspaceId,
@@ -384,7 +383,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(stopStream).not.toHaveBeenCalled();
       expect(sendQueuedMessages).not.toHaveBeenCalled();
 
-      aiEmitter.emit("stream-end", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-end",
         workspaceId,
         messageId: "assistant-1",
@@ -433,7 +432,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         abortReason: "system",
       });
 
-      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
       const didDispatch = await waitForCondition(() => sendQueuedMessages.mock.calls.length > 0);
       expect(didDispatch).toBe(true);
       expect(sendQueuedMessages).toHaveBeenCalledTimes(1);
@@ -610,7 +609,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       // The next turn (e.g. a descendant-task terminal wake) starts and ends.
       aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
-      aiEmitter.emit("stream-end", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-end",
         workspaceId,
         messageId: "assistant-1",
@@ -1254,7 +1253,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const interruptResult = await session.interruptStream();
       expect(interruptResult.success).toBe(true);
       // The native soft-stop can still win the event race after the hard user interrupt.
-      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
 
       await new Promise((resolve) => setTimeout(resolve, 25));
       expect(sendQueuedMessages).not.toHaveBeenCalled();

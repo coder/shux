@@ -210,8 +210,14 @@ export type TurnEngineEventSink = (event: TurnEngineEvent) => void | Promise<voi
 
 // Turn identity lives on TurnStreamHandle.messageId; completions cannot diverge from it.
 export type TurnCompletion =
-  | { status: "completed" }
-  | { status: "aborted"; abortReason: StreamAbortReason }
+  | { status: "completed"; streamEnd: Omit<StreamEndEvent, "messageId"> }
+  | {
+      status: "aborted";
+      abortReason: StreamAbortReason;
+      // Absent for startup cancellation / cleanup without a delivered terminal event.
+      streamAbort?: Omit<StreamAbortEvent, "messageId" | "abortReason">;
+      systemMessageTokens?: number;
+    }
   | { status: "failed"; streamError: StreamErrorPayload & { errorType: StreamErrorType } };
 
 export interface TurnStreamHandle {
@@ -903,6 +909,11 @@ export class StreamManager {
 
   setMockStreamLifecycle(lifecycle: MockStreamLifecycle | undefined): void {
     this.mockStreamLifecycle = lifecycle;
+  }
+
+  getStartupAbortReason(signal?: AbortSignal): StreamAbortReason {
+    const reason: unknown = signal?.reason;
+    return reason === "user" || reason === "system" || reason === "startup" ? reason : "startup";
   }
 
   beginStreamStart(input: {
@@ -2008,14 +2019,16 @@ export class StreamManager {
 
     // Emit abort asynchronously as before; completion settles only after the facade's
     // partial cleanup and external stream-abort emission have finished.
-    const abortDelivery = this.emitStreamAbort(
+    const streamAbort: StreamAbortEvent = {
+      type: "stream-abort",
       workspaceId,
-      streamInfo.messageId,
-      { usage, contextUsage, duration, providerMetadata, contextProviderMetadata },
+      messageId: streamInfo.messageId,
+      metadata: { usage, contextUsage, duration, providerMetadata, contextProviderMetadata },
       abortReason,
       abandonPartial,
-      streamInfo.initialMetadata?.acpPromptId
-    );
+      acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+    };
+    const abortDelivery = Promise.resolve(this.eventSink(streamAbort));
 
     // Clean up immediately
     this.workspaceStreams.delete(workspaceId);
@@ -2026,7 +2039,12 @@ export class StreamManager {
         log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
       })
       .finally(() => {
-        streamInfo.completionController?.settle({ status: "aborted", abortReason });
+        streamInfo.completionController?.settle({
+          status: "aborted",
+          abortReason,
+          streamAbort,
+          systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
+        });
       });
   }
 
@@ -4308,7 +4326,7 @@ export class StreamManager {
             // before updateHistory completes, compaction can clear the file and then
             // updateHistory writes stale data back.
             this.emitTurnEvent(streamEndEvent);
-            streamInfo.terminalCompletion = { status: "completed" };
+            streamInfo.terminalCompletion = { status: "completed", streamEnd: streamEndEvent };
           }
           break;
         } catch (error) {
@@ -5050,7 +5068,10 @@ export class StreamManager {
     const completionController = createTurnCompletionController();
     const handle: TurnStreamHandle = { messageId, completion: completionController.promise };
     const settleStartupAbort = (): Result<TurnStreamHandle, SendMessageError> => {
-      completionController.settle({ status: "aborted", abortReason: "startup" });
+      completionController.settle({
+        status: "aborted",
+        abortReason: this.getStartupAbortReason(abortSignal),
+      });
       return Ok(handle);
     };
 
@@ -5214,7 +5235,10 @@ export class StreamManager {
       // No handle is handed out on this path, so the completion is observed only
       // by a supervisor forked at registration: settle it so that fiber exits
       // instead of cancelling this never-started stream at shutdown.
-      completionController.settle({ status: "aborted", abortReason: "startup" });
+      completionController.settle({
+        status: "aborted",
+        abortReason: this.getStartupAbortReason(abortSignal),
+      });
       // Convert to strongly-typed error
       return Err(this.convertToSendMessageError(error));
     }
@@ -5441,7 +5465,7 @@ export class StreamManager {
       : this.isStreaming(workspaceId);
 
     if (pending) {
-      pending.abortController.abort();
+      pending.abortController.abort(options?.abortReason ?? "startup");
       if (!isActuallyStreaming) {
         await this.emitStreamAbort(
           typedWorkspaceId,

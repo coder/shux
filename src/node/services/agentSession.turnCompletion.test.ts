@@ -1,0 +1,579 @@
+import { createMuxMessage } from "@/common/types/message";
+import { describe, expect, mock, spyOn, test } from "bun:test";
+import { EventEmitter } from "events";
+import type { StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
+import { Ok } from "@/common/types/result";
+import type { StreamMessageOptions } from "./turnRequestBuilder";
+import type { TurnCompletion, TurnStreamHandle } from "./streamManager";
+import type { WorkspaceGoalService } from "./workspaceGoalService";
+import type { AgentSession } from "./agentSession";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
+
+const workspaceId = "session-completion";
+const model = "openai:gpt-4o";
+const sendOptions = { model, agentId: "exec" };
+
+interface Operation {
+  messageId?: string;
+  consumed: boolean;
+  startupMessageId?: string;
+  startupAbortNotified: boolean;
+  compaction: boolean;
+}
+interface InternalSession {
+  activeTurnOperation?: Operation;
+  lastSystemMessageTokens?: number;
+  activeCompactionRequest?: { id: string; modelString: string };
+  consumeTurnCompletion(handle: TurnStreamHandle, operation: Operation): Promise<void>;
+  clearStartupAutoRetryAbandon(): Promise<void>;
+  recordGoalAccountingFromUsage(input: unknown): Promise<void>;
+  setTurnPhase(phase: "preparing" | "streaming" | "idle"): void;
+  getEditTruncateTargetId(messageId: string): Promise<string>;
+}
+const internal = (session: AgentSession) => session as unknown as InternalSession;
+const end = (messageId = "assistant-1"): StreamEndEvent => ({
+  type: "stream-end",
+  workspaceId,
+  messageId,
+  metadata: { model },
+  parts: [{ type: "text", text: "Finished answer" }],
+});
+const abort = (messageId = "assistant-1"): StreamAbortEvent => ({
+  type: "stream-abort",
+  workspaceId,
+  messageId,
+  abortReason: "user",
+});
+function start(emitter: EventEmitter, messageId = "assistant-1") {
+  emitter.emit("stream-start", {
+    type: "stream-start",
+    workspaceId,
+    messageId,
+    model,
+    startTime: Date.now(),
+  });
+}
+
+// Observe the already-detached consumer promise without introducing a second policy path.
+function policyPromise(spy: ReturnType<typeof observePolicy>): Promise<void> {
+  const result = spy.mock.results.at(-1);
+  if (result?.type !== "return") throw new Error("No completion consumer registered");
+  return result.value;
+}
+function observePolicy(session: AgentSession) {
+  return spyOn(internal(session), "consumeTurnCompletion");
+}
+
+describe("AgentSession turn completion", () => {
+  test("raw success is observational; completion uses handle identity and runs policy once", async () => {
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const emitter = new EventEmitter();
+    const handle = { messageId: "assistant-1", completion: completion.promise };
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          start(emitter);
+          return Promise.resolve(Ok(handle));
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    try {
+      expect((await h.session.sendMessage("hello", sendOptions)).success).toBe(true);
+      emitter.emit("stream-end", end());
+      expect(h.session.isBusy()).toBe(true);
+      expect(h.events.filter((event) => event.type === "stream-end")).toHaveLength(0);
+      const operation = internal(h.session).activeTurnOperation!;
+      // Even a malformed producer's redundant event ID cannot override handle identity.
+      completion.resolve({ status: "completed", streamEnd: end("wrong-id") });
+      await policyPromise(consumer);
+      await internal(h.session).consumeTurnCompletion(handle, operation);
+      emitter.emit("stream-end", end());
+      expect(h.events.filter((event) => event.type === "stream-end")).toMatchObject([
+        { messageId: handle.messageId },
+      ]);
+      expect(h.session.isBusy()).toBe(false);
+    } finally {
+      h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  test("delivered abort before stream-start runs once and retains precleanup token context", async () => {
+    const envelopeEntered = Promise.withResolvers<void>();
+    const releaseEnvelope = Promise.withResolvers<void>();
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const emitter = new EventEmitter();
+    const recordUserStoppedStream = mock(() => Promise.resolve());
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(async (opts: StreamMessageOptions) => {
+          opts.onStreamStarting?.("starting-1");
+          envelopeEntered.resolve();
+          await releaseEnvelope.promise;
+          return Ok({ messageId: "assistant-1", completion: completion.promise });
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    const send = h.session.sendMessage("hello", sendOptions);
+    try {
+      await envelopeEntered.promise;
+      Reflect.set(h.session, "workspaceGoalService", {
+        recordUserStoppedStream,
+        recordStreamAccounting: mock(() => Promise.resolve(null)),
+      } satisfies Partial<WorkspaceGoalService>);
+      emitter.emit("stream-abort", abort());
+      expect(recordUserStoppedStream).not.toHaveBeenCalled();
+      expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(0);
+      completion.resolve({
+        status: "aborted",
+        abortReason: "user",
+        streamAbort: abort(),
+        systemMessageTokens: 417,
+      });
+      releaseEnvelope.resolve();
+      await send;
+      await policyPromise(consumer);
+      expect(recordUserStoppedStream).toHaveBeenCalledTimes(1);
+      expect(internal(h.session).lastSystemMessageTokens).toBe(417);
+      expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
+      expect(h.session.isBusy()).toBe(false);
+    } finally {
+      releaseEnvelope.resolve();
+      await send;
+      h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  test.each(["user", "system"] as const)(
+    "startup %s cancellation handle does not duplicate its delayed notification",
+    async (reason) => {
+      const emitter = new EventEmitter();
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter: emitter,
+        captureEvents: true,
+        aiServiceOverrides: {
+          streamMessage: mock((opts: StreamMessageOptions) => {
+            opts.onStreamStarting?.("starting-1");
+            return Promise.resolve(
+              Ok({
+                messageId: "starting-1",
+                completion: Promise.resolve<TurnCompletion>({
+                  status: "aborted",
+                  abortReason: reason,
+                }),
+              })
+            );
+          }),
+        },
+      });
+      const consumer = observePolicy(h.session);
+      try {
+        await h.session.sendMessage("hello", sendOptions);
+        await policyPromise(consumer);
+        const received = Promise.withResolvers<void>();
+        h.session.onChatEvent(({ message }) => {
+          if (message.type === "stream-abort") received.resolve();
+        });
+        const payload = { ...abort("starting-1"), abortReason: reason };
+        emitter.emit("stream-abort", payload);
+        await received.promise;
+        emitter.emit("stream-abort", payload);
+        expect(h.events.filter((event) => event.type === "stream-abort")).toMatchObject([
+          { abortReason: reason },
+        ]);
+      } finally {
+        h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
+  test.each(["completed", "aborted", "failed"] as const)(
+    "late %s completion cannot change a replacement paused in history preparation",
+    async (status) => {
+      const completion = Promise.withResolvers<TurnCompletion>();
+      const emitter = new EventEmitter();
+      let calls = 0;
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter: emitter,
+        captureEvents: true,
+        aiServiceOverrides: {
+          streamMessage: mock(() => {
+            const messageId = `assistant-${++calls}`;
+            start(emitter, messageId);
+            return Promise.resolve(
+              Ok({
+                messageId,
+                completion:
+                  calls === 1 ? completion.promise : new Promise<TurnCompletion>(() => undefined),
+              })
+            );
+          }),
+        },
+      });
+      const consumer = observePolicy(h.session);
+      const historyEntered = Promise.withResolvers<void>();
+      const releaseHistory = Promise.withResolvers<void>();
+      let replacement: Promise<unknown> | undefined;
+      try {
+        await h.session.sendMessage("hello", sendOptions);
+        const oldPolicy = policyPromise(consumer);
+        internal(h.session).setTurnPhase("idle");
+        const commit = h.historyService.commitPartial.bind(h.historyService);
+        spyOn(h.historyService, "commitPartial").mockImplementationOnce(async (id) => {
+          historyEntered.resolve();
+          await releaseHistory.promise;
+          return commit(id);
+        });
+        replacement = h.session.sendMessage("replacement", sendOptions);
+        await historyEntered.promise;
+        completion.resolve(
+          status === "completed"
+            ? { status, streamEnd: end() }
+            : status === "aborted"
+              ? { status, abortReason: "user", streamAbort: abort() }
+              : {
+                  status,
+                  streamError: { messageId: "assistant-1", error: "old failure", errorType: "api" },
+                }
+        );
+        await oldPolicy;
+        expect(h.session.isPreparingTurn()).toBe(true);
+        expect(
+          h.events.filter((event) =>
+            ["stream-end", "stream-abort", "stream-error"].includes(event.type)
+          )
+        ).toHaveLength(0);
+        releaseHistory.resolve();
+        await replacement;
+        expect(calls).toBe(2);
+      } finally {
+        releaseHistory.resolve();
+        await replacement;
+        h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
+  test("disposal during success policy resolves compaction waiters and skips further accounting", async () => {
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const emitter = new EventEmitter();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          start(emitter);
+          return Promise.resolve(Ok({ messageId: "assistant-1", completion: completion.promise }));
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    try {
+      await h.session.sendMessage("hello", sendOptions);
+      internal(h.session).activeCompactionRequest = { id: "compact", modelString: model };
+      internal(h.session).activeTurnOperation!.compaction = true;
+      spyOn(internal(h.session), "clearStartupAutoRetryAbandon").mockImplementation(async () => {
+        entered.resolve();
+        await release.promise;
+      });
+      const accounting = spyOn(internal(h.session), "recordGoalAccountingFromUsage");
+      emitter.emit("stream-end", end());
+      const decision = h.session.waitForPendingCompactionCompletionDecision("assistant-1");
+      completion.resolve({ status: "completed", streamEnd: end() });
+      await entered.promise;
+      h.session.dispose();
+      expect(await decision).toBe(false);
+      expect(await h.session.waitForPendingCompactionCompletionDecision("late-observer")).toBe(
+        false
+      );
+      release.resolve();
+      await policyPromise(consumer);
+      expect(accounting).not.toHaveBeenCalled();
+      expect(h.session.isBusy()).toBe(false);
+    } finally {
+      release.resolve();
+      h.session.dispose();
+      await h.cleanup();
+    }
+  });
+  test("synchronous compaction completion publishes its decision, sanitizes the renderer and starts its follow-up", async () => {
+    const emitter = new EventEmitter();
+    let calls = 0;
+    const rawEnd = {
+      ...end(),
+      metadata: {
+        model,
+        providerMetadata: { openai: { responseId: "stale" } },
+        contextProviderMetadata: { openai: { responseId: "stale" } },
+      },
+      parts: [
+        { type: "reasoning" as const, text: "Private compaction reasoning" },
+        { type: "text" as const, text: "Durable summary" },
+      ],
+    };
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          const messageId = `assistant-${++calls}`;
+          start(emitter, messageId);
+          if (calls > 1)
+            return Promise.resolve(
+              Ok({ messageId, completion: new Promise<TurnCompletion>(() => undefined) })
+            );
+          emitter.emit("stream-end", rawEnd);
+          return Promise.resolve(
+            Ok({
+              messageId,
+              completion: Promise.resolve<TurnCompletion>({
+                status: "completed",
+                streamEnd: rawEnd,
+              }),
+            })
+          );
+        }),
+      },
+    });
+    let decision: Promise<boolean> | undefined;
+    // Raw terminal observation must happen before the handle is returned to sendMessage.
+    emitter.on("stream-end", () => {
+      decision = h.session.waitForPendingCompactionCompletionDecision("assistant-1");
+    });
+    const consumer = observePolicy(h.session);
+    try {
+      await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("prior", "user", "Keep this context")
+      );
+      const result = await h.session.sendMessage(
+        "Please compact",
+        {
+          model,
+          agentId: "compact",
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: {
+              followUpContent: { text: "Continue after summary", model, agentId: "exec" },
+            },
+          },
+        },
+        { synthetic: true }
+      );
+      expect(result.success).toBe(true);
+      const firstPolicy = consumer.mock.results[0];
+      if (firstPolicy?.type !== "return") throw new Error("Missing first policy");
+      await firstPolicy.value;
+      expect(decision).toBeDefined();
+      expect(await decision).toBe(true);
+      expect(calls).toBe(2);
+      expect(h.session.isBusy()).toBe(true);
+      const rendererEnds = h.events.filter((event) => event.type === "stream-end");
+      expect(rendererEnds).toHaveLength(1);
+      expect(rendererEnds[0].parts).toEqual(rawEnd.parts);
+      expect(rendererEnds[0].metadata).not.toHaveProperty("providerMetadata");
+      expect(rendererEnds[0].metadata).not.toHaveProperty("contextProviderMetadata");
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data[0].metadata?.compactionBoundary).toBe(true);
+      expect(history.data.at(-1)?.parts).toMatchObject([
+        { type: "text", text: "Continue after summary" },
+      ]);
+    } finally {
+      h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  test("edit preemption drops the old completion while truncation lookup is paused", async () => {
+    const envelopeEntered = Promise.withResolvers<void>();
+    const releaseEnvelope = Promise.withResolvers<void>();
+    const lookupEntered = Promise.withResolvers<void>();
+    const releaseLookup = Promise.withResolvers<void>();
+    const completion = Promise.withResolvers<TurnCompletion>();
+    let calls = 0;
+    const replacementStarted = Promise.withResolvers<void>();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(async () => {
+          const messageId = `assistant-${++calls}`;
+          if (calls === 1) {
+            envelopeEntered.resolve();
+            await releaseEnvelope.promise;
+          }
+          if (calls === 2) replacementStarted.resolve();
+          return Ok({
+            messageId,
+            completion:
+              calls === 1 ? completion.promise : new Promise<TurnCompletion>(() => undefined),
+          });
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    let edit: Promise<unknown> | undefined;
+    const original = h.session.sendMessage("original", sendOptions);
+    try {
+      await envelopeEntered.promise;
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const userId = history.data.find((message) => message.role === "user")!.id;
+      const lookup = internal(h.session).getEditTruncateTargetId.bind(h.session);
+      spyOn(internal(h.session), "getEditTruncateTargetId").mockImplementation(async (id) => {
+        lookupEntered.resolve();
+        await releaseLookup.promise;
+        return lookup(id);
+      });
+      edit = h.session.sendMessage("edited", { ...sendOptions, editMessageId: userId });
+      await lookupEntered.promise;
+      completion.resolve({ status: "completed", streamEnd: end() });
+      releaseEnvelope.resolve();
+      await original;
+      await policyPromise(consumer);
+      expect(h.events.filter((event) => event.type === "stream-end")).toHaveLength(0);
+      expect(h.session.isBusy()).toBe(true);
+      releaseLookup.resolve();
+      await edit;
+      await replacementStarted.promise;
+      expect(calls).toBe(2);
+    } finally {
+      releaseEnvelope.resolve();
+      releaseLookup.resolve();
+      await original;
+      await edit;
+      h.session.dispose();
+      await h.cleanup();
+    }
+  });
+  test("provider-tool-end abort dispatches the queued turn only after delivered completion", async () => {
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const emitter = new EventEmitter();
+    const nextStarted = Promise.withResolvers<void>();
+    let calls = 0;
+    const stopStream = mock(() => Promise.resolve(Ok(undefined)));
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        stopStream,
+        streamMessage: mock(() => {
+          const messageId = `assistant-${++calls}`;
+          start(emitter, messageId);
+          if (calls === 2) nextStarted.resolve();
+          return Promise.resolve(
+            Ok({
+              messageId,
+              completion:
+                calls === 1 ? completion.promise : new Promise<TurnCompletion>(() => undefined),
+            })
+          );
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    try {
+      await h.session.sendMessage("hello", sendOptions);
+      const firstPolicy = policyPromise(consumer);
+      h.session.queueMessage("queued follow-up", sendOptions);
+      emitter.emit("tool-call-end", {
+        type: "tool-call-end",
+        workspaceId,
+        messageId: "assistant-1",
+        toolCallId: "search-1",
+        toolName: "web_search",
+        providerExecuted: true,
+        result: { success: true },
+        timestamp: Date.now(),
+      });
+      expect(stopStream).toHaveBeenCalledWith(workspaceId, { soft: true, abortReason: "system" });
+      const payload = { ...abort(), abortReason: "system" as const };
+      emitter.emit("stream-abort", payload);
+      expect(calls).toBe(1);
+      expect(h.session.hasQueuedMessages()).toBe(true);
+      completion.resolve({ status: "aborted", abortReason: "system", streamAbort: payload });
+      await firstPolicy;
+      await nextStarted.promise;
+      expect(calls).toBe(2);
+      expect(h.session.hasQueuedMessages()).toBe(false);
+      expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
+      expect(h.session.isBusy()).toBe(true);
+    } finally {
+      h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  test("a duplicate compaction terminal cannot create a second pending decision", async () => {
+    const emitter = new EventEmitter();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          start(emitter);
+          emitter.emit("stream-end", end());
+          return Promise.resolve(
+            Ok({
+              messageId: "assistant-1",
+              completion: Promise.resolve<TurnCompletion>({
+                status: "completed",
+                streamEnd: end(),
+              }),
+            })
+          );
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    let decision: Promise<boolean> | undefined;
+    emitter.once("stream-end", () => {
+      decision = h.session.waitForPendingCompactionCompletionDecision("assistant-1");
+    });
+    try {
+      await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("prior", "user", "context")
+      );
+      await h.session.sendMessage(
+        "compact",
+        {
+          model,
+          agentId: "compact",
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: {},
+          },
+        },
+        { synthetic: true }
+      );
+      await policyPromise(consumer);
+      expect(await decision).toBe(false);
+      emitter.emit("stream-end", end());
+      expect(await h.session.waitForPendingCompactionCompletionDecision("assistant-1")).toBe(false);
+    } finally {
+      h.session.dispose();
+      await h.cleanup();
+    }
+  });
+});

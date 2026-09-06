@@ -1,3 +1,4 @@
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import type { CompactionHandler } from "./compactionHandler";
 import assert from "@/common/utils/assert";
 import type { ContinuousPrefixSwap } from "./continuousCompactionJournal";
@@ -340,7 +341,7 @@ describe("AgentSession continuous compaction wiring", () => {
     );
     Reflect.set(h.session, "activeCompactionRequest", { id: "legacy-request", modelString: model });
     const completion = h.session.waitForPendingCompactionCompletionDecision("legacy-summary");
-    h.aiEmitter.emit("stream-end", {
+    void runSessionTerminalPolicy(h.session, h.aiEmitter, {
       type: "stream-end",
       workspaceId,
       messageId: "legacy-summary",
@@ -449,7 +450,7 @@ describe("AgentSession continuous compaction wiring", () => {
   }
 
   function endStream(h: AgentSessionHarness) {
-    h.aiEmitter.emit("stream-end", {
+    void runSessionTerminalPolicy(h.session, h.aiEmitter, {
       type: "stream-end",
       workspaceId,
       messageId: "live-assistant",
@@ -526,7 +527,7 @@ describe("AgentSession continuous compaction wiring", () => {
     const stop = spyOn(h.aiService, "stopStream").mockImplementation((_id, options) => {
       expect(options?.abortReason).toBe("system");
       streaming = false;
-      h.aiEmitter.emit("stream-abort", {
+      void runSessionTerminalPolicy(h.session, h.aiEmitter, {
         type: "stream-abort",
         workspaceId,
         messageId: "live-assistant",
@@ -631,7 +632,7 @@ describe("AgentSession continuous compaction wiring", () => {
           workspaceId,
           createMuxMessage("live-assistant", "assistant", "Committed partial")
         );
-        h.aiEmitter.emit("stream-abort", {
+        void runSessionTerminalPolicy(h.session, h.aiEmitter, {
           type: "stream-abort",
           workspaceId,
           messageId: "live-assistant",
@@ -737,7 +738,7 @@ describe("AgentSession continuous compaction wiring", () => {
           createMuxMessage("live-assistant", "assistant", "Committed partial")
         );
         expect(result.success).toBe(true);
-        h.aiEmitter.emit("stream-abort", {
+        void runSessionTerminalPolicy(h.session, h.aiEmitter, {
           type: "stream-abort",
           workspaceId,
           messageId: "live-assistant",
@@ -842,7 +843,7 @@ describe("AgentSession continuous compaction wiring", () => {
         return Promise.resolve(Ok(createStartedTurnHandle()));
       });
       spyOn(h.aiService, "stopStream").mockImplementation(() => {
-        h.aiEmitter.emit("stream-abort", {
+        void runSessionTerminalPolicy(h.session, h.aiEmitter, {
           type: "stream-abort",
           workspaceId,
           messageId: "live-assistant",
@@ -875,7 +876,7 @@ describe("AgentSession continuous compaction wiring", () => {
       return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     spyOn(h.aiService, "stopStream").mockImplementation((_id, options) => {
-      h.aiEmitter.emit("stream-abort", {
+      void runSessionTerminalPolicy(h.session, h.aiEmitter, {
         type: "stream-abort",
         workspaceId,
         messageId: "live-assistant",
@@ -903,7 +904,7 @@ describe("AgentSession continuous compaction wiring", () => {
       return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     spyOn(h.aiService, "stopStream").mockImplementation((_id, options) => {
-      h.aiEmitter.emit("stream-abort", {
+      void runSessionTerminalPolicy(h.session, h.aiEmitter, {
         type: "stream-abort",
         workspaceId,
         messageId: "live-assistant",
