@@ -77,10 +77,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
 
 /**
- * One-time best-effort migration: when backend preferences are missing or hidden-model
- * preferences remain uninitialized, persist explicit localStorage values.
- * Called once on startup after backend config is fetched.
- *
+ * Preserve legacy local model choices across port/origin changes.
  * Exported for focused migration tests.
  */
 export async function migrateLocalModelPrefsToBackend(
@@ -127,7 +124,9 @@ export async function migrateLocalModelPrefsToBackend(
   }
 
   if (Object.keys(patch).length > 0) {
-    await api.config.updateModelPreferences(patch);
+    await api.config.updateModelPreferences(patch).catch(() => {
+      // A failed migration write must not block unrelated startup hydration.
+    });
   }
   return { ...cfg, ...patch };
 }
