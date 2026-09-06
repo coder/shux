@@ -6,6 +6,7 @@ import { isMac } from "@/browser/utils/ui/keybinds";
 import { REMOTE_CONNECTION_RETURN_ACCELERATOR } from "@/common/constants/remoteConnection";
 import {
   getRemoteConnectionServerUrl,
+  parseRemoteConnectionUrl,
   type RemoteConnectionState,
 } from "@/common/types/remoteConnection";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -73,6 +74,14 @@ export function RemoteConnectionSection() {
     isMac() ? "Cmd" : "Ctrl"
   );
 
+  // Keep HTTP available for encrypted tunnels without assuming the tunnel makes a secure browser context.
+  let showHttpWarning = false;
+  try {
+    showHttpWarning = parseRemoteConnectionUrl(url).protocol === "http:";
+  } catch {
+    // Incomplete addresses use the existing validation when the user connects.
+  }
+
   async function handleConnect(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!bridge || !canConnect) return;
@@ -132,7 +141,11 @@ export function RemoteConnectionSection() {
             autoCapitalize="none"
             spellCheck={false}
             inputMode="url"
-            aria-describedby="remote-connection-help"
+            aria-describedby={
+              showHttpWarning
+                ? "remote-connection-help remote-connection-http-warning"
+                : "remote-connection-help"
+            }
             disabled={isConnecting || disconnecting || connection?.status === "connected"}
           />
           <p id="remote-connection-help" className="text-muted text-xs">
@@ -141,6 +154,23 @@ export function RemoteConnectionSection() {
             automatically.
           </p>
         </div>
+        {showHttpWarning && (
+          <div
+            id="remote-connection-http-warning"
+            role="note"
+            aria-label="HTTP connection warning"
+            className="bg-warning/10 border-warning/30 text-warning space-y-2 rounded-md border px-3 py-2 text-xs"
+          >
+            <p>
+              HTTP does not encrypt your authentication token or data. Use HTTPS or a trusted
+              encrypted tunnel, such as Tailscale.
+            </p>
+            <p>
+              Voice input and other secure-context features require HTTPS for remote addresses, even
+              over Tailscale. Browsers treat localhost and loopback addresses as exceptions.
+            </p>
+          </div>
+        )}
         <div className="flex flex-wrap items-center gap-2">
           <Button type="submit" size="sm" disabled={!canConnect || !url.trim()}>
             {isConnecting ? "Connecting…" : "Connect"}

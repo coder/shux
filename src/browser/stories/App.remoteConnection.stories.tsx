@@ -174,6 +174,57 @@ export const Phone: AppStory = {
   },
 };
 
+async function exerciseHttpWarning(canvasElement: HTMLElement) {
+  const section = await openRemoteSettings(canvasElement);
+  const input = section.getByRole("textbox", { name: "Server URL" });
+  await expect(section.queryByRole("note")).toBeNull();
+
+  // The warning follows the entered protocol, not saved preferences or a connection attempt.
+  for (const serverUrl of ["http://100.64.0.10:3000", "http://localhost:3000"]) {
+    await userEvent.clear(input);
+    await userEvent.type(input, serverUrl);
+    await expect(section.getByRole("note")).toBeVisible();
+    await expect(section.getByRole("button", { name: "Connect" })).toBeEnabled();
+    await expect(remote.bridge.connect).not.toHaveBeenCalled();
+  }
+  for (const serverUrl of [SERVER_URL, "not a URL"]) {
+    await userEvent.clear(input);
+    await userEvent.type(input, serverUrl);
+    await expect(section.queryByRole("note")).toBeNull();
+  }
+
+  const httpUrl = "http://100.64.0.10:3000/?token=transient-http-secret";
+  await userEvent.clear(input);
+  await userEvent.type(input, httpUrl);
+  await expect(section.getByRole("note")).not.toHaveTextContent("transient-http-secret");
+  await userEvent.keyboard("{Enter}");
+  await waitFor(() => expect(remote.bridge.connect).toHaveBeenCalledWith(httpUrl));
+  await expect(readPersistedState(REMOTE_CONNECTION_URL_KEY, "")).toBe("http://100.64.0.10:3000");
+  await userEvent.click(section.getByRole("button", { name: "Disconnect" }));
+  await expect(section.getByRole("note")).toBeVisible();
+
+  if (window.innerWidth < 768) {
+    const region = within(canvasElement).getByRole("region", { name: "Remote connection" });
+    await expect(region.scrollWidth).toBeLessThanOrEqual(region.clientWidth);
+    await expect(section.getByRole("note").getBoundingClientRect().right).toBeLessThanOrEqual(
+      window.innerWidth
+    );
+  }
+}
+
+export const HttpWarning: AppStory = {
+  ...Desktop,
+  play: async ({ canvasElement }) => exerciseHttpWarning(canvasElement),
+};
+
+export const HttpWarningPhone: AppStory = {
+  ...Phone,
+  play: async ({ canvasElement, parameters }) => {
+    await expect(parameters.pixel).toMatchObject({ matrix: { viewports: ["phone"] } });
+    await exerciseHttpWarning(canvasElement);
+  },
+};
+
 export const NewerStateWins: AppStory = {
   render: () => <AppWithMocks setup={setupRemoteSettings} />,
   play: async ({ canvasElement }) => {
