@@ -1853,19 +1853,16 @@ export class StreamManager {
       return streamInfo.cancelPromise;
     }
     streamInfo.cancelPromise = (async () => {
+      streamInfo.state = StreamState.STOPPING;
       try {
-        streamInfo.state = StreamState.STOPPING;
-        // Flush any pending partial write immediately (preserves work on interruption)
+        // A failed best-effort flush must not prevent the provider from being stopped.
         await this.flushPartialWrite(workspaceId, streamInfo);
-
-        streamInfo.abortController.abort();
-
-        // Unlike checkSoftCancelStream, await cleanup (blocking)
-        await this.cleanupAbortedStream(workspaceId, streamInfo, abortReason, abandonPartial);
       } catch (error) {
-        log.error("Error during stream cancellation:", error);
-        // Force cleanup even if cancellation fails
-        this.workspaceStreams.delete(workspaceId);
+        log.error("Failed to flush partial before cancellation", { error });
+      } finally {
+        streamInfo.abortController.abort();
+        // Unlike checkSoftCancelStream, await cleanup (blocking).
+        await this.cleanupAbortedStream(workspaceId, streamInfo, abortReason, abandonPartial);
       }
     })();
     return streamInfo.cancelPromise;
@@ -1883,7 +1880,9 @@ export class StreamManager {
 
       // Flush any pending partial write immediately (preserves work on interruption)
       await this.flushPartialWrite(workspaceId, streamInfo);
-
+    } catch (error) {
+      log.error("Failed to flush partial before soft cancellation", { error });
+    } finally {
       streamInfo.abortController.abort();
 
       // Return back to the stream loop so we can wait for it to finish before
@@ -1899,10 +1898,6 @@ export class StreamManager {
         abortReason,
         abandonPartial
       );
-    } catch (error) {
-      log.error("Error during stream cancellation:", error);
-      // Force cleanup even if cancellation fails
-      this.workspaceStreams.delete(workspaceId);
     }
   }
 
@@ -1915,7 +1910,13 @@ export class StreamManager {
     // CRITICAL: Wait for processing to fully complete before cleanup
     // This prevents race conditions where the old stream is still running
     // while a new stream starts (e.g., old stream writing to partial.json)
-    await streamInfo.processingPromise;
+    try {
+      await streamInfo.processingPromise;
+    } catch (error) {
+      // The provider has exited even when teardown failed. Cancellation still owns
+      // an aborted terminal unless the loop already published another outcome.
+      log.error("Stream processing failed during cancellation", { error });
+    }
 
     // The cancel lost the race: the loop had already left the fullStream and
     // finished as completed/failed (terminalCompletion set, stream-end/error
@@ -1935,7 +1936,6 @@ export class StreamManager {
     const usage = hasTokenUsage(streamInfo.cumulativeUsage)
       ? streamInfo.cumulativeUsage
       : undefined;
-    await this.backfillReasoningTokensFromParts(streamInfo, usage);
 
     // For context window display, use last step's usage (inputTokens = current context size)
     const contextUsage = streamInfo.lastStepUsage;
@@ -1947,78 +1947,6 @@ export class StreamManager {
       streamInfo.initialMetadata?.costsIncluded
     );
 
-    // Record session usage for aborted streams (mirrors stream-end path)
-    // This ensures tokens consumed before abort are tracked for cost display
-    await this.recordSessionUsage(
-      workspaceId,
-      streamInfo.model,
-      usage,
-      providerMetadata,
-      "Failed to record session usage on abort",
-      "error",
-      streamInfo
-    );
-
-    // Stamp the aborted turn's usage onto the partial message BEFORE emitting
-    // stream-abort (whose handler commits the partial to chat.jsonl). Analytics
-    // prices history rows from metadata.usage, so without this every
-    // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
-    // would ingest as $0 even though the provider billed all completed steps.
-    if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
-      try {
-        await this.awaitPendingPartialWrite(streamInfo);
-        const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
-          metadata: {
-            ...(usage !== undefined ? { usage: cloneUsage(usage) } : {}),
-            ...(providerMetadata !== undefined ? { providerMetadata } : {}),
-            ...(contextUsage !== undefined ? { contextUsage } : {}),
-            ...(contextProviderMetadata !== undefined ? { contextProviderMetadata } : {}),
-            duration,
-            ...(streamInfo.toolModelUsages.length > 0
-              ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
-              : {}),
-          },
-        });
-        await this.historyService.writePartial(workspaceId as string, partialMessage);
-
-        // Tool-only aborts (Esc while a tool is still running): commitPartial
-        // refuses to commit partials whose only parts are input-available tool
-        // calls, so the usage stamped above would die with the deleted
-        // partial. Route that spend through the headless-usage sidecar
-        // instead. Same predicate commitPartial applies, so exactly one of
-        // {chat row, sidecar row} carries this turn's usage.
-        if (!hasCommitWorthyParts(partialMessage.parts)) {
-          await this.recordDroppedPartialUsageInSidecar(
-            workspaceId,
-            streamInfo,
-            usage,
-            providerMetadata,
-            "aborted_stream"
-          );
-        }
-      } catch (error) {
-        log.error("Failed to persist aborted-stream usage on partial message", { error });
-      }
-    } else if (abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
-      // Abandoned aborts (edit/discard of the streaming turn): the partial is
-      // deliberately dropped and its content never reaches chat.jsonl, but
-      // the provider still billed every completed step. The sidecar is the
-      // only route to the events table for this spend.
-      try {
-        await this.recordDroppedPartialUsageInSidecar(
-          workspaceId,
-          streamInfo,
-          usage,
-          providerMetadata,
-          "aborted_stream"
-        );
-      } catch (error) {
-        log.error("Failed to record abandoned-abort usage in headless sidecar", { error });
-      }
-    }
-
-    // Emit abort asynchronously as before; completion settles only after the facade's
-    // partial cleanup and external stream-abort emission have finished.
     const streamAbort: StreamAbortEvent = {
       type: "stream-abort",
       workspaceId,
@@ -2028,24 +1956,109 @@ export class StreamManager {
       abandonPartial,
       acpPromptId: streamInfo.initialMetadata?.acpPromptId,
     };
-    const abortDelivery = Promise.resolve(this.eventSink(streamAbort));
+    try {
+      try {
+        await this.backfillReasoningTokensFromParts(streamInfo, usage);
+      } catch (error) {
+        // Estimation is optional: preserve provider usage and the user's abort reason.
+        log.error("Failed to estimate reasoning usage on abort", { error });
+      }
 
-    // Clean up immediately
-    this.workspaceStreams.delete(workspaceId);
-    void abortDelivery
-      .catch((error) => {
-        // Contain sink rejections: .finally alone would re-propagate them as
-        // an unhandled rejection after completion settles.
-        log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
-      })
-      .finally(() => {
-        streamInfo.completionController?.settle({
-          status: "aborted",
-          abortReason,
-          streamAbort,
-          systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
+      // Record session usage for aborted streams (mirrors stream-end path)
+      // This ensures tokens consumed before abort are tracked for cost display
+      await this.recordSessionUsage(
+        workspaceId,
+        streamInfo.model,
+        usage,
+        providerMetadata,
+        "Failed to record session usage on abort",
+        "error",
+        streamInfo
+      );
+
+      // Stamp the aborted turn's usage onto the partial message BEFORE emitting
+      // stream-abort (whose handler commits the partial to chat.jsonl). Analytics
+      // prices history rows from metadata.usage, so without this every
+      // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
+      // would ingest as $0 even though the provider billed all completed steps.
+      if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+        try {
+          await this.awaitPendingPartialWrite(streamInfo);
+          const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
+            metadata: {
+              ...(usage !== undefined ? { usage: cloneUsage(usage) } : {}),
+              ...(providerMetadata !== undefined ? { providerMetadata } : {}),
+              ...(contextUsage !== undefined ? { contextUsage } : {}),
+              ...(contextProviderMetadata !== undefined ? { contextProviderMetadata } : {}),
+              duration,
+              ...(streamInfo.toolModelUsages.length > 0
+                ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
+                : {}),
+            },
+          });
+          await this.historyService.writePartial(workspaceId as string, partialMessage);
+
+          // Tool-only aborts (Esc while a tool is still running): commitPartial
+          // refuses to commit partials whose only parts are input-available tool
+          // calls, so the usage stamped above would die with the deleted
+          // partial. Route that spend through the headless-usage sidecar
+          // instead. Same predicate commitPartial applies, so exactly one of
+          // {chat row, sidecar row} carries this turn's usage.
+          if (!hasCommitWorthyParts(partialMessage.parts)) {
+            await this.recordDroppedPartialUsageInSidecar(
+              workspaceId,
+              streamInfo,
+              usage,
+              providerMetadata,
+              "aborted_stream"
+            );
+          }
+        } catch (error) {
+          log.error("Failed to persist aborted-stream usage on partial message", { error });
+        }
+      } else if (abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+        // Abandoned aborts (edit/discard of the streaming turn): the partial is
+        // deliberately dropped and its content never reaches chat.jsonl, but
+        // the provider still billed every completed step. The sidecar is the
+        // only route to the events table for this spend.
+        try {
+          await this.recordDroppedPartialUsageInSidecar(
+            workspaceId,
+            streamInfo,
+            usage,
+            providerMetadata,
+            "aborted_stream"
+          );
+        } catch (error) {
+          log.error("Failed to record abandoned-abort usage in headless sidecar", { error });
+        }
+      }
+    } catch (error) {
+      log.error("Failed abort bookkeeping; delivering preserved terminal metadata", { error });
+    } finally {
+      // Emit abort asynchronously as before; completion settles only after the facade's
+      // partial cleanup and external stream-abort emission have finished.
+      const abortDelivery = (async () => this.eventSink(streamAbort))();
+
+      // Clean up immediately
+      if (this.workspaceStreams.get(workspaceId) === streamInfo) {
+        this.workspaceStreams.delete(workspaceId);
+      }
+      void abortDelivery
+        .catch((error) => {
+          // Contain sink rejections: .finally alone would re-propagate them as
+          // an unhandled rejection after completion settles.
+          log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
+        })
+        .finally(() => {
+          streamInfo.completionController?.settle({
+            status: "aborted",
+            abortReason,
+            streamAbort,
+            systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
+          });
         });
-      });
+    }
   }
 
   /**

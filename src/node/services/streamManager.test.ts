@@ -22,6 +22,7 @@ import {
   StreamManager,
   type ModelFallbackPrepareOptions,
   type TurnEngineEvent,
+  type TurnCompletion,
   type TurnExecutionOptions,
 } from "./streamManager";
 import type {
@@ -49,6 +50,7 @@ import { closeScopeBounded } from "./di/appRuntime";
 import { Scope } from "effect";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { countTokens } from "@/node/utils/main/tokenizer";
+import * as tokenizer from "@/node/utils/main/tokenizer";
 import { shouldRunIntegrationTests, validateApiKeys } from "../../../tests/testUtils";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
@@ -56,6 +58,10 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import { shellQuote } from "@/common/utils/shell";
 import { onTurnEngineEvent } from "./streamManager.testHarness";
+import { AIService } from "./aiService";
+import { InitStateManager } from "./initStateManager";
+import { ProviderService } from "./providerService";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 
 function createTestLanguageModel(modelId = "cleanup-model"): LanguageModel {
   return {
@@ -77,10 +83,15 @@ if (shouldRunIntegrationTests()) {
 
 // Real HistoryService backed by a temp directory (created fresh per test)
 let historyService: HistoryService;
+let historyConfig: Awaited<ReturnType<typeof createTestHistoryService>>["config"];
 let historyCleanup: () => Promise<void>;
 
 beforeEach(async () => {
-  ({ historyService, cleanup: historyCleanup } = await createTestHistoryService());
+  ({
+    historyService,
+    config: historyConfig,
+    cleanup: historyCleanup,
+  } = await createTestHistoryService());
 });
 
 afterEach(async () => {
@@ -1347,6 +1358,217 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
     expect(streamManager.isStreaming(workspaceId)).toBe(false);
   });
+
+  test.each([
+    "tokenization",
+    "sink-sync",
+    "sink-async",
+    "preflush",
+    "processing",
+    "usage",
+    "soft-tokenization",
+    "soft-preflush",
+    "soft-usage",
+  ] as const)("abort completion survives %s failure", async (failure) => {
+    const workspaceId = `abort-failure-${failure}`;
+    const soft = failure.startsWith("soft-");
+    const failureKind = failure.replace("soft-", "");
+    const releaseBoundary = Promise.withResolvers<void>();
+    const providerEntered = Promise.withResolvers<void>();
+    const { streamManager, events } = createSupervisedStreamManagerForTests(
+      (signal) =>
+        (async function* () {
+          yield { type: "reasoning-delta", text: "unfinished reasoning" };
+          providerEntered.resolve();
+          if (soft) {
+            await releaseBoundary.promise;
+            yield { type: "text-end" };
+          }
+          if (!signal.aborted) {
+            await new Promise<void>((resolve) =>
+              signal.addEventListener("abort", () => resolve(), { once: true })
+            );
+          }
+        })(),
+      { supervised: false }
+    );
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+    await providerEntered.promise;
+    const streamInfo = getWorkspaceStreamsForTests(streamManager).get(workspaceId) as Record<
+      string,
+      unknown
+    >;
+    const usage = { inputTokens: 120, outputTokens: 30, totalTokens: 150 };
+    streamInfo.cumulativeUsage = usage;
+    const processingPromise = streamInfo.processingPromise as Promise<void>;
+    const abortController = streamInfo.abortController as AbortController;
+    const countTokensSpy = spyOn(tokenizer, "countTokens");
+    const flush = getPrivateMethodForTests<(...args: never[]) => Promise<void>>(
+      streamManager,
+      "flushPartialWrite"
+    );
+    let outcome: TurnCompletion | undefined;
+    const observed = handle.completion.then((value) => {
+      outcome = value;
+    });
+    try {
+      if (failureKind === "tokenization") {
+        countTokensSpy.mockRejectedValueOnce(new Error("tokenizer unavailable"));
+      } else if (failureKind === "sink-sync" || failureKind === "sink-async") {
+        streamManager.setEventSink((event) => {
+          events.push(event);
+          if (event.type !== "stream-abort") return;
+          if (failureKind === "sink-sync") throw new Error("synchronous sink failure");
+          return Promise.reject(new Error("asynchronous sink failure"));
+        });
+      } else if (failureKind === "preflush") {
+        Reflect.set(streamManager, "flushPartialWrite", () => {
+          Reflect.set(streamManager, "flushPartialWrite", flush);
+          return Promise.reject(new Error("pre-cancel flush failure"));
+        });
+      } else if (failureKind === "usage") {
+        Reflect.set(streamManager, "recordSessionUsage", () =>
+          Promise.reject(new Error("usage attribution unavailable"))
+        );
+      } else {
+        // A teardown failure after the provider exits rejects the processing join.
+        streamInfo.processingPromise = processingPromise.then(() => {
+          throw new Error("processing teardown failure");
+        });
+      }
+      expect(
+        (await streamManager.stopStream(workspaceId, { abortReason: "user", soft })).success
+      ).toBe(true);
+      if (soft) {
+        releaseBoundary.resolve();
+        await processingPromise;
+        await streamInfo.cancelPromise;
+      }
+      // stop intentionally does not await sink delivery; drain its settlement microtasks.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(outcome).toMatchObject({
+        status: "aborted",
+        abortReason: "user",
+        streamAbort: {
+          messageId: handle.messageId,
+          metadata: { usage },
+        },
+      });
+      await observed;
+      expect(abortController.signal.aborted).toBe(true);
+      expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
+      expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+    } finally {
+      countTokensSpy.mockRestore();
+      Reflect.set(streamManager, "flushPartialWrite", flush);
+      abortController.abort();
+      releaseBoundary.resolve();
+      await processingPromise;
+    }
+  });
+
+  test.each(["interrupt", "edit", "raw-listener", "partial-commit"] as const)(
+    "%s finishes and publishes its abort despite cancellation bookkeeping failure",
+    async (scenario) => {
+      const workspaceId = `session-abort-failure-${scenario}`;
+      const providerEntered = Promise.withResolvers<void>();
+      const replacementEntered = Promise.withResolvers<void>();
+      let providerCalls = 0;
+      const { streamManager } = createSupervisedStreamManagerForTests(
+        (signal) =>
+          (async function* () {
+            yield { type: "text-delta", text: "retained partial" };
+            yield { type: "reasoning-delta", text: "unfinished reasoning" };
+            if (++providerCalls === 1) providerEntered.resolve();
+            else replacementEntered.resolve();
+            if (!signal.aborted)
+              await new Promise<void>((resolve) =>
+                signal.addEventListener("abort", () => resolve(), { once: true })
+              );
+          })(),
+        { supervised: false }
+      );
+      const service = new AIService(
+        historyConfig,
+        historyService,
+        new InitStateManager(historyConfig),
+        new ProviderService(historyConfig),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        streamManager
+      );
+      let turns = 0;
+      spyOn(service, "streamMessage").mockImplementation(async () =>
+        Ok(await startSupervisedStreamForTests(streamManager, workspaceId, ++turns * 2 - 1))
+      );
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        config: historyConfig,
+        historyService,
+        aiService: service,
+        streamManager,
+        captureEvents: true,
+      });
+      const countTokensSpy = spyOn(tokenizer, "countTokens");
+      const commitSpy = spyOn(historyService, "commitPartial");
+      const throwFromRawListener = () => {
+        throw new Error("raw abort subscriber failure");
+      };
+      const options = { model: "openai:gpt-4.1-mini", agentId: "exec" };
+      try {
+        await h.session.sendMessage("original", options);
+        await providerEntered.promise;
+        const streamInfo = getWorkspaceStreamsForTests(streamManager).get(workspaceId) as Record<
+          string,
+          unknown
+        >;
+        streamInfo.cumulativeUsage = { inputTokens: 120, outputTokens: 30, totalTokens: 150 };
+        if (scenario === "raw-listener") service.on("stream-abort", throwFromRawListener);
+        else if (scenario === "partial-commit")
+          commitSpy.mockRejectedValueOnce(new Error("disk unavailable"));
+        else countTokensSpy.mockRejectedValueOnce(new Error("tokenizer unavailable"));
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!history.success) throw new Error(history.error);
+        const userId = history.data.find((message) => message.role === "user")!.id;
+        const result =
+          scenario === "edit"
+            ? await h.session.sendMessage("edited", { ...options, editMessageId: userId })
+            : await h.session.interruptStream();
+        expect(result.success).toBe(true);
+        expect(h.events.filter((event) => event.type === "stream-abort")).toMatchObject([
+          { abortReason: "user", messageId: `${workspaceId}-msg-1` },
+        ]);
+        if (scenario !== "edit") {
+          expect(h.session.isBusy()).toBe(false);
+          const partial = await historyService.readPartial(workspaceId);
+          if (scenario === "partial-commit") expect(partial).not.toBeNull();
+          else expect(partial).toBeNull();
+          if (scenario !== "partial-commit") {
+            const committed = await historyService.getHistoryFromLatestBoundary(workspaceId);
+            if (!committed.success) throw new Error(committed.error);
+            expect(
+              committed.data.find((message) => message.role === "assistant")?.metadata?.usage
+            ).toMatchObject({ inputTokens: 120, outputTokens: 30 });
+          }
+          expect((await h.session.sendMessage("next", options)).success).toBe(true);
+        }
+        await replacementEntered.promise;
+        expect(providerCalls).toBe(2);
+        expect(h.session.isBusy()).toBe(true);
+      } finally {
+        service.off("stream-abort", throwFromRawListener);
+        countTokensSpy.mockRestore();
+        commitSpy.mockRestore();
+        h.session.dispose();
+        await streamManager.stopStream(workspaceId, { abortReason: "system" });
+      }
+    }
+  );
 
   test("a wedged provider (never yields, ignores abort) cannot pin the bounded close", async () => {
     const workspaceId = "supervised-wedged-workspace";

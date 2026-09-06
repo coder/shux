@@ -6,7 +6,11 @@ import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import type { StreamEndEvent, StreamAbortEvent } from "@/common/types/stream";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
-import { AgentSession, type AgentSessionAIService } from "@/node/services/agentSession";
+import {
+  AgentSession,
+  type AgentSessionAIService,
+  type AgentSessionStreamManager,
+} from "@/node/services/agentSession";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -128,6 +132,7 @@ export interface AgentSessionHarnessOptions {
   config?: Config;
   historyService?: HistoryService;
   aiService?: AgentSessionAIService;
+  streamManager?: AgentSessionStreamManager;
   aiEmitter?: EventEmitter;
   aiServiceOverrides?: Partial<AgentSessionAIService>;
   initStateManager?: InitStateManager;
@@ -176,6 +181,7 @@ export async function createAgentSessionHarness(
     config,
     historyService,
     aiService,
+    streamManager: options.streamManager,
     mcpServerManager: options.mcpServerManager,
     initStateManager,
     workspaceGoalService: options.workspaceGoalService,
