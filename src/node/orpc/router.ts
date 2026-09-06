@@ -101,6 +101,7 @@ import {
   subscribeMetadata,
   subscribeOpenSettings,
   subscribePolicyChanges,
+  subscribeDesignExperiment,
   subscribeProviderConfig,
   subscribeSshPrompts,
   subscribeTerminalActivity,
@@ -2157,6 +2158,10 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => context.voiceService.transcribe(input.audioBase64)),
     },
     experiments: {
+      onDesignChange: t
+        .input(schemas.experiments.onDesignChange.input)
+        .output(schemas.experiments.onDesignChange.output)
+        .handler(({ context, signal }) => subscribeDesignExperiment(context, signal)),
       getOverrides: t
         .input(schemas.experiments.getOverrides.input)
         .output(schemas.experiments.getOverrides.output)
@@ -2167,7 +2172,7 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           await context.experimentsService.setOverride(input.experimentId, input.enabled);
           if (input.experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) {
-            await context.mcpConfigService.claudeDesign.invalidate();
+            await context.mcpConfigService.claudeDesign.getStatus();
           }
         }),
     },

@@ -148,13 +148,6 @@ export class ExperimentsService {
       // Startup is best effort; explicit mutations below must report failed persistence.
     }
     this.initialized = true;
-
-    for (const [experimentId, enabled] of this.overrides) {
-      this.telemetryService.setFeatureFlagVariant(
-        experimentId,
-        this.isExperimentSupported(experimentId) ? enabled : null
-      );
-    }
   }
 
   /**
@@ -197,8 +190,7 @@ export class ExperimentsService {
       await lease.assertStillOwned();
       await this.writeOverridesToDisk(next);
       // A successful acknowledgement means the change survives a restart.
-      this.overrides = next;
-      this.telemetryService.setFeatureFlagVariant(experimentId, value ?? null);
+      this.adoptOverrides(next);
     });
   }
 
@@ -242,8 +234,21 @@ export class ExperimentsService {
    * downgrade mirror and needs a rewrite (see initialize). */
   private async loadOverridesFromDisk(): Promise<boolean> {
     const { overrides, hasLegacyPtcMirror } = await readOverridesFile(this.overridesFilePath);
-    this.overrides = overrides;
+    this.adoptOverrides(overrides);
     return overrides.get(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) === true && !hasLegacyPtcMirror;
+  }
+
+  private adoptOverrides(next: Map<ExperimentId, boolean>): void {
+    // Disk reconciliation also changes telemetry, including removed overrides.
+    for (const id of new Set([...this.overrides.keys(), ...next.keys()])) {
+      if (this.overrides.get(id) !== next.get(id)) {
+        this.telemetryService.setFeatureFlagVariant(
+          id,
+          this.isExperimentSupported(id) ? (next.get(id) ?? null) : null
+        );
+      }
+    }
+    this.overrides = next;
   }
 
   private async writeOverridesToDisk(state = this.overrides): Promise<void> {

@@ -74,6 +74,32 @@ describe("ExperimentsService", () => {
     expect((await first.getOverrides())[EXPERIMENT_IDS.TIMELINE]).toBe(true);
   });
 
+  test("disk reconciliation updates and clears sibling telemetry variants", async () => {
+    const first = createTelemetryService();
+    const service = new ExperimentsService({
+      telemetryService: first.telemetryService,
+      xumHome: tempDir,
+    });
+    const sibling = new ExperimentsService({
+      telemetryService: createTelemetryService().telemetryService,
+      xumHome: tempDir,
+    });
+    await service.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, true);
+    await sibling.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, false);
+    await service.getOverrides();
+    expect(first.setFeatureFlagVariant).toHaveBeenLastCalledWith(
+      EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
+      false
+    );
+    await sibling.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, null);
+    await service.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    expect(first.setFeatureFlagVariant).toHaveBeenCalledWith(
+      EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
+      null
+    );
+    expect(service.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP)).toBe(false);
+  });
+
   test("experiments are disabled until the user sets an override", async () => {
     const { telemetryService } = createTelemetryService();
     const service = new ExperimentsService({ telemetryService, xumHome: tempDir });

@@ -3273,6 +3273,8 @@ export class MCPServerManager {
     const sortedInstances = [...instances.values()].sort((a, b) => a.name.localeCompare(b.name));
 
     for (const instance of sortedInstances) {
+      // A withdrawal can close an instance while the catalog is awaiting other servers.
+      if (instance.isClosed) continue;
       // Get project-level allowlist for this server
       const projectAllowlist = serverInfo[instance.name]?.toolAllowlist;
       // Apply tool allowlist filtering (project-level + workspace-level)

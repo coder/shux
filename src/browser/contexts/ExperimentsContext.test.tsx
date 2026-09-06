@@ -1,3 +1,5 @@
+import { wrapAsyncIterator } from "@orpc/shared";
+import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -135,11 +137,14 @@ describe("ExperimentsProvider", () => {
     "Design disable waits for backend acknowledgement (success=%s)",
     async (success) => {
       let backendEnabled = true;
+      const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+      updates.push({ enabled: true, revision: 0 });
       let finish!: () => void;
       let reject!: (error: Error) => void;
       const pending = new Promise<void>((resolve, fail) => {
         finish = () => {
           backendEnabled = false;
+          updates.push({ enabled: false, revision: 1 });
           resolve();
         };
         reject = fail;
@@ -147,6 +152,10 @@ describe("ExperimentsProvider", () => {
       const setOverride = mock(() => pending);
       currentClientMock = {
         experiments: {
+          onDesignChange: (_input, { signal } = {}) => {
+            signal?.addEventListener("abort", updates.end, { once: true });
+            return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
+          },
           getOverrides: () =>
             Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: backendEnabled }),
           setOverride,
@@ -179,10 +188,33 @@ describe("ExperimentsProvider", () => {
     }
   );
 
-  test("a completed Design toggle adopts a newer backend value", async () => {
-    const setOverride = mock(() => Promise.resolve());
-    const getOverrides = mock(() => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: true }));
-    currentClientMock = { experiments: { setOverride, getOverrides } };
+  test("ordered Design updates win over delayed reads, toggle acknowledgements, and old revisions", async () => {
+    const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+    updates.push({ enabled: true, revision: 1 });
+    let acknowledge!: () => void;
+    const setOverride = mock(
+      () =>
+        new Promise<void>((resolve) => {
+          acknowledge = resolve;
+        })
+    );
+    let finishRead!: () => void;
+    const getOverrides = mock(
+      () =>
+        new Promise<{ "claude-design-mcp": boolean }>((resolve) => {
+          finishRead = () => resolve({ "claude-design-mcp": false });
+        })
+    );
+    currentClientMock = {
+      experiments: {
+        setOverride,
+        getOverrides,
+        onDesignChange: (_input, { signal } = {}) => {
+          signal?.addEventListener("abort", updates.end, { once: true });
+          return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
+        },
+      },
+    };
     function Toggle() {
       const [enabled, setEnabled] = useExperiment(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
       return <button onClick={() => setEnabled(false)}>{String(enabled)}</button>;
@@ -195,12 +227,21 @@ describe("ExperimentsProvider", () => {
       </APIProvider>
     );
     await waitFor(() => expect(view.getByRole("button").textContent).toBe("true"));
+    fireEvent.click(view.getByRole("button"));
     await act(async () => {
-      fireEvent.click(view.getByRole("button"));
+      updates.push({ enabled: false, revision: 2 });
       await Promise.resolve();
     });
-    expect(getOverrides).toHaveBeenCalledTimes(2);
-    expect(view.getByRole("button").textContent).toBe("true");
+    await waitFor(() => expect(view.getByRole("button").textContent).toBe("false"));
+    await act(async () => {
+      updates.push({ enabled: true, revision: 3 });
+      updates.push({ enabled: false, revision: 2 });
+      finishRead();
+      acknowledge();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.getByRole("button").textContent).toBe("true"));
+    expect(getOverrides).toHaveBeenCalledTimes(1);
   });
 
   test("stale local Design enablement is neither uploaded nor displayed on reconnect", async () => {

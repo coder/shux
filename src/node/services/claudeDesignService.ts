@@ -21,6 +21,7 @@ import {
   type ClaudeDesignSource,
   type ClaudeDesignState,
   type ClaudeDesignStatus,
+  type ClaudeDesignExperimentSnapshot,
 } from "@/common/orpc/schemas/claudeDesign";
 import type { MCPHttpServerInfo, MCPTestResult } from "@/common/types/mcp";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -105,6 +106,9 @@ export class ClaudeDesignService {
   private state: ClaudeDesignState = "not_configured";
   private rejected = false;
   private readonly listeners = new Set<() => Promise<void>>();
+  private readonly experimentListeners = new Set<
+    (snapshot: ClaudeDesignExperimentSnapshot) => void
+  >();
   generation = 0;
 
   constructor(
@@ -122,7 +126,7 @@ export class ClaudeDesignService {
     return path.join(this.options.rootDir, "claude-design.json");
   }
   private enabled(): boolean {
-    return this.options.isEnabled() && this.diskEnabled;
+    return this.options.readEnabled ? this.diskEnabled : this.options.isEnabled();
   }
   private load(): Promise<void> {
     return this.lock.withLock("settings", () => this.loadLocked());
@@ -173,6 +177,14 @@ export class ClaudeDesignService {
       }
     };
   }
+  onExperimentChange(listener: (snapshot: ClaudeDesignExperimentSnapshot) => void): () => void {
+    const unsubscribe = this.onChange(() => Promise.resolve());
+    this.experimentListeners.add(listener);
+    return () => {
+      this.experimentListeners.delete(listener);
+      unsubscribe();
+    };
+  }
   async invalidate(): Promise<void> {
     this.generation++;
     this.controller.abort();
@@ -182,10 +194,15 @@ export class ClaudeDesignService {
     this.rejected = false;
     this.state = "not_configured";
     await Promise.all([...this.listeners].map((listener) => listener()));
+    // Renderers may hide controls only after every affected client has retired.
+    for (const listener of this.experimentListeners) listener(this.experimentSnapshot());
+  }
+  experimentSnapshot(): ClaudeDesignExperimentSnapshot {
+    return { enabled: this.enabled(), revision: this.generation };
   }
   async getStatus(): Promise<ClaudeDesignStatus> {
     // Listing status never opens a credential source, even when configured.
-    if (this.options.isEnabled()) await this.load();
+    await this.load();
     return {
       state: !this.enabled() || !this.settings.reuseEnabled ? "disabled" : this.state,
       settings: { ...this.settings },
@@ -195,7 +212,6 @@ export class ClaudeDesignService {
   }
   async configure(settings: Partial<ClaudeDesignSettings>): Promise<ClaudeDesignStatus> {
     await this.lock.withLock("settings", async () => {
-      if (!this.options.isEnabled()) throw new DesignError("disabled");
       await using lease = await acquireProcessFileLock({
         lockPath: `${this.filePath}.lock`,
         timeoutMs: CLAUDE_DESIGN_READ_TIMEOUT_MS,
@@ -222,7 +238,6 @@ export class ClaudeDesignService {
     return this.getStatus();
   }
   async serverInfo(): Promise<MCPHttpServerInfo | undefined> {
-    if (!this.options.isEnabled()) return undefined;
     await this.load();
     if (!this.enabled()) return undefined;
     return {
@@ -352,17 +367,22 @@ export class ClaudeDesignService {
       this.state = "connected";
   }
   async test(): Promise<MCPTestResult> {
-    if (!this.enabled()) return { success: false, error: "Claude Design: disabled" };
     await this.load();
+    if (!this.enabled()) return { success: false, error: "Claude Design: disabled" };
     await this.invalidate();
     const generation = this.generation;
     let client: Awaited<ReturnType<typeof createMCPClient>> | undefined;
+    // Cold tests need the same withdrawal subscription as managed clients.
+    const unsubscribe = this.onChange(async () => {
+      await client?.close().catch(() => undefined);
+    });
     try {
       client = await createMCPClient({
         transport: this.transport(undefined, AbortSignal.timeout(CLAUDE_DESIGN_TEST_TIMEOUT_MS)),
         prior: { kind: "legacy" },
       });
       const tools = Object.keys(await client.tools());
+      await this.load();
       this.guard(this.controller.signal);
       if (generation !== this.generation) throw new DesignError("disabled");
       this.state = "connected";
@@ -377,6 +397,7 @@ export class ClaudeDesignService {
       if (generation === this.generation && !this.rejected) this.state = state;
       return { success: false, error: `Claude Design: ${this.state}` };
     } finally {
+      unsubscribe();
       await client?.close().catch(() => undefined);
     }
   }

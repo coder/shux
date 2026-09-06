@@ -203,7 +203,6 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
   );
 
   const designTogglePending = useRef(false);
-  const designToggleRevision = useRef(0);
 
   const setExperiment = useCallback(
     (experimentId: ExperimentId, enabled: boolean) => {
@@ -216,26 +215,19 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         // when a write fails. Serialize toggles so late acknowledgements cannot undo one.
         if (designTogglePending.current) return;
         designTogglePending.current = true;
-        designToggleRevision.current++;
+        // The ordered backend stream owns Design state. An acknowledgement/read
+        // can already be stale when it reaches this renderer after a sibling toggle.
         persistOverride(experimentId, enabled)
-          .then(async (saved) => {
-            if (!saved || !apiState.api) return;
-            // Another renderer may have changed Design while our acknowledgement
-            // was in flight. Publish the current backend value, never the old intent.
-            const overrides = await apiState.api.experiments.getOverrides();
-            setBackendOverrides(overrides);
-            setExperimentState(experimentId, overrides[experimentId] ?? false);
-          })
-          .catch(() => undefined)
           .finally(() => {
             designTogglePending.current = false;
-          });
+          })
+          .catch(() => undefined);
         return;
       }
       publish();
       persistOverride(experimentId, enabled).catch(() => undefined);
     },
-    [persistOverride, apiState.api]
+    [persistOverride]
   );
 
   useEffect(() => {
@@ -249,7 +241,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
     }
 
     const api = apiState.api;
-    const designRevision = designToggleRevision.current;
+    const controller = new AbortController();
     let cancelled = false;
 
     const reconcile = async () => {
@@ -271,9 +263,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         if (!cancelled) {
           setBackendOverrides((previous) => ({
             ...overrides,
-            ...(designRevision !== designToggleRevision.current
-              ? { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP] }
-              : {}),
+            [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP],
           }));
           reconcileLegacyPtcExclusiveMirror(overrides);
         }
@@ -291,10 +281,32 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
       }
     };
 
-    void reconcile();
+    const followDesign = async () => {
+      let revision = -1;
+      try {
+        const stream = await api.experiments.onDesignChange(undefined, {
+          signal: controller.signal,
+        });
+        for await (const snapshot of stream) {
+          if (cancelled) break;
+          if (snapshot.revision < revision) continue;
+          revision = snapshot.revision;
+          setBackendOverrides((previous) => ({
+            ...previous,
+            [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: snapshot.enabled,
+          }));
+        }
+      } catch {
+        // Keep credential controls accessible on a lost connection; reconnect
+        // establishes a fresh subscription and revision domain.
+      }
+    };
+    reconcile().catch(() => undefined);
+    followDesign().catch(() => undefined);
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [apiState.api]);
 

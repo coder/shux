@@ -36,3 +36,9 @@ export type ClaudeDesignSource = z.infer<typeof ClaudeDesignSourceSchema>;
 export type ClaudeDesignSettings = z.infer<typeof ClaudeDesignSettingsSchema>;
 export type ClaudeDesignState = z.infer<typeof ClaudeDesignStateSchema>;
 export type ClaudeDesignStatus = z.infer<typeof ClaudeDesignStatusSchema>;
+
+export const ClaudeDesignExperimentSnapshotSchema = z.object({
+  enabled: z.boolean(),
+  revision: z.number(),
+});
+export type ClaudeDesignExperimentSnapshot = z.infer<typeof ClaudeDesignExperimentSnapshotSchema>;

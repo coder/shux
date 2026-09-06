@@ -1,4 +1,8 @@
-import { ClaudeDesignSettingsSchema, ClaudeDesignStatusSchema } from "./claudeDesign";
+import {
+  ClaudeDesignSettingsSchema,
+  ClaudeDesignStatusSchema,
+  ClaudeDesignExperimentSnapshotSchema,
+} from "./claudeDesign";
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
@@ -149,6 +153,10 @@ import { ThinkingLevelSchema } from "../../types/thinking";
 
 // Experiments
 export const experiments = {
+  onDesignChange: {
+    input: z.void(),
+    output: eventIterator(ClaudeDesignExperimentSnapshotSchema),
+  },
   getOverrides: {
     input: z.void(),
     output: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),

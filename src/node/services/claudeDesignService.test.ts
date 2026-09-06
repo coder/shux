@@ -681,48 +681,70 @@ test.each(["disconnect", "experiment"] as const)(
   }
 );
 
-test("sibling disconnect during cold tools/list prevents publication", async () => {
-  const fixture = protocolFixture();
-  let entered!: () => void;
-  let finish!: () => void;
-  const started = new Promise<void>((resolve) => {
-    entered = resolve;
-  });
-  const released = new Promise<void>((resolve) => {
-    finish = resolve;
-  });
-  const { service } = await setup({
-    fetch: fakeFetch(async (input, init) => {
-      if (typeof init?.body !== "string") throw new Error("Expected fixture request body");
-      const body: unknown = JSON.parse(init.body);
-      if (body && typeof body === "object" && Reflect.get(body, "method") === "tools/list") {
-        entered();
-        await released;
-      }
-      return fixture.network(input, init);
-    }),
-  });
-  const manager = new MCPServerManager(
-    new MCPConfigService(new Config(rootDir), { claudeDesign: service })
-  );
-  try {
-    const pending = manager.getToolsForWorkspace({
-      workspaceId: "cold-disconnect",
-      projectPath: rootDir,
-      workspacePath: rootDir,
-      runtime: new LocalRuntime(rootDir),
-      trusted: true,
+test.each(["manager", "test"] as const)(
+  "sibling disconnect during cold %s tools/list prevents publication",
+  async (consumer) => {
+    const fixture = protocolFixture();
+    let entered!: () => void;
+    let finish!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
     });
-    await started;
-    const sibling = new ClaudeDesignService({ rootDir, isEnabled: () => true });
-    await sibling.configure({ reuseEnabled: false });
-    finish();
-    expect(Object.keys((await pending).tools)).toHaveLength(0);
-    expect((await service.getStatus()).state).toBe("disabled");
-  } finally {
-    finish();
-    await manager.stopServers("cold-disconnect");
-    manager.dispose();
-    await fixture.server.stop(true);
+    const released = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const { service } = await setup({
+      fetch: fakeFetch(async (input, init) => {
+        if (typeof init?.body !== "string") throw new Error("Expected fixture request body");
+        const body: unknown = JSON.parse(init.body);
+        if (body && typeof body === "object" && Reflect.get(body, "method") === "tools/list") {
+          entered();
+          await released;
+        }
+        return fixture.network(input, init);
+      }),
+    });
+    const manager = new MCPServerManager(
+      new MCPConfigService(new Config(rootDir), { claudeDesign: service })
+    );
+    try {
+      const pending =
+        consumer === "test"
+          ? service.test()
+          : manager.getToolsForWorkspace({
+              workspaceId: "cold-disconnect",
+              projectPath: rootDir,
+              workspacePath: rootDir,
+              runtime: new LocalRuntime(rootDir),
+              trusted: true,
+            });
+      await started;
+      const sibling = new ClaudeDesignService({ rootDir, isEnabled: () => true });
+      await sibling.configure({ reuseEnabled: false });
+      finish();
+      const result = await pending;
+      if ("success" in result) expect(result.success).toBe(false);
+      else expect(Object.keys(result.tools)).toHaveLength(0);
+      expect((await service.getStatus()).state).toBe("disabled");
+    } finally {
+      finish();
+      await manager.stopServers("cold-disconnect");
+      manager.dispose();
+      await fixture.server.stop(true);
+    }
   }
+);
+
+test("a disabled process discovers sibling enablement without an existing listener", async () => {
+  const flags = path.join(rootDir, EXPERIMENT_OVERRIDES_FILE_NAME);
+  const readEnabled = () =>
+    readPersistedExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, { xumHome: rootDir });
+  const service = new ClaudeDesignService({ rootDir, isEnabled: () => false, readEnabled });
+  expect(await service.serverInfo()).toBeUndefined();
+  await fs.writeFile(
+    flags,
+    JSON.stringify({ version: 1, overrides: { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: true } })
+  );
+  expect(await service.serverInfo()).toMatchObject({ managed: "claude-design", disabled: true });
+  expect(service.experimentSnapshot().enabled).toBe(true);
 });

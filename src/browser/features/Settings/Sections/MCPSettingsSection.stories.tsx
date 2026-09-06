@@ -1,3 +1,4 @@
+import { wrapAsyncIterator } from "@orpc/shared";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import { CLAUDE_DESIGN_URL } from "@/common/constants/claudeDesign";
 import type { ClaudeDesignStatus } from "@/common/orpc/schemas/claudeDesign";
@@ -456,6 +457,16 @@ function setupDesignStory(enabled = true, reuseEnabled = false): APIClient {
     },
   };
   client.experiments = {
+    onDesignChange: () =>
+      Promise.resolve(
+        wrapAsyncIterator(
+          (async function* () {
+            await Promise.resolve();
+            yield { enabled, revision: 0 };
+          })(),
+          {}
+        )
+      ),
     getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled }),
     setOverride: () => Promise.resolve(),
   };
