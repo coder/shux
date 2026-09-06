@@ -207,6 +207,61 @@ describe("intuition tool", () => {
     }
   );
 
+  it.each(["chatCompletions", "responses"] as const)(
+    "uses pinned OpenAI %s options for non-Off reasoning",
+    async (wireFormat) => {
+      using f = await fixture(false, "high");
+      const calls: LanguageModelV3CallOptions[] = [];
+      f.createModel.mockImplementation(() =>
+        Promise.resolve({
+          model: reportingModel([], (options) => calls.push(options)),
+          optionsModelString: "openai:gpt-5.6-sol",
+          optionsProvidersConfig: null,
+          optionsMuxProviderOptions: { openai: { wireFormat } },
+          optionsRouteProvider: "openai",
+        })
+      );
+      const result = await execute(createIntuitionTool(f.config));
+      expect(result.kind).toBe("uncertain");
+      expect(calls.length).toBeGreaterThan(0);
+      for (const call of calls) {
+        const options = call.providerOptions?.openai;
+        expect(options?.reasoningEffort).toBe("high");
+        if (wireFormat === "chatCompletions") {
+          expect(options).not.toHaveProperty("reasoningSummary");
+          expect(options).not.toHaveProperty("include");
+          expect(options).not.toHaveProperty("truncation");
+        } else {
+          expect(options).toMatchObject({
+            reasoningSummary: "detailed",
+            include: ["reasoning.encrypted_content"],
+            truncation: "disabled",
+          });
+        }
+      }
+    }
+  );
+
+  it("uses the pinned gateway route for a canonical origin model", async () => {
+    using f = await fixture(false, "high");
+    const calls: LanguageModelV3CallOptions[] = [];
+    f.createModel.mockImplementation(() =>
+      Promise.resolve({
+        model: reportingModel([], (options) => calls.push(options)),
+        optionsModelString: "openai:gpt-5.6-sol",
+        optionsProvidersConfig: null,
+        optionsRouteProvider: "openrouter",
+      })
+    );
+    const result = await execute(createIntuitionTool(f.config));
+    expect(result.kind).toBe("uncertain");
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call.providerOptions?.openrouter).toMatchObject({ reasoning: { effort: "high" } });
+      expect(call.providerOptions?.openai).toBeUndefined();
+    }
+  });
+
   it.each([false, true])(
     "honors path-specific shell hooks for nested reads and verification-only reports (read denied path: %s)",
     async (readDeniedPath) => {

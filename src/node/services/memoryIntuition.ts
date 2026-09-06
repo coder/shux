@@ -363,18 +363,21 @@ export async function runMemoryIntuition(args: {
       stats.indexEntriesOmitted = stats.indexEntriesConsidered - selection.entries.length;
     }
     if (selection.entries.length === 0) return { kind: "no_report", stats };
-    const { model, optionsModelString, optionsProvidersConfig } = await untilAborted(
-      signal,
-      async () => {
-        const created = await args.createModel();
-        // The factory may finish after timeout/abort. Take ownership here, before
-        // the racing await, so even a late model releases its transport resources.
-        if (signal.aborted) runLanguageModelCleanup(created.model);
-        else ownedModel = created.model;
-        metadataModel = created.metadataModel;
-        return created;
-      }
-    );
+    const {
+      model,
+      optionsModelString,
+      optionsProvidersConfig,
+      optionsMuxProviderOptions,
+      optionsRouteProvider,
+    } = await untilAborted(signal, async () => {
+      const created = await args.createModel();
+      // The factory may finish after timeout/abort. Take ownership here, before
+      // the racing await, so even a late model releases its transport resources.
+      if (signal.aborted) runLanguageModelCleanup(created.model);
+      else ownedModel = created.model;
+      metadataModel = created.metadataModel;
+      return created;
+    });
     const body = await untilAborted(signal, args.resolveAgentBody);
     if (!body?.trim())
       return { kind: "error", message: "Intuition agent definition is missing", stats };
@@ -500,15 +503,16 @@ export async function runMemoryIntuition(args: {
         ),
         undefined,
         undefined,
-        undefined,
+        // Keep options aligned with the factory's wire format (Chat Completions vs Responses).
+        optionsMuxProviderOptions,
         undefined,
         undefined,
         optionsProvidersConfig,
-        // Transforming gateways need their own option namespace, not the
-        // canonical origin's. A custom provider shadowing a gateway is direct.
-        isCustomProviderConfig(optionsProvidersConfig?.[optionsModelString.split(":", 1)[0]])
-          ? undefined
-          : getExplicitGatewayPrefix(optionsModelString)
+        // Prefer the pinned route; legacy fixtures can still identify an explicit gateway.
+        optionsRouteProvider ??
+          (isCustomProviderConfig(optionsProvidersConfig?.[optionsModelString.split(":", 1)[0]])
+            ? undefined
+            : getExplicitGatewayPrefix(optionsModelString))
       ) as Parameters<typeof streamText>[0]["providerOptions"],
       prompt: `<cue>${cue}</cue>\nUntrusted memory index (JSON):\n${selection.evidenceJson}`,
       tools: {
