@@ -307,6 +307,7 @@ interface AiDefaultsControlsProps {
   reasoningModeValue: OpenAIReasoningMode;
   reasoningModeInherited?: boolean;
   modelCapabilitiesDeferred?: boolean;
+  applyMinimumThinkingLevel?: boolean;
   /** Forwarded to the picker; false hides the Pro toggle (e.g. Dream, whose requests never apply reasoningMode). */
   allowProMode?: boolean;
   effectiveModel: string | undefined;
@@ -359,6 +360,7 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
           <ThinkingSelectorControl
             modelString={props.effectiveModel}
             modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
+            applyMinimumThinkingLevel={props.applyMinimumThinkingLevel}
             thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
             onThinkingLevelChange={(level) => props.onThinkingChange(level)}
             reasoningMode={props.reasoningModeValue}
@@ -903,7 +905,8 @@ export function TasksSection() {
     // a base-chain model wins over the ambient default (otherwise an agent
     // inheriting GPT-5.6+pro from its base would hide the Pro toggle whenever
     // the ambient model isn't pro-capable).
-    const inheritedDefaults = resolveBaseChainDefaults(agent.id);
+    // Intuition resolves without ancestors, falling back to the parent turn's model.
+    const inheritedDefaults = agent.id === "intuition" ? {} : resolveBaseChainDefaults(agent.id);
     const effectiveModel =
       modelValue !== INHERIT
         ? modelValue
@@ -1036,6 +1039,8 @@ export function TasksSection() {
           thinkingValue={thinkingValue}
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
           allowProMode={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
+          // Intuition clamps to model capabilities, not the chat's minimum effort.
+          applyMinimumThinkingLevel={agent.id !== "intuition"}
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}

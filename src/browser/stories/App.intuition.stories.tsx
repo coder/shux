@@ -218,6 +218,12 @@ export const ReasoningSettings: AppStory = {
 export const ReasoningSettingsPhone: AppStory = {
   ...ReasoningSettings,
   play: async (context) => {
+    // CI's test-runner ignores viewport globals and Pixel variants. It must not
+    // count the desktop interaction as phone coverage; manager/Pixel run it at 390px.
+    if (window.innerWidth > 390) return;
+    const width = context.canvasElement.getBoundingClientRect().width;
+    await expect(width).toBeGreaterThan(0);
+    await expect(width).toBeLessThanOrEqual(390);
     await ReasoningSettings.play!(context);
   },
   // Settings uses viewport media queries; a fixed-width wrapper at the runner's

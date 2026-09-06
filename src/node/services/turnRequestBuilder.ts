@@ -1888,7 +1888,7 @@ export class TurnRequestBuilder {
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
     // Share creation-time provider/pricing snapshots for both headless tools.
-    const createToolModel = async (ms: string) => {
+    const createToolModel = async (ms: string, toolThinkingLevel?: ThinkingLevel) => {
       const toolModelString = ms.trim();
       assert(
         toolModelString.length > 0,
@@ -1907,15 +1907,28 @@ export class TurnRequestBuilder {
       // Let the factory pin provider-level defaults (especially the OpenAI wire
       // format) without inheriting any options from the parent chat.
       const toolMuxProviderOptions: MuxProviderOptions = {};
-      const toolModel = await this.dependencies.createModel(
-        toolModelString,
-        toolMuxProviderOptions,
-        {
-          workspaceId,
-          providersConfig: toolProvidersConfig,
-          agentInitiated: true,
-        }
-      );
+      const creationOptions = {
+        workspaceId,
+        providersConfig: toolProvidersConfig,
+        agentInitiated: true,
+      };
+      // Intuition's effort can select a different model variant, not just provider
+      // options. Preserve the same provider snapshot for resolution and creation.
+      const toolModel =
+        toolThinkingLevel === undefined
+          ? await this.dependencies
+              .createModel(toolModelString, toolMuxProviderOptions, creationOptions)
+              .then((result) =>
+                result.success
+                  ? Ok({ model: result.data, effectiveModelString: undefined })
+                  : result
+              )
+          : await this.dependencies.providerModelFactory.resolveAndCreateModel(
+              toolModelString,
+              toolThinkingLevel,
+              toolMuxProviderOptions,
+              creationOptions
+            );
       if (!toolModel.success) {
         throw new Error(`Failed to create tool model: ${getErrorMessage(toolModel.error)}`);
       }
@@ -1925,6 +1938,7 @@ export class TurnRequestBuilder {
       // options derived from the raw selection (instance type)
       // would diverge from the model actually created.
       const toolEffectiveModelString =
+        toolModel.data.effectiveModelString ??
         this.dependencies.providerModelFactory.resolveEffectiveModelString(
           toolModelString,
           undefined,
@@ -1971,7 +1985,7 @@ export class TurnRequestBuilder {
         return wire ? `${wire.origin}:${wire.modelId}` : toolModelString;
       })();
       return {
-        model: toolModel.data,
+        model: toolModel.data.model,
         optionsModelString: toolOptionsModelString,
         optionsProvidersConfig: toolOptionsProvidersConfig,
         optionsMuxProviderOptions: toolMuxProviderOptions,
@@ -2034,7 +2048,7 @@ export class TurnRequestBuilder {
               thinkingLevel: intuitionSettings.thinkingLevel,
               maxUsesPerTurn: MEMORY_INTUITION_MAX_USES_PER_TURN,
               usesThisTurn: 0,
-              createModel: createToolModel,
+              createModel: (ms) => createToolModel(ms, intuitionSettings.thinkingLevel),
               resolveAgentBody: () => Promise.resolve(intuitionDefinition?.body ?? null),
               abortSignal: combinedAbortSignal,
             },

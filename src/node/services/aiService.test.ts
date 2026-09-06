@@ -1842,6 +1842,65 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   );
 
+  it.each(["off", "high"] as const)(
+    "creates Intuition's effort-dependent model variant with %s reasoning from one provider snapshot",
+    async (thinkingLevel) => {
+      using xumHome = new DisposableTempDir("ai-intuition-model-variant");
+      const metadata = createLocalWorkspaceMetadata("intuition-variant", xumHome.path);
+      const experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHome.path),
+        xumHome: xumHome.path,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+      );
+      const harness = createHarness(xumHome.path, metadata, { experimentsService });
+      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+        harness.config,
+        new MemoryMetaService(xumHome.path)
+      );
+      const providersStore = new ProvidersConfigStore(harness.config.rootDir);
+      providersStore.saveProvidersConfig({ xai: { apiKey: "test-xai-key" } });
+      await harness.config.editConfig((cfg) => ({
+        ...cfg,
+        agentAiDefaults: { intuition: { modelString: "xai:grok-4-1-fast", thinkingLevel } },
+      }));
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId: metadata.id,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        experiments: { memory: true },
+      });
+      expect(result.success).toBe(true);
+      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
+      if (!runtime) throw new Error("Expected Intuition runtime");
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      const resolve = spyOn(factory, "resolveAndCreateModel").mockImplementation((...args) => {
+        // A concurrent config change must not replace the tool's creation-time snapshot.
+        providersStore.saveProvidersConfig({ xai: { enabled: false } });
+        return ProviderModelFactory.prototype.resolveAndCreateModel.apply(factory, args);
+      });
+      const created = await runtime.createModel(runtime.modelString);
+      expect(typeof created.model).not.toBe("string");
+      if (typeof created.model === "string") throw new Error("Expected model instance");
+      expect(created.model.modelId).toBe(
+        thinkingLevel === "off" ? "grok-4-1-fast-non-reasoning" : "grok-4-1-fast-reasoning"
+      );
+      expect(resolve).toHaveBeenCalledWith(
+        "xai:grok-4-1-fast",
+        thinkingLevel,
+        expect.anything(),
+        expect.objectContaining({
+          workspaceId: metadata.id,
+          agentInitiated: true,
+          providersConfig: { xai: { apiKey: "test-xai-key" } },
+        })
+      );
+      expect(created.optionsProvidersConfig?.xai?.isEnabled).toBe(true);
+    }
+  );
+
   for (const denied of ["memory", "intuition"]) {
     it(`strips intuition and its guidance when policy denies ${denied}`, async () => {
       using xumHome = new DisposableTempDir("ai-intuition-policy");
@@ -2709,9 +2768,17 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const runtime =
         toolName === "advisor" ? toolConfig.advisorRuntime : toolConfig.intuitionRuntime;
       if (!runtime) throw new Error(`Expected ${toolName} runtime`);
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      const resolveModel = spyOn(factory, "resolveAndCreateModel").mockImplementation(
+        ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
+      );
       const createModel = spyOn(harness.service, "createModel");
       await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
-      expect(createModel.mock.calls.at(-1)?.[2]).toMatchObject({
+      const creationOptions =
+        toolName === "advisor"
+          ? createModel.mock.calls.at(-1)?.[2]
+          : resolveModel.mock.calls.at(-1)?.[3];
+      expect(creationOptions).toMatchObject({
         agentInitiated: true,
         workspaceId,
       });
