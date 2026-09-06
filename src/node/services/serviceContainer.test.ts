@@ -1,4 +1,7 @@
 import * as path from "path";
+import { EventEmitter } from "events";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
+import type { AgentSession } from "./agentSession";
 import * as fs from "fs";
 import * as os from "os";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
@@ -716,110 +719,185 @@ describe("ServiceContainer", () => {
     expect(services.appFiberScope.state._tag).toBe("Closed");
   });
 
-  it("dispose() aborts and awaits an in-flight stream before desktopBridgeServer.stop()", async () => {
-    // The AppFiberScope occupant end to end: a real stream on the container's
-    // StreamManager (wired with the runtime's scope), its provider stubbed to
-    // flow one delta and then block until the stream's AbortSignal fires.
-    // dispose() must abort it as "system", let AIService commit the partial
-    // into chat.jsonl and delete partial.json, and only then stop the bridge.
-    services = new ServiceContainer(stores);
-    const workspaceId = "dispose-in-flight-stream-workspace";
-    const messageId = "dispose-in-flight-stream-message";
-    const steps: string[] = [];
-    Reflect.set(services.streamManager, "tokenTracker", {
-      setModel: () => Promise.resolve(undefined),
-      countTokens: () => Promise.resolve(0),
-    });
-    Reflect.set(
-      services.streamManager,
-      "createStreamResult",
-      (_request: unknown, abortController: AbortController) => ({
-        fullStream: (async function* () {
-          yield { type: "text-delta", text: "hello from a stream shutdown must not lose" };
-          await new Promise<void>((resolve) => {
-            if (abortController.signal.aborted) return resolve();
-            abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+  it.each([false, true])(
+    "dispose() joins engine and session policy before bridge teardown (session=%s)",
+    async (throughSession) => {
+      // The AppFiberScope occupant end to end: a real stream on the container's
+      // StreamManager (wired with the runtime's scope), its provider stubbed to
+      // flow one delta and then block until the stream's AbortSignal fires.
+      // dispose() must abort it as "system", let AIService commit the partial
+      // into chat.jsonl and delete partial.json, and only then stop the bridge.
+      services = new ServiceContainer(stores);
+      const workspaceId = "dispose-in-flight-stream-workspace";
+      const messageId = "dispose-in-flight-stream-message";
+      const steps: string[] = [];
+      Reflect.set(services.streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(undefined),
+        countTokens: () => Promise.resolve(0),
+      });
+      Reflect.set(
+        services.streamManager,
+        "createStreamResult",
+        (_request: unknown, abortController: AbortController) => ({
+          fullStream: (async function* () {
+            yield { type: "text-delta", text: "hello from a stream shutdown must not lose" };
+            await new Promise<void>((resolve) => {
+              if (abortController.signal.aborted) return resolve();
+              abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+          })(),
+          totalUsage: Promise.resolve(undefined),
+          usage: Promise.resolve(undefined),
+          providerMetadata: Promise.resolve(undefined),
+          steps: Promise.resolve([]),
+        })
+      );
+      Reflect.set(services.streamManager, "createTempDirForStream", () =>
+        Promise.resolve(path.join(tempDir, "stream-tempdir"))
+      );
+      Reflect.set(services.streamManager, "cleanupStreamTempDir", () => undefined);
+      services.aiService.on("stream-abort", (event: { abortReason?: string }) => {
+        steps.push(`stream-abort:${event.abortReason ?? "none"}`);
+      });
+      const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
+        steps.push("bridge-stop");
+        return Promise.resolve(undefined);
+      });
+
+      const historyService = services.runtime.get(History);
+      const partialWritten = Promise.withResolvers<void>();
+      const writePartial = historyService.writePartial.bind(historyService);
+      spyOn(historyService, "writePartial").mockImplementation(async (...args) => {
+        const result = await writePartial(...args);
+        partialWritten.resolve();
+        return result;
+      });
+      const startEngine = async () => {
+        const appendResult = await historyService.appendToHistory(workspaceId, {
+          id: messageId,
+          role: "assistant",
+          metadata: { historySequence: 1, partial: true },
+          parts: [],
+        });
+        expect(appendResult.success).toBe(true);
+        return services!.streamManager.startStream({
+          workspaceId,
+          messageId,
+          model: {
+            specificationVersion: "v3",
+            provider: "test",
+            modelId: "dispose-model",
+            supportedUrls: {},
+            doGenerate: () => Promise.reject(new Error("unused")),
+            doStream: () => Promise.reject(new Error("unused")),
+          },
+          messages: [{ role: "user", content: "hello" }],
+          modelString: "openai:gpt-4.1-mini",
+          historySequence: 1,
+          system: "system",
+          runtime: createRuntime({ type: "local", srcBaseDir: tempDir }),
+          providedRuntimeTempDir: "",
+        });
+      };
+      const policyEntered = Promise.withResolvers<void>();
+      const releasePolicy = Promise.withResolvers<void>();
+      const handleDelivered = Promise.withResolvers<Awaited<ReturnType<typeof startEngine>>>();
+      let session: AgentSession | undefined;
+      if (throughSession) {
+        const emitter = new EventEmitter();
+        for (const event of ["stream-start", "stream-abort", "stream-end", "stream-error"]) {
+          services.aiService.on(event, (payload: unknown) => emitter.emit(event, payload));
+        }
+        const h = await createAgentSessionHarness({
+          workspaceId,
+          historyService,
+          aiEmitter: emitter,
+          streamManager: services.streamManager,
+          effectRunner: services.runtime.get(EffectRunnerTag),
+          appFiberScope: services.appFiberScope,
+          aiServiceOverrides: {
+            streamMessage: async () => {
+              const result = await startEngine();
+              handleDelivered.resolve(result);
+              return result;
+            },
+          },
+        });
+        session = h.session;
+        services.workspaceService.registerSession(workspaceId, session);
+        // Hold only session policy. The actual engine still aborts, retires partial.json,
+        // and delivers its independent completion while the app guardian is closing.
+        const policy = session as unknown as {
+          recordGoalAccountingFromUsage(input: unknown): Promise<void>;
+        };
+        const record = policy.recordGoalAccountingFromUsage.bind(session);
+        spyOn(policy, "recordGoalAccountingFromUsage").mockImplementation(async (input) => {
+          policyEntered.resolve();
+          await releasePolicy.promise;
+          await record(input);
+        });
+        session.onChatEvent(({ message }) => {
+          if (message.type === "stream-abort") steps.push("renderer-abort");
+        });
+        expect(
+          (await session.sendMessage("hello", { model: "openai:gpt-4.1-mini", agentId: "exec" }))
+            .success
+        ).toBe(true);
+      } else {
+        handleDelivered.resolve(await startEngine());
+      }
+      const started = await handleDelivered.promise;
+      expect(started.success).toBe(true);
+      if (!started.success) throw new Error("expected the stream to start");
+      // Signal after real disk persistence, so shutdown starts with a partial worth committing.
+      await partialWritten.promise;
+      expect(services.streamManager.isStreaming(workspaceId)).toBe(true);
+
+      const disposing = services.dispose();
+      try {
+        if (throughSession) {
+          await policyEntered.promise;
+          expect(await started.data.completion).toMatchObject({
+            status: "aborted",
+            abortReason: "system",
           });
-        })(),
-        totalUsage: Promise.resolve(undefined),
-        usage: Promise.resolve(undefined),
-        providerMetadata: Promise.resolve(undefined),
-        steps: Promise.resolve([]),
-      })
-    );
-    Reflect.set(services.streamManager, "createTempDirForStream", () =>
-      Promise.resolve(path.join(tempDir, "stream-tempdir"))
-    );
-    Reflect.set(services.streamManager, "cleanupStreamTempDir", () => undefined);
-    services.aiService.on("stream-abort", (event: { abortReason?: string }) => {
-      steps.push(`stream-abort:${event.abortReason ?? "none"}`);
-    });
-    const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
-      steps.push("bridge-stop");
-      return Promise.resolve(undefined);
-    });
+          expect(bridgeStopSpy).not.toHaveBeenCalled();
+          expect(await historyService.readPartial(workspaceId)).toBeNull();
+        }
+      } finally {
+        releasePolicy.resolve();
+        await disposing;
+      }
 
-    const historyService = services.runtime.get(History);
-    const appendResult = await historyService.appendToHistory(workspaceId, {
-      id: messageId,
-      role: "assistant",
-      metadata: { historySequence: 1, partial: true },
-      parts: [],
-    });
-    expect(appendResult.success).toBe(true);
-    const started = await services.streamManager.startStream({
-      workspaceId,
-      messageId,
-      model: {
-        specificationVersion: "v3",
-        provider: "test",
-        modelId: "dispose-model",
-        supportedUrls: {},
-        doGenerate: () => Promise.reject(new Error("unused")),
-        doStream: () => Promise.reject(new Error("unused")),
-      },
-      messages: [{ role: "user", content: "hello" }],
-      modelString: "openai:gpt-4.1-mini",
-      historySequence: 1,
-      system: "system",
-      runtime: createRuntime({ type: "local", srcBaseDir: tempDir }),
-      providedRuntimeTempDir: "",
-    });
-    expect(started.success).toBe(true);
-    if (!started.success) throw new Error("expected the stream to start");
-    // Wait for the delta to reach partial.json so there is something to commit.
-    const deadline = Date.now() + 5_000;
-    while ((await historyService.readPartial(workspaceId)) === null) {
-      if (Date.now() > deadline) throw new Error("partial never written");
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
+      expect(steps).toEqual(
+        throughSession
+          ? ["stream-abort:system", "renderer-abort", "bridge-stop"]
+          : ["stream-abort:system", "bridge-stop"]
+      );
+      expect(await started.data.completion).toMatchObject({
+        status: "aborted",
+        abortReason: "system",
+      });
+      expect(services.streamManager.isStreaming(workspaceId)).toBe(false);
+      // Durable outcome at the moment the bridge stopped: partial.json gone, the
+      // interrupted assistant message (still flagged partial, as every
+      // interrupted turn is) committed to chat.jsonl with its streamed text —
+      // instead of an empty placeholder row plus an orphan partial.json that only
+      // the next load would reconcile.
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (!history.success) throw new Error(history.error);
+      const committed = history.data.find((message) => message.id === messageId);
+      expect(
+        committed?.parts.some(
+          (part) =>
+            part.type === "text" && part.text === "hello from a stream shutdown must not lose"
+        )
+      ).toBe(true);
     }
-    expect(services.streamManager.isStreaming(workspaceId)).toBe(true);
-
-    await services.dispose();
-
-    expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
-    expect(steps).toEqual(["stream-abort:system", "bridge-stop"]);
-    expect(await started.data.completion).toMatchObject({
-      status: "aborted",
-      abortReason: "system",
-    });
-    expect(services.streamManager.isStreaming(workspaceId)).toBe(false);
-    // Durable outcome at the moment the bridge stopped: partial.json gone, the
-    // interrupted assistant message (still flagged partial, as every
-    // interrupted turn is) committed to chat.jsonl with its streamed text —
-    // instead of an empty placeholder row plus an orphan partial.json that only
-    // the next load would reconcile.
-    expect(await historyService.readPartial(workspaceId)).toBeNull();
-    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-    expect(history.success).toBe(true);
-    if (!history.success) throw new Error(history.error);
-    const committed = history.data.find((message) => message.id === messageId);
-    expect(
-      committed?.parts.some(
-        (part) => part.type === "text" && part.text === "hello from a stream shutdown must not lose"
-      )
-    ).toBe(true);
-  });
+  );
 
   it("shares one teardown across concurrent dispose() calls", async () => {
     services = new ServiceContainer(stores);
