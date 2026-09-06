@@ -211,6 +211,11 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["low", "high"];
   }
 
+  // Grok Fast switches model variants: it has reasoning off/on, not graded effort.
+  if (withoutProviderNamespace === "grok-4-1-fast") {
+    return ["off", "high"];
+  }
+
   // Frontier Grok models always reason. Grok 4.6 adds native xhigh effort;
   // Grok 4.5 supports configurable low/medium/high.
   if (isGrok46Model(withoutProviderNamespace)) {
@@ -259,6 +264,9 @@ export function getDefaultMinimumThinkingLevel(
   modelString: string,
   providersConfig?: ProvidersConfigMap | null
 ): ThinkingLevel {
+  // A binary model must retain its off option unless the user explicitly raises the floor.
+  const policy = getThinkingPolicyForModel(modelString, providersConfig);
+  if (policy.length === 2 && policy[0] === "off") return THINKING_LEVEL_OFF;
   return hasExplicitThinkingPolicy(modelString, providersConfig)
     ? DEFAULT_THINKING_LEVEL
     : THINKING_LEVEL_OFF;
@@ -413,6 +421,9 @@ export function enforceThinkingPolicy(
   if (allowed.includes(requested)) {
     return requested;
   }
+
+  // Legacy low/medium values meant "on" for binary models, not nearest-to-off.
+  if (allowed.length === 2 && allowed[0] === "off" && allowed[1] === "high") return "high";
 
   const orderedAllowed = [...allowed].sort(
     (left, right) => THINKING_LEVELS.indexOf(left) - THINKING_LEVELS.indexOf(right)

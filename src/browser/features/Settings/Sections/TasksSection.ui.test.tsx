@@ -348,6 +348,34 @@ describe("TasksSection Exec subagent defaults", () => {
     }
   );
 
+  test("Intuition exposes only Off and High for the binary Grok Fast model", async () => {
+    advisorExperimentEnabled = true;
+    const view = renderTasksSection({
+      agentAiDefaults: { intuition: { modelString: "xai:grok-4-1-fast", thinkingLevel: "low" } },
+    });
+    await view.findByText("Intuition");
+    const card = getAgentCardByName(view, "Intuition");
+    expect(within(card).getByRole("button", { name: "Reasoning" }).textContent).toContain("High");
+    selectReasoningOption(card, "Off");
+    const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
+    expect(
+      within(listbox)
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("aria-label"))
+    ).toEqual(["Inherit", "Off", "High"]);
+    await waitFor(() => {
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition?.thinkingLevel).toBe(
+        "off"
+      );
+    });
+    fireEvent.click(within(listbox).getByRole("option", { name: "High" }));
+    await waitFor(() => {
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition?.thinkingLevel).toBe(
+        "high"
+      );
+    });
+  });
+
   test("renders a distinct Exec subagent row", async () => {
     const view = renderTasksSection();
 
