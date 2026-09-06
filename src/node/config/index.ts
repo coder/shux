@@ -1692,6 +1692,14 @@ export class Config {
             : parseOptionalPositiveInteger(parsed.advisorMaxOutputTokens);
         const hiddenMigrations = normalizeConfigMigrations(parsed.migrations);
         const existingHiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
+        if (
+          existingHiddenModels === undefined &&
+          hiddenMigrations.hiddenModelsInitialized === true
+        ) {
+          hiddenMigrations.hiddenModelsInitialized = false;
+          parsed.migrations = hiddenMigrations;
+          configModified = true;
+        }
         if (hiddenMigrations.daybreakModelsHidden !== true) {
           // Seed once, without losing unrelated hides or re-hiding models users later enable.
           parsed.migrations = {

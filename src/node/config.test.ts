@@ -51,6 +51,29 @@ describe("Config", () => {
       }
     );
 
+    it.each([undefined, null, "invalid", {}])(
+      "reopens preference recovery for malformed hides after migration: %j",
+      async (hiddenModels) => {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [],
+            hiddenModels,
+            migrations: { daybreakModelsHidden: true, hiddenModelsInitialized: true },
+          })
+        );
+        await flushConfigEdits();
+        const reloaded = new Config(tempDir).getClientConfig();
+        expect(reloaded.hiddenModels).toBeUndefined();
+        expect(reloaded.hiddenModelsInitialized).toBe(false);
+
+        await config.updateModelPreferences({ hiddenModels: [] });
+        const recovered = new Config(tempDir).getClientConfig();
+        expect(recovered.hiddenModels).toEqual([]);
+        expect(recovered.hiddenModelsInitialized).toBe(true);
+      }
+    );
+
     it.each([
       { name: "fresh install", persisted: false, hiddenModels: undefined },
       { name: "legacy local-only preferences", persisted: true, hiddenModels: undefined },

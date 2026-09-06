@@ -126,6 +126,17 @@ describe("migrateLocalModelPrefsToBackend", () => {
     expect(updateModelPreferences).toHaveBeenCalledWith({ hiddenModels: prefs.hiddenModels });
   });
 
+  test.each([{ hiddenModels: [] }, { hiddenModels: ["openai:gpt-5"] }])(
+    "restores local hides when migrated backend data is lost: %j",
+    ({ hiddenModels }) => {
+      updatePersistedState(HIDDEN_MODELS_KEY, hiddenModels);
+      const { api, updateModelPreferences } = createApiMock();
+      const prefs = migrateLocalModelPrefsToBackend(api, { hiddenModelsInitialized: false });
+      expect(prefs.hiddenModels).toEqual([...hiddenModels]);
+      expect(updateModelPreferences).toHaveBeenCalledWith({ hiddenModels });
+    }
+  );
+
   test.each([{ hiddenModels: [] }, { hiddenModels: ["openai:daybreak-red-latest"] }])(
     "keeps initialized backend choices authoritative over stale local hides: %j",
     ({ hiddenModels }) => {
