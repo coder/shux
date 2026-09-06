@@ -59,12 +59,13 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
           ctx,
           cue,
           abortSignal: signal,
-          recordUsage: (usage, providerMetadata) =>
+          recordUsage: (usage, providerMetadata, metadataModel) =>
             Promise.resolve(
               config.reportModelUsage?.({
                 source: "tool",
                 toolName: "intuition",
                 model,
+                metadataModel,
                 usage,
                 providerMetadata,
                 toolCallId,

@@ -104,6 +104,8 @@ export interface ToolModelUsageEvent {
   source: "tool";
   toolName: string;
   model: string;
+  /** Pricing identity pinned by this invocation, independent of other creations of the same model. */
+  metadataModel?: string;
   usage: LanguageModelV2Usage;
   providerMetadata?: Record<string, unknown>;
   toolCallId?: string;
@@ -360,6 +362,7 @@ export interface ToolConfiguration {
      */
     createModel: (modelString: string) => Promise<{
       model: LanguageModel;
+      metadataModel?: string;
       optionsModelString: string;
       /**
        * Providers snapshot captured at model-creation time for option

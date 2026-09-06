@@ -61,7 +61,7 @@ function reportingModel(
   });
 }
 
-async function fixture(empty = false, thinkingLevel?: ThinkingLevel) {
+async function fixture(empty = false, thinkingLevel?: ThinkingLevel, metadataModel?: string) {
   const temp = new TestTempDir("intuition-tool");
   const root = path.join(temp.path, "xum");
   await fs.mkdir(path.join(root, "memory/global"), { recursive: true });
@@ -76,6 +76,7 @@ async function fixture(empty = false, thinkingLevel?: ThinkingLevel) {
   const createModel = mock((_modelString: string) =>
     Promise.resolve({
       model: reportingModel(),
+      ...(metadataModel ? { metadataModel } : {}),
       optionsModelString: "openai:intuition-model",
       optionsProvidersConfig: null,
     })
@@ -126,7 +127,7 @@ async function execute(tool: Tool, abortSignal?: AbortSignal) {
 
 describe("intuition tool", () => {
   it("returns verified recall, accounts total usage in the pinned model, and records only unique recognized paths", async () => {
-    using f = await fixture();
+    using f = await fixture(false, undefined, "openai:pinned-pricing-model");
     const result = await execute(createIntuitionTool(f.config));
     expect(result).toMatchObject({
       kind: "recognized",
@@ -144,6 +145,7 @@ describe("intuition tool", () => {
       source: "tool",
       toolName: "intuition",
       model: f.config.intuitionRuntime.modelString,
+      metadataModel: "openai:pinned-pricing-model",
       toolCallId: mockToolCallOptions.toolCallId,
       usage: { inputTokens: 20, outputTokens: 8, totalTokens: 28 },
       providerMetadata: { anthropic: { cacheCreationInputTokens: 4 } },

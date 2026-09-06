@@ -2696,6 +2696,71 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(typeof sessionUsageDeltaRecord.timestamp).toBe("number");
   });
 
+  it("keeps pricing identities independent for overlapping Advisor and Intuition creations of the same model", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-invocation-pricing");
+    const metadata = createLocalWorkspaceMetadata("tool-invocation-pricing", xumHome.path);
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(xumHome.path),
+      xumHome: xumHome.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+    );
+    const harness = createHarness(xumHome.path, metadata, { experimentsService });
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
+    );
+    const model = "xai:grok-4-1-fast";
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      xai: { apiKey: "test-key" },
+    });
+    await enableAdvisorForHarness(harness, model);
+    await harness.config.editConfig((cfg) => ({
+      ...cfg,
+      agentAiDefaults: {
+        ...cfg.agentAiDefaults,
+        intuition: { modelString: model, thinkingLevel: "high" },
+      },
+    }));
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("user", "user", "hello")],
+      workspaceId: metadata.id,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      experiments: { advisorTool: true, memory: true },
+    });
+    expect(result.success).toBe(true);
+    const tools = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+    if (!tools?.advisorRuntime || !tools.intuitionRuntime || !tools.reportModelUsage)
+      throw new Error("Expected both tool runtimes");
+    const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+    spyOn(factory, "resolveAndCreateModel").mockImplementation(
+      ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
+    );
+    const advisor = await tools.advisorRuntime.createModel(model);
+    const intuition = await tools.intuitionRuntime.createModel(model);
+    const streamManager = Reflect.get(harness.service, "streamManager") as StreamManager;
+    const record = spyOn(streamManager, "recordToolModelUsage");
+    for (const [toolName, created] of [
+      ["advisor", advisor],
+      ["intuition", intuition],
+    ] as const) {
+      tools.reportModelUsage({
+        source: "tool",
+        toolName,
+        model,
+        metadataModel: created.metadataModel,
+        usage: { inputTokens: 120, outputTokens: 45, totalTokens: 165 },
+        timestamp: 1,
+      });
+    }
+    expect(record.mock.calls.map((call) => call[2].metadataModel)).toEqual([
+      model,
+      "xai:grok-4-1-fast-reasoning",
+    ]);
+  });
+
   it.each(["advisor", "intuition"] as const)(
     "records API-equivalent costs for %s tool usage through Codex OAuth",
     async (toolName) => {
@@ -2773,7 +2838,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
       );
       const createModel = spyOn(harness.service, "createModel");
-      await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const created = await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
       const creationOptions =
         toolName === "advisor"
           ? createModel.mock.calls.at(-1)?.[2]
@@ -2800,6 +2865,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         source: "tool",
         toolName,
         model: KNOWN_MODELS.GPT_53_CODEX.id,
+        metadataModel: created.metadataModel,
         usage: {
           inputTokens: 120,
           outputTokens: 45,

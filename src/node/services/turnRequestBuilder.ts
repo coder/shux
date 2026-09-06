@@ -1687,11 +1687,6 @@ export class TurnRequestBuilder {
           return;
       }
     };
-    // Creation-time pricing identity for tool-created models (advisor and intuition): a
-    // Coder catalog refresh can remove/retag the instance while the tool
-    // request runs, and resolving the identity from live config at
-    // completion would price/persist the usage under a different provider.
-    const toolModelMetadataModelByModelString = new Map<string, string>();
     // Normalize: undefined -> default, null -> unlimited, positive int -> exact cap.
     const advisorMaxUses =
       cfg.advisorMaxUsesPerTurn === null
@@ -1945,14 +1940,11 @@ export class TurnRequestBuilder {
           toolProvidersConfig
         );
       const toolOnCoderRoute = toolEffectiveModelString.startsWith("coder:");
-      // Creation-time identity from the SAME snapshot the model
-      // was created from (see map declaration).
-      toolModelMetadataModelByModelString.set(
-        toolModelString,
-        resolveModelForMetadata(
-          toolOnCoderRoute ? toolModelString : normalizeToCanonical(toolEffectiveModelString),
-          toolProvidersConfig
-        )
+      // Carry pricing with each creation: parallel tools can select different
+      // variants or provider snapshots for the same raw model string.
+      const metadataModel = resolveModelForMetadata(
+        toolOnCoderRoute ? toolModelString : normalizeToCanonical(toolEffectiveModelString),
+        toolProvidersConfig
       );
       // Wire-resolved identity for option construction, same
       // snapshot: a raw coder: string carries no wire info, so
@@ -1986,6 +1978,7 @@ export class TurnRequestBuilder {
       })();
       return {
         model: toolModel.data.model,
+        metadataModel,
         optionsModelString: toolOptionsModelString,
         optionsProvidersConfig: toolOptionsProvidersConfig,
         optionsMuxProviderOptions: toolMuxProviderOptions,
@@ -2123,7 +2116,7 @@ export class TurnRequestBuilder {
           // Prefer the creation-time identity captured when the tool model
           // was created; models not created through the tool runtime fall
           // back to live resolution (their identity is not coder-scoped).
-          const pinnedMetadataModel = toolModelMetadataModelByModelString.get(eventModel);
+          const pinnedMetadataModel = event.metadataModel;
           const metadataModel =
             pinnedMetadataModel ??
             resolveModelForMetadata(eventModel, this.dependencies.providerService.getConfig());

@@ -311,7 +311,8 @@ export async function runMemoryIntuition(args: {
   abortSignal?: AbortSignal;
   recordUsage?: (
     usage: LanguageModelV2Usage,
-    providerMetadata?: Record<string, unknown>
+    providerMetadata?: Record<string, unknown>,
+    metadataModel?: string
   ) => Promise<void>;
 }): Promise<MemoryIntuitionResult> {
   const started = Date.now();
@@ -334,6 +335,7 @@ export async function runMemoryIntuition(args: {
   }, MEMORY_INTUITION_TIMEOUT_MS);
   const signal = controller.signal;
   let ownedModel: LanguageModel | undefined;
+  let metadataModel: string | undefined;
   let completedUsage: LanguageModelV2Usage | undefined;
   let completedMetadata: Record<string, unknown> | undefined;
   let usageClosed = false;
@@ -369,6 +371,7 @@ export async function runMemoryIntuition(args: {
         // the racing await, so even a late model releases its transport resources.
         if (signal.aborted) runLanguageModelCleanup(created.model);
         else ownedModel = created.model;
+        metadataModel = created.metadataModel;
         return created;
       }
     );
@@ -590,9 +593,9 @@ export async function runMemoryIntuition(args: {
       try {
         // Invoke before the abort-aware wait: the host captures usage synchronously
         // even on cancellation. Handle late rejection without waiting past the deadline.
-        const write = Promise.resolve(args.recordUsage(completedUsage, completedMetadata)).catch(
-          () => undefined
-        );
+        const write = Promise.resolve(
+          args.recordUsage(completedUsage, completedMetadata, metadataModel)
+        ).catch(() => undefined);
         await untilAborted(signal, () => write);
       } catch {
         /* Accounting is best-effort and must not discard a verified report. */
