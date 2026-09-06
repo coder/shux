@@ -252,8 +252,13 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
         handoffMessage != null ? [...transcript, handoffMessage] : transcript;
 
       try {
-        const { model, optionsModelString, optionsProvidersConfig } =
-          await runtime.createModel(advisorModelString);
+        const {
+          model,
+          optionsModelString,
+          optionsProvidersConfig,
+          optionsMuxProviderOptions,
+          optionsRouteProvider,
+        } = await runtime.createModel(advisorModelString);
         // Provider options from the wire-resolved identity captured at model
         // creation (same snapshot): a raw coder: string would resolve to the
         // wrong (or no) provider namespace for custom-named or cross-typed
@@ -266,10 +271,13 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
           effectiveReasoningLevel,
           undefined,
           undefined,
+          optionsMuxProviderOptions,
           undefined,
           undefined,
+          optionsProvidersConfig,
+          optionsRouteProvider,
           undefined,
-          optionsProvidersConfig
+          runtime.reasoningMode
         ) as unknown as StreamTextProviderOptions;
 
         emitAdvisorPhase("waiting_for_response");

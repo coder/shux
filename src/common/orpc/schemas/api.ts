@@ -144,7 +144,7 @@ import {
 import { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";
 import { UserPreferencesSchema } from "../../config/schemas/userPreferences";
 import { TaskSettingsSchema } from "../../config/schemas/taskSettings";
-import { ThinkingLevelSchema } from "../../types/thinking";
+import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 
 // Experiments
 export const experiments = {
@@ -2527,6 +2527,7 @@ export const config = {
       defaultModel: z.string().optional(),
       advisorModelString: AdvisorModelStringSchema,
       advisorThinkingLevel: AdvisorThinkingLevelSchema,
+      advisorReasoningMode: OpenAIReasoningModeSchema.nullable(),
       advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.optional(),
       advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.optional(),
       hiddenModels: z.array(z.string()).optional(),
@@ -2551,6 +2552,7 @@ export const config = {
       taskSettings: ResolvedTaskSettingsSchema.nullish(),
       advisorModelString: AdvisorModelStringSchema.nullish(),
       advisorThinkingLevel: AdvisorThinkingLevelSchema.nullish(),
+      advisorReasoningMode: OpenAIReasoningModeSchema.nullish(),
       advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.nullish(),
       advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.nullish(),
       agentAiDefaults: AgentAiDefaultsSchema.optional(),

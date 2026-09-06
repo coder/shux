@@ -179,6 +179,7 @@ export const AppConfigOnDiskSchema = z
     defaultModel: z.string().optional(),
     advisorModelString: z.string().optional(),
     advisorThinkingLevel: ThinkingLevelSchema.optional(),
+    advisorReasoningMode: OpenAIReasoningModeSchema.optional(),
     advisorMaxUsesPerTurn: z.number().int().positive().nullable().optional(),
     advisorMaxOutputTokens: z.number().int().positive().nullable().optional(),
     hiddenModels: z.array(z.string()).optional(),

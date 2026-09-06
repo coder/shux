@@ -18,7 +18,7 @@ import type { AgentAiDefaults } from "./agentAiDefaults";
 import type { RuntimeEnablementId } from "./runtime";
 import type { TaskSettings } from "./tasks";
 import type { LayoutPresetsConfig } from "./uiLayouts";
-import type { ThinkingLevel } from "./thinking";
+import type { OpenAIReasoningMode, ThinkingLevel } from "./thinking";
 import type { GoalDefaults } from "@/constants/goals";
 
 export type Workspace = z.infer<typeof WorkspaceConfigSchema>;
@@ -123,6 +123,8 @@ export interface ProjectsConfig {
   advisorModelString?: string;
   /** Global advisor reasoning override for the experimental advisor tool. */
   advisorThinkingLevel?: ThinkingLevel;
+  /** Advisor Pro/Standard selection, independent of effort and the parent chat mode. */
+  advisorReasoningMode?: OpenAIReasoningMode;
   /** Positive per-turn advisor cap; null/undefined means unlimited. */
   advisorMaxUsesPerTurn?: number | null;
   /** Positive max-output-tokens cap for advisor responses; null/undefined means unlimited. */

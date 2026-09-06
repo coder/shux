@@ -91,7 +91,12 @@ import {
   tryProjectRegistrationFileLock,
   withProjectRegistrationFileLock,
 } from "@/node/config/projectRegistrationLock";
-import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  coerceOpenAIReasoningMode,
+  coerceThinkingLevel,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
 export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig };
@@ -1681,6 +1686,7 @@ export class Config {
         const defaultModel = normalizeOptionalModelString(parsed.defaultModel);
         const advisorModelString = parseOptionalNonEmptyString(parsed.advisorModelString);
         const advisorThinkingLevel = parseOptionalThinkingLevel(parsed.advisorThinkingLevel);
+        const advisorReasoningMode = coerceOpenAIReasoningMode(parsed.advisorReasoningMode);
         const advisorMaxUsesPerTurn =
           parsed.advisorMaxUsesPerTurn === null
             ? null
@@ -1806,6 +1812,7 @@ export class Config {
           defaultModel,
           advisorModelString,
           advisorThinkingLevel,
+          advisorReasoningMode,
           advisorMaxUsesPerTurn,
           advisorMaxOutputTokens,
           hiddenModels,
@@ -1960,6 +1967,11 @@ export class Config {
       const advisorModelString = parseOptionalNonEmptyString(config.advisorModelString);
       if (advisorModelString !== undefined) {
         data.advisorModelString = advisorModelString;
+      }
+
+      const advisorReasoningMode = coerceOpenAIReasoningMode(config.advisorReasoningMode);
+      if (advisorReasoningMode !== undefined) {
+        data.advisorReasoningMode = advisorReasoningMode;
       }
 
       const advisorThinkingLevel = parseOptionalThinkingLevel(config.advisorThinkingLevel);
@@ -2314,6 +2326,7 @@ export class Config {
       defaultModel: config.defaultModel,
       advisorModelString: config.advisorModelString ?? null,
       advisorThinkingLevel: config.advisorThinkingLevel ?? null,
+      advisorReasoningMode: config.advisorReasoningMode ?? null,
       advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
       advisorMaxOutputTokens: config.advisorMaxOutputTokens,
       hiddenModels: config.hiddenModels,
@@ -2537,6 +2550,7 @@ export class Config {
     userPreferences?: unknown;
     advisorModelString?: string | null;
     advisorThinkingLevel?: string | null;
+    advisorReasoningMode?: OpenAIReasoningMode | null;
     advisorMaxUsesPerTurn?: number | null;
     advisorMaxOutputTokens?: number | null;
     agentAiDefaults?: unknown;
@@ -2569,6 +2583,9 @@ export class Config {
 
       if (input.advisorModelString !== undefined) {
         result.advisorModelString = parseOptionalNonEmptyString(input.advisorModelString);
+      }
+      if (input.advisorReasoningMode !== undefined) {
+        result.advisorReasoningMode = coerceOpenAIReasoningMode(input.advisorReasoningMode);
       }
       if (input.advisorThinkingLevel !== undefined) {
         result.advisorThinkingLevel = parseOptionalThinkingLevel(input.advisorThinkingLevel);

@@ -151,13 +151,18 @@ describe("openaiSupportsProMode", () => {
     expect(openaiSupportsProMode("anthropic:claude-opus-4-7")).toBe(false);
   });
 
-  test("withholds pro mode from GPT-6 Astra while OpenAI's docs disagree about it", () => {
-    // Native max is real for Astra, but pro mode is gated separately: an
-    // unsupported reasoning.mode could fail the request, a missing toggle cannot
-    // (see openaiSupportsProMode for the doc split).
-    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra")).toBe(true);
-    expect(openaiSupportsProMode("openai:gpt-6-astra")).toBe(false);
-    expect(openaiSupportsProMode("mux-gateway:openai/gpt-6-astra")).toBe(false);
+  test("supports Astra and dated snapshots without enabling unpublished variants", () => {
+    for (const model of [
+      "openai:gpt-6-astra",
+      "mux-gateway:openai/gpt-6-astra",
+      "openai:gpt-6-astra-2026-09-03",
+      "gpt-6-astra-20260903",
+    ]) {
+      expect(openaiSupportsProMode(model)).toBe(true);
+    }
+    for (const model of ["gpt-6", "gpt-6-astra-mini", "gpt-6-astra-2026-preview"]) {
+      expect(openaiSupportsProMode(model)).toBe(false);
+    }
   });
 });
 

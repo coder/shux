@@ -1897,11 +1897,18 @@ export class TurnRequestBuilder {
       // building (buildProviderOptions takes the oRPC view, not
       // the raw config shape).
       const toolOptionsProvidersConfig = this.dependencies.providerService.getConfig();
-      const toolModel = await this.dependencies.createModel(toolModelString, undefined, {
-        workspaceId,
-        providersConfig: toolProvidersConfig,
-        agentInitiated: true,
-      });
+      // Let the factory pin provider-level defaults (especially the OpenAI wire
+      // format) without inheriting any options from the parent chat.
+      const toolMuxProviderOptions: MuxProviderOptions = {};
+      const toolModel = await this.dependencies.createModel(
+        toolModelString,
+        toolMuxProviderOptions,
+        {
+          workspaceId,
+          providersConfig: toolProvidersConfig,
+          agentInitiated: true,
+        }
+      );
       if (!toolModel.success) {
         throw new Error(`Failed to create tool model: ${getErrorMessage(toolModel.error)}`);
       }
@@ -1961,6 +1968,14 @@ export class TurnRequestBuilder {
         model: toolModel.data,
         optionsModelString: toolOptionsModelString,
         optionsProvidersConfig: toolOptionsProvidersConfig,
+        optionsMuxProviderOptions: toolMuxProviderOptions,
+        optionsRouteProvider: (() => {
+          const provider = toolEffectiveModelString.split(":", 1)[0];
+          return !isCustomProviderConfig(toolProvidersConfig[provider]) &&
+            Object.hasOwn(PROVIDER_DEFINITIONS, provider)
+            ? (provider as ProviderName)
+            : undefined;
+        })(),
       };
     };
     // Hoisted so refusal fallback can rebuild tools without changing their context.
@@ -1976,6 +1991,7 @@ export class TurnRequestBuilder {
             advisorRuntime: {
               advisorModelString,
               reasoningLevel: advisorReasoningLevel,
+              reasoningMode: cfg.advisorReasoningMode,
               maxUsesPerTurn: advisorMaxUses,
               maxOutputTokens: advisorMaxOutputTokens,
               getTranscriptSnapshot: () => {

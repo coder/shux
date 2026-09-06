@@ -3,7 +3,7 @@
  *
  * Mirrors the send path's provider-option gating so the UI never offers a toggle that
  * cannot affect the request:
- * - model must be pro-capable (the GPT-5.6 family — openaiSupportsProMode);
+ * - model must be pro-capable (see openaiSupportsProMode);
  * - pro mode is a Responses API field, so `wireFormat: "chatCompletions"` disables it;
  * - only the direct `openai:` route delivers the mode. Gateways hide it:
  *   non-passthrough ones use another provider schema, and mux-gateway currently

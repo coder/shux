@@ -1191,7 +1191,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
   async function enableAdvisorForHarness(
     harness: StreamMessageHarness,
-    advisorModelString = KNOWN_MODELS.SONNET.id
+    advisorModelString: string = KNOWN_MODELS.SONNET.id
   ): Promise<void> {
     const baseConfig = harness.config.loadConfigOrDefault();
     await harness.config.editConfig(() => ({
@@ -2216,6 +2216,78 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     const initialMetadata = initialMetadataFromStartStreamCall(startStreamCall);
     expect(Object.prototype.hasOwnProperty.call(initialMetadata, "routeProvider")).toBe(false);
+  });
+
+  it.each([
+    { advisorReasoningMode: "pro", parentMode: "standard" },
+    { advisorReasoningMode: "standard", parentMode: "pro" },
+    { advisorReasoningMode: undefined, parentMode: "pro" },
+  ] as const)("pins advisor mode independently of the parent: %j", async (testCase) => {
+    using xumHome = new DisposableTempDir("ai-service-advisor-reasoning-mode");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-advisor-reasoning-mode";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    await enableAdvisorForHarness(harness, "openai:gpt-5.6");
+    await harness.config.saveUserConfig({
+      advisorThinkingLevel: "high",
+      advisorReasoningMode: testCase.advisorReasoningMode,
+    });
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.6",
+      thinkingLevel: "max",
+      reasoningMode: testCase.parentMode,
+      experiments: { advisorTool: true },
+    });
+    expect(result.success).toBe(true);
+    expect(getToolConfigFromHarness(harness).advisorRuntime).toMatchObject({
+      reasoningLevel: "high",
+      reasoningMode: testCase.advisorReasoningMode,
+    });
+  });
+
+  it.each([
+    { model: "openai:gpt-5.6", wireFormat: "responses", route: "openai" },
+    { model: "openai:gpt-5.6", wireFormat: "chatCompletions", route: "openai" },
+    { model: "mux-gateway:openai/gpt-5.6", wireFormat: "responses", route: "mux-gateway" },
+  ] as const)("pins advisor wire and route independently of live config: %j", async (testCase) => {
+    using xumHome = new DisposableTempDir("ai-service-advisor-reasoning-route");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-advisor-reasoning-route";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    const providersStore = new ProvidersConfigStore(harness.config.rootDir);
+    providersStore.saveProvidersConfig({
+      openai: { apiKey: "sk-test-key", wireFormat: testCase.wireFormat },
+      "mux-gateway": { couponCode: "test-coupon" },
+    });
+    await harness.config.editConfig((cfg) => ({
+      ...cfg,
+      routePriority: ["direct"],
+      muxGatewayEnabled: true,
+    }));
+    await enableAdvisorForHarness(harness, testCase.model);
+    await startAdvisorStream(harness, workspaceId);
+    const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
+    if (!runtime) throw new Error("Expected advisor runtime");
+    const created = await runtime.createModel(testCase.model);
+    providersStore.saveProvidersConfig({
+      openai: { apiKey: "changed-key", wireFormat: "responses" },
+    });
+
+    expect(created.optionsRouteProvider).toBe(testCase.route);
+    expect(normalizeToCanonical(created.optionsModelString)).toBe("openai:gpt-5.6");
+    if (testCase.route === "openai") {
+      expect(created.optionsMuxProviderOptions?.openai?.wireFormat).toBe(testCase.wireFormat);
+    }
   });
 
   it("freezes advisor tool-call snapshots at the tool-call boundary", async () => {

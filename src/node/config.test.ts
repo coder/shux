@@ -1284,6 +1284,46 @@ describe("Config", () => {
     });
   });
 
+  describe("advisor reasoning mode", () => {
+    it("round-trips modes independently of effort and preserves omitted settings", async () => {
+      await config.saveUserConfig({
+        advisorModelString: "openai:gpt-5.6",
+        advisorThinkingLevel: "high",
+        advisorReasoningMode: "pro",
+      });
+      await config.saveUserConfig({ advisorMaxUsesPerTurn: 2 });
+
+      expect(new Config(tempDir).loadConfigOrDefault()).toMatchObject({
+        advisorThinkingLevel: "high",
+        advisorReasoningMode: "pro",
+      });
+
+      await config.saveUserConfig({ advisorReasoningMode: "standard" });
+      expect(new Config(tempDir).loadConfigOrDefault().advisorReasoningMode).toBe("standard");
+      await config.saveUserConfig({ advisorReasoningMode: null });
+      expect(new Config(tempDir).loadConfigOrDefault().advisorReasoningMode).toBeUndefined();
+      expect(
+        JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8"))
+      ).not.toHaveProperty("advisorReasoningMode");
+    });
+
+    it.each(["invalid", 1, null, { mode: "pro" }])(
+      "discards invalid persisted advisor reasoning mode %j without losing other settings",
+      async (advisorReasoningMode) => {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({ projects: [], advisorReasoningMode, advisorThinkingLevel: "high" })
+        );
+        expect(config.loadConfigOrDefault().advisorReasoningMode).toBeUndefined();
+        expect(config.loadConfigOrDefault().advisorThinkingLevel).toBe("high");
+        await config.saveUserConfig({ advisorMaxUsesPerTurn: 2 });
+        expect(
+          JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8"))
+        ).not.toHaveProperty("advisorReasoningMode");
+      }
+    );
+  });
+
   describe("API config mutations", () => {
     it("normalizes saves while preserving omitted settings", async () => {
       await config.editConfig((current) => ({

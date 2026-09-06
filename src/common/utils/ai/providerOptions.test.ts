@@ -1240,7 +1240,7 @@ describe("buildProviderOptions - OpenAI", () => {
     });
   });
 
-  describe("GPT-5.6 native pro reasoning mode", () => {
+  describe("native pro reasoning mode", () => {
     const buildWithMode = (
       model: string,
       reasoningMode: Parameters<typeof buildProviderOptions>[10],
@@ -1288,6 +1288,12 @@ describe("buildProviderOptions - OpenAI", () => {
     test("omits pro mode for standard mode, unsupported models, gateways, and Chat Completions", () => {
       const cases = [
         buildWithMode("openai:gpt-5.6-sol", "standard"),
+        buildWithMode("openai:gpt-6-astra", "standard"),
+        buildWithMode("openai:gpt-6-astra", undefined),
+        buildWithMode("openai:gpt-6-astra", "pro", { routeProvider: "mux-gateway" }),
+        buildWithMode("openai:gpt-6-astra", "pro", {
+          muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+        }),
         buildWithMode("openai:gpt-5.5-pro", "pro"),
         buildWithMode("openai:gpt-5.6-sol", "pro", { routeProvider: "mux-gateway" }),
         buildWithMode("openai:gpt-5.6-sol", "pro", {
@@ -1310,92 +1316,98 @@ describe("buildProviderOptions - OpenAI", () => {
       );
     });
 
-    test("serializes native max and pro through @ai-sdk/openai 4.0.11", async () => {
-      const capturedBodies: Array<Record<string, unknown>> = [];
-      const captureFetch = Object.assign(
-        (
-          input: Parameters<typeof fetch>[0],
-          init?: Parameters<typeof fetch>[1]
-        ): Promise<Response> => {
-          if (typeof init?.body !== "string") {
-            throw new Error("Expected the OpenAI provider to send a JSON string body");
-          }
-          capturedBodies.push(JSON.parse(init.body) as Record<string, unknown>);
-          const url =
-            typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-          const responseBody = url.endsWith("/responses")
-            ? {
-                id: "resp_test",
-                model: "gpt-5.6-sol",
-                output: [],
-                usage: { input_tokens: 1, output_tokens: 0 },
-              }
-            : {
-                id: "chat_test",
-                model: "gpt-5.6-sol",
-                choices: [
-                  {
-                    index: 0,
-                    message: { role: "assistant", content: "ok" },
-                    finish_reason: "stop",
-                  },
-                ],
-                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-              };
-          return Promise.resolve(
-            new Response(JSON.stringify(responseBody), {
-              status: 200,
-              headers: { "content-type": "application/json" },
-            })
-          );
-        },
-        { preconnect: fetch.preconnect.bind(fetch) }
-      );
-      const openai = createOpenAI({
-        apiKey: "test",
-        baseURL: "https://example.test/v1",
-        fetch: captureFetch,
-      });
-      const responsesOptions = buildWithMode("openai:gpt-5.6-sol", "pro", {
-        thinkingLevel: "max",
-      });
-      if (!responsesOptions) {
-        throw new Error("Expected OpenAI Responses provider options");
+    test.each(["gpt-5.6-sol", "gpt-6-astra"])(
+      "serializes native max and pro for %s through the OpenAI SDK",
+      async (model) => {
+        const capturedBodies: Array<Record<string, unknown>> = [];
+        const captureFetch = Object.assign(
+          (
+            input: Parameters<typeof fetch>[0],
+            init?: Parameters<typeof fetch>[1]
+          ): Promise<Response> => {
+            if (typeof init?.body !== "string") {
+              throw new Error("Expected the OpenAI provider to send a JSON string body");
+            }
+            capturedBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+            const url =
+              typeof input === "string"
+                ? input
+                : input instanceof URL
+                  ? input.toString()
+                  : input.url;
+            const responseBody = url.endsWith("/responses")
+              ? {
+                  id: "resp_test",
+                  model: model,
+                  output: [],
+                  usage: { input_tokens: 1, output_tokens: 0 },
+                }
+              : {
+                  id: "chat_test",
+                  model: model,
+                  choices: [
+                    {
+                      index: 0,
+                      message: { role: "assistant", content: "ok" },
+                      finish_reason: "stop",
+                    },
+                  ],
+                  usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+                };
+            return Promise.resolve(
+              new Response(JSON.stringify(responseBody), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              })
+            );
+          },
+          { preconnect: fetch.preconnect.bind(fetch) }
+        );
+        const openai = createOpenAI({
+          apiKey: "test",
+          baseURL: "https://example.test/v1",
+          fetch: captureFetch,
+        });
+        const responsesOptions = buildWithMode(`openai:${model}`, "pro", {
+          thinkingLevel: "max",
+        });
+        if (!responsesOptions) {
+          throw new Error("Expected OpenAI Responses provider options");
+        }
+
+        const chatOptions = getOpenAIOptions(
+          buildProviderOptions(`openai:${model}`, "max", undefined, undefined, {
+            openai: { wireFormat: "chatCompletions" },
+          })
+        );
+        if (!chatOptions) {
+          throw new Error("Expected OpenAI Chat Completions provider options");
+        }
+
+        await generateText({
+          model: openai.responses(model),
+          prompt: "Return ok.",
+          providerOptions: { openai: responsesOptions },
+          maxRetries: 0,
+        });
+        await generateText({
+          model: openai.chat(model),
+          prompt: "Return ok.",
+          providerOptions: { openai: chatOptions },
+          maxRetries: 0,
+        });
+
+        expect(capturedBodies[0].reasoning).toEqual({
+          effort: "max",
+          summary: "detailed",
+          mode: "pro",
+        });
+        expect(capturedBodies[1].reasoning_effort).toBe("max");
       }
-
-      const chatOptions = getOpenAIOptions(
-        buildProviderOptions("openai:gpt-5.6-sol", "max", undefined, undefined, {
-          openai: { wireFormat: "chatCompletions" },
-        })
-      );
-      if (!chatOptions) {
-        throw new Error("Expected OpenAI Chat Completions provider options");
-      }
-
-      await generateText({
-        model: openai.responses("gpt-5.6-sol"),
-        prompt: "Return ok.",
-        providerOptions: { openai: responsesOptions },
-        maxRetries: 0,
-      });
-      await generateText({
-        model: openai.chat("gpt-5.6-sol"),
-        prompt: "Return ok.",
-        providerOptions: { openai: chatOptions },
-        maxRetries: 0,
-      });
-
-      expect(capturedBodies[0].reasoning).toEqual({
-        effort: "max",
-        summary: "detailed",
-        mode: "pro",
-      });
-      expect(capturedBodies[1].reasoning_effort).toBe("max");
-    });
+    );
   });
 
-  // Astra keeps the GPT-5.6 native max effort but rejects "none" (HTTP 400) and has
-  // no documented pro mode; these tests pin exactly that split.
+  // Astra supports Pro independently of native max effort, but still rejects "none".
   describe("GPT-6 Astra reasoning options", () => {
     test("maps max to the native max effort and clamps off to low instead of none", () => {
       expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "max"))).toMatchObject({
@@ -1435,7 +1447,7 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(build("off")).toEqual({ "github-copilot": { reasoningEffort: "low" } });
     });
 
-    test("withholds pro mode even when requested on the direct Responses route", () => {
+    test("delivers pro mode independently of effort on the direct Responses route", () => {
       const result = buildProviderOptions(
         "openai:gpt-6-astra",
         "max",
@@ -1451,7 +1463,7 @@ describe("buildProviderOptions - OpenAI", () => {
       );
       const openai = getOpenAIOptions(result);
       expect(openai?.reasoningEffort).toBe("max");
-      expect(openai?.reasoningMode).toBeUndefined();
+      expect(openai?.reasoningMode).toBe("pro");
     });
 
     test("resolves mapped aliases to Astra for the native effort mapping", () => {
@@ -2274,6 +2286,10 @@ describe("buildRequestHeaders", () => {
       // Pro mode is family-wide at GA (including Luna and the bare alias).
       ["openai:gpt-5.6-luna", true],
       ["openai:gpt-5.6", true],
+      ["openai:gpt-6-astra", true],
+      ["openai:gpt-6-astra-2026-09-03", true],
+      ["mux-gateway:openai/gpt-6-astra", false],
+      ["openai:gpt-6-astra-mini", false],
       // All gateways fail closed — mux-gateway drops the field server-side.
       ["mux-gateway:openai/gpt-5.6-sol", false],
       ["openrouter:openai/gpt-5.6-sol", false],

@@ -3,7 +3,8 @@ import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
-import { isGrokFrontierModel } from "@/common/types/thinking";
+import { isGrokFrontierModel, type OpenAIReasoningMode } from "@/common/types/thinking";
+import type { ProviderName } from "@/common/constants/providers";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { createFileReadTool } from "@/node/services/tools/file_read";
@@ -333,6 +334,8 @@ export interface ToolConfiguration {
     advisorModelString: string;
     /** Optional reasoning/thinking level metadata for the advisor request. */
     reasoningLevel?: string;
+    /** Independent of the parent chat's reasoning mode and advisor effort. */
+    reasoningMode?: OpenAIReasoningMode;
     /** Normalized max uses per turn: null = unlimited, positive integer = exact cap */
     maxUsesPerTurn: number | null;
     /** Normalized max output tokens cap for advisor responses: undefined = unlimited, positive integer = explicit cap */
@@ -360,6 +363,9 @@ export interface ToolConfiguration {
        * alias metadata from the raw custom identity.
        */
       optionsProvidersConfig: ProvidersConfigMap | null;
+      /** Pinned wire/route options keep Pro restricted to supported direct Responses requests. */
+      optionsMuxProviderOptions?: MuxProviderOptions;
+      optionsRouteProvider?: ProviderName;
     }>;
     /** The abort signal from the parent stream */
     abortSignal: AbortSignal;

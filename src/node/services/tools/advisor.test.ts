@@ -177,6 +177,73 @@ describe("advisor tool", () => {
     mock.restore();
   });
 
+  it.each([
+    { model: "openai:gpt-5.6", mode: "pro", effort: "high", expectedMode: "pro" },
+    { model: "openai:gpt-5.6", mode: "pro", effort: "max", expectedMode: "pro" },
+    { model: "openai:gpt-5.6", mode: "standard", effort: "high", expectedMode: undefined },
+    { model: "openai:gpt-5.6", mode: undefined, effort: "high", expectedMode: undefined },
+    { model: "openai:gpt-5.2", mode: "pro", effort: "high", expectedMode: undefined },
+  ] as const)("forwards advisor mode independently of effort: %j", async (testCase) => {
+    using tempDir = new TestTempDir("advisor-reasoning-mode");
+    const { config } = createToolConfig(tempDir.path);
+    const streamTextSpy = mockStreamTextSuccess({
+      text: "Consider the tradeoff.",
+      usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
+    });
+    const tool = createAdvisorTool({
+      ...config,
+      advisorRuntime: {
+        ...config.advisorRuntime,
+        advisorModelString: testCase.model,
+        reasoningLevel: testCase.effort,
+        reasoningMode: testCase.mode,
+        createModel: () =>
+          Promise.resolve({
+            model: Object.create(null) as LanguageModel,
+            optionsModelString: testCase.model,
+            optionsProvidersConfig: null,
+          }),
+      },
+    });
+    await tool.execute!({}, mockToolCallOptions);
+    expect(getStreamTextArgs(streamTextSpy).providerOptions?.openai?.reasoningMode).toBe(
+      testCase.expectedMode
+    );
+    expect(getStreamTextArgs(streamTextSpy).providerOptions?.openai?.reasoningEffort).toBe(
+      testCase.effort
+    );
+  });
+
+  it.each([
+    { optionsRouteProvider: "coder" },
+    { optionsRouteProvider: "mux-gateway" },
+    { optionsMuxProviderOptions: { openai: { wireFormat: "chatCompletions" } } },
+  ] as const)("does not emit advisor Pro on unsupported routes/wires: %j", async (modelOptions) => {
+    using tempDir = new TestTempDir("advisor-reasoning-route");
+    const { config } = createToolConfig(tempDir.path);
+    const streamTextSpy = mockStreamTextSuccess({
+      text: "Consider the tradeoff.",
+      usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
+    });
+    const tool = createAdvisorTool({
+      ...config,
+      advisorRuntime: {
+        ...config.advisorRuntime,
+        advisorModelString: "openai:gpt-5.6",
+        reasoningMode: "pro",
+        createModel: () =>
+          Promise.resolve({
+            model: Object.create(null) as LanguageModel,
+            optionsModelString: "openai:gpt-5.6",
+            optionsProvidersConfig: null,
+            ...modelOptions,
+          }),
+      },
+    });
+    await tool.execute!({}, mockToolCallOptions);
+    expect(getStreamTextArgs(streamTextSpy).providerOptions?.openai?.reasoningMode).toBeUndefined();
+  });
+
   it("reports model usage after a successful advisor call", async () => {
     using tempDir = new TestTempDir("advisor-tool-report-usage");
     const usage: LanguageModelV2Usage = {

@@ -289,8 +289,7 @@ export function isGpt6AstraModel(modelString: string): boolean {
  *
  * GPT-6 Astra keeps the native max effort (its model page lists
  * low/medium/high/xhigh/max) but, unlike the GPT-5.6 family, rejects `none`; see
- * openaiRejectsDisabledReasoning. Pro mode is not documented for it (see
- * openaiSupportsProMode).
+ * openaiRejectsDisabledReasoning. Pro mode is independent of that effort ladder.
  */
 export function openaiSupportsNativeMaxEffort(modelString: string): boolean {
   return isGpt56FamilyModel(modelString) || isGpt6AstraModel(modelString);
@@ -333,17 +332,11 @@ export function coerceOpenAIReasoningMode(value: unknown): OpenAIReasoningMode |
  * `gpt-5.6` alias) — the Sol/Terra-only restriction came from stale preview
  * coverage.
  *
- * Excludes GPT-6 Astra for now: OpenAI's launch docs disagree with each other.
- * The model guide lists pro mode among the GPT-5.6 capabilities Astra inherits,
- * but the reasoning guide's "Reasoning mode" reference still names only GPT-5.6
- * models, and the Astra model page does not mention `reasoning.mode` at all.
- * OpenAI rejects parameters a model does not support, so enabling the toggle on
- * the optimistic reading could fail every pro-mode request, whereas withholding
- * it only costs an option. Flip once the reference lists Astra or a live
- * Responses probe with `reasoning.mode: "pro"` succeeds.
+ * GPT-6 Astra also supports Pro on the same model id; keep it independent of
+ * effort so choosing native max does not silently opt users into Pro serving.
  */
 export function openaiSupportsProMode(modelString: string): boolean {
-  return isGpt56FamilyModel(modelString);
+  return isGpt56FamilyModel(modelString) || isGpt6AstraModel(modelString);
 }
 
 /**
