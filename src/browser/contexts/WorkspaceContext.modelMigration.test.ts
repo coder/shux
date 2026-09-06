@@ -51,11 +51,11 @@ describe("migrateLocalModelPrefsToBackend", () => {
     globalThis.localStorage = undefined as unknown as Storage;
   });
 
-  test("migrates an explicit local default when it matches the built-in default", async () => {
+  test("migrates an explicit local default when it matches the built-in default", () => {
     setLocalDefaultModel(WORKSPACE_DEFAULTS.model);
     const { api, updateModelPreferences } = createApiMock();
 
-    await migrateLocalModelPrefsToBackend(api, {});
+    migrateLocalModelPrefsToBackend(api, {});
 
     expect(updateModelPreferences).toHaveBeenCalledTimes(1);
     expect(updateModelPreferences).toHaveBeenCalledWith({
@@ -63,48 +63,48 @@ describe("migrateLocalModelPrefsToBackend", () => {
     });
   });
 
-  test("migrates an explicit local default when it differs from the built-in default", async () => {
+  test("migrates an explicit local default when it differs from the built-in default", () => {
     const nonDefaultModel = getNonDefaultModel();
     setLocalDefaultModel(nonDefaultModel);
     const { api, updateModelPreferences } = createApiMock();
 
-    await migrateLocalModelPrefsToBackend(api, {});
+    migrateLocalModelPrefsToBackend(api, {});
 
     expect(updateModelPreferences).toHaveBeenCalledTimes(1);
     expect(updateModelPreferences).toHaveBeenCalledWith({ defaultModel: nonDefaultModel });
   });
 
-  test("does not overwrite a backend default model", async () => {
+  test("does not overwrite a backend default model", () => {
     setLocalDefaultModel(getNonDefaultModel());
     const { api, updateModelPreferences } = createApiMock();
 
-    await migrateLocalModelPrefsToBackend(api, { defaultModel: WORKSPACE_DEFAULTS.model });
+    migrateLocalModelPrefsToBackend(api, { defaultModel: WORKSPACE_DEFAULTS.model });
 
     expect(updateModelPreferences).not.toHaveBeenCalled();
   });
 
-  test("does not migrate when no local default model is stored", async () => {
+  test("does not migrate when no local default model is stored", () => {
     const { api, updateModelPreferences } = createApiMock();
 
-    await migrateLocalModelPrefsToBackend(api, {});
+    migrateLocalModelPrefsToBackend(api, {});
 
     expect(updateModelPreferences).not.toHaveBeenCalled();
   });
 
-  test("does not migrate when the local default model is empty after trimming", async () => {
+  test("does not migrate when the local default model is empty after trimming", () => {
     setLocalDefaultModel("   ");
     const { api, updateModelPreferences } = createApiMock();
 
-    await migrateLocalModelPrefsToBackend(api, {});
+    migrateLocalModelPrefsToBackend(api, {});
 
     expect(updateModelPreferences).not.toHaveBeenCalled();
   });
 
-  test("preserves explicit gateway-scoped local default during migration", async () => {
+  test("preserves explicit gateway-scoped local default during migration", () => {
     setLocalDefaultModel("openrouter:openai/gpt-5");
     const { api, updateModelPreferences } = createApiMock();
 
-    await migrateLocalModelPrefsToBackend(api, {});
+    migrateLocalModelPrefsToBackend(api, {});
 
     expect(updateModelPreferences).toHaveBeenCalledTimes(1);
     expect(updateModelPreferences).toHaveBeenCalledWith({
@@ -112,13 +112,13 @@ describe("migrateLocalModelPrefsToBackend", () => {
     });
   });
 
-  test("merges legacy hides with seeded defaults before hydration", async () => {
+  test("merges legacy hides with seeded defaults before hydration", () => {
     const legacyHidden = "openrouter:openai/gpt-5";
     const seeded = ["openai:daybreak-blue-latest", "openai:daybreak-red-latest"];
     updatePersistedState(HIDDEN_MODELS_KEY, [legacyHidden]);
     const { api, updateModelPreferences } = createApiMock();
 
-    const prefs = await migrateLocalModelPrefsToBackend(api, {
+    const prefs = migrateLocalModelPrefsToBackend(api, {
       hiddenModels: seeded,
       hiddenModelsInitialized: false,
     });
@@ -128,10 +128,10 @@ describe("migrateLocalModelPrefsToBackend", () => {
 
   test.each([{ hiddenModels: [] }, { hiddenModels: ["openai:daybreak-red-latest"] }])(
     "keeps initialized backend choices authoritative over stale local hides: %j",
-    async ({ hiddenModels }) => {
+    ({ hiddenModels }) => {
       updatePersistedState(HIDDEN_MODELS_KEY, ["openai:daybreak-blue-latest"]);
       const { api, updateModelPreferences } = createApiMock();
-      const prefs = await migrateLocalModelPrefsToBackend(api, {
+      const prefs = migrateLocalModelPrefsToBackend(api, {
         hiddenModels: [...hiddenModels],
         hiddenModelsInitialized: true,
       });

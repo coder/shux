@@ -24,7 +24,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { RecursivePartial } from "@/browser/testUtils";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 
@@ -76,9 +76,9 @@ describe("WorkspaceContext", () => {
     currentClientMock = {};
   });
 
-  test.each([false, true])(
-    "hydrates preferences when migration write fails: %s",
-    async (writeFails) => {
+  test.each(["resolves", "rejects", "stalls"])(
+    "hydrates preferences when migration persistence %s",
+    async (writeState) => {
       const seeded = ["openai:daybreak-blue-latest", "openai:daybreak-red-latest"];
       const legacyHidden = "openrouter:openai/gpt-5";
       const defaultModel = "openai:gpt-5.6-terra";
@@ -89,9 +89,11 @@ describe("WorkspaceContext", () => {
           [RUNTIME_ENABLEMENT_KEY]: JSON.stringify({ ssh: true }),
         },
       });
-      const updateModelPreferences = mock(() =>
-        writeFails ? Promise.reject(new Error("config write failed")) : Promise.resolve()
-      );
+      const updateModelPreferences = mock(() => {
+        if (writeState === "stalls") return new Promise<void>(() => undefined);
+        if (writeState === "rejects") return Promise.reject(new Error("config write failed"));
+        return Promise.resolve();
+      });
       const cfg = await createMockORPCClient().config.getConfig();
       currentClientMock.config = {
         getConfig: () =>
@@ -116,6 +118,81 @@ describe("WorkspaceContext", () => {
       });
       expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(defaultModel);
       expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false });
+    }
+  );
+
+  test.each(["hidden", "default", "hidden-aba"])(
+    "keeps %s edits ahead of stale startup config",
+    async (changed) => {
+      const blue = "openai:daybreak-blue-latest";
+      const red = "openai:daybreak-red-latest";
+      const legacyHidden = "openrouter:openai/gpt-5";
+      const legacyDefault = "openai:gpt-5.6-terra";
+      const chosenDefault = "anthropic:claude-opus-4-6";
+      createMockAPI({
+        localStorage: {
+          [HIDDEN_MODELS_KEY]: JSON.stringify([legacyHidden]),
+          [DEFAULT_MODEL_KEY]: JSON.stringify(legacyDefault),
+        },
+      });
+      const cfg = await createMockORPCClient().config.getConfig();
+      let resolveConfig!: (value: typeof cfg) => void;
+      const pendingConfig = new Promise<typeof cfg>((resolve) => {
+        resolveConfig = resolve;
+      });
+      const updateModelPreferences = mock(() => Promise.resolve());
+      currentClientMock.config = { getConfig: () => pendingConfig, updateModelPreferences };
+      await setup();
+      act(() => {
+        if (changed === "default") {
+          updatePersistedState(DEFAULT_MODEL_KEY, chosenDefault);
+        } else {
+          updatePersistedState(HIDDEN_MODELS_KEY, [red, legacyHidden]);
+          if (changed === "hidden-aba") updatePersistedState(HIDDEN_MODELS_KEY, [legacyHidden]);
+        }
+      });
+      resolveConfig({
+        ...cfg,
+        hiddenModels: [blue, red],
+        hiddenModelsInitialized: false,
+        runtimeEnablement: { ssh: false },
+      });
+      await waitFor(() =>
+        expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false })
+      );
+      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(
+        changed === "default" ? chosenDefault : legacyDefault
+      );
+      expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual(
+        changed === "default"
+          ? [blue, red, legacyHidden]
+          : changed === "hidden"
+            ? [red, legacyHidden]
+            : [legacyHidden]
+      );
+      expect(updateModelPreferences).toHaveBeenCalledWith(
+        changed === "default"
+          ? { hiddenModels: [blue, red, legacyHidden] }
+          : { defaultModel: legacyDefault }
+      );
+
+      cleanup();
+      getWorkspaceStoreRaw().dispose();
+      currentClientMock.config = {
+        getConfig: () =>
+          Promise.resolve({
+            ...cfg,
+            defaultModel: legacyDefault,
+            hiddenModels: [],
+            hiddenModelsInitialized: true,
+          }),
+        updateModelPreferences,
+      };
+      await setup();
+      await waitFor(() =>
+        expect(readPersistedState<string[] | null>(HIDDEN_MODELS_KEY, null)).toEqual([])
+      );
+      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(legacyDefault);
     }
   );
 

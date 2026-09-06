@@ -51,6 +51,8 @@ import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
   readPersistedState,
   readPersistedString,
+  subscribePersistedStateWrites,
+  syncPersistedStateFromBackend,
   updatePersistedState,
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
@@ -80,12 +82,13 @@ import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
  * Preserve legacy local model choices across port/origin changes.
  * Exported for focused migration tests.
  */
-export async function migrateLocalModelPrefsToBackend(
+export function migrateLocalModelPrefsToBackend(
   api: APIClient,
   cfg: Pick<
     Awaited<ReturnType<APIClient["config"]["getConfig"]>>,
     "defaultModel" | "hiddenModels" | "hiddenModelsInitialized"
-  >
+  >,
+  dirtyKeys: ReadonlySet<string> = new Set()
 ) {
   if (!api.config.updateModelPreferences) return cfg;
 
@@ -104,15 +107,16 @@ export async function migrateLocalModelPrefsToBackend(
   // localStorage presence implies explicit user choice (usePersistedState never
   // writes fallback defaults). Always migrate to backend so the preference
   // survives future changes to the built-in default constant.
-  if (cfg.defaultModel === undefined && localDefaultModel) {
+  if (!dirtyKeys.has(DEFAULT_MODEL_KEY) && cfg.defaultModel === undefined && localDefaultModel) {
     patch.defaultModel = localDefaultModel;
   }
 
   if (
-    cfg.hiddenModelsInitialized === false ||
-    (cfg.hiddenModels === undefined &&
-      Array.isArray(localHiddenModels) &&
-      localHiddenModels.length > 0)
+    !dirtyKeys.has(HIDDEN_MODELS_KEY) &&
+    (cfg.hiddenModelsInitialized === false ||
+      (cfg.hiddenModels === undefined &&
+        Array.isArray(localHiddenModels) &&
+        localHiddenModels.length > 0))
   ) {
     // Backend defaults are not evidence that legacy local preferences were imported.
     patch.hiddenModels = [
@@ -124,9 +128,8 @@ export async function migrateLocalModelPrefsToBackend(
   }
 
   if (Object.keys(patch).length > 0) {
-    await api.config.updateModelPreferences(patch).catch(() => {
-      // A failed migration write must not block unrelated startup hydration.
-    });
+    // Migration persistence must not delay hydration of unrelated settings.
+    api.config.updateModelPreferences(patch).catch(() => undefined);
   }
   return { ...cfg, ...patch };
 }
@@ -665,22 +668,32 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   useEffect(() => {
     if (!api?.config?.getConfig) return;
 
-    void api.config
+    let active = true;
+    // Track writes, not equality: toggling twice is still local intent.
+    const dirtyKeys = new Set<string>();
+    const unsubscribeWrites = subscribePersistedStateWrites(({ key, source }) => {
+      if (source === "local" && (key === DEFAULT_MODEL_KEY || key === HIDDEN_MODELS_KEY)) {
+        dirtyKeys.add(key);
+      }
+    });
+
+    api.config
       .getConfig()
-      .then(async (cfg) => {
+      .then((cfg) => {
+        if (!active) return;
         // Read legacy local preferences before backend hydration can overwrite them.
-        const modelPrefs = await migrateLocalModelPrefsToBackend(api, cfg);
+        const modelPrefs = migrateLocalModelPrefsToBackend(api, cfg, dirtyKeys);
         updatePersistedState(
           AGENT_AI_DEFAULTS_KEY,
           normalizeAgentAiDefaults(cfg.agentAiDefaults ?? {})
         );
 
         // Seed global model preferences from backend so switching ports doesn't reset the UI.
-        if (modelPrefs.defaultModel !== undefined) {
-          updatePersistedState(DEFAULT_MODEL_KEY, modelPrefs.defaultModel);
+        if (!dirtyKeys.has(DEFAULT_MODEL_KEY) && modelPrefs.defaultModel !== undefined) {
+          syncPersistedStateFromBackend(DEFAULT_MODEL_KEY, modelPrefs.defaultModel);
         }
-        if (modelPrefs.hiddenModels !== undefined) {
-          updatePersistedState(HIDDEN_MODELS_KEY, modelPrefs.hiddenModels);
+        if (!dirtyKeys.has(HIDDEN_MODELS_KEY) && modelPrefs.hiddenModels !== undefined) {
+          syncPersistedStateFromBackend(HIDDEN_MODELS_KEY, modelPrefs.hiddenModels);
         }
 
         // Seed runtime enablement from backend so switching ports doesn't reset the UI.
@@ -700,7 +713,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       })
       .catch(() => {
         // Best-effort only.
-      });
+      })
+      .finally(unsubscribeWrites);
+
+    return () => {
+      active = false;
+      unsubscribeWrites();
+    };
   }, [api]);
   // Get project refresh function from ProjectContext
   const {

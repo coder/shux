@@ -37,6 +37,20 @@ describe("Config", () => {
     const red = "openai:daybreak-red-latest";
     const unrelated = "openrouter:openai/gpt-5";
 
+    it.each([null, "invalid", {}])(
+      "keeps legacy fallback for malformed hides: %j",
+      async (hiddenModels) => {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({ projects: [], hiddenModels })
+        );
+        await flushConfigEdits();
+        const reloaded = new Config(tempDir).getClientConfig();
+        expect(reloaded.hiddenModels).toEqual([blue, red]);
+        expect(reloaded.hiddenModelsInitialized).toBe(false);
+      }
+    );
+
     it.each([
       { name: "fresh install", persisted: false, hiddenModels: undefined },
       { name: "legacy local-only preferences", persisted: true, hiddenModels: undefined },
