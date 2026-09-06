@@ -1,3 +1,7 @@
+import { ClaudeDesignCard } from "./ClaudeDesignCard";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useAPI } from "@/browser/contexts/API";
@@ -717,6 +721,7 @@ const RemoteMCPOAuthSection: React.FC<{
 };
 
 export const MCPSettingsSection: React.FC = () => {
+  const designEnabled = useExperimentValue(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
   const { api } = useAPI();
   const policyState = usePolicy();
   const mcpAllowUserDefined =
@@ -836,7 +841,7 @@ export const MCPSettingsSection: React.FC = () => {
 
   useEffect(() => {
     void refresh();
-  }, [refresh]);
+  }, [refresh, designEnabled]);
 
   // Clear new-server test result when transport/value/headers change
   useEffect(() => {
@@ -1133,6 +1138,18 @@ export const MCPSettingsSection: React.FC = () => {
         </p>
       </div>
 
+      {designEnabled && (
+        <ClaudeDesignCard
+          onChange={refresh}
+          remoteDisabled={mcpAllowUserDefined?.remote === false}
+          conflict={Boolean(
+            servers[CLAUDE_DESIGN_SERVER_NAME] &&
+            (servers[CLAUDE_DESIGN_SERVER_NAME].transport === "stdio" ||
+              !("managed" in servers[CLAUDE_DESIGN_SERVER_NAME]))
+          )}
+        />
+      )}
+
       {/* MCP Servers */}
       <div>
         <h3 className="text-foreground mb-4 text-sm font-medium">MCP Servers</h3>
@@ -1167,6 +1184,7 @@ export const MCPSettingsSection: React.FC = () => {
                   // Agent Plugin servers are read-only config entries: no
                   // global enable/edit/remove; enable them per workspace.
                   const isPluginEntry = entry.plugin !== undefined;
+                  const isDesignEntry = remoteEntry?.managed === "claude-design";
                   const displayName = entry.plugin
                     ? `${entry.plugin.pluginName}/${entry.plugin.serverName}`
                     : name;
@@ -1337,7 +1355,7 @@ export const MCPSettingsSection: React.FC = () => {
                                 <TooltipContent side="top">Test connection</TooltipContent>
                               </Tooltip>
                               {/* Plugin entries are read-only: no edit/remove. */}
-                              {!isPluginEntry && (
+                              {!isPluginEntry && !isDesignEntry && (
                                 <>
                                   <Tooltip>
                                     <TooltipTrigger asChild>
@@ -1377,7 +1395,7 @@ export const MCPSettingsSection: React.FC = () => {
                             </>
                           )}
                         </div>
-                        {!isEditing && remoteEntry && (
+                        {!isEditing && remoteEntry && !isDesignEntry && (
                           <div
                             className={cn(
                               "col-start-2 col-span-2 min-w-0",
@@ -1400,7 +1418,7 @@ export const MCPSettingsSection: React.FC = () => {
                             <span>{cached.result.error}</span>
                           </div>
 
-                          {cached.result.oauthChallenge && (
+                          {cached.result.oauthChallenge && !isDesignEntry && (
                             <div className="mt-2">
                               <MCPOAuthRequiredCallout
                                 serverName={name}

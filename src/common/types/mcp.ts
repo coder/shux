@@ -52,6 +52,8 @@ export interface MCPStdioServerInfo extends MCPServerBaseInfo {
 
 /** HTTP-based server definition. */
 export interface MCPHttpServerInfo extends MCPServerBaseInfo {
+  /** Backend-only provenance; never accepted from mcp.jsonc. */
+  managed?: "claude-design";
   transport: "http" | "sse" | "auto";
   url: string;
   /** Optional headers (string literal or reference to a project secret key). */

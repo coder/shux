@@ -1,3 +1,5 @@
+import { ClaudeDesignService } from "./claudeDesignService";
+import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import * as fs from "fs";
 import * as path from "path";
 import * as jsonc from "jsonc-parser";
@@ -58,6 +60,7 @@ function omitReservedPluginKeys(
 
 export class MCPConfigService {
   private readonly config: Config;
+  readonly claudeDesign: ClaudeDesignService;
   /**
    * Agent Plugins (agent-plugins experiment): read-only extra server source
    * merged into listings. Plugin servers are never persisted — every mutation
@@ -76,6 +79,7 @@ export class MCPConfigService {
     config: Config,
     options?: {
       agentPluginsMcpProvider?: AgentPluginsMcpProvider;
+      claudeDesign?: ClaudeDesignService;
       policyService?: Pick<PolicyService, "isEnforced" | "isMcpTransportAllowed">;
       telemetryService?: Pick<TelemetryService, "capture">;
       workspaceMetadataProvider?: Pick<AIService, "getWorkspaceMetadata">;
@@ -87,6 +91,9 @@ export class MCPConfigService {
     );
 
     this.config = config;
+    this.claudeDesign =
+      options?.claudeDesign ??
+      new ClaudeDesignService({ rootDir: config.rootDir, isEnabled: () => false });
     this.agentPluginsMcpProvider = options?.agentPluginsMcpProvider ?? null;
     this.policyService = options?.policyService ?? null;
     this.telemetryService = options?.telemetryService ?? null;
@@ -126,6 +133,8 @@ export class MCPConfigService {
     headers?: Record<string, MCPHeaderValue>;
   }): Promise<Result<void>> {
     const existingServer = (await this.listServers())[input.name];
+    if (existingServer?.transport !== "stdio" && existingServer?.managed)
+      return Err("Claude Design is managed in its settings card");
     const transport = input.transport ?? "stdio";
     if (this.transportDisabledByPolicy(transport)) {
       return Err("MCP transport is disabled by policy");
@@ -463,7 +472,7 @@ export class MCPConfigService {
   private globalConfigGeneration = 0;
 
   get configGeneration(): number {
-    return this.globalConfigGeneration;
+    return this.globalConfigGeneration + this.claudeDesign.generation;
   }
 
   /**
@@ -487,7 +496,12 @@ export class MCPConfigService {
   ): Promise<Record<string, MCPServerInfo>> {
     const layers = await this.listServerLayers(projectPath, trusted, options);
     // Repo overrides win by server name over global config, which wins over plugin servers.
-    return { ...layers.plugin, ...layers.global, ...layers.project };
+    const servers = { ...layers.plugin, ...layers.global, ...layers.project };
+    const design = await this.claudeDesign.serverInfo();
+    // Never replace an existing user/plugin server or lend it credentials.
+    if (design && !Object.hasOwn(servers, CLAUDE_DESIGN_SERVER_NAME))
+      servers[CLAUDE_DESIGN_SERVER_NAME] = design;
+    return servers;
   }
 
   /**
@@ -609,6 +623,15 @@ export class MCPConfigService {
   }
 
   async setServerEnabled(name: string, enabled: boolean): Promise<Result<void>> {
+    const managed = (await this.listServers())[name];
+    if (managed?.transport !== "stdio" && managed?.managed === "claude-design") {
+      try {
+        await this.claudeDesign.configure({ serverEnabled: enabled });
+        return Ok(undefined);
+      } catch (error) {
+        return Err(getErrorMessage(error));
+      }
+    }
     const cfg = await this.getGlobalConfig();
     const entry = cfg.servers[name];
     if (!entry) {
@@ -640,6 +663,15 @@ export class MCPConfigService {
   }
 
   async setToolAllowlist(name: string, toolAllowlist: string[]): Promise<Result<void>> {
+    const managed = (await this.listServers())[name];
+    if (managed?.transport !== "stdio" && managed?.managed === "claude-design") {
+      try {
+        await this.claudeDesign.configure({ toolAllowlist });
+        return Ok(undefined);
+      } catch (error) {
+        return Err(getErrorMessage(error));
+      }
+    }
     const cfg = await this.getGlobalConfig();
     const entry = cfg.servers[name];
     if (!entry) {

@@ -1,3 +1,6 @@
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { CLAUDE_DESIGN_URL } from "@/common/constants/claudeDesign";
+import type { ClaudeDesignStatus } from "@/common/orpc/schemas/claudeDesign";
 import { useEffect, useRef } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
@@ -424,5 +427,101 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
     await userEvent.click(moreActionsButton);
     await body.findByRole("button", { name: /Re-login/i });
     await body.findByRole("button", { name: /^Logout$/i });
+  },
+};
+
+function setupDesignStory(enabled = true): APIClient {
+  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), enabled);
+  const client = setupMCPSettingsSectionStory({
+    servers: enabled
+      ? {
+          claude_design: {
+            transport: "http",
+            url: CLAUDE_DESIGN_URL,
+            managed: "claude-design",
+            disabled: true,
+          },
+        }
+      : {},
+  });
+  let status: ClaudeDesignStatus = {
+    state: "disabled",
+    backendHost: "remote-backend.example.test",
+    platform: "linux",
+    settings: {
+      source: { type: "file", path: "/home/example/.claude/.credentials.json" },
+      reuseEnabled: false,
+      serverEnabled: false,
+    },
+  };
+  client.mcp.designStatus = () => Promise.resolve(status);
+  client.mcp.configureDesign = (settings) => {
+    status = {
+      ...status,
+      settings: { ...status.settings, ...settings },
+      state: settings.reuseEnabled ? "not_configured" : "disabled",
+    };
+    return Promise.resolve(status);
+  };
+  client.mcp.test = () => {
+    status = { ...status, state: "consent_required" };
+    return Promise.resolve({ success: false, error: "Claude Design: consent_required" });
+  };
+  return client;
+}
+
+export const ClaudeDesignOptIn: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory()}>
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const connect = await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.queryByRole("button", { name: "Login" })).toBeNull();
+    await expect(canvas.queryByRole("button", { name: "Edit server" })).toBeNull();
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+    await userEvent.click(connect);
+    await canvas.findByText(/Design requires consent/);
+    await userEvent.click(canvas.getByRole("button", { name: "Disconnect" }));
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+  },
+};
+
+export const ClaudeDesignPhone: Story = {
+  ...ClaudeDesignOptIn,
+  tags: ["claude-design"],
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+  // The test-runner ignores viewport globals; the wrapper enforces the contract there too.
+  render: () => (
+    <div style={{ width: 375, maxWidth: "100%" }}>
+      <MCPSettingsSectionStoryShell setup={() => setupDesignStory()}>
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    </div>
+  ),
+  play: async (context) => {
+    await ClaudeDesignOptIn.play?.(context);
+    const card = within(context.canvasElement).getByRole("region", { name: "Claude Design" });
+    await expect(card.getBoundingClientRect().width).toBeLessThanOrEqual(375);
+    await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
+  },
+};
+
+export const ClaudeDesignDisabled: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(false)}>
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("No MCP servers configured yet.");
+    await expect(canvas.queryByRole("region", { name: "Claude Design" })).toBeNull();
   },
 };

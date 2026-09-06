@@ -51,6 +51,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
   }),
   z.object({
     transport: z.literal("http"),
+    managed: z.literal("claude-design").optional(),
     url: z.string(),
     headers: MCPHeadersSchema.optional(),
     disabled: z.boolean(),

@@ -1,3 +1,4 @@
+import { ClaudeDesignSettingsSchema, ClaudeDesignStatusSchema } from "./claudeDesign";
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
@@ -1001,6 +1002,13 @@ export const projects = {
  * Global config lives in <xumHome>/mcp.jsonc, with optional repo overrides in <projectPath>/.xum/mcp.jsonc.
  */
 export const mcp = {
+  designStatus: { input: z.void(), output: ClaudeDesignStatusSchema },
+  configureDesign: {
+    input: ClaudeDesignSettingsSchema.pick({ source: true, reuseEnabled: true }).partial({
+      source: true,
+    }),
+    output: ClaudeDesignStatusSchema,
+  },
   list: {
     input: MCPListParamsSchema,
     output: MCPServerMapSchema,

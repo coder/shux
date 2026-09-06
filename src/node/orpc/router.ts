@@ -1,3 +1,4 @@
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 /**
  * oRPC router: procedure definitions only — behavior lives in services.
  *
@@ -987,6 +988,14 @@ export const router = (authToken?: string) => {
         }),
     },
     mcp: {
+      designStatus: t
+        .input(schemas.mcp.designStatus.input)
+        .output(schemas.mcp.designStatus.output)
+        .handler(({ context }) => context.mcpConfigService.claudeDesign.getStatus()),
+      configureDesign: t
+        .input(schemas.mcp.configureDesign.input)
+        .output(schemas.mcp.configureDesign.output)
+        .handler(({ context, input }) => context.mcpConfigService.claudeDesign.configure(input)),
       list: t
         .input(schemas.mcp.list.input)
         .output(schemas.mcp.list.output)
@@ -2157,6 +2166,9 @@ export const router = (authToken?: string) => {
         .output(schemas.experiments.setOverride.output)
         .handler(async ({ context, input }) => {
           await context.experimentsService.setOverride(input.experimentId, input.enabled);
+          if (input.experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) {
+            await context.mcpConfigService.claudeDesign.invalidate();
+          }
         }),
     },
     debug: {
