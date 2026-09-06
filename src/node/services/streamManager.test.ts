@@ -1395,22 +1395,46 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
         })(),
       { supervised: false }
     );
-    let stopPromise: Promise<unknown> | undefined;
+    const finalWriteEntered = Promise.withResolvers<void>();
+    const releaseFinalWrite = Promise.withResolvers<void>();
     const realUpdateHistory = historyService.updateHistory.bind(historyService);
     const updateHistorySpy = spyOn(historyService, "updateHistory").mockImplementation(
       async (targetWorkspaceId, message) => {
-        // partial.json is already gone here; state is still STREAMING.
-        stopPromise ??= streamManager.stopStream(targetWorkspaceId);
+        finalWriteEntered.resolve();
+        await releaseFinalWrite.promise;
         return realUpdateHistory(targetWorkspaceId, message);
       }
     );
+    let completionObserved: Promise<void> | undefined;
+    let stopPromise: Promise<unknown> | undefined;
     try {
       const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+      let settled = false;
+      completionObserved = handle.completion.then(async () => {
+        settled = true;
+        // Dependent turns read immediately on completion, so final history must already exist.
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success).toBe(true);
+        if (!history.success) throw new Error(history.error);
+        expect(history.data.filter((message) => message.role === "assistant")).toMatchObject([
+          { parts: [{ type: "text", text: "final answer" }] },
+        ]);
+        expect(history.data[0].metadata?.partial).not.toBe(true);
+      });
 
+      await finalWriteEntered.promise;
+      stopPromise = streamManager.stopStream(workspaceId);
+      const beforeCommit = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(beforeCommit.success).toBe(true);
+      if (!beforeCommit.success) throw new Error(beforeCommit.error);
+      expect(beforeCommit.data[0].parts).toEqual([]);
+      expect(settled).toBe(false);
+      expect(terminalEvents(events)).toEqual([]);
+
+      releaseFinalWrite.resolve();
       expect(await handle.completion).toEqual({ status: "completed" });
-      expect(stopPromise).toBeDefined();
       expect(await stopPromise).toEqual(Ok(undefined));
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await completionObserved;
 
       expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-end"]);
       expect(await historyService.readPartial(workspaceId)).toBeNull();
@@ -1425,7 +1449,13 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
       ).toBe(true);
       expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
     } finally {
-      updateHistorySpy.mockRestore();
+      releaseFinalWrite.resolve();
+      try {
+        await stopPromise;
+        await completionObserved;
+      } finally {
+        updateHistorySpy.mockRestore();
+      }
     }
   });
 
@@ -2841,28 +2871,70 @@ describe("StreamManager - turn completion", () => {
     });
   });
 
-  test("aborted completion waits for asynchronous abort delivery", async () => {
-    let releaseAbortDelivery!: () => void;
-    const abortDelivery = new Promise<void>((resolve) => {
-      releaseAbortDelivery = resolve;
-    });
+  test("aborted completion waits for the sink to commit and remove the partial", async () => {
+    const workspaceId = "completion-abort-workspace";
+    const providerBlocked = Promise.withResolvers<void>();
+    const abortDeliveryEntered = Promise.withResolvers<void>();
+    const releaseAbortDelivery = Promise.withResolvers<void>();
     const { streamManager, handle } = await startWithStreamResult({
-      workspaceId: "completion-abort-workspace",
+      workspaceId,
       messageId: "completion-abort-message",
-      createStreamResult: hangUntilAbort,
-      sink: (event) => (event.type === "stream-abort" ? abortDelivery : undefined),
+      createStreamResult: (_request, controller) =>
+        createStreamResultForTests(
+          (async function* () {
+            yield { type: "text-delta", text: "interrupted answer" };
+            providerBlocked.resolve();
+            await new Promise<void>((resolve) => {
+              if (controller.signal.aborted) return resolve();
+              controller.signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+          })()
+        ),
+      sink: async (event) => {
+        if (event.type !== "stream-abort") return;
+        abortDeliveryEntered.resolve();
+        await releaseAbortDelivery.promise;
+        // The facade owns abort persistence. A completion consumer must see its cleanup,
+        // even though stopStream has already released the engine's streaming registration.
+        await historyService.commitPartial(workspaceId);
+        await historyService.deletePartial(workspaceId);
+      },
     });
 
     let settled = false;
-    void handle.completion.then(() => {
+    const completionObserved = handle.completion.then(async () => {
       settled = true;
+      return {
+        history: await historyService.getHistoryFromLatestBoundary(workspaceId),
+        partial: await historyService.readPartial(workspaceId),
+      };
     });
-    await streamManager.stopStream("completion-abort-workspace", { abortReason: "user" });
-    await Promise.resolve();
-    expect(settled).toBe(false);
+    let stopPromise: Promise<unknown> | undefined;
+    try {
+      await providerBlocked.promise;
+      stopPromise = streamManager.stopStream(workspaceId, { abortReason: "user" });
+      await stopPromise;
+      await abortDeliveryEntered.promise;
+      expect(streamManager.isStreaming(workspaceId)).toBe(false);
+      expect(await historyService.readPartial(workspaceId)).toMatchObject({
+        parts: [{ type: "text", text: "interrupted answer" }],
+      });
+      expect(settled).toBe(false);
 
-    releaseAbortDelivery();
-    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
+      releaseAbortDelivery.resolve();
+      expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
+      const observed = await completionObserved;
+      expect(observed.partial).toBeNull();
+      expect(observed.history.success).toBe(true);
+      if (!observed.history.success) throw new Error(observed.history.error);
+      expect(observed.history.data).toMatchObject([
+        { id: handle.messageId, parts: [{ type: "text", text: "interrupted answer" }] },
+      ]);
+    } finally {
+      releaseAbortDelivery.resolve();
+      await (stopPromise ?? streamManager.stopStream(workspaceId));
+      await completionObserved;
+    }
   });
 });
 

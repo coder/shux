@@ -58,6 +58,10 @@ describe("AgentSession.waitForIdle", () => {
       const release = session.registerExternalManualFollowUp(controller.signal);
       expect(session.hasQueuedMessages()).toBe(false);
       expect(session.hasPendingManualFollowUp()).toBe(true);
+      // Idle means no active turn phase; it does not promise that all future work is drained.
+      await session.waitForIdle();
+      expect(session.isBusy()).toBe(false);
+      expect(session.hasPendingManualFollowUp()).toBe(true);
 
       controller.abort();
       expect(session.hasPendingManualFollowUp()).toBe(false);
@@ -81,6 +85,8 @@ describe("AgentSession.waitForIdle", () => {
         agentId: "exec",
         queueDispatchMode: "turn-end",
       });
+      await session.waitForIdle();
+      expect(session.isBusy()).toBe(false);
       expect(session.hasQueuedMessages()).toBe(true);
       expect(session.hasQueuedMessages("tool-end")).toBe(false);
 

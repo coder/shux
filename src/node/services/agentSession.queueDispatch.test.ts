@@ -61,6 +61,79 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 500): Prom
 }
 
 describe("AgentSession queued message tool-call dispatch", () => {
+  test.each(["returned error", "rejection"] as const)(
+    "reserves queued startup synchronously and drains after %s cleanup",
+    async (failureKind) => {
+      const workspaceId = `queue-prestart-${failureKind}`;
+      const failureEntered = Promise.withResolvers<void>();
+      const releaseFailure = Promise.withResolvers<void>();
+      const successorStarted = Promise.withResolvers<void>();
+      const streamMessage = mock(() => {
+        successorStarted.resolve();
+        return Promise.resolve(Ok(createStartedTurnHandle()));
+      });
+      const { session, historyService, cleanup } = await createAgentSessionHarness({
+        workspaceId,
+        aiServiceOverrides: { streamMessage },
+      });
+      const append = spyOn(historyService, "appendToHistory");
+      if (failureKind === "returned error") {
+        append.mockResolvedValueOnce(Err("disk unavailable"));
+      } else {
+        append.mockRejectedValueOnce(new Error("disk unavailable"));
+      }
+      const failures: unknown[] = [];
+
+      try {
+        session.queueMessage(
+          "failed head",
+          { model: TEST_MODEL, agentId: "exec" },
+          {
+            synthetic: true,
+            onAcceptedPreStreamFailure: async (error) => {
+              failures.push(error);
+              failureEntered.resolve();
+              await releaseFailure.promise;
+            },
+          }
+        );
+        session.queueMessage("surviving successor", { model: TEST_MODEL, agentId: "exec" });
+        session.sendQueuedMessages();
+
+        // Admission must cover the first await, or another caller can bypass this FIFO head.
+        expect(session.isBusy()).toBe(true);
+        expect(session.isPreparingTurn()).toBe(true);
+        expect(append).not.toHaveBeenCalled();
+
+        await failureEntered.promise;
+        expect(session.isBusy()).toBe(true);
+        expect(session.queuedMessageEntryCount()).toBe(1);
+        expect(streamMessage).not.toHaveBeenCalled();
+        expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
+
+        // No stream-end will arrive for the failed head. Cleanup must finish before its
+        // successor persists, then the queue must make progress without an external nudge.
+        releaseFailure.resolve();
+        await successorStarted.promise;
+        await session.waitForIdle();
+        expect(failures).toHaveLength(1);
+        expect(streamMessage).toHaveBeenCalledTimes(1);
+        expect(session.hasQueuedMessages()).toBe(false);
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success).toBe(true);
+        if (!history.success) throw new Error(history.error);
+        expect(history.data).toMatchObject([
+          { role: "user", parts: [{ type: "text", text: "surviving successor" }] },
+        ]);
+      } finally {
+        releaseFailure.resolve();
+        append.mockRestore();
+        session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
   test("counts only a different direct preparing send as a superseding predecessor", async () => {
     const sessionHolder: {
       current?: {
