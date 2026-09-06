@@ -60,6 +60,39 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 500): Prom
 }
 
 describe("AgentSession queued message tool-call dispatch", () => {
+  test("a queued provider startup failure drains its successor after accepted-turn cleanup", async () => {
+    const successor = Promise.withResolvers<void>();
+    let calls = 0;
+    const streamMessage = mock(() => {
+      if (++calls === 1)
+        return Promise.resolve(
+          Err({ type: "api_key_not_found" as const, provider: "anthropic" as const })
+        );
+      successor.resolve();
+      return Promise.resolve(Ok(createStartedTurnHandle()));
+    });
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-provider-startup-failure",
+      aiServiceOverrides: { streamMessage },
+    });
+    try {
+      session.queueMessage(
+        "failed startup",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true }
+      );
+      session.queueMessage("successor", { model: TEST_MODEL, agentId: "exec" });
+      session.sendQueuedMessages();
+      await successor.promise;
+      await session.waitForIdle();
+      expect(calls).toBe(2);
+      expect(session.hasQueuedMessages()).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test.each(["returned error", "rejection"] as const)(
     "reserves queued startup synchronously and drains after %s cleanup",
     async (failureKind) => {

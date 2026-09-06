@@ -1,3 +1,4 @@
+import type { TurnCoordinator } from "./turnCoordinator";
 import { describe, expect, it, mock, afterEach } from "bun:test";
 import { EventEmitter } from "events";
 import { PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
@@ -133,7 +134,7 @@ describe("AgentSession pre-stream errors", () => {
     let finishStartup: (() => void) | undefined;
     const privateSession = session as unknown as {
       streamWithHistory: () => Promise<Result<void, SendMessageError>>;
-      activePreparedTurnAbortController: AbortController | null;
+      coordinator: TurnCoordinator;
     };
     privateSession.streamWithHistory = async () => {
       await new Promise<void>((resolve) => {
@@ -153,10 +154,10 @@ describe("AgentSession pre-stream errors", () => {
       );
     });
 
-    while (privateSession.activePreparedTurnAbortController == null || finishStartup == null) {
+    while (finishStartup == null) {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
-    privateSession.activePreparedTurnAbortController.abort();
+    expect(privateSession.coordinator.preemptPreparation()).toBe(true);
     finishStartup();
 
     expect(await failure).toEqual({
@@ -292,10 +293,10 @@ describe("AgentSession pre-stream errors", () => {
     historyCleanup = cleanup;
 
     const privateSession = session as unknown as {
-      setTurnPhase(next: "idle" | "preparing" | "streaming" | "completing"): void;
+      coordinator: TurnCoordinator;
     };
 
-    privateSession.setTurnPhase("preparing");
+    privateSession.coordinator.prepare();
     aiEmitter.emit("runtime-status", {
       type: "runtime-status",
       workspaceId,

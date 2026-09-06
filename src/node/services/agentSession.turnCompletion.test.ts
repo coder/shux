@@ -1,10 +1,11 @@
+import type { TurnCoordinator } from "./turnCoordinator";
 import { createMuxMessage } from "@/common/types/message";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import type { StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { StreamMessageOptions } from "./turnRequestBuilder";
-import type { TurnCompletion, TurnStreamHandle } from "./streamManager";
+import type { TurnCompletion } from "./streamManager";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
@@ -13,22 +14,13 @@ const workspaceId = "session-completion";
 const model = "openai:gpt-4o";
 const sendOptions = { model, agentId: "exec" };
 
-interface Operation {
-  messageId?: string;
-  consumed: boolean;
-  startupMessageId?: string;
-  startupAbortNotified: boolean;
-  compaction: boolean;
-}
 interface InternalSession {
-  activeTurnOperation?: Operation;
   lastSystemMessageTokens?: number;
   activeCompactionRequest?: { id: string; modelString: string };
-  consumeTurnCompletion(handle: TurnStreamHandle, operation: Operation): Promise<void>;
   clearStartupAutoRetryAbandon(): Promise<void>;
   recordGoalAccountingFromUsage(input: unknown): Promise<void>;
   observeContinuousCompactionAtStreamEnd(...args: unknown[]): Promise<void>;
-  setTurnPhase(phase: "preparing" | "streaming" | "idle"): void;
+  coordinator: TurnCoordinator;
   getEditTruncateTargetId(messageId: string): Promise<string>;
 }
 const internal = (session: AgentSession) => session as unknown as InternalSession;
@@ -62,7 +54,7 @@ function policyPromise(spy: ReturnType<typeof observePolicy>): Promise<void> {
   return result.value;
 }
 function observePolicy(session: AgentSession) {
-  return spyOn(internal(session), "consumeTurnCompletion");
+  return spyOn(internal(session).coordinator, "consumeCompletion");
 }
 
 describe("AgentSession turn completion", () => {
@@ -87,11 +79,11 @@ describe("AgentSession turn completion", () => {
       emitter.emit("stream-end", end());
       expect(h.session.isBusy()).toBe(true);
       expect(h.events.filter((event) => event.type === "stream-end")).toHaveLength(0);
-      const operation = internal(h.session).activeTurnOperation!;
+      const operation = internal(h.session).coordinator.operationId!;
       // Even a malformed producer's redundant event ID cannot override handle identity.
       completion.resolve({ status: "completed", streamEnd: end("wrong-id") });
       await policyPromise(consumer);
-      await internal(h.session).consumeTurnCompletion(handle, operation);
+      await internal(h.session).coordinator.consumeCompletion(operation, handle);
       emitter.emit("stream-end", end());
       expect(h.events.filter((event) => event.type === "stream-end")).toMatchObject([
         { messageId: handle.messageId },
@@ -326,7 +318,7 @@ describe("AgentSession turn completion", () => {
       try {
         await h.session.sendMessage("hello", sendOptions);
         const oldPolicy = policyPromise(consumer);
-        internal(h.session).setTurnPhase("idle");
+        internal(h.session).coordinator.finishTurn(internal(h.session).coordinator.turnId);
         const commit = h.historyService.commitPartial.bind(h.historyService);
         spyOn(h.historyService, "commitPartial").mockImplementationOnce(async (id) => {
           historyEntered.resolve();
@@ -387,7 +379,10 @@ describe("AgentSession turn completion", () => {
     try {
       await h.session.sendMessage("hello", sendOptions);
       internal(h.session).activeCompactionRequest = { id: "compact", modelString: model };
-      internal(h.session).activeTurnOperation!.compaction = true;
+      internal(h.session).coordinator.configureOperation(
+        internal(h.session).coordinator.operationId!,
+        true
+      );
       spyOn(internal(h.session), "clearStartupAutoRetryAbandon").mockImplementation(async () => {
         entered.resolve();
         await release.promise;
@@ -747,4 +742,105 @@ describe("AgentSession turn completion", () => {
       }
     }
   );
+  test.each(["error", "rejection"] as const)(
+    "a preempted preparation's delayed history %s cannot apply failure policy to its replacement",
+    async (failure) => {
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const emitter = new EventEmitter();
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter: emitter,
+        captureEvents: true,
+        aiServiceOverrides: {
+          streamMessage: mock(() => {
+            start(emitter, "replacement");
+            return Promise.resolve(
+              Ok({
+                messageId: "replacement",
+                completion: new Promise<TurnCompletion>(() => undefined),
+              })
+            );
+          }),
+        },
+      });
+      try {
+        spyOn(h.historyService, "commitPartial").mockImplementationOnce(async () => {
+          entered.resolve();
+          await release.promise;
+          if (failure === "rejection") throw new Error("retired startup history failure");
+          return Err("retired startup history failure");
+        });
+        const original = h.session
+          .sendMessage("original", sendOptions)
+          .catch((error: unknown) => error);
+        await entered.promise;
+        const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!history.success) throw new Error(history.error);
+        const messageId = history.data.find((message) => message.role === "user")!.id;
+        const replacementStarted = Promise.withResolvers<void>();
+        const unsubscribe = h.session.onChatEvent(({ message: event }) => {
+          if (event.type === "stream-start" && event.messageId === "replacement")
+            replacementStarted.resolve();
+        });
+        await h.session.sendMessage("replacement", { ...sendOptions, editMessageId: messageId });
+        await replacementStarted.promise;
+        unsubscribe();
+        release.resolve();
+        await original;
+        expect(h.session.isBusy()).toBe(true);
+        expect(h.session.isPreparingTurn()).toBe(false);
+        expect(h.events.some((event) => event.type === "stream-error")).toBe(false);
+        expect(h.session.hasPendingAutoRetry()).toBe(false);
+        expect(h.session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: true });
+      } finally {
+        release.resolve();
+        h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+  test("shutdown followed by disposal cannot reopen retry after a suspended preference read", async () => {
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const preferenceEntered = Promise.withResolvers<void>();
+    const preference = Promise.withResolvers<boolean>();
+    const emitter = new EventEmitter();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          start(emitter);
+          return Promise.resolve(Ok({ messageId: "assistant-1", completion: completion.promise }));
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    try {
+      await h.session.sendMessage("hello", sendOptions);
+      const retryPolicy = h.session as unknown as {
+        loadAutoRetryEnabledPreference(): Promise<boolean>;
+      };
+      spyOn(retryPolicy, "loadAutoRetryEnabledPreference").mockImplementationOnce(() => {
+        preferenceEntered.resolve();
+        return preference.promise;
+      });
+      completion.resolve({
+        status: "failed",
+        streamError: { messageId: "assistant-1", error: "provider failed", errorType: "api" },
+      });
+      await preferenceEntered.promise;
+      h.session.beginShutdown();
+      h.session.dispose();
+      preference.resolve(true);
+      await policyPromise(consumer);
+      expect(h.session.hasPendingAutoRetry()).toBe(false);
+      expect(h.events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    } finally {
+      preference.resolve(true);
+      h.session.dispose();
+      await h.cleanup();
+    }
+  });
 });

@@ -1,10 +1,10 @@
+import type { TurnCoordinator } from "./turnCoordinator";
 import { describe, expect, test } from "bun:test";
 
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 
 interface IdleWaiterTestSession {
-  setTurnPhase(next: "idle" | "preparing"): void;
-  idleWaiters: Array<() => void>;
+  coordinator: TurnCoordinator;
 }
 
 const WAIT_FOR_IDLE_CANCELED_MESSAGE = "Waiting for session idle canceled.";
@@ -24,12 +24,11 @@ describe("AgentSession.waitForIdle", () => {
     const internalSession = session as unknown as IdleWaiterTestSession;
 
     try {
-      internalSession.setTurnPhase("preparing");
+      internalSession.coordinator.prepare();
       const controller = new AbortController();
       const waitResult = captureWaitForIdleResult(session.waitForIdle(controller.signal));
 
       expect(session.isBusy()).toBe(true);
-      expect(internalSession.idleWaiters).toHaveLength(1);
 
       controller.abort();
 
@@ -37,9 +36,8 @@ describe("AgentSession.waitForIdle", () => {
       expect(error).toBeInstanceOf(Error);
       expect((error as Error).message).toBe(WAIT_FOR_IDLE_CANCELED_MESSAGE);
       expect(session.isBusy()).toBe(true);
-      expect(internalSession.idleWaiters).toHaveLength(0);
     } finally {
-      internalSession.setTurnPhase("idle");
+      internalSession.coordinator.finishTurn(internalSession.coordinator.turnId);
       session.dispose();
       await cleanup();
     }
@@ -106,7 +104,7 @@ describe("AgentSession.waitForIdle", () => {
     const internalSession = session as unknown as IdleWaiterTestSession;
 
     try {
-      internalSession.setTurnPhase("preparing");
+      internalSession.coordinator.prepare();
       const waits = Array.from({ length: 3 }, () => {
         const controller = new AbortController();
         return {
@@ -114,8 +112,6 @@ describe("AgentSession.waitForIdle", () => {
           result: captureWaitForIdleResult(session.waitForIdle(controller.signal)),
         };
       });
-
-      expect(internalSession.idleWaiters).toHaveLength(waits.length);
 
       for (const wait of waits) {
         wait.controller.abort();
@@ -127,9 +123,8 @@ describe("AgentSession.waitForIdle", () => {
         expect((error as Error).message).toBe(WAIT_FOR_IDLE_CANCELED_MESSAGE);
       }
       expect(session.isBusy()).toBe(true);
-      expect(internalSession.idleWaiters).toHaveLength(0);
     } finally {
-      internalSession.setTurnPhase("idle");
+      internalSession.coordinator.finishTurn(internalSession.coordinator.turnId);
       session.dispose();
       await cleanup();
     }

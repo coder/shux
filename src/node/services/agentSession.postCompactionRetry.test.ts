@@ -168,12 +168,8 @@ describe("AgentSession post-compaction context retry", () => {
       agentId: "exec",
     } as unknown as SendMessageOptions;
 
-    // Call streamWithHistory directly (private) to avoid needing a full user send pipeline.
-    await (
-      session as unknown as {
-        streamWithHistory: (m: string, o: SendMessageOptions) => Promise<unknown>;
-      }
-    ).streamWithHistory(options.model, options);
+    // Exercise the public resume facade so retry preparation has a real admitted owner.
+    await session.resumeStream(options);
 
     // Wait for the retry call to happen.
     await Promise.race([
@@ -325,11 +321,7 @@ describe("AgentSession post-compaction context retry", () => {
       agentId: "exec",
     } as unknown as SendMessageOptions;
 
-    await (
-      session as unknown as {
-        streamWithHistory: (m: string, o: SendMessageOptions) => Promise<unknown>;
-      }
-    ).streamWithHistory(options.model, options);
+    await session.resumeStream(options);
 
     // The error event began a recovery decision and kicked off the retry.
     await Promise.race([
@@ -472,11 +464,7 @@ describe("AgentSession post-compaction context retry", () => {
       agentId: "exec",
     } as unknown as SendMessageOptions;
 
-    await (
-      session as unknown as {
-        streamWithHistory: (m: string, o: SendMessageOptions) => Promise<unknown>;
-      }
-    ).streamWithHistory(options.model, options);
+    await session.resumeStream(options);
 
     const withTimeout = <T>(promise: Promise<T>, label: string): Promise<T> =>
       Promise.race([

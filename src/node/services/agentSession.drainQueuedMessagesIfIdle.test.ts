@@ -1,3 +1,4 @@
+import type { TurnCoordinator } from "./turnCoordinator";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import * as path from "node:path";
@@ -22,7 +23,7 @@ const WORKSPACE_ID = "workspace-drain-if-idle-test";
 
 interface PrivateSessionAccess {
   midStreamCompactionPending: boolean;
-  autoRetryStarting: boolean;
+  coordinator: TurnCoordinator;
   activeStreamContext?: { modelString: string; options?: unknown; providersConfig: null };
   interruptForCompaction: () => Promise<void>;
 }
@@ -101,7 +102,7 @@ describe("AgentSession.drainQueuedMessagesIfIdle", () => {
     [
       "a scheduled auto-retry does not hold the queue",
       (s) => {
-        s.autoRetryStarting = true;
+        s.coordinator.beginRetry();
       },
       1,
     ],

@@ -1,3 +1,4 @@
+import type { TurnCoordinator } from "./turnCoordinator";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
 import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/message";
@@ -449,9 +450,9 @@ describe("AgentSession continue-message agentId fallback", () => {
     const { internals } = await createSession([
       compactionSummaryMessage("summary-completing-turn", idleFollowUp()),
     ]);
-    const completingInternals = internals as SessionInternals & { turnPhase: string };
+    const completingInternals = internals as SessionInternals & { coordinator: TurnCoordinator };
     completingInternals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
-    completingInternals.turnPhase = "completing";
+    completingInternals.coordinator.beginPolicy(completingInternals.coordinator.turnId);
 
     const dispatched = await completingInternals.dispatchPendingFollowUp();
 
