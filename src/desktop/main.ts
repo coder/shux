@@ -16,6 +16,7 @@ import "source-map-support/register";
 import { promises as fsPromises } from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { cleanupObsoleteXumBinArtifacts, getXumHome } from "@/common/constants/paths";
 import { getElectronAppIdentity } from "@/common/compat/electronAppIdentity";
 import {
@@ -42,6 +43,11 @@ if (process.platform === "darwin") {
 }
 
 import { DesktopWindowManager } from "./desktopWindowManager";
+import { RemoteConnectionManager } from "./remoteConnectionManager";
+import {
+  REMOTE_CONNECTION_CHANNELS,
+  REMOTE_CONNECTION_RETURN_ACCELERATOR,
+} from "@/common/constants/remoteConnection";
 import { randomBytes } from "crypto";
 import { RPCHandler } from "@orpc/server/message-port";
 import { onError } from "@orpc/server";
@@ -50,7 +56,15 @@ import { formatOrpcError } from "../node/orpc/formatOrpcError";
 import { ServerLockfile } from "../node/services/serverLockfile";
 import "disposablestack/auto";
 
-import type { MenuItemConstructorOptions, MessageBoxOptions } from "electron";
+import type {
+  BrowserWindowConstructorOptions,
+  Event as ElectronEvent,
+  IpcMainEvent,
+  IpcMainInvokeEvent,
+  MenuItemConstructorOptions,
+  MessageBoxOptions,
+  WebContents,
+} from "electron";
 import {
   app,
   crashReporter,
@@ -201,6 +215,54 @@ import { log } from "@/node/services/log";
 // These will be loaded on-demand when createWindow() is called
 let config: Config | null = null;
 let services: ServiceContainer | null = null;
+let remoteConnectionManager: RemoteConnectionManager | null = null;
+const localIpcWindows = new Map<WebContents, URL>();
+
+function isTrustedLocalUrl(target: string, expected: URL): boolean {
+  try {
+    const url = new URL(target);
+    return expected.protocol === "file:"
+      ? url.protocol === "file:" && url.host === expected.host && url.pathname === expected.pathname
+      : url.origin === expected.origin;
+  } catch {
+    return false;
+  }
+}
+
+function createLocalWindow(
+  options: BrowserWindowConstructorOptions,
+  page: "index.html" | "terminal.html" | "desktop.html" = "index.html"
+): BrowserWindow {
+  const window = new BrowserWindow(options);
+  const contents = window.webContents;
+  const expected =
+    !app.isPackaged && !forceDistLoad
+      ? new URL(
+          page === "terminal.html"
+            ? "http://localhost:5173"
+            : "http://" + (getXumEnv("DEVSERVER_HOST") ?? "127.0.0.1") + ":" + devServerPort
+        )
+      : pathToFileURL(path.join(__dirname, "..", page));
+  localIpcWindows.set(contents, expected);
+  contents.once("destroyed", () => localIpcWindows.delete(contents));
+  // Redirects and other packaged files must not retain this window's privileged preload.
+  const guardNavigation = (event: ElectronEvent, target: string): void => {
+    if (!isTrustedLocalUrl(target, expected)) event.preventDefault();
+  };
+  contents.on("will-navigate", guardNavigation);
+  contents.on("will-redirect", guardNavigation);
+  return window;
+}
+
+function isLocalIpcSender(event: IpcMainEvent | IpcMainInvokeEvent): boolean {
+  const expected = localIpcWindows.get(event.sender);
+  return (
+    expected != null &&
+    event.senderFrame === event.sender.mainFrame &&
+    isTrustedLocalUrl(event.senderFrame.url, expected)
+  );
+}
+
 const requireDesktopModule = createRequire(__filename);
 
 // XUM_PROXY_URI is canonical; the transition layer mirrors legacy MUX_PROXY_URI.
@@ -369,6 +431,49 @@ function timestamp(): string {
   return `${hours}:${minutes}:${seconds}.${ms}`;
 }
 
+function initializeRemoteConnections(): void {
+  const manager = new RemoteConnectionManager({
+    createWindow: (options) => new BrowserWindow(options),
+    onConnected: () => mainWindow?.hide(),
+    onDisconnected: () => {
+      if (!isQuitting) openXumFromTray();
+    },
+    onStateChanged: (state) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(REMOTE_CONNECTION_CHANNELS.stateChanged, state);
+      }
+      const returnItem = Menu.getApplicationMenu()?.getMenuItemById("return-to-local");
+      if (returnItem) returnItem.enabled = state.status !== "disconnected";
+    },
+    openExternal: (url) => {
+      shell.openExternal(url).catch(() => {
+        log.warn("Cannot open the remote server link in the browser.");
+      });
+    },
+  });
+  remoteConnectionManager = manager;
+
+  // Keep desktop connection controls off the network API and out of remote pages.
+  const assertLocalController = (event: IpcMainInvokeEvent): void => {
+    if (!isLocalIpcSender(event) || event.sender !== mainWindow?.webContents) {
+      throw new Error("Remote connection controls require the local desktop window.");
+    }
+  };
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.getState, (event) => {
+    assertLocalController(event);
+    return manager.getState();
+  });
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.connect, (event, url: unknown) => {
+    assertLocalController(event);
+    if (typeof url !== "string") throw new Error("Enter a valid server URL.");
+    return manager.connect(url);
+  });
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.disconnect, (event) => {
+    assertLocalController(event);
+    manager.disconnect();
+  });
+}
+
 function createMenu() {
   const template: MenuItemConstructorOptions[] = [
     {
@@ -411,7 +516,20 @@ function createMenu() {
     },
     {
       label: "Window",
-      submenu: [{ role: "minimize" }, { role: "close" }],
+      submenu: [
+        { role: "minimize" },
+        { role: "close" },
+        { type: "separator" },
+        {
+          id: "return-to-local",
+          label: "Return to Local",
+          accelerator: REMOTE_CONNECTION_RETURN_ACCELERATOR,
+          enabled:
+            remoteConnectionManager?.getState().status !== "disconnected" &&
+            remoteConnectionManager != null,
+          click: () => remoteConnectionManager?.disconnect(),
+        },
+      ],
     },
   ];
 
@@ -425,6 +543,7 @@ function createMenu() {
           label: "Settings...",
           accelerator: "Cmd+,",
           click: () => {
+            openXumFromTray();
             services?.menuEventService.emitOpenSettings();
           },
         },
@@ -500,15 +619,8 @@ function openXumFromTray() {
     return;
   }
 
-  // On macOS the app stays open after all windows are closed; recreate the window.
-  if (process.platform === "darwin") {
-    if (!services) {
-      console.warn(`[${timestamp()}] [tray] Cannot open xum (services not loaded yet)`);
-      return;
-    }
-
-    createWindow();
-  }
+  // A remote window can keep the app open after the local window closes.
+  if (services) createWindow();
 }
 
 function updateTrayIcon() {
@@ -755,7 +867,13 @@ async function loadServices(): Promise<void> {
   });
 
   electronIpcMain.on("start-orpc-server", (event) => {
+    // SECURITY AUDIT: only registered local main frames can receive the local bearer credential.
+    if (!isLocalIpcSender(event)) {
+      for (const port of event.ports) port.close();
+      return;
+    }
     const [serverPort] = event.ports;
+    if (!serverPort) return;
     // Use Object.defineProperties to copy all property descriptors from
     // orpcContext as own-properties (required by oRPC's internal property
     // enumeration) while preserving any getters that must resolve lazily
@@ -823,7 +941,9 @@ async function loadServices(): Promise<void> {
   }
 
   // Set TerminalWindowManager for desktop mode (pop-out terminal windows)
-  const terminalWindowManager = new TerminalWindowManagerClass(config);
+  const terminalWindowManager = new TerminalWindowManagerClass(config, (options) =>
+    createLocalWindow(options, "terminal.html")
+  );
   services.setProjectDirectoryPicker(async (initialPath) => {
     const win = BrowserWindow.getFocusedWindow();
     if (!win) return null;
@@ -854,7 +974,10 @@ async function loadServices(): Promise<void> {
   });
 
   services.setDesktopWindowManager(
-    new DesktopWindowManager((options) => new BrowserWindow(options), app.isPackaged)
+    new DesktopWindowManager(
+      (options) => createLocalWindow(options, "desktop.html"),
+      app.isPackaged
+    )
   );
   services.setTerminalWindowManager(terminalWindowManager);
 
@@ -931,7 +1054,7 @@ function createWindow() {
 
   console.log(`[${timestamp()}] [window] Creating BrowserWindow...`);
 
-  mainWindow = new BrowserWindow({
+  mainWindow = createLocalWindow({
     x: windowState.x,
     y: windowState.y,
     width: windowState.width,
@@ -1245,6 +1368,7 @@ async function startDesktopAfterStorage(): Promise<void> {
         await showSplashScreen(); // Wait for splash to actually load
       }
       await loadServices();
+      initializeRemoteConnections();
       createWindow();
       createTray();
       // Note: splash closes in ready-to-show event handler
@@ -1276,6 +1400,7 @@ async function startDesktopAfterStorage(): Promise<void> {
     // Ensure window close handlers don't block an explicit quit.
     // IMPORTANT: must be set before any early returns.
     isQuitting = true;
+    remoteConnectionManager?.dispose();
     if (isUpdateInstallInProgress()) {
       // Don't block updater-driven quitAndInstall() — let Electron quit immediately
       // so the platform installer can take over. Best-effort cleanup only.

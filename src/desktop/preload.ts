@@ -18,6 +18,8 @@
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { contextBridge, ipcRenderer } from "electron";
 import type { DeepLinkPayload } from "@/common/types/deepLink";
+import type { RemoteConnectionApi, RemoteConnectionState } from "@/common/types/remoteConnection";
+import { REMOTE_CONNECTION_CHANNELS } from "@/common/constants/remoteConnection";
 
 const getXumEnv = (suffix: string): string | undefined =>
   resolveXumEnvironmentValue(suffix, process.env);
@@ -53,12 +55,24 @@ function getEnableTutorialsInSandbox(): boolean | undefined {
 
 // Forward ORPC MessagePort from renderer to main process
 window.addEventListener("message", (event) => {
-  if (event.data === "start-orpc-client" && event.ports?.[0]) {
+  if (event.source === window && event.data === "start-orpc-client" && event.ports?.[0]) {
     ipcRenderer.postMessage("start-orpc-server", null, [...event.ports]);
   }
 });
 
+const remoteConnection: RemoteConnectionApi = {
+  getState: () => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.getState),
+  connect: (url) => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.connect, url),
+  disconnect: () => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.disconnect),
+  onStateChanged: (callback) => {
+    const listener = (_event: unknown, state: RemoteConnectionState) => callback(state);
+    ipcRenderer.on(REMOTE_CONNECTION_CHANNELS.stateChanged, listener);
+    return () => ipcRenderer.off(REMOTE_CONNECTION_CHANNELS.stateChanged, listener);
+  },
+};
+
 contextBridge.exposeInMainWorld("api", {
+  remoteConnection,
   platform: process.platform,
   versions: {
     node: process.versions.node,

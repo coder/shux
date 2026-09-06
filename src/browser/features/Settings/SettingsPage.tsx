@@ -16,6 +16,7 @@ import {
   Shield,
   ShieldCheck,
   Server,
+  Monitor,
   Lock,
   ArchiveRestore,
   ScrollText,
@@ -40,6 +41,7 @@ import { LayoutsSection } from "./Sections/LayoutsSection";
 import { RuntimesSection } from "./Sections/RuntimesSection";
 import { ExperimentsSection } from "./Sections/ExperimentsSection";
 import { ServerAccessSection } from "./Sections/ServerAccessSection";
+import { RemoteConnectionSection } from "./Sections/RemoteConnectionSection";
 import { KeybindsSection } from "./Sections/KeybindsSection";
 import { SecuritySection } from "./Sections/SecuritySection";
 import { BackupSection } from "./Sections/BackupSection";
@@ -136,9 +138,19 @@ interface SettingsSectionRedirect {
 export function getSettingsSections(
   governorEnabled: boolean,
   memoryEnabled: boolean,
-  agentPluginsEnabled: boolean
+  agentPluginsEnabled: boolean,
+  remoteConnectionAvailable = false
 ): SettingsSection[] {
   const sections = [...BASE_SECTIONS];
+  if (remoteConnectionAvailable) {
+    const serverAccessIndex = sections.findIndex((section) => section.id === "server-access");
+    sections.splice(serverAccessIndex + 1, 0, {
+      id: "remote-connection",
+      label: "Remote Connection",
+      icon: <Monitor className="h-4 w-4 shrink-0" />,
+      component: RemoteConnectionSection,
+    });
+  }
   if (agentPluginsEnabled) {
     // Next to MCP: plugins contribute skills + MCP servers.
     const mcpIndex = sections.findIndex((section) => section.id === "mcp");
@@ -250,7 +262,12 @@ export function SettingsPage(props: SettingsPageProps) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [close]);
-  const sections = getSettingsSections(governorEnabled, memoryEnabled, agentPluginsEnabled);
+  const sections = getSettingsSections(
+    governorEnabled,
+    memoryEnabled,
+    agentPluginsEnabled,
+    window.api?.remoteConnection != null
+  );
   const currentSection = sections.find((section) => section.id === activeSection) ?? sections[0];
   const SectionComponent = currentSection.component;
 
