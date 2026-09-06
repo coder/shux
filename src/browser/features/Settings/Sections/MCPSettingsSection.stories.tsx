@@ -1,3 +1,4 @@
+import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { wrapAsyncIterator } from "@orpc/shared";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import { CLAUDE_DESIGN_URL } from "@/common/constants/claudeDesign";
@@ -432,7 +433,14 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
   },
 };
 
-function setupDesignStory(enabled = true, reuseEnabled = false): APIClient {
+function setupDesignStory(
+  enabled = true,
+  reuseEnabled = false,
+  sibling?: { disconnect: () => void }
+): APIClient {
+  const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+  let revision = 0;
+  updates.push({ enabled, revision });
   updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), enabled);
   const client = setupMCPSettingsSectionStory({
     servers: enabled
@@ -453,20 +461,14 @@ function setupDesignStory(enabled = true, reuseEnabled = false): APIClient {
     settings: {
       source: { type: "file", path: "/home/example/.claude/.credentials.json" },
       reuseEnabled,
-      serverEnabled: false,
+      serverEnabled: sibling !== undefined,
     },
   };
   client.experiments = {
-    onDesignChange: () =>
-      Promise.resolve(
-        wrapAsyncIterator(
-          (async function* () {
-            await Promise.resolve();
-            yield { enabled, revision: 0 };
-          })(),
-          {}
-        )
-      ),
+    onDesignChange: (_input, { signal } = {}) => {
+      signal?.addEventListener("abort", updates.end, { once: true });
+      return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
+    },
     getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled }),
     setOverride: () => Promise.resolve(),
   };
@@ -477,8 +479,28 @@ function setupDesignStory(enabled = true, reuseEnabled = false): APIClient {
       settings: { ...status.settings, ...settings },
       state: settings.reuseEnabled ? "not_configured" : "disabled",
     };
+    updates.push({ enabled, revision: ++revision });
     return Promise.resolve(status);
   };
+  if (sibling) {
+    client.mcp.list = () =>
+      Promise.resolve({
+        claude_design: {
+          transport: "http",
+          url: CLAUDE_DESIGN_URL,
+          managed: "claude-design",
+          disabled: !status.settings.serverEnabled,
+        },
+      });
+    sibling.disconnect = () => {
+      status = {
+        ...status,
+        state: "disabled",
+        settings: { ...status.settings, reuseEnabled: false, serverEnabled: false },
+      };
+      updates.push({ enabled, revision: ++revision });
+    };
+  }
   client.mcp.test = () => {
     status = { ...status, state: "consent_required" };
     return Promise.resolve({ success: false, error: "Claude Design: consent_required" });
@@ -577,5 +599,32 @@ export const ClaudeDesignPolicyDisconnect: Story = {
     await userEvent.keyboard("{Control>}{Shift>}d{/Shift}{/Control}");
     await canvas.findByRole("button", { name: "Use Claude Code credentials" });
     await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+  },
+};
+
+export const ClaudeDesignSiblingDisconnect: Story = {
+  tags: ["claude-design"],
+  render: () => {
+    const sibling: { disconnect: () => void } = { disconnect: () => undefined };
+    return (
+      <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true, sibling)}>
+        <button onClick={() => sibling.disconnect()}>Disconnect in sibling window</button>
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("button", { name: "Retry connection" });
+    await expect(
+      canvas.getByRole("switch", { name: "Toggle claude_design enabled" })
+    ).toBeChecked();
+    await userEvent.click(canvas.getByRole("button", { name: "Disconnect in sibling window" }));
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.queryByRole("button", { name: "Retry connection" })).toBeNull();
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+    await expect(
+      canvas.getByRole("switch", { name: "Toggle claude_design enabled" })
+    ).not.toBeChecked();
   },
 };

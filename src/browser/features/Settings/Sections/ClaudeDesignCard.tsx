@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useClaudeDesignRevision } from "@/browser/contexts/ExperimentsContext";
+import { useEffect, useState, useRef } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { Button } from "@/browser/components/Button/Button";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
@@ -34,15 +35,23 @@ export function ClaudeDesignCard(props: {
   remoteDisabled: boolean;
 }) {
   const { api } = useAPI();
+  const designRevision = useClaudeDesignRevision();
+  const [loadedRevision, setLoadedRevision] = useState<number | null>(null);
+  const statusRead = useRef({ id: 0, revision: designRevision });
   const [status, setStatus] = useState<ClaudeDesignStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
+    const id = statusRead.current.id + 1;
+    statusRead.current = { id, revision: designRevision };
     api?.mcp
       .designStatus()
       .then((value) => {
-        if (!cancelled) setStatus(value);
+        if (!cancelled && id === statusRead.current.id) {
+          setStatus(value);
+          setLoadedRevision(designRevision);
+        }
       })
       .catch(() => {
         if (!cancelled) setError("Could not load Claude Design settings.");
@@ -50,25 +59,30 @@ export function ClaudeDesignCard(props: {
     return () => {
       cancelled = true;
     };
-  }, [api]);
+  }, [api, designRevision]);
 
   async function save(settings: ClaudeDesignSettings, test: boolean) {
-    if (!api || busy) return;
+    if (!api || busy || (settings.reuseEnabled && loadedRevision !== designRevision)) return;
     setBusy(true);
     setError(null);
     try {
       // Only announce credential intent: the backend owns server enablement/allowlists,
       // which may have changed elsewhere since this card loaded.
-      setStatus(
-        await api.mcp.configureDesign({
-          reuseEnabled: settings.reuseEnabled,
-          ...(settings.reuseEnabled ? { source: settings.source } : {}),
-        })
-      );
+      await api.mcp.configureDesign({
+        reuseEnabled: settings.reuseEnabled,
+        ...(settings.reuseEnabled ? { source: settings.source } : {}),
+      });
       if (test) {
         const result = await api.mcp.test({ name: CLAUDE_DESIGN_SERVER_NAME });
         if (!result.success) setError(result.error);
-        setStatus(await api.mcp.designStatus());
+      }
+      // Fetch after the action; a newer subscription-driven read supersedes this one.
+      const id = ++statusRead.current.id;
+      const revision = statusRead.current.revision;
+      const value = await api.mcp.designStatus();
+      if (id === statusRead.current.id) {
+        setStatus(value);
+        setLoadedRevision(revision);
       }
       await props.onChange();
     } catch {
@@ -81,7 +95,8 @@ export function ClaudeDesignCard(props: {
   }
 
   // Conflicts and policy block connecting, but must never prevent withdrawing reuse.
-  const blocked = busy || props.conflict || props.remoteDisabled;
+  const blocked =
+    busy || loadedRevision !== designRevision || props.conflict || props.remoteDisabled;
   return (
     <section
       aria-label="Claude Design"

@@ -1,4 +1,4 @@
-import { watch, type FSWatcher } from "node:fs";
+import { watchFile, unwatchFile } from "node:fs";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { EXPERIMENT_OVERRIDES_FILE_NAME } from "./experimentsService";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -14,6 +14,7 @@ import {
   CLAUDE_DESIGN_URL,
   CLAUDE_DESIGN_READ_TIMEOUT_MS,
   CLAUDE_DESIGN_TEST_TIMEOUT_MS,
+  CLAUDE_DESIGN_WATCH_INTERVAL_MS,
 } from "@/common/constants/claudeDesign";
 import {
   ClaudeDesignSettingsSchema,
@@ -80,7 +81,11 @@ export function selectClaudeDesignCredential(raw: string, now: number): Credenti
       failure = "expired";
       continue;
     }
-    if (!Array.isArray(scopes) || !CLAUDE_DESIGN_SCOPES.every((scope) => scopes.includes(scope))) {
+    // Only the main-login fallback needs scope evidence; Design tokens are purpose-specific.
+    if (
+      kind === "claudeAiOauth" &&
+      (!Array.isArray(scopes) || !CLAUDE_DESIGN_SCOPES.every((scope) => scopes.includes(scope)))
+    ) {
       failure = "missing_scopes";
       continue;
     }
@@ -98,7 +103,10 @@ export class ClaudeDesignService {
   private settings = defaults();
   private loaded = false;
   private diskEnabled = true;
-  private watcher: FSWatcher | undefined;
+  private watching = false;
+  private readonly onFileChange = () => {
+    this.load().catch(() => undefined);
+  };
   private readonly lock = new MutexMap<string>();
   private controller = new AbortController();
   private reading: Promise<Credential> | undefined;
@@ -148,34 +156,36 @@ export class ClaudeDesignService {
   }
   onChange(listener: () => Promise<void>): () => void {
     this.listeners.add(listener);
-    if (!this.watcher) {
+    if (!this.watching) {
       try {
-        // Atomic replacement changes the file inode: watch its directory. Requests
-        // also re-read preferences, so missed/unavailable notifications fail closed.
-        this.watcher = watch(this.options.rootDir, (_event, filename) => {
-          if (
-            filename === null ||
-            filename === path.basename(this.filePath) ||
-            filename === EXPERIMENT_OVERRIDES_FILE_NAME
-          )
-            this.load().catch(() => undefined);
-        });
-        this.watcher.unref();
-        this.watcher.on("error", () => {
-          this.watcher?.close();
-          this.watcher = undefined;
-        });
+        // Bun/Linux can coalesce directory events before an atomic replacement
+        // completes, then omit the final rename. Observe file metadata instead;
+        // request-time revalidation and local mutations remain immediate.
+        for (const file of this.watchedFiles()) {
+          watchFile(
+            file,
+            { persistent: false, interval: CLAUDE_DESIGN_WATCH_INTERVAL_MS },
+            this.onFileChange
+          );
+        }
+        this.watching = true;
       } catch {
-        /* Request-time revalidation remains authoritative. */
+        this.stopWatching();
       }
     }
     return () => {
       this.listeners.delete(listener);
       if (this.listeners.size === 0) {
-        this.watcher?.close();
-        this.watcher = undefined;
+        this.stopWatching();
       }
     };
+  }
+  private watchedFiles(): string[] {
+    return [this.filePath, path.join(this.options.rootDir, EXPERIMENT_OVERRIDES_FILE_NAME)];
+  }
+  private stopWatching(): void {
+    for (const file of this.watchedFiles()) unwatchFile(file, this.onFileChange);
+    this.watching = false;
   }
   onExperimentChange(listener: (snapshot: ClaudeDesignExperimentSnapshot) => void): () => void {
     const unsubscribe = this.onChange(() => Promise.resolve());

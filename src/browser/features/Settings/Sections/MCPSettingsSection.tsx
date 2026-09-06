@@ -1,3 +1,4 @@
+import { useClaudeDesignRevision } from "@/browser/contexts/ExperimentsContext";
 import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -722,6 +723,8 @@ const RemoteMCPOAuthSection: React.FC<{
 
 export const MCPSettingsSection: React.FC = () => {
   const designEnabled = useExperimentValue(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
+  const designRevision = useClaudeDesignRevision();
+  const refreshRequest = useRef({ id: 0 });
   const { api } = useAPI();
   const policyState = usePolicy();
   const mcpAllowUserDefined =
@@ -802,15 +805,18 @@ export const MCPSettingsSection: React.FC = () => {
 
   const refresh = useCallback(async () => {
     if (!api) return;
+    const request = ++refreshRequest.current.id;
     setLoading(true);
     try {
       const mcpResult = await api.mcp.list({});
+      if (request !== refreshRequest.current.id) return;
       setServers(mcpResult ?? {});
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load MCP servers");
+      if (request === refreshRequest.current.id)
+        setError(err instanceof Error ? err.message : "Failed to load MCP servers");
     } finally {
-      setLoading(false);
+      if (request === refreshRequest.current.id) setLoading(false);
     }
   }, [api]);
 
@@ -840,8 +846,13 @@ export const MCPSettingsSection: React.FC = () => {
   }, [api]);
 
   useEffect(() => {
-    void refresh();
-  }, [refresh, designEnabled]);
+    // A sibling can change reuse/server settings while the experiment stays enabled.
+    const requests = refreshRequest.current;
+    refresh().catch(() => undefined);
+    return () => {
+      requests.id++;
+    };
+  }, [refresh, designEnabled, designRevision]);
 
   // Clear new-server test result when transport/value/headers change
   useEffect(() => {

@@ -169,6 +169,7 @@ function reconcileLegacyPtcExclusiveMirror(
  * Individual experiment values are accessed via useExperimentValue hook.
  */
 interface ExperimentsContextValue {
+  designRevision: number;
   setExperiment: (experimentId: ExperimentId, enabled: boolean) => void;
   backendOverrides: Partial<Record<ExperimentId, boolean>> | null;
 }
@@ -181,6 +182,7 @@ const ExperimentsContext = createContext<ExperimentsContextValue | null>(null);
  */
 export function ExperimentsProvider(props: { children: React.ReactNode }) {
   const apiState = useAPI();
+  const [designRevision, setDesignRevision] = useState(0);
   const [backendOverrides, setBackendOverrides] = useState<Partial<
     Record<ExperimentId, boolean>
   > | null>(null);
@@ -291,6 +293,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
           if (cancelled) break;
           if (snapshot.revision < revision) continue;
           revision = snapshot.revision;
+          setDesignRevision(snapshot.revision);
           setBackendOverrides((previous) => ({
             ...previous,
             [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: snapshot.enabled,
@@ -311,10 +314,15 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
   }, [apiState.api]);
 
   return (
-    <ExperimentsContext.Provider value={{ setExperiment, backendOverrides }}>
+    <ExperimentsContext.Provider value={{ setExperiment, backendOverrides, designRevision }}>
       {props.children}
     </ExperimentsContext.Provider>
   );
+}
+
+/** Settings revisions also cover sibling Disconnect, source, and allowlist changes. */
+export function useClaudeDesignRevision(): number {
+  return useContext(ExperimentsContext)?.designRevision ?? 0;
 }
 
 /**

@@ -83,6 +83,15 @@ describe("read-only credential selection", () => {
     expect(result.kind).toBe("designOauth");
     expect(Object.keys(result).sort()).toEqual(["accessToken", "expiresAt", "kind"]);
   });
+  test("Design tokens need no scope array but main-login tokens do", () => {
+    const credential = { accessToken: "synthetic-no-scopes", expiresAt: now + 60_000 };
+    expect(
+      selectClaudeDesignCredential(JSON.stringify({ designOauth: credential }), now).kind
+    ).toBe("designOauth");
+    expect(() =>
+      selectClaudeDesignCredential(JSON.stringify({ claudeAiOauth: credential }), now)
+    ).toThrow("missing_scopes");
+  });
   test("uses explicitly scoped main login when Design is absent or expired", () => {
     expect(
       selectClaudeDesignCredential(
@@ -106,7 +115,7 @@ describe("read-only credential selection", () => {
     [JSON.stringify({ designOauth: token("expired", { expiresAt: now }) }), "expired"],
     [JSON.stringify({ designOauth: token("unknown", { expiresAt: null }) }), "credentials_invalid"],
     [
-      JSON.stringify({ designOauth: token("scope", { scopes: [CLAUDE_DESIGN_SCOPES[0]] }) }),
+      JSON.stringify({ claudeAiOauth: token("scope", { scopes: [CLAUDE_DESIGN_SCOPES[0]] }) }),
       "missing_scopes",
     ],
   ])("classifies unavailable credential input", (raw, state) => {
