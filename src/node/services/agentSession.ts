@@ -4284,7 +4284,7 @@ export class AgentSession {
           return Ok(undefined);
         }
 
-        // Terminal turn-phase transitions are driven by handle completion.
+        // Raw terminals reserve COMPLETING; delivered completion runs terminal policy.
         const streamResult = await this.streamWithHistory(
           modelForStream,
           optionsForStream,
@@ -5468,14 +5468,19 @@ export class AgentSession {
               break;
             case "aborted":
               if (outcome.streamAbort) {
-                await this.handleTurnAbort(
-                  {
-                    ...outcome.streamAbort,
-                    messageId: handle.messageId,
-                    abortReason: outcome.abortReason,
-                  },
-                  outcome.systemMessageTokens
-                );
+                const payload = {
+                  ...outcome.streamAbort,
+                  messageId: handle.messageId,
+                  abortReason: outcome.abortReason,
+                };
+                if (operation.started) {
+                  await this.handleTurnAbort(payload, outcome.systemMessageTokens);
+                } else if (!operation.startupAbortNotified) {
+                  // A registered engine can abort during envelope preparation, before
+                  // provider startup. Preserve startup policy: no accounting or compaction.
+                  operation.startupAbortNotified = true;
+                  await this.handleStartupAbort(payload);
+                }
               }
               break;
           }
@@ -6357,6 +6362,21 @@ export class AgentSession {
     this.emitChatEvent(payload);
   }
 
+  private markStartedTurnCompleting(messageId: string): void {
+    const operation = this.activeTurnOperation;
+    if (
+      operation?.started &&
+      operation.messageId === messageId &&
+      !operation.consumed &&
+      this.isCurrentTurnOperation(operation) &&
+      this.turnPhase === TurnPhase.STREAMING
+    ) {
+      // Raw terminal observers can initiate edits before engine cleanup settles.
+      // Make those edits wait for completion instead of stopping an already-ended stream.
+      this.setTurnPhase(TurnPhase.COMPLETING);
+    }
+  }
+
   private async handleTurnAbort(
     payload: StreamAbortEvent,
     systemMessageTokens?: number
@@ -6883,6 +6903,7 @@ export class AgentSession {
         if (operation) operation.startupAbortNotified = true;
         return this.handleStartupAbort(payload);
       }
+      this.markStartedTurnCompleting(payload.messageId);
     });
     forward("runtime-status", (payload) => {
       if (payload.type === "runtime-status") {
@@ -6903,6 +6924,8 @@ export class AgentSession {
       ) {
         this.beginCompactionCompletionDecision(payload.messageId);
       }
+      // Register the decision before this transition emits a reentrant lifecycle event.
+      this.markStartedTurnCompleting(payload.messageId);
     });
 
     const errorHandler = (...args: unknown[]) => {

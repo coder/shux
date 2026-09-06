@@ -27,6 +27,7 @@ interface InternalSession {
   consumeTurnCompletion(handle: TurnStreamHandle, operation: Operation): Promise<void>;
   clearStartupAutoRetryAbandon(): Promise<void>;
   recordGoalAccountingFromUsage(input: unknown): Promise<void>;
+  observeContinuousCompactionAtStreamEnd(...args: unknown[]): Promise<void>;
   setTurnPhase(phase: "preparing" | "streaming" | "idle"): void;
   getEditTruncateTargetId(messageId: string): Promise<string>;
 }
@@ -65,7 +66,7 @@ function observePolicy(session: AgentSession) {
 }
 
 describe("AgentSession turn completion", () => {
-  test("raw success is observational; completion uses handle identity and runs policy once", async () => {
+  test("raw success defers policy; completion uses handle identity and runs policy once", async () => {
     const completion = Promise.withResolvers<TurnCompletion>();
     const emitter = new EventEmitter();
     const handle = { messageId: "assistant-1", completion: completion.promise };
@@ -102,56 +103,152 @@ describe("AgentSession turn completion", () => {
     }
   });
 
-  test("delivered abort before stream-start runs once and retains precleanup token context", async () => {
-    const envelopeEntered = Promise.withResolvers<void>();
-    const releaseEnvelope = Promise.withResolvers<void>();
-    const completion = Promise.withResolvers<TurnCompletion>();
-    const emitter = new EventEmitter();
-    const recordUserStoppedStream = mock(() => Promise.resolve());
-    const h = await createAgentSessionHarness({
-      workspaceId,
-      aiEmitter: emitter,
-      captureEvents: true,
-      aiServiceOverrides: {
-        streamMessage: mock(async (opts: StreamMessageOptions) => {
-          opts.onStreamStarting?.("starting-1");
-          envelopeEntered.resolve();
-          await releaseEnvelope.promise;
-          return Ok({ messageId: "assistant-1", completion: completion.promise });
-        }),
-      },
-    });
-    const consumer = observePolicy(h.session);
-    const send = h.session.sendMessage("hello", sendOptions);
-    try {
-      await envelopeEntered.promise;
-      Reflect.set(h.session, "workspaceGoalService", {
-        recordUserStoppedStream,
-        recordStreamAccounting: mock(() => Promise.resolve(null)),
-      } satisfies Partial<WorkspaceGoalService>);
-      emitter.emit("stream-abort", abort());
-      expect(recordUserStoppedStream).not.toHaveBeenCalled();
-      expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(0);
-      completion.resolve({
-        status: "aborted",
-        abortReason: "user",
-        streamAbort: abort(),
-        systemMessageTokens: 417,
+  test.each([false, true])(
+    "delivered abort with started=%s applies the matching policy once",
+    async (started) => {
+      const envelopeEntered = Promise.withResolvers<void>();
+      const releaseEnvelope = Promise.withResolvers<void>();
+      const completion = Promise.withResolvers<TurnCompletion>();
+      const emitter = new EventEmitter();
+      const recordUserStoppedStream = mock(() => Promise.resolve());
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter: emitter,
+        captureEvents: true,
+        aiServiceOverrides: {
+          streamMessage: mock(async (opts: StreamMessageOptions) => {
+            opts.onStreamStarting?.("starting-1");
+            if (started) start(emitter);
+            envelopeEntered.resolve();
+            await releaseEnvelope.promise;
+            return Ok({ messageId: "assistant-1", completion: completion.promise });
+          }),
+        },
       });
-      releaseEnvelope.resolve();
-      await send;
-      await policyPromise(consumer);
-      expect(recordUserStoppedStream).toHaveBeenCalledTimes(1);
-      expect(internal(h.session).lastSystemMessageTokens).toBe(417);
-      expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
-      expect(h.session.isBusy()).toBe(false);
-    } finally {
-      releaseEnvelope.resolve();
-      await send;
-      h.session.dispose();
-      await h.cleanup();
+      const consumer = observePolicy(h.session);
+      const accounting = spyOn(internal(h.session), "recordGoalAccountingFromUsage");
+      const compaction = spyOn(internal(h.session), "observeContinuousCompactionAtStreamEnd");
+      const send = h.session.sendMessage("hello", sendOptions);
+      try {
+        await envelopeEntered.promise;
+        Reflect.set(h.session, "workspaceGoalService", {
+          recordUserStoppedStream,
+          recordStreamAccounting: mock(() => Promise.resolve(null)),
+        } satisfies Partial<WorkspaceGoalService>);
+        emitter.emit("stream-abort", abort());
+        expect(recordUserStoppedStream).not.toHaveBeenCalled();
+        expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(0);
+        completion.resolve({
+          status: "aborted",
+          abortReason: "user",
+          streamAbort: abort(),
+          systemMessageTokens: 417,
+        });
+        releaseEnvelope.resolve();
+        await send;
+        await policyPromise(consumer);
+        expect(recordUserStoppedStream).toHaveBeenCalledTimes(1);
+        expect(accounting).toHaveBeenCalledTimes(started ? 1 : 0);
+        expect(compaction).toHaveBeenCalledTimes(started ? 1 : 0);
+        expect(internal(h.session).lastSystemMessageTokens).toBe(started ? 417 : undefined);
+        expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
+        expect(h.session.isBusy()).toBe(false);
+      } finally {
+        releaseEnvelope.resolve();
+        await send;
+        h.session.dispose();
+        await h.cleanup();
+      }
     }
-  });
+  );
+
+  test.each(["stream-end", "stream-abort"] as const)(
+    "edit from raw %s waits for delivered completion without interrupting again",
+    async (terminal) => {
+      const completion = Promise.withResolvers<TurnCompletion>();
+      const replacementStarted = Promise.withResolvers<void>();
+      const emitter = new EventEmitter();
+      let calls = 0;
+      const stopStream = mock(() => {
+        // The engine registry has already been cleared by the raw terminal.
+        emitter.emit("stream-abort", abort(""));
+        return Promise.resolve(Ok(undefined));
+      });
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter: emitter,
+        captureEvents: true,
+        aiServiceOverrides: {
+          stopStream,
+          streamMessage: mock(() => {
+            const messageId = `assistant-${++calls}`;
+            start(emitter, messageId);
+            if (calls === 2) replacementStarted.resolve();
+            return Promise.resolve(
+              Ok({
+                messageId,
+                completion:
+                  calls === 1 ? completion.promise : new Promise<TurnCompletion>(() => undefined),
+              })
+            );
+          }),
+        },
+      });
+      const consumer = observePolicy(h.session);
+      const accounting = spyOn(internal(h.session), "recordGoalAccountingFromUsage");
+      const editAdmissionEntered = Promise.withResolvers<void>();
+      const interruptStream = h.session.interruptStream.bind(h.session);
+      const interrupt = spyOn(h.session, "interruptStream").mockImplementation((options) => {
+        editAdmissionEntered.resolve();
+        return interruptStream(options);
+      });
+      const waitForIdle = h.session.waitForIdle.bind(h.session);
+      spyOn(h.session, "waitForIdle").mockImplementation((signal) => {
+        editAdmissionEntered.resolve();
+        return waitForIdle(signal);
+      });
+      const payload = { ...abort(), abortReason: "system" as const };
+      const outcome: TurnCompletion =
+        terminal === "stream-end"
+          ? { status: "completed", streamEnd: end() }
+          : { status: "aborted", abortReason: "system", streamAbort: payload };
+      let edit: ReturnType<AgentSession["sendMessage"]> | undefined;
+      try {
+        await h.session.sendMessage("original", sendOptions);
+        const firstPolicy = policyPromise(consumer);
+        const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!history.success) throw new Error(history.error);
+        const userId = history.data.find((message) => message.role === "user")!.id;
+        emitter.once(terminal, () => {
+          edit = h.session.sendMessage("edited", { ...sendOptions, editMessageId: userId });
+        });
+        emitter.emit(terminal, terminal === "stream-end" ? end() : payload);
+        // Observe the actual edit admission branch after its asynchronous history reads.
+        await editAdmissionEntered.promise;
+        expect(edit).toBeDefined();
+        expect(interrupt).not.toHaveBeenCalled();
+        expect(stopStream).not.toHaveBeenCalled();
+        expect(accounting).not.toHaveBeenCalled();
+        expect(calls).toBe(1);
+        expect(h.session.isBusy()).toBe(true);
+        completion.resolve(outcome);
+        await firstPolicy;
+        expect((await edit)?.success).toBe(true);
+        await replacementStarted.promise;
+        expect(calls).toBe(2);
+        expect(h.session.isBusy()).toBe(true);
+        expect(h.events.filter((event) => event.type === terminal)).toHaveLength(1);
+        expect(
+          h.events.filter((event) => event.type === "stream-abort" && event.abortReason === "user")
+        ).toHaveLength(0);
+      } finally {
+        completion.resolve(outcome);
+        await edit;
+        h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
 
   test.each(["user", "system"] as const)(
     "startup %s cancellation handle does not duplicate its delayed notification",
@@ -238,6 +335,10 @@ describe("AgentSession turn completion", () => {
         });
         replacement = h.session.sendMessage("replacement", sendOptions);
         await historyEntered.promise;
+        // Old raw terminals must not mark the replacement as completing either.
+        if (status === "completed") emitter.emit("stream-end", end());
+        if (status === "aborted") emitter.emit("stream-abort", abort());
+        expect(h.session.isPreparingTurn()).toBe(true);
         completion.resolve(
           status === "completed"
             ? { status, streamEnd: end() }
@@ -351,6 +452,12 @@ describe("AgentSession turn completion", () => {
         }),
       },
     });
+    let lifecycleDecision: Promise<boolean> | undefined;
+    h.session.onChatEvent(({ message }) => {
+      if (message.type === "stream-lifecycle" && message.phase === "completing") {
+        lifecycleDecision = h.session.waitForPendingCompactionCompletionDecision("assistant-1");
+      }
+    });
     let decision: Promise<boolean> | undefined;
     // Raw terminal observation must happen before the handle is returned to sendMessage.
     emitter.on("stream-end", () => {
@@ -383,6 +490,8 @@ describe("AgentSession turn completion", () => {
       await firstPolicy.value;
       expect(decision).toBeDefined();
       expect(await decision).toBe(true);
+      expect(lifecycleDecision).toBeDefined();
+      expect(await lifecycleDecision).toBe(true);
       expect(calls).toBe(2);
       expect(h.session.isBusy()).toBe(true);
       const rendererEnds = h.events.filter((event) => event.type === "stream-end");
