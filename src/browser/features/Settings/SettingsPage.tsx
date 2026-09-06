@@ -192,7 +192,8 @@ export function getSettingsSectionRedirect(
   activeSection: string,
   governorEnabled: boolean,
   memoryEnabled: boolean,
-  agentPluginsEnabled: boolean
+  agentPluginsEnabled: boolean,
+  remoteConnectionAvailable = false
 ): SettingsSectionRedirect | null {
   if (LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS.has(activeSection)) {
     return { section: "experiments", replace: true };
@@ -210,6 +211,10 @@ export function getSettingsSectionRedirect(
     return { section: BASE_SECTIONS[0]?.id ?? "general" };
   }
 
+  if (!remoteConnectionAvailable && activeSection === "remote-connection") {
+    return { section: BASE_SECTIONS[0]?.id ?? "general" };
+  }
+
   return null;
 }
 
@@ -224,14 +229,16 @@ export function SettingsPage(props: SettingsPageProps) {
   const governorEnabled = useExperimentValue(EXPERIMENT_IDS.MUX_GOVERNOR);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
+  const remoteConnectionAvailable = window.api?.remoteConnection != null;
 
-  // Keep routing on a valid section when experiment-owned settings move or disappear.
+  // Redirect restored links when an experiment or desktop bridge is unavailable.
   useEffect(() => {
     const redirect = getSettingsSectionRedirect(
       activeSection,
       governorEnabled,
       memoryEnabled,
-      agentPluginsEnabled
+      agentPluginsEnabled,
+      remoteConnectionAvailable
     );
     if (!redirect) {
       return;
@@ -243,7 +250,14 @@ export function SettingsPage(props: SettingsPageProps) {
     }
 
     setActiveSection(redirect.section);
-  }, [activeSection, setActiveSection, governorEnabled, memoryEnabled, agentPluginsEnabled]);
+  }, [
+    activeSection,
+    setActiveSection,
+    governorEnabled,
+    memoryEnabled,
+    agentPluginsEnabled,
+    remoteConnectionAvailable,
+  ]);
 
   // Close settings on Escape. Uses bubble phase so inner surfaces (Select dropdowns,
   // Popover, Dialog) that call stopPropagation/preventDefault on Escape get first
@@ -266,7 +280,7 @@ export function SettingsPage(props: SettingsPageProps) {
     governorEnabled,
     memoryEnabled,
     agentPluginsEnabled,
-    window.api?.remoteConnection != null
+    remoteConnectionAvailable
   );
   const currentSection = sections.find((section) => section.id === activeSection) ?? sections[0];
   const SectionComponent = currentSection.component;

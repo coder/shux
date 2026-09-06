@@ -116,7 +116,7 @@ test("remote connection isolates the page and returns to the same local renderer
     .poll(() => page.evaluate(() => window.api?.remoteConnection?.getState()))
     .toEqual({
       status: "connected",
-      origin: remoteServer.url,
+      serverUrl: remoteServer.url,
     });
   const previousClipboard = await app.evaluate(({ clipboard }: { clipboard: Clipboard }) =>
     clipboard.readText()
@@ -178,7 +178,7 @@ test("remote connection isolates the page and returns to the same local renderer
     .poll(() => page.evaluate(() => window.api?.remoteConnection?.getState()))
     .toEqual({
       status: "disconnected",
-      origin: null,
+      serverUrl: null,
     });
   expect(await localRenderer.evaluate((element) => element === document.documentElement)).toBe(
     true
@@ -211,4 +211,59 @@ test("remote connection isolates the page and returns to the same local renderer
   );
   await localRenderer.dispose();
   await localWindow.dispose();
+});
+
+test("Coder path-mounted servers retain their URL and isolate sibling sessions", async ({
+  app,
+  page,
+  ui,
+  remoteServer,
+}) => {
+  await ui.settings.open();
+  await page.getByRole("button", { name: "Remote Connection", exact: true }).click();
+  const firstServerUrl = remoteServer.url + "/@alice/first/apps/xum";
+  const secondServerUrl = remoteServer.url + "/@alice/second/apps/xum";
+  const connections = [
+    {
+      url: firstServerUrl + "/workspaces/one?token=path-token",
+      serverUrl: firstServerUrl,
+      cookie: "",
+    },
+    { url: firstServerUrl, serverUrl: firstServerUrl, cookie: "remote-session=kept" },
+    { url: secondServerUrl, serverUrl: secondServerUrl, cookie: "" },
+  ];
+  for (const [index, connection] of connections.entries()) {
+    const input = page.getByLabel("Server URL", { exact: true });
+    if (index !== 1) await input.fill(connection.url);
+    else await expect(input).toHaveValue(firstServerUrl);
+    const opened = app.waitForEvent("window");
+    await page.getByRole("button", { name: "Connect", exact: true }).click();
+    const remote = await opened;
+    await expect(remote.getByRole("heading", { name: "Remote server" })).toBeVisible();
+    expect(remote.url()).toBe(connection.url);
+    await expect
+      .poll(() => page.evaluate(() => window.api?.remoteConnection?.getState()))
+      .toEqual({
+        status: "connected",
+        serverUrl: connection.serverUrl,
+      });
+    expect(await remote.evaluate(() => document.cookie)).toBe(connection.cookie);
+    if (index === 0) {
+      expect(remoteServer.requests).toContain(
+        "/@alice/first/apps/xum/workspaces/one?token=path-token"
+      );
+      // A root-path cookie detects session sharing between servers on the same origin.
+      await remote.evaluate(() => {
+        document.cookie = "remote-session=kept; Path=/; SameSite=Lax";
+      });
+    }
+    await remote.close();
+    await expect
+      .poll(() => page.evaluate(() => window.api?.remoteConnection?.getState()))
+      .toEqual({
+        status: "disconnected",
+        serverUrl: null,
+      });
+    await expect(input).toHaveValue(connection.serverUrl);
+  }
 });

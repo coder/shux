@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseRemoteConnectionUrl } from "./remoteConnection";
+import { getRemoteConnectionServerUrl, parseRemoteConnectionUrl } from "./remoteConnection";
 
 describe("parseRemoteConnectionUrl", () => {
   test.each([
@@ -52,4 +52,39 @@ describe("parseRemoteConnectionUrl", () => {
     expect(url.hash).toBe("#private-session");
     expect(url.origin).toBe("https://example.com");
   });
+});
+
+describe("getRemoteConnectionServerUrl", () => {
+  test.each([
+    ["HTTPS://Example.COM:443/?token=secret#session", "https://example.com"],
+    ["http://localhost:3000/", "http://localhost:3000"],
+    ["https://example.com/mounted/xum/?token=secret#session", "https://example.com/mounted/xum"],
+    ["https://example.com/mounted/xum?token=other", "https://example.com/mounted/xum"],
+    ["https://example.com/other/xum/", "https://example.com/other/xum"],
+    [
+      "https://example.com/@alice/workspace/apps/xum/workspaces/one?token=secret#chat",
+      "https://example.com/@alice/workspace/apps/xum",
+    ],
+    [
+      "https://example.com/@alice/workspace/agent/apps/xum/settings/providers",
+      "https://example.com/@alice/workspace/agent/apps/xum",
+    ],
+    ["https://example.com/team%20one/xum/", "https://example.com/team%20one/xum"],
+  ])("preserves the server path without credentials or tokens: %s", (input, serverUrl) => {
+    expect(getRemoteConnectionServerUrl(input)).toBe(serverUrl);
+  });
+
+  test("keeps different path-mounted servers separate", () => {
+    const first = getRemoteConnectionServerUrl("https://example.com/first/?token=one");
+    const second = getRemoteConnectionServerUrl("https://example.com/second/?token=two");
+    expect(first).not.toBe(second);
+    expect(first).toBe(getRemoteConnectionServerUrl("https://example.com/first?token=new#session"));
+  });
+
+  test.each(["https://user:password@example.com/path", "file:///path", "invalid"])(
+    "rejects invalid server identities: %s",
+    (input) => {
+      expect(() => getRemoteConnectionServerUrl(input)).toThrow();
+    }
+  );
 });

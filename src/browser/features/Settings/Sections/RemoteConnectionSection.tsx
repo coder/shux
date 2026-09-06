@@ -5,12 +5,12 @@ import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { isMac } from "@/browser/utils/ui/keybinds";
 import { REMOTE_CONNECTION_RETURN_ACCELERATOR } from "@/common/constants/remoteConnection";
 import {
-  parseRemoteConnectionUrl,
+  getRemoteConnectionServerUrl,
   type RemoteConnectionState,
 } from "@/common/types/remoteConnection";
 import { getErrorMessage } from "@/common/utils/errors";
 
-export const REMOTE_CONNECTION_ORIGIN_KEY = "remoteConnectionOrigin";
+export const REMOTE_CONNECTION_URL_KEY = "remoteConnectionUrl";
 
 const STATUS_LABELS: Record<RemoteConnectionState["status"], string> = {
   disconnected: "Disconnected",
@@ -20,11 +20,11 @@ const STATUS_LABELS: Record<RemoteConnectionState["status"], string> = {
 
 export function RemoteConnectionSection() {
   const bridge = window.api?.remoteConnection;
-  const [savedOrigin, setSavedOrigin] = usePersistedState(REMOTE_CONNECTION_ORIGIN_KEY, "");
-  // Keep pasted tokens transient. Only the validated origin can enter local storage.
+  const [savedUrl, setSavedUrl] = usePersistedState(REMOTE_CONNECTION_URL_KEY, "");
+  // Keep pasted tokens transient. Save the server pathname for app-proxy connections.
   const [url, setUrl] = useState(() => {
     try {
-      return parseRemoteConnectionUrl(savedOrigin).origin;
+      return getRemoteConnectionServerUrl(savedUrl);
     } catch {
       return "";
     }
@@ -78,10 +78,10 @@ export function RemoteConnectionSection() {
     if (!bridge || !canConnect) return;
     setError(null);
     try {
-      const origin = parseRemoteConnectionUrl(url).origin;
-      setSavedOrigin(origin);
+      const serverUrl = getRemoteConnectionServerUrl(url);
+      setSavedUrl(serverUrl);
       const enteredUrl = url;
-      setUrl(origin);
+      setUrl(serverUrl);
       setConnecting(true);
       await bridge.connect(enteredUrl);
     } finally {
@@ -137,7 +137,8 @@ export function RemoteConnectionSection() {
           />
           <p id="remote-connection-help" className="text-muted text-xs">
             Enter an HTTP or HTTPS URL. You can include a token link. Sign in through the remote web
-            UI. Only the server origin is saved. Xum does not connect automatically.
+            UI. The server address and path are saved without tokens. Xum does not connect
+            automatically.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -166,7 +167,7 @@ export function RemoteConnectionSection() {
           : error
             ? "Connection state unavailable"
             : "Reading connection state…"}
-        {connection?.origin && <span> · {connection.origin}</span>}
+        {connection?.serverUrl && <span> · {connection.serverUrl}</span>}
       </div>
       {error && (
         <p role="alert" className="text-destructive text-xs [overflow-wrap:anywhere]">

@@ -1,5 +1,6 @@
 import type { BrowserWindow, BrowserWindowConstructorOptions, Event } from "electron";
 import { createHash } from "node:crypto";
+import { getAppProxyBasePathFromPathname } from "@/common/appProxyBasePath";
 import {
   REMOTE_CONNECTION_GESTURE_WORLD_ID,
   REMOTE_CONNECTION_LOAD_TIMEOUT_MS,
@@ -7,13 +8,14 @@ import {
 } from "@/common/constants/remoteConnection";
 import {
   parseRemoteConnectionUrl,
+  getRemoteConnectionServerUrl,
   type RemoteConnectionState,
 } from "@/common/types/remoteConnection";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
 interface RemoteWindowEntry {
   window: BrowserWindow;
-  origin: string;
+  serverUrl: string;
   abort: AbortController;
   loaded: Promise<void>;
   popup: BrowserWindow | "opening" | null;
@@ -35,10 +37,20 @@ const REMOTE_WEB_PREFERENCES = {
   spellcheck: false,
 };
 
+function isRemoteNavigationAllowed(serverUrl: string, target: string): boolean {
+  const server = parseRemoteConnectionUrl(serverUrl);
+  const destination = parseRemoteConnectionUrl(target);
+  if (server.origin !== destination.origin) return false;
+  const serverAppPath = getAppProxyBasePathFromPathname(server.pathname);
+  const targetAppPath = getAppProxyBasePathFromPathname(destination.pathname);
+  // Coder login redirects can leave the app path, but must not enter another proxied app.
+  return serverAppPath == null || targetAppPath == null || serverAppPath === targetAppPath;
+}
+
 /** Owns remote windows, never the local backend or its running tasks. */
 export class RemoteConnectionManager {
   private entry: RemoteWindowEntry | null = null;
-  private state: RemoteConnectionState = { status: "disconnected", origin: null };
+  private state: RemoteConnectionState = { status: "disconnected", serverUrl: null };
   private disposed = false;
 
   constructor(private readonly options: RemoteWindowOptions) {}
@@ -50,9 +62,10 @@ export class RemoteConnectionManager {
   async connect(input: string): Promise<void> {
     if (this.disposed) throw new Error("Remote connections are shutting down.");
     const url = parseRemoteConnectionUrl(input);
+    const serverUrl = getRemoteConnectionServerUrl(input);
     const existing = this.entry;
     if (existing) {
-      if (existing.origin !== url.origin) {
+      if (existing.serverUrl !== serverUrl) {
         throw new Error("Disconnect the current remote server first.");
       }
       await existing.loaded;
@@ -65,8 +78,8 @@ export class RemoteConnectionManager {
     }
 
     // SECURITY AUDIT: remote HTML must never receive the local preload or local session credentials.
-    // A partition per origin also isolates servers that share a hostname but use different ports.
-    const partition = "persist:xum-remote-" + createHash("sha256").update(url.origin).digest("hex");
+    // App-proxy paths need separate storage because browser localStorage only isolates by origin.
+    const partition = "persist:xum-remote-" + createHash("sha256").update(serverUrl).digest("hex");
     const window = this.options.createWindow({
       width: 1200,
       height: 800,
@@ -79,13 +92,13 @@ export class RemoteConnectionManager {
     });
     const entry: RemoteWindowEntry = {
       window,
-      origin: url.origin,
+      serverUrl,
       abort: new AbortController(),
       loaded: Promise.resolve(),
       popup: null,
     };
     this.entry = entry;
-    this.setState({ status: "connecting", origin: url.origin });
+    this.setState({ status: "connecting", serverUrl });
     this.guardWindow(entry);
     // Reserve the window before loading. Duplicate requests share its completion.
     entry.loaded = this.loadWindow(entry, url.href);
@@ -111,7 +124,7 @@ export class RemoteConnectionManager {
     contents.on("will-prevent-unload", (event) => event.preventDefault());
     const guardNavigation = (event: Event, target: string): void => {
       try {
-        if (parseRemoteConnectionUrl(target).origin === entry.origin) return;
+        if (isRemoteNavigationAllowed(entry.serverUrl, target)) return;
       } catch {
         // Malformed URLs and non-HTTP schemes cannot navigate remote windows.
       }
@@ -177,7 +190,7 @@ export class RemoteConnectionManager {
       !entry.window.isDestroyed() &&
       entry.window.isFocused() &&
       entry.window.webContents.getURL() === requestingUrl;
-    if (!isActiveRequest() || parseRemoteConnectionUrl(requestingUrl).origin !== entry.origin)
+    if (!isActiveRequest() || !isRemoteNavigationAllowed(entry.serverUrl, requestingUrl))
       return false;
     // SECURITY AUDIT: the page can replace its own navigator properties, but not this isolated world's properties.
     const activated: unknown = await entry.window.webContents.executeJavaScriptInIsolatedWorld(
@@ -229,7 +242,7 @@ export class RemoteConnectionManager {
       entry.window.focus();
       // Hide only the local window. Local agents and their renderer state remain alive.
       this.options.onConnected();
-      this.setState({ status: "connected", origin: entry.origin });
+      this.setState({ status: "connected", serverUrl: entry.serverUrl });
     } catch {
       // Electron errors can include URL tokens. Report only a credential-free error.
       if (this.entry !== entry) return;
@@ -250,7 +263,7 @@ export class RemoteConnectionManager {
     const popup = entry.popup;
     if (popup && popup !== "opening" && !popup.isDestroyed()) popup.destroy();
     if (!entry.window.isDestroyed()) entry.window.destroy();
-    this.setState({ status: "disconnected", origin: null, ...(error ? { error } : {}) });
+    this.setState({ status: "disconnected", serverUrl: null, ...(error ? { error } : {}) });
     if (!this.disposed) this.options.onDisconnected();
   }
 

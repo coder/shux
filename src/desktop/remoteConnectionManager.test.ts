@@ -116,13 +116,13 @@ describe("RemoteConnectionManager", () => {
   test("keeps the local window until load completes and shares duplicate connections", async () => {
     const load = deferred();
     const { manager, windows, onConnected, onStateChanged } = setup(load.promise);
-    const first = manager.connect("https://example.com/path?token=first");
-    const duplicate = manager.connect("https://example.com/other?token=second");
+    const first = manager.connect("https://example.com/?token=first");
+    const duplicate = manager.connect("https://example.com/?token=second");
     expect(windows).toHaveLength(1);
     expect(windows[0].loadURL).toHaveBeenCalledTimes(1);
     expect(windows[0].show).not.toHaveBeenCalled();
     expect(onConnected).not.toHaveBeenCalled();
-    expect(manager.getState()).toEqual({ status: "connecting", origin: "https://example.com" });
+    expect(manager.getState()).toEqual({ status: "connecting", serverUrl: "https://example.com" });
     load.resolve();
     await Promise.all([first, duplicate]);
     expect(onConnected).toHaveBeenCalledTimes(1);
@@ -153,7 +153,7 @@ describe("RemoteConnectionManager", () => {
       expect(manager.connect("https://other.example.com/")).rejects.toThrow();
       expect(windows).toHaveLength(1);
       expect(windows[0].destroyed).toBe(false);
-      expect(manager.getState().origin).toBe("https://example.com");
+      expect(manager.getState().serverUrl).toBe("https://example.com");
       load.resolve();
       await pending;
     }
@@ -168,7 +168,7 @@ describe("RemoteConnectionManager", () => {
       const duplicate = manager.connect("https://example.com/");
       manager.disconnect();
       await Promise.all([first, duplicate]);
-      expect(manager.getState()).toEqual({ status: "disconnected", origin: null });
+      expect(manager.getState()).toEqual({ status: "disconnected", serverUrl: null });
       expect(onDisconnected).toHaveBeenCalledTimes(1);
       expect(windows[0].destroyed).toBe(true);
       if (completion === "resolve") load.resolve();
@@ -209,7 +209,7 @@ describe("RemoteConnectionManager", () => {
       );
       expect(manager.getState()).toEqual({
         status: "connected",
-        origin: "https://new.example.com",
+        serverUrl: "https://new.example.com",
       });
       expect(onConnected).toHaveBeenCalledTimes(1);
       expect(onDisconnected).toHaveBeenCalledTimes(1);
@@ -326,11 +326,103 @@ describe("RemoteConnectionManager", () => {
     expect(windows).toHaveLength(1);
   });
 
+  test("keeps path-mounted server identities and sessions separate on one origin", async () => {
+    const load = deferred();
+    const { manager, windows, options, onStateChanged } = setup(load.promise);
+    const address = "https://example.com/mounted/first/?token=private-token#private-session";
+    const first = manager.connect(address);
+    const duplicate = manager.connect("https://EXAMPLE.com:443/mounted/first?token=other-token");
+    expect(windows).toHaveLength(1);
+    expect(windows[0].loadURL).toHaveBeenCalledWith(address);
+    expect(manager.getState()).toEqual({
+      status: "connecting",
+      serverUrl: "https://example.com/mounted/first",
+    });
+    const otherServer = manager.connect("https://example.com/mounted/second").then(
+      () => undefined,
+      (error: unknown) => error
+    );
+    expect(windows).toHaveLength(1);
+    load.resolve();
+    await Promise.all([first, duplicate]);
+    expect(await otherServer).toBeInstanceOf(Error);
+    expect(manager.getState()).toEqual({
+      status: "connected",
+      serverUrl: "https://example.com/mounted/first",
+    });
+    manager.disconnect();
+    await manager.connect("https://example.com/mounted/first");
+    expect(options[1].webPreferences?.partition).toBe(options[0].webPreferences?.partition);
+    manager.disconnect();
+    await manager.connect("https://example.com/mounted/second");
+    expect(options[2].webPreferences?.partition).not.toBe(options[0].webPreferences?.partition);
+    expect(manager.getState().serverUrl).toBe("https://example.com/mounted/second");
+    for (const secret of ["private-token", "private-session", "other-token"]) {
+      expect(JSON.stringify(options)).not.toContain(secret);
+      expect(JSON.stringify(onStateChanged.mock.calls)).not.toContain(secret);
+    }
+  });
+
+  test.each(["will-navigate", "will-redirect"])(
+    "allows Coder login and return but blocks sibling app %s",
+    async (event) => {
+      const { manager, windows } = setup();
+      await manager.connect(
+        "https://example.com/@alice/workspace/apps/xum/workspaces/one?token=private-token"
+      );
+      const contents = windows[0].webContents;
+      for (const url of [
+        "https://example.com/login?redirect=%2F%40alice%2Fworkspace%2Fapps%2Fxum",
+        "https://example.com/",
+        "https://example.com/@alice/workspace/apps/xum",
+        "https://example.com/@alice/workspace/apps/xum/workspaces/two?token=next#message",
+      ]) {
+        const preventDefault = mock(() => undefined);
+        contents.emit(event, { preventDefault }, url);
+        expect(preventDefault).not.toHaveBeenCalled();
+      }
+      for (const url of [
+        "https://example.com/@alice/workspace/apps/other",
+        "https://example.com/@alice/workspace/apps/xum-sibling",
+        "https://example.com/@alice/other/apps/xum/",
+        "https://example.com/@bob/workspace/apps/xum/",
+        "https://other.example.com/@alice/workspace/apps/xum/",
+        "https://user:password@example.com/@alice/workspace/apps/xum/",
+      ]) {
+        const preventDefault = mock(() => undefined);
+        contents.emit(event, { preventDefault }, url);
+        expect(preventDefault).toHaveBeenCalledTimes(1);
+      }
+    }
+  );
+
+  test.each(["https://example.com/", "https://example.com/mounted/xum"])(
+    "retains same-origin navigation outside Coder mounts: %s",
+    async (serverUrl) => {
+      const { manager, windows } = setup();
+      await manager.connect(serverUrl);
+      for (const event of ["will-navigate", "will-redirect"]) {
+        for (const url of [
+          "https://example.com/login",
+          "https://example.com/mounted/other",
+          "https://example.com/@alice/workspace/apps/other",
+        ]) {
+          const preventDefault = mock(() => undefined);
+          windows[0].webContents.emit(event, { preventDefault }, url);
+          expect(preventDefault).not.toHaveBeenCalled();
+        }
+        const preventDefault = mock(() => undefined);
+        windows[0].webContents.emit(event, { preventDefault }, "https://other.example.com/login");
+        expect(preventDefault).toHaveBeenCalledTimes(1);
+      }
+    }
+  );
+
   test("isolates origin sessions without a preload or URL tokens", async () => {
     const { manager, options, onStateChanged, windows } = setup();
     const urls = [
       "https://example.com/path?token=private-token#private-session",
-      "https://EXAMPLE.com:443/other?token=other-token",
+      "https://EXAMPLE.com:443/path/?token=other-token",
       "http://example.com/",
       "https://example.com:8443/",
       "https://other.example.com/",
@@ -366,7 +458,7 @@ describe("RemoteConnectionManager", () => {
       const { manager, windows, onConnected, onStateChanged } = setup();
       expect(manager.connect(url)).rejects.toThrow();
       expect(windows).toHaveLength(0);
-      expect(manager.getState()).toEqual({ status: "disconnected", origin: null });
+      expect(manager.getState()).toEqual({ status: "disconnected", serverUrl: null });
       expect(onConnected).not.toHaveBeenCalled();
       expect(onStateChanged).not.toHaveBeenCalled();
     }
@@ -512,7 +604,10 @@ describe("RemoteConnectionManager", () => {
     oldContents.emit("did-create-window", popup);
     expect(popup.destroyed).toBe(true);
     expect(windows[1].destroyed).toBe(false);
-    expect(manager.getState()).toEqual({ status: "connected", origin: "https://new.example.com" });
+    expect(manager.getState()).toEqual({
+      status: "connected",
+      serverUrl: "https://new.example.com",
+    });
     expect(onDisconnected).toHaveBeenCalledTimes(1);
   });
 
@@ -672,7 +767,7 @@ describe("RemoteConnectionManager", () => {
       expect(remote.destroyed).toBe(true);
       expect(popup.destroyed).toBe(true);
       expect(onDisconnected).toHaveBeenCalledTimes(1);
-      expect(manager.getState()).toEqual({ status: "disconnected", origin: null });
+      expect(manager.getState()).toEqual({ status: "disconnected", serverUrl: null });
     }
   );
 

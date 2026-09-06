@@ -2,20 +2,20 @@ import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
-import { REMOTE_CONNECTION_ORIGIN_KEY } from "@/browser/features/Settings/Sections/RemoteConnectionSection";
+import { REMOTE_CONNECTION_URL_KEY } from "@/browser/features/Settings/Sections/RemoteConnectionSection";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
-  parseRemoteConnectionUrl,
+  getRemoteConnectionServerUrl,
   type RemoteConnectionApi,
   type RemoteConnectionState,
 } from "@/common/types/remoteConnection";
 
-const SAVED_ORIGIN = "https://saved.example.com";
-const SERVER_ORIGIN = "https://remote.example.com";
-const TOKEN_URL = SERVER_ORIGIN + "/?token=transient-secret#private-fragment";
+const SAVED_SERVER_URL = "https://saved.example.com/@user/existing/apps/xum";
+const SERVER_URL = "https://remote.example.com/@user/workspace/apps/xum";
+const TOKEN_URL = SERVER_URL + "///?token=transient-secret#private-fragment";
 
 function createRemoteBridge() {
-  let state: RemoteConnectionState = { origin: null, status: "disconnected" };
+  let state: RemoteConnectionState = { serverUrl: null, status: "disconnected" };
   const listeners = new Set<(next: RemoteConnectionState) => void>();
   const publish = (next: RemoteConnectionState) => {
     state = next;
@@ -24,11 +24,11 @@ function createRemoteBridge() {
   const bridge = {
     getState: fn(() => Promise.resolve(state)),
     connect: fn((url: string) => {
-      publish({ origin: parseRemoteConnectionUrl(url).origin, status: "connecting" });
+      publish({ serverUrl: getRemoteConnectionServerUrl(url), status: "connecting" });
       return Promise.resolve();
     }),
     disconnect: fn(() => {
-      publish({ origin: null, status: "disconnected" });
+      publish({ serverUrl: null, status: "disconnected" });
       return Promise.resolve();
     }),
     onStateChanged: fn((listener: (next: RemoteConnectionState) => void) => {
@@ -48,7 +48,7 @@ export default {
   title: "App/RemoteConnection",
   beforeEach: () => {
     const previousApi = window.api;
-    const previousOrigin = readPersistedState<unknown>(REMOTE_CONNECTION_ORIGIN_KEY, undefined);
+    const previousUrl = readPersistedState<unknown>(REMOTE_CONNECTION_URL_KEY, undefined);
     remote = createRemoteBridge();
     window.api = {
       platform: "linux",
@@ -56,10 +56,10 @@ export default {
       ...previousApi,
       remoteConnection: remote.bridge,
     };
-    updatePersistedState(REMOTE_CONNECTION_ORIGIN_KEY, SAVED_ORIGIN);
+    updatePersistedState(REMOTE_CONNECTION_URL_KEY, SAVED_SERVER_URL);
     return () => {
       window.api = previousApi;
-      updatePersistedState(REMOTE_CONNECTION_ORIGIN_KEY, previousOrigin);
+      updatePersistedState(REMOTE_CONNECTION_URL_KEY, previousUrl);
     };
   },
 };
@@ -86,7 +86,7 @@ async function exerciseConnection(canvasElement: HTMLElement) {
   const section = await openRemoteSettings(canvasElement);
   await waitFor(() => expect(section.getByRole("status")).toHaveTextContent("Disconnected"));
   const input = section.getByRole("textbox", { name: "Server URL" });
-  await expect(input).toHaveValue(SAVED_ORIGIN);
+  await expect(input).toHaveValue(SAVED_SERVER_URL);
   await expect(remote.bridge.connect).not.toHaveBeenCalled();
 
   // Invalid schemes and embedded passwords never reach the bridge or saved preferences.
@@ -98,7 +98,7 @@ async function exerciseConnection(canvasElement: HTMLElement) {
     await userEvent.type(input, invalidUrl + "{Enter}");
     await expect(await section.findByRole("alert")).toBeVisible();
     await expect(remote.bridge.connect).not.toHaveBeenCalled();
-    await expect(readPersistedState(REMOTE_CONNECTION_ORIGIN_KEY, "")).toBe(SAVED_ORIGIN);
+    await expect(readPersistedState(REMOTE_CONNECTION_URL_KEY, "")).toBe(SAVED_SERVER_URL);
   }
 
   remote.bridge.connect.mockRejectedValueOnce(new Error("The remote server is unavailable."));
@@ -108,23 +108,23 @@ async function exerciseConnection(canvasElement: HTMLElement) {
     "The remote server is unavailable."
   );
   await expect(section.getByRole("button", { name: "Connect" })).toBeEnabled();
-  await expect(readPersistedState(REMOTE_CONNECTION_ORIGIN_KEY, "")).toBe(
+  await expect(readPersistedState(REMOTE_CONNECTION_URL_KEY, "")).toBe(
     "https://offline.example.com"
   );
 
   await userEvent.clear(input);
   await userEvent.type(input, TOKEN_URL);
-  await expect(readPersistedState(REMOTE_CONNECTION_ORIGIN_KEY, "")).toBe(
+  await expect(readPersistedState(REMOTE_CONNECTION_URL_KEY, "")).toBe(
     "https://offline.example.com"
   );
   await userEvent.keyboard("{Enter}");
   await waitFor(() => expect(remote.bridge.connect).toHaveBeenLastCalledWith(TOKEN_URL));
   await expect(section.getByRole("button", { name: "Connecting…" })).toBeDisabled();
-  await expect(readPersistedState(REMOTE_CONNECTION_ORIGIN_KEY, "")).toBe(SERVER_ORIGIN);
-  await expect(input).toHaveValue(SERVER_ORIGIN);
+  await expect(readPersistedState(REMOTE_CONNECTION_URL_KEY, "")).toBe(SERVER_URL);
+  await expect(input).toHaveValue(SERVER_URL);
   await expect(section.queryByRole("alert")).toBeNull();
 
-  remote.publish({ origin: SERVER_ORIGIN, status: "connected" });
+  remote.publish({ serverUrl: SERVER_URL, status: "connected" });
   await waitFor(() => expect(section.getByRole("status")).toHaveTextContent("Connected"));
   const disconnect = section.getByRole("button", { name: "Disconnect" });
   disconnect.focus();
@@ -136,9 +136,15 @@ async function exerciseConnection(canvasElement: HTMLElement) {
   await expect(remote.listeners.size).toBe(0);
   await userEvent.click(canvas.getByRole("button", { name: "Remote Connection" }));
   const restored = within(await canvas.findByRole("region", { name: "Remote connection" }));
-  await expect(restored.getByRole("textbox", { name: "Server URL" })).toHaveValue(SERVER_ORIGIN);
+  await expect(restored.getByRole("textbox", { name: "Server URL" })).toHaveValue(SERVER_URL);
   await expect(remote.bridge.connect).toHaveBeenCalledTimes(2);
   await expect(remote.listeners.size).toBe(1);
+
+  // Reconnect to the saved app-proxy path without the original token.
+  await userEvent.click(restored.getByRole("button", { name: "Connect" }));
+  await waitFor(() => expect(remote.bridge.connect).toHaveBeenLastCalledWith(SERVER_URL));
+  await userEvent.click(restored.getByRole("button", { name: "Disconnect" }));
+  await expect(remote.bridge.connect).toHaveBeenCalledTimes(3);
 
   // The test-runner ignores viewport globals. Pixel runs this contract at the pinned phone width.
   if (window.innerWidth < 768) {
@@ -181,8 +187,8 @@ export const NewerStateWins: AppStory = {
     );
     const section = await openRemoteSettings(canvasElement);
     await waitFor(() => expect(remote.bridge.getState).toHaveBeenCalled());
-    remote.publish({ origin: SERVER_ORIGIN, status: "connected" });
-    resolveSnapshot({ origin: null, status: "disconnected" });
+    remote.publish({ serverUrl: SERVER_URL, status: "connected" });
+    resolveSnapshot({ serverUrl: null, status: "disconnected" });
     await waitFor(() => expect(section.getByRole("status")).toHaveTextContent("Connected"));
     await expect(section.getByRole("button", { name: "Disconnect" })).toBeEnabled();
     await expect(section.getByRole("button", { name: "Connect" })).toBeDisabled();
@@ -190,9 +196,9 @@ export const NewerStateWins: AppStory = {
   },
 };
 
-export const InvalidSavedOrigin: AppStory = {
+export const InvalidSavedUrl: AppStory = {
   beforeEach: () => {
-    updatePersistedState(REMOTE_CONNECTION_ORIGIN_KEY, { invalid: true });
+    updatePersistedState(REMOTE_CONNECTION_URL_KEY, { invalid: true });
   },
   render: () => <AppWithMocks setup={setupRemoteSettings} />,
   play: async ({ canvasElement }) => {

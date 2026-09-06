@@ -1,3 +1,5 @@
+import { getAppProxyBasePathFromPathname } from "@/common/appProxyBasePath";
+
 /** Local desktop controls. Remote pages never receive this bridge. */
 export interface RemoteConnectionApi {
   getState(): Promise<RemoteConnectionState>;
@@ -7,8 +9,8 @@ export interface RemoteConnectionApi {
 }
 
 export interface RemoteConnectionState {
-  /** The server origin excludes credentials and URL tokens. */
-  origin: string | null;
+  /** The server base URL retains its app-proxy path but excludes credentials and URL tokens. */
+  serverUrl: string | null;
   status: "disconnected" | "connecting" | "connected";
   error?: string;
 }
@@ -28,4 +30,11 @@ export function parseRemoteConnectionUrl(input: string): URL {
     throw new Error("Remove the username and password from the server URL.");
   }
   return url;
+}
+
+/** Keep path-mounted servers distinct without retaining token links or page fragments. */
+export function getRemoteConnectionServerUrl(input: string): string {
+  const url = parseRemoteConnectionUrl(input);
+  const pathname = getAppProxyBasePathFromPathname(url.pathname) ?? url.pathname;
+  return url.origin + pathname.replace(/\/+$/, "");
 }
