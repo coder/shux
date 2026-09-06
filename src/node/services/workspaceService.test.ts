@@ -1,3 +1,4 @@
+import type { TurnCompletion } from "./streamManager";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
 import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
@@ -18385,6 +18386,100 @@ describe("WorkspaceService interruptStream", () => {
 
   afterEach(async () => {
     await cleanupHistory();
+  });
+
+  test("sendQueuedImmediately waits for interrupted accounting and terminal publication", async () => {
+    const workspaceId = "ws-interrupt-policy-barrier";
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const accountingEntered = Promise.withResolvers<void>();
+    const releaseAccounting = Promise.withResolvers<void>();
+    const replacementStarted = Promise.withResolvers<void>();
+    const emitter = new EventEmitter();
+    const terminalOrder: string[] = [];
+    let streamCount = 0;
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          const messageId = `assistant-${++streamCount}`;
+          emitter.emit("stream-start", {
+            type: "stream-start",
+            workspaceId,
+            messageId,
+            model: "openai:gpt-4o",
+            startTime: Date.now(),
+          });
+          if (streamCount === 2) replacementStarted.resolve();
+          return Promise.resolve(
+            Ok({
+              messageId,
+              completion:
+                streamCount === 1
+                  ? completion.promise
+                  : new Promise<TurnCompletion>(() => undefined),
+            })
+          );
+        }),
+        stopStream: mock(() => {
+          const streamAbort = {
+            type: "stream-abort" as const,
+            workspaceId,
+            messageId: "assistant-1",
+            abortReason: "user" as const,
+          };
+          emitter.emit("stream-abort", streamAbort);
+          completion.resolve({ status: "aborted", abortReason: "user", streamAbort });
+          return Promise.resolve(Ok(undefined));
+        }),
+      },
+    });
+    const workspaceService = createWorkspaceServiceForTest({
+      config: h.config,
+      historyService: h.historyService,
+      aiService: h.aiService as AIService,
+      initStateManager: h.initStateManager,
+      backgroundProcessManager: h.backgroundProcessManager,
+    });
+    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(h.session);
+    const policy = h.session as unknown as {
+      recordGoalAccountingFromUsage(input: unknown): Promise<void>;
+    };
+    spyOn(policy, "recordGoalAccountingFromUsage").mockImplementation(async () => {
+      accountingEntered.resolve();
+      await releaseAccounting.promise;
+    });
+    const dispatch = spyOn(h.session, "sendNextUserQueuedMessage");
+    h.session.onChatEvent(({ message }) => {
+      if (message.type === "stream-start" || message.type === "stream-abort")
+        terminalOrder.push(`${message.type}:${message.messageId}`);
+    });
+    let interrupt: Promise<unknown> | undefined;
+    try {
+      await h.session.sendMessage("source", { model: "openai:gpt-4o", agentId: "exec" });
+      h.session.queueMessage("queued replacement", { model: "openai:gpt-4o", agentId: "exec" });
+      interrupt = workspaceService.interruptStream(workspaceId, { sendQueuedImmediately: true });
+      await accountingEntered.promise;
+      // Drain the facade's Promise-only bookkeeping while terminal accounting is
+      // held by the explicit barrier; no elapsed-time assumption or timer is needed.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(dispatch).not.toHaveBeenCalled();
+      releaseAccounting.resolve();
+      await interrupt;
+      await replacementStarted.promise;
+      expect(terminalOrder).toEqual([
+        "stream-start:assistant-1",
+        "stream-abort:assistant-1",
+        "stream-start:assistant-2",
+      ]);
+      expect(h.session.isBusy()).toBe(true);
+    } finally {
+      releaseAccounting.resolve();
+      await interrupt;
+      h.session.dispose();
+      await h.cleanup();
+    }
   });
 
   test("sendQueuedImmediately clears hard-interrupt suppression before queued resend", async () => {

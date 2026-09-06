@@ -879,6 +879,8 @@ export class AgentSession {
     startupMessageId?: string;
     startupAbortNotified: boolean;
     compaction: boolean;
+    started: boolean;
+    policySettlement: { promise: Promise<void>; resolve: () => void };
   };
 
   /**
@@ -1089,6 +1091,7 @@ export class AgentSession {
       return;
     }
     this.disposed = true;
+    this.activeTurnOperation?.policySettlement.resolve();
     for (const messageId of this.compactionCompletionDecisions.keys()) {
       this.resolveCompactionCompletionDecision(messageId, false);
     }
@@ -3568,7 +3571,7 @@ export class AgentSession {
           this.activePreparedTurnAbortController = null;
           abortController.abort();
           // Editing now owns history, even before its replacement reaches PREPARING.
-          this.activeTurnOperation = undefined;
+          this.clearActiveTurnOperation();
           this.setTurnPhase(TurnPhase.IDLE);
           preemptedPreparing = true;
         }
@@ -5338,6 +5341,16 @@ export class AgentSession {
     abandonPartial?: boolean;
   }): Promise<Result<void>> {
     this.assertNotDisposed("interruptStream");
+    // Send-now callers may replace the turn immediately after this returns. Capture
+    // its settlement before any await so the old abort reaches accounting and the
+    // renderer before replacement PREPARING invalidates its operation identity.
+    // Startup edits must still preempt a blocked envelope; soft stop only requests
+    // a future boundary, so neither joins policy here.
+    const interruptedOperation = this.activeTurnOperation;
+    const interruptedPolicy =
+      options?.soft !== true && interruptedOperation?.started
+        ? interruptedOperation.policySettlement.promise
+        : undefined;
     if (options?.abandonPartial || this.midStreamCompactionPending) {
       this.continuousCompactionAbandoned = true;
       this.continuousCompactor.reset("user-interrupt");
@@ -5369,6 +5382,7 @@ export class AgentSession {
       return Err(stopResult.error);
     }
 
+    await interruptedPolicy;
     return Ok(undefined);
   }
 
@@ -5422,6 +5436,13 @@ export class AgentSession {
     return { success: false, error, failureHandled: true };
   }
 
+  private clearActiveTurnOperation(): void {
+    // A replaced operation may never get a handle back (startup cancellation).
+    // Release any explicit interrupt waiter when ownership is relinquished.
+    this.activeTurnOperation?.policySettlement.resolve();
+    this.activeTurnOperation = undefined;
+  }
+
   private isCurrentTurnOperation(operation: AgentSession["activeTurnOperation"]): boolean {
     return !this.disposed && this.activeTurnOperation === operation;
   }
@@ -5461,9 +5482,11 @@ export class AgentSession {
         } finally {
           this.resolveStreamErrorRecoveryDecision(handle.messageId, "terminal");
           this.resolveCompactionCompletionDecision(handle.messageId, false);
+          operation.policySettlement.resolve();
         }
       })
       .catch((error: unknown) => {
+        operation.policySettlement.resolve();
         log.error("Failed to consume turn completion", {
           workspaceId: this.workspaceId,
           error: getErrorMessage(error),
@@ -5499,7 +5522,10 @@ export class AgentSession {
       consumed: false,
       startupAbortNotified: false,
       compaction: false,
+      started: false,
+      policySettlement: Promise.withResolvers<void>(),
     };
+    this.clearActiveTurnOperation();
     this.activeTurnOperation = operation;
 
     // Reset per-stream flags (used for retries / crash-safe bookkeeping).
@@ -5741,17 +5767,21 @@ export class AgentSession {
     });
 
     if (!streamResult.success) {
-      if (!this.isCurrentTurnOperation(operation)) {
-        for (const payload of preStartErrors) {
-          this.resolveStreamErrorRecoveryDecision(payload.messageId, "terminal");
+      try {
+        if (!this.isCurrentTurnOperation(operation)) {
+          for (const payload of preStartErrors) {
+            this.resolveStreamErrorRecoveryDecision(payload.messageId, "terminal");
+          }
+          return { success: false, error: streamResult.error, failureHandled: true };
         }
-        return { success: false, error: streamResult.error, failureHandled: true };
+        return await this.handleStreamWithHistoryFailure(
+          streamResult.error,
+          acpPromptId,
+          preStartErrors
+        );
+      } finally {
+        operation.policySettlement.resolve();
       }
-      return await this.handleStreamWithHistoryFailure(
-        streamResult.error,
-        acpPromptId,
-        preStartErrors
-      );
     }
 
     operation.messageId = streamResult.data.messageId;
@@ -6628,6 +6658,7 @@ export class AgentSession {
       if (payload.type === "stream-start") {
         if (this.activeTurnOperation && !this.activeTurnOperation.consumed) {
           this.activeTurnOperation.messageId = payload.messageId;
+          this.activeTurnOperation.started = true;
         }
         this.continuousCompactionAbandoned = false;
         this.dispatchingQueuedEntry = false;
@@ -6937,7 +6968,7 @@ export class AgentSession {
 
   private setTurnPhase(next: TurnPhase): void {
     this.turnPhase = next;
-    if (next === TurnPhase.PREPARING) this.activeTurnOperation = undefined;
+    if (next === TurnPhase.PREPARING) this.clearActiveTurnOperation();
     this.clearPreparingRuntimeStatus();
 
     if (next !== TurnPhase.IDLE) {

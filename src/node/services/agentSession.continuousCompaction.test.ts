@@ -1,3 +1,4 @@
+import type { TurnCompletion } from "./streamManager";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import type { CompactionHandler } from "./compactionHandler";
 import assert from "@/common/utils/assert";
@@ -866,52 +867,52 @@ describe("AgentSession continuous compaction wiring", () => {
     }
   );
 
+  // These callbacks interrupt an already-started turn, so model the engine's
+  // completion handle rather than invoking terminal policy without settling it.
+  function mockAbortableStream(h: AgentSessionHarness) {
+    let completion: ReturnType<typeof Promise.withResolvers<TurnCompletion>> | undefined;
+    const streamMessage = spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+      completion = Promise.withResolvers<TurnCompletion>();
+      startStream(h);
+      return Promise.resolve(Ok({ messageId: "live-assistant", completion: completion.promise }));
+    });
+    spyOn(h.aiService, "stopStream").mockImplementation((_id, options) => {
+      const streamAbort = {
+        type: "stream-abort" as const,
+        workspaceId,
+        messageId: completion ? "live-assistant" : "",
+        abortReason: options?.abortReason,
+      };
+      h.aiEmitter.emit("stream-abort", streamAbort);
+      completion?.resolve({
+        status: "aborted",
+        abortReason: options?.abortReason ?? "system",
+        streamAbort,
+      });
+      completion = undefined;
+      return Promise.resolve(Ok(undefined));
+    });
+    return streamMessage;
+  }
+
   test("abandon during fast apply cannot resume the abandoned turn", async () => {
     const h = await setup();
     spyOn(internals(h.session).continuousCompactor, "observe").mockResolvedValue("none");
-    let starts = 0;
-    spyOn(h.aiService, "streamMessage").mockImplementation(() => {
-      starts++;
-      startStream(h);
-      return Promise.resolve(Ok(createStartedTurnHandle()));
-    });
-    spyOn(h.aiService, "stopStream").mockImplementation((_id, options) => {
-      void runSessionTerminalPolicy(h.session, h.aiEmitter, {
-        type: "stream-abort",
-        workspaceId,
-        messageId: "live-assistant",
-        abortReason: options?.abortReason,
-      });
-      return Promise.resolve(Ok(undefined));
-    });
+    const streamMessage = mockAbortableStream(h);
     expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
     const applied = await applyThenFinish(h.session, async () => {
       await h.session.interruptStream({ abandonPartial: true });
       return false;
     });
     expect(applied).toBe(false);
-    expect(starts).toBe(1);
+    expect(streamMessage).toHaveBeenCalledTimes(1);
     mock.restore();
   });
 
   test("abandon after the boundary commit preserves the fold but clears durable resume intent", async () => {
     const h = await setup();
     spyOn(internals(h.session).continuousCompactor, "observe").mockResolvedValue("none");
-    let starts = 0;
-    spyOn(h.aiService, "streamMessage").mockImplementation(() => {
-      starts++;
-      startStream(h);
-      return Promise.resolve(Ok(createStartedTurnHandle()));
-    });
-    spyOn(h.aiService, "stopStream").mockImplementation((_id, options) => {
-      void runSessionTerminalPolicy(h.session, h.aiEmitter, {
-        type: "stream-abort",
-        workspaceId,
-        messageId: "live-assistant",
-        abortReason: options?.abortReason,
-      });
-      return Promise.resolve(Ok(undefined));
-    });
+    const streamMessage = mockAbortableStream(h);
     expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
     const applied = await applyThenFinish(h.session, async (followUp) => {
       await appendBoundary(h, followUp);
@@ -919,7 +920,7 @@ describe("AgentSession continuous compaction wiring", () => {
       return true;
     });
     expect(applied).toBe(true);
-    expect(starts).toBe(1);
+    expect(streamMessage).toHaveBeenCalledTimes(1);
     const history = await rows(h);
     expect(history[0].id).toBe("continuous-boundary");
     expect(history[0].metadata?.muxMetadata).not.toHaveProperty("pendingFollowUp");

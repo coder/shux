@@ -576,4 +576,66 @@ describe("AgentSession turn completion", () => {
       await h.cleanup();
     }
   });
+  test.each(["hard", "soft", "dispose"] as const)(
+    "%s interruption handles stream-start before the handle is returned",
+    async (mode) => {
+      const emitter = new EventEmitter();
+      const started = Promise.withResolvers<void>();
+      const releaseHandle = Promise.withResolvers<void>();
+      const stopped = Promise.withResolvers<void>();
+      const completion = Promise.withResolvers<TurnCompletion>();
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter: emitter,
+        captureEvents: true,
+        aiServiceOverrides: {
+          streamMessage: mock(async () => {
+            start(emitter);
+            started.resolve();
+            await releaseHandle.promise;
+            return Ok({ messageId: "assistant-1", completion: completion.promise });
+          }),
+          stopStream: mock(() => {
+            emitter.emit("stream-abort", abort());
+            completion.resolve({ status: "aborted", abortReason: "user", streamAbort: abort() });
+            stopped.resolve();
+            return Promise.resolve(Ok(undefined));
+          }),
+        },
+      });
+      const consumer = observePolicy(h.session);
+      const sending = h.session.sendMessage("hello", sendOptions);
+      let interrupt: Promise<unknown> | undefined;
+      try {
+        await started.promise;
+        let returned = false;
+        interrupt = h.session.interruptStream({ soft: mode === "soft" }).then((result) => {
+          returned = true;
+          return result;
+        });
+        await stopped.promise;
+        if (mode === "dispose") h.session.dispose();
+        if (mode === "hard") {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(returned).toBe(false);
+        } else {
+          await interrupt;
+          expect(returned).toBe(true);
+        }
+        releaseHandle.resolve();
+        await sending;
+        await interrupt;
+        await policyPromise(consumer);
+        expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(
+          mode === "dispose" ? 0 : 1
+        );
+      } finally {
+        releaseHandle.resolve();
+        h.session.dispose();
+        await sending;
+        await interrupt;
+        await h.cleanup();
+      }
+    }
+  );
 });
