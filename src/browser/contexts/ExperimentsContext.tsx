@@ -5,6 +5,7 @@ import React, {
   useCallback,
   useEffect,
   useState,
+  useRef,
 } from "react";
 import {
   type ExperimentId,
@@ -188,23 +189,44 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
     async (experimentId: ExperimentId, enabled: boolean) => {
       // A degraded (slow) connection still has a usable api; only a missing api means offline.
       if (!apiState.api) {
-        return;
+        return false;
       }
 
       try {
         await apiState.api.experiments.setOverride({ experimentId, enabled });
+        return true;
       } catch {
-        // Best effort
+        return false;
       }
     },
     [apiState.api]
   );
 
+  const designTogglePending = useRef(false);
+
   const setExperiment = useCallback(
     (experimentId: ExperimentId, enabled: boolean) => {
-      setExperimentState(experimentId, enabled);
-      setBackendOverrides((prev) => (prev ? { ...prev, [experimentId]: enabled } : prev));
-      void persistOverride(experimentId, enabled);
+      const publish = () => {
+        setExperimentState(experimentId, enabled);
+        setBackendOverrides((prev) => (prev ? { ...prev, [experimentId]: enabled } : prev));
+      };
+      if (experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) {
+        // Hiding credential controls must follow backend shutdown, even offline or
+        // when a write fails. Serialize toggles so late acknowledgements cannot undo one.
+        if (designTogglePending.current) return;
+        designTogglePending.current = true;
+        persistOverride(experimentId, enabled)
+          .then((saved) => {
+            designTogglePending.current = false;
+            if (saved) publish();
+          })
+          .catch(() => {
+            designTogglePending.current = false;
+          });
+        return;
+      }
+      publish();
+      persistOverride(experimentId, enabled).catch(() => undefined);
     },
     [persistOverride]
   );

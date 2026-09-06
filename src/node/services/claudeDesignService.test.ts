@@ -39,12 +39,13 @@ async function setup(
     readSource?: () => Promise<string>;
     fetch?: typeof fetch;
     enabled?: () => boolean;
+    now?: () => number;
   } = {}
 ) {
   const service = new ClaudeDesignService({
     rootDir,
     isEnabled: options.enabled ?? (() => true),
-    now: () => now,
+    now: options.now ?? (() => now),
     readSource: options.readSource ?? (() => Promise.resolve(data())),
     fetch: options.fetch,
   });
@@ -524,4 +525,53 @@ test("credential configuration preserves independently updated tool settings", a
     source: before.settings.source,
     serverEnabled: false,
   });
+});
+
+test("sequential requests reuse credentials until expiry or settings invalidation", async () => {
+  let currentTime = now;
+  const readSource = mock(() => Promise.resolve(data()));
+  const { service, send } = await setup({
+    readSource,
+    now: () => currentTime,
+    fetch: fakeFetch(() => Promise.resolve(new Response("{}"))),
+  });
+  await send();
+  await send();
+  expect(readSource).toHaveBeenCalledTimes(1);
+  await service.configure({ toolAllowlist: ["design_test"] });
+  await service.transport().fetch?.(CLAUDE_DESIGN_URL, { method: "POST" });
+  expect(readSource).toHaveBeenCalledTimes(2);
+  currentTime += 60_000;
+  await expectFailure(service.transport().fetch!(CLAUDE_DESIGN_URL, { method: "POST" }), "expired");
+  expect(readSource).toHaveBeenCalledTimes(3);
+});
+
+test("checkout overrides cannot enable Design before the backend user enables its server", async () => {
+  const fixture = protocolFixture();
+  const readSource = mock(() => Promise.resolve(data()));
+  const { service } = await setup({ fetch: fixture.network, readSource });
+  await service.configure({ serverEnabled: false });
+  const manager = new MCPServerManager(
+    new MCPConfigService(new Config(rootDir), { claudeDesign: service })
+  );
+  const request = {
+    workspaceId: "checkout-override",
+    projectPath: rootDir,
+    workspacePath: rootDir,
+    runtime: new LocalRuntime(rootDir),
+    trusted: false,
+    overrides: { enabledServers: ["claude_design"] },
+  };
+  try {
+    expect(Object.keys((await manager.getToolsForWorkspace(request)).tools)).toHaveLength(0);
+    expect(readSource).not.toHaveBeenCalled();
+    await service.configure({ serverEnabled: true });
+    expect(Object.keys((await manager.getToolsForWorkspace(request)).tools)).toHaveLength(1);
+    await service.configure({ serverEnabled: false });
+    expect(Object.keys((await manager.getToolsForWorkspace(request)).tools)).toHaveLength(0);
+  } finally {
+    await manager.stopServers(request.workspaceId);
+    manager.dispose();
+    await fixture.server.stop(true);
+  }
 });

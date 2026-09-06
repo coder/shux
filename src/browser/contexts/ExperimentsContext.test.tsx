@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -130,6 +130,49 @@ describe("ExperimentsProvider", () => {
       isolatedModuleDir = null;
     }
   });
+
+  test.each([true, false])(
+    "Design disable waits for backend acknowledgement (success=%s)",
+    async (success) => {
+      let finish!: () => void;
+      let reject!: (error: Error) => void;
+      const pending = new Promise<void>((resolve, fail) => {
+        finish = resolve;
+        reject = fail;
+      });
+      const setOverride = mock(() => pending);
+      currentClientMock = {
+        experiments: {
+          getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: true }),
+          setOverride,
+        },
+      };
+      function Toggle() {
+        const [enabled, setEnabled] = useExperiment(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
+        return <button onClick={() => setEnabled(false)}>{String(enabled)}</button>;
+      }
+      const view = render(
+        <APIProvider client={currentClientMock as APIClient}>
+          <ExperimentsProvider>
+            <Toggle />
+          </ExperimentsProvider>
+        </APIProvider>
+      );
+      await waitFor(() => expect(view.getByRole("button").textContent).toBe("true"));
+      fireEvent.click(view.getByRole("button"));
+      expect(setOverride).toHaveBeenCalledTimes(1);
+      expect(view.getByRole("button").textContent).toBe("true");
+      expect(
+        window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP))
+      ).toBeNull();
+      await act(async () => {
+        if (success) finish();
+        else reject(new Error("offline"));
+        await pending.catch(() => undefined);
+      });
+      expect(view.getByRole("button").textContent).toBe(String(!success));
+    }
+  );
 
   test("syncs existing local overrides to the backend on connect", async () => {
     globalThis.window.localStorage.setItem(

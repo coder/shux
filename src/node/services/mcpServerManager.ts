@@ -1631,6 +1631,9 @@ export class MCPServerManager {
 
     const result: MCPServerMap = {};
     for (const [name, info] of Object.entries(servers)) {
+      // Checkout-local overrides can be tracked by an untrusted contributor. They
+      // must not grant access to borrowed credentials without backend user enablement.
+      if (info.transport !== "stdio" && info.managed === "claude-design" && info.disabled) continue;
       // Workspace overrides take precedence
       if (enabledSet.has(name)) {
         // Explicitly enabled at workspace level (overrides project disabled)

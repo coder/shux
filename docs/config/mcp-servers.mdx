@@ -105,8 +105,10 @@ Choose a credential source on the **Mux backend host** shown in the card:
   account, SYSTEM, and administrators.
 
 Select **Use Claude Code credentials** to opt into read-only access and test the
-connection. Then enable `claude_design` in MCP Servers or through workspace MCP
-controls. Existing tool allowlists and HTTP MCP policy still apply. A conflicting
+connection. Then enable `claude_design` globally in MCP Servers. Workspace MCP
+controls can restrict access, but cannot enable a globally disabled Design server:
+checkout-local files are not authoritative consent to use your Claude credentials.
+Existing tool allowlists and HTTP MCP policy still apply. A conflicting
 server name must be renamed or removed first; Mux never replaces that server or
 lends it Claude credentials.
 

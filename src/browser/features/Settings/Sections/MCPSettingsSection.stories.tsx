@@ -18,6 +18,7 @@ import type { MCPServerInfo } from "@/common/types/mcp";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { Secret } from "@/common/types/secrets";
 
+import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { MCPSettingsSection } from "./MCPSettingsSection";
 
 const MOCK_TOOLS = [
@@ -430,7 +431,7 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
   },
 };
 
-function setupDesignStory(enabled = true): APIClient {
+function setupDesignStory(enabled = true, reuseEnabled = false): APIClient {
   updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), enabled);
   const client = setupMCPSettingsSectionStory({
     servers: enabled
@@ -445,12 +446,12 @@ function setupDesignStory(enabled = true): APIClient {
       : {},
   });
   let status: ClaudeDesignStatus = {
-    state: "disabled",
+    state: reuseEnabled ? "connected" : "disabled",
     backendHost: "remote-backend.example.test",
     platform: "linux",
     settings: {
       source: { type: "file", path: "/home/example/.claude/.credentials.json" },
-      reuseEnabled: false,
+      reuseEnabled,
       serverEnabled: false,
     },
   };
@@ -523,5 +524,43 @@ export const ClaudeDesignDisabled: Story = {
     const canvas = within(canvasElement);
     await canvas.findByText("No MCP servers configured yet.");
     await expect(canvas.queryByRole("region", { name: "Claude Design" })).toBeNull();
+  },
+};
+
+export const ClaudeDesignConflictDisconnect: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true)}>
+      <ClaudeDesignCard conflict remoteDisabled={false} onChange={() => Promise.resolve()} />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const disconnect = await canvas.findByRole("button", { name: "Disconnect" });
+    await expect(canvas.getByRole("button", { name: "Retry connection" })).toBeDisabled();
+    await expect(disconnect).toBeEnabled();
+    await userEvent.click(disconnect);
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+  },
+};
+
+export const ClaudeDesignPolicyDisconnect: Story = {
+  ...ClaudeDesignConflictDisconnect,
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true)}>
+      <ClaudeDesignCard conflict={false} remoteDisabled onChange={() => Promise.resolve()} />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const disconnect = await canvas.findByRole("button", { name: "Disconnect" });
+    await expect(canvas.getByRole("button", { name: "Retry connection" })).toBeDisabled();
+    await expect(disconnect).toBeEnabled();
+    disconnect.focus();
+    await userEvent.keyboard("{Control>}{Shift>}d{/Shift}{/Control}");
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
   },
 };

@@ -96,6 +96,7 @@ export class ClaudeDesignService {
   private readonly lock = new MutexMap<string>();
   private controller = new AbortController();
   private reading: Promise<Credential> | undefined;
+  private cachedCredential: Credential | undefined;
   private state: ClaudeDesignState = "not_configured";
   private rejected = false;
   private readonly listeners = new Set<() => Promise<void>>();
@@ -135,6 +136,7 @@ export class ClaudeDesignService {
     this.controller.abort();
     this.controller = new AbortController();
     this.reading = undefined;
+    this.cachedCredential = undefined;
     this.rejected = false;
     this.state = "not_configured";
     await Promise.all([...this.listeners].map((listener) => listener()));
@@ -188,6 +190,11 @@ export class ClaudeDesignService {
   }
   private async credential(signal: AbortSignal): Promise<Credential> {
     this.guard(signal);
+    // Avoid a Keychain/ACL subprocess for each sequential MCP message. Expiry and
+    // a server rejection invalidate this in-memory cache; Claude still owns refresh.
+    if (this.cachedCredential && this.cachedCredential.expiresAt > (this.options.now ?? Date.now)())
+      return this.cachedCredential;
+    this.cachedCredential = undefined;
     const source = this.settings.source;
     if (!source) throw new DesignError("not_configured");
     const read = (this.reading ??= (async () => {
@@ -208,6 +215,7 @@ export class ClaudeDesignService {
       });
       this.guard(signal);
       if (result.kind !== "ok") throw new DesignError("credentials_unavailable");
+      this.cachedCredential = result.value;
       return result.value;
     } finally {
       if (this.reading === read) this.reading = undefined;
@@ -245,6 +253,7 @@ export class ClaudeDesignService {
         let response = await send(credential);
         this.guard(signal);
         if (response.status === 401 && credential) {
+          if (this.cachedCredential === credential) this.cachedCredential = undefined;
           let next: Credential;
           try {
             next = await this.credential(signal);

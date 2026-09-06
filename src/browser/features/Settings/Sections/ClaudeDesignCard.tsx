@@ -80,6 +80,7 @@ export function ClaudeDesignCard(props: {
     }
   }
 
+  // Conflicts and policy block connecting, but must never prevent withdrawing reuse.
   const blocked = busy || props.conflict || props.remoteDisabled;
   return (
     <section
@@ -109,6 +110,7 @@ export function ClaudeDesignCard(props: {
           key={JSON.stringify(status.settings)}
           status={status}
           blocked={blocked}
+          busy={busy}
           save={save}
         />
       )}
@@ -124,6 +126,7 @@ export function ClaudeDesignCard(props: {
 function ClaudeDesignForm(props: {
   status: ClaudeDesignStatus;
   blocked: boolean;
+  busy: boolean;
   save: (settings: ClaudeDesignSettings, test: boolean) => Promise<void>;
 }) {
   const [source, setSource] = useState(
@@ -153,7 +156,7 @@ function ClaudeDesignForm(props: {
         if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "d") {
           stopKeyboardPropagation(event);
           event.preventDefault();
-          if (!props.blocked)
+          if (!props.busy)
             props
               .save({ ...props.status.settings, reuseEnabled: false, serverEnabled: false }, false)
               .catch(() => undefined);
@@ -233,7 +236,7 @@ function ClaudeDesignForm(props: {
           type="button"
           size="sm"
           variant="secondary"
-          disabled={props.blocked || !props.status.settings.reuseEnabled}
+          disabled={props.busy || !props.status.settings.reuseEnabled}
           onClick={() => {
             props
               .save({ ...props.status.settings, reuseEnabled: false, serverEnabled: false }, false)
@@ -247,8 +250,9 @@ function ClaudeDesignForm(props: {
         Connect: Ctrl/Cmd+Enter · Disconnect: Ctrl/Cmd+Shift+D
       </p>
       <p className="text-muted">
-        After connecting, enable claude_design in MCP Servers or for a workspace to expose its
-        tools. No tokens are copied into Mux.
+        After connecting, enable claude_design in MCP Servers to expose its tools. Workspace
+        settings can restrict access but cannot enable a globally disabled Design server. No tokens
+        are copied into Mux.
       </p>
     </form>
   );
