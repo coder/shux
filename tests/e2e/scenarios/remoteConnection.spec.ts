@@ -3,6 +3,7 @@ import type { BrowserWindow, Clipboard } from "electron";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { electronTest, electronExpect as expect } from "../electronTest";
+import { REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX } from "../../../src/common/constants/remoteConnection";
 
 const test = electronTest.extend<{ remoteServer: { url: string; requests: string[] } }>({
   remoteServer: async ({ workspace }, use) => {
@@ -266,4 +267,83 @@ test("Coder path-mounted servers retain their URL and isolate sibling sessions",
       });
     await expect(input).toHaveValue(connection.serverUrl);
   }
+});
+test("remote app popups and blob attachments retain isolation and close on disconnect", async ({
+  app,
+  page,
+  remoteServer,
+}) => {
+  await page.waitForFunction(() => Boolean(window.api?.remoteConnection));
+  const base = remoteServer.url + "/@user/workspace/apps/xum/";
+  const opened = app.waitForEvent("window");
+  await page.evaluate((url) => window.api!.remoteConnection!.connect(url), base);
+  const remote = await opened;
+  await expect(remote.getByRole("heading", { name: "Remote server" })).toBeVisible();
+  await remote.evaluate(() => {
+    // A browser pop-out needs the remote session's token and cookies, not the local session.
+    window.localStorage.setItem("popout-auth", "remote-session-token");
+    document.cookie = "popout-cookie=remote-session-cookie; path=/";
+  });
+  expect(
+    await remote.evaluate(
+      (prefix) => window.open("about:blank", prefix + "e2e") === null,
+      REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX
+    )
+  ).toBe(true);
+  const popups = [];
+  for (const path of ["terminal.html?terminalId=one", "desktop.html?workspaceId=two"]) {
+    const popupOpened = app.waitForEvent("window");
+    expect(await remote.evaluate((url) => Boolean(window.open(url, "_blank")), base + path)).toBe(
+      true
+    );
+    const popup = await popupOpened;
+    await popup.waitForURL(base + path);
+    expect(
+      await popup.evaluate(() => ({
+        api: typeof window.api,
+        require: typeof Reflect.get(window, "require"),
+        token: window.localStorage.getItem("popout-auth"),
+        cookie: document.cookie,
+      }))
+    ).toEqual({
+      api: "undefined",
+      require: "undefined",
+      token: "remote-session-token",
+      cookie: "popout-cookie=remote-session-cookie",
+    });
+    const popupWindow = await app.browserWindow(popup);
+    expect(
+      await popupWindow.evaluate((window) => {
+        const preferences = window.webContents.getLastWebPreferences();
+        return {
+          sandbox: preferences.sandbox,
+          nodeIntegration: preferences.nodeIntegration,
+          preload: preferences.preload,
+        };
+      })
+    ).toMatchObject({ sandbox: true, nodeIntegration: false, preload: undefined });
+    await popupWindow.evaluate((window) => window.focus());
+    await popup.getByRole("button", { name: "Copy text" }).click();
+    await expect(popup.locator("#copied")).toHaveText("Copied");
+    popups.push(popup);
+  }
+  const blobOpened = app.waitForEvent("window");
+  expect(
+    await remote.evaluate(() => {
+      const url = URL.createObjectURL(new Blob(["Attachment content"], { type: "text/plain" }));
+      return Boolean(window.open(url, "_blank"));
+    })
+  ).toBe(true);
+  const attachment = await blobOpened;
+  await expect(attachment.locator("body")).toContainText("Attachment content");
+  expect(await attachment.evaluate(() => typeof window.api)).toBe("undefined");
+  expect(
+    await attachment.evaluate(() => window.open("https://example.com/", "_blank") === null)
+  ).toBe(true);
+  const returned = Promise.all(
+    [remote, ...popups, attachment].map((window) => window.waitForEvent("close"))
+  );
+  await page.evaluate(() => window.api!.remoteConnection!.disconnect());
+  await returned;
+  expect(await page.evaluate(() => window.localStorage.getItem("popout-auth"))).toBeNull();
 });

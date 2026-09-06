@@ -2,6 +2,7 @@ import type { BrowserWindow, BrowserWindowConstructorOptions, Event } from "elec
 import { createHash } from "node:crypto";
 import { getAppProxyBasePathFromPathname } from "@/common/appProxyBasePath";
 import {
+  REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX,
   REMOTE_CONNECTION_GESTURE_WORLD_ID,
   REMOTE_CONNECTION_LOAD_TIMEOUT_MS,
   REMOTE_CONNECTION_RETURN_KEY,
@@ -13,12 +14,15 @@ import {
 } from "@/common/types/remoteConnection";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
+type RemotePopupKind = "app" | "attachment" | "auth";
+
 interface RemoteWindowEntry {
   window: BrowserWindow;
   serverUrl: string;
   abort: AbortController;
   loaded: Promise<void>;
-  popup: BrowserWindow | "opening" | null;
+  authPopup: BrowserWindow | "opening" | null;
+  popups: Map<BrowserWindow, RemotePopupKind>;
 }
 
 interface RemoteWindowOptions {
@@ -45,6 +49,24 @@ function isRemoteNavigationAllowed(serverUrl: string, target: string): boolean {
   const targetAppPath = getAppProxyBasePathFromPathname(destination.pathname);
   // Coder login redirects can leave the app path, but must not enter another proxied app.
   return serverAppPath == null || targetAppPath == null || serverAppPath === targetAppPath;
+}
+
+function isRemoteAppUrl(serverUrl: string, target: string): boolean {
+  const server = parseRemoteConnectionUrl(serverUrl);
+  const destination = parseRemoteConnectionUrl(target);
+  if (server.origin !== destination.origin) return false;
+  if (
+    getAppProxyBasePathFromPathname(server.pathname) !==
+    getAppProxyBasePathFromPathname(destination.pathname)
+  )
+    return false;
+  const basePath = server.pathname.replace(/[/]$/, "");
+  return destination.pathname === basePath || destination.pathname.startsWith(basePath + "/");
+}
+
+function isRemoteBlobUrl(serverUrl: string, target: string): boolean {
+  const destination = new URL(target);
+  return destination.protocol === "blob:" && destination.origin === new URL(serverUrl).origin;
 }
 
 /** Owns remote windows, never the local backend or its running tasks. */
@@ -95,7 +117,8 @@ export class RemoteConnectionManager {
       serverUrl,
       abort: new AbortController(),
       loaded: Promise.resolve(),
-      popup: null,
+      authPopup: null,
+      popups: new Map(),
     };
     this.entry = entry;
     this.setState({ status: "connecting", serverUrl });
@@ -109,49 +132,21 @@ export class RemoteConnectionManager {
     const contents = entry.window.webContents;
     contents.session.setPermissionCheckHandler(() => false);
     contents.session.setPermissionRequestHandler((requester, permission, callback, details) => {
-      if (
-        permission !== "clipboard-sanitized-write" ||
-        requester !== contents ||
-        !details.isMainFrame
-      ) {
+      const window =
+        requester === contents
+          ? entry.window
+          : [...entry.popups].find(
+              ([popup, kind]) => kind === "app" && popup.webContents === requester
+            )?.[0];
+      if (permission !== "clipboard-sanitized-write" || !window || !details.isMainFrame) {
         callback(false);
         return;
       }
-      this.allowClipboardWrite(entry, details.requestingUrl).then(callback, () => callback(false));
+      this.allowClipboardWrite(entry, window, details.requestingUrl).then(callback, () =>
+        callback(false)
+      );
     });
-    this.installInputHandler(entry, entry.window);
-    contents.on("will-attach-webview", (event) => event.preventDefault());
-    contents.on("will-prevent-unload", (event) => event.preventDefault());
-    const guardNavigation = (event: Event, target: string): void => {
-      try {
-        if (isRemoteNavigationAllowed(entry.serverUrl, target)) return;
-      } catch {
-        // Malformed URLs and non-HTTP schemes cannot navigate remote windows.
-      }
-      event.preventDefault();
-    };
-    contents.on("will-navigate", guardNavigation);
-    contents.on("will-redirect", guardNavigation);
-    contents.setWindowOpenHandler(({ url }) => {
-      // Browser OAuth flows retain a blank popup handle before fetching the authorization URL.
-      if (url === "about:blank" && this.entry === entry && entry.popup == null) {
-        entry.popup = "opening";
-        return {
-          action: "allow",
-          overrideBrowserWindowOptions: {
-            webPreferences: { ...REMOTE_WEB_PREFERENCES, session: contents.session },
-          },
-        };
-      }
-      try {
-        const target = parseRemoteConnectionUrl(url);
-        this.options.openExternal(target.href);
-      } catch {
-        // Remote content cannot launch local programs through custom URL schemes.
-      }
-      return { action: "deny" };
-    });
-    contents.on("did-create-window", (popup) => this.guardAuthPopup(entry, popup));
+    this.guardAppWindow(entry, entry.window);
     contents.on("render-process-gone", () => {
       this.finish(entry, "The remote window stopped. Connect again to retry.");
     });
@@ -162,6 +157,73 @@ export class RemoteConnectionManager {
       }
     });
     entry.window.on("closed", () => this.finish(entry));
+  }
+
+  private guardAppWindow(entry: RemoteWindowEntry, window: BrowserWindow): void {
+    this.guardChildWindow(entry, window);
+    const contents = window.webContents;
+    const guardNavigation = (event: Event, target: string): void => {
+      try {
+        if (isRemoteNavigationAllowed(entry.serverUrl, target)) return;
+      } catch {
+        // Malformed URLs and non-HTTP schemes cannot navigate app windows.
+      }
+      event.preventDefault();
+    };
+    contents.on("will-navigate", guardNavigation);
+    contents.on("will-redirect", guardNavigation);
+    contents.setWindowOpenHandler(({ url, frameName }) => {
+      // Reject editor launches before the browser renderer records a durable editor-open marker.
+      if (
+        this.entry !== entry ||
+        frameName.startsWith(REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX)
+      ) {
+        return { action: "deny" };
+      }
+      const kind = this.getPopupKind(entry, window, url);
+      if (kind && (kind !== "auth" || entry.authPopup == null)) {
+        // Browser OAuth flows reserve a blank popup before fetching the authorization URL.
+        if (kind === "auth") entry.authPopup = "opening";
+        return {
+          action: "allow",
+          overrideBrowserWindowOptions: {
+            webPreferences: { ...REMOTE_WEB_PREFERENCES, session: contents.session },
+          },
+        };
+      }
+      try {
+        this.options.openExternal(parseRemoteConnectionUrl(url).href);
+      } catch {
+        // Remote content cannot launch local programs through custom URL schemes.
+      }
+      return { action: "deny" };
+    });
+    contents.on("did-create-window", (popup, details) => {
+      this.registerPopup(entry, window, popup, details.url);
+    });
+  }
+
+  private getPopupKind(
+    entry: RemoteWindowEntry,
+    source: BrowserWindow,
+    url: string
+  ): RemotePopupKind | null {
+    try {
+      // Login pages share the origin, but cannot create app or attachment windows.
+      if (!isRemoteAppUrl(entry.serverUrl, source.webContents.getURL())) return null;
+      if (url === "about:blank") return "auth";
+      if (isRemoteBlobUrl(entry.serverUrl, url)) return "attachment";
+      if (isRemoteAppUrl(entry.serverUrl, url)) return "app";
+    } catch {
+      // Reject malformed URLs and unsupported schemes.
+    }
+    return null;
+  }
+
+  private guardChildWindow(entry: RemoteWindowEntry, window: BrowserWindow): void {
+    this.installInputHandler(entry, window);
+    window.webContents.on("will-attach-webview", (event) => event.preventDefault());
+    window.webContents.on("will-prevent-unload", (event) => event.preventDefault());
   }
 
   private installInputHandler(entry: RemoteWindowEntry, window: BrowserWindow): void {
@@ -183,46 +245,66 @@ export class RemoteConnectionManager {
 
   private async allowClipboardWrite(
     entry: RemoteWindowEntry,
+    window: BrowserWindow,
     requestingUrl: string
   ): Promise<boolean> {
     const isActiveRequest = (): boolean =>
       this.entry === entry &&
-      !entry.window.isDestroyed() &&
-      entry.window.isFocused() &&
-      entry.window.webContents.getURL() === requestingUrl;
-    if (!isActiveRequest() || !isRemoteNavigationAllowed(entry.serverUrl, requestingUrl))
-      return false;
+      (window === entry.window || entry.popups.get(window) === "app") &&
+      !window.isDestroyed() &&
+      window.isFocused() &&
+      window.webContents.getURL() === requestingUrl;
+    if (!isActiveRequest() || !isRemoteAppUrl(entry.serverUrl, requestingUrl)) return false;
     // SECURITY AUDIT: the page can replace its own navigator properties, but not this isolated world's properties.
-    const activated: unknown = await entry.window.webContents.executeJavaScriptInIsolatedWorld(
+    const activated: unknown = await window.webContents.executeJavaScriptInIsolatedWorld(
       REMOTE_CONNECTION_GESTURE_WORLD_ID,
       [{ code: "navigator.userActivation.isActive" }]
     );
     return activated === true && isActiveRequest();
   }
 
-  private guardAuthPopup(entry: RemoteWindowEntry, popup: BrowserWindow): void {
-    if (this.entry !== entry) {
+  private registerPopup(
+    entry: RemoteWindowEntry,
+    source: BrowserWindow,
+    popup: BrowserWindow,
+    url: string
+  ): void {
+    const kind = this.getPopupKind(entry, source, url);
+    if (this.entry !== entry || !kind) {
       popup.destroy();
       return;
     }
-    entry.popup = popup;
-    this.installInputHandler(entry, popup);
+    entry.popups.set(popup, kind);
+    if (kind === "auth") entry.authPopup = popup;
     popup.on("closed", () => {
-      if (entry.popup === popup) entry.popup = null;
+      entry.popups.delete(popup);
+      if (entry.authPopup === popup) entry.authPopup = null;
     });
-    // OAuth redirects cross origins. They retain only the remote session, never local IPC access.
+    if (kind === "app") {
+      this.guardAppWindow(entry, popup);
+      return;
+    }
+    this.guardChildWindow(entry, popup);
     const guardNavigation = (event: Event, target: string): void => {
-      if (target === "about:blank") return;
       try {
-        parseRemoteConnectionUrl(target);
+        if (kind === "auth") {
+          // OAuth redirects cross origins but retain only the isolated remote session.
+          if (target === "about:blank") return;
+          const destination = parseRemoteConnectionUrl(target);
+          if (
+            destination.origin !== new URL(entry.serverUrl).origin ||
+            isRemoteNavigationAllowed(entry.serverUrl, target)
+          )
+            return;
+        }
+        if (isRemoteBlobUrl(entry.serverUrl, target)) return;
       } catch {
-        event.preventDefault();
+        // Attachments cannot navigate to websites or launch local programs.
       }
+      event.preventDefault();
     };
     popup.webContents.on("will-navigate", guardNavigation);
     popup.webContents.on("will-redirect", guardNavigation);
-    popup.webContents.on("will-attach-webview", (event) => event.preventDefault());
-    popup.webContents.on("will-prevent-unload", (event) => event.preventDefault());
     popup.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   }
 
@@ -260,8 +342,9 @@ export class RemoteConnectionManager {
     if (this.entry !== entry) return;
     this.entry = null;
     entry.abort.abort();
-    const popup = entry.popup;
-    if (popup && popup !== "opening" && !popup.isDestroyed()) popup.destroy();
+    for (const popup of entry.popups.keys()) {
+      if (!popup.isDestroyed()) popup.destroy();
+    }
     if (!entry.window.isDestroyed()) entry.window.destroy();
     this.setState({ status: "disconnected", serverUrl: null, ...(error ? { error } : {}) });
     if (!this.disposed) this.options.onDisconnected();

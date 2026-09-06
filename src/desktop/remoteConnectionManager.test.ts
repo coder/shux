@@ -3,6 +3,7 @@ import type { BrowserWindow, BrowserWindowConstructorOptions } from "electron";
 import { EventEmitter } from "node:events";
 import type { RemoteConnectionState } from "@/common/types/remoteConnection";
 import { RemoteConnectionManager } from "./remoteConnectionManager";
+import { REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX } from "@/common/constants/remoteConnection";
 
 class TestWindow extends EventEmitter {
   destroyed = false;
@@ -32,7 +33,7 @@ class TestWindow extends EventEmitter {
     },
     setWindowOpenHandler: mock<
       (
-        handler: (details: { url: string }) => {
+        handler: (details: { url: string; frameName: string }) => {
           action: string;
           overrideBrowserWindowOptions?: BrowserWindowConstructorOptions;
         }
@@ -506,12 +507,156 @@ describe("RemoteConnectionManager", () => {
     }
   });
 
+  test.each(["terminal.html?terminalId=one", "desktop.html?workspaceId=two"])(
+    "keeps the app popup %s in the remote session",
+    async (page) => {
+      const { manager, windows, openExternal } = setup();
+      const base = "https://example.com/@user/workspace/apps/xum/";
+      await manager.connect(base);
+      const contents = windows[0].webContents;
+      const url = base + page;
+      const opened = contents.setWindowOpenHandler.mock.calls[0][0]({ frameName: "", url });
+      expect(opened.action).toBe("allow");
+      expect(
+        Object.is(opened.overrideBrowserWindowOptions?.webPreferences?.session, contents.session)
+      ).toBe(true);
+      expect(opened.overrideBrowserWindowOptions?.webPreferences?.preload).toBeUndefined();
+      expect(opened.overrideBrowserWindowOptions?.webPreferences?.sandbox).toBe(true);
+      expect(openExternal).not.toHaveBeenCalled();
+      const popup = new TestWindow();
+      popup.url = url;
+      contents.emit("did-create-window", popup, { url });
+      const request = contents.session.setPermissionRequestHandler.mock.calls[0][0];
+      expect(
+        await new Promise<boolean>((resolve) => {
+          request(popup.webContents, "clipboard-sanitized-write", resolve, {
+            isMainFrame: true,
+            requestingUrl: url,
+          });
+        })
+      ).toBe(true);
+      for (const event of ["will-navigate", "will-redirect"]) {
+        const preventDefault = mock(() => undefined);
+        popup.webContents.emit(
+          event,
+          { preventDefault },
+          "https://example.com/@user/other/apps/xum/"
+        );
+        expect(preventDefault).toHaveBeenCalled();
+      }
+      const nestedUrl = base + "terminal.html?terminalId=nested";
+      expect(
+        popup.webContents.setWindowOpenHandler.mock.calls[0][0]({ frameName: "", url: nestedUrl })
+          .action
+      ).toBe("allow");
+      const nested = new TestWindow();
+      popup.webContents.emit("did-create-window", nested, { url: nestedUrl });
+      popup.close();
+      expect(manager.getState().status).toBe("connected");
+      manager.disconnect();
+      expect(nested.destroyed).toBe(true);
+    }
+  );
+
+  test("isolates blob attachments and closes them on disconnect", async () => {
+    const { manager, windows, openExternal } = setup();
+    await manager.connect("https://example.com/");
+    const contents = windows[0].webContents;
+    const openWindow = contents.setWindowOpenHandler.mock.calls[0][0];
+    const url = "blob:https://example.com/attachment-id";
+    expect(openWindow({ frameName: "", url }).action).toBe("allow");
+    for (const blocked of [
+      "blob:null/id",
+      "blob:https://other.example.com/id",
+      "data:text/html,hello",
+    ]) {
+      expect(openWindow({ frameName: "", url: blocked }).action).toBe("deny");
+    }
+    expect(openExternal).not.toHaveBeenCalled();
+    const popup = new TestWindow();
+    contents.emit("did-create-window", popup, { url });
+    for (const event of ["will-navigate", "will-redirect"]) {
+      for (const blocked of [
+        "https://example.com/",
+        "file:///etc/passwd",
+        "blob:https://other.example.com/id",
+      ]) {
+        const preventDefault = mock(() => undefined);
+        popup.webContents.emit(event, { preventDefault }, blocked);
+        expect(preventDefault).toHaveBeenCalled();
+      }
+    }
+    expect(
+      popup.webContents.setWindowOpenHandler.mock.calls[0][0]({
+        frameName: "",
+        url: "https://example.com/",
+      }).action
+    ).toBe("deny");
+    manager.disconnect();
+    expect(popup.destroyed).toBe(true);
+  });
+
+  test("does not open sibling app mounts or login pages as app popups", async () => {
+    const { manager, windows, openExternal } = setup();
+    await manager.connect("https://example.com/@user/workspace/apps/xum/");
+    const openWindow = windows[0].webContents.setWindowOpenHandler.mock.calls[0][0];
+    for (const url of [
+      "https://example.com/@user/other/apps/xum/terminal.html",
+      "https://example.com/login",
+    ]) {
+      expect(openWindow({ frameName: "", url }).action).toBe("deny");
+      expect(openExternal).toHaveBeenCalledWith(url);
+    }
+  });
+
+  test("rejects editor placeholders before reserving an authentication popup", async () => {
+    const { manager, windows, openExternal } = setup();
+    await manager.connect("https://example.com/");
+    const openWindow = windows[0].webContents.setWindowOpenHandler.mock.calls[0][0];
+    expect(
+      openWindow({
+        url: "about:blank",
+        frameName: REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX + "unique-launch",
+      })
+    ).toEqual({ action: "deny" });
+    expect(openWindow({ url: "about:blank", frameName: "auth" }).action).toBe("allow");
+    expect(openExternal).not.toHaveBeenCalled();
+  });
+
+  test("keeps auth redirects outside sibling Coder app mounts", async () => {
+    const { manager, windows } = setup();
+    const base = "https://example.com/@user/workspace/apps/xum";
+    await manager.connect(base);
+    const contents = windows[0].webContents;
+    contents.setWindowOpenHandler.mock.calls[0][0]({ url: "about:blank", frameName: "auth" });
+    const popup = new TestWindow();
+    contents.emit("did-create-window", popup, { url: "about:blank" });
+    for (const event of ["will-navigate", "will-redirect"]) {
+      for (const target of [
+        base + "/callback",
+        "https://example.com/login",
+        "https://auth.example.com/",
+      ]) {
+        const preventDefault = mock(() => undefined);
+        popup.webContents.emit(event, { preventDefault }, target);
+        expect(preventDefault).not.toHaveBeenCalled();
+      }
+      const preventDefault = mock(() => undefined);
+      popup.webContents.emit(
+        event,
+        { preventDefault },
+        "https://example.com/@user/other/apps/xum/"
+      );
+      expect(preventDefault).toHaveBeenCalled();
+    }
+  });
+
   test("allows one blank auth popup with the remote session and no preload", async () => {
     const { manager, windows, onDisconnected, openExternal } = setup();
     await manager.connect("https://example.com/");
     const contents = windows[0].webContents;
     const openWindow = contents.setWindowOpenHandler.mock.calls[0][0];
-    const first = openWindow({ url: "about:blank" });
+    const first = openWindow({ frameName: "", url: "about:blank" });
     expect(first.action).toBe("allow");
     expect(first.overrideBrowserWindowOptions?.webPreferences).toMatchObject({
       sandbox: true,
@@ -523,24 +668,24 @@ describe("RemoteConnectionManager", () => {
     expect(
       Object.is(first.overrideBrowserWindowOptions?.webPreferences?.session, contents.session)
     ).toBe(true);
-    expect(openWindow({ url: "about:blank" })).toEqual({ action: "deny" });
+    expect(openWindow({ frameName: "", url: "about:blank" })).toEqual({ action: "deny" });
     const popup = new TestWindow();
-    contents.emit("did-create-window", popup);
-    expect(openWindow({ url: "about:blank" })).toEqual({ action: "deny" });
+    contents.emit("did-create-window", popup, { url: "about:blank" });
+    expect(openWindow({ frameName: "", url: "about:blank" })).toEqual({ action: "deny" });
     popup.close();
     expect(manager.getState().status).toBe("connected");
     expect(onDisconnected).not.toHaveBeenCalled();
     expect(openExternal).not.toHaveBeenCalled();
-    expect(openWindow({ url: "about:blank" }).action).toBe("allow");
+    expect(openWindow({ frameName: "", url: "about:blank" }).action).toBe("allow");
   });
 
   test("allows HTTP auth redirects but blocks privileged navigation and nested popups", async () => {
     const { manager, windows, openExternal } = setup();
     await manager.connect("https://example.com/");
     const contents = windows[0].webContents;
-    contents.setWindowOpenHandler.mock.calls[0][0]({ url: "about:blank" });
+    contents.setWindowOpenHandler.mock.calls[0][0]({ frameName: "", url: "about:blank" });
     const popup = new TestWindow();
-    contents.emit("did-create-window", popup);
+    contents.emit("did-create-window", popup, { url: "about:blank" });
     for (const event of ["will-navigate", "will-redirect"]) {
       for (const url of [
         "about:blank",
@@ -572,7 +717,7 @@ describe("RemoteConnectionManager", () => {
     }
     const openNested = popup.webContents.setWindowOpenHandler.mock.calls[0][0];
     for (const url of ["about:blank", "https://example.com/", "xum://open"]) {
-      expect(openNested({ url })).toEqual({ action: "deny" });
+      expect(openNested({ frameName: "", url })).toEqual({ action: "deny" });
     }
     expect(openExternal).not.toHaveBeenCalled();
   });
@@ -583,9 +728,9 @@ describe("RemoteConnectionManager", () => {
       const { manager, windows, onDisconnected } = setup();
       await manager.connect("https://example.com/");
       const contents = windows[0].webContents;
-      contents.setWindowOpenHandler.mock.calls[0][0]({ url: "about:blank" });
+      contents.setWindowOpenHandler.mock.calls[0][0]({ frameName: "", url: "about:blank" });
       const popup = new TestWindow();
-      contents.emit("did-create-window", popup);
+      contents.emit("did-create-window", popup, { url: "about:blank" });
       manager[action]();
       expect(popup.destroyed).toBe(true);
       expect(windows[0].destroyed).toBe(true);
@@ -597,11 +742,11 @@ describe("RemoteConnectionManager", () => {
     const { manager, windows, onDisconnected } = setup();
     await manager.connect("https://old.example.com/");
     const oldContents = windows[0].webContents;
-    oldContents.setWindowOpenHandler.mock.calls[0][0]({ url: "about:blank" });
+    oldContents.setWindowOpenHandler.mock.calls[0][0]({ frameName: "", url: "about:blank" });
     manager.disconnect();
     await manager.connect("https://new.example.com/");
     const popup = new TestWindow();
-    oldContents.emit("did-create-window", popup);
+    oldContents.emit("did-create-window", popup, { url: "about:blank" });
     expect(popup.destroyed).toBe(true);
     expect(windows[1].destroyed).toBe(false);
     expect(manager.getState()).toEqual({
@@ -734,8 +879,11 @@ describe("RemoteConnectionManager", () => {
       await manager.connect("https://example.com/");
       const remote = windows[0];
       const popup = new TestWindow();
-      remote.webContents.setWindowOpenHandler.mock.calls[0][0]({ url: "about:blank" });
-      remote.webContents.emit("did-create-window", popup);
+      remote.webContents.setWindowOpenHandler.mock.calls[0][0]({
+        frameName: "",
+        url: "about:blank",
+      });
+      remote.webContents.emit("did-create-window", popup, { url: "about:blank" });
       const contents = target === "remote" ? remote.webContents : popup.webContents;
       const modifier =
         process.platform === "darwin"
@@ -771,7 +919,7 @@ describe("RemoteConnectionManager", () => {
     }
   );
 
-  test("denies permissions and popups, opening only HTTP links externally", async () => {
+  test("denies permissions and custom schemes, opening external HTTP links in the browser", async () => {
     const { manager, windows, openExternal } = setup();
     await manager.connect("https://example.com/");
     const contents = windows[0].webContents;
@@ -793,8 +941,8 @@ describe("RemoteConnectionManager", () => {
     }
     expect(permissionCheck()).toBe(false);
     const openWindow = contents.setWindowOpenHandler.mock.calls[0][0];
-    for (const url of ["https://example.com/help", "http://external.example.com/help"]) {
-      expect(openWindow({ url })).toEqual({ action: "deny" });
+    for (const url of ["https://external.example.com/help", "http://external.example.com/help"]) {
+      expect(openWindow({ frameName: "", url })).toEqual({ action: "deny" });
       expect(openExternal).toHaveBeenLastCalledWith(url);
     }
     for (const url of [
@@ -806,7 +954,7 @@ describe("RemoteConnectionManager", () => {
       "https://user:password@example.com/",
       "invalid",
     ]) {
-      expect(openWindow({ url })).toEqual({ action: "deny" });
+      expect(openWindow({ frameName: "", url })).toEqual({ action: "deny" });
     }
     expect(openExternal).toHaveBeenCalledTimes(2);
   });
