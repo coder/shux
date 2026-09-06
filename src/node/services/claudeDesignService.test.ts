@@ -1,3 +1,8 @@
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  EXPERIMENT_OVERRIDES_FILE_NAME,
+  readPersistedExperimentEnabled,
+} from "./experimentsService";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import { OpenSSHTransport } from "@/node/runtime/transports/OpenSSHTransport";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
@@ -40,6 +45,7 @@ async function setup(
     fetch?: typeof fetch;
     enabled?: () => boolean;
     now?: () => number;
+    readEnabled?: () => Promise<boolean>;
   } = {}
 ) {
   const service = new ClaudeDesignService({
@@ -48,6 +54,7 @@ async function setup(
     now: options.now ?? (() => now),
     readSource: options.readSource ?? (() => Promise.resolve(data())),
     fetch: options.fetch,
+    readEnabled: options.readEnabled,
   });
   await service.configure({
     source: { type: "file", path: path.join(rootDir, "synthetic.json") },
@@ -221,17 +228,22 @@ describe("Design HTTP request seam", () => {
   });
   test("concurrent reads coalesce and disable during lookup prevents both sends", async () => {
     let finish!: (raw: string) => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
     const readSource = mock(
       () =>
         new Promise<string>((resolve) => {
           finish = resolve;
+          entered();
         })
     );
     const network = mock(() => Promise.resolve(new Response("{}")));
     const { service, send } = await setup({ readSource, fetch: fakeFetch(network) });
     const results = Promise.allSettled([send(), send()]);
     // Wait for the deterministic reader entry, not a timing grace period.
-    while (!finish) await Promise.resolve();
+    await started;
     await service.configure({ source: null, reuseEnabled: false, serverEnabled: false });
     finish(data());
     expect((await results).every((result) => result.status === "rejected")).toBe(true);
@@ -575,3 +587,96 @@ test("checkout overrides cannot enable Design before the backend user enables it
     await fixture.server.stop(true);
   }
 });
+
+test("empty Design allowlist denies every tool, including with workspace enablement", async () => {
+  const fixture = protocolFixture();
+  const { service } = await setup({ fetch: fixture.network });
+  await service.configure({ toolAllowlist: [] });
+  const manager = new MCPServerManager(
+    new MCPConfigService(new Config(rootDir), { claudeDesign: service })
+  );
+  try {
+    const result = await manager.getToolsForWorkspace({
+      workspaceId: "deny-all",
+      projectPath: rootDir,
+      workspacePath: rootDir,
+      runtime: new LocalRuntime(rootDir),
+      trusted: true,
+      overrides: {
+        enabledServers: ["claude_design"],
+        toolAllowlist: { claude_design: ["design_test"] },
+      },
+    });
+    expect(Object.keys(result.tools)).toHaveLength(0);
+  } finally {
+    await manager.stopServers("deny-all");
+    manager.dispose();
+    await fixture.server.stop(true);
+  }
+});
+
+test("a sibling disconnect retires a loaded service before it can send again", async () => {
+  const network = mock(() => Promise.resolve(new Response("{}")));
+  const { service, send } = await setup({ fetch: fakeFetch(network) });
+  await send();
+  const sibling = new ClaudeDesignService({ rootDir, isEnabled: () => true });
+  await sibling.configure({ reuseEnabled: false });
+  await expectFailure(send());
+  expect(network).toHaveBeenCalledTimes(1);
+  expect((await service.getStatus()).settings.reuseEnabled).toBe(false);
+  await service.configure({ toolAllowlist: [] });
+  expect((await service.getStatus()).settings.reuseEnabled).toBe(false);
+});
+
+test.each(["disconnect", "experiment"] as const)(
+  "sibling %s aborts an in-flight request through a filesystem notification",
+  async (change) => {
+    const flags = path.join(rootDir, EXPERIMENT_OVERRIDES_FILE_NAME);
+    await fs.writeFile(
+      flags,
+      JSON.stringify({ version: 1, overrides: { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: true } })
+    );
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let aborted = false;
+    const { service, send } = await setup({
+      readEnabled: () =>
+        readPersistedExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, { xumHome: rootDir }),
+      fetch: fakeFetch(
+        (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => {
+                aborted = true;
+                reject(new Error("aborted"));
+              },
+              { once: true }
+            );
+            entered();
+          })
+      ),
+    });
+    const unsubscribe = service.onChange(() => Promise.resolve());
+    try {
+      const pending = send().catch(() => undefined);
+      await started;
+      if (change === "disconnect") {
+        const sibling = new ClaudeDesignService({ rootDir, isEnabled: () => true });
+        await sibling.configure({ reuseEnabled: false });
+      } else {
+        await fs.writeFile(
+          flags,
+          JSON.stringify({ version: 1, overrides: { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: false } })
+        );
+      }
+      await pending;
+      expect(aborted).toBe(true);
+      expect((await service.getStatus()).state).toBe("disabled");
+    } finally {
+      unsubscribe();
+    }
+  }
+);

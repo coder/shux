@@ -1681,11 +1681,11 @@ export class MCPServerManager {
     // - If neither: no filtering
     let effectiveAllowlist: Set<string> | null = null;
 
-    if (projectAllowlist && projectAllowlist.length > 0 && workspaceAllowlist) {
+    if (projectAllowlist && workspaceAllowlist) {
       // Intersection of both allowlists
       const projectSet = new Set(projectAllowlist);
       effectiveAllowlist = new Set(workspaceAllowlist.filter((t) => projectSet.has(t)));
-    } else if (projectAllowlist && projectAllowlist.length > 0) {
+    } else if (projectAllowlist) {
       effectiveAllowlist = new Set(projectAllowlist);
     } else if (workspaceAllowlist) {
       effectiveAllowlist = new Set(workspaceAllowlist);

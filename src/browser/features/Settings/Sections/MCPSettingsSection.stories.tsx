@@ -455,6 +455,10 @@ function setupDesignStory(enabled = true, reuseEnabled = false): APIClient {
       serverEnabled: false,
     },
   };
+  client.experiments = {
+    getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled }),
+    setOverride: () => Promise.resolve(),
+  };
   client.mcp.designStatus = () => Promise.resolve(status);
   client.mcp.configureDesign = (settings) => {
     status = {

@@ -174,6 +174,29 @@ describe("ExperimentsProvider", () => {
     }
   );
 
+  test("stale local Design enablement is neither uploaded nor displayed on reconnect", async () => {
+    window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), "true");
+    const setOverride = mock(() => Promise.resolve());
+    currentClientMock = {
+      experiments: {
+        setOverride,
+        getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: false }),
+      },
+    };
+    function Observer() {
+      return <div>{String(useExperimentValue(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP))}</div>;
+    }
+    const view = render(
+      <APIProvider client={currentClientMock as APIClient}>
+        <ExperimentsProvider>
+          <Observer />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+    await waitFor(() => expect(view.getByText("false")).toBeDefined());
+    expect(setOverride).not.toHaveBeenCalled();
+  });
+
   test("syncs existing local overrides to the backend on connect", async () => {
     globalThis.window.localStorage.setItem(
       getExperimentKey(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES),

@@ -1,3 +1,6 @@
+import { watch, type FSWatcher } from "node:fs";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { EXPERIMENT_OVERRIDES_FILE_NAME } from "./experimentsService";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -92,7 +95,9 @@ export function selectClaudeDesignCredential(raw: string, now: number): Credenti
  */
 export class ClaudeDesignService {
   private settings = defaults();
-  private loaded: Promise<void> | undefined;
+  private loaded = false;
+  private diskEnabled = true;
+  private watcher: FSWatcher | undefined;
   private readonly lock = new MutexMap<string>();
   private controller = new AbortController();
   private reading: Promise<Credential> | undefined;
@@ -106,6 +111,7 @@ export class ClaudeDesignService {
     private readonly options: {
       rootDir: string;
       isEnabled: () => boolean;
+      readEnabled?: () => Promise<boolean>;
       readSource?: (source: ClaudeDesignSource, signal?: AbortSignal) => Promise<string>;
       fetch?: typeof fetch;
       now?: () => number;
@@ -115,21 +121,57 @@ export class ClaudeDesignService {
   private get filePath() {
     return path.join(this.options.rootDir, "claude-design.json");
   }
+  private enabled(): boolean {
+    return this.options.isEnabled() && this.diskEnabled;
+  }
   private load(): Promise<void> {
-    this.loaded ??= (async () => {
-      try {
-        this.settings = ClaudeDesignSettingsSchema.parse(
-          JSON.parse(await fs.readFile(this.filePath, "utf8"))
-        );
-      } catch {
-        this.settings = defaults();
-      }
-    })();
-    return this.loaded;
+    return this.lock.withLock("settings", () => this.loadLocked());
+  }
+  private async loadLocked(): Promise<void> {
+    let next = defaults();
+    try {
+      next = ClaudeDesignSettingsSchema.parse(JSON.parse(await fs.readFile(this.filePath, "utf8")));
+    } catch {
+      /* Missing or invalid settings withdraw consent. */
+    }
+    const enabled = (await this.options.readEnabled?.().catch(() => false)) ?? true;
+    const changed =
+      JSON.stringify(next) !== JSON.stringify(this.settings) || enabled !== this.diskEnabled;
+    this.settings = next;
+    this.diskEnabled = enabled;
+    if (this.loaded && changed) await this.invalidate();
+    this.loaded = true;
   }
   onChange(listener: () => Promise<void>): () => void {
     this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    if (!this.watcher) {
+      try {
+        // Atomic replacement changes the file inode: watch its directory. Requests
+        // also re-read preferences, so missed/unavailable notifications fail closed.
+        this.watcher = watch(this.options.rootDir, (_event, filename) => {
+          if (
+            filename === null ||
+            filename === path.basename(this.filePath) ||
+            filename === EXPERIMENT_OVERRIDES_FILE_NAME
+          )
+            this.load().catch(() => undefined);
+        });
+        this.watcher.unref();
+        this.watcher.on("error", () => {
+          this.watcher?.close();
+          this.watcher = undefined;
+        });
+      } catch {
+        /* Request-time revalidation remains authoritative. */
+      }
+    }
+    return () => {
+      this.listeners.delete(listener);
+      if (this.listeners.size === 0) {
+        this.watcher?.close();
+        this.watcher = undefined;
+      }
+    };
   }
   async invalidate(): Promise<void> {
     this.generation++;
@@ -145,7 +187,7 @@ export class ClaudeDesignService {
     // Listing status never opens a credential source, even when configured.
     if (this.options.isEnabled()) await this.load();
     return {
-      state: !this.options.isEnabled() || !this.settings.reuseEnabled ? "disabled" : this.state,
+      state: !this.enabled() || !this.settings.reuseEnabled ? "disabled" : this.state,
       settings: { ...this.settings },
       backendHost: os.hostname(),
       platform: process.platform,
@@ -154,7 +196,15 @@ export class ClaudeDesignService {
   async configure(settings: Partial<ClaudeDesignSettings>): Promise<ClaudeDesignStatus> {
     await this.lock.withLock("settings", async () => {
       if (!this.options.isEnabled()) throw new DesignError("disabled");
-      await this.load();
+      await using lease = await acquireProcessFileLock({
+        lockPath: `${this.filePath}.lock`,
+        timeoutMs: CLAUDE_DESIGN_READ_TIMEOUT_MS,
+        label: "Claude Design settings",
+      });
+      // Reload under a cross-process lock so a sibling's disconnect cannot be
+      // overwritten by an unrelated stale enablement/allowlist update.
+      await this.loadLocked();
+      if (!this.enabled()) throw new DesignError("disabled");
       const next = ClaudeDesignSettingsSchema.parse({ ...this.settings, ...settings });
       if (settings.serverEnabled === true && !next.reuseEnabled)
         throw new DesignError("not_configured");
@@ -164,6 +214,7 @@ export class ClaudeDesignService {
         throw new DesignError("credentials_invalid");
       await fs.mkdir(this.options.rootDir, { recursive: true, mode: 0o700 });
       // Persist only preferences, then publish and retire old clients.
+      await lease.assertStillOwned();
       await writeFileAtomic(this.filePath, JSON.stringify(next, null, 2), { mode: 0o600 });
       this.settings = next;
       await this.invalidate();
@@ -173,7 +224,7 @@ export class ClaudeDesignService {
   async serverInfo(): Promise<MCPHttpServerInfo | undefined> {
     if (!this.options.isEnabled()) return undefined;
     await this.load();
-    if (!this.options.isEnabled()) return undefined;
+    if (!this.enabled()) return undefined;
     return {
       transport: "http",
       url: CLAUDE_DESIGN_URL,
@@ -183,7 +234,7 @@ export class ClaudeDesignService {
     };
   }
   private guard(signal: AbortSignal): void {
-    if (!this.options.isEnabled() || !this.settings.reuseEnabled) throw new DesignError("disabled");
+    if (!this.enabled() || !this.settings.reuseEnabled) throw new DesignError("disabled");
     if (signal.aborted) throw new DesignError("connection_failed");
     if (!this.settings.source) throw new DesignError("not_configured");
     if (this.rejected) throw new DesignError(this.state);
@@ -228,16 +279,19 @@ export class ClaudeDesignService {
     const baseFetch = this.options.fetch ?? fetch;
     const wrapped = Object.assign(async (...args: Parameters<typeof fetch>): Promise<Response> => {
       try {
-        this.guard(lifecycle);
         const request = new Request(args[0], args[1]);
         if (request.url !== CLAUDE_DESIGN_URL) throw new DesignError("authorization_failed");
         if (request.method !== "POST")
           return new Response(null, { status: 405, headers: { Allow: "POST" } });
+        this.guard(lifecycle);
+        await this.load();
+        this.guard(lifecycle);
         const signal = AbortSignal.any([lifecycle, request.signal]);
         const explicitAuth = request.headers.has("authorization");
         const body = await request.text();
         const credential = explicitAuth ? undefined : await this.credential(signal);
         const send = async (token?: Credential) => {
+          await this.load();
           this.guard(signal);
           const outgoing = new Headers(request.headers);
           if (token) outgoing.set("Authorization", `Bearer ${token.accessToken}`);
@@ -294,11 +348,11 @@ export class ClaudeDesignService {
     return { type: "http", url: CLAUDE_DESIGN_URL, headers, fetch: wrapped };
   }
   markConnected(generation: number): void {
-    if (generation === this.generation && this.options.isEnabled() && this.settings.reuseEnabled)
+    if (generation === this.generation && this.enabled() && this.settings.reuseEnabled)
       this.state = "connected";
   }
   async test(): Promise<MCPTestResult> {
-    if (!this.options.isEnabled()) return { success: false, error: "Claude Design: disabled" };
+    if (!this.enabled()) return { success: false, error: "Claude Design: disabled" };
     await this.load();
     await this.invalidate();
     const generation = this.generation;

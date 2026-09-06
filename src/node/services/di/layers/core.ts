@@ -1,3 +1,4 @@
+import { readPersistedExperimentEnabled } from "@/node/services/experimentsService";
 import { ClaudeDesignService } from "@/node/services/claudeDesignService";
 import * as os from "os";
 import * as path from "path";
@@ -316,6 +317,10 @@ export const MCPConfigLive = Layer.effect(
     return new MCPConfigService(mcpConfig, {
       claudeDesign: new ClaudeDesignService({
         rootDir: mcpConfig.rootDir,
+        readEnabled: () =>
+          readPersistedExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, {
+            xumHome: mcpConfig.rootDir,
+          }),
         isEnabled: () =>
           opts.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) === true,
       }),

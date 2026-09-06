@@ -24,7 +24,7 @@ interface ExperimentsFile {
   overrides?: Record<string, boolean>;
 }
 
-const OVERRIDES_FILE_NAME = "feature_flags.json";
+export const EXPERIMENT_OVERRIDES_FILE_NAME = "feature_flags.json";
 const OVERRIDES_FILE_VERSION = 1;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -92,7 +92,7 @@ export async function readPersistedExperimentEnabled(
   }
 
   const xumHome = options?.xumHome ?? getXumHome();
-  const { overrides } = await readOverridesFile(path.join(xumHome, OVERRIDES_FILE_NAME));
+  const { overrides } = await readOverridesFile(path.join(xumHome, EXPERIMENT_OVERRIDES_FILE_NAME));
   return overrides.get(experimentId) === true;
 }
 
@@ -120,7 +120,7 @@ export class ExperimentsService {
   }) {
     this.telemetryService = options.telemetryService;
     this.xumHome = options.xumHome ?? getXumHome();
-    this.overridesFilePath = path.join(this.xumHome, OVERRIDES_FILE_NAME);
+    this.overridesFilePath = path.join(this.xumHome, EXPERIMENT_OVERRIDES_FILE_NAME);
     this.platform = options.platform ?? process.platform;
   }
 
