@@ -680,3 +680,49 @@ test.each(["disconnect", "experiment"] as const)(
     }
   }
 );
+
+test("sibling disconnect during cold tools/list prevents publication", async () => {
+  const fixture = protocolFixture();
+  let entered!: () => void;
+  let finish!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const { service } = await setup({
+    fetch: fakeFetch(async (input, init) => {
+      if (typeof init?.body !== "string") throw new Error("Expected fixture request body");
+      const body: unknown = JSON.parse(init.body);
+      if (body && typeof body === "object" && Reflect.get(body, "method") === "tools/list") {
+        entered();
+        await released;
+      }
+      return fixture.network(input, init);
+    }),
+  });
+  const manager = new MCPServerManager(
+    new MCPConfigService(new Config(rootDir), { claudeDesign: service })
+  );
+  try {
+    const pending = manager.getToolsForWorkspace({
+      workspaceId: "cold-disconnect",
+      projectPath: rootDir,
+      workspacePath: rootDir,
+      runtime: new LocalRuntime(rootDir),
+      trusted: true,
+    });
+    await started;
+    const sibling = new ClaudeDesignService({ rootDir, isEnabled: () => true });
+    await sibling.configure({ reuseEnabled: false });
+    finish();
+    expect(Object.keys((await pending).tools)).toHaveLength(0);
+    expect((await service.getStatus()).state).toBe("disabled");
+  } finally {
+    finish();
+    await manager.stopServers("cold-disconnect");
+    manager.dispose();
+    await fixture.server.stop(true);
+  }
+});

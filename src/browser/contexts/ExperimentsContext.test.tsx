@@ -134,16 +134,21 @@ describe("ExperimentsProvider", () => {
   test.each([true, false])(
     "Design disable waits for backend acknowledgement (success=%s)",
     async (success) => {
+      let backendEnabled = true;
       let finish!: () => void;
       let reject!: (error: Error) => void;
       const pending = new Promise<void>((resolve, fail) => {
-        finish = resolve;
+        finish = () => {
+          backendEnabled = false;
+          resolve();
+        };
         reject = fail;
       });
       const setOverride = mock(() => pending);
       currentClientMock = {
         experiments: {
-          getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: true }),
+          getOverrides: () =>
+            Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: backendEnabled }),
           setOverride,
         },
       };
@@ -173,6 +178,30 @@ describe("ExperimentsProvider", () => {
       expect(view.getByRole("button").textContent).toBe(String(!success));
     }
   );
+
+  test("a completed Design toggle adopts a newer backend value", async () => {
+    const setOverride = mock(() => Promise.resolve());
+    const getOverrides = mock(() => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: true }));
+    currentClientMock = { experiments: { setOverride, getOverrides } };
+    function Toggle() {
+      const [enabled, setEnabled] = useExperiment(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
+      return <button onClick={() => setEnabled(false)}>{String(enabled)}</button>;
+    }
+    const view = render(
+      <APIProvider client={currentClientMock as APIClient}>
+        <ExperimentsProvider>
+          <Toggle />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+    await waitFor(() => expect(view.getByRole("button").textContent).toBe("true"));
+    await act(async () => {
+      fireEvent.click(view.getByRole("button"));
+      await Promise.resolve();
+    });
+    expect(getOverrides).toHaveBeenCalledTimes(2);
+    expect(view.getByRole("button").textContent).toBe("true");
+  });
 
   test("stale local Design enablement is neither uploaded nor displayed on reconnect", async () => {
     window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), "true");

@@ -218,11 +218,16 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         designTogglePending.current = true;
         designToggleRevision.current++;
         persistOverride(experimentId, enabled)
-          .then((saved) => {
-            designTogglePending.current = false;
-            if (saved) publish();
+          .then(async (saved) => {
+            if (!saved || !apiState.api) return;
+            // Another renderer may have changed Design while our acknowledgement
+            // was in flight. Publish the current backend value, never the old intent.
+            const overrides = await apiState.api.experiments.getOverrides();
+            setBackendOverrides(overrides);
+            setExperimentState(experimentId, overrides[experimentId] ?? false);
           })
-          .catch(() => {
+          .catch(() => undefined)
+          .finally(() => {
             designTogglePending.current = false;
           });
         return;
@@ -230,7 +235,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
       publish();
       persistOverride(experimentId, enabled).catch(() => undefined);
     },
-    [persistOverride]
+    [persistOverride, apiState.api]
   );
 
   useEffect(() => {

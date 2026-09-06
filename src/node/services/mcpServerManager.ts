@@ -3971,6 +3971,8 @@ export class MCPServerManager {
       }
     };
 
+    // Observe sibling shutdown throughout cold startup, including tools/list.
+    const unsubscribeStartupDesign = design?.onChange(cleanupStartupClient);
     try {
       try {
         client = await establishClient();
@@ -4071,6 +4073,8 @@ export class MCPServerManager {
 
       instanceRef.current = instance;
       if (design) {
+        // Revalidate before publication even when filesystem notifications are unavailable.
+        await design.getStatus();
         if (designGeneration !== design.generation) {
           await instance.close();
           return null;
@@ -4086,6 +4090,7 @@ export class MCPServerManager {
       }
       throw error;
     } finally {
+      unsubscribeStartupDesign?.();
       signal.removeEventListener("abort", onAbort);
     }
   }

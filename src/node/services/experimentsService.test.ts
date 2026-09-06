@@ -38,6 +38,42 @@ describe("ExperimentsService", () => {
     return JSON.parse(raw) as { experiments?: unknown; overrides?: Record<string, unknown> };
   }
 
+  test("failed Design persistence rejects the toggle without publishing it", async () => {
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await service.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, true);
+    const file = path.join(tempDir, OVERRIDES_FILE);
+    const backup = `${file}.backup`;
+    await fs.rename(file, backup);
+    await fs.mkdir(file);
+    try {
+      const error: unknown = await service
+        .setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, false)
+        .then(
+          () => undefined,
+          (failure: unknown) => failure
+        );
+      expect(error).toBeInstanceOf(Error);
+      expect(service.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP)).toBe(true);
+    } finally {
+      await fs.rmdir(file);
+      await fs.rename(backup, file);
+    }
+    expect((await readOverridesFile()).overrides?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]).toBe(true);
+  });
+
+  test("stale sibling flag mutations preserve a durable Design disable", async () => {
+    const { telemetryService } = createTelemetryService();
+    const first = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await first.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, true);
+    const sibling = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await sibling.initialize();
+    await first.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, false);
+    await sibling.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    expect((await readOverridesFile()).overrides?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]).toBe(false);
+    expect((await first.getOverrides())[EXPERIMENT_IDS.TIMELINE]).toBe(true);
+  });
+
   test("experiments are disabled until the user sets an override", async () => {
     const { telemetryService } = createTelemetryService();
     const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
