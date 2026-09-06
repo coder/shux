@@ -21,7 +21,11 @@ import {
 } from "@/constants/goals";
 import { waitForCondition } from "./testDispatchHelpers";
 import { IdleDispatcher } from "./idleDispatcher";
-import { createFailedTurnHandle, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  createModelRoutingSnapshotMock,
+  createFailedTurnHandle,
+  createStartedTurnHandle,
+} from "./agentSession.testHarness";
 
 const PROJECT_PATH = "/tmp/mux-agent-session-goal-test-project";
 const SEND_OPTIONS: SendMessageOptions = { model: "openai:gpt-4o", agentId: "exec" };
@@ -56,6 +60,7 @@ function createAiService(workspaceId: string): AIService & EventEmitter {
     streamMessage: mock((_request: unknown) => Promise.resolve(Ok(createStartedTurnHandle()))),
     getStreamInfo: mock((_workspaceId: string) => null),
     getProvidersConfig: mock(() => null),
+    captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
     getWorkspaceMetadata: mock((_workspaceId: string) =>
       Promise.resolve(
         Ok({

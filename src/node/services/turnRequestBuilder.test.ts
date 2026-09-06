@@ -251,6 +251,196 @@ describe("TurnRequestBuilder tool scope", () => {
 });
 
 describe("TurnRequestBuilder model attempt preparation", () => {
+  it("computes limits from accepted auth settings instead of current provider settings", async () => {
+    const harness = await createPreparationHarness();
+    try {
+      const accepted: ProvidersConfigMap = {
+        openai: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          codexOauthSet: true,
+          codexOauthDefaultAccountId: "work",
+          codexOauthAccounts: [{ id: "work", label: "Work" }],
+        },
+      };
+      harness.providersConfigStore.saveProvidersConfig({
+        openai: { codexOauthDefaultAuth: "apiKey" },
+      });
+      const model = "openai:gpt-5.5";
+      const options = preparationOptions(accepted, {
+        rawModelString: model,
+        canonicalModelString: model,
+        canonicalProviderName: "openai",
+        effectiveModelString: model,
+        optionsModelString: model,
+        wireProviderName: "openai",
+      });
+      const live = harness.builder.prepareModelAttempt(options);
+      const next = harness.builder.prepareModelAttempt({
+        ...options,
+        providersConfigSnapshot: {
+          openai: { ...accepted.openai, codexOauthDefaultAuth: "apiKey" },
+        },
+      });
+      const chatCompletions = harness.builder.prepareModelAttempt({
+        ...options,
+        muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+      });
+      expect(live.effectiveContextLimit).toBe(272_000);
+      expect(next.effectiveContextLimit).toBeGreaterThan(272_000);
+      expect(chatCompletions.effectiveContextLimit).toBe(next.effectiveContextLimit);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("does not apply direct OpenAI OAuth caps to an automatic gateway route", async () => {
+    const harness = await createPreparationHarness();
+    try {
+      const model = "openai:gpt-5.5";
+      const options = preparationOptions(
+        {
+          openai: {
+            apiKeySet: true,
+            isEnabled: true,
+            isConfigured: true,
+            codexOauthSet: true,
+            codexOauthDefaultAccountId: "work",
+            codexOauthAccounts: [{ id: "work", label: "Work" }],
+            models: [{ id: "gpt-5.5", contextWindowTokens: 500_000 }],
+          },
+        },
+        {
+          rawModelString: model,
+          canonicalModelString: model,
+          canonicalProviderName: "openai",
+          effectiveModelString: model,
+          optionsModelString: model,
+          wireProviderName: "openai",
+        }
+      );
+      const direct = harness.builder.prepareModelAttempt(options);
+      const gateway = harness.builder.prepareModelAttempt({
+        ...options,
+        effectiveModelString: "openrouter:openai/gpt-5.5",
+        routeProvider: "openrouter",
+      });
+      // A rejected gateway selection can resolve to the direct provider on a later attempt.
+      const fallback = harness.builder.prepareModelAttempt({
+        ...options,
+        rawModelString: "openrouter:openai/gpt-5.5",
+        routeProvider: "openai",
+      });
+      expect(direct.effectiveContextLimit).toBe(272_000);
+      expect(gateway.effectiveContextLimit).toBe(500_000);
+      expect(fallback.effectiveContextLimit).toBe(272_000);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it.each([
+    {
+      routeProvider: "anthropic" as const,
+      effectiveModelString: "anthropic:claude-sonnet-4-5",
+      expectedLimit: 1_000_000,
+    },
+    {
+      routeProvider: "openrouter" as const,
+      effectiveModelString: "openrouter:anthropic/claude-sonnet-4-5",
+      expectedLimit: 100_000,
+    },
+    {
+      routeProvider: "mux-gateway" as const,
+      effectiveModelString: "mux-gateway:anthropic/claude-sonnet-4-5",
+      expectedLimit: 1_000_000,
+    },
+  ])("uses the emitted 1M beta capability for the $routeProvider route", async (testCase) => {
+    const harness = await createPreparationHarness();
+    try {
+      const options = preparationOptions(
+        {
+          anthropic: {
+            apiKeySet: true,
+            isEnabled: true,
+            isConfigured: true,
+            models: [{ id: "claude-sonnet-4-5", contextWindowTokens: 100_000 }],
+          },
+        },
+        {
+          routeProvider: testCase.routeProvider,
+          effectiveModelString: testCase.effectiveModelString,
+          muxProviderOptions: {
+            anthropic: { use1MContextModels: ["anthropic:claude-sonnet-4-5"] },
+          },
+        }
+      );
+      const prepared = harness.builder.prepareModelAttempt(options);
+      expect(prepared.effectiveContextLimit).toBe(testCase.expectedLimit);
+      expect(prepared.requestHeaders?.["anthropic-beta"] !== undefined).toBe(
+        testCase.expectedLimit === 1_000_000
+      );
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("uses the direct context limit when a Coder selection falls back to Anthropic", async () => {
+    const harness = await createPreparationHarness();
+    try {
+      const prepared = harness.builder.prepareModelAttempt(
+        preparationOptions(
+          {
+            anthropic: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              models: [{ id: "claude-sonnet-4-5", contextWindowTokens: 100_000 }],
+            },
+            coder: {
+              apiKeySet: false,
+              isEnabled: true,
+              isConfigured: false,
+              additionalProviders: [{ name: "production", type: "anthropic" }],
+              models: [{ id: "production/claude-sonnet-4-5", contextWindowTokens: 80_000 }],
+            },
+          },
+          {
+            rawModelString: "coder:production/claude-sonnet-4-5",
+            routeProvider: "anthropic",
+          }
+        )
+      );
+      expect(prepared.effectiveContextLimit).toBe(100_000);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("honors accepted custom limits and the request's 1M context option", async () => {
+    const harness = await createPreparationHarness();
+    try {
+      const options = preparationOptions({
+        anthropic: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          models: [{ id: "claude-sonnet-4-5", contextWindowTokens: 100_000 }],
+        },
+      });
+      expect(harness.builder.prepareModelAttempt(options).effectiveContextLimit).toBe(100_000);
+      expect(
+        harness.builder.prepareModelAttempt({
+          ...options,
+          muxProviderOptions: { anthropic: { use1MContextModels: [options.rawModelString] } },
+        }).effectiveContextLimit
+      ).toBe(1_000_000);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   it("merges call settings and provider extras at the resolved namespace", async () => {
     const harness = await createPreparationHarness();
     try {

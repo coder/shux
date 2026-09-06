@@ -337,6 +337,25 @@ describe("Config", () => {
   });
 
   describe("loadConfigOrDefault customInstructions sanitizing", () => {
+    it("sanitizes malformed Codex selections but retains disconnected account IDs", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["/home/user/number", { workspaces: [], codexOauthAccountId: 42 }],
+            ["/home/user/blank", { workspaces: [], codexOauthAccountId: "  " }],
+            ["/home/user/disconnected", { workspaces: [], codexOauthAccountId: "removed-account" }],
+          ],
+        })
+      );
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.projects.get("/home/user/number")?.codexOauthAccountId).toBeUndefined();
+      expect(loaded.projects.get("/home/user/blank")?.codexOauthAccountId).toBeUndefined();
+      expect(loaded.projects.get("/home/user/disconnected")?.codexOauthAccountId).toBe(
+        "removed-account"
+      );
+    });
+
     it("discards malformed non-string customInstructions and keeps valid ones", () => {
       // A malformed value must not survive load: it would fail the
       // projects.list z.string() output schema and brick the project list.

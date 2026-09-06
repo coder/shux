@@ -17,7 +17,9 @@ import type { WorkspaceChatMessage, SendMessageOptions } from "@/common/orpc/typ
 import { createMuxMessage, pickStartupRetrySendOptions } from "@/common/types/message";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -414,6 +416,61 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
     session.dispose();
   });
+
+  test.each(["automatic", "explicit"] as const)(
+    "%s resume uses the correct provider snapshot after settings change",
+    async (kind) => {
+      const workspaceId = "retry-account-" + kind;
+      const { session, historyService, aiService, cleanup } =
+        await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      const initial: ModelRoutingSnapshot = {
+        routeConfig: { routePriority: ["direct"], routeOverrides: {} },
+        providersConfig: { openai: { apiKey: "key", codexOauthDefaultAuth: "oauth" } },
+        metadata: {
+          openai: { apiKeySet: true, isEnabled: true, isConfigured: true, codexOauthSet: true },
+        },
+        codexOauthSelection: { accountId: "work", explicit: true },
+      };
+      let current = initial;
+      const capture = spyOn(aiService, "captureModelRoutingSnapshot").mockImplementation(
+        () => current
+      );
+      const stream = spyOn(aiService, "streamMessage")
+        .mockResolvedValueOnce(Err({ type: "unknown", raw: "Temporary connection failure" }))
+        .mockResolvedValue(Ok(createStartedTurnHandle()));
+      const options = { model: "openai:gpt-5.5", agentId: "exec" };
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user", "user", "Continue")
+      );
+      try {
+        expect((await session.resumeStream(options)).success).toBe(false);
+        current = {
+          routeConfig: { routePriority: ["direct"], routeOverrides: {} },
+          providersConfig: { openai: { apiKey: "key", codexOauthDefaultAuth: "apiKey" } },
+          metadata: { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
+          codexOauthSelection: { accountId: "personal", explicit: true },
+        };
+        if (kind === "automatic") {
+          await (session as unknown as RetryableSessionForTests).retryActiveStream();
+        } else {
+          expect((await session.resumeStream(options)).success).toBe(true);
+        }
+        expect(stream).toHaveBeenCalledTimes(2);
+        const snapshot = stream.mock.calls[1]?.[0].modelRoutingSnapshot;
+        expect(snapshot).toBe(kind === "automatic" ? initial : current);
+        expect(capture).toHaveBeenCalledTimes(kind === "automatic" ? 1 : 2);
+        expect(getEffectiveContextLimit(options.model, false, snapshot?.metadata)).toBe(
+          kind === "automatic" ? 272_000 : 1_050_000
+        );
+      } finally {
+        stream.mockRestore();
+        capture.mockRestore();
+        session.dispose();
+      }
+    }
+  );
 
   test("startup auto-retry reuses workspace-turn metadata from the retry user message", async () => {
     const workspaceId = "startup-retry-workspace-turn-metadata";

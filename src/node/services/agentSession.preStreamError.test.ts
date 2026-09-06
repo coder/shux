@@ -16,7 +16,10 @@ import {
   type WorkspaceChatMessage,
 } from "@/common/orpc/types";
 import { AgentSession } from "./agentSession";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import {
+  createModelRoutingSnapshotMock,
+  createAgentSessionHarness,
+} from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
 interface ReplayHarnessStreamInfo {
@@ -386,6 +389,7 @@ describe("AgentSession pre-stream errors", () => {
       );
     });
     const aiService = Object.assign(aiEmitter, {
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       getStreamInfo: mock((_workspaceId: string) => undefined),

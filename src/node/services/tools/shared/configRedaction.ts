@@ -13,6 +13,7 @@ const PROVIDER_SECRET_KEYS = new Set([
   "couponCode",
   "voucher",
   "codexOauth",
+  "codexOauthAccounts",
 ]);
 
 const APP_SECRET_KEYS = new Set(["muxGovernorToken"]);

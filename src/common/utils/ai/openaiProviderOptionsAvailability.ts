@@ -6,7 +6,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
-import { wouldRouteOpenAIThroughCodexOauth } from "@/common/utils/providers/codexOauthRouting";
+import { resolveCodexOauthRouting } from "@/common/utils/providers/codexOauthRouting";
 
 export interface OpenAIDirectProviderOptionsAvailability {
   /** Settings-resolved route for the canonical model ("direct" = no gateway). */
@@ -15,6 +15,7 @@ export interface OpenAIDirectProviderOptionsAvailability {
   providersConfig?: ProvidersConfigMap | null;
   /** Request-level OpenAI wire format; the stored config value wins when set. */
   openaiWireFormat?: OpenAIWireFormat | null;
+  codexOauthAccountId?: string;
 }
 
 export function openaiDirectProviderOptionsAvailable(
@@ -53,8 +54,9 @@ export function openaiDirectProviderOptionsAvailable(
   // API-only provider options, so toggles for those options must fail closed.
   return !(
     options?.providersConfig != null &&
-    wouldRouteOpenAIThroughCodexOauth(normalized, options.providersConfig, {
+    resolveCodexOauthRouting(normalized, options.providersConfig, {
       openaiWireFormat: options.openaiWireFormat,
-    })
+      codexOauthAccountId: options.codexOauthAccountId,
+    }) !== "other"
   );
 }

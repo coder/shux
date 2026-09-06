@@ -8,7 +8,11 @@ import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
-import { createStartedTurnHandle, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import {
+  createModelRoutingSnapshotMock,
+  createStartedTurnHandle,
+  createStreamLifecycleMocks,
+} from "./agentSession.testHarness";
 
 type StreamMessageHandler = AIService["streamMessage"];
 
@@ -18,6 +22,7 @@ const config = {
   rootDir: "/tmp",
   sessionsDir: "/tmp",
   srcDir: "/tmp",
+  findWorkspace: () => null,
   loadConfigOrDefault: () => ({}),
 } as unknown as Config;
 
@@ -45,6 +50,7 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     const streamMessage = mock(streamHandler);
     const aiService = Object.assign(new EventEmitter(), {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as AIService["streamMessage"],

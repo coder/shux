@@ -12,6 +12,7 @@ import type {
 } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
 import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
+import type { ModelRoutingSnapshot } from "@/node/services/modelRoutingSnapshot";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import type { AgentAiSettingsLayerValues } from "@/common/types/agentAiSettings";
@@ -310,6 +311,8 @@ export interface WorkspaceLiveActivity {
 }
 
 export interface SendMessageInternalOptions {
+  /** In-memory routing for same-session, idle-only continuations. Never persist these credentials. */
+  modelRoutingSnapshot?: ModelRoutingSnapshot;
   allowQueuedAgentTask?: boolean;
   skipAutoResumeReset?: boolean;
   synthetic?: boolean;

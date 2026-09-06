@@ -5,7 +5,13 @@ import * as path from "node:path";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { StreamEndEventSchema, ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
+import {
+  StreamEndEventSchema,
+  StreamStartEventSchema,
+  StreamModelUpdateEventSchema,
+  ToolCallStartEventSchema,
+  UsageDeltaEventSchema,
+} from "@/common/orpc/schemas/stream";
 import type {
   CompletedMessagePart,
   ToolCallEndEvent,
@@ -3473,6 +3479,40 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
 });
 
 describe("StreamManager - exact step indices", () => {
+  test.each([272_000, null])(
+    "publishes the accepted limit when the stream starts: %s",
+    async (limit) => {
+      const streamManager = new StreamManager(historyService);
+      const workspaceId = "start-context-workspace";
+      const messageId = "start-context-message";
+      await appendPartialAssistantForTests(workspaceId, messageId, 1);
+      Reflect.set(streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(undefined),
+        countTokens: () => Promise.resolve(0),
+      });
+      const starts: Array<Extract<TurnEngineEvent, { type: "stream-start" }>> = [];
+      onTurnEngineEvent(streamManager, "stream-start", (event) => starts.push(event));
+      const streamInfo = createStreamInfoForTests({
+        messageId,
+        effectiveContextLimit: limit,
+        streamResult: createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield { type: "finish", finishReason: "stop" };
+          })()
+        ),
+      });
+      await getProcessStreamWithCleanupForTests(streamManager).call(
+        streamManager,
+        workspaceId,
+        streamInfo,
+        1
+      );
+      expect(starts).toHaveLength(1);
+      expect(StreamStartEventSchema.parse(starts[0]).effectiveContextLimit).toBe(limit);
+    }
+  );
+
   test("persists exact tool-only step boundaries through successful completion", async () => {
     const streamManager = new StreamManager(historyService);
     const workspaceId = "step-indices-workspace";
@@ -4149,9 +4189,126 @@ describe("StreamManager - empty stream completions", () => {
     expect(committed?.metadata?.usage).toBeUndefined();
   });
 
+  test.each([false, true])(
+    "publishes every fallback before usage while preserving parts: %s",
+    async (preserveParts) => {
+      const streamManager = new StreamManager(historyService);
+      const workspaceId = "fallback-metadata-workspace";
+      const messageId = "fallback-metadata-message";
+      const models = ["openai:gpt-5.5", "openai:gpt-5.6-sol"];
+      const limits = [272_000, null];
+      const entered = models.map(() => Promise.withResolvers<void>());
+      const release = models.map(() => Promise.withResolvers<void>());
+      const events: TurnEngineEvent[] = [];
+      streamManager.setEventSink((event) => {
+        events.push(event);
+      });
+      await appendPartialAssistantForTests(workspaceId, messageId, 1);
+      Reflect.set(streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(undefined),
+        countTokens: () => Promise.resolve(0),
+      });
+      let attempt = 0;
+      Reflect.set(streamManager, "createStreamResult", () => {
+        const index = attempt++;
+        return createStreamResultForTests(
+          (async function* () {
+            entered[index].resolve();
+            await release[index].promise;
+            if (index === 0) {
+              yield { type: "finish", finishReason: "content-filter" };
+            } else {
+              yield { type: "text-delta", text: "fallback answer" };
+              yield { type: "finish", finishReason: "stop" };
+            }
+          })()
+        );
+      });
+      const streamInfo = createStreamInfoForTests({
+        messageId,
+        model: KNOWN_MODELS.SONNET.id,
+        effectiveContextLimit: 200_000,
+        initialMetadata: { routedThroughGateway: true, routeProvider: "mux-gateway" },
+        streamResult: createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            if (preserveParts) yield { type: "text-delta", text: "partial answer" };
+            yield {
+              type: "finish-step",
+              usage: { inputTokens: 1000, outputTokens: 0, totalTokens: 1000 },
+            };
+            yield { type: "finish", finishReason: "content-filter" };
+          })()
+        ),
+        modelFallback: {
+          options: {
+            chain: models,
+            prepare: (modelString: string) =>
+              Promise.resolve(
+                Ok({
+                  model: createTestLanguageModel(modelString),
+                  modelString,
+                  effectiveContextLimit: limits[models.indexOf(modelString)],
+                  messages: [],
+                  system: "fallback",
+                  tools: undefined,
+                })
+              ),
+          },
+          requestedModel: KNOWN_MODELS.SONNET.id,
+          refusedModels: [],
+          original: { maxOutputTokens: undefined },
+        },
+      });
+      getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+      const processing = getProcessStreamWithCleanupForTests(streamManager).call(
+        streamManager,
+        workspaceId,
+        streamInfo,
+        1
+      );
+      try {
+        for (let index = 0; index < models.length; index++) {
+          await entered[index].promise;
+          const updates = events.filter((event) => event.type === "stream-model-update");
+          expect(updates).toHaveLength(index + 1);
+          const update = StreamModelUpdateEventSchema.parse(updates[index]);
+          expect(update.model).toBe(models[index]);
+          expect(update.metadataModel).toBe(models[index]);
+          expect(update.effectiveContextLimit).toBe(limits[index]);
+          expect(update.routedThroughGateway).toBe(false);
+          expect(update.routeProvider).toBeUndefined();
+          expect(update.modelFallback.refusedModels).toHaveLength(index + 1);
+          expect(events.filter((event) => event.type === "usage-delta")).toHaveLength(1);
+          expect(
+            events.filter((event) => event.type === "stream-start" && !event.replay)
+          ).toHaveLength(1);
+          expect((streamInfo.parts as Array<{ text: string }>).map((part) => part.text)).toEqual(
+            preserveParts ? ["partial answer"] : []
+          );
+          await streamManager.replayStream(workspaceId);
+          const replayStart = events.findLast((event) => event.type === "stream-start");
+          expect(StreamStartEventSchema.parse(replayStart)).toMatchObject({
+            model: models[index],
+            effectiveContextLimit: limits[index],
+            modelFallback: update.modelFallback,
+          });
+          release[index].resolve();
+        }
+      } finally {
+        for (const gate of release) gate.resolve();
+        await processing;
+      }
+    }
+  );
+
   test("zero-output refusal with a configured fallback chain swaps models without any error event", async () => {
     const streamManager = new StreamManager(historyService);
     const errorEvents: unknown[] = [];
+    const limits: Array<number | null | undefined> = [];
+    onTurnEngineEvent(streamManager, "usage-delta", (event) =>
+      limits.push(event.effectiveContextLimit)
+    );
     const streamEndEvents: Array<{
       metadata?: {
         model?: string;
@@ -4188,6 +4345,7 @@ describe("StreamManager - empty stream completions", () => {
         (async function* () {
           await Promise.resolve();
           yield { type: "text-delta", text: "fallback answer" };
+          yield { type: "finish-step", usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 } };
           yield { type: "finish", finishReason: "stop" };
         })(),
         { inputTokens: 5, outputTokens: 3, totalTokens: 8 }
@@ -4211,6 +4369,7 @@ describe("StreamManager - empty stream completions", () => {
         Ok({
           model: fallbackLanguageModel,
           modelString: nextModelString,
+          effectiveContextLimit: 272_000,
           messages: [],
           system: "fallback system",
           tools: fallbackTools,
@@ -4241,6 +4400,7 @@ describe("StreamManager - empty stream completions", () => {
       startTime,
       lastPartTimestamp: startTime,
       model: KNOWN_MODELS.SONNET.id,
+      effectiveContextLimit: 200_000,
       metadataModel: KNOWN_MODELS.SONNET.id,
       historySequence,
       initialMetadata: { agentId: "plan" },
@@ -4258,6 +4418,7 @@ describe("StreamManager - empty stream completions", () => {
 
     // No terminal failure: TaskService and waiters never observe the refusal.
     expect(errorEvents).toHaveLength(0);
+    expect(limits).toEqual([200_000, 272_000]);
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(prepare.mock.calls[0]?.[0]).toBe(fallbackModel);
     expect(prepare.mock.calls[0]?.[1]).toBeUndefined();
@@ -6213,6 +6374,39 @@ describe("StreamManager - replayStream", () => {
     ]);
   });
 
+  test.each([272_000, null])(
+    "replays the accepted limit before usage exists: %s",
+    async (limit) => {
+      const streamManager = createReplayStreamManager();
+      const workspaceId = "replay-context-before-usage";
+      const starts: Array<Extract<TurnEngineEvent, { type: "stream-start" }>> = [];
+      const usageEvents: unknown[] = [];
+      onTurnEngineEvent(streamManager, "stream-start", (event) => starts.push(event));
+      onTurnEngineEvent(streamManager, "usage-delta", (event) => usageEvents.push(event));
+      setReplayStreamInfo(streamManager, workspaceId, {
+        state: "streaming",
+        messageId: "replay-context-message",
+        model: "openai:gpt-5.5",
+        effectiveContextLimit: limit,
+        historySequence: 1,
+        startTime: 123,
+        initialMetadata: {},
+        toolCompletionTimestamps: new Map<string, number>(),
+        parts: [],
+      });
+      stubReplayTokenTracker(streamManager);
+      await streamManager.replayStream(workspaceId);
+      await streamManager.replayStream(workspaceId, { afterTimestamp: 123 });
+      expect(starts).toHaveLength(2);
+      for (const start of starts) {
+        const parsed = StreamStartEventSchema.parse(start);
+        expect(parsed.effectiveContextLimit).toBe(limit);
+        expect(parsed.replay).toBe(true);
+      }
+      expect(usageEvents).toHaveLength(0);
+    }
+  );
+
   test("replayStream emits replay usage-delta from tracked step/cumulative usage", async () => {
     const streamManager = createReplayStreamManager();
 
@@ -6226,6 +6420,7 @@ describe("StreamManager - replayStream", () => {
     setReplayStreamInfo(streamManager, workspaceId, {
       state: "streaming",
       messageId: "msg-usage",
+      effectiveContextLimit: 100_000,
       model: "claude-sonnet-4",
       metadataModel: "claude-sonnet-4",
       historySequence: 1,
@@ -6245,6 +6440,7 @@ describe("StreamManager - replayStream", () => {
 
     expect(usageEvents).toHaveLength(1);
     expect(usageEvents[0]?.replay).toBe(true);
+    expect(UsageDeltaEventSchema.parse(usageEvents[0]).effectiveContextLimit).toBe(100_000);
     expect(usageEvents[0]?.usage).toEqual({ inputTokens: 21, outputTokens: 3, totalTokens: 24 });
     expect(usageEvents[0]?.providerMetadata).toEqual({
       anthropic: { cacheReadInputTokens: 2 },

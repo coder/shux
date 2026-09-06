@@ -7,8 +7,9 @@ import {
   mapModelCreationError,
   mapNameGenerationError,
 } from "./workspaceTitleGenerator";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { AIService } from "./aiService";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 
 afterEach(() => {
@@ -67,6 +68,15 @@ const createApiCallError = (
     responseBody: overrides?.responseBody,
   });
 
+function createRoutingSnapshot(): ModelRoutingSnapshot {
+  return {
+    providersConfig: { openai: { apiKey: "test-key", codexOauthDefaultAuth: "oauth" } },
+    routeConfig: { routePriority: ["direct"], routeOverrides: {} },
+    metadata: null,
+    codexOauthSelection: { accountId: "work", explicit: true },
+  };
+}
+
 describe("generateWorkspaceIdentity cleanup", () => {
   function createTitleModel(modelId = "title-model"): LanguageModel {
     return {
@@ -80,8 +90,96 @@ describe("generateWorkspaceIdentity cleanup", () => {
   }
 
   function createTitleAIService(model: LanguageModel): AIService {
-    return { createModel: () => Promise.resolve(Ok(model)) } as unknown as AIService;
+    return {
+      captureModelRoutingSnapshot: createRoutingSnapshot,
+      createModel: () => Promise.resolve(Ok(model)),
+    } as unknown as AIService;
   }
+
+  test.each([{ workspaceId: "title-workspace" }, { projectPath: "/new-project" }])(
+    "preserves title account context across candidate failures: %j",
+    async (context) => {
+      const createModel = mock<AIService["createModel"]>(() =>
+        Promise.resolve(Err({ type: "oauth_not_connected", provider: "openai" }))
+      );
+      const modelRoutingSnapshot = createRoutingSnapshot();
+      const captureModelRoutingSnapshot = mock(() => modelRoutingSnapshot);
+      const aiService = { createModel, captureModelRoutingSnapshot } as unknown as AIService;
+      const result = await generateWorkspaceIdentity(
+        "Add setting",
+        ["openai:gpt-5.5", "openai:gpt-5.3-codex"],
+        aiService,
+        undefined,
+        undefined,
+        context
+      );
+      expect(result.success).toBe(false);
+      expect(createModel).toHaveBeenCalledTimes(2);
+      for (const call of createModel.mock.calls) {
+        expect(call[2]).toEqual({ ...context, agentInitiated: true, modelRoutingSnapshot });
+      }
+    }
+  );
+
+  test.each([
+    { context: { workspaceId: "title-workspace" }, change: "account" },
+    { context: { workspaceId: "title-workspace" }, change: "preference" },
+    { context: { projectPath: "/new-project" }, change: "account" },
+    { context: { projectPath: "/new-project" }, change: "preference" },
+  ] as const)("pins title routing across provider failures: %j", async ({ context, change }) => {
+    const settings = createRoutingSnapshot();
+    const captureModelRoutingSnapshot = mock<AIService["captureModelRoutingSnapshot"]>(() =>
+      structuredClone(settings)
+    );
+    const createModel = mock<AIService["createModel"]>(() =>
+      Promise.resolve(Ok(createTitleModel()))
+    );
+    const aiService = { captureModelRoutingSnapshot, createModel } as unknown as AIService;
+    const stream = spyOn(aiSdk, "streamText").mockReturnValue({
+      toolResults: Promise.resolve([
+        {
+          dynamic: false,
+          toolName: "propose_name",
+          output: { name: "settings", title: "Add setting" },
+        },
+      ]),
+    } as unknown as ReturnType<typeof aiSdk.streamText>);
+    stream.mockImplementationOnce(() => {
+      if (change === "account") settings.codexOauthSelection.accountId = "personal";
+      else settings.providersConfig.openai!.codexOauthDefaultAuth = "apiKey";
+      throw new Error("First title provider fails");
+    });
+    const generate = () =>
+      generateWorkspaceIdentity(
+        "Add setting",
+        ["openai:gpt-5.5", "openai:gpt-5.3-codex"],
+        aiService,
+        undefined,
+        undefined,
+        context
+      );
+    expect((await generate()).success).toBe(true);
+    expect(captureModelRoutingSnapshot).toHaveBeenCalledTimes(1);
+    expect(captureModelRoutingSnapshot).toHaveBeenCalledWith(
+      "workspaceId" in context ? context.workspaceId : undefined,
+      "projectPath" in context ? context.projectPath : undefined
+    );
+    expect(createModel).toHaveBeenCalledTimes(2);
+    const original = createModel.mock.calls[0]?.[2]?.modelRoutingSnapshot;
+    expect(original?.codexOauthSelection.accountId).toBe("work");
+    expect(original?.providersConfig.openai?.codexOauthDefaultAuth).toBe("oauth");
+    expect(createModel.mock.calls[1]?.[2]?.modelRoutingSnapshot).toBe(original);
+
+    expect((await generate()).success).toBe(true);
+    expect(captureModelRoutingSnapshot).toHaveBeenCalledTimes(2);
+    expect(createModel).toHaveBeenCalledTimes(3);
+    const next = createModel.mock.calls[2]?.[2]?.modelRoutingSnapshot;
+    expect(next).not.toBe(original);
+    expect(next?.codexOauthSelection.accountId).toBe(change === "account" ? "personal" : "work");
+    expect(next?.providersConfig.openai?.codexOauthDefaultAuth).toBe(
+      change === "preference" ? "apiKey" : "oauth"
+    );
+  });
 
   test("cleans up the model after a successful title stream", async () => {
     let cleanupCalls = 0;
@@ -145,6 +243,7 @@ describe("generateWorkspaceIdentity cleanup", () => {
       secondCleanupCalls += 1;
     });
     const aiService = {
+      captureModelRoutingSnapshot: createRoutingSnapshot,
       createModel: mock((modelString: string) =>
         Promise.resolve(Ok(modelString.includes("first") ? firstModel : secondModel))
       ),

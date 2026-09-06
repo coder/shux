@@ -1,5 +1,10 @@
 import { THEME_OPTIONS, type ThemePreference } from "@/browser/contexts/ThemeContext";
-import type { OpenSettingsOptions } from "@/browser/contexts/SettingsContext";
+import type {
+  CodexAccountSettingsIntent,
+  OpenSettingsOptions,
+} from "@/browser/contexts/SettingsContext";
+import { formatCodexAccountLabel } from "@/browser/utils/codexAccountDisplay";
+import { CODEX_OAUTH_DEFAULT_ACCOUNT_ID } from "@/common/constants/codexOauthAccounts";
 import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
@@ -99,6 +104,7 @@ export interface BuildSourcesParams {
   } | null;
   /** Project-scoped preference ID used while a creation composer is active. */
   creationScopeId?: string | null;
+  codexOauthAccountId?: string;
   streamingModels?: Map<string, string>;
   // UI actions
   getThinkingLevel: (workspaceId: string) => ThinkingLevel;
@@ -1304,6 +1310,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       getFastModeProvider(providerOptionGateModel ?? "", {
         providersConfig: p.providersConfig,
         resolvedRouteProvider: providerOptionRoute,
+        codexOauthAccountId: p.codexOauthAccountId,
       }) != null
         ? {
             id: CommandIds.toggleFastMode(),
@@ -1416,6 +1423,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         openaiProModeAvailable(proGateModelString ?? "", {
           providersConfig: p.providersConfig,
           resolvedRouteProvider: currentModelRoute,
+          codexOauthAccountId: p.codexOauthAccountId,
         })
       ) {
         const proActive = p.getReasoningMode(workspaceId) === "pro";
@@ -1606,6 +1614,97 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
   // Settings
   if (p.onOpenSettings) {
     const openSettings = p.onOpenSettings;
+    const openCodexAction = (intent: CodexAccountSettingsIntent) =>
+      openSettings("providers", { expandProvider: "openai", codexAccountAction: intent });
+    const codexVisible = () => {
+      // Policy can omit OpenAI metadata. Custom providers do not expose built-in account controls.
+      const openai = p.providersConfig?.openai;
+      return openai != null && openai.isCustom !== true;
+    };
+    const getCodexAccounts = () => {
+      const openai = p.providersConfig?.openai;
+      return (
+        openai?.codexOauthAccounts ??
+        (openai?.codexOauthSet ? [{ id: CODEX_OAUTH_DEFAULT_ACCOUNT_ID, label: "Default" }] : [])
+      );
+    };
+    actions.push(() => [
+      {
+        id: CommandIds.codexAccountAction("add"),
+        title: "Codex: Add account",
+        section: section.settings,
+        keywords: ["openai", "chatgpt", "oauth", "connect", "login"],
+        visible: codexVisible,
+        run: () => openCodexAction({ type: "add" }),
+      },
+      ...(["reconnect", "rename", "disconnect"] as const).map((type): CommandAction => {
+        const titles = { reconnect: "Reconnect", rename: "Rename", disconnect: "Disconnect" };
+        return {
+          id: CommandIds.codexAccountAction(type),
+          title: "Codex: " + titles[type] + " account…",
+          section: section.settings,
+          keywords: ["openai", "chatgpt", "oauth", type],
+          visible: codexVisible,
+          enabled: () => getCodexAccounts().length > 0,
+          run: () => undefined,
+          prompt: {
+            title: titles[type] + " Codex account",
+            fields: [
+              {
+                type: "select",
+                name: "accountId",
+                label: "Account",
+                getOptions: () => {
+                  const accounts = getCodexAccounts();
+                  return accounts.map((account) => ({
+                    id: account.id,
+                    label: formatCodexAccountLabel(account, accounts),
+                    keywords: [account.id],
+                  }));
+                },
+              },
+            ],
+            onSubmit: (values) => openCodexAction({ type, accountId: values.accountId }),
+          },
+        };
+      }),
+      {
+        id: CommandIds.codexAccountAction("default"),
+        title: "Codex: Change default account",
+        section: section.settings,
+        keywords: ["openai", "chatgpt", "oauth", "global", "default"],
+        visible: codexVisible,
+        enabled: () => getCodexAccounts().length > 0,
+        run: () => openCodexAction({ type: "default" }),
+      },
+      {
+        id: CommandIds.codexAccountAction("project"),
+        title: "Codex: Change project account…",
+        section: section.settings,
+        keywords: ["openai", "chatgpt", "oauth", "project", "inherit"],
+        visible: codexVisible,
+        enabled: () => p.userProjects.size > 0,
+        run: () => undefined,
+        prompt: {
+          title: "Change project Codex account",
+          fields: [
+            {
+              type: "select",
+              name: "projectPath",
+              label: "Project",
+              getOptions: () =>
+                Array.from(p.userProjects.keys(), (projectPath) => ({
+                  id: projectPath,
+                  label: formatProjectHierarchyLabel(projectPath, p.userProjects),
+                  keywords: [projectPath],
+                })),
+            },
+          ],
+          onSubmit: (values) =>
+            openCodexAction({ type: "project", projectPath: values.projectPath }),
+        },
+      },
+    ]);
     actions.push(() => [
       {
         id: CommandIds.settingsOpen(),

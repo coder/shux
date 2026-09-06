@@ -35,6 +35,7 @@ import type {
   StreamDeltaEvent,
   StreamEndEvent,
   StreamStartEvent,
+  StreamModelUpdateEvent,
   ToolCallDeltaEvent,
   ToolCallEndEvent,
   ToolCallExecutionStartEvent,
@@ -63,6 +64,7 @@ export interface ApplyWorkspaceChatEventToAggregatorOptions {
  */
 export interface WorkspaceChatEventAggregator {
   handleStreamStart(data: StreamStartEvent): void;
+  handleStreamModelUpdate(data: StreamModelUpdateEvent): void;
   handleStreamDelta(data: StreamDeltaEvent): void;
   handleStreamEnd(data: StreamEndEvent): void;
   handleStreamAbort(data: StreamAbortEvent): void;
@@ -129,6 +131,11 @@ export function applyWorkspaceChatEventToAggregator(
 
   if (isStreamStart(event)) {
     aggregator.handleStreamStart(event);
+    return "immediate";
+  }
+
+  if (event.type === "stream-model-update") {
+    aggregator.handleStreamModelUpdate(event);
     return "immediate";
   }
 

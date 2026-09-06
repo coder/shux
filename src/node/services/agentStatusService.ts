@@ -405,6 +405,7 @@ export class AgentStatusService {
       // would leak background LLM work past our lifecycle.
       if (this.stopped) return;
       const result = await generateWorkspaceStatus(transcript, candidates, this.aiService, {
+        workspaceId,
         streaming,
         recordUsage: async (modelString, usage, usageOptions) => {
           const recorded = await this.sessionUsageService?.recordHeadlessUsage(

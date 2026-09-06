@@ -7,6 +7,7 @@ import type { AgentSession } from "./agentSession";
 import { CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE } from "./agentSession";
 import {
   createAgentSessionHarness,
+  createModelRoutingSnapshotMock,
   createStartedTurnHandle,
   createStreamLifecycleMocks,
 } from "./agentSession.testHarness";
@@ -6356,6 +6357,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       aiServiceOverride ??
       ({
         ...createStreamLifecycleMocks(),
+        captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
         on: mock(() => undefined),
         isStreaming: mock(() => false),
       } as unknown as AIService);
@@ -7137,6 +7139,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     let streaming = true;
     const aiService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on: mock(() => undefined),
       isStreaming: mock(() => streaming),
     } as unknown as AIService;
@@ -7389,6 +7392,12 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       }),
     ];
     const summaryAiService: BranchSummaryAiService = {
+      captureModelRoutingSnapshot: () => ({
+        providersConfig: {},
+        metadata: null,
+        routeConfig: { routePriority: ["direct"], routeOverrides: {} },
+        codexOauthSelection: { accountId: "default", explicit: false },
+      }),
       createModelWithPinnedMetadata: (modelString: string) =>
         Promise.resolve(
           Ok({
@@ -8827,6 +8836,41 @@ describe("WorkspaceService sendMessage status clearing", () => {
     await cleanupHistory();
   });
 
+  test("forwards workflow routing only through internal idle-send options", async () => {
+    fakeSession.isBusy.mockReturnValue(false);
+    const modelRoutingSnapshot: ReturnType<AIService["captureModelRoutingSnapshot"]> = {
+      providersConfig: { openai: { apiKey: "snapshot-secret" } },
+      metadata: null,
+      codexOauthSelection: { accountId: "work", explicit: true },
+      routeConfig: { routePriority: ["direct"], routeOverrides: {} },
+    };
+    const options = { model: "openai:gpt-5.5", agentId: "exec", skipAiSettingsPersistence: true };
+    expect(
+      (
+        await workspaceService.sendMessage("test-workspace", "Workflow completed", options, {
+          synthetic: true,
+          agentInitiated: true,
+          requireIdle: true,
+          modelRoutingSnapshot,
+        })
+      ).success
+    ).toBe(true);
+    expect(fakeSession.sendMessage).toHaveBeenCalledWith(
+      "Workflow completed",
+      options,
+      expect.objectContaining({ modelRoutingSnapshot })
+    );
+    expect(JSON.stringify(fakeSession.sendMessage.mock.calls[0]?.[1])).not.toContain(
+      "snapshot-secret"
+    );
+    expect(
+      (await workspaceService.sendMessage("test-workspace", "New user turn", options)).success
+    ).toBe(true);
+    expect(fakeSession.sendMessage.mock.calls[1]?.[2]).toEqual(
+      expect.objectContaining({ modelRoutingSnapshot: undefined })
+    );
+  });
+
   test("delegates manual pricing rejections to AgentSession so user input is preserved", async () => {
     fakeSession.isBusy.mockReturnValue(false);
     const pricingError: SendMessageError = { type: "unknown", raw: "unpriced model" };
@@ -10138,6 +10182,7 @@ describe("WorkspaceService pending auto-title", () => {
       expect(metadata?.title).toBe("Harden auth flow");
       expect(metadata?.pendingAutoTitle).toBeUndefined();
       expect(generateIdentitySpy.mock.calls[0]?.[0]).toBe("Continue with auth hardening");
+      expect(generateIdentitySpy.mock.calls[0]?.[5]).toEqual({ workspaceId });
     } finally {
       generateIdentitySpy.mockRestore();
     }
@@ -17458,6 +17503,7 @@ describe("WorkspaceService regenerateTitle", () => {
       const call = generateIdentitySpy.mock.calls[0];
       expect(call?.[3]).toBeUndefined();
       expect(call?.[4]).toBe("Fix CI");
+      expect(call?.[5]).toEqual({ workspaceId });
       expect(updateTitleSpy).toHaveBeenCalledWith(workspaceId, "Fix CI");
     } finally {
       updateTitleSpy.mockRestore();

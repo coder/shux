@@ -772,8 +772,8 @@ describe("continuous prefix prepareStep and journal", () => {
               sliced ||
               mode === "journal-failure" ||
               mode === "ambiguous-anchor")
-            ? ["prefix-swap-invalidated"]
-            : []
+            ? ["stream-model-update", "prefix-swap-invalidated"]
+            : ["stream-model-update"]
         );
         if (
           consumed &&

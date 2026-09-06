@@ -29,7 +29,7 @@ import {
   SUPPORTED_PROVIDERS,
   type ProviderName,
 } from "@/common/constants/providers";
-import type { BaseProviderConfig } from "@/common/config/schemas/providersConfig";
+import type { BaseProviderConfig, ProvidersConfig } from "@/common/config/schemas/providersConfig";
 import type { Result } from "@/common/types/result";
 import type {
   AddCustomProviderInput,
@@ -63,7 +63,7 @@ import {
   isProviderAutoRouteEligible,
   resolveProviderCredentials,
 } from "@/node/utils/providerRequirements";
-import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
+import { getCodexOauthAccounts } from "@/node/utils/codexOauthAuth";
 import {
   normalizeCoderDeploymentUrl,
   parseCoderGatewayProviders,
@@ -363,8 +363,9 @@ export class ProviderService {
   /**
    * Get the full providers config with safe info (no actual API keys)
    */
-  public getConfig(): ProvidersConfigMap {
-    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
+  public getConfig(
+    providersConfig: ProvidersConfig = this.providersConfigStore.loadProvidersConfig() ?? {}
+  ): ProvidersConfigMap {
     const mainConfig = this.config.loadConfigOrDefault();
     const result: ProvidersConfigMap = {};
     const shadowedCustomProviderIds = this.detectAndLogShadowedProviders(providersConfig);
@@ -425,8 +426,8 @@ export class ProviderService {
         config.models === undefined ? undefined : normalizeProviderModelEntries(config.models);
       const filteredModels = filterProviderModelsByPolicy(normalizedModels, allowedModels);
 
-      const codexOauthSet =
-        provider === "openai" && parseCodexOauthAuth(config.codexOauth) !== null;
+      const codexOauthAccounts = provider === "openai" ? getCodexOauthAccounts(config) : [];
+      const codexOauthSet = codexOauthAccounts.some(({ auth }) => auth.invalidReason === undefined);
       let isEnabled = !isProviderDisabledInConfig(config);
       if (provider === "mux-gateway" && mainConfig.muxGatewayEnabled === false) {
         isEnabled = false;
@@ -506,6 +507,19 @@ export class ProviderService {
 
       if (provider === "openai") {
         providerInfo.codexOauthSet = codexOauthSet;
+        providerInfo.codexOauthAccounts = codexOauthAccounts.map(({ id, label, auth }) => ({
+          id,
+          label,
+          // Keep invalid slot identities without exposing credentials or provider error details.
+          ...(auth.invalidReason !== undefined ? { reconnectRequired: true } : {}),
+        }));
+        // Preserve an unset selection. A synthetic default would block API-key-only routing in the renderer.
+        if (
+          "codexOauthDefaultAccountId" in config &&
+          typeof config.codexOauthDefaultAccountId === "string"
+        ) {
+          providerInfo.codexOauthDefaultAccountId = config.codexOauthDefaultAccountId;
+        }
 
         const codexOauthDefaultAuth = config.codexOauthDefaultAuth;
         if (codexOauthDefaultAuth === "oauth" || codexOauthDefaultAuth === "apiKey") {
@@ -1447,22 +1461,23 @@ export class ProviderService {
    * logins/refreshes (e.g. Coder OAuth token rotation across the desktop app
    * and `mux run`/`mux workflow`).
    *
-   * Unlike setConfigValue, this path skips policy gating: it is an internal
-   * credential-management primitive (clearing dead tokens, persisting
-   * rotations), not a user-driven config edit.
+   * Internal credential updates skip policy gating by default.
+   * User-driven edits must set enforcePolicy to check policy under the file lock.
    */
   public updateConfigValue(
     provider: string,
     keyPath: string[],
-    update: (current: unknown) => { value: unknown } | null
+    update: (current: unknown) => { value: unknown } | null,
+    options?: { enforcePolicy?: boolean }
   ): Promise<Result<{ applied: boolean }, string>> {
-    return Effect.runPromise(this.updateConfigValueEffect(provider, keyPath, update));
+    return Effect.runPromise(this.updateConfigValueEffect(provider, keyPath, update, options));
   }
 
   private updateConfigValueEffect(
     provider: string,
     keyPath: string[],
-    update: (current: unknown) => { value: unknown } | null
+    update: (current: unknown) => { value: unknown } | null,
+    options?: { enforcePolicy?: boolean }
   ): Effect.Effect<Result<{ applied: boolean }, string>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -1479,6 +1494,10 @@ export class ProviderService {
       }
 
       const applied = yield* self.providersFileLockEffect(() => {
+        if (options?.enforcePolicy) {
+          const denial = self.validateProviderEditPolicy(provider, keyPath);
+          if (denial != null) return denial;
+        }
         // Load, decide, and write under the lock — no awaits in between, so
         // the predicate result cannot be invalidated by any cooperating writer.
         const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
@@ -1517,6 +1536,7 @@ export class ProviderService {
         return true;
       });
 
+      if (typeof applied === "string") return { success: false as const, error: applied };
       yield* self.afterAppliedMutationEffect(provider, applied);
       return { success: true as const, data: { applied } };
     }).pipe(
@@ -1566,34 +1586,47 @@ export class ProviderService {
    * that fetched it is still the stored credential, and disconnect clears
    * tokens + models in one write.
    *
-   * Internal credential-management primitive: skips policy gating like
-   * updateConfigValue.
+   * Internal callers can omit policy checks. User-driven mutations must set enforcePolicy.
    */
   public updateProviderSection(
     provider: string,
     update: (
       section: Record<string, unknown> | undefined
-    ) => { value: Record<string, unknown> } | null
+    ) => { value: Record<string, unknown> } | null,
+    options?: { enforcePolicy?: boolean }
   ): Promise<Result<{ applied: boolean }, string>> {
-    return Effect.runPromise(this.updateProviderSectionEffect(provider, update));
+    return Effect.runPromise(this.updateProviderSectionEffect(provider, update, options));
   }
 
   private updateProviderSectionEffect(
     provider: string,
     update: (
       section: Record<string, unknown> | undefined
-    ) => { value: Record<string, unknown> } | null
+    ) => { value: Record<string, unknown> } | null,
+    options?: { enforcePolicy?: boolean }
   ): Effect.Effect<Result<{ applied: boolean }, string>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
       const applied = yield* self.providersFileLockEffect(() => {
+        if (options?.enforcePolicy) {
+          const denial = self.validateProviderEditPolicy(provider, []);
+          if (denial != null) return denial;
+        }
         const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
         const section = providersConfig[provider] as Record<string, unknown> | undefined;
 
         const decision = update(section);
         if (!decision) {
           return false;
+        }
+
+        if (options?.enforcePolicy) {
+          for (const key of ["baseUrl", "baseURL"]) {
+            if (decision.value[key] === section?.[key]) continue;
+            const denial = self.validateProviderEditPolicy(provider, [key]);
+            if (denial != null) return denial;
+          }
         }
 
         const deniedKey = Object.keys(decision.value).find((key) =>
@@ -1608,6 +1641,7 @@ export class ProviderService {
         return true;
       });
 
+      if (typeof applied === "string") return { success: false as const, error: applied };
       // Best-effort: a landed write must not be reported as failed (see
       // afterAppliedMutationEffect).
       yield* self.afterAppliedMutationEffect(provider, applied);

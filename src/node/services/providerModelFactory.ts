@@ -19,12 +19,17 @@ import {
   isCodexOauthAllowedModel,
   isCodexOauthRequiredModel,
 } from "@/common/constants/codexOAuth";
-import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
+import {
+  getCodexOauthAccountId,
+  getCodexOauthAccounts,
+  getCodexOauthAuth,
+} from "@/node/utils/codexOauthAuth";
 import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
 import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
+import { getCodexOauthProjectPath } from "@/common/utils/providers/codexOauthRouting";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
   customProviderWireOrigin,
@@ -45,6 +50,7 @@ import { CopilotResponsesLanguageModel } from "@/node/services/copilot/copilotRe
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
+import type { RouteConfigSnapshot } from "./modelRoutingSnapshot";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import {
   coderAibridgeBaseUrl,
@@ -1099,6 +1105,8 @@ export interface ResolveAndCreateModelResult {
    * retagged instance type diverging from the created fallback model.
    */
   coderSelectedInstance?: { name: string; type: string };
+  /** Local account slot pinned for request routing and context limits. */
+  codexOauthAccountId?: string;
   /** Whether the request is being routed through the Xum gateway. */
   routedThroughGateway: boolean;
   /** Route provider chosen by backend routing (direct provider or gateway). */
@@ -1108,7 +1116,13 @@ export interface ResolveAndCreateModelResult {
 interface CreateModelOptions {
   agentInitiated?: boolean;
   workspaceId?: string;
+  /** Project context for requests before workspace creation. */
+  projectPath?: string;
+  /** Account selection snapshot from resolveAndCreateModel. */
+  codexOauthSelection?: { accountId: string; explicit: boolean };
   routeContext?: RouteContext;
+  /** Captured routing rules keep accepted work independent from settings changes. */
+  routeConfig?: RouteConfigSnapshot;
   /**
    * Providers-config snapshot to create the model from. Passed by
    * resolveAndCreateModel so routing, the returned coderWire snapshot,
@@ -1192,10 +1206,30 @@ export class ProviderModelFactory {
     return forced ? { ...providerConfig, deploymentUrl: forced } : providerConfig;
   }
 
+  private resolveCodexOauthSelection(
+    providerConfig: ProviderConfigRaw,
+    opts?: CreateModelOptions
+  ): { accountId: string; explicit: boolean } {
+    if (opts?.codexOauthSelection) {
+      return opts.codexOauthSelection;
+    }
+    const workspace = opts?.workspaceId ? this.config.findWorkspace(opts.workspaceId) : null;
+    const projectPath = getCodexOauthProjectPath(workspace) ?? opts?.projectPath;
+    const projectAccountId = projectPath
+      ? this.config.loadConfigOrDefault().projects.get(projectPath)?.codexOauthAccountId
+      : undefined;
+    return {
+      accountId: getCodexOauthAccountId(providerConfig, projectAccountId),
+      explicit:
+        projectAccountId !== undefined || providerConfig.codexOauthDefaultAccountId !== undefined,
+    };
+  }
+
   private isProviderAvailableForRouting(
     provider: ProviderName,
     providersConfig: ProvidersConfig,
-    config: ReturnType<Config["loadConfigOrDefault"]>
+    config: ReturnType<Config["loadConfigOrDefault"]>,
+    canonicalModel: string
   ): boolean {
     const rawProviderConfig = providersConfig[provider] ?? {};
     const providerConfig =
@@ -1204,11 +1238,12 @@ export class ProviderModelFactory {
         : rawProviderConfig;
     const credentials = resolveProviderCredentials(provider, providerConfig);
 
-    // OpenAI Codex OAuth is a valid credential path even without an API key;
-    // routing should treat it as available so direct OpenAI routes are honored.
+    // OAuth cannot serve every OpenAI model. Unsupported models must retain configured gateway routes.
+    // Rejected slots remain for reconnect, but must not hide configured gateway routes.
     const hasCodexOauth =
       provider === "openai" &&
-      parseCodexOauthAuth((providerConfig as { codexOauth?: unknown }).codexOauth) !== null;
+      isCodexOauthAllowedModel(canonicalModel, providersConfig) &&
+      getCodexOauthAccounts(providerConfig).some(({ auth }) => auth.invalidReason === undefined);
 
     if (!credentials.isConfigured && !hasCodexOauth) {
       return false;
@@ -1284,11 +1319,7 @@ export class ProviderModelFactory {
   private createModelCoreEffect(
     modelString: string,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: {
-      agentInitiated?: boolean;
-      routeContext?: RouteContext;
-      providersConfig?: ProvidersConfig;
-    }
+    opts?: CreateModelOptions
   ): Effect.Effect<Result<LanguageModel, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -1302,7 +1333,8 @@ export class ProviderModelFactory {
         modelString = self.resolveEffectiveModelString(
           modelString,
           opts?.routeContext,
-          opts?.providersConfig
+          opts?.providersConfig,
+          opts?.routeConfig
         );
 
         // Parse model string (format: "provider:model-id")
@@ -1568,17 +1600,18 @@ export class ProviderModelFactory {
           const codexOauthAllowed = isCodexOauthAllowedModel(fullModelId, providersConfig);
           const codexOauthRequired = isCodexOauthRequiredModel(fullModelId, providersConfig);
 
-          const storedCodexOauth = parseCodexOauthAuth(
-            (providerConfig as { codexOauth?: unknown }).codexOauth
-          );
+          // Pin the local slot, not the ChatGPT header ID, across refreshes and retries.
+          const selection = self.resolveCodexOauthSelection(providerConfig, opts);
+          const codexOauthAccountId = selection.accountId;
+          const storedCodexOauth = getCodexOauthAuth(providerConfig, codexOauthAccountId);
+          // Pin the credential before the first fetch. Retries and tool steps must reject replacement logins.
+          const codexOauthCredential = { credentialId: storedCodexOauth?.credentialId };
 
           // Resolve credentials from config + env so we can decide whether to
           // route through Codex OAuth or fall back to API key auth.
           const creds = resolveProviderCredentials("openai", providerConfig);
 
-          // When a model requires Codex OAuth but the user hasn't connected it,
-          // fall back to their API key instead of blocking entirely.  If the model
-          // truly only works through OAuth, OpenAI's API will return a clear error.
+          // Preserve the legacy API-key path when no OAuth account has been selected.
           if (codexOauthRequired && !storedCodexOauth && !creds.isConfigured) {
             return Err({ type: "oauth_not_connected", provider: providerName });
           }
@@ -1594,32 +1627,20 @@ export class ProviderModelFactory {
             (providerConfig.wireFormat as string | undefined) ??
             muxProviderOptions?.openai?.wireFormat;
 
-          // Codex OAuth routing:
-          // - Chat Completions never routes through OAuth when an API key exists.
-          // - Required models route through ChatGPT OAuth when connected.
-          // - If OAuth is not connected, fall back to API key (if available).
-          // - Allowed models route through OAuth only when:
-          //   - no API key is configured, OR
-          //   - the user prefers OAuth when both are set.
-          const shouldRouteThroughCodexOauth = (() => {
-            if (!codexOauthAllowed || !storedCodexOauth) {
-              return false;
-            }
+          // A missing selected slot must not switch billing to an API key or another account.
+          const prefersCodexOauth =
+            codexOauthAllowed &&
+            !(earlyWireFormat === "chatCompletions" && creds.isConfigured) &&
+            (codexOauthRequired || !creds.isConfigured || codexOauthDefaultAuth === "oauth");
+          if (
+            prefersCodexOauth &&
+            !storedCodexOauth &&
+            (selection.explicit || getCodexOauthAccounts(providerConfig).length > 0)
+          ) {
+            return Err({ type: "oauth_not_connected", provider: providerName });
+          }
 
-            if (earlyWireFormat === "chatCompletions" && creds.isConfigured) {
-              return false;
-            }
-
-            if (codexOauthRequired) {
-              return true;
-            }
-
-            if (!creds.isConfigured) {
-              return true;
-            }
-
-            return codexOauthDefaultAuth === "oauth";
-          })();
+          const shouldRouteThroughCodexOauth = prefersCodexOauth && storedCodexOauth !== null;
 
           // OAuth requests use a placeholder key and override auth headers in fetch().
           const resolvedApiKey = shouldRouteThroughCodexOauth ? undefined : creds.apiKey;
@@ -1734,7 +1755,10 @@ export class ProviderModelFactory {
                     throw new Error("Codex OAuth service not initialized");
                   }
 
-                  const authResult = await codexOauthService.getValidAuth();
+                  const authResult = await codexOauthService.getValidAuth(
+                    codexOauthAccountId,
+                    codexOauthCredential
+                  );
                   if (!authResult.success) {
                     throw new Error(authResult.error);
                   }
@@ -1743,6 +1767,9 @@ export class ProviderModelFactory {
                   headers.set("Authorization", `Bearer ${authResult.data.access}`);
                   if (authResult.data.accountId) {
                     headers.set("ChatGPT-Account-Id", authResult.data.accountId);
+                  } else {
+                    // A configured header must not select another ChatGPT account.
+                    headers.delete("ChatGPT-Account-Id");
                   }
 
                   nextInput = CODEX_ENDPOINT;
@@ -2544,7 +2571,15 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string }
+    opts?: Pick<
+      CreateModelOptions,
+      | "agentInitiated"
+      | "workspaceId"
+      | "projectPath"
+      | "providersConfig"
+      | "codexOauthSelection"
+      | "routeConfig"
+    >
   ): Promise<Result<ResolveAndCreateModelResult, SendMessageError>> {
     return Effect.runPromise(
       this.resolveAndCreateModelEffect(modelString, thinkingLevel, muxProviderOptions, opts)
@@ -2555,7 +2590,15 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string }
+    opts?: Pick<
+      CreateModelOptions,
+      | "agentInitiated"
+      | "workspaceId"
+      | "projectPath"
+      | "providersConfig"
+      | "codexOauthSelection"
+      | "routeConfig"
+    >
   ): Effect.Effect<Result<ResolveAndCreateModelResult, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -2567,7 +2610,9 @@ export class ProviderModelFactory {
       // through the built-in machinery instead of the user's custom endpoint.
       // The equivalent guard in resolveGatewayModelString only protects callers
       // that pass raw strings.
-      const providersConfigForShadowCheck = self.providersConfigStore.loadProvidersConfig() ?? {};
+      // Pre-send compaction and model construction must use the same routing snapshot.
+      const providersConfigForShadowCheck =
+        opts?.providersConfig ?? self.providersConfigStore.loadProvidersConfig() ?? {};
       const [rawProviderName] = parseModelString(modelString);
       const rawPrefixShadowedByCustomProvider =
         rawProviderName.length > 0 &&
@@ -2644,7 +2689,8 @@ export class ProviderModelFactory {
 
       const routeContext = self.resolveModelRoute(
         routeSeedModelString,
-        providersConfigForShadowCheck
+        providersConfigForShadowCheck,
+        opts?.routeConfig
       );
       if (rawCoderGatewayModelId != null) {
         const appConfig = self.config.loadConfigOrDefault();
@@ -2655,7 +2701,8 @@ export class ProviderModelFactory {
         const coderProviderRoutable = self.isProviderAvailableForRouting(
           "coder",
           providersConfigForShadowCheck,
-          appConfig
+          appConfig,
+          routeSeedModelString
         );
         const coderModelAccessible = isGatewayModelAccessible("coder", rawCoderGatewayModelId);
         if (coderProviderRoutable && coderModelAccessible) {
@@ -2695,7 +2742,8 @@ export class ProviderModelFactory {
             routeSeedModelString,
             routeContext,
             undefined,
-            providersConfigForShadowCheck
+            providersConfigForShadowCheck,
+            opts?.routeConfig
           );
         }
       } else {
@@ -2703,7 +2751,8 @@ export class ProviderModelFactory {
           effectiveModelString,
           routeContext,
           explicitGateway,
-          providersConfigForShadowCheck
+          providersConfigForShadowCheck,
+          opts?.routeConfig
         );
       }
 
@@ -2790,8 +2839,13 @@ export class ProviderModelFactory {
         }
       }
 
+      const codexOauthSelection = self.resolveCodexOauthSelection(
+        providersConfigForShadowCheck.openai ?? {},
+        opts
+      );
       const modelResult = yield* self.createModelEffect(effectiveModelString, muxProviderOptions, {
         ...opts,
+        codexOauthSelection,
         routeContext,
         // ONE config snapshot for the whole resolve+create: the wire snapshot
         // above and the SDK model must come from the same providers.jsonc read,
@@ -2835,6 +2889,7 @@ export class ProviderModelFactory {
         wireProviderName,
         coderWire,
         coderSelectedInstance,
+        codexOauthAccountId: codexOauthSelection.accountId,
         routedThroughGateway,
         // Custom adapters are direct routes: the raw custom id is not a
         // ProviderName, and leaking it as routeProvider makes downstream
@@ -2847,7 +2902,8 @@ export class ProviderModelFactory {
 
   private resolveModelRoute(
     canonicalModel: string,
-    providersConfigSnapshot?: ProvidersConfig
+    providersConfigSnapshot?: ProvidersConfig,
+    routeConfigSnapshot?: RouteConfigSnapshot
   ): RouteContext {
     const config = this.config.loadConfigOrDefault();
     // resolveAndCreateModel passes its snapshot so route availability,
@@ -2861,8 +2917,8 @@ export class ProviderModelFactory {
     );
     return resolveRoute(
       canonicalModel,
-      config.routePriority ?? ["direct"],
-      config.routeOverrides ?? {},
+      routeConfigSnapshot?.routePriority ?? config.routePriority ?? ["direct"],
+      routeConfigSnapshot?.routeOverrides ?? config.routeOverrides ?? {},
       (provider) => {
         if (!Object.hasOwn(PROVIDER_REGISTRY, provider)) {
           return false;
@@ -2871,7 +2927,8 @@ export class ProviderModelFactory {
         return this.isProviderAvailableForRouting(
           provider as ProviderName,
           providersConfig,
-          config
+          config,
+          canonicalModel
         );
       },
       isGatewayModelAccessible
@@ -2889,14 +2946,16 @@ export class ProviderModelFactory {
   resolveEffectiveModelString(
     modelString: string,
     routeContext?: RouteContext,
-    providersConfig?: ProvidersConfig
+    providersConfig?: ProvidersConfig,
+    routeConfig?: RouteConfigSnapshot
   ): string {
     const explicitGateway = getExplicitGatewayProvider(modelString);
     return this.resolveGatewayModelString(
       modelString,
       routeContext,
       explicitGateway,
-      providersConfig
+      providersConfig,
+      routeConfig
     );
   }
 
@@ -2904,7 +2963,8 @@ export class ProviderModelFactory {
     modelString: string,
     modelKeyOrRouteContext?: string | RouteContext,
     explicitGatewayOrLegacyFlag?: ProviderName | boolean,
-    providersConfigSnapshot?: ProvidersConfig
+    providersConfigSnapshot?: ProvidersConfig,
+    routeConfigSnapshot?: RouteConfigSnapshot
   ): string {
     // Legacy callers may still pass boolean true to mean an explicit mux-gateway request.
     const explicitGateway: ProviderName | undefined =
@@ -2958,15 +3018,17 @@ export class ProviderModelFactory {
       providersConfig,
       this.policyService
     );
+    const routingModel =
+      typeof modelKeyOrRouteContext === "string"
+        ? normalizeToCanonical(modelKeyOrRouteContext)
+        : canonicalModelString;
     const routeContext =
       typeof modelKeyOrRouteContext === "object" && modelKeyOrRouteContext != null
         ? modelKeyOrRouteContext
         : resolveRoute(
-            typeof modelKeyOrRouteContext === "string"
-              ? normalizeToCanonical(modelKeyOrRouteContext)
-              : canonicalModelString,
-            config.routePriority ?? ["direct"],
-            config.routeOverrides ?? {},
+            routingModel,
+            routeConfigSnapshot?.routePriority ?? config.routePriority ?? ["direct"],
+            routeConfigSnapshot?.routeOverrides ?? config.routeOverrides ?? {},
             (provider) => {
               if (!Object.hasOwn(PROVIDER_REGISTRY, provider)) {
                 return false;
@@ -2975,7 +3037,8 @@ export class ProviderModelFactory {
               return this.isProviderAvailableForRouting(
                 provider as ProviderName,
                 providersConfig,
-                config
+                config,
+                routingModel
               );
             },
             isGatewayModelAccessible
@@ -2988,7 +3051,12 @@ export class ProviderModelFactory {
     // gateway selections from being silently rewritten after canonicalization.
     if (
       explicitGateway != null &&
-      this.isProviderAvailableForRouting(explicitGateway, providersConfig, config)
+      this.isProviderAvailableForRouting(
+        explicitGateway,
+        providersConfig,
+        config,
+        canonicalModelString
+      )
     ) {
       const explicitGatewayDefinition = PROVIDER_DEFINITIONS[explicitGateway];
       if (explicitGatewayDefinition.kind === "gateway") {

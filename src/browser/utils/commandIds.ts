@@ -94,6 +94,9 @@ export const CommandIds = {
   // Settings commands
   settingsOpen: () => "settings:open" as const,
   settingsOpenSection: (section: string) => `settings:open:${section}` as const,
+  codexAccountAction: (
+    action: "add" | "reconnect" | "rename" | "disconnect" | "default" | "project"
+  ) => `providers:openai:codex:${action}` as const,
   coderDisconnect: () => "providers:coder:disconnect" as const,
   coderRefreshModels: () => "providers:coder:refresh-models" as const,
 

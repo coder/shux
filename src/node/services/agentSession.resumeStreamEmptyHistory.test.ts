@@ -1,7 +1,10 @@
 import { describe, expect, test, mock, afterEach } from "bun:test";
 
 import { AgentSession } from "./agentSession";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
+import {
+  createModelRoutingSnapshotMock,
+  createStreamLifecycleMocks,
+} from "./agentSession.testHarness";
 import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
 import type { InitStateManager } from "./initStateManager";
@@ -20,6 +23,7 @@ describe("AgentSession.resumeStream", () => {
 
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on: mock(() => aiService),
       off: mock(() => aiService),
       stopStream: mock(() => Promise.resolve(Ok(undefined))),
@@ -44,6 +48,7 @@ describe("AgentSession.resumeStream", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 

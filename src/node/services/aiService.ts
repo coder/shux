@@ -67,6 +67,9 @@ import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
 
 import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
+import { getCodexOauthProjectPath } from "@/common/utils/providers/codexOauthRouting";
+import { getCodexOauthAccountId } from "@/node/utils/codexOauthAuth";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import {
   resolveMemoryProjectIdentity,
@@ -313,8 +316,36 @@ export class AIService extends EventEmitter {
     }
   }
 
-  getProvidersConfig(): ProvidersConfigMap | null {
-    return this.providerService.getConfig();
+  getProvidersConfig(providersConfig?: ProvidersConfig): ProvidersConfigMap | null {
+    return this.providerService.getConfig(providersConfig);
+  }
+
+  /** Keep model credentials and compaction limits on one backend-only snapshot for the turn. */
+  captureModelRoutingSnapshot(workspaceId?: string, projectPath?: string): ModelRoutingSnapshot {
+    // CLI routing config can be temporary. Read credentials from the injected provider store.
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
+    const workspace = workspaceId ? this.config.findWorkspace(workspaceId) : undefined;
+    const routingProjectPath = getCodexOauthProjectPath(workspace) ?? projectPath;
+    const appConfig = this.config.loadConfigOrDefault();
+    const projectAccountId = routingProjectPath
+      ? appConfig.projects.get(routingProjectPath)?.codexOauthAccountId
+      : undefined;
+    // Copy routing rules before metadata reads. Nested models need their own captured overrides.
+    const routeConfig = {
+      routePriority: [...(appConfig.routePriority ?? ["direct"])],
+      routeOverrides: { ...appConfig.routeOverrides },
+    };
+    return {
+      providersConfig,
+      routeConfig,
+      metadata: this.getProvidersConfig(providersConfig),
+      codexOauthSelection: {
+        accountId: getCodexOauthAccountId(providersConfig.openai, projectAccountId),
+        explicit:
+          projectAccountId !== undefined ||
+          providersConfig.openai?.codexOauthDefaultAccountId !== undefined,
+      },
+    };
   }
 
   private emitEngineEvent(event: TurnEngineEvent): void | Promise<void> {
@@ -543,11 +574,18 @@ export class AIService extends EventEmitter {
     opts?: {
       agentInitiated?: boolean;
       workspaceId?: string;
+      projectPath?: string;
       /** Snapshot pass-through (see ProviderModelFactory.createModel). */
       providersConfig?: ProvidersConfig;
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
     }
   ): Promise<Result<LanguageModel, SendMessageError>> {
-    return this.providerModelFactory.createModel(modelString, muxProviderOptions, opts);
+    return this.providerModelFactory.createModel(modelString, muxProviderOptions, {
+      ...opts,
+      providersConfig: opts?.modelRoutingSnapshot?.providersConfig ?? opts?.providersConfig,
+      codexOauthSelection: opts?.modelRoutingSnapshot?.codexOauthSelection,
+      routeConfig: opts?.modelRoutingSnapshot?.routeConfig,
+    });
   }
 
   /**
@@ -560,12 +598,23 @@ export class AIService extends EventEmitter {
    */
   async createModelWithPinnedMetadata(
     modelString: string,
-    opts?: { agentInitiated?: boolean; workspaceId?: string }
+    opts?: {
+      agentInitiated?: boolean;
+      workspaceId?: string;
+      projectPath?: string;
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
+    }
   ): Promise<Result<{ model: LanguageModel; metadataModel: string }, SendMessageError>> {
-    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
+    // Keep model construction and metadata on one route, including callers without an outer snapshot.
+    const snapshot =
+      opts?.modelRoutingSnapshot ??
+      this.captureModelRoutingSnapshot(opts?.workspaceId, opts?.projectPath);
+    const providersConfig = snapshot.providersConfig;
     const result = await this.providerModelFactory.createModel(modelString, undefined, {
       ...opts,
       providersConfig,
+      codexOauthSelection: snapshot.codexOauthSelection,
+      routeConfig: snapshot.routeConfig,
     });
     if (!result.success) {
       return result;
@@ -579,7 +628,8 @@ export class AIService extends EventEmitter {
     const effectiveModelString = this.providerModelFactory.resolveEffectiveModelString(
       modelString,
       undefined,
-      providersConfig
+      providersConfig,
+      snapshot.routeConfig
     );
     const metadataSeed = effectiveModelString.startsWith("coder:")
       ? modelString

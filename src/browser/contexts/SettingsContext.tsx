@@ -7,14 +7,23 @@ import {
   useRef,
   useState,
   type ReactNode,
+  type Dispatch,
+  type SetStateAction,
 } from "react";
 import { useRouter } from "@/browser/contexts/RouterContext";
+
+export type CodexAccountSettingsIntent =
+  | { type: "add" | "default" }
+  | { type: "reconnect" | "rename" | "disconnect"; accountId: string }
+  | { type: "project"; projectPath: string };
 
 export interface OpenSettingsOptions {
   /** When opening the Providers settings, expand the given provider. */
   expandProvider?: string;
   /** When opening the Providers settings, start the Coder OAuth login. */
   startCoderLogin?: boolean;
+  /** Open a Codex account operation through the existing settings controls. */
+  codexAccountAction?: CodexAccountSettingsIntent;
   /** When opening the Runtimes settings, pre-select this project scope. */
   runtimesProjectPath?: string;
   /** When opening the Secrets settings, pre-select this project scope. */
@@ -40,6 +49,9 @@ interface SettingsContextValue {
   /** One-shot hint for ProvidersSection to start the Coder OAuth login. */
   providersStartCoderLogin: boolean;
   setProvidersStartCoderLogin: (start: boolean) => void;
+
+  codexAccountAction: CodexAccountSettingsIntent | null;
+  setCodexAccountAction: Dispatch<SetStateAction<CodexAccountSettingsIntent | null>>;
 
   /** One-shot hint for RuntimesSection to pre-select a project scope. */
   runtimesProjectPath: string | null;
@@ -68,6 +80,9 @@ export function SettingsProvider(props: { children: ReactNode }) {
   const router = useRouter();
   const [providersExpandedProvider, setProvidersExpandedProvider] = useState<string | null>(null);
   const [providersStartCoderLogin, setProvidersStartCoderLogin] = useState(false);
+  const [codexAccountAction, setCodexAccountAction] = useState<CodexAccountSettingsIntent | null>(
+    null
+  );
   const [runtimesProjectPath, setRuntimesProjectPath] = useState<string | null>(null);
   const [secretsProjectPath, setSecretsProjectPath] = useState<string | null>(null);
   const [instructionsProjectPath, setInstructionsProjectPath] = useState<string | null>(null);
@@ -83,9 +98,14 @@ export function SettingsProvider(props: { children: ReactNode }) {
       if (nextSection === "providers") {
         setProvidersExpandedProvider(options?.expandProvider ?? null);
         setProvidersStartCoderLogin(options?.startCoderLogin ?? false);
+        // A fresh identity lets repeated commands reach an already-open settings section.
+        setCodexAccountAction(
+          options?.codexAccountAction ? { ...options.codexAccountAction } : null
+        );
       } else {
         setProvidersExpandedProvider(null);
         setProvidersStartCoderLogin(false);
+        setCodexAccountAction(null);
       }
       if (nextSection === "runtimes") {
         setRuntimesProjectPath(options?.runtimesProjectPath ?? null);
@@ -121,6 +141,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
     if (wasOpenRef.current && !isOpen) {
       setProvidersExpandedProvider(null);
       setProvidersStartCoderLogin(false);
+      setCodexAccountAction(null);
       setRuntimesProjectPath(null);
       setSecretsProjectPath(null);
       setInstructionsProjectPath(null);
@@ -134,6 +155,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
   const close = useCallback(() => {
     setProvidersExpandedProvider(null);
     setProvidersStartCoderLogin(false);
+    setCodexAccountAction(null);
     setRuntimesProjectPath(null);
     setSecretsProjectPath(null);
     setInstructionsProjectPath(null);
@@ -145,6 +167,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
       if (section !== "providers") {
         setProvidersExpandedProvider(null);
         setProvidersStartCoderLogin(false);
+        setCodexAccountAction(null);
       }
       if (section !== "runtimes") {
         // Runtime scope hints are one-shot and should not persist across section changes.
@@ -173,6 +196,8 @@ export function SettingsProvider(props: { children: ReactNode }) {
       setProvidersExpandedProvider,
       providersStartCoderLogin,
       setProvidersStartCoderLogin,
+      codexAccountAction,
+      setCodexAccountAction,
       runtimesProjectPath,
       setRuntimesProjectPath,
       secretsProjectPath,
@@ -189,6 +214,7 @@ export function SettingsProvider(props: { children: ReactNode }) {
       registerOnClose,
       providersExpandedProvider,
       providersStartCoderLogin,
+      codexAccountAction,
       runtimesProjectPath,
       secretsProjectPath,
       instructionsProjectPath,

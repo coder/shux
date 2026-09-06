@@ -42,6 +42,7 @@ import {
 } from "@/constants/streamDrain";
 
 import type { AIService } from "./aiService";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
 import type { HistoryService } from "./historyService";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
@@ -60,7 +61,7 @@ export const BRANCH_SUMMARY_LABEL = "Summary of the abandoned branch:";
  */
 export type BranchSummaryAiService = Pick<
   AIService,
-  "createModelWithPinnedMetadata" | "getWorkspaceMetadata"
+  "createModelWithPinnedMetadata" | "captureModelRoutingSnapshot" | "getWorkspaceMetadata"
 >;
 
 /** Send-option experiment flags relevant to RLM gating (subset of ExperimentsSchema). */
@@ -325,6 +326,7 @@ export function trackPendingUsageWrite(workspaceId: string, write: Promise<void>
 
 async function generateAbandonedBranchSummaryText(input: {
   aiService: BranchSummaryAiService;
+  modelRoutingSnapshot: ModelRoutingSnapshot;
   /**
    * Routes the side-channel request into the workspace's devtools.jsonl:
    * model creation installs its API-debug middleware only when a workspaceId
@@ -387,6 +389,7 @@ async function generateAbandonedBranchSummaryText(input: {
     const modelPromise = input.aiService.createModelWithPinnedMetadata(modelString, {
       agentInitiated: true,
       workspaceId: input.workspaceId,
+      modelRoutingSnapshot: input.modelRoutingSnapshot,
     });
     const modelResult = await Promise.race([modelPromise, deadline]);
     if (modelResult === null) {
@@ -728,6 +731,8 @@ export async function maybeAppendAbandonedBranchSummary(
       return null;
     }
 
+    // One accepted summary keeps its routing across candidate and stream retries.
+    const modelRoutingSnapshot = input.aiService.captureModelRoutingSnapshot(input.workspaceId);
     const candidates =
       input.modelCandidates ??
       (await getSideChannelModelCandidates(input.aiService, input.workspaceId));
@@ -738,6 +743,7 @@ export async function maybeAppendAbandonedBranchSummary(
     const sessionUsageService = input.sessionUsageService;
     const summaryText = await generateAbandonedBranchSummaryText({
       aiService: input.aiService,
+      modelRoutingSnapshot,
       workspaceId: input.workspaceId,
       candidates,
       system: buildAbandonedBranchSummarySystemPrompt(),

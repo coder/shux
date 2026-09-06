@@ -30,6 +30,9 @@ export interface ChatUsageDisplay {
   // Optional model field for display purposes (context window calculation, etc.)
   model?: string;
 
+  // Backend limit for the active request. Null means the limit is unknown.
+  effectiveContextLimit?: number | null;
+
   // True if any model in the sum had unknown pricing (costs are partial/incomplete)
   hasUnknownCosts?: boolean;
 

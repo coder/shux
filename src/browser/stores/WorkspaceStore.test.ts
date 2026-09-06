@@ -1313,6 +1313,62 @@ describe("WorkspaceStore", () => {
   });
 
   describe("live usage identity pinning", () => {
+    it("keeps the limit only for live usage and replaces it on the next turn", async () => {
+      const workspaceId = "live-context-limit";
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+      const aggregator = store.getAggregator(workspaceId);
+      if (!aggregator) throw new Error("Missing live-context aggregator");
+      const bump = () =>
+        getInternal<{ usageStore: { bump: (id: string) => void } }>(store).usageStore.bump(
+          workspaceId
+        );
+      const usage = { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 };
+      for (const [index, effectiveContextLimit] of [272_000, 500_000, null].entries()) {
+        const messageId = "live-limit-" + index;
+        aggregator.handleStreamStart({
+          type: "stream-start",
+          workspaceId,
+          messageId,
+          model: "openai:gpt-5.5",
+          historySequence: index + 1,
+          startTime: 1000 + index,
+          effectiveContextLimit,
+        });
+        bump();
+        const starting = store.getWorkspaceUsage(workspaceId);
+        expect(starting.liveUsage).toBeUndefined();
+        expect(starting.liveModel).toBe("openai:gpt-5.5");
+        expect(starting.liveContextLimit).toBe(effectiveContextLimit);
+        aggregator.handleUsageDelta({
+          type: "usage-delta",
+          workspaceId,
+          messageId,
+          usage,
+          cumulativeUsage: usage,
+          effectiveContextLimit,
+        });
+        bump();
+        expect(store.getWorkspaceUsage(workspaceId).liveUsage?.effectiveContextLimit).toBe(
+          effectiveContextLimit
+        );
+        aggregator.handleStreamEnd({
+          type: "stream-end",
+          workspaceId,
+          messageId,
+          metadata: { model: "openai:gpt-5.5", usage, contextUsage: usage },
+          parts: [{ type: "text", text: "Done" }],
+        });
+        bump();
+        const idle = store.getWorkspaceUsage(workspaceId);
+        expect(idle.liveUsage).toBeUndefined();
+        expect(idle.liveModel).toBeUndefined();
+        expect(idle.liveContextLimit).toBeUndefined();
+        expect(idle.lastContextUsage?.input.tokens).toBe(1000);
+        expect(idle.lastContextUsage?.effectiveContextLimit).toBeUndefined();
+      }
+    });
+
     it("prices live Coder usage via the stream's pinned metadataModel", async () => {
       const workspaceId = "live-coder-usage-pinned";
       createAndAddWorkspace(store, workspaceId);

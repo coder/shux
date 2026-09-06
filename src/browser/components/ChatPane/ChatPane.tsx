@@ -8,6 +8,7 @@ import React, {
   useMemo,
 } from "react";
 import { Lightbulb } from "lucide-react";
+import { getCodexOauthProjectPath } from "@/common/utils/providers/codexOauthRouting";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
 import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
@@ -99,6 +100,7 @@ import { useReviews } from "@/browser/hooks/useReviews";
 import { ReviewsBanner } from "../ReviewsBanner/ReviewsBanner";
 import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import {
   useBackgroundBashActions,
   useBackgroundBashError,
@@ -467,6 +469,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     loadingOlderHistory,
     activeBashMonitorCount,
   } = workspaceState;
+  const { getProjectConfig } = useProjectContext();
+  const accountProjectPath = getCodexOauthProjectPath(meta ?? { projectPath });
+  const codexOauthAccountId = accountProjectPath
+    ? getProjectConfig(accountProjectPath)?.codexOauthAccountId
+    : undefined;
   const shouldShowPinnedTodoList = workspaceState.todos.length > 0;
   const shouldShowReviewsBanner = reviews.reviews.length > 0;
   const shouldRenderLoadOlderMessagesButton = hasOlderHistory && !isPixelSnapshotEnvironment();
@@ -486,6 +493,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     api: api ?? undefined,
     pendingSendOptions,
     providersConfig,
+    codexOauthAccountId,
   });
 
   // Apply message transformations:
@@ -577,9 +585,17 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         use1M,
         autoCompactionThreshold / 100,
         undefined,
-        providersConfig
+        providersConfig,
+        { codexOauthAccountId }
       ),
-    [workspaceUsage, pendingModel, use1M, providersConfig, autoCompactionThreshold]
+    [
+      workspaceUsage,
+      pendingModel,
+      use1M,
+      providersConfig,
+      autoCompactionThreshold,
+      codexOauthAccountId,
+    ]
   );
 
   // Show warning when: shouldShowWarning flag is true AND not currently compacting.

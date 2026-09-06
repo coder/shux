@@ -12,6 +12,7 @@ interface ContextUsageBarProps {
   /** Current model ID — used to show 1M context toggle for supported models */
   model?: string;
   showTitle?: boolean;
+  showEmpty?: boolean;
   testId?: string;
 }
 
@@ -20,6 +21,7 @@ const ContextUsageBarComponent: React.FC<ContextUsageBarProps> = ({
   autoCompaction,
   model,
   showTitle = true,
+  showEmpty = false,
   testId,
 }) => {
   const totalDisplay = formatTokens(data.totalTokens);
@@ -30,7 +32,7 @@ const ContextUsageBarComponent: React.FC<ContextUsageBarProps> = ({
   const showThresholdSlider = Boolean(autoCompaction && data.maxTokens);
   const contextWarning = autoCompaction?.contextWarning;
 
-  if (data.totalTokens === 0) return null;
+  if (data.totalTokens === 0 && !showEmpty) return null;
 
   return (
     <div data-testid={testId} className="relative flex flex-col gap-1">

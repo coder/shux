@@ -53,6 +53,7 @@ import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
 import type { StreamManager } from "./streamManager";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import {
   type ModelFallbackOptions,
   type StreamTextOnChunk,
@@ -92,6 +93,7 @@ import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
 import { resolveModelParameterOverrides } from "@/common/utils/ai/modelParameterOverrides";
 import {
+  ANTHROPIC_1M_CONTEXT_HEADER,
   buildProviderOptions,
   buildRequestHeaders,
   resolveProviderOptionsNamespaceKey,
@@ -229,6 +231,7 @@ import type { ErrorEvent } from "@/common/types/stream";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 
 /** Options used to prepare and execute a turn. */
@@ -246,6 +249,8 @@ export interface StreamMessageOptions {
   additionalSystemInstructions?: string;
   maxOutputTokens?: number;
   muxProviderOptions?: MuxProviderOptions;
+  /** Internal routing state shared with the pre-send compaction check. */
+  modelRoutingSnapshot?: ModelRoutingSnapshot;
   /** Internal-only flag for Copilot billing attribution; never sourced from IPC schemas. */
   agentInitiated?: boolean;
   agentId?: string;
@@ -424,6 +429,7 @@ interface WorkflowResultContinuationSender {
     options: SendMessageOptions,
     internal?: {
       skipAutoResumeReset?: boolean;
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
       synthetic?: boolean;
       agentInitiated?: boolean;
       /** When true, reject instead of queueing if the workspace is busy. */
@@ -517,7 +523,12 @@ interface TurnRequestBuilderDependencies {
   createModel: (
     modelString: string,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string; providersConfig?: ProvidersConfig }
+    opts?: {
+      agentInitiated?: boolean;
+      workspaceId?: string;
+      providersConfig?: ProvidersConfig;
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
+    }
   ) => Promise<Result<LanguageModel, SendMessageError>>;
   isStreaming: (workspaceId: string) => boolean;
   trackPendingDevToolsRunMetadata: (
@@ -549,6 +560,7 @@ export interface PrepareModelAttemptOptions {
 }
 
 interface PreparedModelAttempt {
+  effectiveContextLimit: number | null;
   providerOptions: Record<string, unknown>;
   requestHeaders: Record<string, string> | undefined;
   resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
@@ -706,6 +718,13 @@ export class TurnRequestBuilder {
     };
     options.recordStartupPhaseTiming?.("buildRequestConfigMs", buildRequestConfigStartedAt);
     return {
+      // Use the resolved route and emitted beta header, not the requested direct-provider identity.
+      effectiveContextLimit: getEffectiveContextLimit(
+        options.effectiveModelString,
+        requestHeaders?.["anthropic-beta"] === ANTHROPIC_1M_CONTEXT_HEADER,
+        options.providersConfigSnapshot,
+        { openaiWireFormat: options.muxProviderOptions.openai?.wireFormat }
+      ),
       providerOptions: mergeExtras(providerOptions),
       requestHeaders,
       resolvedOverrides,
@@ -879,7 +898,8 @@ export class TurnRequestBuilder {
       }
 
       const requestedThinkingLevel = options.requestedThinkingLevel ?? THINKING_LEVEL_OFF;
-      const preliminaryProvidersConfig = this.dependencies.providerService.getConfig();
+      const preliminaryProvidersConfig =
+        opts.modelRoutingSnapshot?.metadata ?? this.dependencies.providerService.getConfig();
       const preliminaryMinThinkingLevel = resolveMinimumThinkingLevel(
         options.rawModelString,
         options.minimumThinkingLevelOverride,
@@ -903,7 +923,15 @@ export class TurnRequestBuilder {
         options.rawModelString,
         preliminaryThinkingLevel,
         effectiveMuxProviderOptions,
-        { agentInitiated, workspaceId }
+        {
+          agentInitiated,
+          workspaceId,
+          ...(opts.modelRoutingSnapshot && {
+            providersConfig: opts.modelRoutingSnapshot.providersConfig,
+            codexOauthSelection: opts.modelRoutingSnapshot.codexOauthSelection,
+            routeConfig: opts.modelRoutingSnapshot.routeConfig,
+          }),
+        }
       );
       if (options.recordTiming) {
         recordStartupPhaseTiming("resolveAndCreateModelMs", resolveAndCreateModelStartedAt);
@@ -912,11 +940,25 @@ export class TurnRequestBuilder {
         return resolved;
       }
 
-      const providersConfig = pinCoderInstanceProvidersConfig(
-        this.dependencies.providerService.getConfig(),
+      let providersConfig = pinCoderInstanceProvidersConfig(
+        opts.modelRoutingSnapshot?.metadata ?? this.dependencies.providerService.getConfig(),
         options.rawModelString,
         resolved.data.coderSelectedInstance
       );
+      // Context-limit mirrors must use the account that the model selected.
+      if (
+        providersConfig.openai &&
+        resolved.data.codexOauthAccountId != null &&
+        (!opts.modelRoutingSnapshot || opts.modelRoutingSnapshot.codexOauthSelection.explicit)
+      ) {
+        providersConfig = {
+          ...providersConfig,
+          openai: {
+            ...providersConfig.openai,
+            codexOauthDefaultAccountId: resolved.data.codexOauthAccountId,
+          },
+        };
+      }
       const minThinkingLevel = resolveMinimumThinkingLevel(
         options.rawModelString,
         options.minimumThinkingLevelOverride,
@@ -1774,6 +1816,8 @@ export class TurnRequestBuilder {
                 return;
               }
               if (this.dependencies.bindings.taskService != null) {
+                // Durable attention can combine multiple origins and recover after restart.
+                // It starts a new turn with current routing; only the one-origin fallback keeps this snapshot.
                 this.dependencies.bindings.taskService.noteWorkflowRunTerminalAttention({
                   ownerWorkspaceId: workspaceId,
                   runId,
@@ -1846,6 +1890,8 @@ export class TurnRequestBuilder {
                   },
                   {
                     skipAutoResumeReset: true,
+                    // Only this live callback retains credentials. Restart recovery captures current routing.
+                    modelRoutingSnapshot: opts.modelRoutingSnapshot,
                     synthetic: true,
                     agentInitiated: true,
                     requireIdle: true,
@@ -1878,7 +1924,7 @@ export class TurnRequestBuilder {
     const assistantMessageId = createAssistantMessageId();
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
-    // Share creation-time provider/pricing snapshots for both headless tools.
+    // Headless tools retain accepted turn routing, but use their own model options.
     const createToolModel = async (ms: string) => {
       const toolModelString = ms.trim();
       assert(
@@ -1890,11 +1936,13 @@ export class TurnRequestBuilder {
       // a catalog refresh land between them, running the request
       // on one wire while recording usage under another type.
       const toolProvidersConfig =
-        this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
-      // View snapshot captured at creation time for option
-      // building (buildProviderOptions takes the oRPC view, not
-      // the raw config shape).
-      const toolOptionsProvidersConfig = this.dependencies.providerService.getConfig();
+        opts.modelRoutingSnapshot?.providersConfig ??
+        this.dependencies.providersConfigStore.loadProvidersConfig() ??
+        {};
+      // Option building uses the public provider view from the same snapshot.
+      const toolOptionsProvidersConfig =
+        opts.modelRoutingSnapshot?.metadata ??
+        this.dependencies.providerService.getConfig(toolProvidersConfig);
       // Let the factory pin provider-level defaults (especially the OpenAI wire
       // format) without inheriting any options from the parent chat.
       const toolMuxProviderOptions: MuxProviderOptions = {};
@@ -1904,6 +1952,7 @@ export class TurnRequestBuilder {
         {
           workspaceId,
           providersConfig: toolProvidersConfig,
+          modelRoutingSnapshot: opts.modelRoutingSnapshot,
           agentInitiated: true,
         }
       );
@@ -1919,7 +1968,8 @@ export class TurnRequestBuilder {
         this.dependencies.providerModelFactory.resolveEffectiveModelString(
           toolModelString,
           undefined,
-          toolProvidersConfig
+          toolProvidersConfig,
+          opts.modelRoutingSnapshot?.routeConfig
         );
       const toolOnCoderRoute = toolEffectiveModelString.startsWith("coder:");
       // Creation-time identity from the SAME snapshot the model
@@ -2516,6 +2566,7 @@ export class TurnRequestBuilder {
           engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
           forcedFirstStepToolNames,
+          effectiveContextLimit: preparedAttempt.effectiveContextLimit,
           providerOptions: preparedAttempt.providerOptions,
           headers: preparedAttempt.requestHeaders,
           resolvedOverrides: preparedAttempt.resolvedOverrides,
@@ -2843,6 +2894,7 @@ export class TurnRequestBuilder {
                 rebuildProviderOptionsForThinkingLevel:
                   nextRequest.rebuildProviderOptionsForThinkingLevel,
                 providersConfig: nextRequest.providersConfig,
+                effectiveContextLimit: nextRequest.effectiveContextLimit,
                 initialMetadataPatch: {
                   routedThroughGateway: nextRequest.routedThroughGateway,
                   ...(nextRequest.routeProvider != null
@@ -2944,6 +2996,7 @@ export class TurnRequestBuilder {
       rebuildProviderOptionsForThinkingLevel,
       forcedFirstStepToolNames,
       providersConfigSnapshot: requestProvidersConfig,
+      effectiveContextLimit: primaryRequest.effectiveContextLimit,
       onStreamConstructed: emitPrimaryEnvelope,
       rebuildFirstStepForThinkingLevel: primaryRequest.rebuildFirstStepForThinkingLevel,
     };

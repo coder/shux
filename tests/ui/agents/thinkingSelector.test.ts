@@ -95,7 +95,11 @@ describeIntegration("Thinking selector", () => {
     const harness = await createAppHarness({
       branchPrefix: "thinking-selector",
       beforeRenderEnvironment: async (env) => {
-        await setupProviders(env, { xai: { apiKey: "dummy" } });
+        // Pro and Fast controls require a usable direct API route.
+        await setupProviders(env, {
+          openai: { apiKey: "dummy" },
+          xai: { apiKey: "dummy" },
+        });
       },
     });
 

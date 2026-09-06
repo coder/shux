@@ -212,10 +212,13 @@ import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelM
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { ContinuousCompactor, type ContinuousCompactionContext } from "./continuousCompactor";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import type { CodexOauthRoutingOptions } from "@/common/utils/providers/codexOauthRouting";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
 import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 
 type SessionCompactionContext = ContinuousCompactionContext & {
   sendOptions?: SendMessageOptions;
+  modelRoutingSnapshot?: ModelRoutingSnapshot;
 };
 
 /**
@@ -261,6 +264,8 @@ interface AutoRetryResumeRequest {
   // ACP correlation/delegation lives in transient send options that are
   // intentionally omitted from durable startup-recovery snapshots.
   options: SendMessageOptions;
+  // Keep billing identity across backoff. Credentials stay in memory, never in startup-recovery metadata.
+  modelRoutingSnapshot?: ModelRoutingSnapshot;
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
@@ -553,6 +558,7 @@ export interface AgentSessionMetadataEvent {
 
 interface AgentSessionActiveStreamInfo {
   messageId: string;
+  model?: string;
   startTime?: number;
   parts: Array<
     MuxMessage["parts"][number] & { timestamp?: number; workflowRun?: { timestamp?: number } }
@@ -597,6 +603,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   getStreamInfo?(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
   replayStream?(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
   getProvidersConfig(): ProvidersConfigMap | null;
+  captureModelRoutingSnapshot(workspaceId: string): ModelRoutingSnapshot;
   isExperimentEnabled(experimentId: ExperimentId): boolean;
   buildMemorySessionContext?(
     workspaceId: string,
@@ -879,6 +886,7 @@ export class AgentSession {
     agentInitiated?: boolean;
     openaiTruncationModeOverride?: "auto" | "disabled";
     providersConfig: ProvidersConfigMap | null;
+    modelRoutingSnapshot: ModelRoutingSnapshot;
     goalKind?: GoalSyntheticMessageKind;
     /** Goal identity matching goalKind, so mid-stream compaction follow-ups stay goal-scoped. */
     goalId?: string;
@@ -1033,6 +1041,7 @@ export class AgentSession {
           context,
           baseOptions,
           compactOptions: request.sendOptions,
+          modelRoutingSnapshot: context.modelRoutingSnapshot,
         });
       },
       fastApply: (apply) => this.interruptForContinuousCompaction(apply),
@@ -1315,7 +1324,8 @@ export class AgentSession {
     options: SendMessageOptions | undefined,
     agentInitiated?: boolean,
     goalKind?: GoalSyntheticMessageKind,
-    goalId?: string
+    goalId?: string,
+    modelRoutingSnapshot?: ModelRoutingSnapshot
   ): void {
     if (!options) {
       this.lastAutoRetryResumeRequest = undefined;
@@ -1324,6 +1334,7 @@ export class AgentSession {
 
     this.lastAutoRetryResumeRequest = {
       options,
+      ...(modelRoutingSnapshot != null ? { modelRoutingSnapshot } : {}),
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
@@ -1361,6 +1372,7 @@ export class AgentSession {
         agentInitiated: request.agentInitiated === true ? true : undefined,
         goalKind: request.goalKind,
         goalId: request.goalId,
+        modelRoutingSnapshot: request.modelRoutingSnapshot,
       });
       if (result.success) {
         if (!result.data.started) {
@@ -3071,6 +3083,8 @@ export class AgentSession {
       /** A dequeued send keeps its admission owner through acceptance and startup failure. */
       turnReservation?: TurnId;
       synthetic?: boolean;
+      /** Same-session continuations keep accepted routing. Restart recovery captures current settings. */
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
       agentInitiated?: boolean;
       goalContinuation?: boolean;
       goalKind?: GoalSyntheticMessageKind;
@@ -3687,6 +3701,9 @@ export class AgentSession {
     // away would dangle the trigger's message-ID reference. Family sends are
     // small and bounded, so skip on-send compaction for them; mid-stream
     // forcing still protects the context limit.
+    // Share this snapshot with model construction; settings changes apply to the next turn.
+    const modelRoutingSnapshot =
+      internal?.modelRoutingSnapshot ?? this.captureModelRoutingSnapshot();
     const hasPreTurnMessages = (internal?.preTurnMessages?.length ?? 0) > 0;
     if (!isCompactionRequest && !editMessageId && !hasPreTurnMessages) {
       // Seed usage state from persisted history on the first send after restart
@@ -3697,7 +3714,7 @@ export class AgentSession {
         return Ok(undefined);
       }
 
-      const providersConfigForCompaction = this.getProvidersConfigSafe();
+      const providersConfigForCompaction = modelRoutingSnapshot.metadata;
       // Recover before measuring pressure so the old pre-swap usage cannot force another fold.
       if (await this.continuousCompactor.recover()) this.clearUsageState();
       const compactionResult = this.compactionMonitor.checkBeforeSend({
@@ -3709,12 +3726,13 @@ export class AgentSession {
           providersConfigForCompaction
         ),
         providersConfig: providersConfigForCompaction,
-        openaiWireFormat: optionsForStream.providerOptions?.openai?.wireFormat,
+        ...this.getCompactionRoutingOptions(optionsForStream, modelRoutingSnapshot),
       });
 
       const continuousContext = this.getContinuousCompactionContext(
         modelForStream,
-        optionsForStream
+        optionsForStream,
+        modelRoutingSnapshot
       );
       if (!continuousContext.enabled) this.continuousCompactor.reset("disabled");
       const continuousResult = continuousContext.enabled
@@ -4106,7 +4124,13 @@ export class AgentSession {
 
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
-    this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
+    this.setAutoRetryResumeState(
+      optionsForStream,
+      agentInitiated,
+      goalKind,
+      internal?.goalId,
+      modelRoutingSnapshot
+    );
     try {
       await internal?.onAccepted?.();
     } catch (error) {
@@ -4196,7 +4220,8 @@ export class AgentSession {
           preparedTurnAbortController.signal,
           goalKind,
           internal?.goalId,
-          turnThinkingOverride
+          turnThinkingOverride,
+          modelRoutingSnapshot
         );
         if (streamResult.success && preparedTurnAbortController.signal.aborted) {
           await notifyAcceptedPreStreamFailure(
@@ -4264,7 +4289,12 @@ export class AgentSession {
 
   async resumeStream(
     options: SendMessageOptions,
-    internal?: { agentInitiated?: boolean; goalKind?: GoalSyntheticMessageKind; goalId?: string }
+    internal?: {
+      agentInitiated?: boolean;
+      goalKind?: GoalSyntheticMessageKind;
+      goalId?: string;
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
+    }
   ): Promise<AgentSessionResult<{ started: boolean }>> {
     this.assertNotDisposed("resumeStream");
 
@@ -4303,13 +4333,18 @@ export class AgentSession {
       return Ok({ started: false });
     }
 
+    // Automatic retries keep their failed attempt. Explicit resumes and restart recovery capture current settings.
+    const modelRoutingSnapshot =
+      internal?.modelRoutingSnapshot ?? this.captureModelRoutingSnapshot();
+
     // A resumed attempt becomes the latest live resume request as soon as we
     // accept its options, even if startup fails before the stream fully begins.
     this.setAutoRetryResumeState(
       optionsForStream,
       internal?.agentInitiated,
       internal?.goalKind,
-      internal?.goalId
+      internal?.goalId,
+      modelRoutingSnapshot
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
     const preparedTurn = this.coordinator.prepare();
@@ -4330,7 +4365,8 @@ export class AgentSession {
         undefined,
         internal?.goalKind,
         internal?.goalId,
-        turnThinkingOverride
+        turnThinkingOverride,
+        modelRoutingSnapshot
       );
       if (!result.success) {
         return result;
@@ -4374,6 +4410,23 @@ export class AgentSession {
 
   private getUsageState(): AutoCompactionUsageState | undefined {
     return this.lastUsageState;
+  }
+
+  private captureModelRoutingSnapshot(): ModelRoutingSnapshot {
+    return this.aiService.captureModelRoutingSnapshot(this.workspaceId);
+  }
+
+  private getCompactionRoutingOptions(
+    options?: SendMessageOptions,
+    snapshot = this.activeStreamContext?.modelRoutingSnapshot ?? this.captureModelRoutingSnapshot()
+  ): CodexOauthRoutingOptions {
+    return {
+      // Preserve implicit API-only routing instead of synthesizing an explicit default selection.
+      codexOauthAccountId: snapshot.codexOauthSelection.explicit
+        ? snapshot.codexOauthSelection.accountId
+        : undefined,
+      openaiWireFormat: options?.providerOptions?.openai?.wireFormat,
+    };
   }
 
   private getProvidersConfigSafe(): ProvidersConfigMap | null {
@@ -4860,11 +4913,18 @@ export class AgentSession {
     });
   }
 
+  private syncActiveCompactionModel(): void {
+    const model = this.streamManager.getStreamInfo(this.workspaceId)?.model;
+    if (model && this.activeStreamContext) this.activeStreamContext.modelString = model;
+  }
+
   private getContinuousCompactionContext(
     model: string,
-    options?: SendMessageOptions
+    options?: SendMessageOptions,
+    modelRoutingSnapshot = this.activeStreamContext?.modelRoutingSnapshot ??
+      this.captureModelRoutingSnapshot()
   ): SessionCompactionContext {
-    const providersConfig = this.getProvidersConfigSafe();
+    const providersConfig = modelRoutingSnapshot.metadata;
     const enabled =
       options?.experiments?.continuousCompaction ??
       (typeof this.aiService.isExperimentEnabled === "function" &&
@@ -4884,19 +4944,22 @@ export class AgentSession {
         getEffectiveContextLimit(
           model,
           this.is1MContextEnabledForModel(model, options, providersConfig),
-          providersConfig
+          providersConfig,
+          this.getCompactionRoutingOptions(options, modelRoutingSnapshot)
         ) ?? 0,
       thresholdPercent: this.compactionMonitor.getThreshold() * 100,
       systemMessageTokens:
         this.streamManager.getStreamInfo(this.workspaceId)?.initialMetadata?.systemMessageTokens ??
         this.lastSystemMessageTokens,
       sendOptions: options,
+      modelRoutingSnapshot,
     };
   }
 
   private async observeContinuousCompactionAtStreamEnd(
     model: string,
-    options?: SendMessageOptions
+    options?: SendMessageOptions,
+    modelRoutingSnapshot = this.captureModelRoutingSnapshot()
   ): Promise<void> {
     // fastApply waits for this handler to reach IDLE; waiting on its latch here
     // (or re-entering it from the generated Continue send) would deadlock.
@@ -4907,7 +4970,7 @@ export class AgentSession {
     )
       return;
     try {
-      const context = this.getContinuousCompactionContext(model, options);
+      const context = this.getContinuousCompactionContext(model, options, modelRoutingSnapshot);
       if (!context.enabled && !this.continuousCompactor.hasConsumedSwap()) {
         this.continuousCompactor.reset("disabled");
         return;
@@ -4918,9 +4981,10 @@ export class AgentSession {
         use1MContext: this.is1MContextEnabledForModel(
           model,
           options,
-          this.getProvidersConfigSafe()
+          modelRoutingSnapshot.metadata
         ),
-        providersConfig: this.getProvidersConfigSafe(),
+        providersConfig: modelRoutingSnapshot.metadata,
+        ...this.getCompactionRoutingOptions(options, modelRoutingSnapshot),
       });
       const result = await this.continuousCompactor.observe(usage.usagePercentage, {
         ...context,
@@ -5081,6 +5145,7 @@ export class AgentSession {
           context.providersConfig
         ),
         providersConfig: context.providersConfig,
+        ...this.getCompactionRoutingOptions(context.options, context.modelRoutingSnapshot),
       });
       if (pressure.shouldForceCompact) {
         await eventSpine.run("compaction.prepare", {
@@ -5102,6 +5167,7 @@ export class AgentSession {
         {
           synthetic: true,
           agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
+          modelRoutingSnapshot: context.modelRoutingSnapshot,
           goalKind: fallback ? undefined : context.goalKind,
           goalId: fallback ? undefined : context.goalId,
           admissionStale: () => this.continuousCompactionAbandoned,
@@ -5116,7 +5182,8 @@ export class AgentSession {
     const summaryId = this.pendingCompactionFollowUpSummaryId;
     await this.dispatchPendingFollowUp(
       summaryId ?? undefined,
-      () => this.continuousCompactionAbandoned
+      () => this.continuousCompactionAbandoned,
+      context.modelRoutingSnapshot
     );
     if (this.pendingCompactionFollowUpSummaryId === summaryId)
       this.pendingCompactionFollowUpSummaryId = null;
@@ -5182,7 +5249,11 @@ export class AgentSession {
           ...autoCompactionRequest.sendOptions,
           muxMetadata: autoCompactionRequest.metadata,
         },
-        { synthetic: true, agentInitiated: autoCompactionRequest.agentInitiated }
+        {
+          synthetic: true,
+          agentInitiated: autoCompactionRequest.agentInitiated,
+          modelRoutingSnapshot: streamContext.modelRoutingSnapshot,
+        }
       );
       if (!sendResult.success) {
         log.warn("Failed to dispatch mid-stream compaction request", {
@@ -5354,7 +5425,8 @@ export class AgentSession {
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
-    activeTurnThinkingOverride?: ActiveTurnThinkingOverride
+    activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
+    modelRoutingSnapshot = this.captureModelRoutingSnapshot()
   ): Promise<AgentSessionResult<void>> {
     // Re-read at every pre-stream checkpoint below: dispose or shutdown can land while a
     // recovery-initiated stream (which carries no abortSignal) awaits commitPartial, file-change
@@ -5376,7 +5448,7 @@ export class AgentSession {
     this.ackPendingPostCompactionStateOnStreamEnd = false;
     this.activeStreamHadAnyDelta = false;
     this.activeStreamHadPostCompactionInjection = false;
-    const providersConfig = this.getProvidersConfigSafe();
+    const providersConfig = modelRoutingSnapshot.metadata;
     this.activeStreamContext = {
       modelString,
       options,
@@ -5385,6 +5457,7 @@ export class AgentSession {
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
       providersConfig,
+      modelRoutingSnapshot,
     };
     this.activeStreamUserMessageId = undefined;
 
@@ -5586,6 +5659,7 @@ export class AgentSession {
       additionalSystemInstructions: options?.additionalSystemInstructions,
       maxOutputTokens: options?.maxOutputTokens,
       muxProviderOptions: options?.providerOptions,
+      modelRoutingSnapshot,
       agentInitiated,
       agentId: options?.agentId,
       acpPromptId,
@@ -5846,6 +5920,8 @@ export class AgentSession {
     const retryAgentInitiated = this.activeStreamContext?.agentInitiated;
     const retryGoalKind = this.activeStreamContext?.goalKind;
     const retryGoalId = this.activeStreamContext?.goalId;
+    const retryRoutingSnapshot =
+      this.activeStreamContext?.modelRoutingSnapshot ?? this.captureModelRoutingSnapshot();
     const retryOptionsForResume = retryOptions ?? {
       model: context.modelString,
       agentId: WORKSPACE_DEFAULTS.agentId,
@@ -5869,7 +5945,8 @@ export class AgentSession {
       retryOptionsForResume,
       retryAgentInitiated,
       retryGoalKind,
-      retryGoalId
+      retryGoalId,
+      retryRoutingSnapshot
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
       retryOptionsForResume.muxMetadata
@@ -5886,7 +5963,9 @@ export class AgentSession {
         retryAgentInitiated,
         undefined,
         retryGoalKind,
-        retryGoalId
+        retryGoalId,
+        undefined,
+        retryRoutingSnapshot
       );
     } finally {
       if (this.coordinator.isCurrentTurn(preparedTurn)) {
@@ -5994,7 +6073,9 @@ export class AgentSession {
         context.agentInitiated,
         undefined,
         context.goalKind,
-        context.goalId
+        context.goalId,
+        undefined,
+        context.modelRoutingSnapshot
       );
     } finally {
       if (this.coordinator.isCurrentTurn(preparedTurn)) {
@@ -6238,6 +6319,7 @@ export class AgentSession {
       return;
     const activeModelForAbort = this.activeStreamContext?.modelString;
     const activeOptionsForAbort = this.activeStreamContext?.options;
+    const activeRoutingForAbort = this.activeStreamContext?.modelRoutingSnapshot;
     this.lastSystemMessageTokens = systemMessageTokens ?? this.lastSystemMessageTokens;
     if (activeModelForAbort) {
       this.updateUsageStateFromModelUsage({
@@ -6287,7 +6369,11 @@ export class AgentSession {
     this.activeCompactionRequest = undefined;
     this.resetActiveStreamState();
     if (!hadCompactionRequest && activeModelForAbort && !this.continuousCompactionAbandoned) {
-      await this.observeContinuousCompactionAtStreamEnd(activeModelForAbort, activeOptionsForAbort);
+      await this.observeContinuousCompactionAtStreamEnd(
+        activeModelForAbort,
+        activeOptionsForAbort,
+        activeRoutingForAbort
+      );
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return;
     }
@@ -6331,6 +6417,7 @@ export class AgentSession {
     const streamEndPayload = payload;
     const activeStreamGoalKind = this.activeStreamContext?.goalKind;
     const activeStreamOptions = this.activeStreamContext?.options;
+    const activeRoutingSnapshot = this.activeStreamContext?.modelRoutingSnapshot;
 
     let goalContinuationRequest: {
       sendOptions: SendMessageOptions;
@@ -6420,7 +6507,8 @@ export class AgentSession {
       if (!handled && !completedCompactionRequest) {
         await this.observeContinuousCompactionAtStreamEnd(
           streamEndPayload.metadata.model,
-          activeStreamOptions
+          activeStreamOptions,
+          activeRoutingSnapshot
         );
         if (
           !this.coordinator.isCurrentTurn(turn) ||
@@ -6436,7 +6524,11 @@ export class AgentSession {
         // not the last row, so target it by ID (stashed in onCompactionComplete).
         const rlmSummaryId = this.pendingCompactionFollowUpSummaryId;
         this.pendingCompactionFollowUpSummaryId = null;
-        continuedAfterCompaction = await this.dispatchPendingFollowUp(rlmSummaryId ?? undefined);
+        continuedAfterCompaction = await this.dispatchPendingFollowUp(
+          rlmSummaryId ?? undefined,
+          undefined,
+          activeRoutingSnapshot
+        );
         if (
           !this.coordinator.isCurrentTurn(turn) ||
           !this.coordinator.isCurrentOperation(operation)
@@ -6566,6 +6658,9 @@ export class AgentSession {
         this.emitChatEvent(payload);
       }
     });
+    forward("stream-model-update", (payload) => {
+      this.emitChatEvent(payload);
+    });
     forward("stream-delta", (payload) => {
       this.markActiveStreamHadAnyOutput();
       this.emitChatEvent(payload);
@@ -6644,6 +6739,7 @@ export class AgentSession {
         await this.waitForContinuousCompactionObservation();
         await this.continuousCompactor.waitForIdle();
         await this.waitForContinuousCompactionObservation();
+        this.syncActiveCompactionModel();
         const context = this.activeStreamContext;
         if (
           !context ||
@@ -6673,6 +6769,8 @@ export class AgentSession {
         return;
       }
 
+      // Refusal fallback changes the model without starting a new workspace turn.
+      this.syncActiveCompactionModel();
       const modelForUsage = this.activeStreamContext?.modelString;
       if (!modelForUsage) {
         return;
@@ -6753,7 +6851,7 @@ export class AgentSession {
           streamContext?.providersConfig ?? null
         ),
         providersConfig: streamContext?.providersConfig ?? null,
-        openaiWireFormat: streamOptions?.providerOptions?.openai?.wireFormat,
+        ...this.getCompactionRoutingOptions(streamOptions),
       });
 
       if (shouldInterruptForCompaction) {
@@ -7598,7 +7696,8 @@ export class AgentSession {
    */
   private async dispatchPendingFollowUp(
     summaryMessageId?: string,
-    cancelResume?: () => boolean
+    cancelResume?: () => boolean,
+    modelRoutingSnapshot?: ModelRoutingSnapshot
   ): Promise<boolean> {
     if (this.coordinator.disposed || this.coordinator.closing) {
       return false;
@@ -7907,7 +8006,8 @@ export class AgentSession {
       options,
       followUp.agentInitiated,
       persistedGoalKind,
-      persistedGoalId
+      persistedGoalId,
+      modelRoutingSnapshot
     );
 
     // Await sendMessage to ensure the follow-up is persisted before returning.
@@ -7917,6 +8017,7 @@ export class AgentSession {
     // re-enable auto-retry after a user explicitly opted out.
     const sendResult = await this.sendMessage(finalText, options, {
       synthetic: true,
+      modelRoutingSnapshot,
       agentInitiated: followUp.agentInitiated,
       goalKind: persistedGoalKind,
       // Keep the re-dispatched continuation row goal-scoped so a replaced

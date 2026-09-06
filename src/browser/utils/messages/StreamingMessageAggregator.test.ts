@@ -3515,6 +3515,123 @@ describe("StreamingMessageAggregator", () => {
     });
   });
 
+  test.each([false, true])(
+    "fallback metadata preserves content and timing, replay: %s",
+    (replay) => {
+      const aggregator = createTestAggregator();
+      const start = {
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-1",
+        model: "mux-gateway:anthropic/claude-sonnet-4-5",
+        historySequence: 1,
+        startTime: 1000,
+      };
+      aggregator.handleStreamStart({
+        ...start,
+        type: "stream-start",
+        effectiveContextLimit: 200_000,
+        routedThroughGateway: true,
+        routeProvider: "mux-gateway",
+        thinkingLevel: "high",
+      });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-1",
+        delta: "Partial answer",
+        tokens: 3,
+        timestamp: 1100,
+      });
+      startToolCall(aggregator, {
+        toolCallId: "tool-a",
+        toolName: "bash",
+        args: {},
+        timestamp: 1200,
+      });
+      aggregator.handleToolCallExecutionStart({
+        type: "tool-call-execution-start",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-1",
+        toolCallId: "tool-a",
+        timestamp: 1250,
+      });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-1",
+        delta: "More text",
+        tokens: 2,
+        timestamp: 1300,
+      });
+      const original = aggregator.getAllMessages()[0];
+      const originalTimestamp = original.metadata?.timestamp;
+      const parts = structuredClone(original.parts);
+      const timing = aggregator.getActiveStreamTimingStats();
+      const refusedModels = [start.model];
+      for (const limit of [272_000, null]) {
+        aggregator.handleUsageDelta({
+          type: "usage-delta",
+          workspaceId: TEST_WORKSPACE_ID,
+          messageId: "msg-1",
+          usage: { inputTokens: 1000, outputTokens: 3, totalTokens: 1003 },
+          cumulativeUsage: { inputTokens: 1000, outputTokens: 3, totalTokens: 1003 },
+        });
+        const update = {
+          ...start,
+          model: "openai:gpt-5.5",
+          metadataModel: "openai:gpt-5.5",
+          effectiveContextLimit: limit,
+          routedThroughGateway: false,
+          modelFallback: { requestedModel: start.model, refusedModels: [...refusedModels] },
+        };
+        if (replay) {
+          aggregator.handleStreamStart({ ...update, type: "stream-start", replay: true });
+        } else {
+          aggregator.handleStreamModelUpdate({ ...update, type: "stream-model-update" });
+        }
+        const current = aggregator.getAllMessages()[0];
+        expect(current.parts).toEqual(parts);
+        expect(current.metadata?.timestamp).toBe(originalTimestamp);
+        expect(current.metadata).toMatchObject({
+          model: update.model,
+          metadataModel: update.metadataModel,
+          routedThroughGateway: false,
+          modelFallback: update.modelFallback,
+        });
+        expect(current.metadata?.routeProvider).toBeUndefined();
+        expect(current.metadata?.thinkingLevel).toBeUndefined();
+        expect(aggregator.getActiveStreamContextLimit("msg-1")).toBe(limit);
+        expect(aggregator.getActiveStreamUsage("msg-1")).toBeUndefined();
+        const currentTiming = aggregator.getActiveStreamTimingStats();
+        expect(currentTiming?.model).toBe(update.model);
+        if (replay) {
+          // Replay translates server timestamps again. The first-token duration must remain unchanged.
+          expect(currentTiming!.firstTokenTime! - currentTiming!.startTime).toBe(
+            timing!.firstTokenTime! - timing!.startTime
+          );
+        } else {
+          expect(currentTiming).toMatchObject({
+            startTime: timing?.startTime,
+            firstTokenTime: timing?.firstTokenTime,
+          });
+        }
+        expect(aggregator.getActiveStreamMetadataModel()).toBe(update.metadataModel);
+        expect(
+          aggregator.getDisplayedMessages().findLast((row) => row.type === "assistant")
+            ?.streamPresentation
+        ).toEqual({ source: replay ? "replay" : "live" });
+        refusedModels.push(update.model);
+      }
+      endToolCall(aggregator, {
+        toolCallId: "tool-a",
+        toolName: "bash",
+        result: {},
+        timestamp: 2000,
+      });
+      expect(aggregator.getActiveStreamTimingStats()?.toolExecutionMs).toBe(750);
+    }
+  );
+
   describe("usage-delta handling", () => {
     test("handleUsageDelta stores usage by messageId", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
@@ -3533,6 +3650,36 @@ describe("StreamingMessageAggregator", () => {
         totalTokens: 1050,
       });
     });
+
+    test.each([272_000, null])(
+      "keeps start-time limits across replay and missing usage fields: %s",
+      (limit) => {
+        const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+        const start = {
+          type: "stream-start" as const,
+          workspaceId: "ws-1",
+          messageId: "msg-1",
+          model: "openai:gpt-5.5",
+          historySequence: 1,
+          startTime: 1000,
+        };
+        aggregator.handleStreamStart({ ...start, effectiveContextLimit: limit });
+        expect(aggregator.getActiveStreamUsage("msg-1")).toBeUndefined();
+        expect(aggregator.getActiveStreamContextLimit("msg-1")).toBe(limit);
+        aggregator.handleStreamStart({ ...start, replay: true });
+        expect(aggregator.getActiveStreamContextLimit("msg-1")).toBe(limit);
+        aggregator.handleUsageDelta({
+          type: "usage-delta",
+          workspaceId: "ws-1",
+          messageId: "msg-1",
+          usage: { inputTokens: 1000, outputTokens: 0, totalTokens: 1000 },
+          cumulativeUsage: { inputTokens: 1000, outputTokens: 0, totalTokens: 1000 },
+        });
+        expect(aggregator.getActiveStreamContextLimit("msg-1")).toBe(limit);
+        aggregator.handleStreamStart({ ...start, replay: true, effectiveContextLimit: null });
+        expect(aggregator.getActiveStreamContextLimit("msg-1")).toBeNull();
+      }
+    );
 
     test("clearTokenState removes usage", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);

@@ -2,6 +2,10 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import { getXumHome } from "@/common/constants/paths";
+import {
+  CODEX_OAUTH_REFRESH_LOCK_TIMEOUT_MS,
+  CODEX_OAUTH_REFRESH_LOCK_STALE_MS,
+} from "@/common/constants/codexOauthAccounts";
 import { log } from "@/node/services/log";
 import { ensurePrivateDirSync } from "@/node/utils/fs";
 
@@ -40,6 +44,18 @@ export class FileLeaseManager {
   /** Serializes rotating-token refreshes so losers adopt the persisted winner. */
   async withCoderOauthRefreshLock<T>(fn: () => Promise<T> | T): Promise<T> {
     return this.withDirLock(`${this.providersFile}.coder-refresh.lock`, 45_000, 60_000, fn);
+  }
+
+  /** Serialize each Codex slot across processes before consuming its refresh token. */
+  async withCodexOauthRefreshLock<T>(accountId: string, fn: () => Promise<T> | T): Promise<T> {
+    // Hash slot IDs to keep lock paths bounded and independent of user input.
+    const slotKey = crypto.createHash("sha256").update(accountId).digest("hex");
+    return this.withDirLock(
+      `${this.providersFile}.codex-refresh-${slotKey}.lock`,
+      CODEX_OAUTH_REFRESH_LOCK_TIMEOUT_MS,
+      CODEX_OAUTH_REFRESH_LOCK_STALE_MS,
+      fn
+    );
   }
 
   /** Keeps each desktop login rollback snapshot anchored to committed credentials. */

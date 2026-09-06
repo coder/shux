@@ -4,6 +4,8 @@ import {
   ProviderConfigInfoSchema,
   ProvidersConfigMapSchema,
   config,
+  codexOauth,
+  projects,
   workspace,
 } from "./api";
 import type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap } from "../types";
@@ -18,6 +20,35 @@ import type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap } from
  * If these tests fail, it means the schema is missing fields that the backend
  * service returns, which would cause data loss when crossing the IPC boundary.
  */
+describe("Codex account input validation", () => {
+  it.each(["__proto__", "constructor", "prototype", "", "work/account"])(
+    "rejects unsafe slot ID %s at each mutation boundary",
+    (accountId) => {
+      expect(codexOauth.startDesktopFlow.input.safeParse({ accountId }).success).toBe(false);
+      expect(codexOauth.startDeviceFlow.input.safeParse({ accountId }).success).toBe(false);
+      expect(codexOauth.disconnect.input.safeParse({ accountId }).success).toBe(false);
+      expect(codexOauth.setDefaultAccount.input.safeParse({ accountId }).success).toBe(false);
+      expect(codexOauth.renameAccount.input.safeParse({ accountId, label: "Work" }).success).toBe(
+        false
+      );
+      expect(
+        projects.setCodexOauthAccount.input.safeParse({ projectPath: "/project", accountId })
+          .success
+      ).toBe(false);
+    }
+  );
+
+  it("allows legacy login and explicit project inheritance", () => {
+    expect(codexOauth.startDesktopFlow.input.safeParse(undefined).success).toBe(true);
+    expect(codexOauth.startDeviceFlow.input.safeParse(undefined).success).toBe(true);
+    expect(
+      projects.setCodexOauthAccount.input.safeParse({ projectPath: "/project", accountId: null })
+        .success
+    ).toBe(true);
+    expect(codexOauth.startDesktopFlow.input.safeParse({ label: "  " }).success).toBe(false);
+  });
+});
+
 describe("ProviderConfigInfoSchema conformance", () => {
   it("preserves all AWSCredentialStatus fields", () => {
     const full: AWSCredentialStatus = {
@@ -118,6 +149,8 @@ describe("ProviderConfigInfoSchema conformance", () => {
       cacheTtl: "1h",
       disableBetaFeatures: true,
       codexOauthSet: true,
+      codexOauthAccounts: [{ id: "work", label: "Work" }],
+      codexOauthDefaultAccountId: "work",
       codexOauthDefaultAuth: "apiKey",
       aws: {
         region: "ap-northeast-1",

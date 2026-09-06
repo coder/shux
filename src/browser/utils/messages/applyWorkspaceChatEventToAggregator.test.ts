@@ -10,6 +10,7 @@ import type {
   StreamDeltaEvent,
   StreamEndEvent,
   StreamStartEvent,
+  StreamModelUpdateEvent,
   ToolCallDeltaEvent,
   ToolCallEndEvent,
   ToolCallExecutionStartEvent,
@@ -27,6 +28,10 @@ class StubAggregator implements WorkspaceChatEventAggregator {
 
   handleStreamStart(data: StreamStartEvent): void {
     this.calls.push(`handleStreamStart:${data.messageId}`);
+  }
+
+  handleStreamModelUpdate(data: StreamModelUpdateEvent): void {
+    this.calls.push("handleStreamModelUpdate:" + data.messageId);
   }
 
   handleStreamDelta(data: StreamDeltaEvent): void {

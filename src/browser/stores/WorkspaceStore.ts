@@ -318,6 +318,9 @@ export interface WorkspaceUsageState {
   totalTokens: number;
   /** Live context usage during streaming (last step's inputTokens = current context window) */
   liveUsage?: ChatUsageDisplay;
+  /** Active request metadata exists before the first usage event. */
+  liveModel?: string;
+  liveContextLimit?: number | null;
   /** Live cost usage during streaming (cumulative across all steps) */
   liveCostUsage?: ChatUsageDisplay;
   /**
@@ -908,6 +911,12 @@ export class WorkspaceStore {
       // aggregator.clearActiveStreams() without notifying this store. Bumping
       // on stream-start makes the cache invariant: every new turn forces a
       // fresh recompute regardless of how the previous one was wound down.
+      this.streamingStatsStore.bump(workspaceId);
+    },
+    "stream-model-update": (workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+      this.states.bump(workspaceId);
+      this.usageStore.bump(workspaceId);
       this.streamingStatsStore.bump(workspaceId);
     },
     "stream-lifecycle": (workspaceId, aggregator, data) => {
@@ -2871,6 +2880,10 @@ export class WorkspaceStore {
 
       // Live streaming data (unchanged)
       const activeStreamId = aggregator.getActiveStreamMessageId();
+      const liveModel = activeStreamId ? model : undefined;
+      const liveContextLimit = activeStreamId
+        ? aggregator.getActiveStreamContextLimit(activeStreamId)
+        : undefined;
       // Request-pinned identity stamped by the backend at stream start: a
       // Coder catalog refresh can remove/retag the instance mid-stream, and
       // re-resolving the raw model against the refreshed config would price
@@ -2891,6 +2904,10 @@ export class WorkspaceStore {
               liveMetadataModel ?? this.resolveMetadataModel(model)
             )
           : undefined;
+
+      if (liveUsage) {
+        liveUsage.effectiveContextLimit = liveContextLimit;
+      }
 
       const rawCumulativeUsage = activeStreamId
         ? aggregator.getActiveStreamCumulativeUsage(activeStreamId)
@@ -2915,6 +2932,8 @@ export class WorkspaceStore {
         lastContextUsage,
         totalTokens,
         liveUsage,
+        liveModel,
+        liveContextLimit,
         liveCostUsage,
         liveMetadataModel,
       };

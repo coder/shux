@@ -41,6 +41,7 @@ export function findPreviousModel(messages: DisplayedMessage[]): string | null {
 /** Options for accessibility checks in context switch validation */
 export interface ContextSwitchOptions extends CompactionRouteOptions {
   providersConfig: ProvidersConfigMap | null;
+  codexOauthAccountId?: string;
   policy: EffectivePolicy | null;
 }
 
@@ -63,7 +64,9 @@ function resolveCompactionModel(
       routePriority: options.routePriority,
       routeOverrides: options.routeOverrides,
     });
-    const limit = getEffectiveContextLimit(preferred, use1M, options.providersConfig);
+    const limit = getEffectiveContextLimit(preferred, use1M, options.providersConfig, {
+      codexOauthAccountId: options.codexOauthAccountId,
+    });
     if (accessible && limit && limit > currentTokens) return preferred;
   }
   if (previousModel) {
@@ -74,7 +77,9 @@ function resolveCompactionModel(
       routePriority: options.routePriority,
       routeOverrides: options.routeOverrides,
     });
-    const limit = getEffectiveContextLimit(previousModel, use1M, options.providersConfig);
+    const limit = getEffectiveContextLimit(previousModel, use1M, options.providersConfig, {
+      codexOauthAccountId: options.codexOauthAccountId,
+    });
     if (accessible && limit && limit > currentTokens) return previousModel;
   }
   return null;
@@ -108,7 +113,9 @@ export function checkContextSwitch(
     return null;
   }
 
-  const targetLimit = getEffectiveContextLimit(targetModel, use1M, options.providersConfig);
+  const targetLimit = getEffectiveContextLimit(targetModel, use1M, options.providersConfig, {
+    codexOauthAccountId: options.codexOauthAccountId,
+  });
 
   // Unknown model or context fits with 10% buffer - no warning
   if (!targetLimit || currentTokens <= targetLimit * CONTEXT_FIT_THRESHOLD) {

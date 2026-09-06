@@ -2280,6 +2280,64 @@ exit 1
   });
 
   describe("project settings mutations", () => {
+    it("persists independent Codex accounts and clears only the selected override", async () => {
+      const firstPath = path.join(tempDir, "first");
+      const secondPath = path.join(tempDir, "second");
+      await config.editConfig((current) => {
+        current.projects.set(firstPath, { workspaces: [] });
+        current.projects.set(secondPath, { workspaces: [] });
+        return current;
+      });
+
+      const results = await Promise.all([
+        service.setCodexOauthAccount(firstPath + "/", "personal"),
+        service.setCodexOauthAccount(secondPath, "work"),
+        service.setDisplayName(firstPath, "First project"),
+      ]);
+      expect(results[0]).toEqual(Ok(undefined));
+      expect(results[1]).toEqual(Ok(undefined));
+      const reloaded = new Config(tempDir).loadConfigOrDefault();
+      expect(reloaded.projects.get(firstPath)).toMatchObject({
+        codexOauthAccountId: "personal",
+        displayName: "First project",
+      });
+      expect(reloaded.projects.get(secondPath)?.codexOauthAccountId).toBe("work");
+
+      expect(await service.setCodexOauthAccount(firstPath, null)).toEqual(Ok(undefined));
+      const afterClear = config.loadConfigOrDefault();
+      expect(afterClear.projects.get(firstPath)?.codexOauthAccountId).toBeUndefined();
+      expect(afterClear.projects.get(secondPath)?.codexOauthAccountId).toBe("work");
+    });
+
+    it.each(["work", null])(
+      "rejects an unpersisted Codex account selection: %s",
+      async (accountId) => {
+        const projectPath = path.join(tempDir, "write-failure");
+        await config.editConfig((current) => {
+          current.projects.set(projectPath, { workspaces: [], codexOauthAccountId: "personal" });
+          return current;
+        });
+        // Config can complete the transform without persisting its result.
+        spyOn(config, "editConfig").mockImplementationOnce((transform) => {
+          transform(config.loadConfigOrDefault());
+          return Promise.resolve();
+        });
+
+        const result = await service.setCodexOauthAccount(projectPath, accountId);
+        expect(result.success).toBe(false);
+        expect(config.loadConfigOrDefault().projects.get(projectPath)?.codexOauthAccountId).toBe(
+          "personal"
+        );
+      }
+    );
+
+    it("rejects a Codex account override for an unknown project", async () => {
+      const missing = path.join(tempDir, "missing");
+      const result = await service.setCodexOauthAccount(missing, "work");
+      expect(result.success).toBe(false);
+      expect(config.loadConfigOrDefault().projects.has(missing)).toBe(false);
+    });
+
     it("propagates parent trust to MCP state", async () => {
       const parentPath = path.join(tempDir, "project");
       const childPath = path.join(parentPath, "packages", "api");

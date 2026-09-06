@@ -7346,7 +7346,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
     try {
       const candidates = await this.getWorkspaceTitleModelCandidates(workspaceId);
-      const result = await generateWorkspaceIdentity(trimmedMessage, candidates, this.aiService);
+      const result = await generateWorkspaceIdentity(
+        trimmedMessage,
+        candidates,
+        this.aiService,
+        undefined,
+        undefined,
+        { workspaceId }
+      );
       if (result.success) {
         const persistResult = await this.updateWorkspaceTitleState(workspaceId, {
           title: result.data.title,
@@ -7711,7 +7718,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       candidates,
       this.aiService,
       conversationContext,
-      latestUserText
+      latestUserText,
+      { workspaceId }
     );
     if (!result.success) {
       return Err("Title generation failed");
@@ -11210,6 +11218,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
+        modelRoutingSnapshot: internal?.modelRoutingSnapshot,
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
         goalKind: internal?.goalKind,

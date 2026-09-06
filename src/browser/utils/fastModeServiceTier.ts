@@ -21,6 +21,7 @@ export interface FastModeServiceTierChange {
 export interface FastModeAvailabilityOptions {
   resolvedRouteProvider?: string | null;
   providersConfig?: ProvidersConfigMap | null;
+  codexOauthAccountId?: string;
 }
 
 type ProviderConfigWriter = Pick<APIClient["providers"], "setProviderConfig">;

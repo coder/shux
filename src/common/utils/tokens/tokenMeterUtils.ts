@@ -1,5 +1,6 @@
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import type { CodexOauthRoutingOptions } from "@/common/utils/providers/codexOauthRouting";
 import type { ChatUsageDisplay } from "./usageAggregator";
 
 // NOTE: Provide theme-matching fallbacks so token meters render consistently
@@ -60,11 +61,24 @@ export function calculateTokenMeterData(
   model: string,
   use1M: boolean,
   verticalProportions = false,
-  providersConfig: ProvidersConfigMap | null = null
+  providersConfig: ProvidersConfigMap | null = null,
+  routingOptions?: CodexOauthRoutingOptions,
+  effectiveContextLimit?: number | null
 ): TokenMeterData {
-  if (!usage) return { segments: [], totalTokens: 0, totalPercentage: 0 };
+  if (!usage) {
+    return {
+      segments: [],
+      totalTokens: 0,
+      totalPercentage: 0,
+      maxTokens: effectiveContextLimit ?? undefined,
+    };
+  }
 
-  const maxTokens = getEffectiveContextLimit(model, use1M, providersConfig) ?? undefined;
+  // Live usage keeps the accepted request limit. Idle callers omit the override.
+  const maxTokens =
+    (effectiveContextLimit !== undefined
+      ? effectiveContextLimit
+      : getEffectiveContextLimit(model, use1M, providersConfig, routingOptions)) ?? undefined;
 
   // Total tokens used in the request.
   // For Anthropic prompt caching, cacheCreate tokens are reported separately but still

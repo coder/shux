@@ -491,6 +491,132 @@ test("multi-project workspace command hides itself when the experiment is disabl
   expect(onStartMultiProjectWorkspaceCreation).not.toHaveBeenCalled();
 });
 
+test("Codex commands open each operation without making account RPCs", async () => {
+  const onOpenSettings = mock();
+  const actions = getActions({
+    api: null,
+    onOpenSettings,
+    providersConfig: {
+      openai: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: false,
+        codexOauthSet: false,
+        codexOauthAccounts: [{ id: "work", label: "Work", reconnectRequired: true }],
+      },
+    },
+  });
+  for (const type of ["add", "reconnect", "rename", "disconnect", "default", "project"] as const) {
+    const action = actions.find((candidate) => candidate.id === "providers:openai:codex:" + type);
+    expect(action).toBeDefined();
+    expect(action?.visible?.()).toBe(true);
+    expect(action?.enabled?.() ?? true).toBe(true);
+    if (action?.prompt) {
+      const field = action.prompt.fields[0];
+      if (field.type !== "select") throw new Error("Expected a metadata selector");
+      const choices = await field.getOptions({});
+      expect(choices.map((choice) => choice.id)).toEqual([type === "project" ? "/repo/a" : "work"]);
+      await action.prompt.onSubmit(
+        type === "project" ? { projectPath: "/repo/a" } : { accountId: "work" }
+      );
+    } else {
+      await action?.run();
+    }
+    expect(onOpenSettings).toHaveBeenLastCalledWith("providers", {
+      expandProvider: "openai",
+      codexAccountAction:
+        type === "project"
+          ? { type, projectPath: "/repo/a" }
+          : type === "add" || type === "default"
+            ? { type }
+            : { type, accountId: "work" },
+    });
+  }
+  expect(onOpenSettings).toHaveBeenCalledTimes(6);
+});
+
+test("Codex account commands distinguish duplicate labels without changing account IDs", async () => {
+  const accounts = [
+    { id: "first-slot", label: "Personal" },
+    { id: "second-slot", label: "Personal" },
+    { id: "work-slot", label: "Work" },
+  ];
+  const onOpenSettings = mock();
+  const actions = getActions({
+    onOpenSettings,
+    providersConfig: {
+      openai: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+        codexOauthAccounts: accounts,
+      },
+    },
+  });
+  for (const type of ["reconnect", "rename", "disconnect"] as const) {
+    const prompt = actions.find((action) => action.id === "providers:openai:codex:" + type)?.prompt;
+    const field = prompt?.fields[0];
+    if (!prompt || field?.type !== "select") throw new Error("Expected account selector");
+    const choices = await field.getOptions({});
+    expect(new Set(choices.map((choice) => choice.label)).size).toBe(accounts.length);
+    expect(choices.map((choice) => choice.id)).toEqual(accounts.map((account) => account.id));
+    expect(choices[2].label).toBe(accounts[2].label);
+    const second = choices.find((choice) => choice.label.includes(accounts[1].id));
+    expect(second).toBeDefined();
+    await prompt.onSubmit({ accountId: second!.id });
+    expect(onOpenSettings).toHaveBeenLastCalledWith("providers", {
+      expandProvider: "openai",
+      codexAccountAction: { type, accountId: accounts[1].id },
+    });
+  }
+});
+
+const hiddenCodexProviders: Array<{
+  name: string;
+  providersConfig: Parameters<typeof buildCoreSources>[0]["providersConfig"];
+}> = [
+  { name: "loading metadata", providersConfig: undefined },
+  { name: "policy-hidden OpenAI", providersConfig: {} },
+  {
+    name: "a custom OpenAI shadow",
+    providersConfig: {
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true, isCustom: true },
+    },
+  },
+];
+
+test.each(hiddenCodexProviders)("Codex commands stay hidden with $name", ({ providersConfig }) => {
+  const commands = getActions({ onOpenSettings: mock(), providersConfig }).filter((action) =>
+    action.id.startsWith("providers:openai:codex:")
+  );
+  expect(commands.length).toBeGreaterThan(0);
+  for (const command of commands) {
+    expect(command.visible?.()).toBe(false);
+  }
+});
+
+test("Codex commands use legacy metadata and disable account operations without slots", async () => {
+  const openai = { apiKeySet: false, isEnabled: true, isConfigured: true, codexOauthSet: true };
+  const legacy = getActions({ onOpenSettings: mock(), providersConfig: { openai } });
+  const field = legacy.find((action) => action.id === "providers:openai:codex:reconnect")?.prompt
+    ?.fields[0];
+  if (field?.type !== "select") throw new Error("Expected account selector");
+  expect((await field.getOptions({})).map((choice) => choice.id)).toEqual(["default"]);
+  const disconnected = getActions({
+    onOpenSettings: mock(),
+    providersConfig: { openai: { ...openai, isConfigured: false, codexOauthSet: false } },
+  });
+  for (const type of ["reconnect", "rename", "disconnect", "default"]) {
+    expect(
+      disconnected.find((action) => action.id === "providers:openai:codex:" + type)?.enabled?.()
+    ).toBe(false);
+  }
+  expect(
+    disconnected.find((action) => action.id === "providers:openai:codex:add")?.visible?.()
+  ).toBe(true);
+});
+
 test("Login with Coder command opens providers expanded on Coder and starts the login", async () => {
   // Regression: the command must reach the login operation (expand the Coder
   // provider and start the OAuth flow via the one-shot hints consumed by

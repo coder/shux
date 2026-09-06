@@ -40,6 +40,13 @@ export const OpenAIProviderConfigSchema = BaseProviderConfigSchema.extend({
   organization: z.string().optional(),
   codexOauthDefaultAuth: CodexOauthDefaultAuthSchema.optional(),
   codexOauth: z.record(z.string(), z.unknown()).optional(),
+  // Keep named tokens under credentials so older recursive config redactors cannot expose them.
+  codexOauthAccounts: z
+    .record(
+      z.string(),
+      z.object({ label: z.string(), credentials: z.record(z.string(), z.unknown()) }).strict()
+    )
+    .optional(),
   defaultModel: z.string().optional(),
   apiVersion: z.string().optional(),
   webSocketTransportEnabled: z.boolean().optional(),

@@ -42,6 +42,66 @@ describe("calculateTokenMeterData", () => {
     },
   };
 
+  test("keeps the accepted limit during live usage and uses current settings when idle", () => {
+    const changedConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthDefaultAuth: "apiKey",
+        models: [{ id: "gpt-5.5", contextWindowTokens: 500_000 }],
+      },
+    };
+    const live = calculateTokenMeterData(
+      SAMPLE_USAGE,
+      "openai:gpt-5.5",
+      false,
+      false,
+      changedConfig,
+      { codexOauthAccountId: "different-account" },
+      272_000
+    );
+    const idle = calculateTokenMeterData(
+      SAMPLE_USAGE,
+      "openai:gpt-5.5",
+      false,
+      false,
+      changedConfig
+    );
+    expect(live.maxTokens).toBe(272_000);
+    expect(live.totalPercentage).toBeCloseTo((11_000 / 272_000) * 100);
+    expect(idle.maxTokens).toBe(500_000);
+    expect(idle.totalPercentage).toBeCloseTo(2.2);
+  });
+
+  test.each([272_000, null])("keeps the accepted limit before usage arrives: %s", (limit) => {
+    const result = calculateTokenMeterData(
+      undefined,
+      "anthropic:claude-sonnet-4-20250514",
+      true,
+      false,
+      providerConfigWithOverride,
+      undefined,
+      limit
+    );
+    expect(result.maxTokens).toBe(limit ?? undefined);
+    expect(result.totalTokens).toBe(0);
+    expect(result.totalPercentage).toBe(0);
+  });
+
+  test("keeps an unknown accepted limit despite a current model override", () => {
+    const result = calculateTokenMeterData(
+      SAMPLE_USAGE,
+      "anthropic:claude-sonnet-4-20250514",
+      true,
+      false,
+      providerConfigWithOverride,
+      undefined,
+      null
+    );
+    expect(result.maxTokens).toBeUndefined();
+  });
+
   test("uses custom context override for beta Sonnet models", () => {
     const result = calculateTokenMeterData(
       SAMPLE_USAGE,
@@ -74,6 +134,37 @@ describe("calculateTokenMeterData", () => {
 
     expect(result.maxTokens).toBe(1_000_000);
     expect(result.totalPercentage).toBeCloseTo(1.1);
+  });
+
+  test("keeps the OAuth cap for an unavailable global account and a connected project account", () => {
+    const providersConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+        codexOauthDefaultAccountId: "missing",
+        codexOauthAccounts: [{ id: "work", label: "Work" }],
+      },
+    };
+    const globalMeter = calculateTokenMeterData(
+      SAMPLE_USAGE,
+      "openai:gpt-5.5",
+      false,
+      false,
+      providersConfig
+    );
+    const projectMeter = calculateTokenMeterData(
+      SAMPLE_USAGE,
+      "openai:gpt-5.5",
+      false,
+      false,
+      providersConfig,
+      { codexOauthAccountId: "work" }
+    );
+    expect(projectMeter.maxTokens).toBe(272_000);
+    expect(globalMeter.maxTokens).toBe(projectMeter.maxTokens);
+    expect(projectMeter.totalPercentage).toBe(globalMeter.totalPercentage);
   });
 
   test("uses the Codex OAuth cap for GPT-5.5 token meter percentages", () => {

@@ -722,6 +722,7 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     projectKind?: unknown;
     customInstructions?: unknown;
     codeWorkspaceSyncPath?: unknown;
+    codexOauthAccountId?: unknown;
   };
   const runtimeEnablement = normalizeRuntimeEnablementOverrides(record.runtimeEnablement);
   const defaultRuntime = normalizeRuntimeEnablementId(record.defaultRuntime);
@@ -764,6 +765,13 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     next.customInstructions = record.customInstructions;
   } else {
     delete next.customInstructions;
+  }
+
+  // Invalid disk values must not break the project list. Preserve missing account IDs for explicit recovery.
+  if (typeof record.codexOauthAccountId === "string" && record.codexOauthAccountId.trim()) {
+    next.codexOauthAccountId = record.codexOauthAccountId;
+  } else {
+    delete next.codexOauthAccountId;
   }
 
   // Same hand-edit hazard as customInstructions above.
@@ -2932,6 +2940,7 @@ export class Config {
     workspacePath: string;
     projectPath: string;
     attributionProjectPath?: string;
+    subProjectPath?: string;
     projects?: Workspace["projects"];
     workspaceName?: string;
     parentWorkspaceId?: string;
@@ -2951,6 +2960,7 @@ export class Config {
             // config.projects.get(projectPath), even for multi-project workspaces under _multi.
             projectPath,
             attributionProjectPath,
+            subProjectPath: workspace.subProjectPath,
             projects: workspace.projects,
             workspaceName: workspace.name,
             parentWorkspaceId: workspace.parentWorkspaceId,
@@ -2993,6 +3003,7 @@ export class Config {
                 workspacePath: workspace.path,
                 projectPath,
                 attributionProjectPath,
+                subProjectPath: metadata.subProjectPath ?? workspace.subProjectPath,
                 projects: metadata.projects ?? workspace.projects,
                 workspaceName: undefined,
                 parentWorkspaceId: undefined,
@@ -3042,6 +3053,7 @@ export class Config {
                 workspacePath: workspace.path,
                 projectPath,
                 attributionProjectPath,
+                subProjectPath: legacyMetadata.subProjectPath ?? workspace.subProjectPath,
                 projects: legacyMetadata.projects ?? workspace.projects,
                 workspaceName: undefined,
                 parentWorkspaceId: undefined,
@@ -3061,6 +3073,7 @@ export class Config {
               workspacePath: workspace.path,
               projectPath,
               attributionProjectPath,
+              subProjectPath: workspace.subProjectPath,
               projects: workspace.projects,
               workspaceName: undefined,
               parentWorkspaceId: undefined,

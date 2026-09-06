@@ -49,6 +49,8 @@ export interface UseWorkspaceNameOptions {
   debounceMs?: number;
   /** User's selected model to try after preferred models */
   userModel?: string;
+  /** Apply the project account before the workspace exists. */
+  projectPath?: string;
   /**
    * Optional storage scope for persisting draft name-generation state.
    *
@@ -142,7 +144,7 @@ export function getDisplayTitleFromPersistedState(state: unknown): string {
  * auto-generation resumes.
  */
 export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspaceNameReturn {
-  const { message, debounceMs = 500, userModel, scopeId } = options;
+  const { message, debounceMs = 500, userModel, scopeId, projectPath } = options;
   const { api } = useAPI();
   const candidates = useMemo(() => buildNameGenCandidates(userModel), [userModel]);
 
@@ -235,6 +237,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         const result = await api.nameGeneration.generate({
           message: forMessage,
           candidates,
+          projectPath,
         });
 
         // Check if this request is still current (wasn't cancelled)
@@ -288,7 +291,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         }
       }
     },
-    [api, setStored, candidates]
+    [api, setStored, candidates, projectPath]
   );
 
   // Debounced generation effect

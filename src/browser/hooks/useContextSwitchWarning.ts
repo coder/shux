@@ -37,6 +37,7 @@ interface UseContextSwitchWarningProps {
   api: RouterClient<AppRouter> | undefined;
   pendingSendOptions: SendMessageOptions;
   providersConfig: ProvidersConfigMap | null;
+  codexOauthAccountId?: string;
 }
 
 interface UseContextSwitchWarningResult {
@@ -148,11 +149,12 @@ export function useContextSwitchWarning(
   const checkOptions: ContextSwitchOptions = useMemo(
     () => ({
       providersConfig,
+      codexOauthAccountId: props.codexOauthAccountId,
       policy: effectivePolicy,
       routePriority,
       routeOverrides,
     }),
-    [providersConfig, effectivePolicy, routePriority, routeOverrides]
+    [providersConfig, props.codexOauthAccountId, effectivePolicy, routePriority, routeOverrides]
   );
 
   const prevCheckOptionsRef = useRef(checkOptions);
@@ -197,14 +199,19 @@ export function useContextSwitchWarning(
       });
 
       if (suggestion) {
-        const limit = getEffectiveContextLimit(suggestion.modelId, use1M, providersConfig);
+        const limit = getEffectiveContextLimit(
+          suggestion.modelId,
+          use1M,
+          providersConfig,
+          checkOptions
+        );
         if (limit && limit > w.currentTokens) {
           return { ...w, compactionModel: suggestion.modelId, errorMessage: null };
         }
       }
       return w;
     },
-    [providersConfig, effectivePolicy, routePriority, routeOverrides, use1M]
+    [providersConfig, effectivePolicy, routePriority, routeOverrides, use1M, checkOptions]
   );
 
   const evaluateWarning = useCallback(
@@ -413,8 +420,18 @@ export function useContextSwitchWarning(
     // OFF → ON: may clear warning if context now fits
     // ON → OFF: may show warning if context no longer fits
     if (wasEnabled !== use1M) {
-      const previousLimit = getEffectiveContextLimit(pendingModel, wasEnabled, providersConfig);
-      const nextLimit = getEffectiveContextLimit(pendingModel, use1M, providersConfig);
+      const previousLimit = getEffectiveContextLimit(
+        pendingModel,
+        wasEnabled,
+        providersConfig,
+        checkOptions
+      );
+      const nextLimit = getEffectiveContextLimit(
+        pendingModel,
+        use1M,
+        providersConfig,
+        checkOptions
+      );
 
       // Only surface same-model warnings if the effective limit actually changed.
       if (previousLimit === nextLimit) {
@@ -441,7 +458,16 @@ export function useContextSwitchWarning(
         dispatch({ type: "CLEAR_WARNING" });
       }
     }
-  }, [use1M, pendingModel, tokens, messages, providersConfig, evaluateWarning, warning]);
+  }, [
+    use1M,
+    pendingModel,
+    tokens,
+    messages,
+    providersConfig,
+    evaluateWarning,
+    warning,
+    checkOptions,
+  ]);
 
   return { warning, handleModelChange, handleCompact, handleDismiss };
 }

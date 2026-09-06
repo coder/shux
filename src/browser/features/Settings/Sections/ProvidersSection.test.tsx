@@ -1,10 +1,12 @@
 import type React from "react";
+import { StrictMode } from "react";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 import type { APIClient } from "@/browser/contexts/API";
+import { Err, Ok } from "@/common/types/result";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
@@ -46,6 +48,7 @@ void mock.module("@/browser/utils/modelPreferenceRepair", () => ({
 }));
 
 let providersConfigMock: ProvidersConfigMap | null = null;
+let codexPolicyBlocked = false;
 let apiMock: APIClient | null = null;
 const providersRefreshMock = mock(() => Promise.resolve());
 const updateOptimisticallyMock = mock((provider: string, updates: Partial<ProviderConfigInfo>) => {
@@ -82,8 +85,8 @@ void mock.module("@/browser/contexts/API", () => ({
 
 void mock.module("@/browser/contexts/PolicyContext", () => ({
   usePolicy: () => ({
-    status: { state: "disabled" as const },
-    policy: null,
+    status: { state: codexPolicyBlocked ? "enforced" : "disabled" },
+    policy: codexPolicyBlocked ? { providerAccess: [] } : null,
   }),
 }));
 
@@ -209,6 +212,61 @@ function renderProvidersSection() {
   return { ...view, ...providerMocks, providersConfig };
 }
 
+function CodexIntentHarness(props: { action: SettingsContextModule.CodexAccountSettingsIntent }) {
+  const settings = SettingsContextModule.useSettings();
+  return (
+    <>
+      <button
+        onClick={() =>
+          settings.open("providers", { expandProvider: "openai", codexAccountAction: props.action })
+        }
+      >
+        Run account command
+      </button>
+      <output data-testid="pending-account-command">
+        {settings.codexAccountAction?.type ?? "none"}
+      </output>
+      <ProvidersSection />
+    </>
+  );
+}
+
+function setupCodexIntent(action: SettingsContextModule.CodexAccountSettingsIntent) {
+  providersConfigMock = createProvidersConfig();
+  providersConfigMock.openai.codexOauthAccounts = [{ id: "work", label: "Work" }];
+  const client = setupSettingsStory({});
+  apiMock = client;
+  const startDesktopFlow = mock<APIClient["codexOauth"]["startDesktopFlow"]>(() =>
+    Promise.resolve(Err("Unexpected login"))
+  );
+  const startDeviceFlow = mock<APIClient["codexOauth"]["startDeviceFlow"]>(() =>
+    Promise.resolve(Err("Unexpected login"))
+  );
+  const disconnect = mock<APIClient["codexOauth"]["disconnect"]>(() =>
+    Promise.resolve(Ok(undefined))
+  );
+  client.codexOauth = {
+    startDesktopFlow,
+    startDeviceFlow,
+    disconnect,
+    waitForDesktopFlow: () => Promise.resolve(Ok(undefined)),
+    waitForDeviceFlow: () => Promise.resolve(Ok(undefined)),
+    cancelDesktopFlow: () => Promise.resolve(),
+    cancelDeviceFlow: () => Promise.resolve(),
+    renameAccount: () => Promise.resolve(Ok(undefined)),
+    setDefaultAccount: () => Promise.resolve(Ok(undefined)),
+  };
+  const renderContent = () => (
+    <SettingsSectionStory setup={() => client}>
+      <StrictMode>
+        <CodexIntentHarness action={action} />
+      </StrictMode>
+    </SettingsSectionStory>
+  );
+  const view = render(renderContent());
+  return { view, client, startDesktopFlow, startDeviceFlow, disconnect, renderContent };
+}
+
 function getProviderCard(button: HTMLElement): HTMLElement {
   const card = button.parentElement;
   if (!card) {
@@ -232,6 +290,7 @@ describe("ProvidersSection", () => {
     );
     providersConfigMock = null;
     apiMock = null;
+    codexPolicyBlocked = false;
     providersRefreshMock.mockClear();
     updateOptimisticallyMock.mockClear();
   });
@@ -249,6 +308,131 @@ describe("ProvidersSection", () => {
     apiMock = null;
     restoreDom?.();
     restoreDom = null;
+  });
+
+  test.each(["reconnect", "rename", "disconnect"] as const)(
+    "consumes a stale Codex %s command without a mutation",
+    async (type) => {
+      const { view, startDesktopFlow, startDeviceFlow, disconnect } = setupCodexIntent({
+        type,
+        accountId: "deleted",
+      });
+      fireEvent.click(view.getByRole("button", { name: "Run account command" }));
+      await waitFor(() =>
+        expect(view.getByRole("alert").textContent).toContain("no longer available")
+      );
+      expect(view.getByTestId("pending-account-command").textContent).toBe("none");
+      expect(view.queryByRole("textbox", { name: "Account name" })).toBeNull();
+      expect(startDesktopFlow).not.toHaveBeenCalled();
+      expect(startDeviceFlow).not.toHaveBeenCalled();
+      expect(disconnect).not.toHaveBeenCalled();
+    }
+  );
+
+  test("consumes a stale project command without selecting another project", async () => {
+    const { view } = setupCodexIntent({ type: "project", projectPath: "/deleted" });
+    fireEvent.click(view.getByRole("button", { name: "Run account command" }));
+    await waitFor(() =>
+      expect(view.getByRole("alert").textContent).toContain("no longer available")
+    );
+    expect(view.getByTestId("pending-account-command").textContent).toBe("none");
+  });
+
+  test("does not replay a Codex command after policy permits OpenAI", async () => {
+    codexPolicyBlocked = true;
+    const { view, startDesktopFlow, startDeviceFlow, renderContent } = setupCodexIntent({
+      type: "reconnect",
+      accountId: "work",
+    });
+    fireEvent.click(view.getByRole("button", { name: "Run account command" }));
+    await waitFor(() =>
+      expect(view.getByTestId("pending-account-command").textContent).toBe("none")
+    );
+    expect(view.queryByRole("region", { name: "ChatGPT (Codex) accounts" })).toBeNull();
+    codexPolicyBlocked = false;
+    view.rerender(renderContent());
+    await view.findByRole("region", { name: "ChatGPT (Codex) accounts" });
+    expect(startDesktopFlow).not.toHaveBeenCalled();
+    expect(startDeviceFlow).not.toHaveBeenCalled();
+  });
+
+  test("does not replay a Codex command after a busy login ends", async () => {
+    const { view, client, startDesktopFlow, startDeviceFlow } = setupCodexIntent({
+      type: "reconnect",
+      accountId: "work",
+    });
+    startDesktopFlow.mockResolvedValue({
+      success: true,
+      data: { flowId: "busy", authorizeUrl: "https://auth.openai.com/authorize" },
+    });
+    startDeviceFlow.mockResolvedValue({
+      success: true,
+      data: {
+        flowId: "busy",
+        userCode: "CODE",
+        verifyUrl: "https://auth.openai.com/codex/device",
+        intervalSeconds: 5,
+      },
+    });
+    let finishLogin: () => void = () => undefined;
+    const waitForLogin = () =>
+      new Promise<{ success: true; data: undefined }>((resolve) => {
+        finishLogin = () => resolve({ success: true, data: undefined });
+      });
+    client.codexOauth.waitForDesktopFlow = waitForLogin;
+    client.codexOauth.waitForDeviceFlow = waitForLogin;
+    client.codexOauth.cancelDesktopFlow = () => {
+      finishLogin();
+      return Promise.resolve();
+    };
+    client.codexOauth.cancelDeviceFlow = client.codexOauth.cancelDesktopFlow;
+    await userEvent.click(view.getByRole("button", { name: "Run account command" }));
+    await view.findByText("Waiting for authorization...");
+    await userEvent.click(view.getByRole("button", { name: "Run account command" }));
+    await waitFor(() => expect(view.getByRole("alert").textContent).toContain("in progress"));
+    expect(view.getByTestId("pending-account-command").textContent).toBe("none");
+    await userEvent.click(view.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(view.queryByText("Waiting for authorization...")).toBeNull());
+    expect(startDesktopFlow.mock.calls.length + startDeviceFlow.mock.calls.length).toBe(1);
+    await userEvent.click(view.getByRole("button", { name: "Run account command" }));
+    await waitFor(() =>
+      expect(startDesktopFlow.mock.calls.length + startDeviceFlow.mock.calls.length).toBe(2)
+    );
+    await userEvent.click(view.getByRole("button", { name: "Cancel" }));
+  });
+
+  test("cancels a late command login result after a real unmount", async () => {
+    const { view, client, startDesktopFlow, startDeviceFlow } = setupCodexIntent({
+      type: "reconnect",
+      accountId: "work",
+    });
+    const data = {
+      flowId: "late",
+      authorizeUrl: "https://auth.openai.com/authorize",
+      userCode: "CODE",
+      verifyUrl: "https://auth.openai.com/codex/device",
+      intervalSeconds: 5,
+    };
+    let finishStart: () => void = () => undefined;
+    const pendingStart = new Promise<{ success: true; data: typeof data }>((resolve) => {
+      finishStart = () => resolve({ success: true, data });
+    });
+    startDesktopFlow.mockReturnValue(pendingStart);
+    startDeviceFlow.mockReturnValue(pendingStart);
+    const cancelDesktop = spyOn(client.codexOauth, "cancelDesktopFlow");
+    const cancelDevice = spyOn(client.codexOauth, "cancelDeviceFlow");
+    const waitDesktop = spyOn(client.codexOauth, "waitForDesktopFlow");
+    const waitDevice = spyOn(client.codexOauth, "waitForDeviceFlow");
+    await userEvent.click(view.getByRole("button", { name: "Run account command" }));
+    expect(startDesktopFlow.mock.calls.length + startDeviceFlow.mock.calls.length).toBe(1);
+    view.unmount();
+    finishStart();
+    await waitFor(() =>
+      expect(cancelDesktop.mock.calls.length + cancelDevice.mock.calls.length).toBe(1)
+    );
+    expect(waitDesktop).not.toHaveBeenCalled();
+    expect(waitDevice).not.toHaveBeenCalled();
+    expect(providersRefreshMock).not.toHaveBeenCalled();
   });
 
   test("renders built-in and custom providers in separate groups", async () => {
@@ -709,6 +893,8 @@ describe("ProvidersSection", () => {
       providersExpandedProvider: opts.hint ? null : "coder",
       setProvidersExpandedProvider: () => undefined,
       providersStartCoderLogin: startCoderLoginHint,
+      codexAccountAction: null,
+      setCodexAccountAction: () => undefined,
       setProvidersStartCoderLogin,
       runtimesProjectPath: null,
       setRuntimesProjectPath: () => undefined,

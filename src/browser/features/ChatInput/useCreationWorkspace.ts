@@ -370,6 +370,7 @@ export function useCreationWorkspace({
     debounceMs: 500,
     userModel,
     scopeId: workspaceNameScopeId,
+    projectPath: (subProjectPath ?? projectPath) || undefined,
   });
 
   // Destructure name state functions for use in callbacks

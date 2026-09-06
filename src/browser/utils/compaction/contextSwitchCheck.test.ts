@@ -10,6 +10,24 @@ const OPTIONS = {
 };
 
 describe("checkContextSwitch", () => {
+  test("caps the context limit for the project account", () => {
+    const warning = checkContextSwitch(350_000, "openai:gpt-5.5", "google:gemini-2.5-pro", false, {
+      ...OPTIONS,
+      codexOauthAccountId: "work",
+      providersConfig: {
+        openai: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          codexOauthSet: true,
+          codexOauthAccounts: [{ id: "work", label: "Work" }],
+        },
+      },
+    });
+    expect(warning).not.toBeNull();
+    expect(warning?.targetLimit).toBeLessThan(350_000);
+  });
+
   test("returns null when target model matches previous model", () => {
     const targetModel = "openai:gpt-5.2-codex";
     const limit = getEffectiveContextLimit(targetModel, false);

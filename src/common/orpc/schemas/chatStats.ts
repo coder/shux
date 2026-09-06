@@ -32,6 +32,7 @@ export const ChatUsageDisplaySchema = z.object({
   output: ChatUsageComponentSchema,
   reasoning: ChatUsageComponentSchema,
   model: z.string().optional(),
+  effectiveContextLimit: z.number().positive().nullable().optional(),
   costsIncluded: z.boolean().optional(),
 });
 

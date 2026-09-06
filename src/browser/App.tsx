@@ -4,6 +4,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import "./styles/globals.css";
 import { useWorkspaceContext, toWorkspaceSelection } from "./contexts/WorkspaceContext";
 import { useProjectContext } from "./contexts/ProjectContext";
+import { getCodexOauthProjectPath } from "@/common/utils/providers/codexOauthRouting";
 import type { WorkspaceSelection } from "./components/ProjectSidebar/ProjectSidebar";
 import { LeftSidebar } from "./components/LeftSidebar/LeftSidebar";
 import { ProjectCreateModal } from "./components/ProjectCreateModal/ProjectCreateModal";
@@ -197,6 +198,7 @@ function AppInner() {
 
   const {
     userProjects,
+    getProjectConfig,
     refreshProjects,
     removeProject,
     openProjectCreateModal,
@@ -263,6 +265,18 @@ function AppInner() {
       )
     : null;
   const creationScopeId = creationScope ? getProjectScopeId(creationScope.projectPath) : null;
+  const accountWorkspaceId = selectedWorkspace?.workspaceId ?? currentWorkspaceId;
+  const accountProjectPath = getCodexOauthProjectPath(
+    accountWorkspaceId
+      ? (workspaceMetadata.get(accountWorkspaceId) ?? selectedWorkspace)
+      : {
+          projectPath: creationScope?.projectPath,
+          subProjectPath: creationScope?.subProjectPath ?? undefined,
+        }
+  );
+  const codexOauthAccountId = accountProjectPath
+    ? getProjectConfig(accountProjectPath)?.codexOauthAccountId
+    : undefined;
 
   // History navigation (back/forward)
   const navigate = useNavigate();
@@ -690,9 +704,17 @@ function AppInner() {
     const provider = getFastModeProvider(model, {
       providersConfig,
       resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
+      codexOauthAccountId,
     });
     return provider != null && providersConfig[provider]?.serviceTier === "priority";
-  }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
+  }, [
+    codexOauthAccountId,
+    creationScopeId,
+    getModelForWorkspace,
+    getRouteForModel,
+    providersConfig,
+    selectedWorkspace,
+  ]);
 
   const fastModeToggleInFlightRef = useRef(false);
   const toggleFastMode = useCallback(async () => {
@@ -707,6 +729,7 @@ function AppInner() {
     const provider = getFastModeProvider(model, {
       providersConfig,
       resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
+      codexOauthAccountId,
     });
     if (provider == null) {
       fastModeToggleInFlightRef.current = false;
@@ -736,6 +759,7 @@ function AppInner() {
     }
   }, [
     api,
+    codexOauthAccountId,
     creationScopeId,
     getModelForWorkspace,
     getRouteForModel,
@@ -984,6 +1008,7 @@ function AppInner() {
     workspaceMetadata,
     selectedWorkspace,
     creationScopeId,
+    codexOauthAccountId,
     themePreference,
     getThinkingLevel: getThinkingLevelForWorkspace,
     onSetThinkingLevel: setThinkingLevelFromPalette,

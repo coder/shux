@@ -11,7 +11,7 @@ import {
   type AutoCompactionUsageState,
 } from "@/common/utils/compaction/autoCompactionCheck";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
-import type { OpenAIWireFormat } from "@/common/types/providerOptions";
+import type { CodexOauthRoutingOptions } from "@/common/utils/providers/codexOauthRouting";
 
 export type CompactionStatusEvent =
   | {
@@ -24,22 +24,18 @@ export type CompactionStatusEvent =
       newUsagePercent: number;
     };
 
-interface CheckBeforeSendParams {
+interface CheckBeforeSendParams extends CodexOauthRoutingOptions {
   model: string | null;
   usage: AutoCompactionUsageState | undefined;
   use1MContext: boolean;
   providersConfig: ProvidersConfigMap | null;
-  /** Request-level OpenAI wire format; decides whether the Codex OAuth cap applies. */
-  openaiWireFormat?: OpenAIWireFormat | null;
 }
 
-interface CheckMidStreamParams {
+interface CheckMidStreamParams extends CodexOauthRoutingOptions {
   model: string;
   usage: LanguageModelV2Usage;
   use1MContext: boolean;
   providersConfig: ProvidersConfigMap | null;
-  /** Request-level OpenAI wire format; decides whether the Codex OAuth cap applies. */
-  openaiWireFormat?: OpenAIWireFormat | null;
 }
 
 /**
@@ -77,7 +73,7 @@ export class CompactionMonitor {
       this.threshold,
       undefined,
       params.providersConfig,
-      { openaiWireFormat: params.openaiWireFormat }
+      { openaiWireFormat: params.openaiWireFormat, codexOauthAccountId: params.codexOauthAccountId }
     );
   }
 
@@ -108,7 +104,7 @@ export class CompactionMonitor {
       params.model,
       params.use1MContext,
       params.providersConfig,
-      { openaiWireFormat: params.openaiWireFormat }
+      { openaiWireFormat: params.openaiWireFormat, codexOauthAccountId: params.codexOauthAccountId }
     );
     // Defensive: malformed provider overrides can yield invalid/non-positive limits.
     // Treat those as "no compaction signal" instead of throwing inside usage-delta handlers.

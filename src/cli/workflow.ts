@@ -9,7 +9,6 @@ import * as path from "node:path";
 import { Command } from "commander";
 
 import { EXPERIMENT_IDS, LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID } from "@/common/constants/experiments";
-import type { ProjectConfig } from "@/common/types/project";
 import { parseRuntimeModeAndHost, RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import {
   DEFAULT_THINKING_LEVEL,
@@ -46,7 +45,12 @@ import { hasAnyConfiguredProvider, buildProvidersFromEnv } from "@/node/utils/pr
 import { runBestEffortCleanup } from "./runCleanup";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
-import { resolveProjectDir, resolveProjectTrusted } from "./trust";
+import {
+  materializeCodexOauthAccount,
+  replaceRunTrustProjects,
+  resolveProjectDir,
+  resolveProjectTrusted,
+} from "./trust";
 
 const VALID_EXPERIMENT_IDS = new Set<string>(Object.values(EXPERIMENT_IDS));
 const THINKING_LABELS_LIST = [...new Set(Object.values(THINKING_DISPLAY_LABELS))].join(", ");
@@ -226,17 +230,7 @@ async function copyPersistentConfig(
     await runStores.secretsStore.saveSecretsConfig(existingSecrets);
   }
 
-  const existingConfig = realConfig.loadConfigOrDefault();
-  const trustOnlyProjects = new Map<string, ProjectConfig>();
-  for (const [projectPath, projectConfig] of existingConfig.projects) {
-    if (projectConfig.trusted !== undefined) {
-      trustOnlyProjects.set(projectPath, { workspaces: [], trusted: projectConfig.trusted });
-    }
-  }
-  if (trustOnlyProjects.size > 0) {
-    // Config.saveConfig is private (lost-update safety); route through the queue.
-    await config.editConfig((cfg) => ({ ...cfg, projects: trustOnlyProjects }));
-  }
+  await replaceRunTrustProjects(realConfig, config);
 }
 
 function buildExperimentsObject(experimentIds: readonly string[]) {
@@ -370,8 +364,6 @@ async function createWorkflowContext(options: {
       extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
       mcpConfig: realConfig,
     });
-    codexOauthService = new CodexOauthService(runProvidersStore, services.providerService);
-    services.turnRequestBuilderBindings.codexOauthService = codexOauthService;
     // Bind Coder OAuth to the REAL config (not the ephemeral tempDir copy):
     // Coder rotates the refresh token on every use, so persisting rotations
     // only to tempDir would strand ~/.xum/providers.jsonc with a consumed
@@ -382,6 +374,9 @@ async function createWorkflowContext(options: {
       realProvidersStore,
       realFileLeaseManager
     );
+    // Keep Codex token rotations after the temporary CLI root is removed.
+    codexOauthService = new CodexOauthService(realProvidersStore, realProviderService);
+    services.turnRequestBuilderBindings.codexOauthService = codexOauthService;
     coderOauthService = new CoderOauthService(
       realProvidersStore,
       realFileLeaseManager,
@@ -427,6 +422,14 @@ async function createWorkflowContext(options: {
       projectName: path.basename(options.projectDir),
       runtimeConfig,
     });
+    const registered = config.findWorkspace(workspaceId);
+    assert(registered, "Workflow workspace registration must exist");
+    await materializeCodexOauthAccount(
+      realConfig,
+      config,
+      options.projectDir,
+      registered.projectPath
+    );
     assert(workspacePath.length > 0, "xum workflow workspace path must be non-empty");
 
     return {

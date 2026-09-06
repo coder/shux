@@ -168,24 +168,92 @@ export async function resolveProjectTrusted(
   return mainRepoDir != null && isProjectTrusted(realConfig, mainRepoDir);
 }
 
-/** Replace all run-root trust entries so removed grants cannot survive root reuse. */
+/** Replace run project settings so removed trust grants and account overrides cannot survive root reuse. */
 export async function replaceRunTrustProjects(
   realConfig: Config,
   targetConfig: Config
 ): Promise<void> {
   const trustOnlyProjects = new Map<string, ProjectConfig>();
   for (const [projectPath, projectConfig] of realConfig.loadConfigOrDefault().projects) {
-    if (projectConfig.trusted === undefined) {
+    if (projectConfig.trusted === undefined && projectConfig.codexOauthAccountId === undefined) {
       continue;
     }
 
     trustOnlyProjects.set(projectPath, {
       workspaces: [],
       trusted: projectConfig.trusted,
+      codexOauthAccountId: projectConfig.codexOauthAccountId,
     });
   }
 
   await targetConfig.editConfig(() => ({ projects: trustOnlyProjects }));
+}
+
+/** Copy the source project account onto the CLI workspace project. */
+export async function materializeCodexOauthAccount(
+  realConfig: Config,
+  targetConfig: Config,
+  projectDir: string,
+  targetProjectPath: string
+): Promise<void> {
+  const projects = realConfig.loadConfigOrDefault().projects;
+  // Compare physical directories, but retain config keys and exact-path precedence.
+  const resolvedProjectDir = await realpathOrResolve(projectDir);
+  const resolvedProjects = new Map<string, string>();
+  for (const projectPath of projects.keys()) {
+    resolvedProjects.set(projectPath, await realpathOrResolve(projectPath));
+  }
+  const findExactProject = (requestedPath: string, resolvedPath: string): string | undefined =>
+    projects.has(requestedPath)
+      ? requestedPath
+      : Array.from(resolvedProjects).find(([, physicalPath]) => physicalPath === resolvedPath)?.[0];
+  let sourcePath = findExactProject(projectDir, resolvedProjectDir);
+  if (sourcePath === undefined) {
+    for (const [projectPath, project] of projects) {
+      for (const workspace of project.workspaces) {
+        if ((await realpathOrResolve(workspace.path)) === resolvedProjectDir) {
+          sourcePath =
+            workspace.projects?.[0]?.projectPath ?? workspace.subProjectPath ?? projectPath;
+          break;
+        }
+      }
+      if (sourcePath !== undefined) break;
+    }
+  }
+  if (sourcePath === undefined) {
+    // An explicit directory can sit below a registered subproject. Keep its account scope.
+    let longestMatch = -1;
+    for (const [projectPath, physicalPath] of resolvedProjects) {
+      const relative = path.relative(physicalPath, resolvedProjectDir);
+      if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        continue;
+      }
+      if (physicalPath.length > longestMatch) {
+        sourcePath = projectPath;
+        longestMatch = physicalPath.length;
+      }
+    }
+  }
+  sourcePath ??=
+    (await findMainRepoDir(projectDir)) ?? (await findGitRoot(projectDir)) ?? projectDir;
+  const sourceKey = findExactProject(sourcePath, await realpathOrResolve(sourcePath));
+  const accountId =
+    sourceKey === undefined ? undefined : projects.get(sourceKey)?.codexOauthAccountId;
+  await targetConfig.editConfig((config) => {
+    const project = config.projects.get(targetProjectPath) ?? { workspaces: [] };
+    if (accountId === undefined) {
+      delete project.codexOauthAccountId;
+    } else {
+      project.codexOauthAccountId = accountId;
+    }
+    config.projects.set(targetProjectPath, project);
+    return config;
+  });
+  // Config.saveConfig swallows write errors. Never send with an unintended account.
+  const persistedProject = targetConfig.loadConfigOrDefault().projects.get(targetProjectPath);
+  if (!persistedProject || persistedProject.codexOauthAccountId !== accountId) {
+    throw new Error(`Failed to persist Codex OAuth account for ${targetProjectPath}`);
+  }
 }
 
 /**

@@ -166,6 +166,9 @@ export const StreamStartEventSchema = z.object({
     .optional()
     .meta({ description: "True when this event is emitted during stream replay" }),
   model: z.string(),
+  // Publish the accepted limit before usage arrives. Null means the limit is unknown.
+  effectiveContextLimit: z.number().positive().nullable().optional(),
+  modelFallback: ModelFallbackRecordSchema.optional(),
   metadataModel: z
     .string()
     .optional()
@@ -197,6 +200,26 @@ export const StreamStartEventSchema = z.object({
     .optional()
     .meta({ description: "ACP prompt correlation id for matching stream events" }),
 });
+
+// Replaces attempt metadata without starting a new stream. Omitted optional fields clear prior values.
+export const StreamModelUpdateEventSchema = StreamStartEventSchema.pick({
+  workspaceId: true,
+  messageId: true,
+  model: true,
+  metadataModel: true,
+  effectiveContextLimit: true,
+  modelFallback: true,
+  routedThroughGateway: true,
+  routeProvider: true,
+  thinkingLevel: true,
+})
+  .required({
+    metadataModel: true,
+    effectiveContextLimit: true,
+    modelFallback: true,
+    routedThroughGateway: true,
+  })
+  .extend({ type: z.literal("stream-model-update") });
 
 export const StreamDeltaEventSchema = z.object({
   type: z.literal("stream-delta"),
@@ -564,6 +587,9 @@ export const UsageDeltaEventSchema = z.object({
     .optional()
     .meta({ description: "True when this event is emitted during stream replay" }),
 
+  // Safe numeric limit from the accepted request. Never expose its routing snapshot.
+  effectiveContextLimit: z.number().positive().nullable().optional(),
+
   // Step-level: this step only (for context window display)
   usage: LanguageModelV2UsageSchema,
   providerMetadata: z.record(z.string(), z.unknown()).optional(),
@@ -687,6 +713,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   DeleteMessageSchema,
   StreamLifecycleEventSchema,
   StreamStartEventSchema,
+  StreamModelUpdateEventSchema,
   StreamDeltaEventSchema,
   StreamEndEventSchema,
   StreamAbortEventSchema,

@@ -14,6 +14,7 @@ import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createTestHistoryService } from "./testHistoryService";
 import {
+  createModelRoutingSnapshotMock,
   createFailedTurnHandle,
   createStartedTurnHandle,
   createStreamLifecycleMocks,
@@ -120,6 +121,7 @@ describe("AgentSession post-compaction context retry", () => {
 
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiEmitter.on(String(eventName), listener);
         return this;
@@ -151,6 +153,7 @@ describe("AgentSession post-compaction context retry", () => {
       rootDir: sessionsDir,
       sessionsDir,
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
@@ -272,6 +275,7 @@ describe("AgentSession post-compaction context retry", () => {
 
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiEmitter.on(String(eventName), listener);
         return this;
@@ -304,6 +308,7 @@ describe("AgentSession post-compaction context retry", () => {
       rootDir: sessionsDir,
       sessionsDir,
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
@@ -415,6 +420,7 @@ describe("AgentSession post-compaction context retry", () => {
 
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiEmitter.on(String(eventName), listener);
         return this;
@@ -447,6 +453,7 @@ describe("AgentSession post-compaction context retry", () => {
       rootDir: sessionsDir,
       sessionsDir,
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 

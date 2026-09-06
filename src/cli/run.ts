@@ -15,7 +15,11 @@ import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
 import { createConfigStores } from "../node/config";
-import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
+import {
+  materializeCodexOauthAccount,
+  materializeResolvedTrust,
+  replaceRunTrustProjects,
+} from "./trust";
 import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
@@ -653,7 +657,6 @@ async function main(): Promise<number> {
     initStateManager,
     backgroundProcessManager,
     mcpServerManager,
-    providerService,
     workspaceService,
     workspaceGoalService,
     idleDispatcher,
@@ -681,11 +684,6 @@ async function main(): Promise<number> {
       : undefined,
   });
 
-  // `xum run` uses createCoreServices directly (without ServiceContainer), so wire
-  // Codex OAuth explicitly to ensure Codex-routed OpenAI requests can load/refresh
-  // OAuth tokens from providers.jsonc.
-  const codexOauthService = new CodexOauthService(runProvidersStore, providerService);
-  turnRequestBuilderBindings.codexOauthService = codexOauthService;
   // Same for Coder OAuth: coder:* models need per-request token loading/refresh.
   // Bind it to the REAL config (not the ephemeral tempDir copy): Coder rotates
   // the refresh token on every use, so persisting rotations only to tempDir
@@ -698,6 +696,9 @@ async function main(): Promise<number> {
     realProvidersStore,
     realFileLeaseManager
   );
+  // Keep Codex token rotations after the temporary CLI root is removed.
+  const codexOauthService = new CodexOauthService(realProvidersStore, realProviderService);
+  turnRequestBuilderBindings.codexOauthService = codexOauthService;
   const coderOauthService = new CoderOauthService(
     realProvidersStore,
     realFileLeaseManager,
@@ -887,6 +888,9 @@ async function main(): Promise<number> {
     projectName: path.basename(projectDir),
     runtimeConfig,
   });
+  const registered = config.findWorkspace(workspaceId);
+  assert(registered, "CLI workspace registration must exist");
+  await materializeCodexOauthAccount(realConfig, config, projectDir, registered.projectPath);
 
   // Note: taskService.initialize() is intentionally NOT called. It resumes tasks from a
   // previous session, but xum run uses an ephemeral Config (temp dir) with no prior state.

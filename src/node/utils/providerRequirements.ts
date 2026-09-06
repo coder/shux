@@ -23,7 +23,7 @@ import type {
   OpenAIProviderConfig,
 } from "@/common/config/schemas/providersConfig";
 import type { ProviderConfig, ProvidersConfig } from "@/node/config";
-import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
+import { getCodexOauthAccounts } from "@/node/utils/codexOauthAuth";
 import { parseCoderOauthAuth } from "@/node/utils/coderOauthAuth";
 import { normalizeCoderDeploymentUrl } from "@/common/constants/coderOAuth";
 
@@ -608,20 +608,21 @@ export function hasAnyConfiguredProvider(providers: ProvidersConfig | null | und
       continue;
     }
 
+    // Disabled providers cannot satisfy the CLI startup credential check.
+    if (isProviderDisabledInConfig(rawConfig)) {
+      continue;
+    }
+
     // OpenAI Codex OAuth is a valid credential path even without apiKey.
     if (
       providerKey === "openai" &&
-      parseCodexOauthAuth((rawConfig as { codexOauth?: unknown }).codexOauth) !== null
+      getCodexOauthAccounts(rawConfig).some(({ auth }) => auth.invalidReason === undefined)
     ) {
       return true;
     }
 
     if (!(providerKey in PROVIDER_DEFINITIONS)) {
-      if (
-        isCustomProviderConfig(rawConfig) &&
-        !isProviderDisabledInConfig(rawConfig) &&
-        resolveConfigBaseUrl(rawConfig) !== undefined
-      ) {
+      if (isCustomProviderConfig(rawConfig) && resolveConfigBaseUrl(rawConfig) !== undefined) {
         return true;
       }
 

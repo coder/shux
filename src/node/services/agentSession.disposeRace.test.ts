@@ -18,7 +18,11 @@ import {
   startAbandonedBranchSummaryInBackground,
   type BranchSummaryAiService,
 } from "./branchSummary";
-import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createModelRoutingSnapshotMock,
+  createStreamLifecycleMocks,
+} from "./agentSession.testHarness";
 import type { StreamMessageOptions } from "./aiService";
 import type { TurnCompletion } from "./streamManager";
 
@@ -41,6 +45,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiHandlers.set(String(eventName), listener);
         return this;
@@ -135,6 +140,7 @@ describe("AgentSession disposal race conditions", () => {
     const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
         return this;
       },
@@ -187,6 +193,7 @@ describe("AgentSession disposal race conditions", () => {
         releaseModel = resolve;
       });
       const gatedAiService = {
+        captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
         createModelWithPinnedMetadata: async () => {
           await modelGate;
           return Err({ type: "api_key_not_found" as const, provider: "anthropic" });
@@ -254,6 +261,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiHandlers.set(String(eventName), listener);
         return this;
@@ -341,6 +349,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiHandlers.set(String(eventName), listener);
         return this;
@@ -436,6 +445,7 @@ describe("AgentSession disposal race conditions", () => {
   test("does not reset auto-retry intent for synthetic or rejected sends", async () => {
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
         return this;
       },
@@ -581,6 +591,7 @@ describe("AgentSession disposal race conditions", () => {
   test("preserves synthetic flag when flushing queued messages", () => {
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
         return this;
       },

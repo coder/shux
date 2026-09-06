@@ -6,6 +6,12 @@ import {
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
+import {
+  CODEX_OAUTH_ACCOUNT_ID_MAX_LENGTH,
+  CODEX_OAUTH_ACCOUNT_LABEL_MAX_LENGTH,
+  CODEX_OAUTH_ACCOUNT_ID_PATTERN,
+  CODEX_OAUTH_RESERVED_ACCOUNT_IDS,
+} from "@/common/constants/codexOauthAccounts";
 import { CODER_ARCHIVE_BEHAVIORS } from "@/common/config/coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "@/common/config/worktreeArchiveBehavior";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
@@ -288,8 +294,15 @@ export const ProviderConfigInfoSchema = z.object({
   /** Anthropic-specific fields */
   cacheTtl: CacheTtlSchema.optional(),
   disableBetaFeatures: z.boolean().optional(),
-  /** OpenAI-only: whether Codex OAuth tokens are present in providers.jsonc */
+  /** OpenAI-only: whether usable Codex OAuth credentials exist. */
   codexOauthSet: z.boolean().optional(),
+  /** Account identities remain available for reconnect. Credentials stay in the backend. */
+  codexOauthAccounts: z
+    .array(
+      z.object({ id: z.string(), label: z.string(), reconnectRequired: z.boolean().optional() })
+    )
+    .optional(),
+  codexOauthDefaultAccountId: z.string().optional(),
   /**
    * OpenAI-only: default auth precedence to use for Codex-OAuth-allowed models when BOTH
    * ChatGPT OAuth and an OpenAI API key are configured.
@@ -540,9 +553,28 @@ export const muxGovernorOauth = {
 };
 
 // Codex OAuth (ChatGPT subscription auth)
+const CodexOauthAccountIdSchema = z
+  .string()
+  .min(1)
+  .max(CODEX_OAUTH_ACCOUNT_ID_MAX_LENGTH)
+  .regex(CODEX_OAUTH_ACCOUNT_ID_PATTERN)
+  .refine((id) => !CODEX_OAUTH_RESERVED_ACCOUNT_IDS.has(id), "Invalid account ID");
+const CodexOauthAccountLabelSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(CODEX_OAUTH_ACCOUNT_LABEL_MAX_LENGTH);
+const CodexOauthLoginInputSchema = z
+  .object({
+    label: CodexOauthAccountLabelSchema.optional(),
+    accountId: CodexOauthAccountIdSchema.optional(),
+  })
+  .strict()
+  .optional();
+
 export const codexOauth = {
   startDesktopFlow: {
-    input: z.void(),
+    input: CodexOauthLoginInputSchema,
     output: ResultSchema(z.object({ flowId: z.string(), authorizeUrl: z.string() }), z.string()),
   },
   waitForDesktopFlow: {
@@ -559,7 +591,7 @@ export const codexOauth = {
     output: z.void(),
   },
   startDeviceFlow: {
-    input: z.void(),
+    input: CodexOauthLoginInputSchema,
     output: ResultSchema(
       z.object({
         flowId: z.string(),
@@ -584,7 +616,17 @@ export const codexOauth = {
     output: z.void(),
   },
   disconnect: {
-    input: z.void(),
+    input: z.object({ accountId: CodexOauthAccountIdSchema }).strict().optional(),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  setDefaultAccount: {
+    input: z.object({ accountId: CodexOauthAccountIdSchema }).strict(),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  renameAccount: {
+    input: z
+      .object({ accountId: CodexOauthAccountIdSchema, label: CodexOauthAccountLabelSchema })
+      .strict(),
     output: ResultSchema(z.void(), z.string()),
   },
 };
@@ -834,6 +876,12 @@ export const projects = {
       })
       .passthrough(),
     output: z.void(),
+  },
+  setCodexOauthAccount: {
+    input: z
+      .object({ projectPath: z.string(), accountId: CodexOauthAccountIdSchema.nullable() })
+      .strict(),
+    output: ResultSchema(z.void(), z.string()),
   },
   setCustomInstructions: {
     input: z
@@ -2279,6 +2327,7 @@ export const nameGeneration = {
   generate: {
     input: z.object({
       message: z.string(),
+      projectPath: z.string().optional(),
       /** Ordered list of model candidates to try (backend resolves gateway routing in createModel) */
       candidates: z.array(z.string()),
     }),

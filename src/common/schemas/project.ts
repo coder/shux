@@ -285,6 +285,8 @@ export const WorkspaceConfigSchema = z.object({
 });
 
 export const ProjectConfigSchema = z.object({
+  /** Use this account for the project. Unset inherits the global default. */
+  codexOauthAccountId: z.string().min(1).optional(),
   displayName: z.string().nullish().meta({
     description: "Custom display name for the project",
   }),

@@ -1,4 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import * as aiSdk from "ai";
+import { MockLanguageModelV3 } from "ai/test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { Err, Ok } from "@/common/types/result";
+import type { AIService } from "./aiService";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
 import { buildWorkspaceStatusPrompt, generateWorkspaceStatus } from "./workspaceStatusGenerator";
 
 describe("buildWorkspaceStatusPrompt", () => {
@@ -56,6 +61,99 @@ describe("buildWorkspaceStatusPrompt", () => {
 });
 
 describe("generateWorkspaceStatus error paths", () => {
+  afterEach(() => mock.restore());
+
+  function createRoutingSnapshot(): ModelRoutingSnapshot {
+    return {
+      providersConfig: { openai: { apiKey: "test-key", codexOauthDefaultAuth: "oauth" } },
+      routeConfig: { routePriority: ["direct"], routeOverrides: {} },
+      metadata: null,
+      codexOauthSelection: { accountId: "work", explicit: true },
+    };
+  }
+  test("preserves workspace account context across candidate failures", async () => {
+    const createModelWithPinnedMetadata = mock<AIService["createModelWithPinnedMetadata"]>(() =>
+      Promise.resolve(Err({ type: "oauth_not_connected", provider: "openai" }))
+    );
+    const modelRoutingSnapshot = createRoutingSnapshot();
+    const captureModelRoutingSnapshot = mock(() => modelRoutingSnapshot);
+    const aiService = {
+      createModelWithPinnedMetadata,
+      captureModelRoutingSnapshot,
+    } as unknown as AIService;
+    const result = await generateWorkspaceStatus(
+      "Run tests",
+      ["openai:gpt-5.5", "openai:gpt-5.3-codex"],
+      aiService,
+      { workspaceId: "status-workspace" }
+    );
+    expect(result.success).toBe(false);
+    expect(createModelWithPinnedMetadata).toHaveBeenCalledTimes(2);
+    for (const call of createModelWithPinnedMetadata.mock.calls) {
+      expect(call[1]).toEqual({
+        workspaceId: "status-workspace",
+        agentInitiated: true,
+        modelRoutingSnapshot,
+      });
+    }
+  });
+
+  test.each(["account", "preference"] as const)(
+    "pins status routing across a provider failure and %s change",
+    async (change) => {
+      const settings = createRoutingSnapshot();
+      const captureModelRoutingSnapshot = mock<AIService["captureModelRoutingSnapshot"]>(() =>
+        structuredClone(settings)
+      );
+      const createModelWithPinnedMetadata = mock<AIService["createModelWithPinnedMetadata"]>(
+        (model) => Promise.resolve(Ok({ model: new MockLanguageModelV3(), metadataModel: model }))
+      );
+      const aiService = {
+        captureModelRoutingSnapshot,
+        createModelWithPinnedMetadata,
+      } as unknown as AIService;
+      const stream = spyOn(aiSdk, "streamText").mockReturnValue({
+        toolResults: Promise.resolve([
+          {
+            dynamic: false,
+            toolName: "propose_status",
+            output: { emoji: "", message: "Run tests" },
+          },
+        ]),
+      } as unknown as ReturnType<typeof aiSdk.streamText>);
+      stream.mockImplementationOnce(() => {
+        if (change === "account") settings.codexOauthSelection.accountId = "personal";
+        else settings.providersConfig.openai!.codexOauthDefaultAuth = "apiKey";
+        throw new Error("First status provider fails");
+      });
+      const generate = () =>
+        generateWorkspaceStatus(
+          "Run tests",
+          ["openai:gpt-5.5", "openai:gpt-5.3-codex"],
+          aiService,
+          { workspaceId: "status-workspace" }
+        );
+      expect((await generate()).success).toBe(true);
+      expect(captureModelRoutingSnapshot).toHaveBeenCalledTimes(1);
+      expect(captureModelRoutingSnapshot).toHaveBeenCalledWith("status-workspace");
+      expect(createModelWithPinnedMetadata).toHaveBeenCalledTimes(2);
+      const original = createModelWithPinnedMetadata.mock.calls[0]?.[1]?.modelRoutingSnapshot;
+      expect(original?.codexOauthSelection.accountId).toBe("work");
+      expect(original?.providersConfig.openai?.codexOauthDefaultAuth).toBe("oauth");
+      expect(createModelWithPinnedMetadata.mock.calls[1]?.[1]?.modelRoutingSnapshot).toBe(original);
+
+      expect((await generate()).success).toBe(true);
+      expect(captureModelRoutingSnapshot).toHaveBeenCalledTimes(2);
+      expect(createModelWithPinnedMetadata).toHaveBeenCalledTimes(3);
+      const next = createModelWithPinnedMetadata.mock.calls[2]?.[1]?.modelRoutingSnapshot;
+      expect(next).not.toBe(original);
+      expect(next?.codexOauthSelection.accountId).toBe(change === "account" ? "personal" : "work");
+      expect(next?.providersConfig.openai?.codexOauthDefaultAuth).toBe(
+        change === "preference" ? "apiKey" : "oauth"
+      );
+    }
+  );
+
   test("returns a configuration error when no candidates are provided", async () => {
     const fakeAiService = {
       // Asserting this never gets called is the real point of this test —

@@ -165,6 +165,10 @@ import type {
 import { CreationControls } from "./CreationControls";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
 import { CodexOauthWarningBanner } from "./CodexOauthWarningBanner";
+import {
+  getCodexOauthProjectPath,
+  hasCodexOauthTokens,
+} from "@/common/utils/providers/codexOauthRouting";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
@@ -234,7 +238,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     [effectivePolicy]
   );
   const { variant } = props;
-  const { userProjects } = useProjectContext();
+  const { userProjects, getProjectConfig } = useProjectContext();
   const creationScope =
     variant === "creation"
       ? resolveWorkspaceCreationScope(props.projectPath, userProjects, props.pendingSubProjectPath)
@@ -491,7 +495,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
 
   const { open } = useSettings();
-  const { selectedWorkspace, beginWorkspaceCreation } = useWorkspaceContext();
+  const { selectedWorkspace, workspaceMetadata, beginWorkspaceCreation } = useWorkspaceContext();
   const { agentId, currentAgent, agents } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
@@ -505,7 +509,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     ensureModelInSettings,
     defaultModel,
     setDefaultModel,
-    codexOauthSet,
     requiresCodexOauth,
   } = useModelsFromSettings();
 
@@ -601,17 +604,46 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const usage = useWorkspaceUsage(workspaceIdForUsage);
   const { has1MContext } = useProviderOptions();
   const { config: providersConfig } = useProvidersConfig();
+  const accountProjectPath = getCodexOauthProjectPath(
+    variant === "creation"
+      ? { projectPath: creationParentProjectPath, subProjectPath: creationSubProjectPath }
+      : (workspaceMetadata.get(props.workspaceId) ??
+          (selectedWorkspace?.workspaceId === props.workspaceId ? selectedWorkspace : undefined))
+  );
+  const codexOauthAccountId = accountProjectPath
+    ? getProjectConfig(accountProjectPath)?.codexOauthAccountId
+    : undefined;
+  const codexOauthSet =
+    providersConfig == null
+      ? null
+      : hasCodexOauthTokens(providersConfig.openai, codexOauthAccountId);
   const lastUsage = usage?.liveUsage ?? usage?.lastContextUsage;
   // Token counts come from usage metadata, but context limits/1M eligibility should
   // follow the currently selected model unless a stream is actively running.
-  const activeUsageModel = usage?.liveUsage?.model ?? null;
+  const activeUsageModel = usage?.liveModel ?? usage?.liveUsage?.model ?? null;
   const contextDisplayModel = activeUsageModel ?? baseModel;
   const use1M = has1MContext(contextDisplayModel);
+  const liveContextLimit = usage?.liveContextLimit;
   const contextUsageData = useMemo(() => {
-    return lastUsage
-      ? calculateTokenMeterData(lastUsage, contextDisplayModel, use1M, false, providersConfig)
-      : { segments: [], totalTokens: 0, totalPercentage: 0 };
-  }, [lastUsage, contextDisplayModel, use1M, providersConfig]);
+    return calculateTokenMeterData(
+      lastUsage,
+      contextDisplayModel,
+      use1M,
+      false,
+      providersConfig,
+      {
+        codexOauthAccountId,
+      },
+      liveContextLimit
+    );
+  }, [
+    lastUsage,
+    contextDisplayModel,
+    use1M,
+    providersConfig,
+    codexOauthAccountId,
+    liveContextLimit,
+  ]);
   const { threshold: autoCompactThreshold, setThreshold: setAutoCompactThreshold } =
     useAutoCompactionSettings(workspaceIdForUsage, contextDisplayModel);
   const autoCompactionProps = useMemo(
@@ -2765,7 +2797,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       className="flex shrink-0 items-center"
                       data-component="ThinkingSelectorGroup"
                     >
-                      <ThinkingSelector modelString={baseModel} />
+                      <ThinkingSelector
+                        modelString={baseModel}
+                        codexOauthAccountId={codexOauthAccountId}
+                      />
                     </div>
                   </div>
 

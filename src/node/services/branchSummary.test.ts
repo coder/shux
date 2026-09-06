@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -37,6 +37,7 @@ import {
   type SideChannelMetadata,
 } from "./branchSummary";
 import { createTestHistoryService } from "./testHistoryService";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
 
 function finishChunk(unified: "stop" | "length" = "stop"): LanguageModelV3StreamPart {
   return {
@@ -95,6 +96,12 @@ function fakeAiService(
   const workspaceModel =
     opts?.workspaceModel === undefined ? "anthropic:claude-haiku-4-5" : opts.workspaceModel;
   return {
+    captureModelRoutingSnapshot: () => ({
+      providersConfig: {},
+      metadata: null,
+      routeConfig: { routePriority: ["direct"], routeOverrides: {} },
+      codexOauthSelection: { accountId: "default", explicit: false },
+    }),
     createModelWithPinnedMetadata: ((modelString: string) => {
       opts?.onCreateModel?.(modelString);
       if (!model) {
@@ -750,6 +757,92 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     }
   });
 
+  test.each([
+    { failure: "creation", change: "account" },
+    { failure: "creation", change: "route" },
+    { failure: "stream", change: "account" },
+    { failure: "stream", change: "route" },
+  ] as const)(
+    "pins summary routing across a $failure failure and $change change",
+    async ({ failure, change }) => {
+      const { historyService, cleanup } = await createTestHistoryService();
+      try {
+        const settings: ModelRoutingSnapshot = {
+          providersConfig: { openai: { apiKey: "summary-secret" } },
+          metadata: null,
+          routeConfig: { routePriority: ["direct"], routeOverrides: {} },
+          codexOauthSelection: { accountId: "work", explicit: true },
+        };
+        const captureModelRoutingSnapshot = mock(() => structuredClone(settings));
+        const changeSettings = () => {
+          if (change === "account") settings.codexOauthSelection.accountId = "personal";
+          else settings.routeConfig.routePriority.unshift("openrouter");
+        };
+        const failedModel = new MockLanguageModelV3({
+          doStream: () => {
+            changeSettings();
+            throw new Error("First summary stream fails");
+          },
+        });
+        const successfulModel = summaryModel("The abandoned branch identifies the race.");
+        let firstAttempt = true;
+        const createModelWithPinnedMetadata = mock<
+          BranchSummaryAiService["createModelWithPinnedMetadata"]
+        >((modelString) => {
+          if (firstAttempt) {
+            firstAttempt = false;
+            if (failure === "creation") {
+              changeSettings();
+              return Promise.resolve(Err({ type: "oauth_not_connected", provider: "openai" }));
+            }
+            return Promise.resolve(Ok({ model: failedModel, metadataModel: modelString }));
+          }
+          return Promise.resolve(Ok({ model: successfulModel, metadataModel: modelString }));
+        });
+        const aiService: BranchSummaryAiService = {
+          ...fakeAiService(successfulModel),
+          captureModelRoutingSnapshot,
+          createModelWithPinnedMetadata,
+        };
+        const generate = () =>
+          maybeAppendAbandonedBranchSummary({
+            historyService,
+            aiService,
+            workspaceId: "ws-routing",
+            abandonedMessages: meatyExchange("routing"),
+            experiments: RLM_ON,
+            modelCandidates: ["openai:gpt-5.5", "openai:gpt-5.3-codex"],
+          });
+        expect(await generate()).not.toBeNull();
+        expect(captureModelRoutingSnapshot).toHaveBeenCalledTimes(1);
+        expect(captureModelRoutingSnapshot).toHaveBeenCalledWith("ws-routing");
+        expect(createModelWithPinnedMetadata).toHaveBeenCalledTimes(2);
+        const original = createModelWithPinnedMetadata.mock.calls[0]?.[1]?.modelRoutingSnapshot;
+        expect(original?.codexOauthSelection.accountId).toBe("work");
+        expect(original?.routeConfig.routePriority).toEqual(["direct"]);
+        expect(createModelWithPinnedMetadata.mock.calls[1]?.[1]?.modelRoutingSnapshot).toBe(
+          original
+        );
+        expect(await generate()).not.toBeNull();
+        expect(captureModelRoutingSnapshot).toHaveBeenCalledTimes(2);
+        expect(createModelWithPinnedMetadata).toHaveBeenCalledTimes(3);
+        const next = createModelWithPinnedMetadata.mock.calls[2]?.[1]?.modelRoutingSnapshot;
+        expect(next).not.toBe(original);
+        expect(next?.codexOauthSelection.accountId).toBe(
+          change === "account" ? "personal" : "work"
+        );
+        expect(next?.routeConfig.routePriority).toEqual(
+          change === "route" ? ["openrouter", "direct"] : ["direct"]
+        );
+        const history = await historyService.getHistoryFromLatestBoundary("ws-routing");
+        expect(history.success).toBe(true);
+        expect(JSON.stringify(history)).not.toContain("summary-secret");
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+
   test("generation failure skips the row and never throws", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
@@ -842,6 +935,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       // and workspace removal waits forever on the background drain.
       const base = fakeAiService(null);
       const wedgedCreation: BranchSummaryAiService = {
+        captureModelRoutingSnapshot: base.captureModelRoutingSnapshot,
         createModelWithPinnedMetadata: () => new Promise<never>(() => undefined),
         getWorkspaceMetadata: base.getWorkspaceMetadata,
       };
@@ -1385,6 +1479,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       });
       const model = summaryModel("The abandoned branch context both requests need.");
       const gatedAiService: BranchSummaryAiService = {
+        captureModelRoutingSnapshot: fakeAiService(model).captureModelRoutingSnapshot,
         createModelWithPinnedMetadata: (async (...createArgs) => {
           await modelGate;
           return fakeAiService(model).createModelWithPinnedMetadata(...createArgs);
@@ -1533,6 +1628,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       });
       const model = summaryModel("A summary that must never land after removal.");
       const gatedAiService: BranchSummaryAiService = {
+        captureModelRoutingSnapshot: fakeAiService(model).captureModelRoutingSnapshot,
         createModelWithPinnedMetadata: (async (...createArgs) => {
           await modelGate;
           return fakeAiService(model).createModelWithPinnedMetadata(...createArgs);

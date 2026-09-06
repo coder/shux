@@ -16,6 +16,7 @@ import {
 import {
   copyStreamLifecycleSnapshot,
   type StreamStartEvent,
+  type StreamModelUpdateEvent,
   type StreamDeltaEvent,
   type UsageDeltaEvent,
   type StreamEndEvent,
@@ -248,6 +249,8 @@ interface StreamingContext {
    * stream is active.
    */
   metadataModel?: string;
+  effectiveContextLimit?: number | null;
+  modelFallback?: MuxMetadata["modelFallback"];
   routedThroughGateway?: boolean;
   routeProvider?: string;
 
@@ -2158,6 +2161,17 @@ export class StreamingMessageAggregator {
       this.getLatestUnresolvedCompactionRequest()?.parsed.followUpContent?.dispatchOptions
         ?.source === "internal-resume";
     const now = Date.now();
+    const existingContext = this.activeStreams.get(data.messageId);
+    // A reconnect can skip the update event while the backend accepts a fallback attempt.
+    if (
+      data.replay &&
+      existingContext &&
+      (existingContext.model !== data.model ||
+        existingContext.modelFallback?.refusedModels.length !==
+          data.modelFallback?.refusedModels.length)
+    ) {
+      this.activeStreamUsage.delete(data.messageId);
+    }
     const context: StreamingContext = {
       serverStartTime: data.startTime,
       clockOffsetMs: now - data.startTime,
@@ -2169,6 +2183,13 @@ export class StreamingMessageAggregator {
       isReplay: data.replay === true,
       model: data.model,
       metadataModel: data.metadataModel,
+      modelFallback: data.modelFallback,
+      effectiveContextLimit:
+        data.effectiveContextLimit !== undefined
+          ? data.effectiveContextLimit
+          : data.replay
+            ? existingContext?.effectiveContextLimit
+            : undefined,
       routedThroughGateway: data.routedThroughGateway,
       routeProvider,
       serverFirstTokenTime: null,
@@ -2182,7 +2203,6 @@ export class StreamingMessageAggregator {
     // For incremental replay: stream-start may be re-emitted to re-establish context.
     // If we already have this message with accumulated parts, don't wipe its content.
     const existingMessage = this.messages.get(data.messageId);
-    const existingContext = this.activeStreams.get(data.messageId);
     if (data.replay && existingMessage && existingMessage.parts.length > 0) {
       if (existingContext) {
         // Preserve the highest observed server timestamp across reconnect boundaries.
@@ -2205,6 +2225,8 @@ export class StreamingMessageAggregator {
       this.activeStreams.set(data.messageId, context);
       if (existingMessage.metadata) {
         existingMessage.metadata.model = data.model;
+        existingMessage.metadata.metadataModel = data.metadataModel;
+        existingMessage.metadata.modelFallback = data.modelFallback;
         existingMessage.metadata.routedThroughGateway = data.routedThroughGateway;
         existingMessage.metadata.routeProvider = routeProvider;
         if (data.agentId != null) {
@@ -2226,6 +2248,8 @@ export class StreamingMessageAggregator {
       historySequence: data.historySequence,
       timestamp: Date.now(),
       model: data.model,
+      metadataModel: data.metadataModel,
+      modelFallback: data.modelFallback,
       routedThroughGateway: data.routedThroughGateway,
       routeProvider,
       agentId: data.agentId,
@@ -2234,6 +2258,32 @@ export class StreamingMessageAggregator {
     });
 
     this.messages.set(data.messageId, streamingMessage);
+    this.markMessageDirty(data.messageId);
+  }
+
+  handleStreamModelUpdate(data: StreamModelUpdateEvent): void {
+    const context = this.activeStreams.get(data.messageId);
+    const message = this.messages.get(data.messageId);
+    if (!context || !message) return;
+
+    // Keep parts, timestamps, and tool timing. Usage belongs to the new attempt only after its first step.
+    context.model = data.model;
+    context.metadataModel = data.metadataModel;
+    context.effectiveContextLimit = data.effectiveContextLimit;
+    context.modelFallback = data.modelFallback;
+    context.routedThroughGateway = data.routedThroughGateway;
+    context.routeProvider = resolveRouteProvider(data.routeProvider, data.routedThroughGateway);
+    context.thinkingLevel = data.thinkingLevel;
+    message.metadata = {
+      ...message.metadata,
+      model: data.model,
+      metadataModel: data.metadataModel,
+      modelFallback: data.modelFallback,
+      routedThroughGateway: data.routedThroughGateway,
+      routeProvider: context.routeProvider,
+      thinkingLevel: data.thinkingLevel,
+    };
+    this.activeStreamUsage.delete(data.messageId);
     this.markMessageDirty(data.messageId);
   }
 
@@ -3965,6 +4015,10 @@ export class StreamingMessageAggregator {
    * Handle usage-delta event: update usage tracking for active stream
    */
   handleUsageDelta(data: UsageDeltaEvent): void {
+    const context = this.activeStreams.get(data.messageId);
+    if (context && data.effectiveContextLimit !== undefined) {
+      context.effectiveContextLimit = data.effectiveContextLimit;
+    }
     this.activeStreamUsage.set(data.messageId, {
       step: { usage: data.usage, providerMetadata: data.providerMetadata },
       cumulative: {
@@ -3972,6 +4026,10 @@ export class StreamingMessageAggregator {
         providerMetadata: data.cumulativeProviderMetadata,
       },
     });
+  }
+
+  getActiveStreamContextLimit(messageId: string): number | null | undefined {
+    return this.activeStreams.get(messageId)?.effectiveContextLimit;
   }
 
   /**

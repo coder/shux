@@ -76,6 +76,27 @@ describe("hasAnyConfiguredProvider", () => {
     expect(hasAnyConfiguredProvider(providers)).toBe(true);
   });
 
+  it("accepts an additional OAuth account even when the global selection is missing", () => {
+    expect(
+      hasAnyConfiguredProvider({
+        openai: {
+          codexOauthDefaultAccountId: "deleted",
+          codexOauthAccounts: {
+            work: {
+              label: "Work",
+              credentials: {
+                type: "oauth",
+                access: "access",
+                refresh: "refresh",
+                expires: Date.now() + 60_000,
+              },
+            },
+          },
+        },
+      })
+    ).toBe(true);
+  });
+
   it("returns true for OpenAI Codex OAuth-only configuration", () => {
     const providers: ProvidersConfig = {
       openai: {
@@ -91,6 +112,49 @@ describe("hasAnyConfiguredProvider", () => {
 
     expect(hasAnyConfiguredProvider(providers)).toBe(true);
   });
+
+  it.each(["default", "work"])("does not count a revoked %s account as configured", (accountId) => {
+    const savedKey = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    try {
+      const auth = {
+        type: "oauth" as const,
+        access: "access",
+        refresh: "refresh",
+        expires: Date.now() + 60_000,
+        invalidReason: "invalid_grant" as const,
+      };
+      const openai =
+        accountId === "default"
+          ? { codexOauth: auth }
+          : { codexOauthAccounts: { work: { label: "Work", credentials: auth } } };
+      expect(hasAnyConfiguredProvider({ openai })).toBe(false);
+      expect(hasAnyConfiguredProvider({ openai, openrouter: { apiKey: "or-test" } })).toBe(true);
+    } finally {
+      if (savedKey !== undefined) process.env.OPENAI_API_KEY = savedKey;
+    }
+  });
+
+  it.each(["default", "work"])(
+    "does not count a disabled %s account as configured",
+    (accountId) => {
+      const auth = {
+        type: "oauth" as const,
+        access: "access",
+        refresh: "refresh",
+        expires: Date.now() + 60_000,
+      };
+      const openai = {
+        enabled: false,
+        ...(accountId === "default"
+          ? { codexOauth: auth }
+          : { codexOauthAccounts: { work: { label: "Work", credentials: auth } } }),
+      };
+      expect(hasAnyConfiguredProvider({ openai })).toBe(false);
+      expect(hasAnyConfiguredProvider({ openai, openrouter: { apiKey: "or-test" } })).toBe(true);
+      expect(hasAnyConfiguredProvider({ openai: { ...openai, enabled: true } })).toBe(true);
+    }
+  );
 
   it("returns true for keyless providers with explicit config", () => {
     const providers: ProvidersConfig = {

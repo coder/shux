@@ -147,6 +147,34 @@ describe("CompactionMonitor", () => {
     ).toBe(false);
   });
 
+  test("project account selection caps both pre-send and mid-stream pressure", () => {
+    const providersConfig: ProvidersConfigMap = {
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    };
+    const model = "openai:gpt-5.5";
+    const params = { model, providersConfig, use1MContext: false };
+    const beforeSend = {
+      ...params,
+      usage: { lastContextUsage: createUsageDisplay(260_000, model) },
+    };
+    const midStream = { ...params, usage: createMidStreamUsage(260_000) };
+    const { monitor } = createMonitor();
+    expect(monitor.checkBeforeSend(beforeSend).shouldForceCompact).toBe(false);
+    expect(monitor.checkMidStream(midStream)).toBe(false);
+    // A missing project selection must retain the OAuth cap instead of falling back to API billing.
+    expect(
+      monitor.checkBeforeSend({ ...beforeSend, codexOauthAccountId: "missing" }).shouldForceCompact
+    ).toBe(true);
+    expect(monitor.checkMidStream({ ...midStream, codexOauthAccountId: "missing" })).toBe(true);
+
+    providersConfig.openai.codexOauthDefaultAuth = "apiKey";
+    monitor.resetForNewStream();
+    expect(
+      monitor.checkBeforeSend({ ...beforeSend, codexOauthAccountId: "missing" }).shouldForceCompact
+    ).toBe(false);
+    expect(monitor.checkMidStream({ ...midStream, codexOauthAccountId: "missing" })).toBe(false);
+  });
+
   test("checkMidStream stays disabled when threshold is set to 1.0", () => {
     const { monitor, statusEvents } = createMonitor();
     monitor.setThreshold(1);

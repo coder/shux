@@ -10,7 +10,7 @@ import {
   getCodexOauthContextWindowOverride,
 } from "@/common/constants/codexOAuth";
 import {
-  wouldRouteOpenAIThroughCodexOauth,
+  resolveCodexOauthRouting,
   type CodexOauthRoutingOptions,
 } from "@/common/utils/providers/codexOauthRouting";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -36,7 +36,7 @@ function getCodexOauthContextLimit(
     return null;
   }
 
-  return wouldRouteOpenAIThroughCodexOauth(model, providersConfig, options) ? oauthLimit : null;
+  return resolveCodexOauthRouting(model, providersConfig, options) !== "other" ? oauthLimit : null;
 }
 
 /**

@@ -776,8 +776,8 @@ export const router = (authToken?: string) => {
         .input(schemas.codexOauth.startDesktopFlow.input)
         .output(schemas.codexOauth.startDesktopFlow.output)
         .handler(
-          handlerGen(function* ({ context }) {
-            return yield* context.codexOauthService.startDesktopFlowEffect();
+          handlerGen(function* ({ context }, input) {
+            return yield* context.codexOauthService.startDesktopFlowEffect(input);
           })
         ),
       waitForDesktopFlow: t
@@ -802,8 +802,8 @@ export const router = (authToken?: string) => {
         .input(schemas.codexOauth.startDeviceFlow.input)
         .output(schemas.codexOauth.startDeviceFlow.output)
         .handler(
-          handlerGen(function* ({ context }) {
-            return yield* context.codexOauthService.startDeviceFlowEffect();
+          handlerGen(function* ({ context }, input) {
+            return yield* context.codexOauthService.startDeviceFlowEffect(input);
           })
         ),
       waitForDeviceFlow: t
@@ -828,8 +828,27 @@ export const router = (authToken?: string) => {
         .input(schemas.codexOauth.disconnect.input)
         .output(schemas.codexOauth.disconnect.output)
         .handler(
-          handlerGen(function* ({ context }) {
-            return yield* context.codexOauthService.disconnectEffect();
+          handlerGen(function* ({ context }, input) {
+            return yield* context.codexOauthService.disconnectEffect(input?.accountId);
+          })
+        ),
+      setDefaultAccount: t
+        .input(schemas.codexOauth.setDefaultAccount.input)
+        .output(schemas.codexOauth.setDefaultAccount.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.codexOauthService.setDefaultAccountEffect(input.accountId);
+          })
+        ),
+      renameAccount: t
+        .input(schemas.codexOauth.renameAccount.input)
+        .output(schemas.codexOauth.renameAccount.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.codexOauthService.renameAccountEffect(
+              input.accountId,
+              input.label
+            );
           })
         ),
     },
@@ -1183,6 +1202,12 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.projectService.setColor(input.projectPath, input.color)
         ),
+      setCodexOauthAccount: t
+        .input(schemas.projects.setCodexOauthAccount.input)
+        .output(schemas.projects.setCodexOauthAccount.output)
+        .handler(({ context, input }) =>
+          context.projectService.setCodexOauthAccount(input.projectPath, input.accountId)
+        ),
       setCustomInstructions: t
         .input(schemas.projects.setCustomInstructions.input)
         .output(schemas.projects.setCustomInstructions.output)
@@ -1329,7 +1354,16 @@ export const router = (authToken?: string) => {
         .input(schemas.nameGeneration.generate.input)
         .output(schemas.nameGeneration.generate.output)
         .handler(({ context, input }) =>
-          generateWorkspaceIdentity(input.message, input.candidates, context.aiService)
+          generateWorkspaceIdentity(
+            input.message,
+            input.candidates,
+            context.aiService,
+            undefined,
+            undefined,
+            {
+              projectPath: input.projectPath,
+            }
+          )
         ),
     },
     coder: {

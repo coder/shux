@@ -12,12 +12,14 @@ import {
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
 import { ProvidersConfigStore, type Config } from "@/node/config";
-import type { AIService } from "@/node/services/aiService";
+import { AIService } from "@/node/services/aiService";
+import { ProviderService } from "./providerService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
 import {
+  createModelRoutingSnapshotMock,
   createAgentSessionHarness,
   createStartedTurnHandle,
   createStreamLifecycleMocks,
@@ -402,6 +404,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({
         agentAiDefaults: { compact: { modelString: compactionModel } },
       }),
@@ -661,6 +664,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({
         agentAiDefaults: { compact: { modelString: compactionModel } },
       }),
@@ -713,6 +717,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({
         agentAiDefaults: {
           compact: { modelString: "openai:gpt-5.5", thinkingLevel: "high" },
@@ -792,7 +797,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     session.dispose();
   });
 
-  test("threads providers config into pre-send and mid-stream compaction checks", async () => {
+  test("threads provider config and project routing into pre-send and mid-stream checks", async () => {
     const workspaceId = "ws-auto-compaction-providers-config";
 
     const { config, historyService, cleanup } = await createTestHistoryService();
@@ -802,13 +807,20 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       openai: {
         models: [
           {
-            id: "openai:gpt-4o",
-            contextWindow: 222_222,
+            id: "gpt-4o",
+            contextWindowTokens: 222_222,
           },
         ],
       },
     };
     new ProvidersConfigStore(config.rootDir).saveProvidersConfig(providersConfig);
+    await config.editConfig((cfg) => {
+      cfg.projects.set(config.rootDir, {
+        codexOauthAccountId: "work",
+        workspaces: [{ id: workspaceId, name: workspaceId, path: config.rootDir }],
+      });
+      return cfg;
+    });
 
     const aiEmitter = new EventEmitter();
     const streamMessage = mock((_history: MuxMessage[]) => {
@@ -842,6 +854,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     const aiService = Object.assign(aiEmitter, {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as (
@@ -850,6 +863,14 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     }) as unknown as AIService;
 
     const initStateManager = new EventEmitter() as unknown as InitStateManager;
+    const routingService = new AIService(
+      config,
+      historyService,
+      initStateManager,
+      new ProviderService(config)
+    );
+    aiService.captureModelRoutingSnapshot =
+      routingService.captureModelRoutingSnapshot.bind(routingService);
 
     const backgroundProcessManager = {
       cleanup: mock((_workspaceId: string) => Promise.resolve()),
@@ -892,11 +913,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(checkBeforeSend).toHaveBeenCalledTimes(1);
     expect(checkBeforeSend.mock.calls[0]?.[0]).toMatchObject({
       providersConfig,
+      codexOauthAccountId: "work",
     });
 
     expect(checkMidStream).toHaveBeenCalledTimes(1);
     expect(checkMidStream.mock.calls[0]?.[0]).toMatchObject({
       providersConfig,
+      codexOauthAccountId: "work",
     });
 
     session.dispose();
@@ -957,6 +980,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     );
     const aiService = Object.assign(aiEmitter, {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as (
@@ -977,6 +1001,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
@@ -1069,6 +1094,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     const aiService = Object.assign(aiEmitter, {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream,
       streamMessage: streamMessage as unknown as (
@@ -1089,6 +1115,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
@@ -1220,6 +1247,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     const aiService = Object.assign(aiEmitter, {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream,
       streamMessage: streamMessage as unknown as (
@@ -1240,6 +1268,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 

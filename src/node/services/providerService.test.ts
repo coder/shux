@@ -7,6 +7,13 @@ import { writeFile } from "node:fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import {
+  hasCodexOauthTokens,
+  resolveCodexOauthRouting,
+} from "@/common/utils/providers/codexOauthRouting";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { Config } from "@/node/config";
@@ -314,6 +321,152 @@ describe("ProviderService.getConfig", () => {
     });
   });
 
+  it("exposes account labels without exposing credentials", () => {
+    withTempConfig((config, service) => {
+      const auth = {
+        type: "oauth",
+        access: "secret-access",
+        refresh: "secret-refresh",
+        expires: 12345,
+      };
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        openai: {
+          codexOauth: auth,
+          codexOauthLabel: "Personal",
+          codexOauthAccounts: {
+            work: { label: "Work", credentials: auth },
+            broken: { label: "Broken", credentials: {} },
+          },
+          codexOauthDefaultAccountId: "work",
+        },
+      });
+      const result = service.getConfig().openai;
+      expect(result.codexOauthSet).toBe(true);
+      expect(result.codexOauthAccounts).toEqual([
+        { id: "default", label: "Personal" },
+        { id: "work", label: "Work" },
+      ]);
+      expect(result.codexOauthDefaultAccountId).toBe("work");
+      expect(JSON.stringify(result)).not.toContain("secret-access");
+      expect(JSON.stringify(result)).not.toContain("secret-refresh");
+    });
+  });
+
+  it("preserves implicit and explicit account selections for browser routing", () => {
+    withTempConfig((config, service) => {
+      saveOpenAIConfig(config);
+      expect(resolveCodexOauthRouting(KNOWN_MODELS.GPT.id, service.getConfig())).toBe("other");
+
+      saveOpenAIConfig(config, { codexOauthDefaultAccountId: "default" });
+      expect(resolveCodexOauthRouting(KNOWN_MODELS.GPT.id, service.getConfig())).toBe(
+        "missing-account"
+      );
+    });
+  });
+
+  it.each(["default", "work"])(
+    "retains invalid %s credentials without reporting usable OAuth",
+    (accountId) => {
+      withProviderEnv({}, () =>
+        withTempConfig((config, service) => {
+          const store = new ProvidersConfigStore(config.rootDir);
+          const auth = {
+            type: "oauth",
+            access: "private-access",
+            refresh: "private-refresh",
+            expires: 12345,
+            invalidReason: "invalid_grant",
+          };
+          const accountConfig =
+            accountId === "default"
+              ? { codexOauth: auth }
+              : { codexOauthAccounts: { work: { label: "Work", credentials: auth } } };
+          store.saveProvidersConfig({
+            openai: { ...accountConfig, codexOauthDefaultAccountId: accountId },
+          });
+          const view = service.getConfig();
+          expect(view.openai.codexOauthSet).toBe(false);
+          expect(view.openai.isConfigured).toBe(false);
+          expect(view.openai.codexOauthAccounts).toEqual([
+            {
+              id: accountId,
+              label: accountId === "default" ? "Default" : "Work",
+              reconnectRequired: true,
+            },
+          ]);
+          expect(view.openai.codexOauthDefaultAccountId).toBe(accountId);
+          expect(JSON.stringify(view)).not.toContain("private-access");
+          expect(JSON.stringify(view)).not.toContain("private-refresh");
+          expect(JSON.stringify(view)).not.toContain("invalid_grant");
+          expect(hasCodexOauthTokens(view.openai)).toBe(false);
+          expect(hasCodexOauthTokens(accountConfig, accountId)).toBe(false);
+          expect(resolveCodexOauthRouting("openai:gpt-5.6-sol", view)).toBe("missing-account");
+          expect(getEffectiveContextLimit("openai:gpt-5.6-sol", false, view)).toBe(372_000);
+          expect(openaiProModeAvailable("openai:gpt-5.6-sol", { providersConfig: view })).toBe(
+            false
+          );
+
+          store.saveProvidersConfig({
+            openai: {
+              ...accountConfig,
+              codexOauthDefaultAccountId: accountId,
+              apiKey: "api-key",
+              codexOauthDefaultAuth: "apiKey",
+            },
+          });
+          const apiView = service.getConfig();
+          expect(apiView.openai.codexOauthSet).toBe(false);
+          expect(apiView.openai.isConfigured).toBe(true);
+          expect(resolveCodexOauthRouting("openai:gpt-5.6-sol", apiView)).toBe("other");
+        })
+      );
+    }
+  );
+
+  it("keeps other accounts available without substituting them for an invalid selection", () => {
+    withProviderEnv({}, () =>
+      withTempConfig((config, service) => {
+        const auth = { type: "oauth", access: "access", refresh: "refresh", expires: 12345 };
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+          openai: {
+            codexOauth: { ...auth, invalidReason: "invalid_grant" },
+            codexOauthAccounts: { work: { label: "Work", credentials: auth } },
+          },
+        });
+        const view = service.getConfig();
+        expect(view.openai.codexOauthSet).toBe(true);
+        expect(view.openai.isConfigured).toBe(true);
+        expect(hasCodexOauthTokens(view.openai)).toBe(false);
+        expect(hasCodexOauthTokens(view.openai, "work")).toBe(true);
+        expect(resolveCodexOauthRouting("openai:gpt-5.6-sol", view)).toBe("missing-account");
+        expect(
+          resolveCodexOauthRouting("openai:gpt-5.6-sol", view, { codexOauthAccountId: "work" })
+        ).toBe("oauth");
+      })
+    );
+  });
+
+  it("reports named accounts as connected without legacy credentials", () => {
+    withTempConfig((config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        openai: {
+          codexOauthAccounts: {
+            work: {
+              label: "Work",
+              credentials: { type: "oauth", access: "access", refresh: "refresh", expires: 12345 },
+            },
+          },
+          codexOauthDefaultAccountId: "work",
+        },
+      });
+      expect(service.getConfig().openai).toMatchObject({
+        codexOauthSet: true,
+        isConfigured: true,
+        codexOauthAccounts: [{ id: "work", label: "Work" }],
+      });
+    });
+  });
+
   it("treats disabled OpenAI as unconfigured even when Codex OAuth tokens are stored", () => {
     withTempConfig((config, service) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
@@ -617,6 +770,31 @@ describe("ProviderService.getConfig", () => {
         if (!result.success) {
           expect(result.error).toContain("not allowed by policy");
         }
+      }
+    );
+  });
+
+  it("checks policy for account edits but retains internal credential cleanup", async () => {
+    await withTempPolicyProviderService(
+      { policy_format_version: "0.1", provider_access: [{ id: "anthropic" }] },
+      async (config, service) => {
+        const store = new ProvidersConfigStore(config.rootDir);
+        store.saveProvidersConfig({ openai: { codexOauthDefaultAccountId: "personal" } });
+        const denied = await service.updateConfigValue(
+          "openai",
+          ["codexOauthDefaultAccountId"],
+          () => ({ value: "work" }),
+          { enforcePolicy: true }
+        );
+        expect(denied.success).toBe(false);
+        expect(store.loadProvidersConfig()?.openai?.codexOauthDefaultAccountId).toBe("personal");
+        const cleaned = await service.updateConfigValue(
+          "openai",
+          ["codexOauthDefaultAccountId"],
+          () => ({ value: undefined })
+        );
+        expect(cleaned).toEqual({ success: true, data: { applied: true } });
+        expect(store.loadProvidersConfig()?.openai?.codexOauthDefaultAccountId).toBeUndefined();
       }
     );
   });
@@ -2066,6 +2244,59 @@ describe("ProviderService.updateConfigValue", () => {
       }
       expect(lockExists).toBe(false);
     });
+  });
+});
+
+describe("ProviderService.updateProviderSection policy", () => {
+  it("denies user section writes but preserves internal mutation behavior", async () => {
+    await withTempPolicyProviderService(
+      { policy_format_version: "0.1", provider_access: [{ id: "anthropic" }] },
+      async (config, service) => {
+        const denied = await service.updateProviderSection(
+          "openai",
+          () => ({ value: { codexOauthDefaultAccountId: "work" } }),
+          { enforcePolicy: true }
+        );
+        expect(denied.success).toBe(false);
+        expect(
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai
+        ).toBeUndefined();
+        const internal = await service.updateProviderSection("openai", () => ({
+          value: { codexOauthDefaultAccountId: "work" },
+        }));
+        expect(internal).toEqual({ success: true, data: { applied: true } });
+      }
+    );
+  });
+
+  it("allows unchanged locked URLs but rejects section writes that change them", async () => {
+    await withTempPolicyProviderService(
+      {
+        policy_format_version: "0.1",
+        provider_access: [{ id: "openai", base_url: "https://locked.example.com" }],
+      },
+      async (config, service) => {
+        const store = new ProvidersConfigStore(config.rootDir);
+        store.saveProvidersConfig({
+          openai: { baseUrl: "https://old.example.com", apiKey: "keep-key" },
+        });
+        expect(
+          await service.updateProviderSection(
+            "openai",
+            (section) => ({ value: { ...section, codexOauthDefaultAccountId: "work" } }),
+            { enforcePolicy: true }
+          )
+        ).toEqual({ success: true, data: { applied: true } });
+        const before = store.loadProvidersConfig()?.openai;
+        const denied = await service.updateProviderSection(
+          "openai",
+          (section) => ({ value: { ...section, baseUrl: "https://new.example.com" } }),
+          { enforcePolicy: true }
+        );
+        expect(denied.success).toBe(false);
+        expect(store.loadProvidersConfig()?.openai).toEqual(before);
+      }
+    );
   });
 });
 

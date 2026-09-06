@@ -56,6 +56,7 @@ export interface ThinkingInheritOption {
 
 interface ThinkingSelectorControlProps {
   modelString: string | undefined;
+  codexOauthAccountId?: string;
   /** Delegated preferences may inherit a model that is only known at launch. */
   modelCapabilitiesDeferred?: boolean;
   /** Independent of effort/model inheritance; false denotes an explicit mode override. */
@@ -130,12 +131,14 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
           openaiProModeAvailable(props.modelString, {
             providersConfig,
             resolvedRouteProvider: resolvedRoute,
+            codexOauthAccountId: props.codexOauthAccountId,
           }),
         fastModeProvider:
           props.allowFastMode !== false && providersConfig != null
             ? getFastModeProvider(props.modelString, {
                 providersConfig,
                 resolvedRouteProvider: resolvedRoute,
+                codexOauthAccountId: props.codexOauthAccountId,
               })
             : null,
       };
@@ -437,6 +440,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
 
 interface ThinkingSelectorProps {
   modelString: string;
+  codexOauthAccountId?: string;
   /** Some embedded clients cannot resolve route-aware provider options safely. */
   allowProMode?: boolean;
   /** Some embedded clients do not expose provider configuration mutations. */
@@ -451,6 +455,7 @@ export const ThinkingSelector: React.FC<ThinkingSelectorProps> = (props) => {
   return (
     <ThinkingSelectorControl
       modelString={props.modelString}
+      codexOauthAccountId={props.codexOauthAccountId}
       thinkingLevel={thinkingLevel}
       onThinkingLevelChange={setThinkingLevel}
       reasoningMode={reasoningMode}

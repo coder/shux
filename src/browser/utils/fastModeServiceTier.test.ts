@@ -20,6 +20,30 @@ function createWriter() {
 }
 
 describe("fast mode service tier", () => {
+  test("uses the project account and preserves the API-key preference", () => {
+    const providersConfig = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+        codexOauthAccounts: [{ id: "work", label: "Work" }],
+      },
+    };
+    expect(
+      getFastModeProvider("openai:gpt-5.5", {
+        providersConfig,
+        codexOauthAccountId: "work",
+      })
+    ).toBeNull();
+    expect(
+      getFastModeProvider("openai:gpt-5.5", {
+        providersConfig: { openai: { ...providersConfig.openai, codexOauthDefaultAuth: "apiKey" } },
+        codexOauthAccountId: "work",
+      })
+    ).toBe("openai");
+  });
+
   test("resolves direct native providers and rejects gateway routes", () => {
     expect(getFastModeProvider("openai:gpt-5.6-sol", { resolvedRouteProvider: "direct" })).toBe(
       "openai"

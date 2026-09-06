@@ -3,6 +3,23 @@ import { describe, expect, it } from "bun:test";
 import { ProvidersConfigSchema } from "./providersConfig";
 
 describe("ProvidersConfigSchema", () => {
+  it("requires named OAuth credentials to use the protected storage field", () => {
+    const credentials = { type: "oauth", access: "access", refresh: "refresh", expires: 1000 };
+    const account = { label: "Work", credentials };
+    const document = { openai: { codexOauthAccounts: { work: account } } };
+    expect(ProvidersConfigSchema.parse(document)).toEqual(document);
+    for (const unsafe of [
+      { label: "Work", auth: credentials },
+      { ...account, auth: credentials },
+    ]) {
+      expect(
+        ProvidersConfigSchema.safeParse({
+          openai: { codexOauthAccounts: { work: unsafe } },
+        }).success
+      ).toBe(false);
+    }
+  });
+
   it("validates a valid providers config with anthropic key", () => {
     const valid = {
       anthropic: { apiKey: "sk-ant-123", cacheTtl: "5m" },

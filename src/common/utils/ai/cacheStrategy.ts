@@ -4,7 +4,7 @@ import { isGpt56FamilyModel } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import {
-  wouldRouteOpenAIThroughCodexOauth,
+  resolveCodexOauthRouting,
   type CodexOauthRoutingOptions,
 } from "@/common/utils/providers/codexOauthRouting";
 import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
@@ -250,7 +250,7 @@ function isOfficialOpenAIBaseUrl(baseUrl: string): boolean {
  *   capability target must itself be an OpenAI GPT-5.6-family model;
  * - the backend-resolved route provider must be exactly "openai" — missing,
  *   legacy, gateway, or unknown route metadata fails closed;
- * - Codex OAuth precedence (mirrored by wouldRouteOpenAIThroughCodexOauth)
+ * - Codex OAuth precedence (mirrored by resolveCodexOauthRouting)
  *   fails closed because the ChatGPT backend strips these fields;
  * - a configured custom base URL fails closed unless it is the official
  *   endpoint. Transport-level HTTP proxy env vars are not endpoint overrides
@@ -297,7 +297,7 @@ export function openaiExplicitPromptCachingAvailable(
     return false;
   }
 
-  if (wouldRouteOpenAIThroughCodexOauth(normalized, providersConfig, options)) {
+  if (resolveCodexOauthRouting(normalized, providersConfig, options) !== "other") {
     return false;
   }
 

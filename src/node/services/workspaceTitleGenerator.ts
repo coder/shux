@@ -185,11 +185,18 @@ export async function generateWorkspaceIdentity(
   /** Optional conversation turns context used for regenerate-title prompts. */
   conversationContext?: string,
   /** Optional most recent user message; included as additional context only — not given precedence over older turns. */
-  latestUserMessage?: string
+  latestUserMessage?: string,
+  context?: { workspaceId?: string; projectPath?: string }
 ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
   if (candidates.length === 0) {
     return Err({ type: "unknown", raw: "No model candidates provided for name generation" });
   }
+
+  // Retries belong to one operation. Keep its billing identity when settings change.
+  const modelRoutingSnapshot = aiService.captureModelRoutingSnapshot(
+    context?.workspaceId,
+    context?.projectPath
+  );
 
   // Try up to 3 candidates
   const maxAttempts = Math.min(candidates.length, 3);
@@ -201,7 +208,9 @@ export async function generateWorkspaceIdentity(
     const modelString = candidates[i];
 
     const modelResult = await aiService.createModel(modelString, undefined, {
+      ...context,
       agentInitiated: true,
+      modelRoutingSnapshot,
     });
     if (!modelResult.success) {
       lastError = mapModelCreationError(modelResult.error, modelString);
