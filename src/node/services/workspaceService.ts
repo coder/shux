@@ -1814,6 +1814,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private shuttingDown = false;
   private readonly shutdownSessions = new Set<AgentSession>();
   private readonly pendingWorkspaceCleanup = new Set<Promise<void>>();
+  // Retired sessions release all live resources, but their exact canceled-history
+  // obligations survive until I/O recovers. Never recreate a ready recovery owner first.
+  private readonly failedCompactionCleanups = new Map<
+    string,
+    {
+      owners: Set<AgentSession>;
+      retry?: Promise<void>;
+    }
+  >();
   private readonly providerConfigChangedListener = (): void => {
     const liveSessions = new Map([
       ...this.sessions.entries(),
@@ -3060,6 +3069,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   /** r41: mark a context-discarding mutation as durably committed (see contextMutationEpochs). */
   private advanceContextMutationEpoch(workspaceId: string): void {
+    this.sessions.get(workspaceId)?.contextMutationCommitted();
     this.contextMutationEpochs.set(
       workspaceId,
       (this.contextMutationEpochs.get(workspaceId) ?? 0) + 1
@@ -4049,6 +4059,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   beginShutdown(): void {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    for (const workspaceId of this.failedCompactionCleanups.keys()) {
+      this.retryFailedCompactionCleanup(workspaceId).catch((error: unknown) =>
+        log.warn("Stopped compaction cleanup retry failed during shutdown", { workspaceId, error })
+      );
+    }
     // Capture before disposal can remove transient instances from either registry.
     for (const session of [
       ...this.sessions.values(),
@@ -4092,6 +4107,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return;
     }
 
+    if (this.failedCompactionCleanups.has(trimmed)) {
+      this.retryFailedCompactionCleanup(trimmed).then(
+        () => {
+          if (!this.shuttingDown) this.startStartupRecovery(trimmed);
+        },
+        (error: unknown) =>
+          log.warn("Stopped compaction cleanup retry failed", { workspaceId: trimmed, error })
+      );
+      return;
+    }
+
     const existingSession =
       this.sessions.get(trimmed) ?? this.transientStartupRecoverySessions.get(trimmed);
     if (existingSession) {
@@ -4128,8 +4154,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       });
   }
 
+  private assertCompactionCleanupSettled(workspaceId: string): void {
+    if (this.failedCompactionCleanups.has(workspaceId)) {
+      this.retryFailedCompactionCleanup(workspaceId).catch((error: unknown) =>
+        log.warn("Stopped compaction cleanup retry failed", { workspaceId, error })
+      );
+      throw new Error(
+        "Stopped compaction cleanup is still pending. Please retry opening this workspace."
+      );
+    }
+  }
+
   private createSession(workspaceId: string): AgentSession {
     if (this.shuttingDown) throw new Error("Server is shutting down");
+    this.assertCompactionCleanupSettled(workspaceId);
     return new AgentSession({
       effectRunner: this.effectRunner,
       appFiberScope: this.appFiberScope,
@@ -4271,7 +4309,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     assert(!this.sessions.has(workspaceId), `session already registered for ${workspaceId}`);
     if (this.transientStartupRecoverySessions.get(workspaceId) === session) {
       this.transientStartupRecoverySessions.delete(workspaceId);
-    }
+    } else this.assertCompactionCleanupSettled(workspaceId);
 
     this.sessions.set(workspaceId, session);
     this.attachSessionSubscriptions(workspaceId, session);
@@ -4290,6 +4328,39 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return this.sessions.get(trimmed)?.countQueuedAgentPeerMessages() ?? 0;
   }
 
+  private retryFailedCompactionCleanup(workspaceId: string): Promise<void> {
+    const obligation = this.failedCompactionCleanups.get(workspaceId);
+    if (!obligation) return Promise.resolve();
+    if (obligation.retry) return obligation.retry;
+    const settled = Promise.withResolvers<void>();
+    obligation.retry = settled.promise;
+    let failure: PromiseRejectedResult | undefined;
+    this.trackWorkspaceCleanup(async () => {
+      const owners = [...obligation.owners];
+      const results = await Promise.allSettled(
+        owners.map((owner) => owner.retryPendingCompactionCleanup())
+      );
+      for (const owner of owners)
+        if (!owner.hasPendingCompactionCleanup) obligation.owners.delete(owner);
+      if (
+        obligation.owners.size === 0 &&
+        this.failedCompactionCleanups.get(workspaceId) === obligation
+      )
+        this.failedCompactionCleanups.delete(workspaceId);
+      failure = results.find((result) => result.status === "rejected");
+      if (!failure && obligation.owners.size > 0)
+        failure = {
+          status: "rejected",
+          reason: new Error("Stopped compaction cleanup remains pending"),
+        };
+    }).then(() => {
+      obligation.retry = undefined;
+      if (failure) settled.reject(failure.reason);
+      else settled.resolve();
+    }, settled.reject);
+    return settled.promise;
+  }
+
   public disposeSession(workspaceId: string): Promise<void> {
     const trimmed = workspaceId.trim();
     const transientSession = this.transientStartupRecoverySessions.get(trimmed);
@@ -4300,10 +4371,24 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       clearTimeout(refreshTimer);
       this.postCompactionRefreshTimers.delete(trimmed);
     }
+    let failure: PromiseRejectedResult | undefined;
     return this.trackWorkspaceCleanup(async () => {
       // Start both synchronous admission latches before the first await. Registry identity
       // remains visible through terminal delivery and prevents a late old disposer removing B.
-      await Promise.all([transientSession?.dispose(), session?.dispose()]);
+      const settled = await Promise.allSettled([
+        this.retryFailedCompactionCleanup(trimmed),
+        transientSession?.dispose(),
+        session?.dispose(),
+      ]);
+      for (const owner of [transientSession, session]) {
+        if (!owner?.hasPendingCompactionCleanup) continue;
+        let obligation = this.failedCompactionCleanups.get(trimmed);
+        if (!obligation) {
+          obligation = { owners: new Set() };
+          this.failedCompactionCleanups.set(trimmed, obligation);
+        }
+        obligation.owners.add(owner);
+      }
       if (this.transientStartupRecoverySessions.get(trimmed) === transientSession) {
         this.transientStartupRecoverySessions.delete(trimmed);
       }
@@ -4312,6 +4397,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (this.sessionSubscriptions.get(trimmed) === subscriptions)
         this.sessionSubscriptions.delete(trimmed);
       if (this.sessions.get(trimmed) === session) this.sessions.delete(trimmed);
+      // Failed durable cleanup must be reported after both old sessions release
+      // resources and identity-guarded registry teardown has completed.
+      failure = settled.find((result) => result.status === "rejected");
+    }).then(() => {
+      // The guardian's physical cleanup promise remains fulfilled; the public
+      // caller still receives unresolved durable work after registries are clean.
+      if (failure) throw failure.reason;
     });
   }
 

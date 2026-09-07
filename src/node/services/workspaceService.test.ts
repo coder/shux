@@ -7133,6 +7133,214 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  test.each(["lazy access", "shutdown", "external registration"] as const)(
+    "failed disposal retains cleanup through %s and storage recovery",
+    async (retry) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "retained-disposal-cleanup";
+      let external: Awaited<ReturnType<typeof createAgentSessionHarness>> | undefined;
+      try {
+        await config.addWorkspace("/tmp/retained-cleanup-project", {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "retained-cleanup-project",
+          projectPath: "/tmp/retained-cleanup-project",
+          runtimeConfig: { type: "local" },
+        });
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("summary", "assistant", "Prior work", {
+            muxMetadata: {
+              type: "compaction-summary",
+              pendingFollowUp: { text: "Continue", model: "openai:gpt-4o", agentId: "exec" },
+            },
+          })
+        );
+        const session = workspaceService.getOrCreateSession(workspaceId);
+        await session.interruptStream({ abandonPartial: true });
+        const internal = session as unknown as { dispatchPendingFollowUp(): Promise<boolean> };
+        const read = spyOn(historyService, "getLastMessages").mockRejectedValue(
+          new Error("storage unavailable")
+        );
+        await internal.dispatchPendingFollowUp().catch(() => undefined);
+        const failure = await workspaceService
+          .disposeSession(workspaceId)
+          .catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(Error);
+        const state = workspaceService as unknown as {
+          sessions: Map<string, AgentSession>;
+          failedCompactionCleanups: Map<string, { retry?: Promise<void> }>;
+        };
+        expect(state.sessions.has(workspaceId)).toBe(false);
+        expect(state.failedCompactionCleanups.has(workspaceId)).toBe(true);
+        read.mockRestore();
+        const recoveredRead = spyOn(historyService, "getLastMessages");
+        if (retry === "external registration") {
+          external = await createAgentSessionHarness({ workspaceId, config, historyService });
+          const supplied = external.session;
+          expect(() => workspaceService.registerSession(workspaceId, supplied)).toThrow("cleanup");
+          expect(state.sessions.has(workspaceId)).toBe(false);
+          await state.failedCompactionCleanups.get(workspaceId)?.retry;
+          workspaceService.registerSession(workspaceId, supplied);
+        } else if (retry === "lazy access") {
+          expect(() => workspaceService.getOrCreateSession(workspaceId)).toThrow("cleanup");
+          const first = state.failedCompactionCleanups.get(workspaceId)?.retry;
+          expect(first).toBeDefined();
+          expect(() => workspaceService.getOrCreateSession(workspaceId)).toThrow("cleanup");
+          expect(state.failedCompactionCleanups.get(workspaceId)?.retry).toBe(first);
+          await first;
+        } else {
+          workspaceService.beginShutdown();
+          await state.failedCompactionCleanups.get(workspaceId)?.retry;
+        }
+        expect(recoveredRead).toHaveBeenCalledTimes(1);
+        expect(state.failedCompactionCleanups.has(workspaceId)).toBe(false);
+        const rows = await historyService.getLastMessages(workspaceId, 1);
+        expect(rows.success && rows.data[0].metadata?.muxMetadata).not.toHaveProperty(
+          "pendingFollowUp"
+        );
+        if (retry !== "shutdown") {
+          const reopened = workspaceService.getOrCreateSession(workspaceId);
+          expect(reopened).not.toBe(session);
+          const send = spyOn(reopened, "sendMessage");
+          await reopened.runStartupRecovery();
+          expect(send).not.toHaveBeenCalled();
+        } else {
+          const restarted = await createAgentSessionHarness({
+            workspaceId,
+            config,
+            historyService,
+          });
+          try {
+            const send = spyOn(restarted.session, "sendMessage");
+            await restarted.session.runStartupRecovery();
+            expect(send).not.toHaveBeenCalled();
+          } finally {
+            await restarted.session.dispose();
+          }
+        }
+      } finally {
+        await external?.session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
+  test("disposeSession reports failed durable cleanup after removing old registry entries", async () => {
+    const { config, workspaceService, cleanup } = await createServices();
+    const workspaceId = "failed-cleanup-disposal";
+    try {
+      await config.addWorkspace("/tmp/failed-cleanup-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "failed-cleanup-project",
+        projectPath: "/tmp/failed-cleanup-project",
+        runtimeConfig: { type: "local" },
+      });
+      const session = workspaceService.getOrCreateSession(workspaceId);
+      const dispose = session.dispose.bind(session);
+      spyOn(session, "dispose").mockImplementationOnce(async () => {
+        await dispose();
+        throw new Error("unresolved stopped cleanup");
+      });
+      const failure = await workspaceService
+        .disposeSession(workspaceId)
+        .catch((error: unknown) => error);
+      expect(failure).toHaveProperty("message", "unresolved stopped cleanup");
+      const state = workspaceService as unknown as {
+        sessions: Map<string, AgentSession>;
+        sessionSubscriptions: Map<string, unknown>;
+      };
+      expect(state.sessions.has(workspaceId)).toBe(false);
+      expect(state.sessionSubscriptions.has(workspaceId)).toBe(false);
+      expect(workspaceService.getOrCreateSession(workspaceId)).not.toBe(session);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test.each([
+    "temporary",
+    "busy",
+    "preflight",
+    "failed partial discard",
+    "failed reset read",
+  ] as const)(
+    "temporary or failed context admission preserves Stop cleanup (%s)",
+    async (operation) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "stop-context-admission";
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let pending: Promise<boolean> | undefined;
+      try {
+        await config.addWorkspace("/tmp/stop-context-project", {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "stop-context-project",
+          projectPath: "/tmp/stop-context-project",
+          runtimeConfig: { type: "local" },
+        });
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("summary", "assistant", "Prior work", {
+            muxMetadata: {
+              type: "compaction-summary",
+              pendingFollowUp: { text: "Continue", model: "openai:gpt-4o", agentId: "exec" },
+            },
+          })
+        );
+        const session = workspaceService.getOrCreateSession(workspaceId);
+        const internal = session as unknown as {
+          coordinator: TurnCoordinator;
+          dispatchPendingFollowUp(): Promise<boolean>;
+        };
+        await session.interruptStream({ abandonPartial: true });
+        const update = historyService.updateHistory.bind(historyService);
+        spyOn(historyService, "updateHistory").mockImplementationOnce(async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return update(...args);
+        });
+        pending = internal.dispatchPendingFollowUp();
+        await entered.promise;
+        const token = internal.coordinator.compactionIntent.followUp;
+        if (!token) throw new Error("Expected stopped cleanup");
+        if (operation === "busy")
+          spyOn(session, "hasActiveOrPendingTurnWork").mockReturnValueOnce(true);
+        const serviceState = workspaceService as unknown as {
+          preflightSendCounts: Map<string, number>;
+        };
+        if (operation === "preflight") serviceState.preflightSendCounts.set(workspaceId, 1);
+        if (operation === "failed partial discard")
+          spyOn(historyService, "deletePartial").mockResolvedValueOnce(Err("disk unavailable"));
+        if (operation === "failed reset read")
+          spyOn(historyService, "getHistoryFromLatestBoundary").mockResolvedValueOnce(
+            Err("disk unavailable")
+          );
+        if (operation.startsWith("failed"))
+          expect((await workspaceService.resetContext(workspaceId)).success).toBe(false);
+        else {
+          const held = workspaceService.acquireIdleTurnExclusion(workspaceId);
+          expect(held.success).toBe(operation === "temporary");
+          if (held.success) held.data[Symbol.dispose]();
+        }
+        serviceState.preflightSendCounts.delete(workspaceId);
+        expect(internal.coordinator.canClearCompactionFollowUp(token)).toBe(true);
+        release.resolve();
+        expect(await pending).toBe(false);
+        const rows = await historyService.getLastMessages(workspaceId, 1);
+        expect(rows.success && rows.data[0].metadata?.muxMetadata).not.toHaveProperty(
+          "pendingFollowUp"
+        );
+      } finally {
+        release.resolve();
+        await pending?.catch(() => undefined);
+        await cleanup();
+      }
+    }
+  );
+
   test("acquireIdleTurnExclusion refuses busy workspaces and blocks turn admission while held (r40)", async () => {
     // /refine publication rides this exclusion: it must fail closed when a
     // turn is active and, while held, refuse new turn admission so the

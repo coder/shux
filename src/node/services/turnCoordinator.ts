@@ -56,10 +56,16 @@ type Operation = {
 );
 
 type Turn =
-  | { readonly phase: "idle"; readonly id: TurnId; readonly operation?: Operation }
+  | {
+      readonly phase: "idle";
+      readonly id: TurnId;
+      readonly observedMessageId?: string;
+      readonly operation?: Operation;
+    }
   | {
       readonly phase: Exclude<TurnPhase, "idle">;
       readonly id: TurnId;
+      readonly observedMessageId?: string;
       readonly operation?: Operation;
     };
 interface Decision {
@@ -87,6 +93,8 @@ export type CoordinatorEvent =
   | { type: "configure-operation"; id: OperationId; compaction: boolean }
   | { type: "starting"; id: OperationId; messageId: string }
   | { type: "started"; payload: StreamStartEvent }
+  | { type: "observe-stream"; messageId: string }
+  | { type: "finish-observed-stream"; id: TurnId; messageId: string }
   | { type: "raw-terminal"; kind: "completed" | "aborted"; messageId: string }
   | { type: "startup-abort"; messageId: string }
   | { type: "completion"; id: OperationId; messageId: string; outcome: TurnCompletion }
@@ -304,6 +312,25 @@ export function transition(
       break;
     case "starting":
       if (current?.id === event.id) operation({ ...current, startupMessageId: event.messageId });
+      break;
+    case "observe-stream":
+      if (
+        state.lifetime === "open" &&
+        !current &&
+        state.turn.observedMessageId == null &&
+        (state.turn.phase === "idle" || state.turn.phase === "streaming")
+      )
+        phase({ ...state.turn, phase: "streaming", observedMessageId: event.messageId });
+      break;
+    case "finish-observed-stream":
+      if (
+        !current &&
+        state.turn.id === event.id &&
+        state.turn.observedMessageId === event.messageId
+      ) {
+        phase({ id: state.turn.id, phase: "idle" });
+        commands.push({ type: "drain", turnId: state.turn.id });
+      }
       break;
     case "started":
       if (current && (current.delivery !== "waiting" || current.stage === "started")) break;
@@ -672,7 +699,7 @@ export class TurnCoordinator {
     return owns;
   }
 
-  invalidateCompaction(abandon = false): void {
+  invalidateCompaction(abandon = this.state.compaction.status === "abandoned"): void {
     this.dispatch({ type: "compaction-invalidate", abandon });
   }
 
@@ -1044,6 +1071,43 @@ export class TurnCoordinator {
   streamStarting(id: OperationId, messageId: string): void {
     this.dispatch({ type: "starting", id, messageId });
   }
+  observeStreamReplay(messageId: string): boolean {
+    if (!this.canReplayStreamStart(messageId)) return false;
+    this.dispatch({ type: "observe-stream", messageId });
+    return this.canReplayStreamStart(messageId);
+  }
+
+  finishObservedStream(messageId: string, publish: () => void): boolean {
+    const turn = this.state.turn;
+    if (turn.operation || turn.observedMessageId !== messageId) return false;
+    try {
+      publish();
+    } finally {
+      this.dispatch({ type: "finish-observed-stream", id: turn.id, messageId });
+    }
+    return true;
+  }
+
+  canReplayStreamStart(messageId: string): boolean {
+    if (this.closing) return false;
+    const operation = this.state.turn.operation;
+    // A newly constructed session can observe an existing engine without owning
+    // its operation. The caller also verifies the engine's current message ID.
+    if (!operation)
+      return (
+        this.phase === "idle" ||
+        (this.phase === "streaming" &&
+          (this.state.turn.observedMessageId == null ||
+            this.state.turn.observedMessageId === messageId))
+      );
+    return (
+      this.phase === "streaming" &&
+      operation.stage === "started" &&
+      operation.delivery === "waiting" &&
+      operation.messageId === messageId
+    );
+  }
+
   streamStarted(payload: StreamStartEvent): boolean {
     const previous = this.state;
     const turn = this.turnId;

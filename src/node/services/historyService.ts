@@ -2874,11 +2874,21 @@ export class HistoryService {
     workspaceId: string,
     messageId: string,
     shouldDelete?: (messages: MuxMessage[]) => boolean,
-    onCommitted?: () => void
+    onCommitted?: () => void,
+    onAlreadyAbsent?: () => void
   ): Promise<Result<void>> {
-    assert(!onCommitted || shouldDelete, "Delete commit observers require a conditional cleanup");
+    assert(
+      !(onCommitted ?? onAlreadyAbsent) || shouldDelete,
+      "Delete observers require a conditional cleanup"
+    );
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to delete message", () =>
-      this.deleteMessageUnderWriteLock(workspaceId, messageId, shouldDelete, onCommitted)
+      this.deleteMessageUnderWriteLock(
+        workspaceId,
+        messageId,
+        shouldDelete,
+        onCommitted,
+        onAlreadyAbsent
+      )
     );
   }
 
@@ -2886,7 +2896,8 @@ export class HistoryService {
     workspaceId: string,
     messageId: string,
     shouldDelete?: (messages: MuxMessage[]) => boolean,
-    onCommitted?: () => void
+    onCommitted?: () => void,
+    onAlreadyAbsent?: () => void
   ): Promise<Result<void>> {
     try {
       // Structural rewrite requires full file content
@@ -2896,7 +2907,24 @@ export class HistoryService {
       const filteredMessages = messages.filter((msg) => msg.id !== messageId);
 
       if (filteredMessages.length === messages.length) {
-        if (shouldDelete) return Ok(undefined);
+        if (shouldDelete) {
+          // Another backend may already have deleted this exact active target.
+          // An archived row is a replaced context, never an invitation to restore it.
+          if (
+            onAlreadyAbsent &&
+            !(await this.readArchivedHistory(workspaceId)).some((row) => row.id === messageId) &&
+            shouldDelete(messages)
+          ) {
+            try {
+              onAlreadyAbsent();
+            } catch (error) {
+              log.error("Absent history cleanup publication failed", {
+                error: getErrorMessage(error),
+              });
+            }
+          }
+          return Ok(undefined);
+        }
         // Not in the active epoch — the row may live in the sealed archive
         // (rare: cleanup paths almost always target recent rows).
         const archiveMessages = await this.readArchivedHistory(workspaceId);

@@ -151,6 +151,80 @@ describe("continuous compaction provider replay", () => {
     }
   );
 
+  it.each(["missing", "replacement sequence"] as const)(
+    "settles local heartbeat rollback after a shared-history change (%s)",
+    async (state) => {
+      const sessionDir = path.join(store.tempDir, "pending");
+      await mkdir(sessionDir, { recursive: true });
+      const priorDiff = { path: "/tmp/prior.ts", diff: "prior change", truncated: false };
+      await writeFile(
+        path.join(sessionDir, "post-compaction.json"),
+        JSON.stringify({
+          version: 1,
+          createdAt: 1,
+          diffs: [priorDiff],
+          loadedSkills: [],
+          readFiles: [],
+        })
+      );
+      const recent = createMuxMessage("recent-edit", "assistant", "");
+      recent.parts = [
+        {
+          type: "dynamic-tool",
+          toolCallId: "edit",
+          toolName: "file_edit_replace_string",
+          state: "output-available",
+          input: { path: "/tmp/recent.ts" },
+          output: { success: true, diff: "recent change" },
+        },
+      ];
+      await store.historyService.appendToHistory(workspaceId, recent);
+      const emitter = new EventEmitter();
+      const handler = new CompactionHandler({
+        workspaceId,
+        historyService: store.historyService,
+        sessionDir,
+        emitter,
+      });
+      await handler.appendHeartbeatContextResetBoundary({
+        boundaryText: "Heartbeat",
+        pendingFollowUp: { text: "wake", model: "openai:gpt-4o", agentId: "exec" },
+      });
+      const rows = await store.historyService.getLastMessages(workspaceId, 1);
+      assert(rows.success && rows.data[0], "Expected boundary");
+      const boundary = rows.data[0];
+      // A second backend can commit the shared history deletion without touching
+      // this handler's captured rollback or its post-reset memory.
+      expect((await store.historyService.deleteMessage(workspaceId, boundary.id)).success).toBe(
+        true
+      );
+      if (state === "replacement sequence") {
+        await store.historyService.appendToHistory(workspaceId, {
+          ...boundary,
+          metadata: { ...boundary.metadata, historySequence: undefined },
+        });
+      }
+      const before = await handler.peekPendingState();
+      expect(before?.diffs.map((diff) => diff.path)).toContain("/tmp/recent.ts");
+      const emit = spyOn(emitter, "emit");
+      const published = mock(() => {
+        expect(handler.peekCachedFilePaths()).toEqual([priorDiff.path]);
+      });
+      expect(
+        (await handler.rollbackHeartbeatContextResetBoundary(boundary, () => true, published))
+          .success
+      ).toBe(true);
+      expect(emit).not.toHaveBeenCalled();
+      if (state === "missing") {
+        expect(published).toHaveBeenCalledTimes(1);
+        expect((await handler.peekPendingState())?.diffs).toEqual([priorDiff]);
+      } else {
+        expect(published).not.toHaveBeenCalled();
+        expect(await handler.peekPendingState()).toEqual(before);
+      }
+    }
+  );
+
   it.each(["veto", "archived"] as const)(
     "does not restore or publish a skipped heartbeat rollback (%s)",
     async (skipReason) => {

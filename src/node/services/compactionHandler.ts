@@ -906,29 +906,31 @@ export class CompactionHandler {
     );
 
     let restoration: Promise<void> | undefined;
+    const restore = (deleted: boolean) => {
+      // Restoration is local even when another backend committed the shared delete.
+      // Detach/enqueue state under the lock before any publication can admit B.
+      restoration = this.restoreHeartbeatResetRollbackState();
+      try {
+        const historySequence = summaryMessage.metadata?.historySequence;
+        if (deleted && isNonNegativeInteger(historySequence)) {
+          this.emitChatEvent({ type: "delete", historySequences: [historySequence] });
+        }
+      } finally {
+        onCommitted?.();
+      }
+    };
     const deleteResult = await this.historyService.deleteMessage(
       this.workspaceId,
       summaryMessage.id,
       (messages) =>
         isCurrent() &&
-        messages.some(
+        messages.every(
           (message) =>
-            message.id === summaryMessage.id &&
+            message.id !== summaryMessage.id ||
             message.metadata?.historySequence === summaryMessage.metadata?.historySequence
         ),
-      () => {
-        // The boundary is gone. Restore memory and enqueue its immutable disk
-        // snapshot before publishing events that may admit a replacement turn.
-        restoration = this.restoreHeartbeatResetRollbackState();
-        try {
-          const historySequence = summaryMessage.metadata?.historySequence;
-          if (isNonNegativeInteger(historySequence)) {
-            this.emitChatEvent({ type: "delete", historySequences: [historySequence] });
-          }
-        } finally {
-          onCommitted?.();
-        }
-      }
+      () => restore(true),
+      () => restore(false)
     );
     // Physical persistence outlives ownership. A later admission may not veto a
     // committed rollback; the existing write queue orders it before successor state.

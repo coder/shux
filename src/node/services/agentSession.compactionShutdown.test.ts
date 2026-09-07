@@ -421,6 +421,7 @@ test.each([
             },
           },
         });
+        h.session.contextMutationCommitted();
       }
       closing = h.session.finishShutdown();
       release.resolve();
@@ -568,6 +569,7 @@ test("context replacement after Stop dispatches B while A's held cleanup is reti
           },
         },
       });
+      h.session.contextMutationCommitted();
     }
     expect(await h.internals.dispatchPendingFollowUp()).toBe(true);
     release.resolve();
@@ -602,6 +604,97 @@ test("a persistently unreadable abandoned follow-up retries once and preserves t
     expect(failure).toHaveProperty("message", "original read failure");
     expect(read).toHaveBeenCalledTimes(2);
     expect(stream).not.toHaveBeenCalled();
+  } finally {
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test.each(["recovery", "shutdown", "dispose", "teardown read recovers"] as const)(
+  "failed abandoned cleanup keeps ownership until %s retries it",
+  async (retry) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(workspaceId, summary());
+    await h.session.interruptStream({ abandonPartial: true });
+    const read = spyOn(h.historyService, "getLastMessages")
+      .mockRejectedValueOnce(new Error("initial read unavailable"))
+      .mockRejectedValueOnce(new Error("cleanup read unavailable"));
+    if (retry === "teardown read recovers")
+      read.mockRejectedValueOnce(new Error("teardown first read unavailable"));
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      const failure = await h.internals.dispatchPendingFollowUp().catch((error: unknown) => error);
+      expect(failure).toHaveProperty("message", "initial read unavailable");
+      const owner = h.internals.coordinator.compactionIntent.followUp;
+      expect(owner).toBeDefined();
+      if (!owner) throw new Error("Expected retained cleanup owner");
+      expect(h.internals.coordinator.canClearCompactionFollowUp(owner)).toBe(true);
+      if (retry === "recovery") expect(await h.internals.dispatchPendingFollowUp()).toBe(false);
+      if (retry === "shutdown") await h.session.finishShutdown();
+      else await h.session.dispose();
+      expect(stream).not.toHaveBeenCalled();
+      const rows = await h.historyService.getLastMessages(workspaceId, 1);
+      expect(rows.success && rows.data[0].metadata?.muxMetadata).not.toHaveProperty(
+        "pendingFollowUp"
+      );
+      await expectNoRecovery(h.config, h.historyService);
+    } finally {
+      await h.session.dispose().catch(() => undefined);
+      await h.cleanup();
+    }
+  }
+);
+
+test("permanent abandoned cleanup failure is bounded and fails shutdown after releasing resources", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  await h.session.interruptStream({ abandonPartial: true });
+  const read = spyOn(h.historyService, "getLastMessages").mockRejectedValue(
+    new Error("history unavailable")
+  );
+  try {
+    await h.internals.dispatchPendingFollowUp().catch(() => undefined);
+    const failure = await h.session.finishShutdown().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(read).toHaveBeenCalledTimes(4);
+    expect(h.aiEmitter.listenerCount("stream-start")).toBe(0);
+    expect(h.aiEmitter.listenerCount("stream-end")).toBe(0);
+    expect(h.internals.coordinator.compactionIntent.followUp).toBeDefined();
+  } finally {
+    await h.session.dispose().catch(() => undefined);
+    await h.cleanup();
+  }
+});
+
+test("retrying retired cleanup never dispatches the replacement handoff", async () => {
+  const h = await setup();
+  const boundary = summary();
+  await h.historyService.appendToHistory(workspaceId, boundary);
+  await h.session.interruptStream({ abandonPartial: true });
+  spyOn(h.historyService, "getLastMessages")
+    .mockRejectedValueOnce(new Error("initial read unavailable"))
+    .mockRejectedValueOnce(new Error("cleanup read unavailable"));
+  const stream = spyOn(h.aiService, "streamMessage");
+  try {
+    await h.internals.dispatchPendingFollowUp().catch(() => undefined);
+    {
+      using _mutation = h.session.holdTurnAdmission();
+      await h.historyService.updateHistory(workspaceId, {
+        ...boundary,
+        metadata: {
+          ...boundary.metadata,
+          muxMetadata: {
+            type: "compaction-summary",
+            pendingFollowUp: { text: "replacement", ...options },
+          },
+        },
+      });
+      h.session.contextMutationCommitted();
+    }
+    await h.session.retryPendingCompactionCleanup();
+    expect(stream).not.toHaveBeenCalled();
+    expect(await h.internals.dispatchPendingFollowUp()).toBe(true);
+    expect(stream).toHaveBeenCalledTimes(1);
   } finally {
     await h.session.dispose();
     await h.cleanup();

@@ -1,3 +1,12 @@
+import { EventEmitter } from "node:events";
+// This integration regression drives the real server replay into the real renderer store.
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only server fixture, never bundled into the renderer
+import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
+// eslint-disable-next-line local/no-cross-boundary-imports -- exercise the actual IPC replay boundary in this store fixture
+import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
+import type { ORPCContext } from "@/node/orpc/context";
+import type { TurnCoordinator, OperationId } from "@/node/services/turnCoordinator";
+import { Ok } from "@/common/types/result";
 import { GlobalWindow } from "happy-dom";
 import {
   describe,
@@ -821,6 +830,186 @@ describe("WorkspaceStore", () => {
 
   afterEach(() => {
     store.dispose();
+  });
+
+  it.each([
+    ["stream-abort", "full"],
+    ["error", "full"],
+    ["stream-abort", "since"],
+    ["error", "since"],
+    ["stream-abort", "live"],
+    ["error", "live"],
+  ])("keeps the successor streaming after %s during %s replay", async (terminal, mode) => {
+    const workspaceId = `replay-successor-${terminal}`;
+    const emitter = new EventEmitter();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let messageId = "engine-A";
+    const info = () => ({
+      messageId,
+      model: "anthropic:claude-test",
+      historySequence: 1,
+      startTime: 1,
+      parts: [],
+      currentStepStartIndex: 0,
+      stepStartIndices: [0],
+      toolCompletionTimestamps: new Map<string, number>(),
+    });
+    const publish = (replay = false) => {
+      emitter.emit("stream-start", { ...info(), type: "stream-start", workspaceId, replay });
+      emitter.emit("stream-delta", {
+        type: "stream-delta",
+        workspaceId,
+        messageId,
+        delta: "successor text",
+        timestamp: 30,
+        replay,
+      });
+      emitter.emit("reasoning-delta", {
+        type: "reasoning-delta",
+        workspaceId,
+        messageId,
+        delta: "successor reasoning",
+        timestamp: 30,
+        replay,
+      });
+      emitter.emit("tool-call-start", {
+        type: "tool-call-start",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-B",
+        toolName: "bash",
+        args: { script: "pwd" },
+        tokens: 1,
+        timestamp: 31,
+        replay,
+      });
+      emitter.emit("tool-call-end", {
+        type: "tool-call-end",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-B",
+        toolName: "bash",
+        result: "result-B",
+        timestamp: 32,
+        replay,
+      });
+    };
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      aiServiceOverrides: {
+        isStreaming: () => true,
+        getStreamInfo: info,
+        replayStream: async () => {
+          if (mode === "live") {
+            entered.resolve();
+            await release.promise;
+          }
+          publish(true);
+        },
+      },
+      initStateManagerOverrides: { replayInit: () => Promise.resolve() },
+    });
+    await h.historyService.appendToHistory(workspaceId, createMuxMessage("seed", "user", "seed"));
+    const read = h.historyService.readPartial.bind(h.historyService);
+    spyOn(h.historyService, "readPartial").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return read(...args);
+    });
+    const coordinator = (h.session as unknown as { coordinator: TurnCoordinator }).coordinator;
+    let operation: OperationId | undefined;
+    const send = spyOn(h.session, "sendMessage").mockImplementation(() => {
+      operation = coordinator.registerOperation(coordinator.turnId);
+      messageId = "engine-B";
+      publish();
+      return Promise.resolve(Ok(undefined));
+    });
+    const context = {
+      workspaceService: { getOrCreateSession: () => h.session },
+    } as unknown as ORPCContext;
+    const trace: WorkspaceChatMessage[] = [];
+    const consumed = Promise.withResolvers<void>();
+    mockOnChat.mockImplementation(async function* (_input, options) {
+      for await (const event of subscribeWorkspaceChat(
+        context,
+        {
+          workspaceId,
+          mode:
+            mode === "live"
+              ? { type: "live" }
+              : mode === "since"
+                ? {
+                    type: "since",
+                    cursor: {
+                      history: { messageId: "seed", historySequence: 0 },
+                      stream: { messageId: "engine-A", lastTimestamp: 10 },
+                    },
+                  }
+                : undefined,
+        },
+        options?.signal
+      )) {
+        trace.push(event);
+        yield event;
+        if (event.type === "caught-up") consumed.resolve();
+      }
+    });
+    try {
+      createAndAddWorkspace(store, workspaceId);
+      await entered.promise;
+      h.session.queueMessage("queued successor");
+      emitter.emit(terminal, {
+        type: terminal,
+        workspaceId,
+        messageId: "engine-A",
+        error: "failed A",
+        errorType: "unknown",
+        abortReason: "user",
+        metadata: {},
+        parts: [],
+      });
+      expect(send).toHaveBeenCalledTimes(1);
+      release.resolve();
+      expect(await waitUntil(() => trace.some((event) => event.type === "caught-up"))).toBe(true);
+      await consumed.promise;
+      const aggregator = store.getAggregator(workspaceId)!;
+      expect(store.getWorkspaceState(workspaceId).canInterrupt).toBe(true);
+      expect(aggregator.getActiveStreamMessageId()).toBe("engine-B");
+      expect(aggregator.getStreamLifecycle()?.phase).toBe("streaming");
+      const successor = aggregator.getAllMessages().find((message) => message.id === "engine-B")!;
+      expect(
+        successor.parts.filter((part) => part.type === "text").map((part) => part.text)
+      ).toEqual(["successor text"]);
+      expect(
+        successor.parts.filter((part) => part.type === "reasoning").map((part) => part.text)
+      ).toEqual(["successor reasoning"]);
+      expect(successor.parts.filter((part) => part.type === "dynamic-tool")).toHaveLength(1);
+      expect(successor.parts.find((part) => part.type === "dynamic-tool")).toMatchObject({
+        state: "output-available",
+        output: "result-B",
+      });
+      emitter.emit("stream-delta", {
+        type: "stream-delta",
+        workspaceId,
+        messageId: "engine-B",
+        delta: " still live",
+        timestamp: 40,
+      });
+      expect(
+        await waitUntil(() =>
+          JSON.stringify(aggregator.getDisplayedMessages()).includes("still live")
+        )
+      ).toBe(true);
+    } finally {
+      release.resolve();
+      store.dispose();
+      if (operation) coordinator.finishStartup(operation);
+      h.session.clearQueue();
+      await h.session.dispose();
+      await h.cleanup();
+    }
   });
 
   describe("provider config changes", () => {

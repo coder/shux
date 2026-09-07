@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { TurnStreamHandle } from "./streamManager";
 import type { StreamManager } from "./streamManager";
 import * as path from "path";
@@ -778,6 +779,10 @@ interface PreparationAttempt {
 }
 
 export class AgentSession {
+  private readonly replayPublication = new AsyncLocalStorage<{
+    listener: (event: AgentSessionChatEvent) => void;
+    emittedStreamEvents: boolean;
+  }>();
   private readonly workspaceId: string;
   private readonly config: Config;
   private readonly historyService: HistoryService;
@@ -1201,6 +1206,10 @@ export class AgentSession {
 
     this.attachAiListeners();
     this.attachInitListeners();
+    // A subscription is lazy: protect an existing engine before any caller can
+    // send through this new session, even before replay is first pulled.
+    const existingStream = this.streamManager.getStreamInfo(this.workspaceId);
+    if (existingStream) this.coordinator.observeStreamReplay(existingStream.messageId);
     eventSpine.emit("session.start", { workspaceId: this.workspaceId });
   }
 
@@ -1240,6 +1249,59 @@ export class AgentSession {
     }
   }
 
+  // Failed I/O keeps its exact semantic owner in the coordinator. This payload
+  // schedules a later explicit recovery/teardown attempt, never a busy physical lease.
+  private deferredCompactionCleanup?: {
+    token: CompactionToken;
+    dispatch: CompactionFollowUpDispatch;
+    summaryMessageId?: string;
+  };
+
+  private compactionCleanupRetry?: Promise<void>;
+
+  private hasDeferredCompactionCleanup(token: CompactionToken): boolean {
+    return this.deferredCompactionCleanup?.token.id === token.id;
+  }
+
+  get hasPendingCompactionCleanup(): boolean {
+    return (
+      this.compactionCleanupRetry != null ||
+      (this.deferredCompactionCleanup != null &&
+        this.coordinator.canClearCompactionFollowUp(this.deferredCompactionCleanup.token))
+    );
+  }
+
+  retryPendingCompactionCleanup(): Promise<void> {
+    if (this.compactionCleanupRetry) return this.compactionCleanupRetry;
+    const deferred = this.deferredCompactionCleanup;
+    if (!deferred) return Promise.resolve();
+    if (!this.coordinator.canClearCompactionFollowUp(deferred.token)) {
+      this.deferredCompactionCleanup = undefined;
+      return Promise.resolve();
+    }
+    const settled = Promise.withResolvers<void>();
+    this.compactionCleanupRetry = settled.promise;
+    this.dispatchPendingFollowUp().then(
+      () => {
+        this.compactionCleanupRetry = undefined;
+        settled.resolve();
+      },
+      (error: unknown) => {
+        this.compactionCleanupRetry = undefined;
+        // Dispatch preserves its original error even when bounded cleanup succeeds.
+        if (
+          this.hasDeferredCompactionCleanup(deferred.token) &&
+          this.coordinator.canClearCompactionFollowUp(deferred.token)
+        )
+          settled.reject(
+            new Error(`Stopped compaction cleanup remains pending: ${getErrorMessage(error)}`)
+          );
+        else settled.resolve();
+      }
+    );
+    return settled.promise;
+  }
+
   private disposePromise?: Promise<void>;
   private disposalMessageId?: string;
 
@@ -1275,7 +1337,15 @@ export class AgentSession {
         emitIfMissing: false,
       })
     );
-    const invalidated = cleanup("invalidate", () => this.coordinator.dispose());
+    const invalidated = cleanup("invalidate", () => {
+      try {
+        this.coordinator.dispose();
+      } finally {
+        // Release Node's async-context registration only after late replay events
+        // are suppressed; disabling while merely closing could broadcast them live.
+        if (this.coordinator.disposed) this.replayPublication.disable();
+      }
+    });
     const compactionStopped = cleanup("compaction", () =>
       this.continuousCompactor.reset("dispose")
     );
@@ -1285,10 +1355,19 @@ export class AgentSession {
       : cleanup("background processes", () =>
           this.backgroundProcessManager.cleanup(this.workspaceId)
         );
+    let unresolvedCompactionCleanup: Error | undefined;
     Promise.all([stopped, invalidated, compactionStopped, retryStopped, backgroundStopped])
       .then(async () => {
         cleanupExecution[Symbol.dispose]();
         await cleanup("drain", () => this.coordinator.drain());
+        // A failed producer may defer cleanup while drain is running. Retry only
+        // after its lease settles; retaining its token must never self-join drain.
+        try {
+          await this.retryPendingCompactionCleanup();
+        } catch (error) {
+          unresolvedCompactionCleanup =
+            error instanceof Error ? error : new Error(getErrorMessage(error));
+        }
         // Raw bridges stay attached through the attempt fence. Destructive disposal suppresses
         // recovery policy, but still presents its captured terminal exactly once below.
         for (const { event, handler } of this.aiListeners) this.aiService.off(event, handler);
@@ -1300,7 +1379,10 @@ export class AgentSession {
         eventSpine.emit("session.end", { workspaceId: this.workspaceId });
       })
       .catch((error: unknown) => log.debug("dispose: final cleanup failed", { error }))
-      .finally(() => disposed.resolve());
+      .finally(() => {
+        if (unresolvedCompactionCleanup) disposed.reject(unresolvedCompactionCleanup);
+        else disposed.resolve();
+      });
     return disposed.promise;
   }
 
@@ -1325,7 +1407,7 @@ export class AgentSession {
     assert(typeof listener === "function", "listener must be a function");
 
     const unsubscribe = this.onChatEvent(listener);
-    await this.emitHistoricalEvents(listener);
+    await this.replayHistory(listener);
 
     this.scheduleStartupRecovery();
 
@@ -1334,11 +1416,14 @@ export class AgentSession {
 
   async replayHistory(
     listener: (event: AgentSessionChatEvent) => void,
-    mode?: OnChatMode
+    mode?: OnChatMode,
+    beforeReplayCompletion?: () => void
   ): Promise<void> {
     this.assertNotDisposed("replayHistory");
     assert(typeof listener === "function", "listener must be a function");
-    await this.emitHistoricalEvents(listener, mode);
+    await this.replayPublication.run({ listener, emittedStreamEvents: false }, () =>
+      this.emitHistoricalEvents(listener, mode, beforeReplayCompletion)
+    );
   }
 
   emitMetadata(metadata: FrontendWorkspaceMetadata | null): void {
@@ -2679,7 +2764,8 @@ export class AgentSession {
 
   private async emitHistoricalEvents(
     listener: (event: AgentSessionChatEvent) => void,
-    mode?: OnChatMode
+    mode?: OnChatMode,
+    beforeReplayCompletion?: () => void
   ): Promise<void> {
     let replayMode: "full" | "since" | "live" = "full";
     let hasOlderHistory: boolean | undefined;
@@ -2746,30 +2832,15 @@ export class AgentSession {
       }
     };
 
-    let emittedReplayStreamEvents = false;
-    const replayStreamEventTracker = (event: AgentSessionChatEvent) => {
-      if (event.workspaceId !== this.workspaceId) {
-        return;
-      }
-
-      const message = event.message;
-      if (typeof message !== "object" || message === null) {
-        return;
-      }
-
-      if (!("replay" in message) || message.replay !== true) {
-        return;
-      }
-
-      emittedReplayStreamEvents = true;
-    };
-    this.emitter.on("chat-event", replayStreamEventTracker);
-
     const shouldReplayTerminalState = mode?.type !== "live";
 
     // try/catch/finally guarantees caught-up is always sent, even if replay fails.
     // Without caught-up, the frontend stays in "Loading workspace..." forever.
     try {
+      // Reserve the observed engine before history/tokenization awaits or the first
+      // lifecycle publication can reenter a manual send. The envelope arrives later.
+      const initialStreamInfo = this.streamManager.getStreamInfo(this.workspaceId);
+      if (initialStreamInfo) this.coordinator.observeStreamReplay(initialStreamInfo.messageId);
       if (shouldReplayTerminalState) {
         // Rehydrate the current terminal/preparing state immediately so reconnect clients do not
         // regress to transcript heuristics while the rest of replay is still streaming in.
@@ -2782,7 +2853,7 @@ export class AgentSession {
         // Live mode still needs stream context when a response is currently active.
         // Replay only stream-start (no historical deltas/tool updates) so clients can
         // attach future live events to the correct message.
-        const liveStreamInfo = this.streamManager.getStreamInfo(this.workspaceId);
+        const liveStreamInfo = initialStreamInfo;
         if (liveStreamInfo) {
           const streamLastTimestamp = this.getStreamLastTimestamp(liveStreamInfo);
           await this.streamManager.replayStream(this.workspaceId, {
@@ -2811,7 +2882,7 @@ export class AgentSession {
 
       // Read partial BEFORE iterating history so we can skip the corresponding
       // placeholder message (which has empty parts). The partial has the real content.
-      const streamInfo = this.streamManager.getStreamInfo(this.workspaceId);
+      const streamInfo = initialStreamInfo;
       const partial = await this.historyService.readPartial(this.workspaceId);
       const partialHistorySequence = partial?.metadata?.historySequence;
 
@@ -3017,7 +3088,11 @@ export class AgentSession {
       // Keep append/live semantics when we've already emitted incremental payload.
       // Downgrading to full at that point would make the frontend apply replace-mode to
       // a partial replay buffer and temporarily hide older transcript rows.
-      if (replayMode !== "full" && !emittedReplayMessages && !emittedReplayStreamEvents) {
+      if (
+        replayMode !== "full" &&
+        !emittedReplayMessages &&
+        !this.replayPublication.getStore()?.emittedStreamEvents
+      ) {
         replayMode = "full";
       }
       if (mode?.type === "since" && replayMode === "full") {
@@ -3027,8 +3102,8 @@ export class AgentSession {
       // Replay failed, so do not advertise a trustworthy reconnect cursor.
       serverCursor = undefined;
     } finally {
-      this.emitter.off("chat-event", replayStreamEventTracker);
-
+      // Flush overlapping live events before authoritative final snapshots, including on replay failure.
+      beforeReplayCompletion?.();
       if (shouldReplayTerminalState) {
         // Replay the latest terminal/preparing state one last time before caught-up in case the
         // stream changed while history was replaying (for example PREPARING -> failed/idle).
@@ -3307,7 +3382,7 @@ export class AgentSession {
       // unwinds. A replaced handoff may delete its own rows, but cannot retire its successor.
       if (handoff == null || ownsCleanup || this.coordinator.isCurrentCompaction(handoff)) {
         this.coordinator.invalidateCompaction(
-          ownsCleanup && this.coordinator.compactionIntent.status === "abandoned"
+          this.coordinator.compactionIntent.status === "abandoned"
         );
         this.continuousCompactor.reset("delete-messages");
       }
@@ -6931,6 +7006,16 @@ export class AgentSession {
     };
 
     forward("stream-start", (payload) => {
+      if (payload.type === "stream-start" && payload.replay === true) {
+        // Reconnect needs the stream envelope even when its live start was already
+        // admitted. Replay must not rerun start policy or revive a retired attempt.
+        if (
+          this.streamManager.getStreamInfo(this.workspaceId)?.messageId === payload.messageId &&
+          this.coordinator.observeStreamReplay(payload.messageId)
+        )
+          this.emitChatEvent(payload);
+        return;
+      }
       if (payload.type === "stream-start" && this.coordinator.streamStarted(payload)) {
         this.emitChatEvent(payload);
       }
@@ -7132,6 +7217,7 @@ export class AgentSession {
     forward("stream-abort", (payload) => {
       if (payload.type !== "stream-abort") return;
       if (this.forwardDisposalTerminal(payload)) return;
+      if (this.finishObservedStream(payload.messageId, payload)) return;
       if (this.coordinator.observeStartupAbort(payload)) return this.handleStartupAbort(payload);
       this.coordinator.rawTerminal("aborted", payload.messageId);
     });
@@ -7145,6 +7231,7 @@ export class AgentSession {
     forward("stream-end", (payload) => {
       if (payload.type !== "stream-end") return;
       if (this.forwardDisposalTerminal(payload)) return;
+      if (this.finishObservedStream(payload.messageId, payload)) return;
       this.coordinator.rawTerminal("completed", payload.messageId);
     });
 
@@ -7159,6 +7246,14 @@ export class AgentSession {
         return;
       }
       const data = raw as StreamErrorPayload & { workspaceId: string };
+      if (
+        this.finishObservedStream(data.messageId, {
+          ...data,
+          type: "stream-error",
+          errorType: data.errorType ?? "unknown",
+        })
+      )
+        return;
       // Begin synchronously at event emission so completion waiters always find
       // this attempt's decision before they run.
       this.coordinator.beginErrorDecision(data.messageId);
@@ -7207,6 +7302,10 @@ export class AgentSession {
     return true;
   }
 
+  private finishObservedStream(messageId: string, payload: WorkspaceChatMessage): boolean {
+    return this.coordinator.finishObservedStream(messageId, () => this.emitChatEvent(payload));
+  }
+
   // Public method to emit chat events (used by init hooks and other workspace events)
   emitChatEvent(message: WorkspaceChatMessage): void {
     // Destructive disposal keeps raw terminal presentation separate from late policy work.
@@ -7214,10 +7313,16 @@ export class AgentSession {
       return;
     }
 
-    this.emitter.emit("chat-event", {
-      workspaceId: this.workspaceId,
-      message,
-    } satisfies AgentSessionChatEvent);
+    const event = { workspaceId: this.workspaceId, message } satisfies AgentSessionChatEvent;
+    const replay = this.replayPublication.getStore();
+    if (replay && "replay" in message && message.replay === true) {
+      // Async-local routing isolates concurrent reconnects without redirecting live
+      // provider events or resetting another subscriber's active-stream queue state.
+      replay.emittedStreamEvents = true;
+      replay.listener(event);
+      return;
+    }
+    this.emitter.emit("chat-event", event);
   }
 
   private publishTurnPhase(next: TurnPhase, isCurrent: () => boolean): void {
@@ -7278,7 +7383,6 @@ export class AgentSession {
    * deleting the partial removes the discarded transcript's tail durably.
    */
   async discardAutoRetryForContextMutation(): Promise<Result<void>> {
-    this.coordinator.invalidateCompaction();
     this.continuousCompactor.reset("context-mutation");
     this.retryManager.cancel();
     this.setAutoRetryResumeState(undefined);
@@ -7306,9 +7410,14 @@ export class AgentSession {
    * check.
    */
   holdTurnAdmission(): Disposable {
-    this.coordinator.invalidateCompaction();
-    this.continuousCompactor.reset("context-mutation");
+    // Refine/archive and failed mutation acquisition share this temporary gate.
+    // Only committed replacement history may retire Stop's exact cleanup owner.
     return this.coordinator.reserve("admission");
+  }
+
+  contextMutationCommitted(): void {
+    this.coordinator.invalidateCompaction(false);
+    this.continuousCompactor.reset("context-mutation");
   }
 
   /**
@@ -7959,26 +8068,43 @@ export class AgentSession {
     cancelResume?: () => boolean
   ): Promise<boolean> {
     if (
-      this.coordinator.disposed ||
+      this.deferredCompactionCleanup &&
+      !this.coordinator.canClearCompactionFollowUp(this.deferredCompactionCleanup.token)
+    ) {
+      this.deferredCompactionCleanup = undefined;
+    }
+    const deferred = this.deferredCompactionCleanup;
+    if (
+      (this.coordinator.disposed && !deferred) ||
       (this.coordinator.closing && this.coordinator.compactionIntent.status !== "abandoned")
     ) {
       return false;
     }
+    // A temporary admission hold is not a replacement. Keep deferred work for
+    // its next lifecycle opportunity rather than competing with context writes.
+    if (deferred && this.coordinator.admissionBlocked && !this.coordinator.closing) return false;
+    this.deferredCompactionCleanup = undefined;
+    const targetSummaryId = deferred ? deferred.summaryMessageId : summaryMessageId;
     // A leased terminal producer can reach its abandoned boundary only after
     // shutdown begins. Join its cleanup while continuing to forbid new sends.
     using _execution = this.coordinator.enterExecution();
     // Claim before history I/O: a send admitted and completed during that read
     // must not make an obsolete summary look like a fresh idle continuation.
     const token =
+      deferred?.token ??
       this.coordinator.claimCompactionFollowUp() ??
       this.coordinator.claimCompactionFollowUpCleanup();
     if (!token) return false;
-    const dispatch: CompactionFollowUpDispatch = { accepted: false };
+    const dispatch: CompactionFollowUpDispatch = deferred?.dispatch ?? { accepted: false };
     try {
+      if (deferred && dispatch.summary) {
+        await this.clearPendingFollowUpFromSummary(dispatch.summary, token);
+        return false;
+      }
       return await this.dispatchOwnedCompactionFollowUp(
         token,
         dispatch,
-        summaryMessageId,
+        targetSummaryId,
         cancelResume
       );
     } catch (error) {
@@ -7995,9 +8121,12 @@ export class AgentSession {
           else {
             // The initial read can fail before capturing a summary. Retry once under
             // the same abandoned owner; this path cannot admit a send or reclaim B.
-            await this.dispatchOwnedCompactionFollowUp(token, dispatch, summaryMessageId);
+            await this.dispatchOwnedCompactionFollowUp(token, dispatch, targetSummaryId);
           }
         } catch (cleanupError) {
+          if (this.coordinator.canClearCompactionFollowUp(token)) {
+            this.deferredCompactionCleanup = { token, dispatch, summaryMessageId: targetSummaryId };
+          }
           log.warn("Abandoned compaction follow-up cleanup failed", {
             workspaceId: this.workspaceId,
             error: getErrorMessage(cleanupError),
@@ -8006,7 +8135,8 @@ export class AgentSession {
       }
       throw error;
     } finally {
-      this.coordinator.finishCompactionFollowUp(token);
+      if (!this.hasDeferredCompactionCleanup(token))
+        this.coordinator.finishCompactionFollowUp(token);
     }
   }
 

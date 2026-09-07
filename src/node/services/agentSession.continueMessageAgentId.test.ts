@@ -344,6 +344,7 @@ describe("AgentSession continue-message agentId fallback", () => {
             })
           ).success
         ).toBe(true);
+        session.contextMutationCommitted();
         release.resolve();
         expect(await pending).toBe(false);
         const history = await historyService.getLastMessages("ws", 1);
@@ -385,6 +386,7 @@ describe("AgentSession continue-message agentId fallback", () => {
           })
         ).success
       ).toBe(true);
+      session.contextMutationCommitted();
       release.resolve();
       expect(await pending).toBe(false);
       const history = await historyService.getHistoryFromLatestBoundary("ws");

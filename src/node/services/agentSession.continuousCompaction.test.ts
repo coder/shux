@@ -1186,6 +1186,8 @@ describe("AgentSession continuous compaction wiring", () => {
     const h = await setup();
     const reset = spyOn(internals(h.session).continuousCompactor, "reset");
     using _admission = h.session.holdTurnAdmission();
+    expect(reset).not.toHaveBeenCalled();
+    h.session.contextMutationCommitted();
     expect(reset).toHaveBeenCalled();
     reset.mockClear();
     await h.session.discardAutoRetryForContextMutation();
