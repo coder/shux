@@ -32,7 +32,9 @@ import type {
   ProvidersConfigMap,
   WorkspaceStatsSnapshot,
   ServerAuthSession,
+  UpdateStatus,
 } from "@/common/orpc/types";
+import type { UpdateChannel } from "@/common/types/project";
 import type { ProjectGitStatusResult as ApiProjectGitStatusResult } from "@/common/orpc/schemas/api";
 import type { MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
@@ -189,6 +191,10 @@ export interface MockORPCClientOptions {
   memoryConsolidationStatus?: MemoryConsolidationStatusPayload;
   /** Optional file contents for memory.read keyed by virtual path. */
   memoryFileContents?: Map<string, string>;
+  /** Initial updater status for update.onStatus (About dialog stories). */
+  updateStatus?: UpdateStatus;
+  /** Release channel for update.getChannel. */
+  updateChannel?: UpdateChannel;
   /** Initial route priority for config.getConfig */
   routePriority?: string[];
   /** Initial per-model route overrides for config.getConfig */
@@ -416,6 +422,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     memoryFiles = [],
     memoryConsolidationStatus,
     memoryFileContents = new Map<string, string>(),
+    updateStatus,
+    updateChannel = "stable",
     routePriority: initialRoutePriority = ["direct"],
     routeOverrides: initialRouteOverrides = {},
     agentDefinitions: initialAgentDefinitions,
@@ -1998,10 +2006,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       download: () => Promise.resolve(undefined),
       install: () => Promise.resolve(undefined),
       onStatus: async function* () {
-        yield* [];
+        if (updateStatus) yield updateStatus;
         await new Promise<void>(() => undefined);
       },
-      getChannel: () => Promise.resolve("stable" as const),
+      getChannel: () => Promise.resolve(updateChannel),
       setChannel: () => Promise.resolve(undefined),
     },
     policy: {

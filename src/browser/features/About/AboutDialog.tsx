@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Download, Loader2, RefreshCw } from "lucide-react";
 import { VERSION } from "@/version";
-import type { UpdateStatus } from "@/common/orpc/types";
+import type { RestartBlocker, UpdateStatus } from "@/common/orpc/types";
 import type { UpdateChannel } from "@/common/types/project";
 import XumLogoDark from "@/browser/assets/logos/xum-logo-dark.svg?react";
 import XumLogoLight from "@/browser/assets/logos/xum-logo-light.svg?react";
@@ -14,6 +14,21 @@ import {
   ToggleGroup,
   ToggleGroupItem,
 } from "@/browser/components/ToggleGroupPrimitive/ToggleGroupPrimitive";
+
+const blockerLabels: Record<RestartBlocker["kind"], string> = {
+  "active-streams": "Active streams",
+  "pending-turns": "Pending turns",
+  "workspace-inits": "Workspaces still initializing",
+  "workspace-lifecycle": "Workspaces being archived, removed, forked, or staged",
+  workflows: "Workflow runs in progress",
+  projects: "Projects being cloned or created",
+  requests: "Requests in flight",
+  "desktop-sessions": "Live desktop sessions",
+  "queued-messages": "Sessions with queued messages",
+  "auto-retries": "Pending auto-retries",
+  terminals: "Open terminals",
+  "background-processes": "Running background processes",
+};
 
 interface VersionRecord {
   buildTime?: unknown;
@@ -75,10 +90,8 @@ export function AboutDialog() {
   const [pendingAction, setPendingAction] = useState<"check" | "download" | "install" | null>(null);
   const channelRequestTokenRef = useRef(0);
 
-  const isDesktop = typeof window !== "undefined" && Boolean(window.api);
-
   useEffect(() => {
-    if (!isOpen || !isDesktop || !api) {
+    if (!isOpen || !api) {
       return;
     }
 
@@ -105,10 +118,10 @@ export function AboutDialog() {
     return () => {
       controller.abort();
     };
-  }, [api, isDesktop, isOpen]);
+  }, [api, isOpen]);
 
   useEffect(() => {
-    if (!isOpen || !isDesktop || !api) {
+    if (!isOpen || !api) {
       return;
     }
 
@@ -128,9 +141,9 @@ export function AboutDialog() {
     return () => {
       active = false;
     };
-  }, [api, isDesktop, isOpen]);
+  }, [api, isOpen]);
 
-  const canUseUpdateApi = isDesktop && Boolean(api);
+  const canUseUpdateApi = Boolean(api);
   const isChecking =
     canUseUpdateApi &&
     (updateStatus.type === "checking" ||
@@ -161,7 +174,7 @@ export function AboutDialog() {
     api.update
       .check({ source: "manual" })
       .catch(console.error)
-      // Clear pending if the backend no-ops (e.g. already downloaded) and emits no status event.
+      // Clear pending if the backend no-ops (e.g. a check is already running) and emits no status event.
       .finally(() => setPendingAction((prev) => (prev === "check" ? null : prev)));
   };
 
@@ -216,12 +229,10 @@ export function AboutDialog() {
         <div className="border-border-medium space-y-3 border-t pt-3">
           <div className="text-foreground text-sm font-medium">Updates</div>
 
-          {!isDesktop ? (
-            <div className="text-muted text-xs">
-              Desktop updates are available in the Electron app only.
-            </div>
+          {updateStatus.type === "unsupported" ? (
+            <div className="text-muted text-xs">{updateStatus.reason}</div>
           ) : !canUseUpdateApi ? (
-            <div className="text-muted text-xs">Connecting to desktop update service…</div>
+            <div className="text-muted text-xs">Connecting to update service…</div>
           ) : (
             <>
               {channel !== null && (
@@ -236,7 +247,7 @@ export function AboutDialog() {
                           handleChannelChange(next);
                         }
                       }}
-                      disabled={channelLoading}
+                      disabled={channelLoading || isChecking || pendingAction !== null}
                       aria-label="Update channel"
                       size="sm"
                     >
@@ -271,8 +282,8 @@ export function AboutDialog() {
               )}
 
               {updateStatus.type === "available" && (
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-foreground text-xs">
+                <div className="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
+                  <div className="text-foreground min-w-0 text-xs break-words">
                     Update available: <span className="font-mono">{updateStatus.info.version}</span>
                   </div>
                   <Button
@@ -292,13 +303,20 @@ export function AboutDialog() {
 
               {updateStatus.type === "downloading" && (
                 <div className="text-muted text-xs">
-                  Downloading update: {updateStatus.percent}%
+                  {updateStatus.percent === null ? (
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Downloading update…
+                    </span>
+                  ) : (
+                    <>Downloading update: {updateStatus.percent}%</>
+                  )}
                 </div>
               )}
 
-              {updateStatus.type === "downloaded" && (
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-foreground text-xs">
+              {(updateStatus.type === "downloaded" || updateStatus.type === "install-blocked") && (
+                <div className="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
+                  <div className="text-foreground min-w-0 text-xs break-words">
                     Ready to install: <span className="font-mono">{updateStatus.info.version}</span>
                   </div>
                   <Button size="sm" onClick={handleInstall} disabled={pendingAction === "install"}>
@@ -309,6 +327,20 @@ export function AboutDialog() {
                     )}
                     {pendingAction === "install" ? "Installing…" : "Install & restart"}
                   </Button>
+                </div>
+              )}
+
+              {updateStatus.type === "install-blocked" && (
+                <div className="text-muted space-y-1 text-xs" role="status">
+                  <div>Finish or stop this work, then retry the restart:</div>
+                  <ul>
+                    {updateStatus.blockers.map((blocker) => (
+                      <li key={blocker.kind}>
+                        {blockerLabels[blocker.kind]}:{" "}
+                        <span className="counter-nums">{blocker.count}</span>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
 

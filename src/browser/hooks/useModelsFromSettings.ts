@@ -1,6 +1,6 @@
 import { useCallback, useMemo } from "react";
 import { readPersistedString, usePersistedState } from "./usePersistedState";
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
 import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { useProvidersConfig } from "./useProvidersConfig";
@@ -207,9 +207,13 @@ export function useModelsFromSettings() {
     [persistModelPrefs, setDefaultModel]
   );
 
-  const [hiddenModels, setHiddenModels] = usePersistedState<string[]>(HIDDEN_MODELS_KEY, [], {
-    listener: true,
-  });
+  const [hiddenModels, setHiddenModels] = usePersistedState<string[]>(
+    HIDDEN_MODELS_KEY,
+    DEFAULT_HIDDEN_MODELS,
+    {
+      listener: true,
+    }
+  );
 
   const isConfigured = useCallback(
     (provider: string) =>

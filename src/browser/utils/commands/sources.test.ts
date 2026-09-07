@@ -508,6 +508,33 @@ test("Login with Coder command opens providers expanded on Coder and starts the 
   });
 });
 
+test("update commands run the operation and open the About dialog, and need an About opener", async () => {
+  const onOpenAbout = mock();
+  const install = mock(() => Promise.resolve());
+  let settleChannel!: () => void;
+  const setChannel = mock(
+    () =>
+      new Promise<void>((resolve) => {
+        settleChannel = resolve;
+      })
+  );
+  const actions = getActions({
+    onOpenAbout,
+    api: { update: { install, setChannel } } as unknown as APIClient,
+  });
+  await actions.find((a) => a.title === "Install Update and Restart")!.run();
+  expect(install).toHaveBeenCalledTimes(1);
+  expect(onOpenAbout).toHaveBeenCalledTimes(1);
+  // About reads the channel when it opens, so the switch must persist before the dialog appears.
+  const switched = actions.find((a) => a.title === "Update Channel: Nightly")!.run();
+  expect(setChannel).toHaveBeenCalledWith({ channel: "nightly" });
+  expect(onOpenAbout).toHaveBeenCalledTimes(1);
+  settleChannel();
+  await switched;
+  expect(onOpenAbout).toHaveBeenCalledTimes(2);
+  expect(getActions().some((a) => a.title === "Check for Updates")).toBe(false);
+});
+
 test("Login with Coder command hides itself when a custom provider shadows the coder id", () => {
   // Regression: an upgraded install can carry a custom OpenAI-compatible
   // provider named "coder". ProvidersSection hides the OAuth block for

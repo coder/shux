@@ -1,3 +1,6 @@
+import type { RestartBlocker } from "@/common/orpc/types";
+import type { Scope } from "effect";
+import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import {
   DesktopInputCoordinator,
   settleArchivedSharedDesktopTask,
@@ -1808,6 +1811,7 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly sessions = new Map<string, AgentSession>();
+  private shuttingDown = false;
   private readonly providerConfigChangedListener = (): void => {
     const liveSessions = new Map([
       ...this.sessions.entries(),
@@ -2355,7 +2359,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       config.rootDir
     ),
     private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir),
-    private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
+    private readonly desktopInputCoordinator = new DesktopInputCoordinator(config),
+    private readonly effectRunner: EffectRunner = defaultEffectRunner,
+    private readonly appFiberScope?: Scope.Scope
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -3960,6 +3966,45 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     );
   }
 
+  collectRestartBlockers(): RestartBlocker[] {
+    const sessions = new Map([...this.sessions, ...this.transientStartupRecoverySessions]);
+    const pendingTurns = new Set(this.preflightSendCounts.keys());
+    let queuedMessages = 0;
+    let autoRetries = 0;
+    for (const [workspaceId, session] of sessions) {
+      if (session.hasActiveOrPendingTurnWork()) pendingTurns.add(workspaceId);
+      if (session.hasQueuedMessages()) queuedMessages++;
+      if (session.hasPendingAutoRetry()) autoRetries++;
+    }
+    const blockers: RestartBlocker[] = [
+      { kind: "pending-turns", count: pendingTurns.size },
+      {
+        kind: "workspace-inits",
+        // Controllers exist from the start of provisioning; settlements from init start onward.
+        count: new Set([...this.initAbortControllers.keys(), ...this.initSettlementPromises.keys()])
+          .size,
+      },
+      {
+        kind: "workspace-lifecycle",
+        count: new Set([
+          ...this.renamingWorkspaces,
+          ...this.removingWorkspaces,
+          ...this.archivingWorkspaces,
+          ...this.contextMutationWorkspaces,
+          ...this.preflightForkCounts.keys(),
+          ...this.preflightStagingCounts.keys(),
+        ]).size,
+      },
+      { kind: "queued-messages", count: queuedMessages },
+      { kind: "auto-retries", count: autoRetries },
+      {
+        kind: "background-processes",
+        count: Array.from(this.preflightExecCounts.values()).reduce((sum, count) => sum + count, 0),
+      },
+    ];
+    return blockers.filter((blocker) => blocker.count > 0);
+  }
+
   /**
    * Shutdown: stop startup chat recovery before the services it dispatches through go away.
    * Transient recovery sessions are disposed outright. Sessions that outlived that sweep (promoted
@@ -3967,6 +4012,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * on) may own a live stream whose partial the next startup needs, so they only stop dispatching.
    */
   beginShutdown(): void {
+    this.shuttingDown = true;
     for (const [workspaceId, session] of this.transientStartupRecoverySessions) {
       this.transientStartupRecoverySessions.delete(workspaceId);
       session.dispose();
@@ -4025,7 +4071,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   private createSession(workspaceId: string): AgentSession {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     return new AgentSession({
+      effectRunner: this.effectRunner,
+      appFiberScope: this.appFiberScope,
       workspaceId,
       config: this.config,
       historyService: this.historyService,
@@ -5530,6 +5579,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   private async removeUnlocked(workspaceId: string, force = false): Promise<Result<void>> {
+    if (this.shuttingDown) return Err("Server is shutting down");
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
       return Ok(undefined);
@@ -6905,6 +6955,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   async rename(workspaceId: string, newName: string): Promise<Result<{ newWorkspaceId: string }>> {
     try {
+      if (this.shuttingDown) return Err("Server is shutting down");
       if (this.aiService.isStreaming(workspaceId)) {
         return Err(
           "Cannot rename workspace while AI stream is active. Please wait for the stream to complete."
@@ -8403,6 +8454,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     acknowledgedUntrackedPaths?: string[],
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
+    if (this.shuttingDown) return Err("Server is shutting down");
     this.archivingWorkspaces.add(workspaceId);
     let admissionHold: Disposable | undefined;
 
@@ -14220,6 +14272,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     command?: string,
     args?: string[]
   ): Promise<Result<BashToolResult>> {
+    if (this.shuttingDown) return Err("Server is shutting down");
     // Block bash execution while workspace is being removed to prevent races with directory deletion.
     // A common case: subagent calls agent_report → frontend's GitStatusStore triggers a git status
     // refresh → executeBash arrives while remove() is deleting the directory → spawn fails with ENOENT.

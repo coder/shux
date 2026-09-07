@@ -3,6 +3,7 @@
  * `xum workflow` - Headless CLI runner for durable workflow scripts.
  */
 
+import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -397,6 +398,8 @@ async function createWorkflowContext(options: {
     // below would lose TypeScript's definite-assignment narrowing.
     const workspaceServiceForSanitize = services.workspaceService;
     session = new AgentSession({
+      effectRunner: services.runtime.get(EffectRunnerTag),
+      appFiberScope: services.appFiberScope,
       workspaceId,
       config,
       historyService: services.historyService,

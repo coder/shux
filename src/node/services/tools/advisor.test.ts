@@ -40,6 +40,7 @@ function createToolConfig(
   tempDir: string,
   options?: {
     reportModelUsage?: Parameters<typeof createAdvisorTool>[0]["reportModelUsage"];
+    metadataModel?: string;
     transcript?: ModelMessage[];
     snapshot?: AdvisorToolCallSnapshot | undefined;
     maxOutputTokens?: number;
@@ -51,6 +52,7 @@ function createToolConfig(
   const createModel = mock(() =>
     Promise.resolve({
       model: advisorLanguageModel,
+      ...(options?.metadataModel ? { metadataModel: options.metadataModel } : {}),
       optionsModelString: ADVISOR_MODEL,
       optionsProvidersConfig: null,
     })
@@ -257,7 +259,10 @@ describe("advisor tool", () => {
       anthropic: { cacheCreationInputTokens: 6 },
     };
     const reportModelUsage = mock((_event: ToolModelUsageEvent) => undefined);
-    const { config, createModel } = createToolConfig(tempDir.path, { reportModelUsage });
+    const { config, createModel } = createToolConfig(tempDir.path, {
+      reportModelUsage,
+      metadataModel: "openai:pinned-pricing-model",
+    });
     const streamTextSpy = mockStreamTextSuccess({
       text: "Focus on the highest-risk dependency edges first.",
       usage,
@@ -281,6 +286,7 @@ describe("advisor tool", () => {
         source: "tool",
         toolName: "advisor",
         model: ADVISOR_MODEL,
+        metadataModel: "openai:pinned-pricing-model",
         usage,
         providerMetadata,
         toolCallId: "test-call-id",

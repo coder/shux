@@ -148,6 +148,7 @@ export {
   AdvisorOutputEventSchema,
   AdvisorReasoningOutputEventSchema,
   AdvisorPhaseEventSchema,
+  RestartBlockerSchema,
   UpdateStatusSchema,
   UsageDeltaEventSchema,
   WorkspaceChatMessageSchema,

@@ -1,4 +1,6 @@
 import assert from "@/common/utils/assert";
+import { Cause, Effect, Exit, Fiber, Scope } from "effect";
+import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import type { StreamAbortEvent, StreamStartEvent } from "@/common/types/stream";
 import type { TurnCompletion, TurnStreamHandle } from "./streamManager";
 import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
@@ -281,6 +283,120 @@ interface CoordinatorCallbacks {
   policyError: (error: unknown) => void;
 }
 
+/** Physical resources only: the reducer remains the authority for admission and turn ownership. */
+class TurnExecution {
+  private readonly scope = Scope.makeUnsafe("parallel");
+  // Registered producers may add correlated terminal work while closing. The app retains its
+  // bounded shutdown: timing out this drain does not cancel non-cooperative Promise I/O.
+  private readonly pending = new Set<Promise<void>>();
+  private readonly policies = new Set<Fiber.Fiber<void>>();
+  private guardian?: Fiber.Fiber<void>;
+  private closePromise?: Promise<void>;
+
+  constructor(private runner: EffectRunner) {}
+
+  lease(): Disposable {
+    const settled = Promise.withResolvers<void>();
+    this.pending.add(settled.promise);
+    return {
+      [Symbol.dispose]: () => {
+        this.pending.delete(settled.promise);
+        settled.resolve();
+      },
+    };
+  }
+
+  resource(release: () => void): Disposable {
+    const scope = this.runner.runSync(Scope.fork(this.scope, "sequential"));
+    this.runner.runSync(Scope.addFinalizer(scope, Effect.sync(release)));
+    return { [Symbol.dispose]: () => this.runner.runSync(Scope.close(scope, Exit.void)) };
+  }
+
+  supervise(runner: EffectRunner, appScope: Scope.Scope | undefined, shutdown: () => void): void {
+    assert(this.guardian == null, "Turn execution supervision already attached");
+    this.runner = runner;
+    // The session calls this only after its collaborators exist. A closed parent interrupts
+    // synchronously, latching shutdown before a newly constructed session can accept a send.
+    const guardian = Effect.never.pipe(
+      Effect.onInterrupt(() =>
+        Effect.sync(shutdown).pipe(Effect.ensuring(Effect.promise(() => this.close())))
+      )
+    );
+    this.guardian = appScope
+      ? this.runner.runSync(Effect.forkIn(guardian, appScope, { startImmediately: true }))
+      : this.runner.runFork(guardian);
+  }
+
+  requestClose(): void {
+    if (this.guardian) this.guardian.interruptUnsafe();
+    else this.runner.runFork(Effect.promise(() => this.close()));
+  }
+
+  private close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    const closed = Promise.withResolvers<void>();
+    // Publish the close latch before interrupting fibers: their finalizers can reenter disposal.
+    this.closePromise = closed.promise;
+    this.runner
+      .runPromise(
+        Effect.gen({ self: this }, function* () {
+          // Interruption cannot cancel existing Promise I/O. Policy finalizers join the exact
+          // original Promise before releasing resources. Late terminals still have an open scope.
+          for (const fiber of this.policies) fiber.interruptUnsafe();
+          while (this.pending.size > 0) {
+            yield* Effect.promise(() => Promise.all([...this.pending]));
+          }
+          // Engine supervisors close in parallel with the guardian. A direct child policy scope
+          // would close before those engines deliver their final abort, silently losing policy.
+          yield* Scope.close(this.scope, Exit.void);
+        })
+      )
+      .then(closed.resolve, closed.reject);
+    return closed.promise;
+  }
+
+  policy(
+    start: () => Promise<void>,
+    finalize: () => void,
+    report: (error: unknown) => void
+  ): Promise<void> {
+    const lease = this.lease();
+    let original: Promise<void> | undefined;
+    const program = Effect.tryPromise({
+      try: () => (original = start()),
+      catch: (error) => error,
+    }).pipe(
+      Effect.onInterrupt(() => {
+        const started = original;
+        return started
+          ? Effect.tryPromise({ try: () => started, catch: (error) => error }).pipe(
+              Effect.catch((error) => Effect.sync(() => report(error)))
+            )
+          : Effect.void;
+      }),
+      Effect.catch((error) => Effect.sync(() => report(error))),
+      Effect.ensuring(
+        Effect.sync(() => {
+          try {
+            finalize();
+          } finally {
+            lease[Symbol.dispose]();
+          }
+        })
+      )
+    );
+    // rc112 requires startImmediately to preserve callback execution through its first await.
+    const fiber = this.runner.runSync(
+      Effect.forkIn(program, this.scope, { startImmediately: true })
+    );
+    this.policies.add(fiber);
+    fiber.addObserver(() => this.policies.delete(fiber));
+    return this.runner.runPromise(Fiber.await(fiber)).then((exit) => {
+      if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) report(exit.cause);
+    });
+  }
+}
+
 /**
  * The sole owner of lifecycle state and runtime registries. Dispatch publishes state before any
  * callback; cleanup captures retired resources before publication so observer reentrancy is safe.
@@ -298,9 +414,21 @@ export class TurnCoordinator {
   >();
   private idleWaiters = new Set<() => void>();
   private prepared?: { id: TurnId; controller: AbortController };
-  private thinking: ActiveTurnThinkingOverride | null = null;
+  private thinking: { holder: ActiveTurnThinkingOverride; resource?: Disposable } | null = null;
+  private readonly execution = new TurnExecution(defaultEffectRunner);
+  private readonly operations = new Map<OperationId, Disposable>();
 
   constructor(private readonly callbacks: CoordinatorCallbacks) {}
+
+  /** Attach after AgentSession initialization, including when the app scope is already closed. */
+  supervise(runner: EffectRunner, scope: Scope.Scope | undefined, shutdown: () => void): void {
+    this.execution.supervise(runner, scope, shutdown);
+  }
+
+  /** An opaque physical lease must never reserve semantic admission or change queue priority. */
+  enterExecution(): Disposable {
+    return this.execution.lease();
+  }
 
   get phase(): TurnPhase {
     return this.state.turn.phase;
@@ -330,7 +458,7 @@ export class TurnCoordinator {
     return this.state.retry != null;
   }
   get thinkingOverride(): ActiveTurnThinkingOverride | null {
-    return this.thinking;
+    return this.thinking?.holder ?? null;
   }
   isBusy(): boolean {
     return this.phase !== "idle" || this.editReserved;
@@ -360,6 +488,7 @@ export class TurnCoordinator {
       (command) => command.type === "phase" && command.next.phase === "idle"
     );
     const waiters = idle ? this.idleWaiters : undefined;
+    const retiredThinking = idle ? this.thinking : undefined;
     const retiredPrepared =
       idle && this.prepared?.id === result.state.turn.id ? this.prepared : undefined;
     if (idle) {
@@ -398,27 +527,22 @@ export class TurnCoordinator {
         }
         case "policy":
           if (this.isCurrentOperation(command.id)) {
-            // Invoke synchronously up to the policy's first await; never insert an admission gap.
-            let policy: Promise<void>;
-            try {
-              policy = this.callbacks.policy(
-                command.id,
-                command.messageId,
-                command.outcome,
-                command.started,
-                command.notifyStartup
-              );
-            } catch (error) {
-              policy = Promise.reject(error instanceof Error ? error : new Error(String(error)));
-            }
-            launchedPolicy = policy
-              .catch(this.callbacks.policyError)
-              .finally(() => {
+            launchedPolicy = this.execution.policy(
+              () =>
+                this.callbacks.policy(
+                  command.id,
+                  command.messageId,
+                  command.outcome,
+                  command.started,
+                  command.notifyStartup
+                ),
+              () => {
                 this.resolveErrorDecision(command.messageId, "terminal");
                 this.resolveCompactionDecision(command.messageId, false);
                 this.settleOperation(command.id);
-              })
-              .catch(this.callbacks.policyError);
+              },
+              this.callbacks.policyError
+            );
           }
           break;
         case "drain":
@@ -440,6 +564,7 @@ export class TurnCoordinator {
       }
     }
     for (const resolve of waiters ?? []) resolve();
+    retiredThinking?.resource?.[Symbol.dispose]();
     // Outcomes live in pure state; the registry holds resources only, including pending waiters.
     const keys = new Set(
       this.state.decisions.map((entry) => this.decisionKey(entry.kind, entry.messageId))
@@ -488,16 +613,26 @@ export class TurnCoordinator {
     this.dispatch({ type: "complete-policy", id });
   }
   acceptThinkingOverride(holder: ActiveTurnThinkingOverride, turnId: TurnId): void {
-    if (this.isCurrentTurn(turnId)) this.thinking = holder;
+    if (!this.isCurrentTurn(turnId)) return;
+    this.thinking?.resource?.[Symbol.dispose]();
+    const thinking: NonNullable<typeof this.thinking> = { holder };
+    this.thinking = thinking;
+    thinking.resource = this.execution.resource(() => {
+      if (this.thinking === thinking) this.thinking = null;
+    });
   }
   releaseThinkingOverride(holder: ActiveTurnThinkingOverride): void {
-    if (this.thinking === holder) this.thinking = null;
+    if (this.thinking?.holder === holder) this.thinking.resource?.[Symbol.dispose]();
   }
   beginShutdown(): void {
     this.dispatch({ type: "shutdown" });
   }
   dispose(): void {
-    this.dispatch({ type: "dispose" });
+    try {
+      this.dispatch({ type: "dispose" });
+    } finally {
+      this.execution.requestClose();
+    }
   }
 
   reserve(kind: ReservationKind): Disposable {
@@ -530,18 +665,22 @@ export class TurnCoordinator {
     if (this.phase === "idle") return Promise.resolve();
     return new Promise<void>((resolve, reject) => {
       const batch = this.idleWaiters;
-      const finish = () => {
-        signal?.removeEventListener("abort", abort);
-        batch.delete(finish);
-        resolve();
-      };
+      let canceled = false;
+      const finish = () => resource[Symbol.dispose]();
       const abort = () => {
-        signal?.removeEventListener("abort", abort);
-        batch.delete(finish);
-        reject(new Error("Waiting for session idle canceled."));
+        canceled = true;
+        finish();
       };
       batch.add(finish);
       signal?.addEventListener("abort", abort, { once: true });
+      // Session scope finalization also releases waiters without a future idle publication.
+      // Capture this batch: closing a retired waiter must never delete a replacement's waiter.
+      const resource = this.execution.resource(() => {
+        signal?.removeEventListener("abort", abort);
+        batch.delete(finish);
+        if (canceled) reject(new Error("Waiting for session idle canceled."));
+        else resolve();
+      });
     });
   }
 
@@ -560,8 +699,9 @@ export class TurnCoordinator {
   registerOperation(turnId: TurnId): OperationId {
     const id = Symbol("operation");
     this.settlements.set(id, Promise.withResolvers<void>());
+    this.operations.set(id, this.enterExecution());
     this.dispatch({ type: "register", id, turnId });
-    if (!this.isCurrentOperation(id)) this.settleOperation(id);
+    if (!this.isCurrentOperation(id)) this.finishStartup(id);
     return id;
   }
   configureOperation(id: OperationId, compaction: boolean): void {
@@ -603,6 +743,8 @@ export class TurnCoordinator {
   }
   finishStartup(id: OperationId): void {
     this.settleOperation(id);
+    this.operations.get(id)?.[Symbol.dispose]();
+    this.operations.delete(id);
   }
   private settleOperation(id: OperationId): void {
     this.settlements.get(id)?.resolve();
@@ -622,7 +764,8 @@ export class TurnCoordinator {
       .catch((error: unknown) => {
         this.settleOperation(id);
         this.callbacks.policyError(error);
-      });
+      })
+      .finally(() => this.finishStartup(id));
   }
 
   private decisionKey(kind: DecisionKind, messageId: string): string {

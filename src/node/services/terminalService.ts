@@ -69,6 +69,7 @@ export class TerminalService {
   private readonly headlessOnDataDisposables = new Map<string, { dispose: () => void }>();
   private readonly titleChangeDisposables = new Map<string, { dispose: () => void }>();
 
+  private shuttingDown = false;
   // Per-session activity tracking for sidebar indicator.
   // Maps sessionId -> { workspaceId, isRunning (derived from terminal title) }.
   private readonly sessionActivity = new Map<string, { workspaceId: string; isRunning: boolean }>();
@@ -233,7 +234,12 @@ export class TerminalService {
     return proxyUriEnv;
   }
 
+  beginShutdown(): void {
+    this.shuttingDown = true;
+  }
+
   async create(params: TerminalCreateParams): Promise<TerminalSession> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     // Reserve the startup synchronously: a creation that has passed its archived check but is
     // still awaiting metadata/secrets/PTY spawn is not yet in sessionActivity, so without this
     // reservation an archive's live-activity gate could pass and the pending creation would
@@ -1279,6 +1285,13 @@ export class TerminalService {
         this.cleanup(sessionId);
       }
     }
+  }
+
+  getOpenSessionCount(): number {
+    return (
+      this.sessionActivity.size +
+      Array.from(this.pendingSessionCreations.values()).reduce((sum, count) => sum + count, 0)
+    );
   }
 
   /**

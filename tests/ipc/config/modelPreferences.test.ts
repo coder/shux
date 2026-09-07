@@ -14,6 +14,20 @@ describe("config.updateModelPreferences", () => {
     }
   });
 
+  it("defaults Daybreak models to hidden and keeps independent choices across config reads", async () => {
+    const blue = "openai:daybreak-blue-latest";
+    const red = "openai:daybreak-red-latest";
+    expect((await env.orpc.config.getConfig()).hiddenModels).toEqual([blue, red]);
+
+    for (const hiddenModels of [[red], [blue], [], [blue, red]]) {
+      await env.orpc.config.updateModelPreferences({ hiddenModels });
+      const cfg = await env.orpc.config.getConfig();
+      expect(cfg.hiddenModels).toEqual(hiddenModels);
+      expect(cfg.hiddenModelsInitialized).toBe(true);
+      expect(env.config.loadConfigOrDefault().hiddenModels).toEqual(hiddenModels);
+    }
+  });
+
   it("persists model preferences", async () => {
     await env.orpc.config.updateModelPreferences({
       defaultModel: "openai:gpt-4o",

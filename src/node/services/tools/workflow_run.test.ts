@@ -1039,7 +1039,7 @@ describe("workflow_run duplicate guard", () => {
     expect(startWorkflow).not.toHaveBeenCalled();
   });
 
-  test("serializes overlapping launches so only the first creates a run", async () => {
+  test("serializes overlapping launches so only one creates a run", async () => {
     using tempDir = new TestTempDir("test-workflow-run-duplicate");
     const scriptPath = await writeWorkflowScript(tempDir.path);
     const runs: WorkflowRunRecord[] = [];
@@ -1056,7 +1056,8 @@ describe("workflow_run duplicate guard", () => {
           run: unknown;
         }) => Promise<void> | void;
       }) => {
-        const record = activeRunRecordFor(scriptPath, "wfr_first");
+        const isFirstAdmission = runs.length === 0;
+        const record = activeRunRecordFor(scriptPath, `wfr_${runs.length + 1}`);
         runs.push(record);
         await input.onRunCreated?.({
           runId: record.id,
@@ -1064,7 +1065,8 @@ describe("workflow_run duplicate guard", () => {
           result: null,
           run: record,
         });
-        await firstLaunchGate;
+        // A broken guard must fail promptly rather than block both launches forever.
+        if (isFirstAdmission) await firstLaunchGate;
         return { runId: record.id, status: "completed" as const, result: null };
       }
     );
@@ -1084,13 +1086,27 @@ describe("workflow_run duplicate guard", () => {
       args: {},
       run_in_background: false,
     };
-    const firstLaunch = Promise.resolve(tool.execute!(launchArgs, mockToolCallOptions));
-    const secondLaunch = Promise.resolve(tool.execute!(launchArgs, mockToolCallOptions));
-    // The second launch must observe the first launch's durable record even though the first
-    // is still executing in the foreground, and refuse instead of double-starting.
-    await expect(secondLaunch).rejects.toThrow(/already has an active run/);
-    releaseFirstLaunch();
-    await firstLaunch;
+    // Script reads can finish in either order. Handle both rejections immediately
+    // and assert the duplicate invariant without assuming which caller wins.
+    const launch = () =>
+      Promise.resolve()
+        .then(async () => {
+          await tool.execute!(launchArgs, mockToolCallOptions);
+        })
+        .then(
+          () => ({ status: "fulfilled" as const }),
+          (reason: unknown) => ({ status: "rejected" as const, reason })
+        );
+    const launches = [launch(), launch()];
+    const beforeRelease = await Promise.race(launches).finally(releaseFirstLaunch);
+    const outcomes = await Promise.all(launches);
+    expect(beforeRelease.status).toBe("rejected");
+    if (beforeRelease.status === "rejected") {
+      expect(beforeRelease.reason).toMatchObject({
+        message: expect.stringMatching(/already has an active run/),
+      });
+    }
+    expect(outcomes.map((outcome) => outcome.status).sort()).toEqual(["fulfilled", "rejected"]);
     expect(startWorkflow).toHaveBeenCalledTimes(1);
   });
 

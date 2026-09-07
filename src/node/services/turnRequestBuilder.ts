@@ -8,7 +8,7 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { MEMORY_INTUITION_MAX_USES_PER_TURN } from "@/common/constants/memory";
 import {
   resolveHeadlessAgentDefinition,
-  resolveHeadlessAgentModelString,
+  resolveHeadlessAgentSettings,
 } from "@/node/services/memoryConsolidationService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
@@ -1538,6 +1538,15 @@ export class TurnRequestBuilder {
         agentId: "intuition",
         resolvedFrontmatter: intuitionDefinition.frontmatter,
       });
+    const intuitionSettings = intuitionToolEligible
+      ? resolveHeadlessAgentSettings(
+          this.dependencies.config,
+          workspaceId,
+          "intuition",
+          modelString,
+          intuitionDefinition.frontmatter.ai
+        )
+      : undefined;
     const buildStreamSystemContextForToolset = (
       toolset: {
         advisorToolAvailable: boolean;
@@ -1750,11 +1759,6 @@ export class TurnRequestBuilder {
           return;
       }
     };
-    // Creation-time pricing identity for tool-created models (advisor and intuition): a
-    // Coder catalog refresh can remove/retag the instance while the tool
-    // request runs, and resolving the identity from live config at
-    // completion would price/persist the usage under a different provider.
-    const toolModelMetadataModelByModelString = new Map<string, string>();
     // Normalize: undefined -> default, null -> unlimited, positive int -> exact cap.
     const advisorMaxUses =
       cfg.advisorMaxUsesPerTurn === null
@@ -1951,7 +1955,7 @@ export class TurnRequestBuilder {
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
     // Share creation-time provider/pricing snapshots for both headless tools.
-    const createToolModel = async (ms: string) => {
+    const createToolModel = async (ms: string, toolThinkingLevel?: ThinkingLevel) => {
       const toolModelString = ms.trim();
       assert(
         toolModelString.length > 0,
@@ -1970,15 +1974,28 @@ export class TurnRequestBuilder {
       // Let the factory pin provider-level defaults (especially the OpenAI wire
       // format) without inheriting any options from the parent chat.
       const toolMuxProviderOptions: MuxProviderOptions = {};
-      const toolModel = await this.dependencies.createModel(
-        toolModelString,
-        toolMuxProviderOptions,
-        {
-          workspaceId,
-          providersConfig: toolProvidersConfig,
-          agentInitiated: true,
-        }
-      );
+      const creationOptions = {
+        workspaceId,
+        providersConfig: toolProvidersConfig,
+        agentInitiated: true,
+      };
+      // Intuition's effort can select a different model variant, not just provider
+      // options. Preserve the same provider snapshot for resolution and creation.
+      const toolModel =
+        toolThinkingLevel === undefined
+          ? await this.dependencies
+              .createModel(toolModelString, toolMuxProviderOptions, creationOptions)
+              .then((result) =>
+                result.success
+                  ? Ok({ model: result.data, effectiveModelString: undefined })
+                  : result
+              )
+          : await this.dependencies.providerModelFactory.resolveAndCreateModel(
+              toolModelString,
+              toolThinkingLevel,
+              toolMuxProviderOptions,
+              creationOptions
+            );
       if (!toolModel.success) {
         throw new Error(`Failed to create tool model: ${getErrorMessage(toolModel.error)}`);
       }
@@ -1988,20 +2005,18 @@ export class TurnRequestBuilder {
       // options derived from the raw selection (instance type)
       // would diverge from the model actually created.
       const toolEffectiveModelString =
+        toolModel.data.effectiveModelString ??
         this.dependencies.providerModelFactory.resolveEffectiveModelString(
           toolModelString,
           undefined,
           toolProvidersConfig
         );
       const toolOnCoderRoute = toolEffectiveModelString.startsWith("coder:");
-      // Creation-time identity from the SAME snapshot the model
-      // was created from (see map declaration).
-      toolModelMetadataModelByModelString.set(
-        toolModelString,
-        resolveModelForMetadata(
-          toolOnCoderRoute ? toolModelString : normalizeToCanonical(toolEffectiveModelString),
-          toolProvidersConfig
-        )
+      // Carry pricing with each creation: parallel tools can select different
+      // variants or provider snapshots for the same raw model string.
+      const metadataModel = resolveModelForMetadata(
+        toolOnCoderRoute ? toolModelString : normalizeToCanonical(toolEffectiveModelString),
+        toolProvidersConfig
       );
       // Wire-resolved identity for option construction, same
       // snapshot: a raw coder: string carries no wire info, so
@@ -2034,7 +2049,8 @@ export class TurnRequestBuilder {
         return wire ? `${wire.origin}:${wire.modelId}` : toolModelString;
       })();
       return {
-        model: toolModel.data,
+        model: toolModel.data.model,
+        metadataModel,
         optionsModelString: toolOptionsModelString,
         optionsProvidersConfig: toolOptionsProvidersConfig,
         optionsMuxProviderOptions: toolMuxProviderOptions,
@@ -2090,19 +2106,14 @@ export class TurnRequestBuilder {
             },
           }
         : {}),
-      ...(intuitionToolEligible
+      ...(intuitionSettings
         ? {
             intuitionRuntime: {
-              modelString: resolveHeadlessAgentModelString(
-                this.dependencies.config,
-                workspaceId,
-                "intuition",
-                modelString,
-                intuitionDefinition?.frontmatter.ai
-              ),
+              modelString: intuitionSettings.model,
+              thinkingLevel: intuitionSettings.thinkingLevel,
               maxUsesPerTurn: MEMORY_INTUITION_MAX_USES_PER_TURN,
               usesThisTurn: 0,
-              createModel: createToolModel,
+              createModel: (ms) => createToolModel(ms, intuitionSettings.thinkingLevel),
               resolveAgentBody: () => Promise.resolve(intuitionDefinition?.body ?? null),
               abortSignal: combinedAbortSignal,
             },
@@ -2177,7 +2188,7 @@ export class TurnRequestBuilder {
           // Prefer the creation-time identity captured when the tool model
           // was created; models not created through the tool runtime fall
           // back to live resolution (their identity is not coder-scoped).
-          const pinnedMetadataModel = toolModelMetadataModelByModelString.get(eventModel);
+          const pinnedMetadataModel = event.metadataModel;
           const metadataModel =
             pinnedMetadataModel ??
             resolveModelForMetadata(eventModel, this.dependencies.providerService.getConfig());

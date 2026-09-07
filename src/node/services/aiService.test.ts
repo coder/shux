@@ -1846,7 +1846,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       await harness.config.editConfig((cfg) => {
         cfg.agentAiDefaults = {
           ...cfg.agentAiDefaults,
-          intuition: { modelString: KNOWN_MODELS.SONNET.id, enabled: scenario.agentEnabled },
+          intuition: {
+            modelString: KNOWN_MODELS.SONNET.id,
+            enabled: scenario.agentEnabled,
+            thinkingLevel: "high",
+          },
         };
         return cfg;
       });
@@ -1877,6 +1881,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(runtime !== undefined).toBe(scenario.eligible);
       if (runtime) {
         expect(runtime.modelString).toBe(KNOWN_MODELS.SONNET.id);
+        expect(runtime.thinkingLevel).toBe("high");
         if (frontmatterDisabled !== undefined) {
           await fs.writeFile(
             definitionPath,
@@ -1918,7 +1923,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         );
         await fs.writeFile(
           path.join(agents, "private-base.md"),
-          "---\nname: Private base\nai:\n  model: private:definition-route\n---\nPrivate guidance."
+          "---\nname: Private base\nai:\n  model: private:definition-route\n  thinkingLevel: low\n---\nPrivate guidance."
         );
       }
       await harness.config.editConfig((cfg) => {
@@ -1939,13 +1944,75 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         messages: [createMuxMessage("user", "user", "hello")],
         workspaceId: metadata.id,
         modelString: selected,
+        thinkingLevel: "high",
+        experiments: { memory: true },
+      });
+      expect(result.success).toBe(true);
+      expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.thinkingLevel).toBe(
+        definitionOverride ? "low" : "off"
+      );
+      expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.modelString).toBe(
+        definitionOverride ? "private:definition-route" : selected
+      );
+    }
+  );
+
+  it.each(["off", "high"] as const)(
+    "creates Intuition's effort-dependent model variant with %s reasoning from one provider snapshot",
+    async (thinkingLevel) => {
+      using xumHome = new DisposableTempDir("ai-intuition-model-variant");
+      const metadata = createLocalWorkspaceMetadata("intuition-variant", xumHome.path);
+      const experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHome.path),
+        xumHome: xumHome.path,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+      );
+      const harness = createHarness(xumHome.path, metadata, { experimentsService });
+      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+        harness.config,
+        new MemoryMetaService(xumHome.path)
+      );
+      const providersStore = new ProvidersConfigStore(harness.config.rootDir);
+      providersStore.saveProvidersConfig({ xai: { apiKey: "test-xai-key" } });
+      await harness.config.editConfig((cfg) => ({
+        ...cfg,
+        agentAiDefaults: { intuition: { modelString: "xai:grok-4-1-fast", thinkingLevel } },
+      }));
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId: metadata.id,
+        modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
         experiments: { memory: true },
       });
       expect(result.success).toBe(true);
-      expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.modelString).toBe(
-        definitionOverride ? "private:definition-route" : selected
+      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
+      if (!runtime) throw new Error("Expected Intuition runtime");
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      const resolve = spyOn(factory, "resolveAndCreateModel").mockImplementation((...args) => {
+        // A concurrent config change must not replace the tool's creation-time snapshot.
+        providersStore.saveProvidersConfig({ xai: { enabled: false } });
+        return ProviderModelFactory.prototype.resolveAndCreateModel.apply(factory, args);
+      });
+      const created = await runtime.createModel(runtime.modelString);
+      expect(typeof created.model).not.toBe("string");
+      if (typeof created.model === "string") throw new Error("Expected model instance");
+      expect(created.model.modelId).toBe(
+        thinkingLevel === "off" ? "grok-4-1-fast-non-reasoning" : "grok-4-1-fast-reasoning"
       );
+      expect(resolve).toHaveBeenCalledWith(
+        "xai:grok-4-1-fast",
+        thinkingLevel,
+        expect.anything(),
+        expect.objectContaining({
+          workspaceId: metadata.id,
+          agentInitiated: true,
+          providersConfig: { xai: { apiKey: "test-xai-key" } },
+        })
+      );
+      expect(created.optionsProvidersConfig?.xai?.isEnabled).toBe(true);
     }
   );
 
@@ -2792,6 +2859,71 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(typeof sessionUsageDeltaRecord.timestamp).toBe("number");
   });
 
+  it("keeps pricing identities independent for overlapping Advisor and Intuition creations of the same model", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-invocation-pricing");
+    const metadata = createLocalWorkspaceMetadata("tool-invocation-pricing", xumHome.path);
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(xumHome.path),
+      xumHome: xumHome.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+    );
+    const harness = createHarness(xumHome.path, metadata, { experimentsService });
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
+    );
+    const model = "xai:grok-4-1-fast";
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      xai: { apiKey: "test-key" },
+    });
+    await enableAdvisorForHarness(harness, model);
+    await harness.config.editConfig((cfg) => ({
+      ...cfg,
+      agentAiDefaults: {
+        ...cfg.agentAiDefaults,
+        intuition: { modelString: model, thinkingLevel: "high" },
+      },
+    }));
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("user", "user", "hello")],
+      workspaceId: metadata.id,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      experiments: { advisorTool: true, memory: true },
+    });
+    expect(result.success).toBe(true);
+    const tools = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+    if (!tools?.advisorRuntime || !tools.intuitionRuntime || !tools.reportModelUsage)
+      throw new Error("Expected both tool runtimes");
+    const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+    spyOn(factory, "resolveAndCreateModel").mockImplementation(
+      ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
+    );
+    const advisor = await tools.advisorRuntime.createModel(model);
+    const intuition = await tools.intuitionRuntime.createModel(model);
+    const streamManager = Reflect.get(harness.service, "streamManager") as StreamManager;
+    const record = spyOn(streamManager, "recordToolModelUsage");
+    for (const [toolName, created] of [
+      ["advisor", advisor],
+      ["intuition", intuition],
+    ] as const) {
+      tools.reportModelUsage({
+        source: "tool",
+        toolName,
+        model,
+        metadataModel: created.metadataModel,
+        usage: { inputTokens: 120, outputTokens: 45, totalTokens: 165 },
+        timestamp: 1,
+      });
+    }
+    expect(record.mock.calls.map((call) => call[2].metadataModel)).toEqual([
+      model,
+      "xai:grok-4-1-fast-reasoning",
+    ]);
+  });
+
   it.each(["advisor", "intuition"] as const)(
     "records API-equivalent costs for %s tool usage through Codex OAuth",
     async (toolName) => {
@@ -2864,9 +2996,17 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const runtime =
         toolName === "advisor" ? toolConfig.advisorRuntime : toolConfig.intuitionRuntime;
       if (!runtime) throw new Error(`Expected ${toolName} runtime`);
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      const resolveModel = spyOn(factory, "resolveAndCreateModel").mockImplementation(
+        ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
+      );
       const createModel = spyOn(harness.service, "createModel");
-      await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
-      expect(createModel.mock.calls.at(-1)?.[2]).toMatchObject({
+      const created = await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const creationOptions =
+        toolName === "advisor"
+          ? createModel.mock.calls.at(-1)?.[2]
+          : resolveModel.mock.calls.at(-1)?.[3];
+      expect(creationOptions).toMatchObject({
         agentInitiated: true,
         workspaceId,
       });
@@ -2888,6 +3028,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         source: "tool",
         toolName,
         model: KNOWN_MODELS.GPT_53_CODEX.id,
+        metadataModel: created.metadataModel,
         usage: {
           inputTokens: 120,
           outputTokens: 45,

@@ -307,9 +307,9 @@ interface AiDefaultsControlsProps {
   reasoningModeValue: OpenAIReasoningMode;
   reasoningModeInherited?: boolean;
   modelCapabilitiesDeferred?: boolean;
+  applyMinimumThinkingLevel?: boolean;
   /** Forwarded to the picker; false hides the Pro toggle (e.g. Dream, whose requests never apply reasoningMode). */
   allowProMode?: boolean;
-  modelOnly?: boolean;
   effectiveModel: string | undefined;
   models: string[];
   hiddenModelsForSelector: string[];
@@ -352,42 +352,41 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
         </div>
       </div>
 
-      {!props.modelOnly && (
-        <div className="space-y-1">
-          <div className="text-muted text-xs">Reasoning</div>
-          <div className="flex items-center gap-2">
-            {/* Shared composer picker so settings inherit the same features
-              (route-aware Pro mode, provider Fast mode) as the chat input. */}
-            <ThinkingSelectorControl
-              modelString={props.effectiveModel}
-              modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
-              thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
-              onThinkingLevelChange={(level) => props.onThinkingChange(level)}
-              reasoningMode={props.reasoningModeValue}
-              reasoningModeInherited={props.reasoningModeInherited}
-              onReasoningModeChange={props.onReasoningModeChange}
-              allowProMode={props.allowProMode}
-              variant="box"
-              inheritOption={{
-                label: inheritLabel,
-                selected: props.thinkingValue === INHERIT,
-                onSelect: () => props.onThinkingChange(INHERIT),
-              }}
-            />
-            {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="h-9 px-2"
-                onClick={() => props.onThinkingChange(INHERIT)}
-              >
-                Reset
-              </Button>
-            ) : null}
-          </div>
+      <div className="space-y-1">
+        <div className="text-muted text-xs">Reasoning</div>
+        <div className="flex items-center gap-2">
+          {/* Shared composer picker so settings inherit the same features
+            (route-aware Pro mode, provider Fast mode) as the chat input. */}
+          <ThinkingSelectorControl
+            modelString={props.effectiveModel}
+            modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
+            applyMinimumThinkingLevel={props.applyMinimumThinkingLevel}
+            thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
+            onThinkingLevelChange={(level) => props.onThinkingChange(level)}
+            reasoningMode={props.reasoningModeValue}
+            reasoningModeInherited={props.reasoningModeInherited}
+            onReasoningModeChange={props.onReasoningModeChange}
+            allowProMode={props.allowProMode}
+            variant="box"
+            inheritOption={{
+              label: inheritLabel,
+              selected: props.thinkingValue === INHERIT,
+              onSelect: () => props.onThinkingChange(INHERIT),
+            }}
+          />
+          {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-9 px-2"
+              onClick={() => props.onThinkingChange(INHERIT)}
+            >
+              Reset
+            </Button>
+          ) : null}
         </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -870,7 +869,6 @@ export function TasksSection() {
 
   const renderAgentDefaults = (agent: AgentDefinitionDescriptor) => {
     const entry = agentAiDefaults[agent.id];
-    const modelOnly = agent.id === "intuition";
     const modelValue = entry?.modelString ?? INHERIT;
     const thinkingValue = entry?.thinkingLevel ?? INHERIT;
     const enabledOverride = entry?.enabled;
@@ -907,7 +905,8 @@ export function TasksSection() {
     // a base-chain model wins over the ambient default (otherwise an agent
     // inheriting GPT-5.6+pro from its base would hide the Pro toggle whenever
     // the ambient model isn't pro-capable).
-    const inheritedDefaults = resolveBaseChainDefaults(agent.id);
+    // Intuition resolves without ancestors, falling back to the parent turn's model.
+    const inheritedDefaults = agent.id === "intuition" ? {} : resolveBaseChainDefaults(agent.id);
     const effectiveModel =
       modelValue !== INHERIT
         ? modelValue
@@ -1004,7 +1003,7 @@ export function TasksSection() {
                 </Button>
               ) : null}
             </div>
-            {advisorToolEnabled && !modelOnly ? (
+            {advisorToolEnabled && agent.id !== "intuition" ? (
               <div className="flex items-center gap-3">
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -1040,8 +1039,8 @@ export function TasksSection() {
           thinkingValue={thinkingValue}
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
           allowProMode={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
-          // Intuition is model-only; persisted thinking values never affect its requests.
-          modelOnly={modelOnly}
+          // Intuition clamps to model capabilities, not the chat's minimum effort.
+          applyMinimumThinkingLevel={agent.id !== "intuition"}
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}

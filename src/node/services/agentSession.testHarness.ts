@@ -131,7 +131,10 @@ function createMockAiService(args?: {
   return { aiEmitter, aiService };
 }
 
-export interface AgentSessionHarnessOptions {
+export interface AgentSessionHarnessOptions extends Pick<
+  ConstructorParameters<typeof AgentSession>[0],
+  "effectRunner" | "appFiberScope"
+> {
   workspaceId: string;
   config?: Config;
   historyService?: HistoryService;
@@ -181,6 +184,8 @@ export async function createAgentSessionHarness(
     createMockBackgroundProcessManager(options.backgroundProcessManagerOverrides);
 
   const session = new AgentSession({
+    effectRunner: options.effectRunner,
+    appFiberScope: options.appFiberScope,
     workspaceId: options.workspaceId,
     config,
     historyService,

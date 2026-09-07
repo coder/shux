@@ -2195,6 +2195,27 @@ exit 1
     }
   });
 
+  describe("beginShutdown", () => {
+    it("refuses new project mutations once teardown starts", async () => {
+      const projectPath = path.join(tempDir, "late-project");
+      await fs.mkdir(projectPath);
+      service.beginShutdown();
+
+      const outcomes = await Promise.allSettled([
+        service.create(projectPath),
+        service.gitInit(projectPath),
+        service.remove(projectPath),
+        service.cloneWithProgress({ repoUrl: "https://example.invalid/repo.git" }).next(),
+      ]);
+      expect(
+        outcomes.map((outcome) =>
+          outcome.status === "rejected" ? String(outcome.reason) : "fulfilled"
+        )
+      ).toEqual(Array<string>(4).fill("Error: Server is shutting down"));
+      expect(service.getMutationCount()).toBe(0);
+    });
+  });
+
   describe("gitInit", () => {
     it("initializes git repo in non-git directory with initial commit", async () => {
       const testDir = path.join(tempDir, "new-project");

@@ -159,7 +159,7 @@ export const Phone: AppStory = {
   },
 };
 
-export const ModelOnlySettings: AppStory = {
+export const ReasoningSettings: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
@@ -200,20 +200,46 @@ export const ModelOnlySettings: AppStory = {
     await expect(within(card).getAllByRole("switch")).toHaveLength(1);
     await expect(within(card).queryByLabelText("Toggle intuition advisor")).toBeNull();
     await expect(canvas.getByLabelText("Toggle name_workspace advisor")).toBeInTheDocument();
-    await expect(within(card).queryByRole("button", { name: "Reasoning" })).toBeNull();
-    await expect(within(card).queryByText("Reasoning")).toBeNull();
+    const reasoning = within(card).getByRole("button", { name: "Reasoning" });
+    await expect(reasoning).toHaveTextContent("High");
+    await userEvent.click(reasoning);
+    await expect(within(card).queryByRole("button", { name: /Pro mode/ })).toBeNull();
+    await userEvent.click(within(card).getByRole("option", { name: "Medium" }));
+    await expect(reasoning).toHaveTextContent("Medium");
+    await userEvent.click(within(card).getByRole("option", { name: "Inherit" }));
+    await expect(reasoning).toHaveTextContent("Inherit");
+    await userEvent.click(within(card).getByRole("option", { name: "High" }));
+    await expect(reasoning).toHaveTextContent("High");
+    await userEvent.click(reasoning);
+    await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth + 1);
   },
 };
 
-export const ModelOnlySettingsPhone: AppStory = {
-  ...ModelOnlySettings,
+export const ReasoningSettingsPhone: AppStory = {
+  ...ReasoningSettings,
   play: async (context) => {
-    await ModelOnlySettings.play!(context);
+    // CI's test-runner ignores viewport globals and Pixel variants. It must not
+    // count the desktop interaction as phone coverage; manager/Pixel run it at 390px.
+    if (window.innerWidth > 390) return;
+    const width = context.canvasElement.getBoundingClientRect().width;
+    await expect(width).toBeGreaterThan(0);
+    await expect(width).toBeLessThanOrEqual(390);
+    await ReasoningSettings.play!(context);
   },
-  decorators: [PhoneDecorator],
-  globals: { viewport: { value: "mobile1", isRotated: false } },
+  // Settings uses viewport media queries; a fixed-width wrapper at the runner's
+  // desktop viewport would squeeze its desktop sidebar into the phone width.
+  globals: { viewport: { value: "phone", isRotated: false } },
   parameters: {
     ...appMeta.parameters,
+    viewport: {
+      options: {
+        phone: {
+          name: "Phone",
+          styles: { width: "390px", height: "844px" },
+          type: "mobile",
+        },
+      },
+    },
     pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
   },
 };

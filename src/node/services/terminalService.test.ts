@@ -493,7 +493,9 @@ describe("TerminalService", () => {
     await service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
     closeSessionMock.mockClear();
 
+    expect(service.getOpenSessionCount()).toBe(1);
     service.closeAllSessions();
+    expect(service.getOpenSessionCount()).toBe(0);
 
     expect(closeSessionMock).toHaveBeenCalled();
     // PTY bulk close should NOT be used

@@ -397,6 +397,8 @@ export class ProjectService {
   private readonly fileCompletionsCache = new Map<string, FileCompletionsCacheEntry>();
   /** Canonical paths with git initialization in flight; see create() claim below. */
   private readonly activeGitInits = new Set<string>();
+  private activeClones = 0;
+  private shuttingDown = false;
   private directoryPicker?: (initialPath?: string | null) => Promise<string | null>;
   private readonly sshPromptService: SshPromptService | undefined;
   private workspaceService?: WorkspaceRemover;
@@ -475,6 +477,7 @@ export class ProjectService {
     options: { initGit?: boolean; displayName?: string } | undefined,
     lock: ProjectRegistrationLockHandle | null
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     let gitInitClaimKey: string | null = null;
     try {
       // Validate input
@@ -932,7 +935,30 @@ export class ProjectService {
     }
   }
 
+  /** Clones and git inits in flight; a restart between them would leave a partial project. */
+  getMutationCount(): number {
+    return this.activeClones + this.activeGitInits.size;
+  }
+
+  /** A mutation admitted during teardown would be killed half-done by the exit that follows. */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+  }
+
   async *cloneWithProgress(
+    input: CloneProjectParams,
+    signal?: AbortSignal
+  ): AsyncGenerator<CloneEvent> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
+    this.activeClones++;
+    try {
+      yield* this.cloneWithProgressTracked(input, signal);
+    } finally {
+      this.activeClones--;
+    }
+  }
+
+  private async *cloneWithProgressTracked(
     input: CloneProjectParams,
     signal?: AbortSignal
   ): AsyncGenerator<CloneEvent> {
@@ -1347,6 +1373,7 @@ export class ProjectService {
   }
 
   async remove(projectPath: string, force = false): Promise<Result<void, ProjectRemoveError>> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     try {
       const normalizedPath = stripTrailingSlashes(projectPath);
       let config = this.config.loadConfigOrDefault();
@@ -1744,6 +1771,7 @@ export class ProjectService {
    * Also handles "unborn" repos (git init already run but no commits yet).
    */
   async gitInit(projectPath: string): Promise<Result<void>> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     if (typeof projectPath !== "string" || projectPath.trim().length === 0) {
       return Err("Project path is required");
     }
