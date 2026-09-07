@@ -1152,15 +1152,15 @@ describe("session_history real disk recovery", () => {
         JSON.stringify(createMuxMessage("legacy-item", "assistant", "legacy facts")) +
         "\n"
     );
-    const windows = (await pages({ action: "list_windows", limit: 1 }))
-      .flatMap((page) => page.windows ?? [])
-      .map((window) => window.windowId);
+    const windows = (await pages({ action: "list_windows", limit: 1 })).flatMap(
+      (page) => page.windows ?? []
+    );
     expect(windows).toEqual([
-      "w:0",
-      `w:${String(compact.metadata!.historySequence)}`,
-      `w:${String(heartbeat.metadata!.historySequence)}`,
-      `w:${String(roll.metadata!.historySequence)}`,
-      "w:m:legacy-boundary",
+      { windowId: "w:0", boundaryKind: "root" },
+      { windowId: `w:${String(compact.metadata!.historySequence)}`, boundaryKind: "compaction" },
+      { windowId: `w:${String(heartbeat.metadata!.historySequence)}`, boundaryKind: "compaction" },
+      { windowId: `w:${String(roll.metadata!.historySequence)}`, boundaryKind: "reset" },
+      { windowId: "w:m:legacy-boundary", boundaryKind: "compaction" },
     ]);
     expect((await call({ action: "read_item", item_id: "m:legacy-item" })).items?.[0]?.text).toBe(
       "legacy facts"
@@ -1175,6 +1175,58 @@ describe("session_history real disk recovery", () => {
       ).items?.map((item) => item.text)
     ).toEqual(["recent facts"]);
   });
+
+  for (const readable of [true, false]) {
+    test.each([1, SESSION_HISTORY_MAX_SCAN_ROWS - 2])(
+      `post-reset windows retain only verified boundary metadata (readable: ${readable}, rows: %s)`,
+      async (tailLength) => {
+        const reset = readable
+          ? JSON.stringify(
+              createMuxMessage("manual-reset", "assistant", "", {
+                contextBoundaryKind: "reset",
+                historySequence: 42,
+              })
+            )
+          : '{"metadata":{"contextBoundaryKind":"reset"},broken';
+        await appendTrackedHistory(
+          chatPath,
+          [
+            reset,
+            ...Array.from({ length: tailLength }, (_, index) =>
+              JSON.stringify(createMuxMessage(`post-reset-${index}`, "assistant", "public facts"))
+            ),
+            JSON.stringify(
+              createMuxMessage("later-compaction", "assistant", "public summary", {
+                compacted: true,
+                compactionBoundary: true,
+                compactionEpoch: 1,
+                historySequence: 1000,
+              })
+            ),
+          ].join("\n") + "\n"
+        );
+        const listed = await pages({ action: "list_windows", limit: 1 });
+        if (tailLength > 1) {
+          // The reverse scan reaches its row cap at the floor; its boundary
+          // metadata must survive the signed cursor before any browse row runs.
+          expect(listed[0].windows).toEqual([]);
+          expect(listed[0].nextCursor).toBeString();
+        }
+        expect(listed.flatMap((page) => page.windows ?? [])).toEqual([
+          { windowId: readable ? "w:42" : "w:0", boundaryKind: readable ? "reset" : "root" },
+          { windowId: "w:1000", boundaryKind: "compaction" },
+        ]);
+        expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+          "item_not_found"
+        );
+        expect(
+          (await pages({ action: "search", query: "opening facts" })).flatMap(
+            (page) => page.items ?? []
+          )
+        ).toEqual([]);
+      }
+    );
+  }
 
   test("plain manual reset is a privacy floor even for arbitrary IDs and multi-page floor discovery", async () => {
     const hidden = await append("hidden", "private-before-reset");

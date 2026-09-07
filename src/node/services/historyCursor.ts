@@ -2,6 +2,7 @@ import {
   SESSION_HISTORY_MAX_ID_CHARS,
   SESSION_HISTORY_RESET_PROBE_CHARS,
 } from "@/common/constants/contextBudget";
+import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
@@ -43,6 +44,7 @@ export const HistoryScanStateSchema = z
     anchorSequence: offset.nullable(),
     // null means an unaddressable persisted window, not an alias for the root.
     windowId: z.string().refine(isHistoryIdentifierRepresentable).nullable(),
+    windowBoundaryKind: z.nativeEnum(CONTEXT_BOUNDARY_KINDS).nullable(),
     windowPending: z.boolean(),
     appendCheck: z
       .object({

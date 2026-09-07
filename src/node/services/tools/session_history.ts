@@ -14,7 +14,6 @@ import {
   SESSION_HISTORY_MAX_RESULT_BYTES,
 } from "@/common/constants/contextBudget";
 import { getHistoryItemId } from "@/common/utils/messages/contextWindows";
-import { getContextBoundaryKind } from "@/common/utils/messages/compactionBoundary";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { Config } from "@/node/config";
@@ -143,13 +142,13 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             : null;
         const scan = await history.scanHistoryBounded(workspaceId, {
           cursor: args.cursor != null ? decodeHistoryCursor(args.cursor, binding) : undefined,
-          visit: ({ message, itemId, windowId, startsWindow }) => {
+          visit: ({ message, itemId, windowId, windowBoundaryKind, startsWindow }) => {
             if (args.action === "list_windows") {
               if (!startsWindow) return true;
               if (args.window_id != null && args.window_id !== windowId) return true;
               if (windows.at(-1)?.windowId === windowId) return true;
               if (windows.length >= limit) return false;
-              windows.push({ windowId, boundaryKind: getContextBoundaryKind(message) ?? "root" });
+              windows.push({ windowId, boundaryKind: windowBoundaryKind ?? "root" });
               if (byteLength() > payloadBudget) {
                 windows.pop();
                 return false;

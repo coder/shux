@@ -15,7 +15,10 @@ import {
 } from "@/common/constants/contextBudget";
 import type { MuxMessage } from "@/common/types/message";
 import { getContextWindowId, isManualHistoryReset } from "@/common/utils/messages/contextWindows";
-import { isDurableContextBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
+import {
+  getContextBoundaryKind,
+  isDurableContextBoundaryMarker,
+} from "@/common/utils/messages/compactionBoundary";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
 import {
   isHistoryIdentifierRepresentable,
@@ -376,6 +379,7 @@ export interface BoundedHistoryRow {
   /** Exact row, stable across certified EOF appends with an unchanged prefix, not rewrites/rotation. */
   itemId: string;
   windowId: string;
+  windowBoundaryKind: HistoryScanState["windowBoundaryKind"];
   startsWindow: boolean;
 }
 export interface BoundedHistoryScanOptions {
@@ -498,6 +502,7 @@ export async function scanHistoryFilesBounded(
           archiveWatermark: -1,
           anchorSequence: null,
           windowId: "w:0",
+          windowBoundaryKind: null,
           windowPending: true,
           appendCheck: null,
         };
@@ -702,7 +707,13 @@ export async function scanHistoryFilesBounded(
       const artifact = state.artifact;
       const reverse = state.phase === "floor";
       const end = state.snapshots[artifact].endOffsetSnapshot;
-      let floor: { offset: number; windowId: string | null } | undefined;
+      let floor:
+        | {
+            offset: number;
+            windowId: string | null;
+            windowBoundaryKind: HistoryScanState["windowBoundaryKind"];
+          }
+        | undefined;
       const completed = await scan(
         artifact,
         state,
@@ -718,7 +729,11 @@ export async function scanHistoryFilesBounded(
             if (isManualHistoryReset(message, possibleReset)) {
               // Corrupt reset rows are privacy floors even when they parse or
               // carry a partial rollover tag. Only a validated rollover is exempt.
-              floor = { offset: finish, windowId: message ? boundedWindowId(message) : "w:0" };
+              floor = {
+                offset: finish,
+                windowId: message ? boundedWindowId(message) : "w:0",
+                windowBoundaryKind: getContextBoundaryKind(message ?? undefined),
+              };
               return false;
             }
             return true;
@@ -730,9 +745,9 @@ export async function scanHistoryFilesBounded(
             Number.isSafeInteger(sequence) && sequence! >= 0 ? sequence! : null;
           // Repaired/imported rows may reuse archived sequences with different
           // identities or payloads. Retain possible replays without exact proof.
-          const windowId = isDurableContextBoundaryMarker(message)
-            ? boundedWindowId(message)
-            : state.windowId;
+          const boundaryKind = getContextBoundaryKind(message);
+          const windowId = boundaryKind ? boundedWindowId(message) : state.windowId;
+          const windowBoundaryKind = boundaryKind ?? state.windowBoundaryKind;
           // Consume unaddressable windows without persisting oversized IDs in
           // cursors or silently assigning their rows to a different window.
           if (
@@ -741,11 +756,13 @@ export async function scanHistoryFilesBounded(
               message,
               itemId: `r:${state.provenanceEpoch}:${artifact}:${start}:${createHash("sha256").update(raw).digest("hex")}`,
               windowId,
-              startsWindow: state.windowPending || isDurableContextBoundaryMarker(message),
+              windowBoundaryKind,
+              startsWindow: state.windowPending || boundaryKind !== null,
             })
           )
             return false;
           state.windowId = windowId;
+          state.windowBoundaryKind = windowBoundaryKind;
           state.windowPending = false;
           state.anchorSequence = anchorSequence;
           return true;
@@ -756,6 +773,9 @@ export async function scanHistoryFilesBounded(
         state.phase = "browse";
         state.byteOffset = floor.offset;
         state.windowId = floor.windowId;
+        // Browsing excludes the reset row itself; preserve its verified kind
+        // alongside its ID even when the first visible row is on another page.
+        state.windowBoundaryKind = floor.windowBoundaryKind;
         state.windowPending = true;
         state.skippingOversized = false;
         state.oversizedRowEnd = null;
