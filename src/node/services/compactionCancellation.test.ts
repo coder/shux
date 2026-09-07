@@ -1,3 +1,5 @@
+import { writeFile } from "node:fs/promises";
+import { COMPACTION_CANCELLATION_FILE } from "@/common/constants/compactionCancellation";
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { CompactionCancellation } from "./compactionCancellation";
 import { createTestHistoryService } from "./testHistoryService";
@@ -227,6 +229,114 @@ test("refreshing a foreign nonce does not reactivate settled mutation debt", asy
       current
     );
   } finally {
+    await h.cleanup();
+  }
+});
+
+test("corrupt-read repair preserves a newer valid foreign cancellation", async () => {
+  const h = await createTestHistoryService();
+  const workspaceId = "cancel-corrupt-race";
+  await h.historyService.appendToHistory(workspaceId, createMuxMessage("user", "user", "work"));
+  await writeFile(`${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`, "{");
+  const state = new CompactionCancellation(h.historyService, workspaceId);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const repair = h.historyService.repairCompactionCancellation.bind(h.historyService);
+  spyOn(h.historyService, "repairCompactionCancellation").mockImplementationOnce(
+    async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return repair(...args);
+    }
+  );
+  const pending = state.read();
+  try {
+    await entered.promise;
+    const foreign = new CompactionCancellation(new HistoryService(h.config), workspaceId);
+    await foreign.cancel();
+    const newer = await foreign.read();
+    release.resolve();
+    expect(await pending).toEqual(newer);
+    expect(await new HistoryService(h.config).readCompactionCancellation(workspaceId)).toEqual(
+      newer
+    );
+  } finally {
+    release.resolve();
+    await pending;
+    await h.cleanup();
+  }
+});
+
+test.each(["publication", "retirement"] as const)(
+  "corrupt shared bytes cannot discard local cancellation %s debt",
+  async (mutation) => {
+    const h = await createTestHistoryService();
+    const workspaceId = "cancel-corrupt-debt";
+    await h.historyService.appendToHistory(workspaceId, createMuxMessage("user", "user", "work"));
+    const state = new CompactionCancellation(h.historyService, workspaceId);
+    await state.cancel();
+    const original = await state.read();
+    if (!original) throw new Error("Expected cancellation");
+    spyOn(h.historyService, "writeCompactionCancellation").mockRejectedValueOnce(
+      new Error("write unavailable")
+    );
+    await (mutation === "publication" ? state.cancel() : state.retire(original.nonce)).catch(
+      () => undefined
+    );
+    const owned = await state.read();
+    await writeFile(`${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`, "{");
+    const repair = spyOn(h.historyService, "repairCompactionCancellation");
+    try {
+      expect(await state.read()).toEqual(owned);
+      expect(state.needsPersistence).toBe(true);
+      expect(repair).not.toHaveBeenCalled();
+    } finally {
+      await h.cleanup();
+    }
+  }
+);
+
+test("a local Stop during corrupt repair prevents its obsolete history commit", async () => {
+  const h = await createTestHistoryService();
+  const workspaceId = "cancel-corrupt-local";
+  await h.historyService.appendToHistory(
+    workspaceId,
+    createMuxMessage("summary", "assistant", "work", {
+      muxMetadata: {
+        type: "compaction-summary",
+        pendingFollowUp: { text: "Continue", model: "openai:gpt-4o", agentId: "exec" },
+      },
+    })
+  );
+  await writeFile(`${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`, "{");
+  const state = new CompactionCancellation(h.historyService, workspaceId);
+  const writes = h.historyService as unknown as {
+    writeGuardedHistory(path: string, contents: string, guard: () => boolean): Promise<boolean>;
+  };
+  const write = writes.writeGuardedHistory.bind(writes);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  spyOn(writes, "writeGuardedHistory").mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return write(...args);
+  });
+  const pending = state.read();
+  try {
+    await entered.promise;
+    const stop = state.cancel();
+    const newer = await state.read();
+    release.resolve();
+    expect(await pending).toEqual(newer);
+    await stop;
+    const freshHistory = new HistoryService(h.config);
+    expect(await freshHistory.readCompactionCancellation(workspaceId)).toEqual(newer);
+    const rows = await freshHistory.getLastMessages(workspaceId, 1);
+    expect(rows.success && rows.data[0].metadata?.muxMetadata).toHaveProperty("pendingFollowUp");
+  } finally {
+    release.resolve();
+    await pending;
+    await state.flush();
     await h.cleanup();
   }
 });

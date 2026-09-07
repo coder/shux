@@ -19,10 +19,18 @@ export const CompactionCancellationSchema = z.object({
 });
 export type CompactionCancellationRecord = z.infer<typeof CompactionCancellationSchema>;
 
+/** Only successfully read bytes with invalid JSON/schema may enter automatic repair. */
+export class MalformedCompactionCancellationError extends Error {
+  constructor(readonly contents: Uint8Array) {
+    super("Malformed compaction cancellation record");
+  }
+}
+
 /** Cancellation publication survives failed preparation, independently of turn admission epochs. */
 export class CompactionCancellation {
   private current: CompactionCancellationRecord | null | undefined;
   private generation = 0;
+  private repairedHistoryRevision = 0;
   private pending: Promise<void> = Promise.resolve();
   private unsettled = false;
   private mutation?: { record: CompactionCancellationRecord | null; retiredNonce?: string };
@@ -36,6 +44,10 @@ export class CompactionCancellation {
     return this.unsettled;
   }
 
+  get repairRevision(): number {
+    return this.repairedHistoryRevision;
+  }
+
   async read(): Promise<CompactionCancellationRecord | null> {
     // Other backends can publish Stop after a previous read (including absence).
     // Local in-flight/failed mutations still own their conservative exclusion.
@@ -44,7 +56,14 @@ export class CompactionCancellation {
     const mutation = this.mutation;
     const isCurrent = () => generation === this.generation && mutation === this.mutation;
     try {
-      const record = await this.history.readCompactionCancellation(this.workspaceId);
+      const record = await this.history
+        .readCompactionCancellation(this.workspaceId)
+        .catch((error: unknown) => {
+          if (!(error instanceof MalformedCompactionCancellationError) || !isCurrent()) throw error;
+          return this.history.repairCompactionCancellation(this.workspaceId, isCurrent, () => {
+            this.repairedHistoryRevision++;
+          });
+        });
       if (isCurrent()) this.current = record;
     } catch (error) {
       // An obsolete read must not trigger explicit repair over a newer local Stop.

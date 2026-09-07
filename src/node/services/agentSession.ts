@@ -8296,6 +8296,7 @@ export class AgentSession {
     summaryMessageId?: string,
     cancelResume?: () => boolean
   ): Promise<boolean | "deferred"> {
+    const repairRevision = this.compactionCancellation.repairRevision;
     let summaryMessage: MuxMessage | undefined;
     if (summaryMessageId) {
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(
@@ -8389,6 +8390,9 @@ export class AgentSession {
         await this.clearPendingFollowUpFromSummary(lastMessage, token);
       return false;
     }
+    // A repairing read may have removed this captured follow-up from history.
+    // Its now-absent fence cannot authorize the stale request we read before repair.
+    if (repairRevision !== this.compactionCancellation.repairRevision) return false;
     if (cancellation && this.compactionCancellation.matches(cancellation, lastMessage)) {
       await this.clearPendingFollowUpFromSummary(lastMessage, token);
       return false;
@@ -8530,6 +8534,7 @@ export class AgentSession {
     // Ordinary durable follow-ups reconstruct the interrupted request and precede
     // queued input. Optional/goal/requireIdle continuations yield to manual work.
     const followUpAdmissionStale = () =>
+      repairRevision !== this.compactionCancellation.repairRevision ||
       !this.coordinator.isCurrentCompaction(token) ||
       idleRuleStale?.() === true ||
       goalAdmissionStale?.() === true ||

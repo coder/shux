@@ -1,4 +1,5 @@
-import { writeFile } from "node:fs/promises";
+import * as fs from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { COMPACTION_CANCELLATION_FILE } from "@/common/constants/compactionCancellation";
 import type { ContinuousCompactor } from "./continuousCompactor";
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
@@ -964,26 +965,260 @@ test("an exact cancellation survives failed summary writes across a fresh servic
   }
 });
 
-test("an unreadable cancellation blocks journal and follow-up startup recovery", async () => {
+test.each(["{", JSON.stringify({ version: 1, nonce: "broken", scope: {} })])(
+  "malformed cancellation %s self-heals before automatic startup recovery",
+  async (malformed) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(workspaceId, summary());
+    const sessionDir = `${h.config.sessionsDir}/${workspaceId}`;
+    await writeFile(`${sessionDir}/${COMPACTION_CANCELLATION_FILE}`, malformed);
+    const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
+    await writeFile(journal.path, "untrusted interrupted journal");
+    const compactor = (h.session as unknown as { continuousCompactor: ContinuousCompactor })
+      .continuousCompactor;
+    const recoverJournal = compactor.recover.bind(compactor);
+    const recover = spyOn(compactor, "recover").mockImplementation(async () => {
+      // The old journal must be gone before normal recovery can inspect it.
+      expect(await journal.exists()).toBe(false);
+      return recoverJournal();
+    });
+    const recoverGoal = spyOn(h.goalService, "recoverPendingDispatchAfterRestart");
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      await h.session.runStartupRecovery();
+      expect(recoverGoal).toHaveBeenCalledTimes(1);
+      expect(recover).toHaveBeenCalledTimes(1);
+      expect(stream).not.toHaveBeenCalled();
+      const freshHistory = new HistoryService(h.config);
+      expect(await freshHistory.readCompactionCancellation(workspaceId)).toBeNull();
+      expect(await freshHistory.getContinuousCompactionJournal(workspaceId).exists()).toBe(false);
+      const rows = await freshHistory.getLastMessages(workspaceId, 1);
+      expect(rows.success && rows.data[0].metadata?.muxMetadata).not.toHaveProperty(
+        "pendingFollowUp"
+      );
+      const files = await readdir(sessionDir);
+      const preserved = await Promise.all(
+        files.map((file) => readFile(`${sessionDir}/${file}`, "utf8").catch(() => ""))
+      );
+      expect(preserved).toContain(malformed);
+      await expectNoRecovery(h.config, freshHistory);
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each([
+  [false, false],
+  [true, false],
+  [false, true],
+  [true, true],
+] as const)(
+  "direct follow-up dispatch discards its pre-repair summary (targeted=%s, during history=%s)",
+  async (targeted, duringHistory) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(workspaceId, summary());
+    await writeFile(`${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`, "{");
+    if (duringHistory) {
+      if (targeted) {
+        const read = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);
+        spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(
+          async (...args) => {
+            const captured = await read(...args);
+            await h.session.getCompactionCancellationNonce();
+            return captured;
+          }
+        );
+      } else {
+        const read = h.historyService.getLastMessages.bind(h.historyService);
+        spyOn(h.historyService, "getLastMessages").mockImplementationOnce(async (...args) => {
+          const captured = await read(...args);
+          await h.session.getCompactionCancellationNonce();
+          return captured;
+        });
+      }
+    }
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      expect(await h.internals.dispatchPendingFollowUp(targeted ? "summary" : undefined)).toBe(
+        false
+      );
+      expect(stream).not.toHaveBeenCalled();
+      const rows = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(rows.success && rows.data.some((row) => row.role === "user")).toBe(false);
+      expect(rows.success && rows.data[0].metadata?.muxMetadata).not.toHaveProperty(
+        "pendingFollowUp"
+      );
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(["goal admission", "preparation", "row persistence"] as const)(
+  "late repair during %s invalidates an unaccepted follow-up",
+  async (stage) => {
+    const h = await setup();
+    const boundary = summary();
+    if (stage === "goal admission") {
+      boundary.metadata = {
+        ...boundary.metadata,
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Continue",
+            ...options,
+            goalKind: "goal_continuation",
+            goalId: "00000000-0000-4000-8000-000000000001",
+          },
+        },
+      };
+    }
+    await h.historyService.appendToHistory(workspaceId, boundary);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    if (stage === "goal admission") {
+      spyOn(h.goalService, "buildGoalRedispatchAdmission").mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        return { admissible: true, admissionStale: () => false };
+      });
+    } else if (stage === "preparation") {
+      const pricing = h.goalService.assertPricedModelForBudgetedGoal.bind(h.goalService);
+      spyOn(h.goalService, "assertPricedModelForBudgetedGoal").mockImplementationOnce(
+        async (...args) => {
+          const result = await pricing(...args);
+          entered.resolve();
+          await release.promise;
+          return result;
+        }
+      );
+    } else {
+      const append = h.historyService.appendToHistory.bind(h.historyService);
+      spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
+        const result = await append(...args);
+        entered.resolve();
+        await release.promise;
+        return result;
+      });
+    }
+    const stream = spyOn(h.aiService, "streamMessage");
+    const pending = h.internals.dispatchPendingFollowUp();
+    try {
+      await entered.promise;
+      await writeFile(
+        `${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`,
+        "{"
+      );
+      await h.session.runStartupRecovery();
+      release.resolve();
+      expect(await pending).toBe(false);
+      expect(stream).not.toHaveBeenCalled();
+      const rows = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(rows.success && rows.data.some((row) => row.role === "user")).toBe(false);
+      expect(rows.success && rows.data[0].metadata?.muxMetadata).not.toHaveProperty(
+        "pendingFollowUp"
+      );
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test("cancellation storage-access failures still block automatic startup recovery", async () => {
   const h = await setup();
   await h.historyService.appendToHistory(workspaceId, summary());
-  await writeFile(`${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`, "{");
+  spyOn(h.historyService, "readCompactionCancellation").mockRejectedValue(
+    Object.assign(new Error("cancellation inaccessible"), { code: "EACCES" })
+  );
   const compactor = (h.session as unknown as { continuousCompactor: ContinuousCompactor })
     .continuousCompactor;
   const recover = spyOn(compactor, "recover");
+  const recoverGoal = spyOn(h.goalService, "recoverPendingDispatchAfterRestart");
   const stream = spyOn(h.aiService, "streamMessage");
   try {
     await h.session.runStartupRecovery();
     expect(recover).not.toHaveBeenCalled();
+    expect(recoverGoal).not.toHaveBeenCalled();
     expect(stream).not.toHaveBeenCalled();
     const failure = await h.internals.dispatchPendingFollowUp().catch((error: unknown) => error);
-    expect(failure).toBeInstanceOf(Error);
-    expect(stream).not.toHaveBeenCalled();
+    expect(failure).toHaveProperty("code", "EACCES");
+    const rows = await h.historyService.getLastMessages(workspaceId, 1);
+    expect(rows.success && rows.data[0].metadata?.muxMetadata).toHaveProperty("pendingFollowUp");
   } finally {
     await h.session.dispose();
     await h.cleanup();
   }
 });
+
+test.each(["quarantine", "journal", "history", "unlink"] as const)(
+  "failed corrupt cancellation repair at %s retains the fence and retries safely",
+  async (step) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(workspaceId, summary());
+    const cancellationPath = `${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`;
+    await writeFile(cancellationPath, "{");
+    const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
+    await writeFile(journal.path, "interrupted journal");
+    const failure = new Error(`${step} unavailable`);
+    if (step === "quarantine") {
+      const write = fs.writeFile;
+      let failed = false;
+      spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+        if (!failed && typeof args[0] === "string" && args[0].includes(".corrupt.")) {
+          failed = true;
+          throw failure;
+        }
+        return write(...args);
+      });
+    } else if (step === "journal") {
+      spyOn(journal, "clear").mockRejectedValueOnce(failure);
+    } else if (step === "unlink") {
+      const remove = fs.rm;
+      let failed = false;
+      spyOn(fs, "rm").mockImplementation(async (...args) => {
+        if (!failed && typeof args[0] === "string" && args[0] === cancellationPath) {
+          failed = true;
+          throw failure;
+        }
+        return remove(...args);
+      });
+    } else {
+      const writes = h.historyService as unknown as {
+        writeGuardedHistory(path: string, contents: string, guard: () => boolean): Promise<boolean>;
+      };
+      spyOn(writes, "writeGuardedHistory").mockRejectedValueOnce(failure);
+    }
+    const recoverGoal = spyOn(h.goalService, "recoverPendingDispatchAfterRestart");
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      await h.session.runStartupRecovery();
+      expect(recoverGoal).not.toHaveBeenCalled();
+      expect(stream).not.toHaveBeenCalled();
+      expect(await readFile(cancellationPath, "utf8")).toBe("{");
+      expect(await journal.exists()).toBe(step === "quarantine" || step === "journal");
+      const rows = await h.historyService.getLastMessages(workspaceId, 1);
+      const metadata = rows.success && rows.data[0].metadata?.muxMetadata;
+      if (step === "unlink") expect(metadata).not.toHaveProperty("pendingFollowUp");
+      else expect(metadata).toHaveProperty("pendingFollowUp");
+      await h.session.runStartupRecovery();
+      expect(recoverGoal).toHaveBeenCalledTimes(1);
+      expect(stream).not.toHaveBeenCalled();
+      const freshHistory = new HistoryService(h.config);
+      expect(await freshHistory.readCompactionCancellation(workspaceId)).toBeNull();
+      expect(await freshHistory.getContinuousCompactionJournal(workspaceId).exists()).toBe(false);
+      await expectNoRecovery(h.config, freshHistory);
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
 
 test("ordinary manual sends do not write cancellation state or attach a witness", async () => {
   const h = await setup();

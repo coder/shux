@@ -5,6 +5,7 @@ import * as fs from "fs/promises";
 import { COMPACTION_CANCELLATION_FILE } from "@/common/constants/compactionCancellation";
 import {
   CompactionCancellationSchema,
+  MalformedCompactionCancellationError,
   type CompactionCancellationRecord,
 } from "./compactionCancellation";
 import { ContinuousCompactionJournalStore } from "./continuousCompactionJournal";
@@ -249,20 +250,81 @@ export class HistoryService {
   async readCompactionCancellation(
     workspaceId: string
   ): Promise<CompactionCancellationRecord | null> {
+    let contents: Buffer;
     try {
-      return CompactionCancellationSchema.parse(
-        JSON.parse(
-          await fs.readFile(
-            path.join(this.getSessionDir(workspaceId), COMPACTION_CANCELLATION_FILE),
-            "utf8"
-          )
-        )
+      contents = await fs.readFile(
+        path.join(this.getSessionDir(workspaceId), COMPACTION_CANCELLATION_FILE)
       );
     } catch (error) {
       if (isErrnoWithCode(error, "ENOENT")) return null;
-      // An unreadable cancellation record must never authorize automatic recovery.
+      // Access/I/O errors do not prove corruption and must remain fail-closed.
       throw error;
     }
+    try {
+      return CompactionCancellationSchema.parse(JSON.parse(contents.toString("utf8")));
+    } catch {
+      throw new MalformedCompactionCancellationError(contents);
+    }
+  }
+
+  async repairCompactionCancellation(
+    workspaceId: string,
+    isCurrent: () => boolean,
+    onRepaired: () => void
+  ): Promise<CompactionCancellationRecord | null> {
+    return this.fileLocks.withLock(workspaceId, () =>
+      this.withCrossProcessWriteLock(workspaceId, async () => {
+        if (!isCurrent()) return null;
+        let malformed: MalformedCompactionCancellationError;
+        try {
+          // A newer valid Stop may have replaced the corrupt bytes while we waited.
+          return await this.readCompactionCancellation(workspaceId);
+        } catch (error) {
+          if (!(error instanceof MalformedCompactionCancellationError)) throw error;
+          malformed = error;
+        }
+        if (!isCurrent()) return null;
+        const cancellationPath = path.join(
+          this.getSessionDir(workspaceId),
+          COMPACTION_CANCELLATION_FILE
+        );
+        // Keep the canonical corrupt file as a fail-closed fence through every
+        // repair await/crash. Quarantine is a copy, never a rename-away gap.
+        await fs.writeFile(`${cancellationPath}.corrupt.${randomUUID()}`, malformed.contents, {
+          mode: 0o600,
+          flag: "wx",
+        });
+        if (!isCurrent()) return null;
+        await this.getContinuousCompactionJournal(workspaceId).clear();
+        const rows = await this.readChatHistory(workspaceId);
+        let changed = false;
+        const sanitized = rows.map((row) => {
+          const metadata = row.metadata?.muxMetadata;
+          if (!isCompactionSummaryMetadata(metadata) || !metadata.pendingFollowUp) return row;
+          changed = true;
+          const { pendingFollowUp: _pendingFollowUp, ...muxMetadata } = metadata;
+          return { ...row, metadata: { ...row.metadata, muxMetadata } };
+        });
+        if (!isCurrent()) return null;
+        if (
+          changed &&
+          !(await this.writeGuardedHistory(
+            this.getChatHistoryPath(workspaceId),
+            this.serializeHistoryEntries(sanitized, workspaceId),
+            isCurrent,
+            onRepaired
+          ))
+        )
+          return null;
+        // Both legacy pending markers and the journal must be durably neutralized
+        // before absence may authorize normal recovery, including on the next launch.
+        if (isCurrent()) {
+          if (!changed) onRepaired();
+          await fs.rm(cancellationPath, { force: true });
+        }
+        return null;
+      })
+    );
   }
 
   async writeCompactionCancellation(
@@ -271,7 +333,9 @@ export class HistoryService {
     isCurrent: () => boolean,
     retiredNonce?: string
   ): Promise<void> {
-    // This file must remain writable when transcript reads/recovery are failing.
+    // This file supplements legacy pendingFollowUp removal when transcript I/O
+    // fails. Older builds only honor successful cleanup of that legacy marker.
+    // It must remain writable when transcript reads/recovery are failing.
     await this.withHistoryWriteFileLock(workspaceId, async () => {
       if (!isCurrent()) return;
       if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
