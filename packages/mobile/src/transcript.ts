@@ -182,6 +182,17 @@ export function applyChatEvent(
         }
         return { ...message, parts };
       });
+    case "usage-delta":
+      if (state.streamingMessageId !== event.messageId) return state;
+      // Context is the latest step, not cumulative billing across tool iterations.
+      return updateMessage(state, event.messageId, (message) => ({
+        ...message,
+        metadata: {
+          ...message.metadata,
+          contextUsage: event.usage,
+          contextProviderMetadata: event.providerMetadata,
+        },
+      }));
     case "tool-call-start":
     case "tool-call-end":
       return updateMessage(state, event.messageId, (message) => applyTool(message, event));

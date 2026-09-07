@@ -1,0 +1,100 @@
+import { expect, test } from "bun:test";
+import type { MuxMessage, WorkspaceChatMessage } from "./transcript";
+import { applyChatEvent, createTranscriptState } from "./transcript";
+import { getContextUsage } from "./contextUsage";
+import { calculateTokenMeterData } from "../../../src/common/utils/tokens/tokenMeterUtils";
+
+const usage = {
+  inputTokens: 100,
+  outputTokens: 20,
+  totalTokens: 120,
+  cachedInputTokens: 40,
+  reasoningTokens: 5,
+};
+const row: MuxMessage = {
+  id: "a",
+  role: "assistant",
+  parts: [],
+  metadata: { model: "test:model", historySequence: 1, contextUsage: usage },
+};
+const start: Extract<WorkspaceChatMessage, { type: "stream-start" }> = {
+  type: "stream-start",
+  workspaceId: "w",
+  messageId: "b",
+  model: "test:model",
+  historySequence: 2,
+  startTime: 1,
+};
+const delta: Extract<WorkspaceChatMessage, { type: "usage-delta" }> = {
+  type: "usage-delta",
+  workspaceId: "w",
+  messageId: "b",
+  usage,
+  cumulativeUsage: { ...usage, inputTokens: 900, totalTokens: 920 },
+};
+const meter = (messages: MuxMessage[]) =>
+  calculateTokenMeterData(getContextUsage(messages, "test:model"), "test:model", false);
+
+test("context uses the latest step, not cumulative usage, and survives finish/replay", () => {
+  let state = applyChatEvent(createTranscriptState(), { type: "message", ...row });
+  state = applyChatEvent(state, start);
+  expect(meter(state.messages).totalTokens).toBe(120);
+  expect(applyChatEvent(state, { ...delta, messageId: "stale" })).toBe(state);
+  state = applyChatEvent(state, { ...delta, usage: { ...usage, inputTokens: 200 } });
+  expect(meter(state.messages).totalTokens).toBe(220);
+  state = applyChatEvent(state, {
+    type: "stream-end",
+    workspaceId: "w",
+    messageId: "b",
+    parts: [],
+    metadata: { model: "test:model", contextUsage: { ...usage, inputTokens: 250 } },
+  });
+  expect(meter(state.messages).totalTokens).toBe(270);
+  const replay = state.messages.reduce(
+    (current, message) => applyChatEvent(current, { type: "message", ...message }),
+    createTranscriptState()
+  );
+  expect(meter(replay.messages)).toEqual(meter(state.messages));
+  expect(
+    meter(applyChatEvent(state, { type: "delete", historySequences: [1, 2] }).messages).totalTokens
+  ).toBe(0);
+});
+
+test("context does not resurrect pre-boundary or compacted usage, but keeps the boundary estimate", () => {
+  const boundary: MuxMessage = {
+    id: "boundary",
+    role: "assistant",
+    parts: [],
+    metadata: { compactionBoundary: true, compacted: "user", compactionEpoch: 1 },
+  };
+  expect(getContextUsage([row, boundary], "test:model")).toBeUndefined();
+  expect(
+    getContextUsage(
+      [row, { ...boundary, metadata: { contextBoundaryKind: "reset" } }],
+      "test:model"
+    )
+  ).toBeUndefined();
+  expect(
+    meter([
+      row,
+      {
+        ...boundary,
+        metadata: { ...boundary.metadata, contextUsage: { ...usage, inputTokens: 50 } },
+      },
+    ]).totalTokens
+  ).toBe(70);
+  expect(
+    meter([
+      row,
+      {
+        ...row,
+        id: "compacted",
+        metadata: {
+          ...row.metadata,
+          compacted: true,
+          contextUsage: { ...usage, inputTokens: 500 },
+        },
+      },
+    ]).totalTokens
+  ).toBe(120);
+});

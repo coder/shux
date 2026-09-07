@@ -13,6 +13,7 @@ import { Message } from "../components/Message";
 import { Markdown } from "../components/Markdown";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { ModelSettings } from "./ModelSettings";
+import { Navigator } from "./Navigator";
 import { SettingsScreen } from "./SettingsScreen";
 import type { ChatSettings, SettingsData } from "../settings";
 
@@ -26,6 +27,47 @@ const workspace: FrontendWorkspaceMetadata = {
   namedWorkspacePath: "/project/feature",
   runtimeConfig: { type: "local" },
 };
+
+test("navigator counts and searches roots, not their agents, and preserves orphan access", () => {
+  const child: FrontendWorkspaceMetadata = {
+    ...workspace,
+    id: "child",
+    title: "Architecture Scout",
+    parentWorkspaceId: workspace.id,
+    taskStatus: "reported",
+  };
+  const props = {
+    projects: [],
+    workspaces: [workspace, child],
+    loading: false,
+    error: null,
+    onRetry: () => {},
+    onSelect: () => {},
+    onCreate: () => {},
+    onSettings: () => {},
+  };
+  const view = render(<Navigator {...props} />);
+  expect(view.getByRole("button", { name: "project, 1 workspaces" })).toBeDefined();
+  expect(view.queryByRole("button", { name: child.title })).toBeNull();
+  const search = view.getByRole("textbox", { name: "Search workspaces" });
+  fireEvent.change(search, { target: { value: "Scout" } });
+  expect(view.getByText("No matching workspaces")).toBeDefined();
+  fireEvent.change(search, { target: { value: "" } });
+
+  // A live metadata update must not promote a running child into a peer row.
+  view.rerender(
+    <Navigator {...props} workspaces={[workspace, { ...child, taskStatus: "running" }]} />
+  );
+  expect(view.queryByRole("button", { name: child.title })).toBeNull();
+  // Preserve desktop's orphan recovery when the parent is no longer in the list.
+  view.rerender(<Navigator {...props} workspaces={[child]} />);
+  expect(view.getByRole("button", { name: child.title })).toBeDefined();
+  // User-created roots can have agent-like names; hierarchy, not naming, controls visibility.
+  view.rerender(
+    <Navigator {...props} workspaces={[{ ...workspace, name: "agent_explore_user" }]} />
+  );
+  expect(view.getByRole("button", { name: "agent_explore_user" })).toBeDefined();
+});
 
 test("empty assistant history is explained without mislabeling a live or completed response", () => {
   const props = { canAnswer: false, onAnswer: async () => {} };
@@ -42,6 +84,54 @@ test("empty assistant history is explained without mislabeling a live or complet
   );
   expect(view.queryByText("No response received")).toBeNull();
   expect(view.queryByText("Interrupted")).toBeNull();
+});
+
+test("raw completion and replay chunks render as adjacent runs without crossing tools", () => {
+  const parts: MuxMessage["parts"] = [
+    { type: "reasoning", text: "Just a sim" },
+    { type: "reasoning", text: "ple greeting, not t" },
+    { type: "reasoning", text: "ools needed." },
+    { type: "text", text: "Hey" },
+    { type: "text", text: "! What can I help with?" },
+  ];
+  const original = structuredClone(parts);
+  const message: MuxMessage = { id: "reply", role: "assistant", parts };
+  const props = { canAnswer: false, onAnswer: async () => {} };
+  const view = render(<Message {...props} message={message} />);
+  expect(view.getAllByRole("button", { name: "Reasoning" })).toHaveLength(1);
+  fireEvent.click(view.getByRole("button", { name: "Reasoning" }));
+  expect(view.getByText("Just a simple greeting, not tools needed.")).toBeDefined();
+  expect(view.getByText("Hey! What can I help with?")).toBeDefined();
+  expect(parts).toEqual(original);
+
+  view.rerender(<Message {...props} message={{ ...message, metadata: { partial: true } }} />);
+  expect(view.getAllByRole("button", { name: "Reasoning" })).toHaveLength(1);
+  expect(view.getByText("Interrupted")).toBeDefined();
+  view.rerender(
+    <Message
+      {...props}
+      message={{
+        ...message,
+        parts: [
+          ...parts,
+          {
+            type: "dynamic-tool",
+            toolCallId: "t",
+            toolName: "bash",
+            state: "output-available",
+            input: {},
+            output: { success: true },
+          },
+          { type: "text", text: "After " },
+          { type: "text", text: "the tool." },
+          { type: "reasoning", text: "A separate thought." },
+        ],
+      }}
+    />
+  );
+  expect(view.getAllByRole("button", { name: "Reasoning" })).toHaveLength(2);
+  expect(view.getByText("Hey! What can I help with?")).toBeDefined();
+  expect(view.getByText("After the tool.")).toBeDefined();
 });
 
 test("a field ref focuses the next native input", () => {

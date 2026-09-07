@@ -25,6 +25,9 @@ import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/wor
 import type { MuxMessage } from "../../../../src/common/types/message";
 import { Button, IconButton, Loading, Notice } from "../components/Controls";
 import { Message } from "../components/Message";
+import { ContextUsage } from "../components/ContextUsage";
+import { getContextUsage } from "../contextUsage";
+import { calculateTokenMeterData } from "../../../../src/common/utils/tokens/tokenMeterUtils";
 import { useConversation } from "../useConversation";
 import { linkedAbortController } from "../useConnection";
 import { modelName, resolveSettings } from "../settings";
@@ -87,6 +90,13 @@ export function ConversationScreen(props: {
   const agentId = props.workspace.agentId ?? "exec";
   const options =
     props.selection ?? (settings ? resolveSettings(props.workspace, settings, agentId) : null);
+  const context = calculateTokenMeterData(
+    getContextUsage(transcript.messages, options?.model ?? "unknown"),
+    options?.model ?? "unknown",
+    false,
+    false,
+    settings?.providers
+  );
   const ready =
     props.connected && !props.signal.aborted && transcript.caughtUp && !error && settings !== null;
   const running = ready && transcript.streaming;
@@ -318,9 +328,15 @@ export function ConversationScreen(props: {
               <Text numberOfLines={1} style={styles.modelLabel}>
                 {options?.model ? modelName(options.model) : "Model"}
               </Text>
+              {options && (
+                <Text style={styles.effortLabel}>
+                  {(options.thinkingLevel ?? DEFAULT_THINKING_LEVEL).toUpperCase()}
+                </Text>
+              )}
               <ChevronDown size={12} color={colors.muted} />
             </Pressable>
           </View>
+          <ContextUsage data={context} />
         </View>
         <View
           style={[
@@ -478,6 +494,16 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     backgroundColor: colors.panel,
     borderRadius: radii.pill,
+  },
+  effortLabel: {
+    fontFamily,
+    color: colors.muted,
+    fontSize: 10,
+    fontWeight: "600",
+    flexShrink: 0,
+    paddingLeft: 6,
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderLeftColor: colors.border,
   },
   modeDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: colors.accent },
   modelLabel: { fontFamily, color: colors.text, fontSize: 13, fontWeight: "500", flexShrink: 1 },

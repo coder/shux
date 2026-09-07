@@ -24,6 +24,7 @@ import {
 } from "lucide-react-native";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 import type { Projects } from "../useProjects";
+import { excludeSubAgentRows } from "../../../../src/browser/utils/ui/workspaceFiltering";
 import { Button, IconButton, Loading, Notice } from "../components/Controls";
 import {
   colors,
@@ -57,7 +58,8 @@ export function Navigator(props: {
       name: config.displayName ?? path.split(/[\\/]/).filter(Boolean).at(-1) ?? path,
       workspaces: [],
     });
-  for (const workspace of props.workspaces) {
+  // Match desktop's root list before searching/counting; keep orphaned agents accessible.
+  for (const workspace of excludeSubAgentRows(props.workspaces)) {
     const key = workspace.kind === "scratch" ? "scratch" : workspace.projectPath;
     const group = groups.get(key) ?? {
       name: workspace.kind === "scratch" ? "Scratch chats" : workspace.projectName,

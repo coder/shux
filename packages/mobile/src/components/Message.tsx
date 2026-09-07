@@ -4,6 +4,7 @@ import { Brain, ChevronDown, ChevronRight, File, Pause, Wrench } from "lucide-re
 import type { MuxMessage, MuxToolPart } from "../../../../src/common/types/message";
 import { Button, Field, Notice, Sheet } from "./Controls";
 import { Markdown } from "./Markdown";
+import { mergeAdjacentParts } from "../../../../src/common/utils/messages/mergeAdjacentParts";
 import { colors, layout, mono, radii, spacing, typography } from "../theme";
 
 export function Message(props: {
@@ -21,7 +22,8 @@ export function Message(props: {
   return (
     <View role="group" accessibilityLabel={label} style={[styles.message, user && styles.user]}>
       {props.message.role === "system" && <Text style={styles.secondary}>System</Text>}
-      {props.message.parts.map((part, index) => {
+      {/* Persisted snapshots retain wire chunks; project the same contiguous display runs as desktop. */}
+      {mergeAdjacentParts(props.message.parts).map((part, index) => {
         switch (part.type) {
           case "text":
             return <Markdown key={index} text={part.text} />;
