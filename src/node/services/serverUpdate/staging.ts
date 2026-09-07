@@ -25,11 +25,13 @@ export function installCommand(
   tarball: string
 ): { file: string; args: string[] } {
   // CLI flags outrank npmrc files and npm_config_* env, so an inherited strict-ssl=false cannot
-  // disable certificate validation for the download and an inherited package-lock=false or
-  // lockfile=false cannot suppress the lockfile that dependency verification reads. bun has no
-  // such flags; its TLS and lockfile knobs are env variables runInstall strips (a global bunfig
-  // that disables lockfile saving still makes verification fail closed). The text lockfile is
-  // required, so an older bun that only writes bun.lockb must fail here.
+  // disable certificate validation for the download, an inherited package-lock=false or
+  // lockfile=false cannot suppress the lockfile that dependency verification reads, and npm's
+  // include beats any inherited omit of the optional platform packages. bun has no such flags;
+  // its TLS and lockfile knobs are env variables runInstall strips (a global bunfig that disables
+  // lockfile saving still makes verification fail closed). Neither bun nor pnpm offers a flag
+  // that overrides an inherited optional=false. The text lockfile is required, so an older bun
+  // that only writes bun.lockb must fail here.
   const flags = {
     bun: ["add", "--ignore-scripts", "--save-text-lockfile"],
     npm: [
@@ -41,6 +43,7 @@ export function installCommand(
       "--ignore-scripts",
       "--strict-ssl",
       "--package-lock=true",
+      "--include=optional",
     ],
     pnpm: [
       "add",
@@ -84,8 +87,7 @@ export async function verifyStagedPackage(
   } finally {
     await handle.close();
   }
-  if (process.platform !== "win32" && (stat.mode & 0o111) === 0)
-    throw new Error("Staged CLI entry is not executable");
+  if ((stat.mode & 0o111) === 0) throw new Error("Staged CLI entry is not executable");
   // Parse-only: nothing from the registry runs until the operator activates it. The shebang's
   // interpreter is used because process.execPath may be bun, which has no parse-only mode.
   using smoke = execFileAsync(SERVER_UPDATE_CLI_INTERPRETER, ["--check", entry], {

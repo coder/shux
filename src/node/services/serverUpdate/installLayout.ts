@@ -72,9 +72,13 @@ export function readPackageVersion(packageDir: string): string {
 
 export function resolveInstallLayout(
   env: NodeJS.ProcessEnv,
-  argv: readonly string[]
+  argv: readonly string[],
+  platform: NodeJS.Platform = process.platform
 ): LayoutResult {
   try {
+    // Activation replaces the launcher symlink with rename(), which is atomic only on POSIX, and
+    // the staged entry is checked for a POSIX executable bit.
+    if (platform === "win32") throw new Error("Server updates are not supported on Windows");
     // coder/mux registry module v1.5 declares its restart loop through RESTART_ON_KILL_VALUE.
     const supervised = resolveXumEnvironmentValue("SERVER_SUPERVISED", env);
     if (!(/^(1|true|yes)$/i.test(supervised ?? "") || env.RESTART_ON_KILL_VALUE === "true")) {

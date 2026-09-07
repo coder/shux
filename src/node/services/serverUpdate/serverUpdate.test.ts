@@ -195,6 +195,8 @@ describe("server install layout", () => {
   test("requires supervisor, a symlink, and a matching running entry", async () => {
     const { env, argv, layout, root } = await fixture();
     expect(resolveInstallLayout({ MUX_BINARY: env.MUX_BINARY }, argv).supported).toBe(false);
+    expect(resolveInstallLayout(env, argv, "win32").supported).toBe(false);
+    expect(resolveInstallLayout(env, argv, "linux").supported).toBe(true);
     expect(
       resolveInstallLayout({ RESTART_ON_KILL_VALUE: "true" }, ["node", layout.entry]).supported
     ).toBe(false);
@@ -265,6 +267,7 @@ describe("staging and activation", () => {
     const npmArgs = installCommand({ ...layout, packageManager: "npm" }, "/x.tgz").args;
     expect(npmArgs).toContain("--strict-ssl");
     expect(npmArgs).toContain("--package-lock=true");
+    expect(npmArgs).toContain("--include=optional");
     const pnpmArgs = installCommand({ ...layout, packageManager: "pnpm" }, "/x.tgz").args;
     expect(pnpmArgs).toContain("--config.strict-ssl=true");
     expect(pnpmArgs).toContain("--config.lockfile=true");
