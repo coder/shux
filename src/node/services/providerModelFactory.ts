@@ -23,6 +23,7 @@ import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
 import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
@@ -1103,6 +1104,18 @@ export interface ResolveAndCreateModelResult {
   routedThroughGateway: boolean;
   /** Route provider chosen by backend routing (direct provider or gateway). */
   routeProvider?: ProviderName;
+}
+
+/** Creation-time request receipt; routing and wire data must not be reconstructed after awaits. */
+export interface PinnedModelOptions extends Pick<
+  ResolveAndCreateModelResult,
+  "model" | "effectiveModelString" | "wireProviderName"
+> {
+  metadataModel: string;
+  optionsModelString: string;
+  optionsProvidersConfig: ProvidersConfigMap;
+  optionsMuxProviderOptions: MuxProviderOptions;
+  optionsRouteProvider?: ProviderName;
 }
 
 interface CreateModelOptions {
@@ -2531,6 +2544,63 @@ export class ProviderModelFactory {
     );
   }
 
+  /** Create a model and its complete request options from one config/route decision. */
+  async createModelWithPinnedOptions(
+    modelString: string,
+    opts?: {
+      thinkingLevel?: ThinkingLevel;
+      providerOptions?: MuxProviderOptions;
+      agentInitiated?: boolean;
+      workspaceId?: string;
+    }
+  ): Promise<Result<PinnedModelOptions, SendMessageError>> {
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
+    const optionsProvidersConfig = this.providerService.getConfig(providersConfig);
+    const optionsMuxProviderOptions = structuredClone(opts?.providerOptions ?? {});
+    const result = await this.resolveAndCreateModel(
+      modelString,
+      opts?.thinkingLevel,
+      optionsMuxProviderOptions,
+      {
+        agentInitiated: opts?.agentInitiated,
+        workspaceId: opts?.workspaceId,
+        providersConfig,
+      }
+    );
+    if (!result.success) return result;
+
+    if (result.data.coderWire?.origin === "openai") {
+      // Coder's SDK protocol comes from the selected instance, not direct
+      // OpenAI preferences (or a caller's requested wire format).
+      optionsMuxProviderOptions.openai = {
+        ...optionsMuxProviderOptions.openai,
+        wireFormat:
+          result.data.coderWire.providerType === "openai" ? "responses" : "chatCompletions",
+      };
+    }
+
+    const onCoderRoute = result.data.effectiveModelString.startsWith("coder:");
+    const custom = isCustomProviderConfig(providersConfig[modelString.split(":", 1)[0]]);
+    // Preserve scoped aliases on Coder/custom routes, but fallback options and
+    // pricing must follow the provider that actually created the model.
+    const fallbackModel = normalizeToCanonical(result.data.effectiveModelString);
+    const optionsModelString =
+      modelString.startsWith("coder:") && !custom && !onCoderRoute ? fallbackModel : modelString;
+    return Ok({
+      model: result.data.model,
+      effectiveModelString: result.data.effectiveModelString,
+      wireProviderName: result.data.wireProviderName,
+      metadataModel: resolveModelForMetadata(
+        custom || onCoderRoute ? modelString : fallbackModel,
+        providersConfig
+      ),
+      optionsModelString,
+      optionsProvidersConfig,
+      optionsMuxProviderOptions,
+      optionsRouteProvider: result.data.routeProvider,
+    });
+  }
+
   /**
    * Resolve model string (xAI variant mapping + gateway routing) and create the model.
    *
@@ -2542,7 +2612,7 @@ export class ProviderModelFactory {
    */
   resolveAndCreateModel(
     modelString: string,
-    thinkingLevel: ThinkingLevel,
+    thinkingLevel: ThinkingLevel | undefined,
     muxProviderOptions?: MuxProviderOptions,
     opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
   ): Promise<Result<ResolveAndCreateModelResult, SendMessageError>> {
@@ -2553,7 +2623,7 @@ export class ProviderModelFactory {
 
   private resolveAndCreateModelEffect(
     modelString: string,
-    thinkingLevel: ThinkingLevel,
+    thinkingLevel: ThinkingLevel | undefined,
     muxProviderOptions?: MuxProviderOptions,
     opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
   ): Effect.Effect<Result<ResolveAndCreateModelResult, SendMessageError>> {
@@ -2584,8 +2654,13 @@ export class ProviderModelFactory {
       const [canonicalProviderName, canonicalModelId] = parseModelString(canonicalModelString);
 
       // xAI Grok: swap between reasoning and non-reasoning variants based on thinking level.
+      // An unset level preserves createModel's no-variant-selection behavior for headless callers.
       // xAI only supports full reasoning (no medium/low).
-      if (canonicalProviderName === "xai" && canonicalModelId === "grok-4-1-fast") {
+      if (
+        thinkingLevel != null &&
+        canonicalProviderName === "xai" &&
+        canonicalModelId === "grok-4-1-fast"
+      ) {
         const variant =
           thinkingLevel !== "off" ? "grok-4-1-fast-reasoning" : "grok-4-1-fast-non-reasoning";
         effectiveModelString = `xai:${variant}`;

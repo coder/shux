@@ -223,8 +223,6 @@ export class AIService extends EventEmitter {
       durableEventJournalFor: (workspaceId) => this.durableEventJournalFor(workspaceId),
       shouldAllowLegacyInvalidWorkflowAgentOutputSchema: (metadata) =>
         this.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata),
-      createModel: (modelString, providerOptions, options) =>
-        this.createModel(modelString, providerOptions, options),
       isStreaming: (workspaceId) => this.streamManager.isStreaming(workspaceId),
       trackPendingDevToolsRunMetadata: (messageId, workspaceId, metadataId) =>
         this.trackPendingDevToolsRunMetadata(messageId, workspaceId, metadataId),
@@ -593,6 +591,13 @@ export class AIService extends EventEmitter {
       model: result.data,
       metadataModel: resolveModelForMetadata(metadataSeed, providersConfig),
     });
+  }
+
+  createModelWithPinnedOptions(
+    modelString: string,
+    opts?: Parameters<ProviderModelFactory["createModelWithPinnedOptions"]>[1]
+  ): ReturnType<ProviderModelFactory["createModelWithPinnedOptions"]> {
+    return this.providerModelFactory.createModelWithPinnedOptions(modelString, opts);
   }
 
   private wrapToolsForDelegation(

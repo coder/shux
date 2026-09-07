@@ -582,11 +582,6 @@ interface TurnRequestBuilderDependencies {
   shouldAllowLegacyInvalidWorkflowAgentOutputSchema: (
     metadata: WorkspaceMetadata
   ) => Promise<boolean>;
-  createModel: (
-    modelString: string,
-    muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string; providersConfig?: ProvidersConfig }
-  ) => Promise<Result<LanguageModel, SendMessageError>>;
   isStreaming: (workspaceId: string) => boolean;
   trackPendingDevToolsRunMetadata: (
     messageId: string,
@@ -2034,87 +2029,14 @@ export class TurnRequestBuilder {
         toolModelString.length > 0,
         "tool model string must be non-empty when creating a tool model"
       );
-      // ONE config snapshot for both SDK model creation and the
-      // pinned pricing identity: two independent reads would let
-      // a catalog refresh land between them, running the request
-      // on one wire while recording usage under another type.
-      const toolProvidersConfig =
-        this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
-      // Project that same snapshot for option building; raw Coder identities
-      // must not resolve against refreshed instance types or alias metadata.
-      const toolOptionsProvidersConfig =
-        this.dependencies.providerService.getConfig(toolProvidersConfig);
-      // Let the factory pin provider-level defaults (especially the OpenAI wire
-      // format) without inheriting any options from the parent chat.
-      const toolMuxProviderOptions: MuxProviderOptions = {};
-      const creationOptions = {
-        workspaceId,
-        providersConfig: toolProvidersConfig,
-        agentInitiated: true,
-      };
-      // Intuition's effort can select a different model variant, not just provider
-      // options. Preserve the same provider snapshot for resolution and creation.
-      const toolModel =
-        toolThinkingLevel === undefined
-          ? await this.dependencies
-              .createModel(toolModelString, toolMuxProviderOptions, creationOptions)
-              .then((result) =>
-                result.success
-                  ? Ok({ model: result.data, effectiveModelString: undefined })
-                  : result
-              )
-          : await this.dependencies.providerModelFactory.resolveAndCreateModel(
-              toolModelString,
-              toolThinkingLevel,
-              toolMuxProviderOptions,
-              creationOptions
-            );
-      if (!toolModel.success) {
-        throw new Error(`Failed to create tool model: ${getErrorMessage(toolModel.error)}`);
-      }
-      // Same effective-route rule as createModelWithPinnedMetadata:
-      // a coder: selection whose gateway is unavailable falls away
-      // to a direct provider inside createModel, and identity or
-      // options derived from the raw selection (instance type)
-      // would diverge from the model actually created.
-      const toolEffectiveModelString =
-        toolModel.data.effectiveModelString ??
-        this.dependencies.providerModelFactory.resolveEffectiveModelString(
-          toolModelString,
-          undefined,
-          toolProvidersConfig
-        );
-      const toolOnCoderRoute = toolEffectiveModelString.startsWith("coder:");
-      // Carry pricing with each creation: parallel tools can select different
-      // variants or provider snapshots for the same raw model string.
-      const metadataModel = resolveModelForMetadata(
-        toolOnCoderRoute ? toolModelString : normalizeToCanonical(toolEffectiveModelString),
-        toolProvidersConfig
+      const created = await this.dependencies.providerModelFactory.createModelWithPinnedOptions(
+        toolModelString,
+        { thinkingLevel: toolThinkingLevel, workspaceId, agentInitiated: true }
       );
-      // Keep the raw Coder instance and scoped aliases for option construction;
-      // the builder resolves the wire itself. A normalized openai: identity would
-      // make Pro inspect the unrelated default-named instance. Only fallback-away
-      // requests must switch to the identity of the provider actually serving them.
-      const toolOptionsModelString =
-        toolModelString.startsWith("coder:") &&
-        !isCustomProviderConfig(toolProvidersConfig.coder) &&
-        !toolOnCoderRoute
-          ? normalizeToCanonical(toolEffectiveModelString)
-          : toolModelString;
-      return {
-        model: toolModel.data.model,
-        metadataModel,
-        optionsModelString: toolOptionsModelString,
-        optionsProvidersConfig: toolOptionsProvidersConfig,
-        optionsMuxProviderOptions: toolMuxProviderOptions,
-        optionsRouteProvider: (() => {
-          const provider = toolEffectiveModelString.split(":", 1)[0];
-          return !isCustomProviderConfig(toolProvidersConfig[provider]) &&
-            Object.hasOwn(PROVIDER_DEFINITIONS, provider)
-            ? (provider as ProviderName)
-            : undefined;
-        })(),
-      };
+      if (!created.success) {
+        throw new Error(`Failed to create tool model: ${getErrorMessage(created.error)}`);
+      }
+      return created.data;
     };
     // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {

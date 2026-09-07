@@ -2567,6 +2567,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     await startAdvisorStream(harness, workspaceId);
     const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
     if (!runtime) throw new Error("Expected advisor runtime");
+    const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+    spyOn(factory, "resolveAndCreateModel").mockImplementation(
+      ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
+    );
     const created = await runtime.createModel(testCase.model);
     providersStore.saveProvidersConfig({
       openai: { apiKey: "changed-key", wireFormat: "responses" },
@@ -2619,17 +2623,32 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       await startAdvisorStream(harness, workspaceId);
       // Avoid an OAuth exchange; the real option/route adapter below must retain
       // the selected instance instead of re-resolving the unrelated "openai" instance.
-      spyOn(harness.service, "createModel").mockImplementation((_model, options, creation) => {
-        expect(creation?.providersConfig?.coder).toMatchObject({
-          discoveredProviders: [
-            { name: "prod-openai", type: "openai" },
-            { name: "openai", type: "openai-compat" },
-          ],
-        });
-        if (!options) throw new Error("Expected the adapter's provider-options target");
-        options.openai = { wireFormat: "responses" };
-        return Promise.resolve({ success: true, data: Object.create(null) as LanguageModel });
-      });
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      spyOn(factory, "resolveAndCreateModel").mockImplementation(
+        (_model, _thinking, options, creation) => {
+          expect(creation?.providersConfig?.coder).toMatchObject({
+            discoveredProviders: [
+              { name: "prod-openai", type: "openai" },
+              { name: "openai", type: "openai-compat" },
+            ],
+          });
+          if (!options) throw new Error("Expected the adapter's provider-options target");
+          options.openai = { wireFormat: "responses" };
+          return Promise.resolve({
+            success: true,
+            data: {
+              model: Object.create(null) as LanguageModel,
+              effectiveModelString: model,
+              canonicalModelString: "openai:gpt-6-astra",
+              canonicalProviderName: "openai",
+              canonicalModelId: "gpt-6-astra",
+              wireProviderName: "openai",
+              routeProvider: "coder",
+              routedThroughGateway: false,
+            },
+          });
+        }
+      );
       const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
       if (!runtime) throw new Error("Expected advisor runtime");
       if (testCase.refresh !== "none") {
@@ -3095,12 +3114,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const resolveModel = spyOn(factory, "resolveAndCreateModel").mockImplementation(
         ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
       );
-      const createModel = spyOn(harness.service, "createModel");
       const created = await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
-      const creationOptions =
-        toolName === "advisor"
-          ? createModel.mock.calls.at(-1)?.[2]
-          : resolveModel.mock.calls.at(-1)?.[3];
+      const creationOptions = resolveModel.mock.calls.at(-1)?.[3];
       expect(creationOptions).toMatchObject({
         agentInitiated: true,
         workspaceId,
