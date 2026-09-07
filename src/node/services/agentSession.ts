@@ -3767,6 +3767,7 @@ export class AgentSession {
     // contains the new prompt, then replay it again post-compaction).
     let autoCompactionMessage: MuxMessage | null = null;
     const tokenBudgetActive = this.isTokenBudgetActive(optionsForStream);
+    // Await rejection at each return so the execution lease owns persistence and goal safety.
     const rejectBudgetSend = async (error: SendMessageError) => {
       if (isManualUserMessage) {
         const actionable = await this.preserveRejectedManualSend(
@@ -3796,7 +3797,7 @@ export class AgentSession {
       await this.seedUsageStateFromHistory();
       const prepared = await this.prepareContextBudgetSend(userMessage, optionsForStream);
       if (!prepared.success) {
-        return rejectBudgetSend(prepared.error);
+        return await rejectBudgetSend(prepared.error);
       }
       contextBudgetPrefix = prepared.data.prefix;
       requestAssemblySnapshot = prepared.data.requestAssemblySnapshot;
@@ -4089,7 +4090,7 @@ export class AgentSession {
         if (isAdmissionStale() || this.coordinator.admissionBlocked || this.coordinator.closing) {
           return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
         }
-        if (!freshBudget.success) return rejectBudgetSend(freshBudget.error);
+        if (!freshBudget.success) return await rejectBudgetSend(freshBudget.error);
         userMessage.metadata = {
           ...userMessage.metadata,
           requestPreludeMessageIds: requestPrelude.map((row) => row.id),

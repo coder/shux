@@ -1,8 +1,15 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import * as contextLimits from "@/common/utils/compaction/contextLimit";
+import { ExtensionMetadataService } from "./ExtensionMetadataService";
+import { WorkspaceGoalService } from "./workspaceGoalService";
+import { createTestHistoryService } from "./testHistoryService";
 import { createMuxMessage } from "@/common/types/message";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import { Effect, Exit, Scope } from "effect";
-import { Err } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import { defaultEffectRunner as runner } from "./di/effectRunner";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 
@@ -214,6 +221,124 @@ describe("AgentSession scoped turn lifetimes", () => {
       await h.cleanup();
     }
   });
+
+  test.each(
+    (["initial", "materialized"] as const).flatMap((branch) =>
+      (["history", "goal"] as const).map((heldWrite) => ({ branch, heldWrite }))
+    )
+  )(
+    "$branch send rejection retains its scope through the $heldWrite write",
+    async ({ branch, heldWrite }) => {
+      const appFiberScope = Scope.makeUnsafe("parallel");
+      const history = await createTestHistoryService();
+      await history.config.addWorkspace(history.config.rootDir, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "rejection",
+        projectPath: history.config.rootDir,
+        runtimeConfig: { type: "local" },
+      });
+      const goalService = new WorkspaceGoalService(
+        history.config,
+        history.historyService,
+        new ExtensionMetadataService(path.join(history.config.rootDir, "extension.json"))
+      );
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        appFiberScope,
+        config: history.config,
+        historyService: history.historyService,
+        workspaceGoalService: goalService,
+        aiServiceOverrides: {
+          getWorkspaceMetadata: mock(() =>
+            Promise.resolve(
+              Ok({
+                id: workspaceId,
+                name: workspaceId,
+                projectName: "rejection",
+                projectPath: history.config.rootDir,
+                namedWorkspacePath: history.config.rootDir,
+                runtimeConfig: { type: "local" },
+              } as FrontendWorkspaceMetadata)
+            )
+          ),
+        },
+      });
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const limit = spyOn(contextLimits, "getEffectiveContextLimit").mockReturnValue(10000);
+      let closed = false;
+      let closing: Promise<void> | undefined;
+      let send: ReturnType<typeof h.session.sendMessage> | undefined;
+      const writes: string[] = [];
+      const writesAfterDrain: string[] = [];
+      try {
+        expect(
+          (await goalService.setGoal({ workspaceId, objective: "Continue until interrupted" }))
+            .success
+        ).toBe(true);
+        const append = h.historyService.appendToHistory.bind(h.historyService);
+        spyOn(h.historyService, "appendToHistory").mockImplementation(async (id, message) => {
+          if (message.metadata?.contextBudgetRejected && heldWrite === "history") {
+            entered.resolve();
+            await release.promise;
+          }
+          const result = await append(id, message);
+          if (message.metadata?.contextBudgetRejected) {
+            writes.push("history");
+            if (closed) writesAfterDrain.push("history");
+          }
+          return result;
+        });
+        const setGoal = goalService.setGoal.bind(goalService);
+        spyOn(goalService, "setGoal").mockImplementation(async (input) => {
+          if (input.status === "paused" && heldWrite === "goal") {
+            entered.resolve();
+            await release.promise;
+          }
+          const result = await setGoal(input);
+          if (input.status === "paused") {
+            writes.push("goal");
+            if (closed) writesAfterDrain.push("goal");
+          }
+          return result;
+        });
+        const large = ("漢".repeat(100) + "\n").repeat(40);
+        if (branch === "materialized")
+          await fs.writeFile(path.join(history.config.rootDir, "oversized.txt"), large);
+        send = h.session.sendMessage(branch === "initial" ? large : "Read @oversized.txt", {
+          ...options,
+          experiments: { tokenBudget: true },
+        });
+        await entered.promise;
+        expect(h.session.isBusy()).toBe(false);
+        closing = runner.runPromise(Scope.close(appFiberScope, Exit.void)).then(() => {
+          closed = true;
+        });
+        await runner.runPromise(Effect.yieldNow);
+        expect(closed).toBe(false);
+        release.resolve();
+        const [result] = await Promise.all([send, closing]);
+        expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
+        expect(closed).toBe(true);
+        expect(writes).toEqual(["history", "goal"]);
+        expect(writesAfterDrain).toEqual([]);
+        expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "paused" });
+        const rows = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(rows.success && rows.data.some((row) => row.metadata?.contextBudgetRejected)).toBe(
+          true
+        );
+        expect(spyOn(h.aiService, "streamMessage")).not.toHaveBeenCalled();
+      } finally {
+        release.resolve();
+        await send;
+        await (closing ?? runner.runPromise(Scope.close(appFiberScope, Exit.void)));
+        limit.mockRestore();
+        h.session.dispose();
+        await history.cleanup();
+      }
+    }
+  );
 
   test.each(["throw", "reject", "empty-history", "budget-rejected"])(
     "registered preparation %s does not orphan shutdown",
