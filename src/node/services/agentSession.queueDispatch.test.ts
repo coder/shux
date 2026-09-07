@@ -2,6 +2,7 @@ import type { StreamAbortEvent } from "@/common/types/stream";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import * as fsPromises from "node:fs/promises";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 
@@ -10,6 +11,7 @@ import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
+import type { CompactionMonitor } from "./compactionMonitor";
 import type { TurnCompletion } from "./streamManager";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
@@ -1301,6 +1303,78 @@ describe("AgentSession queued message tool-call dispatch", () => {
           )
         ).toBe(true);
       }
+    } finally {
+      releaseSync();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a wake withdrawn under on-send compaction records the persisted compaction row as abandoned", async () => {
+    const workspaceId = "queue-dispatch-withdrawn-compaction-row";
+    let markSyncStarted: () => void = () => undefined;
+    const syncStarted = new Promise<void>((resolve) => {
+      markSyncStarted = resolve;
+    });
+    let releaseSync: () => void = () => undefined;
+    const syncRelease = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+      syncGoalModeWithChatTail: mock(async () => {
+        markSyncStarted();
+        await syncRelease;
+        return null;
+      }),
+    } as unknown as WorkspaceGoalService;
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      workspaceGoalService,
+      aiServiceOverrides: { streamMessage },
+    });
+    const internals = session as unknown as {
+      compactionMonitor: CompactionMonitor;
+      getAutoRetryPreferencePath(): string;
+    };
+    internals.compactionMonitor = {
+      checkBeforeSend: () => ({
+        shouldShowWarning: true,
+        shouldForceCompact: true,
+        usagePercentage: 99,
+        thresholdPercentage: 85,
+      }),
+      checkMidStream: () => false,
+      resetForNewStream: () => undefined,
+      setThreshold: () => undefined,
+      getThreshold: () => 0.85,
+    } as unknown as CompactionMonitor;
+
+    try {
+      const controller = new AbortController();
+      const sendPromise = session.sendMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
+      );
+      await syncStarted;
+      // A Stop withdraws the wake past the point of no return.
+      controller.abort();
+      releaseSync();
+      expect((await sendPromise).success).toBe(true);
+      expect(streamMessage).not.toHaveBeenCalled();
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const trailing = history.data.at(-1);
+      expect(trailing?.metadata?.muxMetadata?.type).toBe("compaction-request");
+      const persisted = JSON.parse(
+        await fsPromises.readFile(internals.getAutoRetryPreferencePath(), "utf-8")
+      ) as { startupAutoRetryAbandon?: { userMessageId?: string } };
+      expect(persisted.startupAutoRetryAbandon?.userMessageId).toBe(trailing?.id);
     } finally {
       releaseSync();
       await session.dispose();

@@ -112,7 +112,6 @@ export function useAIViewKeybinds({
           if (api) {
             void cancelCompaction(api, workspaceId, aggregator, setEditingMessage);
           }
-          void api?.workspace.setAutoRetryEnabled?.({ workspaceId, enabled: false });
           return;
         }
 
@@ -121,9 +120,8 @@ export function useAIViewKeybinds({
         // Non-vim mode: Esc interrupts (except when typing in inputs, unless explicitly opted in)
         if (canInterrupt || showRetryBarrier) {
           e.preventDefault();
-          void api?.workspace.setAutoRetryEnabled?.({ workspaceId, enabled: false });
           if (api) {
-            void stopStream(api, workspaceId);
+            void stopStream(api, workspaceId, { disableAutoRetry: true });
           }
           return;
         }

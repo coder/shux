@@ -1222,8 +1222,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           if (!p.api) {
             return;
           }
-          await p.api.workspace.setAutoRetryEnabled?.({ workspaceId: id, enabled: false });
-          await stopStream(p.api, id);
+          await stopStream(p.api, id, { disableAutoRetry: true });
         },
       });
       list.push({

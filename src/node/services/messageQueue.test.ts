@@ -415,12 +415,12 @@ describe("MessageQueue", () => {
 
       expect(queue.setVisibleQueueDispatchMode("turn-end")).toBe(true);
       expect(queue.getVisibleQueueDispatchMode()).toBe("turn-end");
-      expect(queue.getNextQueueDispatchMode()).toBe("turn-end");
+      expect(queue.getNextDispatchableMode()).toBe("turn-end");
       expect(queue.getQueueDispatchMode()).toBe("tool-end");
       expect(queue.getMessages()).toEqual(["visible first", "visible second", "hidden wake"]);
 
       queue.dequeueNext();
-      expect(queue.getNextQueueDispatchMode()).toBe("turn-end");
+      expect(queue.getNextDispatchableMode()).toBe("turn-end");
     });
 
     it("reports a hidden predecessor's effective mode until the user reprioritizes the visible card", () => {
@@ -440,7 +440,7 @@ describe("MessageQueue", () => {
       expect(queue.setVisibleQueueDispatchMode("tool-end")).toBe(true);
       expect(queue.getMessages()).toEqual(["visible follow-up", "hidden predecessor"]);
       expect(queue.getVisibleQueueDispatchMode()).toBe("tool-end");
-      expect(queue.getNextQueueDispatchMode()).toBe("tool-end");
+      expect(queue.getNextDispatchableMode()).toBe("tool-end");
     });
 
     it("reports the first visible entry mode instead of a later visible tool-end entry", () => {
@@ -476,9 +476,9 @@ describe("MessageQueue", () => {
       );
 
       expect(queue.getQueueDispatchMode()).toBe("tool-end");
-      expect(queue.getNextQueueDispatchMode()).toBe("turn-end");
+      expect(queue.getNextDispatchableMode()).toBe("turn-end");
       queue.dequeueNext();
-      expect(queue.getNextQueueDispatchMode()).toBe("tool-end");
+      expect(queue.getNextDispatchableMode()).toBe("tool-end");
     });
 
     it("does not update a queue containing only hidden entries", () => {
@@ -504,7 +504,7 @@ describe("MessageQueue", () => {
 
       queue.add("follow up", { ...validOptions, queueDispatchMode: "turn-end" });
       expect(queue.getNextDispatchableMode()).toBe("turn-end");
-      expect(queue.getNextQueueDispatchMode()).toBe("tool-end");
+      expect(queue.getVisibleQueueDispatchMode()).toBe("turn-end");
     });
 
     it("should reset mode to tool-end when cleared", () => {

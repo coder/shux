@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
@@ -163,7 +163,7 @@ describe("StreamingBarrier", () => {
     globalThis.document = undefined as unknown as Document;
   });
 
-  test("clicking stop during normal streaming interrupts with default options", () => {
+  test("clicking stop during normal streaming interrupts with default options", async () => {
     currentWorkspaceState = createWorkspaceState({
       canInterrupt: true,
       isCompacting: false,
@@ -177,13 +177,15 @@ describe("StreamingBarrier", () => {
 
     expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws-1", enabled: false });
     expect(setInterrupting).toHaveBeenCalledWith("ws-1");
-    expect(interruptStream).toHaveBeenCalledWith({
-      workspaceId: "ws-1",
-      options: { retireBashMonitorAttention: true },
-    });
+    await waitFor(() =>
+      expect(interruptStream).toHaveBeenCalledWith({
+        workspaceId: "ws-1",
+        options: { retireBashMonitorAttention: true },
+      })
+    );
   });
 
-  test("clicking stop during stream-start interrupts without setting interrupting state", () => {
+  test("clicking stop during stream-start interrupts without setting interrupting state", async () => {
     currentWorkspaceState = createWorkspaceState({
       canInterrupt: false,
       pendingStreamStartTime: Date.now(),
@@ -200,10 +202,12 @@ describe("StreamingBarrier", () => {
 
     expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws-1", enabled: false });
     expect(setInterrupting).not.toHaveBeenCalled();
-    expect(interruptStream).toHaveBeenCalledWith({
-      workspaceId: "ws-1",
-      options: { retireBashMonitorAttention: true },
-    });
+    await waitFor(() =>
+      expect(interruptStream).toHaveBeenCalledWith({
+        workspaceId: "ws-1",
+        options: { retireBashMonitorAttention: true },
+      })
+    );
   });
 
   test("shows the barrier immediately on first appearance", () => {
@@ -364,13 +368,14 @@ describe("StreamingBarrier", () => {
 
     fireEvent.click(view.getByRole("button", { name: "Stop streaming" }));
 
-    expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws-1", enabled: false });
+    // The compaction-cancel flow owns the retry opt-out along with its Stop.
     expect(onCancelCompaction).toHaveBeenCalledTimes(1);
+    expect(setAutoRetryEnabled).not.toHaveBeenCalled();
     expect(setInterrupting).not.toHaveBeenCalled();
     expect(interruptStream).not.toHaveBeenCalled();
   });
 
-  test("clicking stop during compaction falls back to abandonPartial interrupt", () => {
+  test("clicking stop during compaction falls back to abandonPartial interrupt", async () => {
     currentWorkspaceState = createWorkspaceState({
       canInterrupt: true,
       isCompacting: true,
@@ -382,10 +387,12 @@ describe("StreamingBarrier", () => {
 
     expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws-1", enabled: false });
     expect(setInterrupting).not.toHaveBeenCalled();
-    expect(interruptStream).toHaveBeenCalledWith({
-      workspaceId: "ws-1",
-      options: { abandonPartial: true, retireBashMonitorAttention: true },
-    });
+    await waitFor(() =>
+      expect(interruptStream).toHaveBeenCalledWith({
+        workspaceId: "ws-1",
+        options: { abandonPartial: true, retireBashMonitorAttention: true },
+      })
+    );
   });
 
   test("resets to new workspace text immediately on workspace switch", () => {

@@ -278,11 +278,6 @@ export class MessageQueue {
     return entries.some((entry) => entry.dispatchMode === "tool-end") ? "tool-end" : "turn-end";
   }
 
-  /** Dispatch boundary for the FIFO head entry — the only entry the next drain can send. */
-  getNextQueueDispatchMode(): QueueDispatchMode {
-    return this.entries[0]?.dispatchMode ?? "tool-end";
-  }
-
   /**
    * The first entry whose cancel signal has not fired. Aborted entries still drain FIFO (as no-ops that fire
    * onCanceled), but they are not pending work or continuations of a turn.
@@ -417,9 +412,13 @@ export class MessageQueue {
   /**
    * Dispatch mode for user-visible entries only. Backend-initiated maintenance/wake
    * messages should not change the queue badge shown beside the user's own follow-up.
+   * Derived from the entry the next drain actually sends, so a withdrawn head cannot show a
+   * boundary the live message will not dispatch at.
    */
   getVisibleQueueDispatchMode(): QueueDispatchMode {
-    return this.getVisibleEntries().length > 0 ? this.getNextQueueDispatchMode() : "tool-end";
+    return this.getVisibleEntries().length > 0
+      ? (this.getNextDispatchableMode() ?? "tool-end")
+      : "tool-end";
   }
 
   /**

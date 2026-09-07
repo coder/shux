@@ -100,7 +100,7 @@ export async function cancelCompaction(
 
   // Interrupt stream with abandonPartial flag
   // Backend detects this and skips compaction (Ctrl+C flow)
-  await stopStream(client, workspaceId, { abandonPartial: true });
+  await stopStream(client, workspaceId, { abandonPartial: true, disableAutoRetry: true });
 
   return true;
 }

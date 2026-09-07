@@ -9,7 +9,6 @@ import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { stopStream } from "@/browser/utils/stopStream";
-import { publishChatError } from "@/browser/utils/chatErrorToasts";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -239,18 +238,7 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     setCountdown(0);
     setManualRetryError(null);
     if (!api) return;
-    // The Stop is acknowledged only once the session's auto-retry state is on disk, so the opt-out
-    // must reach the session first or its write escapes that check.
-    try {
-      const optOut = await api.workspace.setAutoRetryEnabled?.({
-        workspaceId: props.workspaceId,
-        enabled: false,
-      });
-      if (optOut != null && !optOut.success) publishChatError(props.workspaceId, optOut.error);
-    } catch (error) {
-      publishChatError(props.workspaceId, getErrorMessage(error));
-    }
-    await stopStream(api, props.workspaceId);
+    await stopStream(api, props.workspaceId, { disableAutoRetry: true });
   };
 
   const lastMessage = getLastMainRetryCandidateMessage(workspaceState.messages);

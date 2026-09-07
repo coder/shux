@@ -4182,7 +4182,12 @@ export class AgentSession {
     // runs this check after its last other await.
     const abandonWithdrawnSend = async (): Promise<void> => {
       if (cancelSignal?.aborted === true) {
-        await this.updateStartupAutoRetryAbandonFromAbort("user", userMessage.id);
+        // Startup recovery matches the marker against the trailing durable row, which under on-send
+        // compaction is the compaction request, not the never-persisted user message.
+        await this.updateStartupAutoRetryAbandonFromAbort(
+          "user",
+          (autoCompactionMessage ?? userMessage).id
+        );
       }
     };
     // A stale refusal past this point keeps the durable, already accepted row, which the manual
