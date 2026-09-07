@@ -1163,7 +1163,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   );
 
-  test.each(["options", "settings"] as const)(
+  test.each(["options", "pricing"] as const)(
     "wake yields when a turn starts during %s admission",
     async (gate) => {
       const h = await createActiveWakeHarness();
@@ -1180,11 +1180,12 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         );
       } else {
         const internal = h.service as unknown as {
-          maybePersistAISettingsFromOptions(): Promise<void>;
+          assertPricedModelForBudgetedGoal(): Promise<Result<void, SendMessageError>>;
         };
-        spyOn(internal, "maybePersistAISettingsFromOptions").mockImplementationOnce(async () => {
+        spyOn(internal, "assertPricedModelForBudgetedGoal").mockImplementationOnce(async () => {
           entered.resolve();
           await release.promise;
+          return Ok(undefined);
         });
       }
       try {
