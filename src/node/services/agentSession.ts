@@ -961,6 +961,10 @@ export class AgentSession {
 
   /** Tracks file state for detecting external edits. */
   private readonly fileChangeTracker = new FileChangeTracker();
+  private acceptedFileSnapshotBaseline?: {
+    messageId: string;
+    tracking: ReturnType<FileChangeTracker["captureSnapshotBaseline"]>;
+  };
 
   /**
    * Track turns since last post-compaction attachment injection.
@@ -4362,6 +4366,14 @@ export class AgentSession {
     for (const file of snapshotResult?.fileStates ?? []) {
       await this.recordFileState(file.path, file.state);
     }
+    if (shouldPersistTurnSnapshots && snapshotResult && !isAdmissionStale()) {
+      this.acceptedFileSnapshotBaseline = {
+        messageId: snapshotResult.snapshotMessage.id,
+        tracking: this.fileChangeTracker.captureSnapshotBaseline(
+          snapshotResult.fileStates.map((file) => file.state)
+        ),
+      };
+    }
 
     // Goal synchronization can mutate goal.json based on this durable user row. Once it begins, the
     // turn has crossed the cancellation point-of-no-return: a concurrent monitor stop must let this
@@ -4962,6 +4974,11 @@ export class AgentSession {
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return Ok(undefined);
     if (!updated.success) return Err(createUnknownSendMessageError(updated.error));
+    const baseline = this.acceptedFileSnapshotBaseline;
+    if (baseline && updated.data.some((row) => row.id === baseline.messageId)) {
+      baseline.tracking.forget();
+      this.acceptedFileSnapshotBaseline = undefined;
+    }
     for (const row of updated.data) this.emitChatEvent({ ...row, type: "message" });
     return Ok(undefined);
   }
@@ -5076,6 +5093,7 @@ export class AgentSession {
       };
       // Snapshot/payload rows are part of the accepted request, not just its
       // fixed trigger. Preserve their roles and rebind server-owned ID references.
+      let copiedFileBaseline: AgentSession["acceptedFileSnapshotBaseline"];
       const requestPrelude = [...preludeIds].flatMap((id) => {
         const row = history.data.findLast((message) => message.id === id);
         // Tolerant history parsing can drop a damaged snapshot or payload while
@@ -5094,6 +5112,9 @@ export class AgentSession {
           return [];
         }
         const newId = randomUUID();
+        if (this.acceptedFileSnapshotBaseline?.messageId === id) {
+          copiedFileBaseline = { ...this.acceptedFileSnapshotBaseline, messageId: newId };
+        }
         continuation.parts = continuation.parts.map((part) =>
           part.type === "text" ? { ...part, text: part.text.replaceAll(id, newId) } : part
         );
@@ -5195,9 +5216,18 @@ export class AgentSession {
       )
         return Ok(undefined);
       const appended = await this.historyService.appendManyToHistory(this.workspaceId, rows);
-      if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
+      if (
+        !this.coordinator.isCurrentTurn(turn) ||
+        !this.coordinator.isCurrentOperation(operation) ||
+        this.coordinator.closing ||
+        this.contextBudgetGeneration !== generation
+      )
         return Ok(undefined);
       if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
+      // Only the copied snapshot belongs in the new window. Its accepted bytes—not a newer
+      // disk read or tool-tracked hash—must drive subsequent external-edit notifications.
+      copiedFileBaseline?.tracking.restore();
+      this.acceptedFileSnapshotBaseline = copiedFileBaseline;
       this.clearContextBudgetState();
       this.onContextWindowRollover?.();
       await clearPendingBranchSummary(this.workspaceId);
@@ -9526,6 +9556,7 @@ export class AgentSession {
   /** Clear all tracked file state (e.g., on /clear). */
   clearFileState(): void {
     this.fileChangeTracker.clear();
+    this.acceptedFileSnapshotBaseline = undefined;
   }
 
   /**
@@ -9636,7 +9667,7 @@ export class AgentSession {
       // files/pins/usage stats.
       this.memoryContextByModelString.clear();
       // Clear file state cache since history context is gone
-      this.fileChangeTracker.clear();
+      this.clearFileState();
 
       return this.buildAttachmentsFromContext({
         diffs: pendingState.diffs,

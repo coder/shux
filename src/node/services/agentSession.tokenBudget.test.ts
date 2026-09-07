@@ -2255,6 +2255,108 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test.each([false, true])(
+    "emergency copied file snapshots keep their original baseline (edited before rollover=%s)",
+    async (editBeforeRollover) => {
+      let mentioned = "";
+      const h = await setup({
+        failure: async (attempt) => {
+          if (attempt !== 1) return undefined;
+          if (editBeforeRollover) {
+            await fs.writeFile(mentioned, "changed content\n");
+            await fs.utimes(mentioned, new Date(2000), new Date(2000));
+            await h.session.recordFileState(mentioned, {
+              content: "changed content\n",
+              timestamp: 2000,
+            });
+          }
+          return exceeded;
+        },
+      });
+      mentioned = path.join(h.config.rootDir, "emergency-mentioned.txt");
+      const unrelated = path.join(h.config.rootDir, "unrelated-read.txt");
+      await fs.writeFile(mentioned, "initial content\n");
+      await fs.writeFile(unrelated, "unrelated old context\n");
+      await fs.utimes(mentioned, new Date(1000), new Date(1000));
+      await fs.utimes(unrelated, new Date(1000), new Date(1000));
+      await h.session.recordFileState(unrelated, {
+        content: "unrelated old context\n",
+        timestamp: 1000,
+      });
+      await seedHistory(h, 20000);
+      expect(
+        (await h.session.sendMessage("Inspect @emergency-mentioned.txt", options)).success
+      ).toBe(true);
+      expect(h.requests).toHaveLength(2);
+      expect(rolloverRows(await allRows(h))).toHaveLength(1);
+      expect(trackedFilePaths(h)).toEqual([mentioned]);
+      const snapshots = (await allRows(h)).filter((row) => row.metadata?.fileAtMentionSnapshot);
+      expect(snapshots).toHaveLength(2);
+      expect(text(snapshots[1])).toBe(text(snapshots[0]));
+      h.completions[0].settle({
+        status: "completed",
+        streamEnd: {
+          type: "stream-end",
+          workspaceId,
+          metadata: { model, agentId: "exec", finishReason: "stop" },
+          parts: [],
+        },
+      });
+      await h.session.waitForIdle();
+      if (!editBeforeRollover) {
+        await fs.writeFile(mentioned, "changed content\n");
+        await fs.utimes(mentioned, new Date(2000), new Date(2000));
+      }
+      expect((await h.session.sendMessage("Continue after external edit", options)).success).toBe(
+        true
+      );
+      const notification = h.requests[2].messages.find((row) =>
+        text(row).includes("<system-file-update>")
+      );
+      expect(notification).toBeDefined();
+      expect(text(notification!)).toContain("-initial content");
+      expect(text(notification!)).toContain("+changed content");
+      expect(text(notification!)).not.toContain("unrelated old context");
+    }
+  );
+
+  test.each(["append-failure", "shutdown-after-append", "rejected-retry"] as const)(
+    "emergency file tracking does not survive %s",
+    async (failure) => {
+      const h = await setup({
+        failure: (attempt) =>
+          attempt === 1 || (failure === "rejected-retry" && attempt === 2) ? exceeded : undefined,
+      });
+      const mentioned = path.join(h.config.rootDir, "failed-emergency.txt");
+      await fs.writeFile(mentioned, "accepted original bytes\n");
+      await fs.utimes(mentioned, new Date(1000), new Date(1000));
+      await seedHistory(h, 20000);
+      const append = h.historyService.appendManyToHistory.bind(h.historyService);
+      spyOn(h.historyService, "appendManyToHistory").mockImplementation(async (id, rows) => {
+        const rollover = rows.some(
+          (row) => row.metadata?.muxMetadata?.type === "context-window-rollover"
+        );
+        if (rollover) {
+          expect(trackedFilePaths(h)).toEqual([]);
+          if (failure === "append-failure") return Err("injected emergency append failure");
+        }
+        const result = await append(id, rows);
+        if (rollover && failure === "shutdown-after-append") h.session.beginShutdown();
+        return result;
+      });
+      await h.session.sendMessage("Inspect @failed-emergency.txt", options);
+      expect(trackedFilePaths(h)).toEqual([]);
+      expect(h.requests).toHaveLength(failure === "rejected-retry" ? 2 : 1);
+      const rows = await allRows(h);
+      expect(rolloverRows(rows)).toHaveLength(failure === "append-failure" ? 0 : 1);
+      if (failure === "rejected-retry") {
+        const displayed = rows.map(restoreContextBudgetRejectedMessageForDisplay);
+        const copied = displayed.findLast((row) => row.metadata?.fileAtMentionSnapshot);
+        expect(copied?.metadata?.contextBudgetRejected).toBe(true);
+      }
+    }
+  );
+
   test("the rollover-triggering file mention remains tracked in the fresh window", async () => {
     const h = await setup();
     const mentioned = path.join(h.config.rootDir, "mentioned.txt");

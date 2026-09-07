@@ -15,6 +15,61 @@ const model = "openai:gpt-4o";
 afterEach(() => mock.restore());
 
 describe("real-encoding budget guards", () => {
+  test.each([
+    { name: "empty arrays", value: Array.from({ length: 10000 }, () => []) },
+    { name: "empty objects", value: Array.from({ length: 10000 }, () => ({})) },
+    { name: "escaped controls", value: { ["\u0000".repeat(1000)]: "\u0000".repeat(6000) } },
+  ])("JSON $name cannot evade settled or assembled token budgets", async ({ value }) => {
+    const tokenizer = await tokenizerModule.getTokenizerForModel(model, undefined, {
+      requireRealEncoding: true,
+    });
+    const direct = await tokenizer.countTokens(JSON.stringify(value));
+    const limit = 12000;
+    expect(direct).toBeGreaterThan(getContextBudgetHardCeiling(limit));
+    expect(await estimateToolResultTokensForModel(value, { model })).toBeGreaterThanOrEqual(direct);
+    const payload = {
+      messages: [
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "structured",
+              toolName: "read",
+              output: { type: "json", value },
+            },
+          ],
+        },
+      ],
+    };
+    expect(
+      (await checkAssembledRequestBudgetForModel(payload, { model, modelContextLimit: limit }))
+        ?.type
+    ).toBe("context_budget_exceeded");
+  });
+
+  test("structure-only aliases remain bounded and cycles do not hide visible escaped text", async () => {
+    const tokenizer = await tokenizerModule.getTokenizerForModel(model, undefined, {
+      requireRealEncoding: true,
+    });
+    const count = spyOn(tokenizer, "countTokens");
+    spyOn(tokenizerModule, "getTokenizerForModel").mockResolvedValue(tokenizer);
+    const shared: unknown[] = [];
+    const aliases = Array.from({ length: 1500 }, () => shared);
+    const encoded = await tokenizer.countTokens(JSON.stringify(aliases));
+    count.mockClear();
+    expect(await estimateToolResultTokensForModel(aliases, { model })).toBeGreaterThanOrEqual(
+      encoded
+    );
+    expect(count.mock.calls.length).toBeLessThanOrEqual(1);
+    const cyclic: { value: string; self?: unknown } = { value: "\u0000".repeat(1000) };
+    const plain = await estimateToolResultTokensForModel(cyclic, { model });
+    cyclic.self = cyclic;
+    const withCycle = await estimateToolResultTokensForModel(cyclic, { model });
+    expect(withCycle).toBeGreaterThanOrEqual(plain);
+    expect(Number.isFinite(withCycle)).toBe(true);
+  });
+
   test("bypass warmed approx-4 without changing ordinary callers for CJK, emoji and dense identifiers", async () => {
     const keys = [
       "XUM_APPROX_TOKENIZER",

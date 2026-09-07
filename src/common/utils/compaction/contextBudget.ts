@@ -152,10 +152,14 @@ function measureBudgetContent(
   while (stack.length > 0) {
     const entry = stack.pop()!;
     const value = entry.value;
-    if (value == null) continue;
+    if (value == null) {
+      toolResultChars += 4;
+      textParts?.push("null");
+      continue;
+    }
     if (typeof value === "string") {
       // A data URL in user/tool text is still sent verbatim, not as an attachment.
-      toolResultChars += value.length + 2;
+      toolResultChars += JSON.stringify(value).length;
       textParts?.push(value);
       continue;
     }
@@ -172,7 +176,7 @@ function measureBudgetContent(
     }
     if (ancestors.has(value)) continue;
     if (value instanceof URL) {
-      toolResultChars += value.href.length;
+      toolResultChars += JSON.stringify(value.href).length;
       textParts?.push(value.href);
       continue;
     }
@@ -219,7 +223,7 @@ function measureBudgetContent(
         (urlMedia && key === "url")
       )
         continue;
-      toolResultChars += key.length + 4;
+      toolResultChars += JSON.stringify(key).length + 2;
       textParts?.push(key);
       stack.push({
         value: child,
@@ -252,11 +256,16 @@ export function prepareBudgetTokenCount(
 ): BudgetTokenCountInput {
   const textParts: string[] = [];
   const size = measureBudgetContent(content, textParts, kind);
-  const fixedTokens = size.imageParts * IMAGE_TOKEN_ESTIMATE;
+  const mediaTokens = size.imageParts * IMAGE_TOKEN_ESTIMATE;
+  // Raw leaves omit JSON punctuation and escape expansion. Each omitted ASCII byte costs
+  // at most one token; charge that conservative bound instead of dividing structure by 3.5.
+  const textChars = textParts.reduce((sum, text) => sum + text.length, 0);
+  const omittedBytes = size.toolResultChars - textChars;
+  assert(omittedBytes >= 0, "Budget text must be contained in the measured serialization");
   return {
     text: textParts.join("\n"),
-    fixedTokens,
-    heuristicTokens: Math.ceil(size.toolResultChars / 3.5) + fixedTokens,
+    fixedTokens: mediaTokens + omittedBytes,
+    heuristicTokens: Math.ceil(textChars / 3.5) + mediaTokens + omittedBytes,
   };
 }
 
