@@ -7457,9 +7457,9 @@ export class AgentSession {
     }
 
     const queuedMessages = this.messageQueue.getVisibleMessages();
-    const displayText = this.messageQueue.getVisibleDisplayText();
+    const displayText = this.messageQueue.getVisibleRestoreText();
     const fileParts = this.messageQueue.getVisibleFileParts();
-    const reviews = this.messageQueue.getVisibleReviews();
+    const reviews = this.messageQueue.getVisibleRestoreReviews();
     const hasVisibleContent =
       queuedMessages.length > 0 || fileParts.length > 0 || (reviews?.length ?? 0) > 0;
 

@@ -4,7 +4,7 @@ import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxMessage } from "@/common/types/message";
-import type { ReviewNoteData } from "@/common/types/review";
+import { stripRenderedReviews, type ReviewNoteData } from "@/common/types/review";
 
 // Type guard for compaction request metadata (for display text)
 interface CompactionMetadata {
@@ -176,6 +176,9 @@ type QueueClearCallbacks = Pick<
  */
 interface QueueEntry {
   messages: string[];
+  // Restore each original send before batching loses its review metadata/boundaries.
+  // These records never affect provider dispatch or the queued-message display.
+  restoreMessages: Array<{ text: string; reviews?: ReviewNoteData[]; messageIndex: number | null }>;
   /** First muxMetadata added to this entry (never overwritten by later batched adds). */
   muxMetadata?: unknown;
   latestOptions?: SendMessageOptions;
@@ -609,6 +612,7 @@ export class MessageQueue {
       }
     } else {
       entry = {
+        restoreMessages: [],
         messages: [],
         fileParts: [],
         dedupeKeys: new Set<string>(),
@@ -638,6 +642,19 @@ export class MessageQueue {
       entry.goalInterventionPolicy === "pause" || options?.goalInterventionPolicy === "pause"
         ? "pause"
         : (options?.goalInterventionPolicy ?? entry.goalInterventionPolicy);
+
+    const reviews = hasReviews(options?.muxMetadata) ? options.muxMetadata.reviews : undefined;
+    let restoreText = message;
+    try {
+      restoreText = stripRenderedReviews(message, reviews);
+    } catch {
+      // muxMetadata is a black box: malformed legacy notes must not make enqueue throw.
+    }
+    entry.restoreMessages.push({
+      text: restoreText,
+      reviews: reviews?.slice(),
+      messageIndex: trimmedMessage.length > 0 ? entry.messages.length : null,
+    });
 
     // Add text message if non-empty
     if (trimmedMessage.length > 0) {
@@ -755,7 +772,7 @@ export class MessageQueue {
     return entries.flatMap((entry) => entry.messages);
   }
 
-  private getDisplayTextForEntries(entries: readonly QueueEntry[]): string {
+  private getDisplayTextForEntries(entries: readonly QueueEntry[], restore = false): string {
     return entries
       .map((entry) => {
         if (
@@ -764,7 +781,11 @@ export class MessageQueue {
         ) {
           return entry.muxMetadata.rawCommand;
         }
-        return entry.messages.join("\n");
+        return (
+          restore
+            ? entry.restoreMessages.map((message) => message.text).filter(Boolean)
+            : entry.messages
+        ).join("\n");
       })
       .filter((text) => text.length > 0)
       .join("\n");
@@ -803,6 +824,19 @@ export class MessageQueue {
   /** Get display text for user-visible entries only. */
   getVisibleDisplayText(): string {
     return this.getDisplayTextForEntries(this.getVisibleEntries());
+  }
+
+  /** Editable text, normalized before per-send review boundaries were flattened. */
+  getVisibleRestoreText(): string {
+    return this.getDisplayTextForEntries(this.getVisibleEntries(), true);
+  }
+
+  /** Preserve later batched sends' reviews without changing first-metadata dispatch semantics. */
+  getVisibleRestoreReviews(): ReviewNoteData[] | undefined {
+    const reviews = this.getVisibleEntries().flatMap((entry) =>
+      entry.restoreMessages.flatMap((message) => message.reviews ?? [])
+    );
+    return reviews.length > 0 ? reviews : undefined;
   }
 
   /** Get accumulated file parts across all entries. */
@@ -892,12 +926,20 @@ export class MessageQueue {
       // but multiple progress sends can still batch together. Remove only the matched messages and
       // preserve unrelated keys/messages that share the same entry.
       const matchingKeySet = new Set(matchingKeys);
+      const keptIndexes = new Map<number, number>();
       const keptMessages = entry.messages.filter((_message, index) => {
         const key = [...entry.dedupeKeys][index];
-        return key == null || !matchingKeySet.has(key);
+        const keep = key == null || !matchingKeySet.has(key);
+        if (keep) keptIndexes.set(index, keptIndexes.size);
+        return keep;
       });
       if (keptMessages.length > 0) {
         entry.messages = keptMessages;
+        entry.restoreMessages = entry.restoreMessages.flatMap((message) => {
+          if (message.messageIndex === null) return [message];
+          const messageIndex = keptIndexes.get(message.messageIndex);
+          return messageIndex === undefined ? [] : [{ ...message, messageIndex }];
+        });
         for (const key of matchingKeys) {
           entry.dedupeKeys.delete(key);
         }

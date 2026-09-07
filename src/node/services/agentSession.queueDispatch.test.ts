@@ -1,5 +1,7 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 
+import { prepareUserMessageForSend } from "@/common/types/message";
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
@@ -677,6 +679,74 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(setMessageQueued).toHaveBeenLastCalledWith(workspaceId, false);
       expect(session.hasQueuedMessages()).toBe(true);
     } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("restoreQueueToInput emits all reviewed bodies once without dispatching or changing cancellation", async () => {
+    const workspaceId = "queue-restore-reviewed-input";
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: { streamMessage },
+    });
+    const reviews = ["one.ts", "two.ts"].map((filePath) => ({
+      filePath,
+      lineRange: "1",
+      selectedCode: "code",
+      userNote: filePath,
+    }));
+    const fileParts = [
+      { url: "data:text/plain;base64,dGV4dA==", mediaType: "text/plain", filename: "notes.txt" },
+    ];
+    const restored: Extract<WorkspaceChatMessage, { type: "restore-to-input" }>[] = [];
+    const displays: string[] = [];
+    const canceled: string[] = [];
+    const unsubscribe = session.onChatEvent(({ message }) => {
+      if (message.type === "restore-to-input") restored.push(message);
+      if (message.type === "queued-message-changed") displays.push(message.displayText);
+    });
+    try {
+      session.queueMessage(
+        "hidden",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          onCanceled: (reason) => {
+            canceled.push(reason);
+          },
+        }
+      );
+      const prepared = reviews.map((review, index) =>
+        prepareUserMessageForSend({ text: `body ${index}`, reviews: [review] })
+      );
+      for (const message of prepared)
+        session.queueMessage(message.finalText, {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: message.metadata,
+          fileParts,
+        });
+      expect(displays.at(-1)).toBe(prepared.map((message) => message.finalText).join("\n"));
+      session.restoreQueueToInput();
+      expect(restored).toEqual([
+        {
+          type: "restore-to-input",
+          workspaceId,
+          text: "body 0\nbody 1",
+          fileParts: [...fileParts, ...fileParts],
+          reviews,
+        },
+      ]);
+      expect(prepareUserMessageForSend(restored[0])).toEqual(
+        prepareUserMessageForSend({ text: "body 0\nbody 1", reviews })
+      );
+      expect(canceled).toHaveLength(1);
+      expect(session.hasQueuedMessages()).toBe(false);
+      expect(streamMessage).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
       session.dispose();
       await cleanup();
     }
