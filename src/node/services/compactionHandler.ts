@@ -382,6 +382,8 @@ interface CompactionHandlerOptions {
   emitter: EventEmitter;
   /** Called when compaction completes successfully (e.g., to clear idle compaction pending state) */
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
+  /** Capture semantic ownership before I/O; durable completion must not retarget a successor. */
+  captureCompletionGuard?: () => () => boolean;
   /**
    * Called with the terminal outcome of an idle compaction (source === "idle-compaction"),
    * after the summary is actually persisted (success) or a post-stream persistence failure
@@ -411,6 +413,7 @@ export class CompactionHandler {
   private readonly processedCompactionRequestIds: Set<string> = new Set<string>();
 
   private readonly onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
+  private readonly captureCompletionGuard?: () => () => boolean;
   private readonly onIdleCompactionOutcome?: (success: boolean) => void;
 
   /** Flag indicating post-compaction attachments should be generated on next turn */
@@ -419,6 +422,13 @@ export class CompactionHandler {
   private cachedFileDiffs: FileEditDiff[] = [];
   /** Rollback snapshot for synthetic heartbeat reset boundaries that get skipped before dispatch. */
   private heartbeatResetRollbackState: HeartbeatResetRollbackState | null = null;
+  private pendingStateWrites: Promise<unknown> = Promise.resolve();
+
+  private enqueuePendingStateWrite<T>(write: () => Promise<T>): Promise<T> {
+    const result = this.pendingStateWrites.then(write);
+    this.pendingStateWrites = result.catch(() => undefined);
+    return result;
+  }
   /** Cached loaded skill snapshots extracted from history before appending compaction summary */
   private cachedLoadedSkills: LoadedSkillSnapshot[] = [];
   /** Cumulative file paths read in summarized epochs (paths only, newest-first, capped). */
@@ -437,6 +447,7 @@ export class CompactionHandler {
     this.telemetryService = options.telemetryService;
     this.emitter = options.emitter;
     this.onCompactionComplete = options.onCompactionComplete;
+    this.captureCompletionGuard = options.captureCompletionGuard;
     this.onIdleCompactionOutcome = options.onIdleCompactionOutcome;
   }
 
@@ -590,7 +601,7 @@ export class CompactionHandler {
   async discardPendingStateDurably(reason: string): Promise<void> {
     await this.discardPendingState(reason);
     try {
-      await fsPromises.unlink(this.postCompactionStatePath);
+      await this.enqueuePendingStateWrite(() => fsPromises.unlink(this.postCompactionStatePath));
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return;
@@ -601,7 +612,7 @@ export class CompactionHandler {
 
   private async deletePersistedPendingStateBestEffort(): Promise<void> {
     try {
-      await fsPromises.unlink(this.postCompactionStatePath);
+      await this.enqueuePendingStateWrite(() => fsPromises.unlink(this.postCompactionStatePath));
     } catch {
       // ignore
     }
@@ -623,6 +634,10 @@ export class CompactionHandler {
       return;
     }
 
+    // Consume the captured rollback before I/O. A new heartbeat can install its
+    // own snapshot while this unlink/write is pending; A must never clear B's.
+    this.heartbeatResetRollbackState = null;
+
     this.postCompactionAttachmentsPending = rollbackState.postCompactionAttachmentsPending;
     this.cachedFileDiffs = [...rollbackState.cachedFileDiffs];
     this.cachedLoadedSkills = [...rollbackState.cachedLoadedSkills];
@@ -638,8 +653,6 @@ export class CompactionHandler {
     } else {
       await this.deletePersistedPendingStateBestEffort();
     }
-
-    this.heartbeatResetRollbackState = null;
   }
 
   private async persistPendingStateBestEffort(
@@ -650,8 +663,6 @@ export class CompactionHandler {
     previousState?: PersistedPostCompactionStateV1
   ): Promise<void> {
     try {
-      await fsPromises.mkdir(this.sessionDir, { recursive: true });
-
       for (const snapshot of loadedSkills) {
         assert(snapshot.name.trim().length > 0, "loaded skill snapshot name must not be empty");
       }
@@ -665,7 +676,13 @@ export class CompactionHandler {
         ...(boundaryMessageId && { boundaryMessageId, previousState }),
       };
 
-      await fsPromises.writeFile(this.postCompactionStatePath, JSON.stringify(persisted));
+      // Freeze the admitted snapshot, then order writes AND unlinks. A held rollback
+      // must not erase a newer compaction's pending state after that compaction completes.
+      const serialized = JSON.stringify(persisted);
+      await this.enqueuePendingStateWrite(async () => {
+        await fsPromises.mkdir(this.sessionDir, { recursive: true });
+        await fsPromises.writeFile(this.postCompactionStatePath, serialized);
+      });
     } catch (error) {
       log.warn("Failed to persist post-compaction state", {
         workspaceId: this.workspaceId,
@@ -875,7 +892,8 @@ export class CompactionHandler {
   }
 
   async rollbackHeartbeatContextResetBoundary(
-    summaryMessage: MuxMessage
+    summaryMessage: MuxMessage,
+    isCurrent: () => boolean = () => true
   ): Promise<Result<void, string>> {
     assert(
       summaryMessage.role === "assistant",
@@ -888,13 +906,24 @@ export class CompactionHandler {
 
     const deleteResult = await this.historyService.deleteMessage(
       this.workspaceId,
-      summaryMessage.id
+      summaryMessage.id,
+      (messages) =>
+        isCurrent() &&
+        messages.some(
+          (message) =>
+            message.id === summaryMessage.id &&
+            message.metadata?.historySequence === summaryMessage.metadata?.historySequence
+        )
     );
     if (!deleteResult.success) {
       return Err(`Failed to delete heartbeat reset boundary: ${deleteResult.error}`);
     }
 
+    if (!isCurrent()) return Ok(undefined);
+
     await this.restoreHeartbeatResetRollbackState();
+
+    if (!isCurrent()) return Ok(undefined);
 
     const historySequence = summaryMessage.metadata?.historySequence;
     if (isNonNegativeInteger(historySequence)) {
@@ -929,6 +958,7 @@ export class CompactionHandler {
     event: StreamEndEvent,
     compactionRequestMessageId?: string
   ): Promise<boolean> {
+    const canComplete = this.captureCompletionGuard?.();
     // The current stream identifies its request when available. Synthetic prompt snapshots can
     // follow that request in history, so the last user row is not always the compaction request.
     const historyResult = compactionRequestMessageId
@@ -1052,7 +1082,7 @@ export class CompactionHandler {
     });
 
     // Notify that compaction completed (clears idle compaction pending state)
-    this.onCompactionComplete?.(result.data);
+    if (canComplete?.() !== false) this.onCompactionComplete?.(result.data);
 
     // Report the idle-compaction success only after the summary is actually persisted,
     // so the idle loop's failure streak is reset on real success (not just stream end).
@@ -1239,6 +1269,7 @@ export class CompactionHandler {
       shouldPersist: (messages: MuxMessage[]) => boolean;
     }
   ): Promise<boolean> {
+    const canComplete = this.captureCompletionGuard?.();
     const { boundary, copies } = params.prepared ?? this.buildContinuousCompactionRows(params);
     const inputTokens =
       params.systemMessageTokens +
@@ -1271,15 +1302,16 @@ export class CompactionHandler {
     const epoch = boundary.metadata.compactionEpoch;
     assert(isNonNegativeInteger(sequence), "Continuous boundary requires a persisted sequence");
     assert(isPositiveInteger(epoch), "Continuous boundary requires an epoch");
-    this.onCompactionComplete?.({
-      workspaceId: this.workspaceId,
-      summaryMessageId: boundary.id,
-      summaryHistorySequence: sequence,
-      compactionEpoch: epoch,
-      previousBoundaryHistorySequence: getLatestBoundaryHistorySequence(params.messages),
-      compactionRequestMessageId: boundary.id,
-      preservedTailMessageCount: copies.length,
-    });
+    if (canComplete?.() !== false)
+      this.onCompactionComplete?.({
+        workspaceId: this.workspaceId,
+        summaryMessageId: boundary.id,
+        summaryHistorySequence: sequence,
+        compactionEpoch: epoch,
+        previousBoundaryHistorySequence: getLatestBoundaryHistorySequence(params.messages),
+        compactionRequestMessageId: boundary.id,
+        preservedTailMessageCount: copies.length,
+      });
     return true;
   }
 

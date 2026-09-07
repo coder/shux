@@ -46,6 +46,8 @@ interface StreamSnapshot {
 }
 interface Dependencies {
   workspaceId: string;
+  /** Physical session ownership; speculative work must not reserve turn admission. */
+  enterExecution?(): Disposable;
   historyService: HistoryService;
   compactionHandler: CompactionHandler;
   streamManager: {
@@ -148,20 +150,30 @@ export class ContinuousCompactor {
     // It also keeps the disabled hot path free of journal I/O when no swap ever activated.
     const discardJournal = !settingsOnly || this.activeSwap !== null || this.swapAttempted !== null;
     this.generation++;
-    this.job?.abort.abort();
+    const job = this.job;
     this.job = null;
     this.staged = null;
     this.swapAttempted = null;
     this.activeSwap = null;
-    this.deps.streamManager.clearPrefixSwap?.(this.deps.workspaceId);
     // Graceful shutdown retains the write-ahead record for ordinary startup recovery.
     if (discardJournal && reason !== "shutdown") {
-      this.deps.historyService
-        .getContinuousCompactionJournal(this.deps.workspaceId)
-        .clear()
-        .catch((error: unknown) => log.warn("[continuous-compaction] journal clear failed", error));
+      this.clearJournal().catch((error: unknown) =>
+        log.warn("[continuous-compaction] journal clear failed", error)
+      );
+    }
+    // Detach semantic ownership and enqueue the old clear before abort observers can
+    // synchronously replace work. The original job retains its physical lease until done.
+    try {
+      this.deps.streamManager.clearPrefixSwap?.(this.deps.workspaceId);
+    } finally {
+      job?.abort.abort();
     }
     log.debug("[continuous-compaction] reset", { workspaceId: this.deps.workspaceId, reason });
+  }
+
+  private async clearJournal(): Promise<void> {
+    using _execution = this.deps.enterExecution?.();
+    await this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId).clear();
   }
 
   hasConsumedSwap(): boolean {
@@ -220,6 +232,7 @@ export class ContinuousCompactor {
       }
       if (context.phase !== "mid-stream") {
         if (await this.finalizeJournal()) return "applied";
+        if (generation !== this.generation) return "none";
         // A transient history failure must remain recoverable even when future
         // compaction is disabled; only a discarded/invalid journal releases this latch.
         if (this.hasConsumedSwap()) return "none";
@@ -263,6 +276,7 @@ export class ContinuousCompactor {
         done: Promise.resolve(),
       };
       this.job = job;
+      const execution = this.deps.enterExecution?.();
       job.done = this.startEagerJob(job, context)
         .catch((error: unknown) => {
           if (!job.abort.signal.aborted)
@@ -270,6 +284,7 @@ export class ContinuousCompactor {
         })
         .finally(() => {
           if (this.job === job) this.job = null;
+          execution?.[Symbol.dispose]();
         });
     }
     return usagePercent >= context.thresholdPercent + FORCE_COMPACTION_BUFFER_PERCENT
@@ -582,6 +597,7 @@ export class ContinuousCompactor {
       rows.some((row) => row.id === journal.liveTailCopySpec.copyId);
     if (rows.some((row) => row.id === journal.boundary.id) && copiesPresent) {
       await store.clear();
+      if (generation !== this.generation) return false;
       this.activeSwap = null;
       return true;
     }
@@ -618,6 +634,7 @@ export class ContinuousCompactor {
         workspaceId: this.deps.workspaceId,
       });
       await store.clear();
+      if (generation !== this.generation) return false;
       this.activeSwap = null;
       return false;
     }
@@ -668,9 +685,11 @@ export class ContinuousCompactor {
       },
       boundary.id
     );
-    if (applied) {
+    if (applied && generation === this.generation) {
       await store.clear();
-      this.reset("applied");
+      // Persistence may finish after an edit/reset. Its old clear is already ordered
+      // by the store; a new reset here would enqueue another clear behind replacement work.
+      if (generation === this.generation) this.reset("applied");
     }
     return applied;
   }
@@ -725,7 +744,7 @@ export class ContinuousCompactor {
           attachmentTokens: context.attachmentTokens ?? 0,
           pendingFollowUp,
         });
-        if (applied) this.reset("applied");
+        if (applied && staged.generation === this.generation) this.reset("applied");
         return applied;
       }
     );

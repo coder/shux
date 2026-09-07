@@ -92,7 +92,9 @@ describe("AgentSession.drainQueuedMessagesIfIdle", () => {
     [
       "a pending mid-stream compaction owns the next dispatch",
       (s) => {
-        s.midStreamCompactionPending = true;
+        const token = s.coordinator.beginCompactionObservation("legacy");
+        if (!token) throw new Error("Expected compaction owner");
+        s.coordinator.setCompactionStage(token, "stopping");
       },
       0,
     ],

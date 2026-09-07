@@ -3,11 +3,124 @@ import { Effect, Exit, Scope } from "effect";
 import { Err } from "@/common/types/result";
 import { defaultEffectRunner as runner } from "./di/effectRunner";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
+import type { ContinuousCompactor } from "./continuousCompactor";
+import { createMuxMessage } from "@/common/types/message";
 
 const workspaceId = "scoped-turn";
 const options = { model: "openai:gpt-4o", agentId: "exec" };
 
 describe("AgentSession scoped turn lifetimes", () => {
+  test("a canceled non-cooperative summary stays joined while its replacement applies", async () => {
+    const h = await createAgentSessionHarness({ workspaceId });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const { continuousCompactor: compactor } = h.session as unknown as {
+      continuousCompactor: ContinuousCompactor;
+    };
+    const { deps } = compactor as unknown as {
+      deps: ConstructorParameters<typeof ContinuousCompactor>[0];
+    };
+    const summarize = spyOn(deps, "summarize")
+      .mockImplementationOnce(async (_head, signal) => {
+        entered.resolve();
+        await release.promise;
+        expect(signal.aborted).toBe(true);
+        return { text: "obsolete summary", model: options.model };
+      })
+      .mockResolvedValue({ text: "replacement summary", model: options.model });
+    const context = {
+      enabled: true,
+      model: options.model,
+      contextWindowTokens: 100_000,
+      thresholdPercent: 80,
+      phase: "on-send" as const,
+    };
+    let closing: Promise<void> | undefined;
+    try {
+      for (const row of [
+        createMuxMessage("old-user", "user", "Investigate"),
+        createMuxMessage("old-answer", "assistant", "earlier investigation ".repeat(4_000)),
+        createMuxMessage("recent-user", "user", "Implement"),
+        createMuxMessage("recent-answer", "assistant", "Done"),
+      ])
+        expect((await h.historyService.appendToHistory(workspaceId, row)).success).toBe(true);
+      await compactor.observe(75, context);
+      await entered.promise;
+      {
+        using _mutation = h.session.holdTurnAdmission();
+      }
+      expect(h.session.isBusy()).toBe(false);
+      await compactor.observe(75, context);
+      const replacement = (compactor as unknown as { job: { done: Promise<void> } }).job;
+      await replacement.done;
+      expect(await compactor.observe(80, context)).toBe("applied");
+      expect(summarize).toHaveBeenCalledTimes(2);
+      let closed = false;
+      closing = h.session.finishShutdown().then(() => {
+        closed = true;
+      });
+      await runner.runPromise(Effect.yieldNow);
+      expect(closed).toBe(false);
+      release.resolve();
+      await closing;
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success && history.data[0].parts).toMatchObject([
+        { type: "text", text: "replacement summary" },
+      ]);
+    } finally {
+      release.resolve();
+      await closing;
+      await h.session.dispose();
+      await h.cleanup();
+      mock.restore();
+    }
+  });
+
+  test("shutdown joins an eager job whose prepare synchronously closes the session", async () => {
+    const h = await createAgentSessionHarness({ workspaceId });
+    const stream = spyOn(h.aiService, "streamMessage");
+    const release = Promise.withResolvers<void>();
+    const { continuousCompactor } = h.session as unknown as {
+      continuousCompactor: ContinuousCompactor;
+    };
+    const { deps } = continuousCompactor as unknown as {
+      deps: { prepare(): Promise<void> };
+    };
+    spyOn(deps, "prepare").mockImplementation(() => {
+      h.session.beginShutdown();
+      return release.promise;
+    });
+    let closed = false;
+    let closing: Promise<void> | undefined;
+    try {
+      await continuousCompactor.observe(75, {
+        enabled: true,
+        model: options.model,
+        contextWindowTokens: 100_000,
+        thresholdPercent: 80,
+        phase: "on-send",
+      });
+      // Reset detaches the job immediately; its original preparation still owns I/O.
+      expect(h.session.closingSignal.aborted).toBe(true);
+      expect(h.session.isBusy()).toBe(false);
+      closing = h.session.finishShutdown().then(() => {
+        closed = true;
+      });
+      await runner.runPromise(Effect.yieldNow);
+      expect(closed).toBe(false);
+      release.resolve();
+      await closing;
+      expect(closed).toBe(true);
+      expect(stream).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await closing;
+      await h.session.dispose();
+      await h.cleanup();
+      mock.restore();
+    }
+  });
+
   test("queue clear publication cannot outrun its cancellation refund", async () => {
     const appFiberScope = Scope.makeUnsafe("parallel");
     const entered = Promise.withResolvers<void>();

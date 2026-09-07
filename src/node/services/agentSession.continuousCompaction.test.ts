@@ -24,6 +24,7 @@ import {
   type AgentSessionHarness,
 } from "./agentSession.testHarness";
 import type { ContinuousCompactor } from "./continuousCompactor";
+import type { CompactionToken, TurnCoordinator } from "./turnCoordinator";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
@@ -34,6 +35,10 @@ const sendOptions: SendMessageOptions = {
 };
 
 interface SessionInternals {
+  coordinator: TurnCoordinator;
+  runContinuousCompactionObservation<T>(
+    observe: (token: CompactionToken) => Promise<T>
+  ): Promise<T | undefined>;
   continuousCompactor: ContinuousCompactor;
   activeStreamContext?: {
     modelString: string;
@@ -42,7 +47,8 @@ interface SessionInternals {
   };
   finishContinuousCompaction: (
     applied: boolean,
-    context: NonNullable<SessionInternals["activeStreamContext"]>
+    context: NonNullable<SessionInternals["activeStreamContext"]>,
+    token: CompactionToken
   ) => Promise<void>;
   interruptForContinuousCompaction: (
     apply: (followUp?: CompactionFollowUpRequest) => Promise<boolean>
@@ -60,9 +66,13 @@ async function applyThenFinish(
   const state = internals(session);
   const context = state.activeStreamContext;
   if (!context) throw new Error("Expected active stream context");
-  const applied = await state.interruptForContinuousCompaction(apply);
-  await state.finishContinuousCompaction(applied, context);
-  return applied;
+  return (
+    (await state.runContinuousCompactionObservation(async (token) => {
+      const applied = await state.interruptForContinuousCompaction(apply);
+      await state.finishContinuousCompaction(applied, context, token);
+      return applied;
+    })) ?? false
+  );
 }
 
 function deferred<T>() {
@@ -244,16 +254,22 @@ describe("AgentSession continuous compaction wiring", () => {
     await h.historyService.writePartial(workspaceId, source);
     streaming = false;
     if (mode === "failed-consumed-apply") {
-      Reflect.set(h.session, "continuousCompactionStopped", true);
+      const token = internals(h.session).coordinator.beginCompactionObservation("continuous");
+      assert(token, "Expected observation");
+      internals(h.session).coordinator.setCompactionStage(token, "stopped");
       const reset = spyOn(compactor, "reset");
-      await internals(h.session).finishContinuousCompaction(false, {
-        modelString: model,
-        options: sendOptions,
-        providersConfig: null,
-      });
+      await internals(h.session).finishContinuousCompaction(
+        false,
+        {
+          modelString: model,
+          options: sendOptions,
+          providersConfig: null,
+        },
+        token
+      );
       expect(reset).not.toHaveBeenCalled();
       expect(await store.read()).not.toBeNull();
-      Reflect.set(h.session, "continuousCompactionStopped", false);
+      internals(h.session).coordinator.finishCompactionObservation(token);
     }
     if (mode !== "startup") {
       const terminal = Reflect.get(h.session, "observeContinuousCompactionAtStreamEnd") as (
@@ -499,6 +515,36 @@ describe("AgentSession continuous compaction wiring", () => {
     });
   });
 
+  test("a late durable completion cannot replace a successor's summary target", async () => {
+    const h = await setup();
+    const handler = (h.session as unknown as { compactionHandler: CompactionHandler })
+      .compactionHandler;
+    const tail = createMuxMessage("tail", "user", "Retain this request");
+    await h.historyService.appendToHistory(workspaceId, tail);
+    const history = await rows(h);
+    const persist = h.historyService.persistBoundaryWithTailCopies.bind(h.historyService);
+    spyOn(h.historyService, "persistBoundaryWithTailCopies").mockImplementationOnce(
+      async (...args) => {
+        const result = await persist(...args);
+        internals(h.session).coordinator.invalidateCompaction();
+        internals(h.session).coordinator.recordCompactionSummary("successor-summary");
+        return result;
+      }
+    );
+    expect(
+      await handler.persistContinuousCompaction({
+        messages: history,
+        text: "Old summary",
+        model,
+        tail: [tail],
+        systemMessageTokens: 0,
+        attachmentTokens: 0,
+        shouldPersist: () => true,
+      })
+    ).toBe(true);
+    expect(internals(h.session).coordinator.compactionIntent.summaryId).toBe("successor-summary");
+  });
+
   test("invalidation contains an initial wait rejection and safely stops the blocked stream", async () => {
     const h = await setup();
     const compactor = internals(h.session).continuousCompactor;
@@ -574,10 +620,10 @@ describe("AgentSession continuous compaction wiring", () => {
     const invoked = deferred<void>();
     const drain = spyOn(h.session, "drainQueuedMessagesIfIdle").mockImplementation(() => undefined);
     const run = Reflect.get(h.session, "runContinuousCompactionObservation") as (
-      observe: () => Promise<void>
+      observe: (token: CompactionToken) => Promise<void>
     ) => Promise<void>;
-    const first = run.call(h.session, async () => {
-      Reflect.set(h.session, "midStreamCompactionPending", true);
+    const first = run.call(h.session, async (token) => {
+      internals(h.session).coordinator.setCompactionStage(token, "stopping");
       await release.promise;
     });
     const observe = spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
@@ -805,7 +851,6 @@ describe("AgentSession continuous compaction wiring", () => {
         spyOn(internals(h.session).continuousCompactor, "waitForIdle").mockReturnValueOnce(
           observationFinished.promise
         );
-        Reflect.set(h.session, "continuousCompactionObserving", true);
       }
       h.aiEmitter.emit(eventType, {
         type: eventType,
@@ -815,7 +860,6 @@ describe("AgentSession continuous compaction wiring", () => {
       });
       if (eventType === "prefix-swap-invalidated") {
         expect(order).toEqual([]);
-        Reflect.set(h.session, "continuousCompactionObserving", false);
         observationFinished.resolve();
       }
       await resumed.promise;

@@ -1,5 +1,5 @@
 import type { TurnCoordinator } from "./turnCoordinator";
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
 import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/message";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
@@ -26,14 +26,29 @@ interface AutoRetryResumeRequest {
 }
 
 interface SessionInternals {
-  dispatchPendingFollowUp: () => Promise<boolean>;
+  coordinator: TurnCoordinator;
+  dispatchPendingFollowUp: (summaryId?: string) => Promise<boolean>;
   sendMessage: (
     message: string,
     options?: SendOptions,
-    internal?: { synthetic?: boolean; agentInitiated?: boolean }
+    internal?: {
+      synthetic?: boolean;
+      agentInitiated?: boolean;
+      onAccepted?: () => void | Promise<void>;
+    }
   ) => Promise<SendMessageResult>;
   runStartupRecovery: () => Promise<void>;
   lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+}
+
+function mockAcceptedSend(
+  send: SessionInternals["sendMessage"] = () => Promise.resolve({ success: true })
+) {
+  return mock(async (...args: Parameters<SessionInternals["sendMessage"]>) => {
+    const result = await send(...args);
+    if (result.success) await args[2]?.onAccepted?.();
+    return result;
+  });
 }
 
 const idleFollowUp = (): CompactionFollowUpRequest => ({
@@ -187,7 +202,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       compactionSummaryMessage("summary-1", legacyFollowUp),
     ]);
 
-    internals.sendMessage = mock(
+    internals.sendMessage = mockAcceptedSend(
       (
         message: string,
         options?: SendOptions,
@@ -205,6 +220,216 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(dispatchedMessage).toBe("follow up");
     expect(dispatchedOptions?.agentId).toBe("plan");
     expect(dispatchedInternal?.synthetic).toBe(true);
+  });
+
+  test.each([false, true])(
+    "a completed manual replacement retires a held follow-up read (targeted=%s)",
+    async (targeted) => {
+      const { internals, historyService } = await createSession([
+        compactionSummaryMessage("held-summary", {
+          text: "old request",
+          agentId: "exec",
+          model: "openai:gpt-4o",
+        }),
+      ]);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const read = targeted ? "getHistoryFromLatestBoundary" : "getLastMessages";
+      const original = historyService[read].bind(historyService);
+      spyOn(historyService, read).mockImplementationOnce(async (workspaceId: string) => {
+        const result = await original(workspaceId, 1);
+        entered.resolve();
+        await release.promise;
+        return result;
+      });
+      const send = mockAcceptedSend(() => Promise.resolve({ success: true as const }));
+      internals.sendMessage = send;
+      const pending = internals.dispatchPendingFollowUp(targeted ? "held-summary" : undefined);
+      try {
+        await entered.promise;
+        const admitted = internals.coordinator.prepare({
+          kind: "fresh",
+          intent: "direct",
+          expectedTurnId: internals.coordinator.turnId,
+        });
+        expect(admitted.status).toBe("admitted");
+        if (admitted.status !== "admitted") throw new Error("Expected replacement");
+        await historyService.appendToHistory("ws", createMuxMessage("manual", "user", "new work"));
+        internals.coordinator.finishTurn(admitted.turnId);
+        release.resolve();
+        expect(await pending).toBe(false);
+        expect(send).not.toHaveBeenCalled();
+        expect(internals.lastAutoRetryResumeRequest).toBeUndefined();
+      } finally {
+        release.resolve();
+        await pending;
+      }
+    }
+  );
+
+  test("concurrent durable dispatch has one owner and preserves ordinary request priority", async () => {
+    const { session, internals, historyService } = await createSession([
+      compactionSummaryMessage("held-summary", {
+        text: "interrupted request",
+        agentId: "exec",
+        model: "openai:gpt-4o",
+      }),
+    ]);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const send = mockAcceptedSend(async () => {
+      entered.resolve();
+      await release.promise;
+      await historyService.appendToHistory(
+        "ws",
+        createMuxMessage("accepted", "user", "interrupted request")
+      );
+      return { success: true as const };
+    });
+    internals.sendMessage = send;
+    session.queueMessage("later manual work", { agentId: "exec", model: "openai:gpt-4o" });
+    const pending = internals.dispatchPendingFollowUp();
+    try {
+      await entered.promise;
+      expect(await internals.dispatchPendingFollowUp()).toBe(false);
+      release.resolve();
+      expect(await pending).toBe(true);
+      expect(await internals.dispatchPendingFollowUp()).toBe(false);
+      expect(send).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+      await pending;
+    }
+  });
+
+  test("a delayed follow-up cleanup cannot overwrite a replacement summary", async () => {
+    const summary = compactionSummaryMessage("summary", {
+      text: "obsolete goal",
+      goalKind: "goal_continuation",
+      agentId: "exec",
+      model: "openai:gpt-4o",
+    });
+    const { session, internals, historyService } = await createSession([summary]);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const update = historyService.updateHistory.bind(historyService);
+    spyOn(historyService, "updateHistory").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return update(...args);
+    });
+    const pending = internals.dispatchPendingFollowUp();
+    try {
+      await entered.promise;
+      using _mutation = session.holdTurnAdmission();
+      expect(
+        (
+          await update("ws", {
+            ...summary,
+            parts: [{ type: "text", text: "replacement summary" }],
+            metadata: {
+              ...summary.metadata,
+              muxMetadata: {
+                type: "compaction-summary",
+                pendingFollowUp: {
+                  text: "replacement request",
+                  agentId: "exec",
+                  model: "openai:gpt-4o",
+                },
+              },
+            },
+          })
+        ).success
+      ).toBe(true);
+      release.resolve();
+      expect(await pending).toBe(false);
+      const history = await historyService.getLastMessages("ws", 1);
+      expect(history.success && history.data[0].parts).toEqual([
+        { type: "text", text: "replacement summary" },
+      ]);
+      expect(history.success && history.data[0].metadata?.muxMetadata).toHaveProperty(
+        "pendingFollowUp.text",
+        "replacement request"
+      );
+    } finally {
+      release.resolve();
+      await pending;
+    }
+  });
+
+  test("a delayed heartbeat rollback cannot delete a replacement context", async () => {
+    const summary = heartbeatBoundaryMessage();
+    const { session, internals, historyService } = await createSession([summary]);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const remove = historyService.deleteMessage.bind(historyService);
+    spyOn(historyService, "deleteMessage").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return remove(...args);
+    });
+    session.queueMessage("manual replacement", { agentId: "exec", model: "openai:gpt-4o" });
+    const pending = internals.dispatchPendingFollowUp();
+    try {
+      await entered.promise;
+      using _mutation = session.holdTurnAdmission();
+      expect(
+        (
+          await historyService.updateHistory("ws", {
+            ...summary,
+            parts: [{ type: "text", text: "new context" }],
+          })
+        ).success
+      ).toBe(true);
+      release.resolve();
+      expect(await pending).toBe(false);
+      const history = await historyService.getHistoryFromLatestBoundary("ws");
+      expect(history.success && history.data[0].parts).toEqual([
+        { type: "text", text: "new context" },
+      ]);
+    } finally {
+      release.resolve();
+      await pending;
+    }
+  });
+
+  test("Stop during a held summary read clears the canceled durable handoff", async () => {
+    const { session, internals, historyService } = await createSession([
+      compactionSummaryMessage("summary", {
+        text: "resume",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+      }),
+    ]);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const read = historyService.getHistoryFromLatestBoundary.bind(historyService);
+    spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(
+      async (...args) => {
+        const result = await read(...args);
+        entered.resolve();
+        await release.promise;
+        return result;
+      }
+    );
+    const send = mockAcceptedSend(() => Promise.resolve({ success: true as const }));
+    internals.sendMessage = send;
+    const pending = internals.dispatchPendingFollowUp("summary");
+    try {
+      await entered.promise;
+      await session.interruptStream({ abandonPartial: true });
+      release.resolve();
+      expect(await pending).toBe(false);
+      expect(send).not.toHaveBeenCalled();
+      const history = await historyService.getLastMessages("ws", 1);
+      expect(history.success && history.data[0].metadata?.muxMetadata).not.toHaveProperty(
+        "pendingFollowUp"
+      );
+      expect(await internals.dispatchPendingFollowUp()).toBe(false);
+    } finally {
+      release.resolve();
+      await pending;
+    }
   });
 
   test("dispatchPendingFollowUp aliases legacy exclusive-PTC experiments", async () => {
@@ -227,7 +452,7 @@ describe("AgentSession continue-message agentId fallback", () => {
         },
       }),
     ]);
-    internals.sendMessage = mock((_message: string, options?: SendOptions) => {
+    internals.sendMessage = mockAcceptedSend((_message: string, options?: SendOptions) => {
       dispatchedOptions = options;
       return Promise.resolve({ success: true as const });
     });
@@ -248,7 +473,7 @@ describe("AgentSession continue-message agentId fallback", () => {
         agentInitiated: true,
       }),
     ]);
-    internals.sendMessage = mock(
+    internals.sendMessage = mockAcceptedSend(
       (
         _message: string,
         _options?: SendOptions,
@@ -275,7 +500,7 @@ describe("AgentSession continue-message agentId fallback", () => {
         strictAgentResolution: true,
       }),
     ]);
-    internals.sendMessage = mock((_message: string, options?: SendOptions) => {
+    internals.sendMessage = mockAcceptedSend((_message: string, options?: SendOptions) => {
       dispatchedOptions = options;
       return Promise.resolve({ success: true as const });
     });
@@ -312,7 +537,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       ],
       archivedConfig
     );
-    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    internals.sendMessage = mockAcceptedSend(() => Promise.resolve({ success: true as const }));
 
     const dispatched = await internals.dispatchPendingFollowUp();
 
@@ -330,7 +555,7 @@ describe("AgentSession continue-message agentId fallback", () => {
     const { session, historyService, internals } = await createSession([
       compactionSummaryMessage("summary-idle-only", idleFollowUp()),
     ]);
-    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    internals.sendMessage = mockAcceptedSend(() => Promise.resolve({ success: true as const }));
     session.queueMessage(
       "user returned",
       { model: "openai:gpt-4o", agentId: "exec" },
@@ -356,7 +581,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       earlierMessage,
       heartbeatBoundaryMessage(),
     ]);
-    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    internals.sendMessage = mockAcceptedSend(() => Promise.resolve({ success: true as const }));
     session.queueMessage(
       "user returned",
       { model: "openai:gpt-4o", agentId: "exec" },
@@ -386,7 +611,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       earlierMessage,
       heartbeatBoundaryMessage(),
     ]);
-    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    internals.sendMessage = mockAcceptedSend(() => Promise.resolve({ success: true as const }));
     (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
       () => true;
 
@@ -408,7 +633,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       compactionSummaryMessage("summary-active-turn", idleFollowUp()),
     ]);
     const busyInternals = internals as SessionInternals & { isBusy: () => boolean };
-    busyInternals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    busyInternals.sendMessage = mockAcceptedSend(() => Promise.resolve({ success: true as const }));
     busyInternals.isBusy = () => true;
 
     const dispatched = await busyInternals.dispatchPendingFollowUp();
@@ -427,7 +652,7 @@ describe("AgentSession continue-message agentId fallback", () => {
   test("dispatchPendingFollowUp keeps heartbeat reset boundaries once a non-idle turn has started", async () => {
     const { historyService, internals } = await createSession([heartbeatBoundaryMessage()]);
     const busyInternals = internals as SessionInternals & { isBusy: () => boolean };
-    busyInternals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    busyInternals.sendMessage = mockAcceptedSend(() => Promise.resolve({ success: true as const }));
     busyInternals.isBusy = () => true;
 
     const dispatched = await busyInternals.dispatchPendingFollowUp();
@@ -449,7 +674,9 @@ describe("AgentSession continue-message agentId fallback", () => {
       compactionSummaryMessage("summary-completing-turn", idleFollowUp()),
     ]);
     const completingInternals = internals as SessionInternals & { coordinator: TurnCoordinator };
-    completingInternals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    completingInternals.sendMessage = mockAcceptedSend(() =>
+      Promise.resolve({ success: true as const })
+    );
     completingInternals.coordinator.beginPolicy(completingInternals.coordinator.turnId);
 
     const dispatched = await completingInternals.dispatchPendingFollowUp();
@@ -478,7 +705,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       },
       agentInitiated: true,
     };
-    internals.sendMessage = mock(() =>
+    internals.sendMessage = mockAcceptedSend(() =>
       Promise.resolve({
         success: false as const,
         error: { type: "runtime_start_failed", message: "startup failed" },
@@ -544,7 +771,7 @@ describe("AgentSession continue-message agentId fallback", () => {
         agentId: "exec",
       }),
     ]);
-    internals.sendMessage = mock(() => {
+    internals.sendMessage = mockAcceptedSend(() => {
       sendCount += 1;
       return Promise.resolve({ success: true as const });
     });
@@ -563,7 +790,7 @@ describe("AgentSession continue-message agentId fallback", () => {
         agentId: "exec",
       }),
     ]);
-    internals.sendMessage = mock(() => {
+    internals.sendMessage = mockAcceptedSend(() => {
       sendCount += 1;
       if (sendCount === 1) {
         return Promise.resolve({
@@ -596,7 +823,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       preservedTailCopy("tail-copy-1", "user", "original user message"),
       preservedTailCopy("tail-copy-2", "assistant", "original assistant reply"),
     ]);
-    internals.sendMessage = mock((message: string) => {
+    internals.sendMessage = mockAcceptedSend((message: string) => {
       dispatchedMessage = message;
       return Promise.resolve({ success: true as const });
     });
@@ -621,7 +848,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       createMuxMessage("post-compaction-turn", "assistant", "new turn after compaction"),
       preservedTailCopy("tail-copy-2", "assistant", "trailing copy"),
     ]);
-    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    internals.sendMessage = mockAcceptedSend(() => Promise.resolve({ success: true as const }));
 
     const dispatched = await internals.dispatchPendingFollowUp();
 

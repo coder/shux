@@ -933,6 +933,31 @@ describe("ContinuousCompactor", () => {
     expect(history.filter((row) => row.metadata?.compactionBoundary)).toHaveLength(1);
   });
 
+  it("late journal finalization cannot clear a replacement journal after reset", async () => {
+    const { answer, journal, journalStore } = await activateJournaledSwap();
+    assert(live, "Live fixture missing");
+    answer.parts = live.parts;
+    await store.historyService.writePartial(workspaceId, answer);
+    streaming = false;
+    live = undefined;
+    const entered = deferred();
+    const release = deferred();
+    const clear = journalStore.clear.bind(journalStore);
+    spyOn(journalStore, "clear").mockImplementationOnce(async () => {
+      await clear();
+      entered.resolve();
+      await release.promise;
+    });
+    const recovering = compactor.recover();
+    await entered.promise;
+    compactor.reset("edit");
+    const replacement = { ...journal, boundary: { ...journal.boundary, id: "replacement" } };
+    expect(await journalStore.write(replacement, [], () => true)).not.toBeNull();
+    release.resolve();
+    await recovering;
+    expect((await journalStore.read())?.boundary.id).toBe("replacement");
+  });
+
   it("reset during journal apply cannot append a boundary", async () => {
     const { answer, dependencies } = await activateJournaledSwap();
     assert(live, "Live fixture missing");

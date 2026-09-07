@@ -2533,15 +2533,22 @@ export class HistoryService {
    * always in the active epoch (stream placeholders, compaction summaries),
    * never in the sealed archive.
    */
-  async updateHistory(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
+  // Optional ownership predicates are synchronous/pure and may run twice (under
+  // the lock and immediately before rename). Losing ownership is a successful no-op.
+  async updateHistory(
+    workspaceId: string,
+    message: MuxMessage,
+    shouldUpdate?: (current: MuxMessage) => boolean
+  ): Promise<Result<void>> {
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to update history", () =>
-      this.updateHistoryUnderWriteLock(workspaceId, message)
+      this.updateHistoryUnderWriteLock(workspaceId, message, shouldUpdate)
     );
   }
 
   private async updateHistoryUnderWriteLock(
     workspaceId: string,
-    message: MuxMessage
+    message: MuxMessage,
+    shouldUpdate?: (current: MuxMessage) => boolean
   ): Promise<Result<void>> {
     try {
       const historyPath = this.getChatHistoryPath(workspaceId);
@@ -2562,10 +2569,13 @@ export class HistoryService {
       // Find and replace the message with matching historySequence
       let found = false;
       let persistedMessage: MuxMessage | undefined;
+      let sourceMessage: MuxMessage | undefined;
       for (let i = 0; i < messages.length; i++) {
         if (messages[i].metadata?.historySequence === targetSequence) {
           const existingMessage = messages[i];
           assert(existingMessage, "updateHistory matched message must exist");
+          if (shouldUpdate && !shouldUpdate(existingMessage)) return Ok(undefined);
+          sourceMessage = existingMessage;
 
           // Preserve compaction boundary metadata during late in-place rewrites.
           // Compaction may update an assistant row first, then a late stream rewrite can
@@ -2599,7 +2609,13 @@ export class HistoryService {
       const historyEntries = this.serializeHistoryEntries(messages, workspaceId);
 
       // Atomic write prevents corruption if app crashes mid-write
-      await writeFileAtomic(historyPath, historyEntries);
+      if (shouldUpdate && sourceMessage) {
+        const source = sourceMessage;
+        if (
+          !(await this.writeGuardedHistory(historyPath, historyEntries, () => shouldUpdate(source)))
+        )
+          return Ok(undefined);
+      } else await writeFileAtomic(historyPath, historyEntries);
 
       // Compaction updates the streamed summary row in-place with boundary
       // metadata — seal the previous epoch once that lands. Check the persisted
@@ -2610,6 +2626,23 @@ export class HistoryService {
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to update history: ${message}`);
+    }
+  }
+
+  /** The final ownership check and rename do not yield to a context reset/new admission. */
+  private async writeGuardedHistory(
+    historyPath: string,
+    serialized: string,
+    isCurrent: () => boolean
+  ): Promise<boolean> {
+    const stagedPath = `${historyPath}.continuous-${randomUUID()}`;
+    try {
+      await writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
+      if (!isCurrent()) return false;
+      renameSync(stagedPath, historyPath);
+      return true;
+    } finally {
+      await fs.rm(stagedPath, { force: true });
     }
   }
 
@@ -2723,16 +2756,12 @@ export class HistoryService {
 
           const serialized = this.serializeHistoryEntries(messages, workspaceId);
           if (shouldPersist) {
-            const stagedPath = `${historyPath}.continuous-${randomUUID()}`;
-            try {
-              await writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
-              // Bulk I/O remains asynchronous, but the final generation check and
-              // publication must not yield to reset(), abandonment, or a new stream.
-              if (!shouldPersist(sourceMessages)) return Err("Compaction snapshot changed");
-              renameSync(stagedPath, historyPath);
-            } finally {
-              await fs.rm(stagedPath, { force: true });
-            }
+            if (
+              !(await this.writeGuardedHistory(historyPath, serialized, () =>
+                shouldPersist(sourceMessages)
+              ))
+            )
+              return Err("Compaction snapshot changed");
           } else {
             await writeFileAtomic(historyPath, serialized);
           }
@@ -2816,20 +2845,29 @@ export class HistoryService {
    *
    * This is safer than truncateAfterMessage for cleanup paths where subsequent
    * messages may already have been appended.
+   * A conditional cleanup uses a synchronous/pure predicate under the lock and
+   * before rename; false returns Ok without changing history.
    */
-  async deleteMessage(workspaceId: string, messageId: string): Promise<Result<void>> {
+  async deleteMessage(
+    workspaceId: string,
+    messageId: string,
+    shouldDelete?: (messages: MuxMessage[]) => boolean
+  ): Promise<Result<void>> {
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to delete message", () =>
-      this.deleteMessageUnderWriteLock(workspaceId, messageId)
+      this.deleteMessageUnderWriteLock(workspaceId, messageId, shouldDelete)
     );
   }
 
   private async deleteMessageUnderWriteLock(
     workspaceId: string,
-    messageId: string
+    messageId: string,
+    shouldDelete?: (messages: MuxMessage[]) => boolean
   ): Promise<Result<void>> {
     try {
       // Structural rewrite requires full file content
       const messages = await this.readChatHistory(workspaceId);
+      // Conditional cleanup is scoped to the observed active context, never its archive.
+      if (shouldDelete && !shouldDelete(messages)) return Ok(undefined);
       const filteredMessages = messages.filter((msg) => msg.id !== messageId);
 
       if (filteredMessages.length === messages.length) {
@@ -2854,7 +2892,14 @@ export class HistoryService {
       const historyEntries = this.serializeHistoryEntries(filteredMessages, workspaceId);
 
       // Atomic write prevents corruption if app crashes mid-write
-      await writeFileAtomic(historyPath, historyEntries);
+      if (shouldDelete) {
+        if (
+          !(await this.writeGuardedHistory(historyPath, historyEntries, () =>
+            shouldDelete(messages)
+          ))
+        )
+          return Ok(undefined);
+      } else await writeFileAtomic(historyPath, historyEntries);
 
       // Keep the in-memory sequence counter monotonic. It's okay to reuse deleted sequence
       // numbers on restart, but we must not regress within a running process.

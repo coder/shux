@@ -63,6 +63,37 @@ function reduce(events: CoordinatorEvent[]) {
 }
 
 describe("TurnCoordinator", () => {
+  test("a compaction handoff survives its own admission, but stale completion cannot release its replacement", () => {
+    const { coordinator } = setup();
+    const token = coordinator.beginCompactionObservation("continuous");
+    if (!token) throw new Error("Expected observation");
+    coordinator.setCompactionStage(token, "stopped");
+    const followUp = coordinator.claimCompactionFollowUp();
+    if (!followUp) throw new Error("Expected follow-up");
+    const own = coordinator.prepare({
+      kind: "fresh",
+      intent: "direct",
+      expectedTurnId: coordinator.turnId,
+      compactionHandoff: followUp,
+    });
+    expect(own.status).toBe("admitted");
+    expect(coordinator.isCurrentCompaction(token)).toBe(true);
+    expect(coordinator.isCurrentCompaction(followUp)).toBe(true);
+    coordinator.finishTurn(coordinator.turnId);
+    expect(
+      coordinator.prepare({ kind: "fresh", intent: "direct", expectedTurnId: coordinator.turnId })
+        .status
+    ).toBe("admitted");
+    const replacement = coordinator.beginCompactionObservation("continuous");
+    if (!replacement) throw new Error("Expected replacement observation");
+    coordinator.setCompactionStage(replacement, "stopping");
+    expect(coordinator.isCurrentCompaction(token)).toBe(false);
+    expect(coordinator.finishCompactionObservation(token)).toBe(false);
+    coordinator.finishCompactionFollowUp(followUp);
+    expect(coordinator.compactionIntent.observation?.id).toBe(replacement.id);
+    expect(coordinator.compactionIntent.observation?.stage).toBe("stopping");
+  });
+
   test("session scope releases thinking and idle listeners even without another idle event", async () => {
     const scope = Scope.makeUnsafe("parallel");
     const { coordinator } = setup();

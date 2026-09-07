@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, mock } from "bun:test";
+import * as fsPromises from "fs/promises";
 import { mkdir, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import * as path from "node:path";
@@ -17,7 +18,73 @@ describe("continuous compaction provider replay", () => {
     store = await createTestHistoryService();
   });
   afterEach(async () => {
+    mock.restore();
     await store.cleanup();
+  });
+
+  it("a held heartbeat rollback unlink cannot consume the replacement rollback snapshot", async () => {
+    const sessionDir = path.join(store.tempDir, "pending");
+    const handler = new CompactionHandler({
+      workspaceId,
+      historyService: store.historyService,
+      sessionDir,
+      emitter: new EventEmitter(),
+    });
+    const followUp = { text: "wake", model: "openai:gpt-4o", agentId: "exec" };
+    expect(
+      (
+        await handler.appendHeartbeatContextResetBoundary({
+          boundaryText: "A",
+          pendingFollowUp: followUp,
+        })
+      ).success
+    ).toBe(true);
+    const first = await store.historyService.getLastMessages(workspaceId, 1);
+    assert(first.success, "Expected first boundary");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const captured = Promise.withResolvers<void>();
+    const unlink = fsPromises.unlink;
+    let held = false;
+    spyOn(fsPromises, "unlink").mockImplementation(async (file) => {
+      if (!held && file === path.join(sessionDir, "post-compaction.json")) {
+        held = true;
+        entered.resolve();
+        await release.promise;
+      }
+      return unlink(file);
+    });
+    const internals = handler as unknown as { captureHeartbeatResetRollbackState(): void };
+    const capture = internals.captureHeartbeatResetRollbackState.bind(handler);
+    spyOn(internals, "captureHeartbeatResetRollbackState").mockImplementation(() => {
+      capture();
+      captured.resolve();
+    });
+    const rollingBack = handler.rollbackHeartbeatContextResetBoundary(first.data[0]);
+    let replacement:
+      | ReturnType<CompactionHandler["appendHeartbeatContextResetBoundary"]>
+      | undefined;
+    try {
+      await entered.promise;
+      replacement = handler.appendHeartbeatContextResetBoundary({
+        boundaryText: "B",
+        pendingFollowUp: followUp,
+      });
+      await captured.promise;
+      release.resolve();
+      expect((await rollingBack).success).toBe(true);
+      expect((await replacement).success).toBe(true);
+      const second = await store.historyService.getLastMessages(workspaceId, 1);
+      assert(second.success, "Expected replacement boundary");
+      expect((await handler.rollbackHeartbeatContextResetBoundary(second.data[0])).success).toBe(
+        true
+      );
+      expect(await handler.peekPendingState()).toBeNull();
+    } finally {
+      release.resolve();
+      await rollingBack;
+      await replacement;
+    }
   });
 
   it("preserves previously pending attachments when a newer fold is abandoned or crashes", async () => {

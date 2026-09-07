@@ -9,7 +9,7 @@
 import "../dom";
 import { waitFor } from "@testing-library/react";
 
-import { preloadTestModules, type TestEnvironment } from "../../ipc/setup";
+import { preloadTestModules, setupProviders, type TestEnvironment } from "../../ipc/setup";
 
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 
@@ -19,6 +19,7 @@ import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 
 interface ServiceContainerPrivates {
   backgroundProcessManager: BackgroundProcessManager;
@@ -123,7 +124,17 @@ describe("Compaction UI (mock AI router)", () => {
   }, 60_000);
 
   test("auto-compacts after context_exceeded and resumes", async () => {
-    const app = await createAppHarness({ branchPrefix: "compaction-ui" });
+    const app = await createAppHarness({
+      branchPrefix: "compaction-ui",
+      beforeRenderEnvironment: async (env) => {
+        // Auto-recovery needs an available compaction model even with the mock router;
+        // make that independent of local credentials and the catalog's context-window ordering.
+        await setupProviders(env, { anthropic: { apiKey: "dummy" } });
+        await env.orpc.config.updateAgentAiDefaults({
+          agentAiDefaults: { compact: { modelString: KNOWN_MODELS.HAIKU.id } },
+        });
+      },
+    });
 
     try {
       const triggerMessage = "Trigger context error";

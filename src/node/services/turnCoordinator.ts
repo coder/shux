@@ -16,6 +16,7 @@ export type PreparationRequest =
       intent: "direct" | "resume" | "handoff" | QueueDrainTrigger;
       expectedTurnId: TurnId;
       editReservation?: symbol;
+      compactionHandoff?: CompactionToken;
     }
   | { kind: "adopt"; turnId: TurnId };
 export type PreparationAdmission =
@@ -26,6 +27,22 @@ export type PreparationAdmission =
 type ReservationKind = "admission" | "edit" | "manual";
 type DecisionKind = "error" | "compaction";
 type DecisionOutcome = StreamErrorRecoveryOutcome | boolean;
+
+export interface CompactionToken {
+  readonly id: symbol;
+  readonly epoch: number;
+}
+type CompactionObservation = CompactionToken & {
+  readonly kind: "continuous" | "legacy";
+  readonly stage: "observing" | "stopping" | "stopped" | "dispatching";
+};
+interface CompactionIntent {
+  readonly epoch: number;
+  readonly status: "ready" | "abandoned";
+  readonly observation?: CompactionObservation;
+  readonly followUp?: CompactionToken;
+  readonly summaryId: string | null;
+}
 
 type Operation = {
   readonly id: OperationId;
@@ -58,6 +75,7 @@ export interface CoordinatorState {
   readonly reservations: ReadonlyArray<{ id: symbol; kind: ReservationKind }>;
   readonly retry?: symbol;
   readonly decisions: readonly Decision[];
+  readonly compaction: CompactionIntent;
 }
 
 export type CoordinatorEvent =
@@ -76,6 +94,12 @@ export type CoordinatorEvent =
   | { type: "reserve" | "release"; id: symbol; kind: ReservationKind }
   | { type: "retry-start" | "retry-finish"; id: symbol }
   | { type: "decision"; kind: DecisionKind; messageId: string; outcome?: DecisionOutcome }
+  | { type: "compaction-observe"; token: CompactionToken; kind: CompactionObservation["kind"] }
+  | { type: "compaction-stage"; token: CompactionToken; stage: CompactionObservation["stage"] }
+  | { type: "compaction-finish"; token: CompactionToken }
+  | { type: "compaction-invalidate"; abandon: boolean }
+  | { type: "compaction-follow-up" | "compaction-follow-up-finish"; token: CompactionToken }
+  | { type: "compaction-summary"; summaryId: string | null }
   | { type: "shutdown" | "dispose" };
 
 type CoordinatorCommand =
@@ -95,7 +119,13 @@ type CoordinatorCommand =
   | { type: "dispose" };
 
 export function initialCoordinatorState(id: TurnId): CoordinatorState {
-  return { lifetime: "open", turn: { phase: "idle", id }, reservations: [], decisions: [] };
+  return {
+    lifetime: "open",
+    turn: { phase: "idle", id },
+    reservations: [],
+    decisions: [],
+    compaction: { epoch: 0, status: "ready", summaryId: null },
+  };
 }
 
 function hasConflictingEdit(state: CoordinatorState, owner?: symbol): boolean {
@@ -205,6 +235,28 @@ export function transition(
           admission = { status: "deferred", reason: "busy" };
           break;
         }
+        const handoff = request.compactionHandoff;
+        if (handoff != null) {
+          if (
+            handoff.epoch !== state.compaction.epoch ||
+            (state.compaction.observation?.id !== handoff.id &&
+              state.compaction.followUp?.id !== handoff.id)
+          ) {
+            admission = { status: "rejected", reason: "retired" };
+            break;
+          }
+          // This admission belongs to the captured handoff. It changes TurnId, but
+          // must keep the source intent alive until actual send acceptance is known.
+        } else {
+          next = {
+            ...next,
+            compaction: {
+              epoch: state.compaction.epoch + 1,
+              status: "ready",
+              summaryId: null,
+            },
+          };
+        }
         if (current) commands.push({ type: "retire", id: current.id });
         phase({ phase: "preparing", id: event.id });
       }
@@ -252,6 +304,15 @@ export function transition(
       if (current?.delivery === "waiting") {
         operation({ ...current, stage: "started", messageId: event.payload.messageId });
       }
+      if (next.compaction.status === "abandoned")
+        next = {
+          ...next,
+          compaction: {
+            epoch: next.compaction.epoch + 1,
+            status: "ready",
+            summaryId: null,
+          },
+        };
       commands.push({ type: "record-start", turnId: state.turn.id, payload: event.payload });
       // Existing raw streams also restore sessions constructed around an already-running engine.
       phase({ ...next.turn, phase: "streaming" });
@@ -325,6 +386,68 @@ export function transition(
       break;
     case "decision":
       decision(event.kind, event.messageId, event.outcome);
+      break;
+    case "compaction-observe":
+      if (
+        state.lifetime === "open" &&
+        !state.compaction.observation &&
+        state.compaction.status === "ready" &&
+        event.token.epoch === state.compaction.epoch
+      )
+        next = {
+          ...state,
+          compaction: {
+            ...state.compaction,
+            observation: { ...event.token, kind: event.kind, stage: "observing" },
+          },
+        };
+      break;
+    case "compaction-stage":
+      if (
+        state.compaction.observation?.id === event.token.id &&
+        state.compaction.epoch === event.token.epoch
+      )
+        next = {
+          ...state,
+          compaction: {
+            ...state.compaction,
+            observation: { ...state.compaction.observation, stage: event.stage },
+          },
+        };
+      break;
+    case "compaction-finish":
+      if (state.compaction.observation?.id === event.token.id)
+        next = { ...state, compaction: { ...state.compaction, observation: undefined } };
+      break;
+    case "compaction-invalidate":
+      next = {
+        ...state,
+        compaction: {
+          ...state.compaction,
+          epoch: state.compaction.epoch + 1,
+          status: event.abandon ? "abandoned" : state.compaction.status,
+          // User Stop retains only cleanup ownership for its just-committed boundary.
+          // Context mutation retires semantic observation immediately; physical leases remain.
+          observation: event.abandon ? state.compaction.observation : undefined,
+          followUp: event.abandon ? state.compaction.followUp : undefined,
+          summaryId: null,
+        },
+      };
+      break;
+    case "compaction-follow-up":
+      if (
+        state.lifetime === "open" &&
+        !state.compaction.followUp &&
+        event.token.epoch === state.compaction.epoch
+      )
+        next = { ...state, compaction: { ...state.compaction, followUp: event.token } };
+      break;
+    case "compaction-follow-up-finish":
+      if (state.compaction.followUp?.id === event.token.id)
+        next = { ...state, compaction: { ...state.compaction, followUp: undefined } };
+      break;
+    case "compaction-summary":
+      next = { ...state, compaction: { ...state.compaction, summaryId: event.summaryId } };
       break;
     case "shutdown":
       next = { ...state, lifetime: "shutting-down" };
@@ -505,6 +628,58 @@ export class TurnCoordinator {
   /** An opaque physical lease must never reserve semantic admission or change queue priority. */
   enterExecution(): Disposable {
     return this.execution.lease();
+  }
+
+  get compactionIntent(): CompactionIntent {
+    return this.state.compaction;
+  }
+
+  beginCompactionObservation(kind: CompactionObservation["kind"]): CompactionToken | undefined {
+    if (this.admissionBlocked || this.editReserved) return undefined;
+    const token = { id: Symbol("compaction observation"), epoch: this.state.compaction.epoch };
+    this.dispatch({ type: "compaction-observe", token, kind });
+    return this.state.compaction.observation?.id === token.id ? token : undefined;
+  }
+
+  isCurrentCompaction(token: CompactionToken): boolean {
+    return (
+      !this.closing &&
+      token.epoch === this.state.compaction.epoch &&
+      (this.state.compaction.observation?.id === token.id ||
+        this.state.compaction.followUp?.id === token.id)
+    );
+  }
+
+  setCompactionStage(token: CompactionToken, stage: CompactionObservation["stage"]): void {
+    this.dispatch({ type: "compaction-stage", token, stage });
+  }
+
+  finishCompactionObservation(token: CompactionToken): boolean {
+    const owns = this.state.compaction.observation?.id === token.id;
+    this.dispatch({ type: "compaction-finish", token });
+    return owns;
+  }
+
+  invalidateCompaction(abandon = false): void {
+    this.dispatch({ type: "compaction-invalidate", abandon });
+  }
+
+  claimCompactionFollowUp(): CompactionToken | undefined {
+    const token = { id: Symbol("compaction follow-up"), epoch: this.state.compaction.epoch };
+    this.dispatch({ type: "compaction-follow-up", token });
+    return this.state.compaction.followUp?.id === token.id ? token : undefined;
+  }
+
+  finishCompactionFollowUp(token: CompactionToken): void {
+    this.dispatch({ type: "compaction-follow-up-finish", token });
+  }
+
+  canClearCompactionFollowUp(token: CompactionToken): boolean {
+    return !this.closing && this.state.compaction.followUp?.id === token.id;
+  }
+
+  recordCompactionSummary(summaryId: string | null): void {
+    this.dispatch({ type: "compaction-summary", summaryId });
   }
 
   /** Physical completion, distinct from semantic idle and operation policy settlement. */
