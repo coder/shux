@@ -5770,6 +5770,77 @@ describe("StreamManager - previousResponseId recovery", () => {
   }
 });
 
+describe("StreamManager - request-pinned context capacity", () => {
+  test("live starts, replay, and partials keep capacity across config refreshes and new streams", async () => {
+    let liveProviders: ProvidersConfigMap = {};
+    const manager = new StreamManager(historyService, undefined, () => liveProviders);
+    const starts: Array<Extract<TurnEngineEvent, { type: "stream-start" }>> = [];
+    onTurnEngineEvent(manager, "stream-start", (event) => starts.push(event));
+    const workspaceId = "pinned-context";
+    for (const [index, capacity] of [1_000_000, 150_000, null].entries()) {
+      const messageId = `capacity-${index}`;
+      await appendPartialAssistantForTests(workspaceId, messageId, index);
+      let release!: () => void;
+      const finish = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let markDeltaProcessed!: () => void;
+      const deltaProcessed = new Promise<void>((resolve) => {
+        markDeltaProcessed = resolve;
+      });
+      Reflect.set(manager, "createStreamResult", () =>
+        createStreamResultForTests(
+          (async function* () {
+            yield { type: "text-delta", text: "hello" };
+            markDeltaProcessed();
+            await finish;
+            yield { type: "finish", finishReason: "stop" };
+          })()
+        )
+      );
+      const result = await manager.startStream(
+        testStartOptions({
+          workspaceId,
+          messageId,
+          model: createTestLanguageModel(),
+          historySequence: index,
+          contextWindowTokens: capacity,
+        })
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error("Expected stream start");
+      try {
+        await deltaProcessed;
+        liveProviders = {
+          openai: {
+            isConfigured: true,
+            isEnabled: true,
+            apiKeySet: true,
+            models: [{ id: "gpt-4.1-mini", contextWindowTokens: 99_000 }],
+          },
+        };
+        await manager.replayStream(workspaceId);
+        expect(starts.slice(-2).map((event) => event.contextWindowTokens)).toEqual([
+          capacity,
+          capacity,
+        ]);
+        expect(starts.at(-1)?.replay).toBe(true);
+        const info = getWorkspaceStreamsForTests(manager).get(workspaceId);
+        await getPrivateMethodForTests<(workspaceId: string, info: unknown) => Promise<void>>(
+          manager,
+          "flushPartialWrite"
+        ).call(manager, workspaceId, info);
+        expect((await historyService.readPartial(workspaceId))?.metadata?.contextWindowTokens).toBe(
+          capacity
+        );
+      } finally {
+        release();
+        await result.data.completion;
+      }
+    }
+  });
+});
+
 describe("StreamManager - replayStream", () => {
   function createReplayStreamManager(): StreamManager {
     const streamManager = new StreamManager(historyService);

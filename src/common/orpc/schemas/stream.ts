@@ -5,6 +5,7 @@ import { AgentModeSchema } from "../../types/mode";
 import { ChatUsageDisplaySchema } from "./chatStats";
 import { StreamErrorTypeSchema } from "./errors";
 import {
+  ContextWindowTokensSchema,
   FilePartSchema,
   ModelFallbackRecordSchema,
   MuxMessageSchema,
@@ -175,6 +176,7 @@ export const StreamStartEventSchema = z.object({
         "frontends must prefer it over re-resolving the raw model against a " +
         "possibly refreshed providers config",
     }),
+  contextWindowTokens: ContextWindowTokensSchema.optional(),
   routedThroughGateway: z.boolean().optional(),
   routeProvider: z.string().optional(),
   historySequence: z.number().meta({
@@ -257,6 +259,7 @@ export const StreamEndEventSchema = z.object({
     .object({
       model: z.string(),
       metadataModel: z.string().optional(),
+      contextWindowTokens: ContextWindowTokensSchema.optional(),
       agentId: AgentIdSchema.optional().catch(undefined),
       mode: AgentModeSchema.optional().catch(undefined),
       thinkingLevel: ThinkingLevelSchema.optional(),

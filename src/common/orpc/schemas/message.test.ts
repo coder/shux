@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { MuxMessageSchema } from "./message";
+import { StreamStartEventSchema } from "./stream";
 
 function createMessage() {
   return {
@@ -186,4 +187,31 @@ describe("MuxMessageSchema compactionEpoch parsing", () => {
       expect(parsed.metadata?.compactionEpoch).toBeUndefined();
     }
   });
+});
+
+test("request capacity preserves explicit unknown versus legacy absence and sanitizes corrupt history", () => {
+  const start = {
+    type: "stream-start",
+    workspaceId: "w",
+    messageId: "m",
+    model: "local:test",
+    historySequence: 0,
+    startTime: 0,
+  };
+  for (const contextWindowTokens of [200_000, null, undefined]) {
+    expect(
+      StreamStartEventSchema.parse({ ...start, contextWindowTokens }).contextWindowTokens
+    ).toBe(contextWindowTokens);
+    expect(
+      MuxMessageSchema.parse({ ...createMessage(), metadata: { contextWindowTokens } }).metadata
+        ?.contextWindowTokens
+    ).toBe(contextWindowTokens);
+  }
+  for (const contextWindowTokens of [-1, 0, 1.5, "unknown"]) {
+    expect(StreamStartEventSchema.safeParse({ ...start, contextWindowTokens }).success).toBe(false);
+    expect(
+      MuxMessageSchema.parse({ ...createMessage(), metadata: { contextWindowTokens } }).metadata
+        ?.contextWindowTokens
+    ).toBeUndefined();
+  }
 });

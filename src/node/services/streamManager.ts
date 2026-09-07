@@ -265,6 +265,8 @@ interface StreamRequestOptions {
 }
 
 export interface TurnExecutionOptions extends StreamRequestOptions {
+  /** Effective capacity computed with the provider request; null is authoritative unknown. */
+  contextWindowTokens?: number | null;
   workspaceId: string;
   historySequence: number;
   runtime: Runtime;
@@ -344,6 +346,7 @@ interface StreamRequestConfig {
  * verbatim would leak provider-specific options/messages across providers).
  */
 interface PreparedModelFallback {
+  contextWindowTokens?: number | null;
   model: LanguageModel;
   /** Canonical model string of the fallback attempt (drives metadata + tokenizer). */
   modelString: string;
@@ -655,6 +658,7 @@ interface WorkspaceStreamInfo {
   model: string;
   /** Metadata model resolved from provider mapping for cost/token metadata lookups. */
   metadataModel: string;
+  contextWindowTokens: number | null;
   /** Effective thinking level after model policy clamping */
   thinkingLevel?: string;
   initialMetadata?: Partial<MuxMetadata>;
@@ -2619,6 +2623,7 @@ export class StreamManager {
       pendingToolExecutionStarts: new Map(),
       model: modelString,
       metadataModel,
+      contextWindowTokens: options.contextWindowTokens ?? null,
       thinkingLevel,
       initialMetadata,
       toolModelUsages: [],
@@ -2966,6 +2971,7 @@ export class StreamManager {
       // diverge from the backend ledger when a Coder catalog refresh
       // removes/retags the instance mid-stream.
       metadataModel: streamInfo.metadataModel,
+      contextWindowTokens: streamInfo.contextWindowTokens,
       routedThroughGateway,
       ...(routeProvider != null && { routeProvider }),
       historySequence,
@@ -3197,6 +3203,7 @@ export class StreamManager {
         ...streamInfo.initialMetadata,
         model: canonicalModel,
         metadataModel: streamInfo.metadataModel,
+        contextWindowTokens: streamInfo.contextWindowTokens,
         routedThroughGateway,
         ...(streamInfo.thinkingLevel && {
           thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel,
@@ -3494,6 +3501,7 @@ export class StreamManager {
     streamInfo.reasoningBackfillStartIndex = preserveParts ? streamInfo.parts.length : undefined;
 
     streamInfo.model = prepared.data.modelString;
+    streamInfo.contextWindowTokens = prepared.data.contextWindowTokens ?? null;
     streamInfo.metadataModel = this.resolveMetadataModel(
       prepared.data.modelString,
       prepared.data.providersConfig
@@ -4225,6 +4233,7 @@ export class StreamManager {
                 ...streamInfo.initialMetadata, // TurnRequestBuilder-provided metadata (systemMessageTokens, etc)
                 model: canonicalModel,
                 metadataModel: streamInfo.metadataModel,
+                contextWindowTokens: streamInfo.contextWindowTokens,
                 routedThroughGateway,
                 ...(streamInfo.thinkingLevel && {
                   thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel,

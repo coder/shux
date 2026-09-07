@@ -92,10 +92,12 @@ import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
 import { resolveModelParameterOverrides } from "@/common/utils/ai/modelParameterOverrides";
 import {
+  ANTHROPIC_1M_CONTEXT_HEADER,
   buildProviderOptions,
   buildRequestHeaders,
   resolveProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { uniqueSuffix } from "@/common/utils/hasher";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
@@ -547,6 +549,7 @@ export interface PrepareModelAttemptOptions {
 }
 
 interface PreparedModelAttempt {
+  contextWindowTokens: number | null;
   providerOptions: Record<string, unknown>;
   requestHeaders: Record<string, string> | undefined;
   resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
@@ -704,6 +707,15 @@ export class TurnRequestBuilder {
     };
     options.recordStartupPhaseTiming?.("buildRequestConfigMs", buildRequestConfigStartedAt);
     return {
+      // Pin against the actual routed model and the exact beta decision sent on this request,
+      // not live preferences or the preceding user's retry options (which can differ on resume).
+      contextWindowTokens: getEffectiveContextLimit(
+        options.effectiveModelString,
+        requestHeaders?.["anthropic-beta"]?.split(",").includes(ANTHROPIC_1M_CONTEXT_HEADER) ===
+          true,
+        options.providersConfigSnapshot,
+        { openaiWireFormat: options.muxProviderOptions.openai?.wireFormat }
+      ),
       providerOptions: mergeExtras(providerOptions),
       requestHeaders,
       resolvedOverrides,
@@ -2512,6 +2524,7 @@ export class TurnRequestBuilder {
           engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
           forcedFirstStepToolNames,
+          contextWindowTokens: preparedAttempt.contextWindowTokens,
           providerOptions: preparedAttempt.providerOptions,
           headers: preparedAttempt.requestHeaders,
           resolvedOverrides: preparedAttempt.resolvedOverrides,
@@ -2819,6 +2832,7 @@ export class TurnRequestBuilder {
               return Ok({
                 onStreamConstructed: nextRequest.onStreamConstructed,
                 rebuildFirstStepForThinkingLevel: nextRequest.rebuildFirstStepForThinkingLevel,
+                contextWindowTokens: nextRequest.contextWindowTokens,
                 model: nextRequest.model,
                 modelString: nextModelString,
                 messages: nextRequest.messages,
@@ -2908,6 +2922,7 @@ export class TurnRequestBuilder {
         ...(muxMetadata !== undefined ? { muxMetadata } : {}),
         ...(acpPromptId != null ? { acpPromptId } : {}),
       },
+      contextWindowTokens: primaryRequest.contextWindowTokens,
       providerOptions: streamProviderOptions,
       maxOutputTokens,
       toolPolicy: effectiveToolPolicy,
