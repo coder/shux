@@ -9,6 +9,9 @@ import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/util
 import { CompactionHandler } from "./compactionHandler";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { createTestHistoryService } from "./testHistoryService";
+import { TurnCoordinator } from "./turnCoordinator";
+import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
 
 describe("continuous compaction provider replay", () => {
   let store: Awaited<ReturnType<typeof createTestHistoryService>>;
@@ -21,6 +24,194 @@ describe("continuous compaction provider replay", () => {
     mock.restore();
     await store.cleanup();
   });
+
+  it.each(["none", "cleanup", "observer"] as const)(
+    "publishes committed heartbeat rollback before replacement admission (failure=%s)",
+    async (failurePoint) => {
+      const sessionDir = path.join(store.tempDir, "pending");
+      await mkdir(sessionDir, { recursive: true });
+      const priorDiff = { path: "/tmp/prior.ts", diff: "prior change", truncated: false };
+      await writeFile(
+        path.join(sessionDir, "post-compaction.json"),
+        JSON.stringify({
+          version: 1,
+          createdAt: 1,
+          diffs: [priorDiff],
+          loadedSkills: [],
+          readFiles: [],
+        })
+      );
+      const recent = createMuxMessage("recent", "assistant", "");
+      recent.parts = [
+        {
+          type: "dynamic-tool",
+          toolCallId: "edit",
+          toolName: "file_edit_replace_string",
+          state: "output-available",
+          input: { path: "/tmp/recent.ts" },
+          output: { success: true, diff: "recent change" },
+        },
+      ];
+      await store.historyService.appendToHistory(workspaceId, recent);
+      const emitter = new EventEmitter();
+      const emitted: WorkspaceChatMessage[] = [];
+      emitter.on("chat-event", (event: { message: WorkspaceChatMessage }) => {
+        emitted.push(event.message);
+        if (failurePoint === "observer" && event.message.type === "delete")
+          throw new Error("observer failed after commit");
+      });
+      const handler = new CompactionHandler({
+        workspaceId,
+        historyService: store.historyService,
+        sessionDir,
+        emitter,
+      });
+      expect(
+        (
+          await handler.appendHeartbeatContextResetBoundary({
+            boundaryText: "Heartbeat",
+            pendingFollowUp: { text: "wake", model: "openai:gpt-4o", agentId: "exec" },
+          })
+        ).success
+      ).toBe(true);
+      const boundary = await store.historyService.getLastMessages(workspaceId, 1);
+      assert(boundary.success, "Expected heartbeat boundary");
+      const boundarySequence = boundary.data[0].metadata?.historySequence;
+      assert(boundarySequence != null, "Expected persisted boundary sequence");
+      // The external send has already persisted its row; PREPARING can race
+      // rollback without needing another history write or its lock.
+      await store.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual", "user", "manual replacement")
+      );
+      const coordinator = new TurnCoordinator({
+        phaseChanged: () => undefined,
+        drainQueue: () => undefined,
+        policy: () => Promise.resolve(),
+        policyError: () => undefined,
+      });
+      const token = coordinator.claimCompactionFollowUp();
+      assert(token, "Expected cleanup owner");
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const rm = fsPromises.rm;
+      const historyPath = path.join(store.config.sessionsDir, workspaceId, CHAT_FILE_NAME);
+      spyOn(fsPromises, "rm").mockImplementation(async (file, options) => {
+        if (String(file).startsWith(`${historyPath}.continuous-`)) {
+          entered.resolve();
+          await release.promise;
+          if (failurePoint === "cleanup") throw new Error("post-commit cleanup failed");
+        }
+        return rm(file, options);
+      });
+      const published = mock(() => undefined);
+      const pending = handler.rollbackHeartbeatContextResetBoundary(
+        boundary.data[0],
+        () => coordinator.canClearCompactionFollowUp(token),
+        published
+      );
+      try {
+        await entered.promise;
+        const committedRows = (await fsPromises.readFile(historyPath, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as MuxMessage);
+        expect(committedRows.map((message) => message.id)).toEqual(["manual"]);
+        expect(
+          coordinator.prepare({
+            kind: "fresh",
+            intent: "direct",
+            expectedTurnId: coordinator.turnId,
+          }).status
+        ).toBe("admitted");
+        expect(handler.peekCachedFilePaths()).toEqual([priorDiff.path]);
+        expect(emitted.filter((message) => message.type === "delete")).toEqual([
+          {
+            type: "delete",
+            historySequences: [boundarySequence],
+          },
+        ]);
+        expect(published).toHaveBeenCalledTimes(1);
+        release.resolve();
+        const result = await pending;
+        expect(result.success).toBe(failurePoint !== "cleanup");
+        if (!result.success) expect(result.error).toContain("was deleted");
+        expect((await handler.peekPendingState())?.diffs).toEqual([priorDiff]);
+        const reloaded = new CompactionHandler({
+          workspaceId,
+          historyService: store.historyService,
+          sessionDir,
+          emitter: new EventEmitter(),
+        });
+        expect((await reloaded.peekPendingState())?.diffs).toEqual([priorDiff]);
+      } finally {
+        release.resolve();
+        await pending;
+      }
+    }
+  );
+
+  it.each(["veto", "archived"] as const)(
+    "does not restore or publish a skipped heartbeat rollback (%s)",
+    async (skipReason) => {
+      const sessionDir = path.join(store.tempDir, "pending");
+      const emitter = new EventEmitter();
+      const handler = new CompactionHandler({
+        workspaceId,
+        historyService: store.historyService,
+        sessionDir,
+        emitter,
+      });
+      expect(
+        (
+          await handler.appendHeartbeatContextResetBoundary({
+            boundaryText: "Heartbeat",
+            pendingFollowUp: { text: "wake", model: "openai:gpt-4o", agentId: "exec" },
+          })
+        ).success
+      ).toBe(true);
+      const boundary = await store.historyService.getLastMessages(workspaceId, 1);
+      assert(boundary.success, "Expected heartbeat boundary");
+      if (skipReason === "archived") {
+        await store.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("replacement", "assistant", "New boundary", {
+            compacted: true,
+            compactionBoundary: true,
+            compactionEpoch: 2,
+          })
+        );
+      }
+      const emit = spyOn(emitter, "emit");
+      const published = mock(() => undefined);
+      const state = await handler.peekPendingState();
+      expect(state).not.toBeNull();
+      expect(
+        (
+          await handler.rollbackHeartbeatContextResetBoundary(
+            boundary.data[0],
+            () => skipReason !== "veto",
+            published
+          )
+        ).success
+      ).toBe(true);
+      expect(await handler.peekPendingState()).toEqual(state);
+      expect(emit).not.toHaveBeenCalled();
+      expect(published).not.toHaveBeenCalled();
+      if (skipReason === "archived") {
+        const archive = await fsPromises.readFile(
+          path.join(store.config.sessionsDir, workspaceId, CHAT_ARCHIVE_FILE_NAME),
+          "utf8"
+        );
+        expect(
+          archive
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => (JSON.parse(line) as MuxMessage).id)
+        ).toContain(boundary.data[0].id);
+      }
+    }
+  );
 
   it("a held heartbeat rollback unlink cannot consume the replacement rollback snapshot", async () => {
     const sessionDir = path.join(store.tempDir, "pending");
@@ -74,6 +265,14 @@ describe("continuous compaction provider replay", () => {
       release.resolve();
       expect((await rollingBack).success).toBe(true);
       expect((await replacement).success).toBe(true);
+      const reloaded = new CompactionHandler({
+        workspaceId,
+        historyService: store.historyService,
+        sessionDir,
+        emitter: new EventEmitter(),
+      });
+      // A's delayed unlink must finish before B's pending snapshot publishes.
+      expect(await reloaded.peekPendingState()).not.toBeNull();
       const second = await store.historyService.getLastMessages(workspaceId, 1);
       assert(second.success, "Expected replacement boundary");
       expect((await handler.rollbackHeartbeatContextResetBoundary(second.data[0])).success).toBe(

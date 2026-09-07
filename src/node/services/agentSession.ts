@@ -8343,12 +8343,12 @@ export class AgentSession {
     ) {
       const rollbackResult = await this.compactionHandler.rollbackHeartbeatContextResetBoundary(
         summaryMessage,
-        () => this.coordinator.canClearCompactionFollowUp(token)
+        () => this.coordinator.canClearCompactionFollowUp(token),
+        this.onPostCompactionStateChange
       );
       if (!rollbackResult.success) {
         throw new Error(`Failed to rollback heartbeat reset boundary: ${rollbackResult.error}`);
       }
-      if (this.coordinator.canClearCompactionFollowUp(token)) this.onPostCompactionStateChange?.();
     } else {
       await this.clearPendingFollowUpFromSummary(summaryMessage, token);
     }

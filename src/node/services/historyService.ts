@@ -2629,17 +2629,27 @@ export class HistoryService {
     }
   }
 
-  /** The final ownership check and rename do not yield to a context reset/new admission. */
+  /** The ownership check, rename and commit publication never yield to new admission. */
   private async writeGuardedHistory(
     historyPath: string,
     serialized: string,
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    onCommitted?: () => void
   ): Promise<boolean> {
     const stagedPath = `${historyPath}.continuous-${randomUUID()}`;
     try {
       await writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
       if (!isCurrent()) return false;
       renameSync(stagedPath, historyPath);
+      try {
+        onCommitted?.();
+      } catch (error) {
+        // Observer failure cannot turn an already committed rewrite into a
+        // reported write failure. Filesystem cleanup errors still propagate.
+        log.error("Committed history rewrite publication failed", {
+          error: getErrorMessage(error),
+        });
+      }
       return true;
     } finally {
       await fs.rm(stagedPath, { force: true });
@@ -2847,21 +2857,26 @@ export class HistoryService {
    * messages may already have been appended.
    * A conditional cleanup uses a synchronous/pure predicate under the lock and
    * before rename; false returns Ok without changing history.
+   * Its optional commit observer runs synchronously after rename, before any
+   * cleanup await. It must not await or reenter the history write lock.
    */
   async deleteMessage(
     workspaceId: string,
     messageId: string,
-    shouldDelete?: (messages: MuxMessage[]) => boolean
+    shouldDelete?: (messages: MuxMessage[]) => boolean,
+    onCommitted?: () => void
   ): Promise<Result<void>> {
+    assert(!onCommitted || shouldDelete, "Delete commit observers require a conditional cleanup");
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to delete message", () =>
-      this.deleteMessageUnderWriteLock(workspaceId, messageId, shouldDelete)
+      this.deleteMessageUnderWriteLock(workspaceId, messageId, shouldDelete, onCommitted)
     );
   }
 
   private async deleteMessageUnderWriteLock(
     workspaceId: string,
     messageId: string,
-    shouldDelete?: (messages: MuxMessage[]) => boolean
+    shouldDelete?: (messages: MuxMessage[]) => boolean,
+    onCommitted?: () => void
   ): Promise<Result<void>> {
     try {
       // Structural rewrite requires full file content
@@ -2871,6 +2886,7 @@ export class HistoryService {
       const filteredMessages = messages.filter((msg) => msg.id !== messageId);
 
       if (filteredMessages.length === messages.length) {
+        if (shouldDelete) return Ok(undefined);
         // Not in the active epoch — the row may live in the sealed archive
         // (rare: cleanup paths almost always target recent rows).
         const archiveMessages = await this.readArchivedHistory(workspaceId);
@@ -2894,8 +2910,11 @@ export class HistoryService {
       // Atomic write prevents corruption if app crashes mid-write
       if (shouldDelete) {
         if (
-          !(await this.writeGuardedHistory(historyPath, historyEntries, () =>
-            shouldDelete(messages)
+          !(await this.writeGuardedHistory(
+            historyPath,
+            historyEntries,
+            () => shouldDelete(messages),
+            onCommitted
           ))
         )
           return Ok(undefined);

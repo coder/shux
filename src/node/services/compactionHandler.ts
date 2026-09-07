@@ -628,10 +628,10 @@ export class CompactionHandler {
     };
   }
 
-  private async restoreHeartbeatResetRollbackState(): Promise<void> {
+  private restoreHeartbeatResetRollbackState(): Promise<void> {
     const rollbackState = this.heartbeatResetRollbackState;
     if (!rollbackState) {
-      return;
+      return Promise.resolve();
     }
 
     // Consume the captured rollback before I/O. A new heartbeat can install its
@@ -645,13 +645,13 @@ export class CompactionHandler {
     this.persistedPendingStateLoaded = rollbackState.persistedPendingStateLoaded;
 
     if (rollbackState.postCompactionAttachmentsPending) {
-      await this.persistPendingStateBestEffort(
+      return this.persistPendingStateBestEffort(
         this.cachedFileDiffs,
         this.cachedLoadedSkills,
         this.cachedReadFilePaths
       );
     } else {
-      await this.deletePersistedPendingStateBestEffort();
+      return this.deletePersistedPendingStateBestEffort();
     }
   }
 
@@ -893,7 +893,8 @@ export class CompactionHandler {
 
   async rollbackHeartbeatContextResetBoundary(
     summaryMessage: MuxMessage,
-    isCurrent: () => boolean = () => true
+    isCurrent: () => boolean = () => true,
+    onCommitted?: () => void
   ): Promise<Result<void, string>> {
     assert(
       summaryMessage.role === "assistant",
@@ -904,6 +905,7 @@ export class CompactionHandler {
       "rollbackHeartbeatContextResetBoundary requires a heartbeat reset boundary"
     );
 
+    let restoration: Promise<void> | undefined;
     const deleteResult = await this.historyService.deleteMessage(
       this.workspaceId,
       summaryMessage.id,
@@ -913,24 +915,29 @@ export class CompactionHandler {
           (message) =>
             message.id === summaryMessage.id &&
             message.metadata?.historySequence === summaryMessage.metadata?.historySequence
-        )
+        ),
+      () => {
+        // The boundary is gone. Restore memory and enqueue its immutable disk
+        // snapshot before publishing events that may admit a replacement turn.
+        restoration = this.restoreHeartbeatResetRollbackState();
+        try {
+          const historySequence = summaryMessage.metadata?.historySequence;
+          if (isNonNegativeInteger(historySequence)) {
+            this.emitChatEvent({ type: "delete", historySequences: [historySequence] });
+          }
+        } finally {
+          onCommitted?.();
+        }
+      }
     );
+    // Physical persistence outlives ownership. A later admission may not veto a
+    // committed rollback; the existing write queue orders it before successor state.
+    await restoration;
     if (!deleteResult.success) {
-      return Err(`Failed to delete heartbeat reset boundary: ${deleteResult.error}`);
-    }
-
-    if (!isCurrent()) return Ok(undefined);
-
-    await this.restoreHeartbeatResetRollbackState();
-
-    if (!isCurrent()) return Ok(undefined);
-
-    const historySequence = summaryMessage.metadata?.historySequence;
-    if (isNonNegativeInteger(historySequence)) {
-      this.emitChatEvent({
-        type: "delete",
-        historySequences: [historySequence],
-      });
+      const failure = restoration
+        ? "Heartbeat reset boundary was deleted, but cleanup failed"
+        : "Failed to delete heartbeat reset boundary";
+      return Err(`${failure}: ${deleteResult.error}`);
     }
 
     return Ok(undefined);
