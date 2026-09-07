@@ -558,12 +558,12 @@ describe("MessageQueue", () => {
 
       expect(queue.setVisibleQueueDispatchMode("turn-end")).toBe(true);
       expect(queue.getVisibleQueueDispatchMode()).toBe("turn-end");
-      expect(queue.getNextQueueDispatchMode()).toBe("turn-end");
+      expect(queue.getNextDispatchableMode()).toBe("turn-end");
       expect(queue.getQueueDispatchMode()).toBe("tool-end");
       expect(queue.getMessages()).toEqual(["visible first", "visible second", "hidden wake"]);
 
       queue.dequeueNext();
-      expect(queue.getNextQueueDispatchMode()).toBe("turn-end");
+      expect(queue.getNextDispatchableMode()).toBe("turn-end");
     });
 
     it("reports a hidden predecessor's effective mode until the user reprioritizes the visible card", () => {
@@ -583,7 +583,7 @@ describe("MessageQueue", () => {
       expect(queue.setVisibleQueueDispatchMode("tool-end")).toBe(true);
       expect(queue.getMessages()).toEqual(["visible follow-up", "hidden predecessor"]);
       expect(queue.getVisibleQueueDispatchMode()).toBe("tool-end");
-      expect(queue.getNextQueueDispatchMode()).toBe("tool-end");
+      expect(queue.getNextDispatchableMode()).toBe("tool-end");
     });
 
     it("reports the first visible entry mode instead of a later visible tool-end entry", () => {
@@ -619,9 +619,9 @@ describe("MessageQueue", () => {
       );
 
       expect(queue.getQueueDispatchMode()).toBe("tool-end");
-      expect(queue.getNextQueueDispatchMode()).toBe("turn-end");
+      expect(queue.getNextDispatchableMode()).toBe("turn-end");
       queue.dequeueNext();
-      expect(queue.getNextQueueDispatchMode()).toBe("tool-end");
+      expect(queue.getNextDispatchableMode()).toBe("tool-end");
     });
 
     it("does not update a queue containing only hidden entries", () => {
@@ -647,7 +647,7 @@ describe("MessageQueue", () => {
 
       queue.add("follow up", { ...validOptions, queueDispatchMode: "turn-end" });
       expect(queue.getNextDispatchableMode()).toBe("turn-end");
-      expect(queue.getNextQueueDispatchMode()).toBe("tool-end");
+      expect(queue.getVisibleQueueDispatchMode()).toBe("turn-end");
     });
 
     it("should reset mode to tool-end when cleared", () => {
@@ -798,6 +798,42 @@ describe("MessageQueue", () => {
       expect(skipped.internal?.onCanceled).toBe(peerCanceled);
     });
 
+    it("ignores a withdrawn predecessor when revalidating correlations after a promotion", () => {
+      const turnMetadata: MuxMessageMetadata = {
+        type: "workspace-turn-task",
+        taskHandleId: "wst_parent",
+        ownerWorkspaceId: "grandparent",
+        turnId: "turn-1",
+      };
+      const withdrawn = new AbortController();
+      queue.add(
+        "withdrawn wake",
+        { ...validOptions, queueDispatchMode: "tool-end" },
+        { ...hidden, cancelSignal: withdrawn.signal }
+      );
+      withdrawn.abort();
+      const peerCanceled = () => undefined;
+      queue.add(
+        "peer message",
+        { ...validOptions, queueDispatchMode: "turn-end", muxMetadata: turnMetadata },
+        { ...hidden, workspaceTurnContinuation: true, onCanceled: peerCanceled }
+      );
+      queue.add(
+        "progress report",
+        { ...validOptions, queueDispatchMode: "tool-end", muxMetadata: turnMetadata },
+        { ...hidden, workspaceTurnContinuation: true, promoteAheadOfHiddenTurnEnd: true }
+      );
+
+      expect(queue.dequeueNext().message).toBe("withdrawn wake");
+      const promoted = queue.dequeueNext();
+      expect(promoted.message).toBe("progress report");
+      expect(promoted.options?.muxMetadata).toEqual(turnMetadata);
+      const skipped = queue.dequeueNext();
+      expect(skipped.message).toBe("peer message");
+      expect(skipped.options?.muxMetadata).toEqual(turnMetadata);
+      expect(skipped.internal?.onCanceled).toBe(peerCanceled);
+    });
+
     it("ignores the hidden turn-end entries a promoted report overtakes when judging its correlation", () => {
       // A queued heartbeat (hidden, turn-end, uncorrelated) would make the plain check report a
       // superseding predecessor and strip the report's correlation before enqueue — yet the
@@ -934,6 +970,55 @@ describe("MessageQueue", () => {
         queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
       ).toBe(false);
     });
+
+    it.each(["continuation", "wake", "manual"] as const)(
+      "ignores withdrawn predecessors when the live successor is %s",
+      (kind) => {
+        const options = { model: "gpt-4", agentId: "exec" };
+        const canceled = new AbortController();
+        queue.add(
+          "withdrawn continuation",
+          { ...options, muxMetadata: metadata },
+          {
+            synthetic: true,
+            cancelSignal: canceled.signal,
+          }
+        );
+        queue.add(
+          "withdrawn wake",
+          {
+            ...options,
+            muxMetadata: { type: "bash-monitor-wake", records: [] },
+          },
+          { synthetic: true, cancelSignal: canceled.signal }
+        );
+        canceled.abort();
+        expect(queue.getNextQueueCutCandidate()).toBeUndefined();
+        expect(queue.isNextEntryBashMonitorWake()).toBe(false);
+        expect(
+          queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+        ).toBe(true);
+
+        const liveMetadata =
+          kind === "continuation"
+            ? metadata
+            : kind === "wake"
+              ? { type: "bash-monitor-wake" as const, records: [] }
+              : undefined;
+        queue.add("live", { ...options, muxMetadata: liveMetadata, queueDispatchMode: "turn-end" });
+        expect(queue.getNextQueueCutCandidate()).toEqual({
+          muxMetadata: liveMetadata,
+          dispatchMode: "turn-end",
+        });
+        expect(queue.isNextEntryBashMonitorWake()).toBe(kind === "wake");
+        expect(
+          queue.hasNextWorkspaceTurnContinuation("wst_followup", "parent-workspace", "turn-1")
+        ).toBe(kind === "continuation");
+        expect(
+          queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+        ).toBe(kind === "continuation");
+      }
+    );
 
     it("exposes the head entry's metadata and dispatch mode as the queue-cut candidate", () => {
       expect(queue.getNextQueueCutCandidate()).toBeUndefined();

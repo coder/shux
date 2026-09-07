@@ -969,6 +969,7 @@ test("interrupt restores the full queue into the existing draft once and keeps i
   await act(async () => fireEvent.click(view.getByRole("button", { name: "Interrupt agent" })));
   expect(view.calls.find((call) => call.path === "workspace.interruptStream")?.input).toEqual({
     workspaceId: "alpha",
+    options: { retireBashMonitorAttention: true, disableAutoRetry: true },
   });
   expect(view.getByLabelText("Message")).toHaveProperty(
     "value",

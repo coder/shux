@@ -327,6 +327,8 @@ export interface SendMessageInternalOptions {
   cancelState?: { canceledBeforeAcceptance: boolean };
   /** Cancels a synthetic send even after it has left MessageQueue for PREPARING. */
   cancelSignal?: AbortSignal;
+  /** Let a late `cancelSignal` abort withdraw the send after its rows are durable (see AgentSession). */
+  withdrawAcceptedOnCancel?: boolean;
   /**
    * Synchronous staleness probe from the caller, re-evaluated at the real admission points
    * (the enqueue block and the session's turn-admission gates) in addition to the

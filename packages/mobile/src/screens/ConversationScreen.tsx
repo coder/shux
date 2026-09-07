@@ -201,7 +201,11 @@ export function ConversationScreen(props: {
     const signal = controller.current.signal;
     try {
       const result = await props.client.workspace.interruptStream(
-        { workspaceId: props.workspace.id },
+        {
+          workspaceId: props.workspace.id,
+          // Match desktop User Stop: owed monitor output must not restart the stopped turn.
+          options: { retireBashMonitorAttention: true, disableAutoRetry: true },
+        },
         { signal }
       );
       if (!result.success) throw new Error(result.error);
