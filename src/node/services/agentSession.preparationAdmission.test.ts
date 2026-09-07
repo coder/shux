@@ -320,6 +320,8 @@ describe("preparation admission", () => {
       shouldForceCompact: true,
       usagePercentage: 99,
       thresholdPercentage: 85,
+      contextTokens: 99000,
+      maxTokens: 100000,
     });
     let stale = false;
     const append = h.historyService.appendToHistory.bind(h.historyService);

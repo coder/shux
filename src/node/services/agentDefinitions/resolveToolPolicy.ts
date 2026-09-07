@@ -75,7 +75,8 @@ function matchesSubagentHardDeniedTool(pattern: string): boolean {
 export function resolveToolPolicyForAgent(options: ResolveToolPolicyOptions): ToolPolicy {
   const { agents, isSubagent, disableTaskToolsForDepth } = options;
 
-  // Start with deny-all baseline
+  // History recovery uses the deny-all baseline too: enabling its experiment
+  // must not widen a deliberately narrow agent allowlist.
   const agentPolicy: ToolPolicy = [{ regex_match: ".*", action: "disable" }];
 
   // Process inheritance chain: base → child

@@ -8,7 +8,7 @@ import { UserMessage, type UserMessageNavigation } from "./UserMessage";
 import { AgentPeerMessage } from "./AgentPeerMessage";
 import { BashMonitorWakeMessage } from "./BashMonitorWakeMessage";
 import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
-import { MessageSquare } from "lucide-react";
+import { AlertTriangle, MessageSquare } from "lucide-react";
 import {
   BackgroundWorkWakeMessage,
   getBackgroundWorkWakeSummary,
@@ -99,7 +99,15 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         const backgroundWorkWakeSummary =
           message.isSynthetic === true ? getBackgroundWorkWakeSummary(message.content) : null;
         renderedMessage =
-          message.bashMonitorWake != null ? (
+          message.contextBudgetWarning != null ? (
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary="Context budget warning"
+              icon={<AlertTriangle aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="context-budget-warning"
+              className={className}
+            />
+          ) : message.bashMonitorWake != null ? (
             <BashMonitorWakeMessage message={message} className={className} />
           ) : message.agentPeerMessageTrigger != null ? (
             // The wake trigger is backend-generated control text: a full user bubble would

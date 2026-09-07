@@ -4,6 +4,7 @@ export function hasProviderReplayableContent(
   message: MuxMessage,
   options: { preserveReasoningOnly?: boolean } = {}
 ): boolean {
+  if (message.metadata?.contextBudgetRejected) return false;
   if (message.role === "system") {
     return true;
   }

@@ -90,6 +90,20 @@ export interface RequestAssembleContext {
   tools: Record<string, Tool>;
 }
 
+/** A deliberately separate projection: callbacks cannot obtain the live tool objects. */
+export type RequestContextOnly = Omit<RequestAssembleContext, "tools">;
+
+export interface RequestAssemblySnapshot {
+  readonly workspaceId: string;
+  readonly preservesToolset: boolean;
+  run(ctx: RequestAssembleContext): Promise<void>;
+}
+
+interface RegistrationOptions {
+  order?: number;
+  workspaceId?: string;
+}
+
 export interface CompactionPrepareContext {
   readonly workspaceId: string;
   readonly reason: "on-send" | "mid-stream" | "continuous-eager";
@@ -109,10 +123,12 @@ export type WaterfallMiddleware<C> = (ctx: C, next: WaterfallNext) => void | Pro
 export type HookCallback<C> = (ctx: C) => void | Promise<void>;
 
 interface Registration {
-  // Stored type-erased; `use()` is the only writer and it is fully typed.
+  // Stored type-erased; the registration helpers are fully typed.
   middleware: WaterfallMiddleware<unknown>;
   order: number;
   seq: number;
+  workspaceId?: string;
+  preservesToolset: boolean;
 }
 
 /** Duck-check for contexts that support blocking (currently tool.execute). */
@@ -175,14 +191,27 @@ export class EventSpine {
   use<K extends keyof WaterfallPointMap>(
     point: K,
     middleware: WaterfallMiddleware<WaterfallPointMap[K]>,
-    opts?: { order?: number }
+    opts?: RegistrationOptions
   ): () => void {
+    return this.register(point, middleware, opts, false);
+  }
+
+  private register<K extends keyof WaterfallPointMap>(
+    point: K,
+    middleware: WaterfallMiddleware<WaterfallPointMap[K]>,
+    opts: RegistrationOptions | undefined,
+    preservesToolset: boolean
+  ): () => void {
+    if (opts?.workspaceId != null)
+      assert(opts.workspaceId.length > 0, "Workspace scope must not be empty");
     const registrations = this.waterfalls.get(point) ?? [];
-    const registration: Registration = {
+    const registration: Registration = Object.freeze({
       middleware: middleware as WaterfallMiddleware<unknown>,
       order: opts?.order ?? 0,
       seq: this.registrationSeq++,
-    };
+      workspaceId: opts?.workspaceId,
+      preservesToolset,
+    });
     registrations.push(registration);
     // Stable order: explicit order first, then registration sequence.
     registrations.sort((a, b) => a.order - b.order || a.seq - b.seq);
@@ -204,7 +233,7 @@ export class EventSpine {
   useBefore<K extends keyof WaterfallPointMap>(
     point: K,
     callback: HookCallback<WaterfallPointMap[K]>,
-    opts?: { order?: number }
+    opts?: RegistrationOptions
   ): () => void {
     return this.use(
       point,
@@ -221,7 +250,7 @@ export class EventSpine {
   useAfter<K extends keyof WaterfallPointMap>(
     point: K,
     callback: HookCallback<WaterfallPointMap[K]>,
-    opts?: { order?: number }
+    opts?: RegistrationOptions
   ): () => void {
     return this.use(
       point,
@@ -232,6 +261,53 @@ export class EventSpine {
         }
       },
       opts
+    );
+  }
+
+  /** Toolset preservation is by construction, not a claim made by arbitrary middleware. */
+  useRequestContext(
+    callback: HookCallback<RequestContextOnly>,
+    opts?: RegistrationOptions
+  ): () => void {
+    return this.register(
+      "request.assemble",
+      async (ctx, next) => {
+        const projection: RequestContextOnly = {
+          workspaceId: ctx.workspaceId,
+          modelString: ctx.modelString,
+          systemMessage: ctx.systemMessage,
+        };
+        await callback(projection);
+        assert(typeof projection.systemMessage === "string", "Request context must remain text");
+        ctx.systemMessage = projection.systemMessage;
+        await next();
+      },
+      opts,
+      true
+    );
+  }
+
+  captureRequestAssembly(workspaceId: string): RequestAssemblySnapshot {
+    assert(workspaceId.length > 0, "Request assembly snapshot requires a workspace");
+    const registrations = Object.freeze(
+      this.applicableRegistrations("request.assemble", workspaceId)
+    );
+    return Object.freeze({
+      workspaceId,
+      preservesToolset: registrations.every((registration) => registration.preservesToolset),
+      run: async (ctx: RequestAssembleContext) => {
+        assert(ctx.workspaceId === workspaceId, "Request assembly snapshot workspace mismatch");
+        await this.runRegistrations("request.assemble", registrations, ctx);
+      },
+    });
+  }
+
+  private applicableRegistrations(
+    point: keyof WaterfallPointMap,
+    workspaceId: string
+  ): Registration[] {
+    return (this.waterfalls.get(point) ?? []).filter(
+      (registration) => registration.workspaceId == null || registration.workspaceId === workspaceId
     );
   }
 
@@ -251,16 +327,29 @@ export class EventSpine {
     ctx: WaterfallPointMap[K],
     terminal?: (ctx: WaterfallPointMap[K]) => void | Promise<void>
   ): Promise<void> {
-    const registrations = this.waterfalls.get(point) ?? [];
+    await this.runRegistrations(point, this.waterfalls.get(point) ?? [], ctx, terminal);
+  }
+
+  private async runRegistrations<K extends keyof WaterfallPointMap>(
+    point: K,
+    registrations: readonly Registration[],
+    ctx: WaterfallPointMap[K],
+    terminal?: (ctx: WaterfallPointMap[K]) => void | Promise<void>
+  ): Promise<void> {
+    const workspaceId = "host" in ctx ? ctx.host.workspaceId : ctx.workspaceId;
     const dispatch = async (index: number): Promise<void> => {
       if (index < registrations.length) {
+        const registration = registrations[index];
+        if (registration.workspaceId != null && registration.workspaceId !== workspaceId) {
+          return dispatch(index + 1);
+        }
         let nextCalled = false;
         const next: WaterfallNext = () => {
           assert(!nextCalled, `EventSpine '${point}' middleware called next() more than once`);
           nextCalled = true;
           return dispatch(index + 1);
         };
-        await registrations[index].middleware(ctx, next);
+        await registration.middleware(ctx, next);
         return;
       }
       if (terminal && !isBlocked(ctx)) {

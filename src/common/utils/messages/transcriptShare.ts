@@ -1,3 +1,7 @@
+import {
+  createContextBudgetRejectedMessage,
+  restoreContextBudgetRejectedMessageForDisplay,
+} from "./contextBudgetRejection";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
 import type { NestedToolCall } from "@/common/orpc/schemas/message";
 
@@ -296,9 +300,20 @@ export function buildChatJsonlForSharing(
 
   const includeToolOutput = options.includeToolOutput ?? true;
 
+  // Sanitize the display payload as well, then retain inert capsules in the exported JSONL.
+  const displayMessages = messages.map((message) => {
+    const display = restoreContextBudgetRejectedMessageForDisplay(message);
+    if (!includeToolOutput && display.metadata?.contextBudgetRejectedMessage != null) {
+      // A malformed original could not be projected, so its opaque bytes cannot be safely redacted.
+      const metadata = { ...display.metadata };
+      delete metadata.contextBudgetRejectedMessage;
+      return { ...display, metadata };
+    }
+    return display;
+  });
   const withPlanInlined = options.planSnapshot
-    ? inlinePlanContentForSharing(messages, options.planSnapshot)
-    : messages;
+    ? inlinePlanContentForSharing(displayMessages, options.planSnapshot)
+    : displayMessages;
 
   const sanitized = includeToolOutput
     ? withPlanInlined
@@ -309,6 +324,7 @@ export function buildChatJsonlForSharing(
   return (
     compacted
       .map((msg): ChatJsonlEntry => {
+        if (msg.metadata?.contextBudgetRejected) msg = createContextBudgetRejectedMessage(msg);
         if (options.workspaceId === undefined) {
           return msg;
         }

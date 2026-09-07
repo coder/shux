@@ -130,6 +130,53 @@ describe("AgentSession goal safety hooks", () => {
     }
   });
 
+  test.each([false, true])(
+    "token-budget rejection applies goal safety only to actionable manual intervention (synthetic=%s)",
+    async (synthetic) => {
+      const workspaceId = `budget-rejection-goal-${synthetic}`;
+      const { session, goalService, aiService, cleanup } = await createSessionHarness(workspaceId);
+      cleanups.push(cleanup);
+      const stream = spyOn(aiService, "streamMessage");
+      const candidates = registerBusyKickoffConsumer(goalService);
+      await setGoalOk(goalService, { workspaceId, objective: "Keep working until interrupted" });
+      await goalService.requireUserAcknowledgment(workspaceId, 55_000);
+      expect(candidates.has(workspaceId)).toBe(true);
+      const result = await session.sendMessage(
+        "Oversized intervention ".repeat(40_000),
+        {
+          ...SEND_OPTIONS,
+          experiments: { tokenBudget: true },
+        },
+        synthetic ? { synthetic: true, agentInitiated: true } : undefined
+      );
+      expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({
+        status: synthetic ? "active" : "paused",
+        requireUserAcknowledgmentSinceMs: synthetic ? 55_000 : null,
+      });
+      expect(candidates.has(workspaceId)).toBe(synthetic);
+      expect(stream).not.toHaveBeenCalled();
+      await session.dispose();
+    }
+  );
+
+  test("blank token-budget sends do not acknowledge or pause an active goal", async () => {
+    const workspaceId = "blank-budget-rejection-goal";
+    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    await setGoalOk(goalService, { workspaceId, objective: "Continue working" });
+    await goalService.requireUserAcknowledgment(workspaceId, 55_000);
+    expect(
+      (await session.sendMessage(" ", { ...SEND_OPTIONS, experiments: { tokenBudget: true } }))
+        .success
+    ).toBe(false);
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({
+      status: "active",
+      requireUserAcknowledgmentSinceMs: 55_000,
+    });
+    await session.dispose();
+  });
+
   test("manual user messages pause active goals by default", async () => {
     const workspaceId = "manual-pauses-active-goal-by-default";
     const { session, goalService, analytics, cleanup } = await createSessionHarness(workspaceId);

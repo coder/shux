@@ -13,7 +13,9 @@ export const CompactionBoundaryMessage: React.FC<CompactionBoundaryMessageProps>
     typeof props.message.compactionEpoch === "number" ? ` #${props.message.compactionEpoch}` : "";
   const label =
     props.message.boundaryKind === CONTEXT_BOUNDARY_KINDS.RESET
-      ? "Context reset"
+      ? props.message.contextWindowRollover
+        ? "Context window rollover"
+        : "Context reset"
       : props.message.strategy === "continuous"
         ? `Continuous compaction${epochLabel}`
         : `Compaction boundary${epochLabel}`;

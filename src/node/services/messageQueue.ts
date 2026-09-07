@@ -1,3 +1,4 @@
+import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import assert from "@/common/utils/assert";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
@@ -114,6 +115,8 @@ export type QueueCutCutter =
   | { stage: "queued"; muxMetadata: unknown; dispatchMode: QueueDispatchMode };
 
 interface QueuedMessageInternalOptions {
+  goalKind?: GoalSyntheticMessageKind;
+  goalId?: string;
   synthetic?: boolean;
   agentInitiated?: boolean;
   /**
@@ -175,6 +178,8 @@ type QueueClearCallbacks = Pick<
  * exactly one dispatch.
  */
 interface QueueEntry {
+  goalKind?: GoalSyntheticMessageKind;
+  goalId?: string;
   messages: string[];
   /** First muxMetadata added to this entry (never overwritten by later batched adds). */
   muxMetadata?: unknown;
@@ -587,6 +592,7 @@ export class MessageQueue {
       // A staleness probe gates exactly one dispatch; batching would let one
       // sender's stop-refusal veto unrelated queued messages.
       internal?.admissionStale != null ||
+      internal?.goalKind != null ||
       incomingHasAcceptedCallbacks;
     // Compaction starts its own entry (its metadata must not adopt earlier batched
     // texts), but stays open so a follow-up typed behind a pending /compact batches
@@ -617,6 +623,8 @@ export class MessageQueue {
         sealed: incomingIsSealed,
         userAuthored: incomingIsUserAuthored,
         workspaceTurnContinuation: internal?.workspaceTurnContinuation === true,
+        goalKind: internal?.goalKind,
+        goalId: internal?.goalId,
         addCount: 0,
         syntheticCount: 0,
         agentInitiatedCount: 0,
@@ -989,6 +997,7 @@ export class MessageQueue {
       ? {
           ...(allAddsAreSynthetic ? { synthetic: true } : {}),
           ...(allAddsAreAgentInitiated ? { agentInitiated: true } : {}),
+          ...(entry.goalKind != null ? { goalKind: entry.goalKind, goalId: entry.goalId } : {}),
           ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
           ...(entry.cancelState != null ? { cancelState: entry.cancelState } : {}),
           ...(entry.cancelSignal != null ? { cancelSignal: entry.cancelSignal } : {}),

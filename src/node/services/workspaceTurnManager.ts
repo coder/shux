@@ -20,6 +20,8 @@ import {
   type WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
+import type { HistoryControlRow } from "@/node/services/historyScanner";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import {
   SUBAGENT_FAILURE_ENVELOPE_TAG,
@@ -57,7 +59,6 @@ import {
 } from "@/common/types/backgroundWorkAttention";
 import {
   createMuxMessage,
-  getCompactionFollowUpContent,
   parseWorkspaceTurnTaskCorrelation,
   type MuxMessage,
   type MuxMessageMetadata,
@@ -334,7 +335,7 @@ const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
   "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report";
 
 /** A human-authored child input that redirects the delegated turn. */
-function isManualChildWorkspaceInput(message: MuxMessage): boolean {
+function isManualChildWorkspaceInput(message: HistoryControlRow): boolean {
   if (message.role !== "user") {
     return false;
   }
@@ -342,10 +343,20 @@ function isManualChildWorkspaceInput(message: MuxMessage): boolean {
     return true;
   }
   const muxMetadata = message.metadata.muxMetadata;
-  return (
-    muxMetadata?.type === "compaction-request" &&
-    muxMetadata.source === "auto-compaction" &&
-    getCompactionFollowUpContent(muxMetadata)?.dispatchOptions?.source !== "internal-resume"
+  if (
+    !isPlainObject(muxMetadata) ||
+    muxMetadata.type !== "compaction-request" ||
+    muxMetadata.source !== "auto-compaction"
+  )
+    return false;
+  // Control rows need not be valid MuxMessages. Read only the guarded dispatch
+  // source, including the legacy continuation field, instead of casting payloads.
+  const parsed = isPlainObject(muxMetadata.parsed) ? muxMetadata.parsed : undefined;
+  const followUp = parsed?.followUpContent ?? parsed?.continueMessage;
+  return !(
+    isPlainObject(followUp) &&
+    isPlainObject(followUp.dispatchOptions) &&
+    followUp.dispatchOptions.source === "internal-resume"
   );
 }
 
@@ -4373,20 +4384,22 @@ export class WorkspaceTurnManager {
 
   private isWorkspaceTurnAnchorForRecord(
     record: WorkspaceTurnTaskHandleRecord,
-    message: MuxMessage
+    message: HistoryControlRow
   ): boolean {
     const muxMetadata = message.metadata?.muxMetadata;
-    if (muxMetadata?.type === "workspace-turn-task") {
+    if (!isPlainObject(muxMetadata)) return false;
+    if (muxMetadata.type === "workspace-turn-task") {
       return (
         muxMetadata.taskHandleId === record.handleId &&
         muxMetadata.ownerWorkspaceId === record.ownerWorkspaceId &&
         muxMetadata.turnId === record.turnId
       );
     }
-    if (muxMetadata?.type === "compaction-summary") {
+    if (muxMetadata.type === "compaction-summary" && isPlainObject(muxMetadata.pendingFollowUp)) {
       const preserved = muxMetadata.pendingFollowUp?.workspaceTurnMetadata;
       return (
-        preserved?.taskHandleId === record.handleId &&
+        isPlainObject(preserved) &&
+        preserved.taskHandleId === record.handleId &&
         preserved.ownerWorkspaceId === record.ownerWorkspaceId &&
         preserved.turnId === record.turnId
       );
@@ -4425,7 +4438,9 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(event.workspaceId);
+    const historyResult = await this.historyService.getControlEvidenceFromLatestBoundary(
+      event.workspaceId
+    );
     if (!historyResult.success) {
       log.warn("Could not compare uncorrelated stream-end history for workspace turn", {
         workspaceId: event.workspaceId,
@@ -4472,11 +4487,12 @@ export class WorkspaceTurnManager {
     if (manualSupersessionInput) {
       // Readable JSON can still contain a malformed message ID. Preserve conservative
       // interruption without inventing manual evidence or letting corrupt history strand waiters.
+      const messageId = manualSupersessionInput.id;
       await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(
         record,
         event,
-        coerceNonEmptyString(manualSupersessionInput.id) != null
-          ? { kind: "manual-supersession", messageId: manualSupersessionInput.id }
+        typeof messageId === "string" && coerceNonEmptyString(messageId) != null
+          ? { kind: "manual-supersession", messageId }
           : { kind: "uncorrelated-conservative-fallback", reason: "invalid-manual-input-id" }
       );
     }

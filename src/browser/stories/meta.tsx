@@ -104,6 +104,14 @@ function resetStorybookPersistedStateForStory(): void {
     // Cleared via the persisted-state helper so mounted experiment subscribers
     // observe the reset instead of holding a stale snapshot.
     updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), undefined);
+    // Context-policy stories must not change subsequent stories' automatic behavior.
+    for (const id of [
+      EXPERIMENT_IDS.TOKEN_BUDGET,
+      EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
+      EXPERIMENT_IDS.RLM,
+    ]) {
+      updatePersistedState(getExperimentKey(id), undefined);
+    }
   }
 }
 function getStorybookRenderKey(): string | null {

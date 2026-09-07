@@ -1,7 +1,9 @@
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider";
 import { summarizeContinuousCompaction } from "../continuousCompactionSummary";
-import { createAgentSessionHarness } from "../agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "../agentSession.testHarness";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { prepareWorkspaceRequestHooks } from "./requestHooks";
 import { attachLanguageModelCleanup } from "../languageModelCleanup";
 import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
@@ -481,6 +483,130 @@ describe("AgentPluginHookService", () => {
       await h.session.dispose();
       await h.cleanup();
     }
+  });
+
+  test("lazy context-only hooks participate in the first rollover without prebuilding tools", async () => {
+    const harness = await createHarness({ spine: eventSpine });
+    await writeHookPlugin(
+      harness.container,
+      "first-rollover",
+      `({ "request.assemble": input => ({ context: Object.keys(input).sort().join(",") }) })`
+    );
+    const injected: string[] = [];
+    const h = await createAgentSessionHarness({
+      workspaceId: WORKSPACE_ID,
+      aiServiceOverrides: {
+        captureRequestAssemblySnapshot: async (workspaceId) => {
+          await prepareWorkspaceRequestHooks({
+            config: h.config,
+            metadata,
+            hostCheckoutRoot: h.config.rootDir,
+            enabled: true,
+            journal: sharedDurableEventJournal(path.join(h.config.sessionsDir, workspaceId)),
+          });
+          return Ok(eventSpine.captureRequestAssembly(workspaceId));
+        },
+        streamMessage: async (request) => {
+          expect(request.requestAssemblySnapshot?.preservesToolset).toBe(true);
+          const ctx: RequestAssembleContext = {
+            workspaceId: WORKSPACE_ID,
+            modelString: request.modelString,
+            systemMessage: "base",
+            tools: {},
+          };
+          await request.requestAssemblySnapshot!.run(ctx);
+          injected.push(ctx.systemMessage);
+          return Ok(createStartedTurnHandle(h.session.closingSignal, "assistant"));
+        },
+      },
+    });
+    const metadata: FrontendWorkspaceMetadata = {
+      id: WORKSPACE_ID,
+      name: "rollover",
+      projectName: "project",
+      projectPath: h.config.rootDir,
+      namedWorkspacePath: h.config.rootDir,
+      runtimeConfig: { type: "local" },
+    };
+    const ensure = spyOn(agentPluginHookService, "ensureWorkspaceHooks").mockImplementation(
+      (args) => harness.service.ensureWorkspaceHooks(args)
+    );
+    spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(Ok(metadata));
+    try {
+      await h.historyService.appendManyToHistory(WORKSPACE_ID, [
+        createMuxMessage("old-user", "user", "old request"),
+        createMuxMessage("old-answer", "assistant", "old answer", {
+          model: "openai:gpt-4o",
+          contextUsage: { inputTokens: 110000, outputTokens: 10, totalTokens: 110010 },
+        }),
+      ]);
+      h.session.setAutoCompactionThreshold(0.7);
+      expect(eventSpine.hasMiddleware("request.assemble")).toBe(false);
+      expect(
+        (
+          await h.session.sendMessage("New request", {
+            model: "openai:gpt-4o",
+            agentId: "exec",
+            experiments: { tokenBudget: true },
+          })
+        ).success
+      ).toBe(true);
+      expect(ensure).toHaveBeenCalledTimes(1);
+      expect(injected).toEqual(["base\n\nmodelString,workspaceId"]);
+    } finally {
+      ensure.mockRestore();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  test.each(["dispose", "epoch"] as const)(
+    "an admitted context snapshot cannot revive a plugin revoked by %s",
+    async (mode) => {
+      const harness = await createHarness();
+      await writeHookPlugin(
+        harness.container,
+        "revoked-context",
+        `({ "request.assemble": () => ({ context: "must not return" }) })`
+      );
+      await harness.ensure();
+      const snapshot = harness.spine.captureRequestAssembly(WORKSPACE_ID);
+      expect(snapshot.preservesToolset).toBe(true);
+      if (mode === "dispose") await harness.service.disposeWorkspace(WORKSPACE_ID);
+      else {
+        const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+        await fs.mkdir(stagingRoot, { recursive: true });
+        await bumpContainerMutationEpoch(stagingRoot);
+      }
+      const ctx: RequestAssembleContext = {
+        workspaceId: WORKSPACE_ID,
+        modelString: "model",
+        systemMessage: "base",
+        tools: {},
+      };
+      await snapshot.run(ctx);
+      expect(ctx.systemMessage).toBe("base");
+    }
+  );
+
+  test("an admitted context snapshot reacquires a dropped sandbox instead of retaining its runtime", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "reload-context",
+      `({ "request.assemble": (input) => ({ context: input.workspaceId }) })`
+    );
+    await harness.ensure();
+    const snapshot = harness.spine.captureRequestAssembly(WORKSPACE_ID);
+    harness.sandboxHost.disposeAll();
+    const ctx: RequestAssembleContext = {
+      workspaceId: WORKSPACE_ID,
+      modelString: "model",
+      systemMessage: "base",
+      tools: {},
+    };
+    await snapshot.run(ctx);
+    expect(ctx.systemMessage).toBe(`base\n\n${WORKSPACE_ID}`);
   });
 
   test("request.assemble context is journaled as a hook-context row, then applied", async () => {

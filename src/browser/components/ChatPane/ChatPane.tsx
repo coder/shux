@@ -383,7 +383,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // after the transcript is visible.
   const chatViewDataReady = useChatViewDataReady(workspaceId);
 
-  const { threshold: autoCompactionThreshold } = useAutoCompactionSettings(
+  const { threshold: autoCompactionThreshold, rolloverEnabled } = useAutoCompactionSettings(
     workspaceId,
     pendingModel
   );
@@ -763,12 +763,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const userMessageNavigationByHistoryId = useMemo(() => {
     const userHistoryIds: string[] = [];
     for (const message of deferredMessages) {
-      // Monitor wakes and peer-message wake triggers are synthetic machine rows and should not
-      // interrupt navigation between human prompts (payloads themselves are assistant rows).
+      // Machine wakes and budget warnings should not interrupt navigation between human prompts.
       if (
         message.type === "user" &&
         message.bashMonitorWake == null &&
-        message.agentPeerMessageTrigger == null
+        message.agentPeerMessageTrigger == null &&
+        message.contextBudgetWarning == null
       ) {
         userHistoryIds.push(message.historyId);
       }
@@ -1714,6 +1714,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       canInterrupt={canInterrupt}
                       autoCompactionResult={autoCompactionResult}
                       shouldShowCompactionWarning={shouldShowCompactionWarning}
+                      rolloverEnabled={rolloverEnabled}
                       contextSwitchWarning={contextSwitchWarning}
                       onContextSwitchCompact={handleContextSwitchCompact}
                       onContextSwitchDismiss={handleContextSwitchDismiss}
@@ -1789,6 +1790,7 @@ interface ChatInputPaneProps {
   canInterrupt: boolean;
   autoCompactionResult: ReturnType<typeof checkAutoCompaction>;
   shouldShowCompactionWarning: boolean;
+  rolloverEnabled: boolean;
   contextSwitchWarning: ContextSwitchWarning | null;
   onContextSwitchCompact: () => void;
   onContextSwitchDismiss: () => void;
@@ -1855,6 +1857,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
             usagePercentage={props.autoCompactionResult.usagePercentage}
             thresholdPercentage={props.autoCompactionResult.thresholdPercentage}
             isStreaming={props.canInterrupt}
+            rolloverEnabled={props.rolloverEnabled}
           />
         </ChatDockSurface>
       ),
