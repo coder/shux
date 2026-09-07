@@ -999,11 +999,13 @@ async function main(): Promise<number> {
 
   // Budget tracking state
   let budgetExceeded = false;
+  let budgetStop: Promise<void> | null = null;
   // The budget cap is the user's Stop: go through the retiring interrupt so owed background-process
   // attention is dismissed, or the after-idle reconcile would start another billed turn before
-  // teardown. The Err case is a stop that did not persist, not a stop that failed.
+  // teardown. The Err case is a stop that did not persist, not a stop that failed. The stream abort
+  // settles the run before retirement is durable, so teardown awaits this promise first.
   const stopForBudget = (): void => {
-    void workspaceService
+    budgetStop ??= workspaceService
       .interruptStream(workspaceId, { abandonPartial: false, retireBashMonitorAttention: true })
       .then((result) => {
         if (!result.success) {
@@ -1582,6 +1584,7 @@ async function main(): Promise<number> {
     // Contain each step, report it, and keep going.
     await runBestEffortCleanup(
       [
+        { name: "budgetStop", run: () => budgetStop ?? undefined },
         { name: "unsubscribe", run: () => unsubscribe() },
         // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
         // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
