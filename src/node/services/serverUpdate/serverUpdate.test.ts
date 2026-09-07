@@ -271,6 +271,7 @@ describe("staging and activation", () => {
     const pnpmArgs = installCommand({ ...layout, packageManager: "pnpm" }, "/x.tgz").args;
     expect(pnpmArgs).toContain("--config.strict-ssl=true");
     expect(pnpmArgs).toContain("--config.lockfile=true");
+    expect(pnpmArgs).toContain("--config.optional=true");
     expect(installCommand({ ...layout, packageManager: "bun" }, "/x.tgz").args).toContain(
       "--save-text-lockfile"
     );

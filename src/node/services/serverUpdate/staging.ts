@@ -26,12 +26,12 @@ export function installCommand(
 ): { file: string; args: string[] } {
   // CLI flags outrank npmrc files and npm_config_* env, so an inherited strict-ssl=false cannot
   // disable certificate validation for the download, an inherited package-lock=false or
-  // lockfile=false cannot suppress the lockfile that dependency verification reads, and npm's
-  // include beats any inherited omit of the optional platform packages. bun has no such flags;
-  // its TLS and lockfile knobs are env variables runInstall strips (a global bunfig that disables
-  // lockfile saving still makes verification fail closed). Neither bun nor pnpm offers a flag
-  // that overrides an inherited optional=false. The text lockfile is required, so an older bun
-  // that only writes bun.lockb must fail here.
+  // lockfile=false cannot suppress the lockfile that dependency verification reads, and an
+  // inherited omit of the optional platform packages loses to npm's include and pnpm's
+  // optional=true. bun has no such flags; its TLS and lockfile knobs are env variables runInstall
+  // strips, while a global bunfig that disables lockfile saving still fails closed at
+  // verification and one that disables optional dependencies has no override. The text lockfile
+  // is required, so an older bun that only writes bun.lockb must fail here.
   const flags = {
     bun: ["add", "--ignore-scripts", "--save-text-lockfile"],
     npm: [
@@ -51,6 +51,7 @@ export function installCommand(
       "--ignore-scripts",
       "--config.strict-ssl=true",
       "--config.lockfile=true",
+      "--config.optional=true",
     ],
   } satisfies Record<InstallLayout["packageManager"], string[]>;
   return {
