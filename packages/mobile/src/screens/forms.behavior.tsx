@@ -725,6 +725,36 @@ test("a tool in a narrow transcript opens a sheet with literal output and closes
   expect(view.getByRole("button", { name: "Bash: Done. git status --short" })).toBeDefined();
 });
 
+test.each([
+  ["bash", "Wrench"],
+  ["ask_user_question", "MessageCircleQuestion"],
+  ["file_edit_replace_string", "Pencil"],
+  ["file_read", "BookOpen"],
+  ["server:GOOGLE_SEARCH_WEB", "Globe"],
+  ["mcp__custom__search", "Sparkles"],
+  ["unknown_tool", "Sparkles"],
+  ["constructor", "Sparkles"],
+  ["__proto__", "Sparkles"],
+])("tool header %s renders its semantic glyph without changing inspection", (toolName, icon) => {
+  const part: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "icon-call",
+    toolName,
+    input: {},
+    state: "output-available",
+    output: "Inspect this result",
+  };
+  const view = render(
+    <Message message={toolMessage(part)} canAnswer={false} onAnswer={async () => {}} />
+  );
+  const header = view.getByRole("button");
+  expect(header.querySelector(`svg[data-icon="${icon}"]`)).not.toBeNull();
+  fireEvent.click(header);
+  expect(view.getByText("Inspect this result")).toBeDefined();
+  fireEvent.click(view.getByRole("button", { name: "Close" }));
+  expect(view.getByRole("button").querySelector(`svg[data-icon="${icon}"]`)).not.toBeNull();
+});
+
 test("tool headers distinguish execution, completion, failure, redaction, and interrupted replay", () => {
   const part: MuxToolPart = {
     type: "dynamic-tool",

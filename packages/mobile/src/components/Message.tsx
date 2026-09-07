@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { Brain, Check, ChevronDown, ChevronRight, File, Pause, Wrench } from "lucide-react-native";
+import { Brain, Check, ChevronDown, ChevronRight, File, Pause } from "lucide-react-native";
 import type { MuxMessage, MuxToolPart } from "../../../../src/common/types/message";
 import type { AskUserQuestionQuestion } from "../../../../src/common/types/tools";
 import { AskUserQuestionToolArgsSchema } from "../../../../src/common/utils/tools/toolDefinitions";
 import { Button, Field, Notice, Sheet } from "./Controls";
 import { Markdown } from "./Markdown";
+import { ToolIcon } from "./ToolIcon";
 import { mergeAdjacentParts } from "../../../../src/common/utils/messages/mergeAdjacentParts";
 import { colors, layout, mono, radii, spacing, typography } from "../theme";
 
@@ -183,7 +184,7 @@ function Tool(props: {
         onPress={() => setInspecting(true)}
         style={styles.actionRow}
       >
-        <Wrench size={16} color={colors.muted} />
+        <ToolIcon toolName={props.part.toolName} />
         <View style={{ flex: 1, minWidth: 0 }}>
           <Text numberOfLines={1} style={styles.toolName}>
             {name}
