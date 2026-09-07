@@ -379,7 +379,6 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       })
     : workspaces;
 
-  // Group filtered workspaces by time period
   const groupedWorkspaces = groupByTimePeriod(filteredWorkspaces);
   const flatWorkspaces = flattenGrouped(groupedWorkspaces);
 
@@ -470,13 +469,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
         return next;
       });
     } else {
-      // Select all filtered
       setSelectedIds((prev) => new Set([...prev, ...allFilteredIds]));
     }
     setBulkDeleteConfirm(false); // Clear confirmation when selection changes
   };
 
-  // Bulk restore
   const handleBulkRestore = async () => {
     const idsToRestore = Array.from(selectedIds);
     setBulkOperation({

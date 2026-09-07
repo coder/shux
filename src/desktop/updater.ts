@@ -124,7 +124,6 @@ export class UpdaterService {
     autoUpdater.autoDownload = false; // Wait for user confirmation
     autoUpdater.autoInstallOnAppQuit = true;
 
-    // Set up event handlers
     this.setupEventHandlers();
 
     this.currentChannel = initialChannel;

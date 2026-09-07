@@ -408,11 +408,6 @@ export class PortableDesktopSession {
     );
   }
 
-  getVncPort(): number {
-    assert(this.vncPort != null, "PortableDesktop session has not started yet");
-    return this.vncPort;
-  }
-
   getSessionInfo(): {
     width: number;
     height: number;

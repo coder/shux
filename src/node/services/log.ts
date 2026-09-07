@@ -676,7 +676,6 @@ function debugObject(filename: string, obj: unknown): void {
     // Write the object as pretty-printed JSON
     fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf-8");
 
-    // Log that we dumped the object
     safePipeLog("debug", `Dumped object to ${filePath}`);
   } catch (error) {
     // Don't crash if we can't write debug files

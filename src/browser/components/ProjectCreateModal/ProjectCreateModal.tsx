@@ -227,7 +227,6 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
         setError(errorMessage);
         return false;
       } catch (err) {
-        // Unexpected error
         const errorMessage = err instanceof Error ? err.message : "An unexpected error occurred";
         setError(`Failed to add project: ${errorMessage}`);
         return false;

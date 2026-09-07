@@ -296,7 +296,11 @@ describe("AgentSession pre-stream errors", () => {
       coordinator: TurnCoordinator;
     };
 
-    privateSession.coordinator.prepare();
+    privateSession.coordinator.prepare({
+      kind: "fresh",
+      intent: "handoff",
+      expectedTurnId: privateSession.coordinator.turnId,
+    });
     aiEmitter.emit("runtime-status", {
       type: "runtime-status",
       workspaceId,
@@ -413,7 +417,7 @@ describe("AgentSession pre-stream errors", () => {
       backgroundProcessManager,
     });
     await sessionWithPersistedPreference.setAutoRetryEnabled(false);
-    sessionWithPersistedPreference.dispose();
+    await sessionWithPersistedPreference.dispose();
 
     const session = new AgentSession({
       workspaceId,
@@ -443,7 +447,7 @@ describe("AgentSession pre-stream errors", () => {
     expect(result.success).toBe(false);
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
-    session.dispose();
+    await session.dispose();
   });
 
   it("replays init state for since-mode reconnects", async () => {

@@ -110,7 +110,6 @@ Use this index to find a page's:
     - Terminal Benchmarking (`/reference/benchmarking`) → `references/docs/reference/benchmarking.mdx`: Run Terminal-Bench benchmarks with the Xum adapter
     - Context Boundaries for Compaction and Reset (`/adr/0003-context-boundaries-for-compaction-and-reset`) → `references/docs/adr/0003-context-boundaries-for-compaction-and-reset.md`: Architecture decision for modeling provider context windows separately from transcript history
     - CLI Goal Runs are not strict /goal aliases (`/adr/0004-cli-goal-runs-are-not-strict-goal-aliases`) → `references/docs/adr/0004-cli-goal-runs-are-not-strict-goal-aliases.md`: Architecture decision for giving xum run --goal CLI-specific completion and limit semantics
-    - Research: Claude Code cross-session messaging vs. Mux (`/research/claude-code-cross-session-messaging-comparison`) → `references/docs/research/claude-code-cross-session-messaging-comparison.md`: Feature-by-feature comparison of Claude Code's cross-session messaging against Mux's existing inter-agent messaging, with code-level evidence and gap analysis
     - AGENTS.md (`/AGENTS`) → `references/docs/AGENTS.md`: Agent instructions for AI assistants working on the Xum codebase
 <!-- END DOCS_TREE -->
 

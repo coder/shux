@@ -823,11 +823,6 @@ export class MessageQueue {
     return this.getFilePartsForEntries(this.getVisibleEntries());
   }
 
-  /** Get reviews across all entries' metadata. */
-  getReviews(): ReviewNoteData[] | undefined {
-    return this.getReviewsForEntries(this.entries);
-  }
-
   /** Get reviews across user-visible entries' metadata only. */
   getVisibleReviews(): ReviewNoteData[] | undefined {
     return this.getReviewsForEntries(this.getVisibleEntries());
@@ -943,6 +938,12 @@ export class MessageQueue {
       this.revalidateWorkspaceTurnCorrelations();
     }
     return true;
+  }
+
+  /** Capture before admission publication; observers may remove or reorder the head. */
+  peekNext(): { identity: object; muxMetadata: unknown } | undefined {
+    const entry = this.entries[0];
+    return entry ? { identity: entry, muxMetadata: entry.muxMetadata } : undefined;
   }
 
   /**

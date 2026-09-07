@@ -103,7 +103,6 @@ export function usePostCompactionState(workspaceId: string): PostCompactionState
           }
           const newState = { ...prev, excludedItems: newSet };
 
-          // Update cache
           updatePersistedState<CachedPostCompactionData>(getPostCompactionStateKey(workspaceId), {
             planPath: newState.planPath,
             trackedFilePaths: newState.trackedFilePaths,

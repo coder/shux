@@ -248,7 +248,6 @@ function parseBedrockModelName(modelId: string): string | null {
     return null;
   }
 
-  // Split by dot to get parts
   const dotParts = modelId.split(".");
 
   // Need at least vendor.modelName (2 parts)

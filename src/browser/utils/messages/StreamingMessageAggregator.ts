@@ -646,20 +646,6 @@ export class StreamingMessageAggregator {
   private optimisticPendingStreamStart = false;
   private optimisticPendingStreamStartIdleCaughtUpCount = 0;
 
-  // Last completed stream timing stats (preserved after stream ends for display)
-  // Unlike activeStreams, this persists until the next stream starts
-  private lastCompletedStreamStats: {
-    startTime: number;
-    endTime: number;
-    firstTokenTime: number | null;
-    toolExecutionMs: number;
-    model: string;
-    outputTokens: number;
-    reasoningTokens: number;
-    streamingMs: number; // Time from first token to end (for accurate tok/s)
-    mode?: string; // Mode in which this response occurred
-  } | null = null;
-
   // Optimistic "interrupting" state: set before calling interruptStream
   // Shows "interrupting..." in StreamingBarrier until real stream-abort arrives
   private interruptingMessageId: string | null = null;
@@ -791,7 +777,6 @@ export class StreamingMessageAggregator {
   /** Clear all session timing stats (in-memory only). */
   clearSessionTimingStats(): void {
     this.sessionTimingStats = {};
-    this.lastCompletedStreamStats = null;
   }
 
   private updateStreamClock(context: StreamingContext, serverTimestamp: number): void {
@@ -965,20 +950,6 @@ export class StreamingMessageAggregator {
   }
 
   /**
-   * Extract compaction summary text from a completed assistant message.
-   * Used when a compaction stream completes to get the summary for history replacement.
-   * @param messageId The ID of the assistant message to extract text from
-   * @returns The concatenated text from all text parts, or undefined if message not found
-   */
-  getCompactionSummary(messageId: string): string | undefined {
-    const message = this.messages.get(messageId);
-    if (!message) return undefined;
-
-    // Concatenate all text parts (ignore tool calls and reasoning)
-    return getTextPartContent(message.parts);
-  }
-
-  /**
    * Clean up stream-scoped state when stream ends (normally or abnormally).
    * Called by handleStreamEnd, handleStreamAbort, and handleStreamError.
    *
@@ -988,7 +959,6 @@ export class StreamingMessageAggregator {
    *
    * Preserves:
    * - currentTodos (incomplete lists stay visible; handleStreamEnd may clear fully completed lists)
-   * - lastCompletedStreamStats - timing stats from this stream for display after completion
    */
   private cleanupStreamState(messageId: string): void {
     // Clear optimistic interrupt flag if this stream was being interrupted.
@@ -1046,21 +1016,6 @@ export class StreamingMessageAggregator {
       const streamingMs = Math.max(0, durationMs - (ttftMs ?? 0) - totalToolExecutionMs);
 
       const mode = message?.metadata?.mode ?? context.mode;
-
-      // Store last completed stream stats (include durations anchored in the renderer clock)
-      const startTime = endTime - durationMs;
-      const firstTokenTime = ttftMs !== null ? startTime + ttftMs : null;
-      this.lastCompletedStreamStats = {
-        startTime,
-        endTime,
-        firstTokenTime,
-        toolExecutionMs: totalToolExecutionMs,
-        model: context.model,
-        outputTokens,
-        reasoningTokens,
-        streamingMs,
-        mode,
-      };
 
       // Use composite key model:mode for per-model+mode stats
       // Old data (no mode) will just use model as key, maintaining backward compat
@@ -1554,10 +1509,6 @@ export class StreamingMessageAggregator {
 
     return cursor;
   }
-  // Efficient methods to check message state without creating arrays
-  getMessageCount(): number {
-    return this.messages.size;
-  }
 
   hasMessages(): boolean {
     return this.messages.size > 0;
@@ -1790,25 +1741,6 @@ export class StreamingMessageAggregator {
   }
 
   /**
-   * Get timing statistics from the last completed stream.
-   * Returns null if no stream has completed yet in this session.
-   * Unlike getActiveStreamTimingStats, this includes endTime and token counts.
-   */
-  getLastCompletedStreamStats(): {
-    startTime: number;
-    endTime: number;
-    firstTokenTime: number | null;
-    toolExecutionMs: number;
-    model: string;
-    outputTokens: number;
-    reasoningTokens: number;
-    streamingMs: number;
-    mode?: string;
-  } | null {
-    return this.lastCompletedStreamStats;
-  }
-
-  /**
    * Get aggregate timing statistics across all completed streams in this session.
    * Totals are computed on-the-fly from per-model data.
    * Returns null if no streams have completed yet.
@@ -1969,13 +1901,6 @@ export class StreamingMessageAggregator {
       this.interruptingMessageId = activeMessageId;
       this.invalidateCache();
     }
-  }
-
-  /**
-   * Check if a message is in the "interrupting" transient state.
-   */
-  isInterrupting(messageId: string): boolean {
-    return this.interruptingMessageId === messageId;
   }
 
   /**

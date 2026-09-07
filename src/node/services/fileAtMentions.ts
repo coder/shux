@@ -216,7 +216,6 @@ export async function materializeFileAtMentions(
       continue;
     }
 
-    // Resolve the path
     let resolvedPath: string;
     try {
       resolvedPath = resolveWorkspaceFilePath(options.runtime, options.workspacePath, mention.path);

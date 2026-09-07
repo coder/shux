@@ -1,6 +1,6 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
 import { EventEmitter } from "events";
-import type { AIService } from "@/node/services/aiService";
+import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { Config } from "@/node/config";
@@ -29,7 +29,9 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
-    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const streamMessage = mock((opts: StreamMessageOptions) =>
+      Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
+    );
     const aiService = Object.assign(new EventEmitter(), {
       ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),

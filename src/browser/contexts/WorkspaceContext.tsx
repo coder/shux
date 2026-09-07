@@ -387,7 +387,6 @@ function createWorkspaceDraftId(): string {
 function isDraftEmpty(projectPath: string, draftId: string): boolean {
   const scopeId = getDraftScopeId(projectPath, draftId);
 
-  // Check for input text
   const inputText = readPersistedState<string>(getInputKey(scopeId), "");
   if (inputText.trim().length > 0) {
     return false;

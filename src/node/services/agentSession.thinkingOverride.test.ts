@@ -16,7 +16,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
     try {
       expect(session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: false });
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -38,7 +38,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       expect(first).toEqual({ accepted: true });
       expect(second).toEqual({ accepted: true });
       expect(opts.activeTurnThinkingOverride?.pending).toBe("low");
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
     const { session, cleanup } = await createAgentSessionHarness({
@@ -67,7 +67,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       expect(capturedHolders[1]).not.toBe(capturedHolders[0]);
       expect(capturedPendingAtStreamStart[1]).toBeUndefined();
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -76,7 +76,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
     let pendingSeenByStream: string | undefined;
     const streamMessage = mock((opts: StreamMessageOptions) => {
       pendingSeenByStream = opts.activeTurnThinkingOverride?.pending;
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
     const { session, cleanup } = await createAgentSessionHarness({
@@ -104,7 +104,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       // holder (prepareStep runs before step 1).
       expect(pendingSeenByStream).toBe("high");
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -127,14 +127,14 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       await session.waitForIdle();
       expect(session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: false });
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
 
   it("clears the holder when an onAccepted failure aborts the turn before streaming", async () => {
     const streamMessage = mock((_history: MuxMessage[]) =>
-      Promise.resolve(Ok(createStartedTurnHandle()))
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
     );
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "thinking-override-onaccepted-failure",
@@ -158,7 +158,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       expect(streamMessage.mock.calls).toHaveLength(0);
       expect(session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: false });
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });

@@ -296,7 +296,6 @@ export class AttachmentService {
       attachments.push(loadedSkillsAttachment);
     }
 
-    // Filter out excluded files
     const filteredDiffs = fileDiffs.filter((f) => !excludedItems.has(`file:${f.path}`));
 
     // Edited files reference - always filter out both new and legacy plan paths

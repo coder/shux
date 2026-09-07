@@ -11,7 +11,7 @@ import type { StreamMessageOptions } from "./turnRequestBuilder";
 import type { TurnCompletion } from "./streamManager";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { AgentSession } from "./agentSession";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createStartedTurnHandle, createAgentSessionHarness } from "./agentSession.testHarness";
 
 const workspaceId = "session-completion";
 const model = "openai:gpt-4o";
@@ -101,7 +101,7 @@ describe("AgentSession turn completion", () => {
         abortReason: "user",
       });
     } finally {
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -127,7 +127,13 @@ describe("AgentSession turn completion", () => {
     h.session.onChatEvent(({ message }) => {
       if (message.type !== "stream-abort") return;
       aborted++;
-      replacement = coordinator.prepare();
+      const admission = coordinator.prepare({
+        kind: "fresh",
+        intent: "handoff",
+        expectedTurnId: coordinator.turnId,
+      });
+      if (admission.status !== "admitted") throw new Error("Expected replacement admission");
+      replacement = admission.turnId;
       coordinator.acceptThinkingOverride(replacementThinking, replacement);
     });
     try {
@@ -143,7 +149,7 @@ describe("AgentSession turn completion", () => {
       expect(coordinator.phase).toBe("preparing");
       expect(coordinator.thinkingOverride).toBe(replacementThinking);
     } finally {
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -213,7 +219,7 @@ describe("AgentSession turn completion", () => {
       });
     } finally {
       releaseAccounting.resolve();
-      h.session.dispose();
+      await h.session.dispose();
       await edit;
       await closing;
       errorLog.mockRestore();
@@ -253,7 +259,7 @@ describe("AgentSession turn completion", () => {
       ]);
       expect(h.session.isBusy()).toBe(false);
     } finally {
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -311,7 +317,7 @@ describe("AgentSession turn completion", () => {
       } finally {
         releaseEnvelope.resolve();
         await send;
-        h.session.dispose();
+        await h.session.dispose();
         await h.cleanup();
       }
     }
@@ -343,7 +349,9 @@ describe("AgentSession turn completion", () => {
               Ok({
                 messageId,
                 completion:
-                  calls === 1 ? completion.promise : new Promise<TurnCompletion>(() => undefined),
+                  calls === 1
+                    ? completion.promise
+                    : createStartedTurnHandle(h.session.closingSignal).completion,
               })
             );
           }),
@@ -399,7 +407,7 @@ describe("AgentSession turn completion", () => {
       } finally {
         completion.resolve(outcome);
         await edit;
-        h.session.dispose();
+        await h.session.dispose();
         await h.cleanup();
       }
     }
@@ -444,7 +452,7 @@ describe("AgentSession turn completion", () => {
           { abortReason: reason },
         ]);
       } finally {
-        h.session.dispose();
+        await h.session.dispose();
         await h.cleanup();
       }
     }
@@ -466,7 +474,9 @@ describe("AgentSession turn completion", () => {
             Ok({
               messageId,
               completion:
-                calls === 1 ? completion.promise : new Promise<TurnCompletion>(() => undefined),
+                calls === 1
+                  ? completion.promise
+                  : createStartedTurnHandle(h.session.closingSignal).completion,
             })
           );
         }),
@@ -525,7 +535,7 @@ describe("AgentSession turn completion", () => {
       ).toBe(false);
     } finally {
       releaseHistory.resolve();
-      h.session.dispose();
+      await h.session.dispose();
       await oldPolicy;
       await h.cleanup();
     }
@@ -549,7 +559,9 @@ describe("AgentSession turn completion", () => {
               Ok({
                 messageId,
                 completion:
-                  calls === 1 ? completion.promise : new Promise<TurnCompletion>(() => undefined),
+                  calls === 1
+                    ? completion.promise
+                    : createStartedTurnHandle(h.session.closingSignal).completion,
               })
             );
           }),
@@ -598,7 +610,7 @@ describe("AgentSession turn completion", () => {
       } finally {
         releaseHistory.resolve();
         await replacement;
-        h.session.dispose();
+        await h.session.dispose();
         await h.cleanup();
       }
     }
@@ -636,7 +648,7 @@ describe("AgentSession turn completion", () => {
       const decision = h.session.waitForPendingCompactionCompletionDecision("assistant-1");
       completion.resolve({ status: "completed", streamEnd: end() });
       await entered.promise;
-      h.session.dispose();
+      h.session.beginDispose();
       expect(await decision).toBe(false);
       expect(await h.session.waitForPendingCompactionCompletionDecision("late-observer")).toBe(
         false
@@ -647,7 +659,7 @@ describe("AgentSession turn completion", () => {
       expect(h.session.isBusy()).toBe(false);
     } finally {
       release.resolve();
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -676,7 +688,10 @@ describe("AgentSession turn completion", () => {
           start(emitter, messageId);
           if (calls > 1)
             return Promise.resolve(
-              Ok({ messageId, completion: new Promise<TurnCompletion>(() => undefined) })
+              Ok({
+                messageId,
+                completion: createStartedTurnHandle(h.session.closingSignal).completion,
+              })
             );
           emitter.emit("stream-end", rawEnd);
           return Promise.resolve(
@@ -745,7 +760,7 @@ describe("AgentSession turn completion", () => {
         { type: "text", text: "Continue after summary" },
       ]);
     } finally {
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -772,7 +787,9 @@ describe("AgentSession turn completion", () => {
           return Ok({
             messageId,
             completion:
-              calls === 1 ? completion.promise : new Promise<TurnCompletion>(() => undefined),
+              calls === 1
+                ? completion.promise
+                : createStartedTurnHandle(h.session.closingSignal).completion,
           });
         }),
       },
@@ -808,7 +825,7 @@ describe("AgentSession turn completion", () => {
       releaseLookup.resolve();
       await original;
       await edit;
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -832,7 +849,9 @@ describe("AgentSession turn completion", () => {
             Ok({
               messageId,
               completion:
-                calls === 1 ? completion.promise : new Promise<TurnCompletion>(() => undefined),
+                calls === 1
+                  ? completion.promise
+                  : createStartedTurnHandle(h.session.closingSignal).completion,
             })
           );
         }),
@@ -866,7 +885,7 @@ describe("AgentSession turn completion", () => {
       expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
       expect(h.session.isBusy()).toBe(true);
     } finally {
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -920,7 +939,7 @@ describe("AgentSession turn completion", () => {
       emitter.emit("stream-end", end());
       expect(await h.session.waitForPendingCompactionCompletionDecision("assistant-1")).toBe(false);
     } finally {
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -962,7 +981,7 @@ describe("AgentSession turn completion", () => {
           return result;
         });
         await stopped.promise;
-        if (mode === "dispose") h.session.dispose();
+        if (mode === "dispose") h.session.beginDispose();
         if (mode === "hard") {
           await new Promise<void>((resolve) => setImmediate(resolve));
           expect(returned).toBe(false);
@@ -974,12 +993,11 @@ describe("AgentSession turn completion", () => {
         await sending;
         await interrupt;
         await policyPromise(consumer);
-        expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(
-          mode === "dispose" ? 0 : 1
-        );
+        // Disposal retains the captured attempt's raw terminal even before its handle returns.
+        expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
       } finally {
         releaseHandle.resolve();
-        h.session.dispose();
+        await h.session.dispose();
         await sending;
         await interrupt;
         await h.cleanup();
@@ -1002,7 +1020,7 @@ describe("AgentSession turn completion", () => {
             return Promise.resolve(
               Ok({
                 messageId: "replacement",
-                completion: new Promise<TurnCompletion>(() => undefined),
+                completion: createStartedTurnHandle(h.session.closingSignal).completion,
               })
             );
           }),
@@ -1039,7 +1057,7 @@ describe("AgentSession turn completion", () => {
         expect(h.session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: true });
       } finally {
         release.resolve();
-        h.session.dispose();
+        await h.session.dispose();
         await h.cleanup();
       }
     }
@@ -1076,14 +1094,14 @@ describe("AgentSession turn completion", () => {
       });
       await preferenceEntered.promise;
       h.session.beginShutdown();
-      h.session.dispose();
+      h.session.beginDispose();
       preference.resolve(true);
       await policyPromise(consumer);
       expect(h.session.hasPendingAutoRetry()).toBe(false);
       expect(h.events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
     } finally {
       preference.resolve(true);
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });

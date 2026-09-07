@@ -21,8 +21,17 @@ import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { StreamErrorType } from "@/common/types/errors";
 
-export function createStartedTurnHandle(messageId = "test-assistant"): TurnStreamHandle {
-  return { messageId, completion: new Promise(() => undefined) };
+export function createStartedTurnHandle(
+  signal: AbortSignal,
+  messageId = "test-assistant"
+): TurnStreamHandle {
+  // Policy-only fixtures have no engine. Their own session shutdown retires this handle;
+  // lifecycle tests supply independent completion gates instead of this convenience helper.
+  const completion = Promise.withResolvers<Awaited<TurnStreamHandle["completion"]>>();
+  const stop = () => completion.resolve({ status: "aborted", abortReason: "user" });
+  if (signal.aborted) stop();
+  else signal.addEventListener("abort", stop, { once: true });
+  return { messageId, completion: completion.promise };
 }
 
 export function createFailedTurnHandle(
@@ -99,7 +108,8 @@ export function createStreamLifecycleMocks() {
   };
 }
 
-function createMockAiService(args?: {
+function createMockAiService(args: {
+  getClosingSignal: () => AbortSignal;
   emitter?: EventEmitter;
   overrides?: Partial<AgentSessionAIService>;
 }): {
@@ -124,7 +134,9 @@ function createMockAiService(args?: {
     ),
     ...createStreamLifecycleMocks(),
     streamMessage: mock(() =>
-      Promise.resolve(Ok(createStartedTurnHandle("test-assistant-message")))
+      Promise.resolve(
+        Ok(createStartedTurnHandle(args.getClosingSignal(), "test-assistant-message"))
+      )
     ),
     ...args?.overrides,
   });
@@ -174,6 +186,7 @@ export async function createAgentSessionHarness(
   const { aiEmitter, aiService } = options.aiService
     ? { aiEmitter: options.aiEmitter ?? new EventEmitter(), aiService: options.aiService }
     : createMockAiService({
+        getClosingSignal: () => session.closingSignal,
         emitter: options.aiEmitter,
         overrides: options.aiServiceOverrides,
       });
@@ -183,7 +196,7 @@ export async function createAgentSessionHarness(
     options.backgroundProcessManager ??
     createMockBackgroundProcessManager(options.backgroundProcessManagerOverrides);
 
-  const session = new AgentSession({
+  const session: AgentSession = new AgentSession({
     effectRunner: options.effectRunner,
     appFiberScope: options.appFiberScope,
     workspaceId: options.workspaceId,

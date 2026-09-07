@@ -2229,23 +2229,29 @@ export class HistoryService {
    * commit of the same partial) would otherwise be appended pre-update and then dropped, or
    * resurrect an already committed partial.
    */
-  async commitPartial(workspaceId: string): Promise<Result<void>> {
+  async commitPartial(workspaceId: string, expectedMessageId?: string): Promise<Result<void>> {
     // Lock-free probe: most stream starts have no partial to commit, and a reader observes either
     // the old or the new atomically written file, never a torn one.
     if ((await this.readPartial(workspaceId)) == null) {
       return Ok(undefined);
     }
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to commit partial", () =>
-      this.commitPartialUnderWriteLock(workspaceId)
+      this.commitPartialUnderWriteLock(workspaceId, expectedMessageId)
     );
   }
 
-  private async commitPartialUnderWriteLock(workspaceId: string): Promise<Result<void>> {
+  private async commitPartialUnderWriteLock(
+    workspaceId: string,
+    expectedMessageId?: string
+  ): Promise<Result<void>> {
     try {
       let partial = await this.readPartial(workspaceId);
       if (!partial) {
         return Ok(undefined);
       }
+      // Attempt finalization must not commit a replacement's partial. Check inside the
+      // same transaction as the history write and deletion, never in a caller-side probe.
+      if (expectedMessageId != null && partial.id !== expectedMessageId) return Ok(undefined);
 
       const hadErrorMetadata = partial.metadata?.error != null;
 

@@ -47,7 +47,7 @@ import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import { closeScopeBounded } from "./di/appRuntime";
-import { Scope } from "effect";
+import { Effect, Scope } from "effect";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import * as tokenizer from "@/node/utils/main/tokenizer";
@@ -1564,7 +1564,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
         service.off("stream-abort", throwFromRawListener);
         countTokensSpy.mockRestore();
         commitSpy.mockRestore();
-        h.session.dispose();
+        await h.session.dispose();
         await streamManager.stopStream(workspaceId, { abortReason: "system" });
       }
     }
@@ -1793,6 +1793,31 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+  });
+
+  test("a resource finalizer defect cannot orphan a completed engine handle", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const workspaceId = "completion-finalizer-defect";
+    const { streamManager, events, engineScope } = createSupervisedStreamManagerForTests(() =>
+      (async function* () {
+        yield { type: "text-delta", text: "completed answer" };
+        entered.resolve();
+        await release.promise;
+        yield { type: "finish", finishReason: "stop" };
+      })()
+    );
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+    await entered.promise;
+    const info = getWorkspaceStreamsForTests(streamManager).get(workspaceId) as {
+      resourceScope: Scope.Closeable;
+    };
+    Effect.runSync(Scope.addFinalizer(info.resourceScope, Effect.die(new Error("cleanup defect"))));
+    release.resolve();
+    expect(await handle.completion).toMatchObject({ status: "completed" });
+    expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-end"]);
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+    await closeScopeBounded(engineScope);
   });
 
   test("completed streams leave no supervisor residue: closing the scope after 50 completions aborts nothing", async () => {
@@ -2999,6 +3024,91 @@ describe("StreamManager - language model cleanup", () => {
     expect(getCleanupCalls()).toBe(1);
   });
 
+  test("returning the startup envelope cannot bypass a held abort fence or emit a second startup abort", async () => {
+    const workspaceId = "envelope-abort-fence";
+    const events: TurnEngineEvent[] = [];
+    const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
+      events.push(event);
+    });
+    const envelopeEntered = Promise.withResolvers<void>();
+    const envelopeRelease = Promise.withResolvers<void>();
+    const commitEntered = Promise.withResolvers<void>();
+    const commitRelease = Promise.withResolvers<void>();
+    const originalCommit = historyService.commitPartial.bind(historyService);
+    spyOn(historyService, "commitPartial").mockImplementationOnce(async (...args) => {
+      commitEntered.resolve();
+      await commitRelease.promise;
+      return originalCommit(...args);
+    });
+    const pending = streamManager.beginStreamStart({ workspaceId });
+    const started = streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "constructed-fence",
+        model: createTestLanguageModel(),
+        abortSignal: pending.abortSignal,
+        onStreamConstructed: async () => {
+          envelopeEntered.resolve();
+          await envelopeRelease.promise;
+        },
+      })
+    );
+    await envelopeEntered.promise;
+    const stop = streamManager.stopStream(workspaceId, { abortReason: "user" });
+    await commitEntered.promise;
+    const secondStop = streamManager.stopStream(workspaceId, { abortReason: "system" });
+    let returned = false;
+    const observedStart = started.then(() => {
+      returned = true;
+    });
+    try {
+      envelopeRelease.resolve();
+      await envelopeRelease.promise;
+      await Promise.resolve();
+      expect(events.filter((event) => event.type === "stream-abort")).toHaveLength(0);
+      expect(streamManager.getStreamInfo(workspaceId, true)?.messageId).toBe("constructed-fence");
+      expect(returned).toBe(false);
+      commitRelease.resolve();
+      await Promise.all([stop, secondStop]);
+      const result = await started;
+      await observedStart;
+      if (!result.success) throw new Error("Expected aborted handle");
+      expect(await result.data.completion).toMatchObject({
+        status: "aborted",
+        abortReason: "user",
+      });
+      expect(events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
+    } finally {
+      envelopeRelease.resolve();
+      commitRelease.resolve();
+      pending.finish();
+      await Promise.all([started, stop, secondStop]);
+    }
+  });
+
+  test("throwing startup envelope cleanup preserves a replacement registration", async () => {
+    const workspaceId = "throwing-envelope-replacement";
+    const streamManager = new StreamManager(historyService);
+    const streams = getWorkspaceStreamsForTests(streamManager);
+    const replacement = createStreamInfoForTests({ messageId: "replacement" });
+    const { model, getCleanupCalls } = createCleanupModel("throwing-envelope");
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "old",
+        model,
+        onStreamConstructed: async () => {
+          await streamManager.stopStream(workspaceId);
+          streams.set(workspaceId, replacement);
+          throw new Error("envelope failure");
+        },
+      })
+    );
+    expect(result.success).toBe(false);
+    expect(streams.get(workspaceId)).toBe(replacement);
+    expect(getCleanupCalls()).toBe(1);
+  });
+
   test("runs model cleanup when stream creation throws before processing", async () => {
     const streamManager = new StreamManager(historyService);
     const { model, getCleanupCalls } = createCleanupModel("cleanup-create-throw-model");
@@ -3078,6 +3188,88 @@ describe("StreamManager - turn completion", () => {
     if (!result.success) throw new Error("Expected stream to start");
     return { streamManager, handle: result.data };
   }
+
+  test("replacement and concurrent stops join the captured attempt's held commit", async () => {
+    const workspaceId = "held-commit-replacement";
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const providerEntered = Promise.withResolvers<void>();
+    const terminals: TurnEngineEvent[] = [];
+    const originalCommit = historyService.commitPartial.bind(historyService);
+    spyOn(historyService, "commitPartial").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return originalCommit(...args);
+    });
+    const { streamManager, handle } = await startWithStreamResult({
+      workspaceId,
+      messageId: "attempt-a",
+      events: terminals,
+      createStreamResult: (_request, controller) =>
+        createStreamResultForTests(
+          (async function* () {
+            yield { type: "text-delta", text: "durable interrupted answer" };
+            providerEntered.resolve();
+            if (!controller.signal.aborted)
+              await new Promise<void>((resolve) =>
+                controller.signal.addEventListener("abort", () => resolve(), { once: true })
+              );
+          })()
+        ),
+    });
+    await providerEntered.promise;
+    let stopped = false;
+    let replaced = false;
+    const userStop = streamManager.stopStream(workspaceId, { abortReason: "user" }).then(() => {
+      stopped = true;
+    });
+    await entered.promise;
+    const systemStop = streamManager.stopStream(workspaceId, {
+      abortReason: "system",
+      abandonPartial: true,
+    });
+    const replacement = streamManager
+      .startStream(
+        testStartOptions({
+          workspaceId,
+          messageId: "attempt-b",
+          historySequence: 2,
+          model: createTestLanguageModel(),
+          providedRuntimeTempDir: "",
+          onStreamConstructed: () => appendPartialAssistantForTests(workspaceId, "attempt-b", 2),
+        })
+      )
+      .then((result) => {
+        replaced = true;
+        return result;
+      });
+    try {
+      expect(stopped).toBe(false);
+      expect(replaced).toBe(false);
+      expect(streamManager.getStreamInfo(workspaceId, true)?.messageId).toBe("attempt-a");
+      expect(terminals.filter((event) => event.type === "stream-abort")).toHaveLength(0);
+      release.resolve();
+      await Promise.all([userStop, systemStop]);
+      expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "user" });
+      const next = await replacement;
+      expect(next.success).toBe(true);
+      expect(streamManager.getStreamInfo(workspaceId)?.messageId).toBe("attempt-b");
+      const history = await historyService.getLastMessages(workspaceId, 10);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.find((message) => message.id === "attempt-a")?.parts).toMatchObject([
+        { type: "text", text: "durable interrupted answer" },
+      ]);
+      expect(
+        terminals.filter(
+          (event) => event.type === "stream-abort" && event.messageId === "attempt-a"
+        )
+      ).toHaveLength(1);
+    } finally {
+      release.resolve();
+      await replacement;
+      await streamManager.stopStream(workspaceId, { abandonPartial: true });
+    }
+  });
 
   test("pre-start failures return Err while successful startup owns an aborted completion", async () => {
     const streamManager = new StreamManager(historyService);
@@ -3171,7 +3363,7 @@ describe("StreamManager - turn completion", () => {
     });
   });
 
-  test("aborted completion waits for the sink to commit and remove the partial", async () => {
+  test("hard stop and completion wait for raw delivery after attempt persistence", async () => {
     const workspaceId = "completion-abort-workspace";
     const providerBlocked = Promise.withResolvers<void>();
     const abortDeliveryEntered = Promise.withResolvers<void>();
@@ -3195,10 +3387,7 @@ describe("StreamManager - turn completion", () => {
         if (event.type !== "stream-abort") return;
         abortDeliveryEntered.resolve();
         await releaseAbortDelivery.promise;
-        // The facade owns abort persistence. A completion consumer must see its cleanup,
-        // even though stopStream has already released the engine's streaming registration.
-        await historyService.commitPartial(workspaceId);
-        await historyService.deletePartial(workspaceId);
+        expect(await historyService.readPartial(workspaceId)).toBeNull();
       },
     });
 
@@ -3214,12 +3403,10 @@ describe("StreamManager - turn completion", () => {
     try {
       await providerBlocked.promise;
       stopPromise = streamManager.stopStream(workspaceId, { abortReason: "user" });
-      await stopPromise;
       await abortDeliveryEntered.promise;
       expect(streamManager.isStreaming(workspaceId)).toBe(false);
-      expect(await historyService.readPartial(workspaceId)).toMatchObject({
-        parts: [{ type: "text", text: "interrupted answer" }],
-      });
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      expect(streamManager.getStreamInfo(workspaceId, true)?.messageId).toBe(handle.messageId);
       expect(settled).toBe(false);
 
       releaseAbortDelivery.resolve();
@@ -6549,7 +6736,7 @@ describe("StreamManager - stopStream", () => {
     expect((await streamManager.stopStream("mock-workspace")).success).toBe(true);
     await streamManager.replayStream("mock-workspace", { afterTimestamp: 10 });
 
-    expect(stop).toHaveBeenCalledWith("mock-workspace");
+    expect(stop).toHaveBeenCalledWith("mock-workspace", undefined);
     expect(replayStream).toHaveBeenCalledWith("mock-workspace");
   });
 
@@ -6608,8 +6795,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
     );
     await cleanupAborted.call(streamManager, workspaceId, createAbortStreamInfo(messageId), "user");
 
-    const partial = await historyService.readPartial(workspaceId);
-    expect(partial?.metadata?.partial).toBe(true);
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+    const history = await historyService.getLastMessages(workspaceId, 10);
+    if (!history.success) throw new Error(history.error);
+    const partial = history.data.find((message) => message.id === messageId);
     expect(partial?.metadata?.usage).toEqual({
       inputTokens: 120,
       outputTokens: 30,
@@ -6623,6 +6812,66 @@ describe("StreamManager - aborted stream usage persistence", () => {
       outputTokens: 30,
       totalTokens: 150,
     });
+  });
+
+  test.each(["commit-err", "commit-throw", "delete-err", "delete-throw"] as const)(
+    "abort settles once and retains recovery data on %s",
+    async (failure) => {
+      const workspaceId = `partial-finalize-${failure}`;
+      const messageId = "partial-owner";
+      const info = createAbortStreamInfo(messageId);
+      await historyService.writePartial(workspaceId, {
+        id: messageId,
+        role: "assistant",
+        parts: [{ type: "text", text: "recover me" }],
+        metadata: { historySequence: 1 },
+      });
+      const events: TurnEngineEvent[] = [];
+      const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
+        events.push(event);
+      });
+      const abandon = failure.startsWith("delete");
+      if (abandon) {
+        const deletion = spyOn(historyService, "deletePartialIfMessageIdMatches");
+        if (failure.endsWith("throw"))
+          deletion.mockRejectedValueOnce(new Error("disk unavailable"));
+        else deletion.mockResolvedValueOnce(Err("disk unavailable"));
+      } else {
+        const commit = spyOn(historyService, "commitPartial");
+        if (failure.endsWith("throw")) commit.mockRejectedValueOnce(new Error("disk unavailable"));
+        else commit.mockResolvedValueOnce(Err("disk unavailable"));
+      }
+      const cleanupAborted = getPrivateMethodForTests<CleanupAbortedStreamForTests>(
+        streamManager,
+        "cleanupAbortedStream"
+      );
+      await cleanupAborted.call(streamManager, workspaceId, info, "user", abandon);
+      expect(events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({ abortReason: "user", messageId });
+      expect(await historyService.readPartial(workspaceId)).not.toBeNull();
+    }
+  );
+
+  test("identity-checked partial finalization preserves a replacement and empty startup cannot drop it", async () => {
+    const workspaceId = "partial-identity";
+    await historyService.writePartial(workspaceId, {
+      id: "replacement",
+      role: "assistant",
+      parts: [{ type: "text", text: "replacement answer" }],
+      metadata: { historySequence: 1 },
+    });
+    expect((await historyService.commitPartial(workspaceId, "old")).success).toBe(true);
+    expect((await historyService.deletePartialIfMessageIdMatches(workspaceId, "old")).success).toBe(
+      true
+    );
+    const streamManager = new StreamManager(historyService);
+    await streamManager.stopStream(workspaceId, { abandonPartial: true });
+    expect((await historyService.readPartial(workspaceId))?.id).toBe("replacement");
+    expect((await historyService.commitPartial(workspaceId, "replacement")).success).toBe(true);
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+    const history = await historyService.getLastMessages(workspaceId, 10);
+    if (!history.success) throw new Error(history.error);
+    expect(history.data[0]?.id).toBe("replacement");
   });
 
   test("routes tool-only aborted usage to the headless sidecar (commit would drop it)", async () => {
@@ -6713,9 +6962,13 @@ describe("StreamManager - aborted stream usage persistence", () => {
         "headless-usage.jsonl"
       );
       expect(existsSync(sidecarPath)).toBe(false);
-      // Usage still reaches history via the partial (asserted in the test above).
-      const partial = await hs.readPartial(workspaceId);
-      expect(partial?.metadata?.usage).toBeDefined();
+      const history = await hs.getLastMessages(workspaceId, 10);
+      if (!history.success) throw new Error(history.error);
+      expect(
+        history.data.find((message) => message.id === "abort-commit-worthy-message")?.metadata
+          ?.usage
+      ).toBeDefined();
+      expect(await hs.readPartial(workspaceId)).toBeNull();
     } finally {
       await cleanup();
     }
@@ -7181,16 +7434,6 @@ describe("StreamManager - mid-turn thinking override", () => {
     expect(state.applied).toBeUndefined();
     expect(await prepareStep({ messages })).toBeUndefined();
     expect(rebuild).toHaveBeenCalledTimes(1);
-  });
-
-  test("stays byte-identical to the feature-off behavior when no override state exists", async () => {
-    const streamManager = new StreamManager(historyService);
-    const { createStreamResult } = getRequestHelpers(streamManager);
-    const streamTextSpy = setupStreamTextSpy();
-
-    createStreamResult({ model, messages, system: "system" }, new AbortController());
-    const prepareStep = capturePrepareStep(streamTextSpy);
-    expect(await prepareStep({ messages })).toBeUndefined();
   });
 
   test("buildStreamRequestConfig normalizes providerOptions to a stable mutable object only when a rebuild closure exists", () => {

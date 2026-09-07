@@ -38,6 +38,11 @@ const correlation = {
 } as const;
 type Request = Parameters<AgentSessionAIService["streamMessage"]>[0];
 
+function trackedFilePaths(h: AgentSessionHarness): string[] {
+  return (h.session as unknown as { fileChangeTracker: { paths: string[] } }).fileChangeTracker
+    .paths;
+}
+
 function text(row: MuxMessage): string {
   return row.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n");
 }
@@ -99,7 +104,7 @@ describe("AgentSession token-budget lifecycle", () => {
   const harnesses: AgentSessionHarness[] = [];
   afterEach(async () => {
     for (const h of harnesses.reverse()) {
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
     harnesses.length = 0;
@@ -130,9 +135,15 @@ describe("AgentSession token-budget lifecycle", () => {
       });
       const completion = createTurnCompletionController();
       completions.push(completion);
-      return Promise.resolve(
-        Ok({ messageId: `assistant-${requests.length}`, completion: completion.promise })
-      );
+      // This controlled provider has no engine supervisor; shutdown still retires its handle.
+      const close = () => completion.settle({ status: "aborted", abortReason: "system" });
+      const signal = h.session.closingSignal;
+      if (signal.aborted) close();
+      else signal.addEventListener("abort", close, { once: true });
+      return Ok({
+        messageId: `assistant-${requests.length}`,
+        completion: completion.promise.finally(() => signal.removeEventListener("abort", close)),
+      });
     });
     const h = await createAgentSessionHarness({
       workspaceId,
@@ -321,11 +332,9 @@ describe("AgentSession token-budget lifecycle", () => {
           ).success
         ).toBe(true);
       }
-      first.session.dispose();
+      await first.session.dispose();
       const h = await setup({ previous: first });
-      h.session.ensureStartupAutoRetryCheck();
-      await (h.session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null })
-        .startupAutoRetryCheckPromise;
+      await h.session.ensureStartupAutoRetryCheck();
       expect(h.events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
       expect(await h.session.getStartupAutoRetryModelHint()).toBeNull();
       expect((await h.session.resumeStream(options)).success).toBe(false);
@@ -493,7 +502,7 @@ describe("AgentSession token-budget lifecycle", () => {
         const ctx = { workspaceId, modelString: model, systemMessage: "base", tools: {} };
         await snapshot.run(ctx);
         expect(ctx.systemMessage).toBe("base admitted");
-        h.session.dispose();
+        await h.session.dispose();
         const next = await setup({ previous: h });
         await seedHistory(next, 110_000);
         expect(await next.session.sendMessage("Next admission", options)).toMatchObject({
@@ -651,7 +660,7 @@ describe("AgentSession token-budget lifecycle", () => {
         expect(rows.at(-1)?.role).toBe("assistant");
         expect(rows.at(-1)?.parts).toEqual([]);
       }
-      expect(h.session.getTrackedFilePaths()).toEqual([]);
+      expect(trackedFilePaths(h)).toEqual([]);
       if (kind === "mcp") expect(getPrompt).toHaveBeenCalledTimes(1);
       if (kind === "skill")
         expect(
@@ -678,7 +687,7 @@ describe("AgentSession token-budget lifecycle", () => {
           await fs.readFile(path.join(h.config.rootDir, "materializations.marker"), "utf8")
         ).toBe("xx");
       if (kind === "file")
-        expect(h.session.getTrackedFilePaths()).toContain(path.join(h.config.rootDir, "large.txt"));
+        expect(trackedFilePaths(h)).toContain(path.join(h.config.rootDir, "large.txt"));
     }
   );
 
@@ -851,7 +860,7 @@ describe("AgentSession token-budget lifecycle", () => {
         },
       };
       expect((await h.session.sendMessage("Use the skill", skillOptions)).success).toBe(true);
-      h.session.dispose();
+      await h.session.dispose();
       const resumed = await setup({
         previous: h,
         failure: emergency ? (attempt) => (attempt === 1 ? exceeded : undefined) : undefined,
@@ -889,7 +898,7 @@ describe("AgentSession token-budget lifecycle", () => {
       },
     };
     expect((await first.session.sendMessage("Use the skill", skillOptions)).success).toBe(true);
-    first.session.dispose();
+    await first.session.dispose();
     const h = await setup({
       previous: first,
       failure: (attempt) => (attempt <= 2 ? exceeded : undefined),
@@ -990,7 +999,7 @@ describe("AgentSession token-budget lifecycle", () => {
           },
         }) + "\n"
       );
-      first.session.dispose();
+      await first.session.dispose();
       const h = await setup({ previous: first });
       expect(
         (h.session as unknown as { getUsageState(): unknown }).getUsageState()
@@ -1027,7 +1036,7 @@ describe("AgentSession token-budget lifecycle", () => {
   test("restart recomputes pending rollover including a giant final tool result", async () => {
     const first = await setup();
     await seedHistory(first, 30_000, 300_000);
-    first.session.dispose();
+    await first.session.dispose();
     const h = await setup({ previous: first });
     expect((await h.session.sendMessage("Resume after restart", options)).success).toBe(true);
     const rows = await allRows(h);
@@ -1065,7 +1074,7 @@ describe("AgentSession token-budget lifecycle", () => {
       },
     ];
     expect((await first.historyService.writePartial(workspaceId, partial)).success).toBe(true);
-    first.session.dispose();
+    await first.session.dispose();
     const h = await setup({ previous: first });
     expect(await h.session.sendMessage("Resume safely", options)).toMatchObject({ success: true });
     const rows = await allRows(h);
@@ -1106,7 +1115,7 @@ describe("AgentSession token-budget lifecycle", () => {
           )
         ).success
       ).toBe(true);
-      first.session.dispose();
+      await first.session.dispose();
       const h = await setup({ previous: first });
       expect((await h.session.sendMessage("Recover accepted work", options)).success).toBe(true);
       const rows = await allRows(h);
@@ -1321,7 +1330,7 @@ describe("AgentSession token-budget lifecycle", () => {
           expect(
             (await h.session.sendMessage("Earlier skill invocation", sendOptions)).success
           ).toBe(true);
-          h.session.dispose();
+          await h.session.dispose();
           h = await setup({ previous: h, failure });
           spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
             (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT
@@ -1432,9 +1441,10 @@ describe("AgentSession token-budget lifecycle", () => {
       const before = await allRows(h);
       if (action === "interrupt") expect((await h.session.interruptStream()).success).toBe(true);
       else if (action === "shutdown") h.session.beginShutdown();
-      else h.session.dispose();
+      const disposal = action === "dispose" ? h.session.dispose() : undefined;
       release.resolve();
       await send;
+      await disposal;
       expect(cleanup).not.toHaveBeenCalled();
       expect(h.requests).toHaveLength(1);
       const rows = await allRows(h);
@@ -1444,6 +1454,47 @@ describe("AgentSession token-budget lifecycle", () => {
           .map(restoreContextBudgetRejectedMessageForDisplay)
           .map((row) => ({ id: row.id, text: text(row) }))
       ).toEqual(before.map((row) => ({ id: row.id, text: text(row) })));
+    }
+  );
+
+  test.each([false, true])(
+    "accepted budget failure settles its preparation callback before terminal policy (rollover=%s)",
+    async (rollover) => {
+      const h = await setup({ failure: () => exceeded });
+      if (rollover) await seedHistory(h, 20_000);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let busyDuringCallback = false;
+      let terminalBeforeCallback = false;
+      const onFailure = mock(async (_error: SendMessageError) => {
+        busyDuringCallback = h.session.isBusy();
+        terminalBeforeCallback = h.events.some((event) => event.type === "stream-error");
+        entered.resolve();
+        await release.promise;
+      });
+      const sending = h.session.sendMessage("Accepted budget request", options, {
+        onAcceptedPreStreamFailure: onFailure,
+      });
+      try {
+        await entered.promise;
+        expect(busyDuringCallback).toBe(true);
+        expect(terminalBeforeCallback).toBe(false);
+        expect(h.requests).toHaveLength(rollover ? 2 : 1);
+        expect(onFailure).toHaveBeenCalledTimes(1);
+        expect(onFailure).toHaveBeenCalledWith(
+          expect.objectContaining({ type: "context_budget_blocked" })
+        );
+        release.resolve();
+        expect(await sending).toMatchObject({
+          success: false,
+          error: { type: "context_budget_blocked" },
+        });
+        expect(onFailure).toHaveBeenCalledTimes(1);
+        expect(rolloverRows(await allRows(h))).toHaveLength(rollover ? 1 : 0);
+      } finally {
+        release.resolve();
+        await sending;
+      }
     }
   );
 
@@ -1511,7 +1562,7 @@ describe("AgentSession token-budget lifecycle", () => {
         ])
       ).success
     ).toBe(true);
-    original.session.dispose();
+    await original.session.dispose();
     const resumed = await setup({ previous: original, failure: () => exceeded });
     expect(await resumed.session.resumeStream(options)).toMatchObject({
       success: false,
@@ -1993,7 +2044,7 @@ describe("AgentSession token-budget lifecycle", () => {
         prepareProviderRequestMessages([MuxMessageSchema.parse(rejected!)], "openai", "off")
           .providerRequestMessages
       ).toHaveLength(0);
-      h.session.dispose();
+      await h.session.dispose();
       const resumed = await setup({ previous: h });
       expect((await resumed.session.sendMessage("Short replacement", options)).success).toBe(true);
       const providerRows = prepareProviderRequestMessages(
@@ -2052,7 +2103,7 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(
         prepareProviderRequestMessages(preludes, "openai", "off").providerRequestMessages
       ).toHaveLength(0);
-      h.session.dispose();
+      await h.session.dispose();
       const resumed = await setup({ previous: h });
       expect((await resumed.session.sendMessage("Unrelated replacement", options)).success).toBe(
         true
@@ -2211,7 +2262,7 @@ describe("AgentSession token-budget lifecycle", () => {
     await fs.utimes(mentioned, new Date(1_000), new Date(1_000));
     await seedHistory(h, 110_000);
     expect((await h.session.sendMessage("Inspect @mentioned.txt", options)).success).toBe(true);
-    expect(h.session.getTrackedFilePaths()).toContain(mentioned);
+    expect(trackedFilePaths(h)).toContain(mentioned);
     expect(rolloverRows(await allRows(h))).toHaveLength(1);
     h.completions[0].settle({
       status: "completed",

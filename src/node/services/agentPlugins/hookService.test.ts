@@ -480,7 +480,7 @@ describe("AgentPluginHookService", () => {
       metadata.mockRestore();
       create.mockRestore();
       await harness.service.disposeWorkspace(WORKSPACE_ID);
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -516,7 +516,7 @@ describe("AgentPluginHookService", () => {
           };
           await request.requestAssemblySnapshot!.run(ctx);
           injected.push(ctx.systemMessage);
-          return Ok(createStartedTurnHandle("assistant"));
+          return Ok(createStartedTurnHandle(h.session.closingSignal, "assistant"));
         },
       },
     });
@@ -555,7 +555,7 @@ describe("AgentPluginHookService", () => {
       expect(injected).toEqual(["base\n\nmodelString,workspaceId"]);
     } finally {
       ensure.mockRestore();
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });

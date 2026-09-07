@@ -1,4 +1,10 @@
-import { describe, test, expect } from "bun:test";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import { createConfigStores } from "@/node/config";
+import { ServiceContainer } from "@/node/services/serviceContainer";
+import { closeScopeBounded } from "@/node/services/di/appRuntime";
+import { describe, test, expect, spyOn } from "bun:test";
 import { runBestEffortCleanup, type RunCleanupStep } from "./runCleanup";
 
 describe("runBestEffortCleanup", () => {
@@ -60,5 +66,41 @@ describe("runBestEffortCleanup", () => {
       }
     );
     expect(ran).toEqual(["after"]);
+  });
+  test("CLI cleanup proceeds after the shared scope budget expires without a second disposal join", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-cli-disposal-test-"));
+    const services = new ServiceContainer(createConfigStores(tempDir));
+    const session = services.workspaceService.getOrCreateSession("bounded-cli-disposal");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spyOn(services.backgroundProcessManager, "cleanup").mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    let nextDependency = false;
+    try {
+      const cleanup = runBestEffortCleanup(
+        [
+          { name: "scope", run: () => closeScopeBounded(services.appFiberScope, 20) },
+          { name: "session", run: () => session.beginDispose() },
+          {
+            name: "dependency",
+            run: () => {
+              nextDependency = true;
+            },
+          },
+        ],
+        () => undefined
+      );
+      await entered.promise;
+      await cleanup;
+      expect(nextDependency).toBe(true);
+    } finally {
+      release.resolve();
+      await session.dispose();
+      await services.dispose();
+      await services.shutdown();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

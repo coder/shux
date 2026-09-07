@@ -536,7 +536,7 @@ describe("AIService turn engine events", () => {
     mock.restore();
   });
 
-  it("forwards stream-abort even when partial cleanup throws", async () => {
+  it("forwards stream-abort without mutating a workspace partial", async () => {
     using harness = createForwardingHarness("ai-service-stream-abort-forwarding");
     const { historyService, service, internals, clearPendingRunMetadataSpy } = harness;
     const cleanupError = new Error("disk full");
@@ -560,7 +560,7 @@ describe("AIService turn engine events", () => {
     await internals.emitEngineEvent(abortEvent);
 
     expect(await forwardedAbortPromise).toEqual(abortEvent);
-    expect(deletePartialSpy).toHaveBeenCalledWith(abortEvent.workspaceId);
+    expect(deletePartialSpy).not.toHaveBeenCalled();
     expect(clearPendingRunMetadataSpy).toHaveBeenCalledWith(abortEvent.workspaceId, "metadata-1");
     expect(internals.pendingDevToolsRunMetadataByMessageId.has(abortEvent.messageId)).toBe(false);
   });

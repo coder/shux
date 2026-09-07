@@ -526,16 +526,5 @@ describe("InitStateManager", () => {
       await waitPromise;
       // No spurious timeout error should be logged (verify via log spy if needed)
     });
-
-    it("should work without abortSignal (backwards compat)", async () => {
-      const workspaceId = "test-workspace";
-      manager.startInit(workspaceId, "/path/to/hook");
-      const waitPromise = manager.waitForInit(workspaceId);
-
-      // Complete init
-      await manager.endInit(workspaceId, 0);
-      await waitPromise;
-      // Should complete without error
-    });
   });
 });

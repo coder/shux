@@ -128,7 +128,7 @@ describe("AgentSession memory context", () => {
       expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -167,7 +167,7 @@ describe("AgentSession memory context", () => {
       );
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -201,7 +201,7 @@ describe("AgentSession memory context", () => {
       );
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -223,7 +223,7 @@ describe("AgentSession memory context", () => {
       expect(await priv.resolveMemoryContext("test-model")).toBeUndefined();
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -303,7 +303,7 @@ describe("AgentSession memory context", () => {
         (await priv.resolveMemoryContext("primary", { tokenBudgetActive: true }))?.hotMemoriesBlock
       ).toBe("primary:notes");
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -392,7 +392,7 @@ describe("AgentSession memory context", () => {
         previous = policy.active;
       }
     } finally {
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -431,7 +431,7 @@ describe("AgentSession memory context", () => {
       );
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 });

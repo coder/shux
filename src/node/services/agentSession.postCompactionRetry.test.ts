@@ -114,7 +114,7 @@ describe("AgentSession post-compaction context retry", () => {
       resolveSecondCall?.();
       return Promise.resolve({
         success: true as const,
-        data: createStartedTurnHandle("assistant-retry"),
+        data: createStartedTurnHandle(session.closingSignal, "assistant-retry"),
       });
     });
 
@@ -212,7 +212,7 @@ describe("AgentSession post-compaction context retry", () => {
     }
     expect(exists).toBe(false);
 
-    session.dispose();
+    await session.dispose();
   });
 
   // Waiters (task/workspace-turn stream-error settlement) treat the resolved
@@ -356,7 +356,7 @@ describe("AgentSession post-compaction context retry", () => {
     expect(session.isPreparingTurn()).toBe(false);
     expect(callCount).toBe(2);
 
-    session.dispose();
+    await session.dispose();
   });
 
   // Overlapping recovery episodes: a retry stream can emit its own error
@@ -490,6 +490,6 @@ describe("AgentSession post-compaction context retry", () => {
     ).toBe("terminal");
     expect(callCount).toBe(2);
 
-    session.dispose();
+    await session.dispose();
   });
 });

@@ -145,7 +145,6 @@ export function highlightSearchMatches(html: string, config: SearchHighlightConf
         fragment.appendChild(workingDoc.createTextNode(text.slice(lastIndex)));
       }
 
-      // Replace text node with fragment
       textNode.parentNode?.replaceChild(fragment, textNode);
     });
 

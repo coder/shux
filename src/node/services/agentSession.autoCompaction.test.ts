@@ -51,7 +51,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const workspaceId = "ws-auto-compaction-snapshot-deferral";
 
     const streamMessage = mock((_history: MuxMessage[]) =>
-      Promise.resolve(Ok(createStartedTurnHandle()))
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
     );
     const { session, historyService, events, backgroundProcessManager } =
       await createSessionHarness({
@@ -146,7 +146,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(emittedSnapshot).toBe(false);
     expect(cleanupSpy).not.toHaveBeenCalled();
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("tracks a compaction request when a synthetic snapshot follows it", async () => {
@@ -191,7 +191,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       source: "auto-compaction",
     });
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("does not materialize skill snapshots (or run their directives) on deferred on-send compaction turns", async () => {
@@ -237,7 +237,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(result.success).toBe(true);
     expect(materializeSkillSnapshots).not.toHaveBeenCalled();
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("stamps on-send auto-compaction requests with the RLM keep-recent tail only when RLM is on", async () => {
@@ -289,7 +289,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       );
       expect(request).toBeDefined();
 
-      session.dispose();
+      await session.dispose();
       const muxMetadata = request?.metadata?.muxMetadata;
       return muxMetadata?.type === "compaction-request" ? muxMetadata.keepRecentTail : undefined;
     };
@@ -342,7 +342,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cIv2E): the re-dispatched follow-up row must
     // stay goal-scoped instead of degrading to a legacy unscoped row.
     expect(followUp.goalId).toBe("goal-compaction-scope");
-    session.dispose();
+    await session.dispose();
   });
 
   test("triggers on-send compaction at threshold even before force buffer", async () => {
@@ -351,7 +351,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session } = await createSessionHarness({
       workspaceId,
@@ -386,7 +386,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     );
     expect(hasCompactionRequest).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("uses preferred compaction model for on-send auto-compaction requests", async () => {
@@ -395,7 +395,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const compactionModel = "openai:gpt-4o-mini";
     const config = {
@@ -441,7 +441,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     expect(compactionRequestMessage?.metadata?.muxMetadata?.requestedModel).toBe(compactionModel);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("does not trigger compaction at 200K threshold when 1M context is preserved after agent routing", async () => {
@@ -450,7 +450,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session, historyService } = await createSessionHarness({
       workspaceId,
@@ -504,7 +504,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     );
     expect(persistedCompactionRequest).toBe(false);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("does trigger compaction at the default beta Anthropic threshold when beta features disable 1M", async () => {
@@ -513,7 +513,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session, historyService } = await createSessionHarness({
       workspaceId,
@@ -566,7 +566,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     );
     expect(persistedCompactionRequest).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("compaction model inherit uses caller-provided baseOptions.model when no preferred model configured", async () => {
@@ -611,7 +611,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(compactionRequest.metadata.requestedModel).toBe(inheritedModel);
     expect(compactionRequest.metadata.parsed?.model).toBe(inheritedModel);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("clears strictAgentResolution on the internal compact request", async () => {
@@ -650,7 +650,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(compactionRequest.sendOptions.agentId).toBe("compact");
     expect(compactionRequest.sendOptions.strictAgentResolution).toBeUndefined();
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("compaction model explicit override takes priority over baseOptions.model", async () => {
@@ -703,7 +703,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(compactionRequest.metadata.requestedModel).toBe(compactionModel);
     expect(compactionRequest.metadata.parsed?.model).toBe(compactionModel);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("compaction thinking level prefers compact agent default over baseOptions", async () => {
@@ -752,7 +752,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     // matching desktop /compact (applyCompactionOverrides).
     expect(compactionRequest.sendOptions.thinkingLevel).toBe("high");
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("compaction thinking level falls back to baseOptions when compact default is unset", async () => {
@@ -789,7 +789,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     expect(compactionRequest.sendOptions.thinkingLevel).toBe("medium");
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("threads providers config into pre-send and mid-stream compaction checks", async () => {
@@ -837,7 +837,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         },
       });
 
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
     const aiService = Object.assign(aiEmitter, {
@@ -899,7 +899,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       providersConfig,
     });
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("seeds on-send compaction usage from the active compaction epoch only", async () => {
@@ -953,7 +953,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     const aiEmitter = new EventEmitter();
     const streamMessage = mock((_history: MuxMessage[]) =>
-      Promise.resolve(Ok(createStartedTurnHandle()))
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
     );
     const aiService = Object.assign(aiEmitter, {
       ...createStreamLifecycleMocks(),
@@ -1015,7 +1015,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(result.success).toBe(true);
     expect(checkBeforeSend).toHaveBeenCalledTimes(1);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("surfaces nested dispatch failures after mid-stream compaction interrupt", async () => {
@@ -1053,7 +1053,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         });
       }
 
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
     const stopStream = mock((_workspaceId: string) => {
@@ -1159,7 +1159,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(streamError?.error).toContain("mid-stream compaction dispatch failed");
     expect(stopStream).toHaveBeenCalledTimes(1);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("hides default follow-up sentinel in mid-stream auto-compaction prompts", async () => {
@@ -1204,7 +1204,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         });
       }
 
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
     const stopStream = mock((_workspaceId: string) => {
@@ -1318,7 +1318,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(compactionRequestText).not.toContain("[CONTINUE]");
     expect(stopStream).toHaveBeenCalledTimes(1);
 
-    session.dispose();
+    await session.dispose();
   });
 });
 
@@ -1498,7 +1498,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
       )
     ).toBe(true);
 
-    fixture.session.dispose();
+    await fixture.session.dispose();
   });
 
   // Characterization: sends carrying preTurnMessages (family-message payloads)
@@ -1542,7 +1542,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
     }
     expect(historyResult.data.some((message) => message.id === "payload-1")).toBe(true);
 
-    fixture.session.dispose();
+    await fixture.session.dispose();
   });
 
   test("startup retry of an interrupted compaction keeps compaction identity", async () => {
@@ -1609,6 +1609,6 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
     });
     expect(boundaryLanded).toBe(true);
 
-    fixture.session.dispose();
+    await fixture.session.dispose();
   });
 });
