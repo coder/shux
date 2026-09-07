@@ -8693,7 +8693,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "Rollover stops only after a tool step settles, preserving tool call/result pairs. Only one rollover may be pending; it is handled on the next send. Restart leaves the workspace paused rather than resurrecting a queued continuation, and the next message re-evaluates pressure from history.",
       "",
-      "The boundary, lead-in, and triggering message or continuation are saved as one atomic, all-or-nothing batch. Recovery also tolerates incomplete batches in legacy or externally modified histories. Requests estimated to exceed a fresh window are blocked before contacting the provider; rollover cannot make oversized attachments or instructions fit. Text guards use real encodings, but provider-family, media, and framing estimates can still differ from the provider's accounting.",
+      "The boundary, lead-in, and triggering message or continuation are saved as one atomic, all-or-nothing batch. Recovery also tolerates incomplete batches in legacy or externally modified histories. Requests estimated to exceed a fresh window are blocked before contacting the provider; rollover cannot make oversized attachments or instructions fit. Text guards use real encodings, but provider-family, media, and framing estimates can still differ from the provider's accounting. Pasted data URLs and ordinary tool JSON count as text, not as image attachments. With Tool Search, deferred schemas count only when advertised; each provider step rechecks activated tools and transformed messages. A failed step preflight pauses without starting another rollover.",
       "",
     ].join("\n"),
     "references/docs/workspaces/fork.mdx": [
