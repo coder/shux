@@ -2594,7 +2594,8 @@ export class HistoryService {
             }
           }
           // Raw reads only: malformed/access failures must not authorize an append,
-          // and repair would reacquire this lock. A foreign Stop also wins here.
+          // and repair would reacquire this lock. Without a source identity, even
+          // a narrowed Stop must veto the handoff until a replacement is witnessed.
           const cancellation = await this.readCompactionCancellation(workspaceId);
           if (
             !compactionCondition.isCurrent() ||
@@ -2604,9 +2605,7 @@ export class HistoryService {
                 cancellation.nonce,
                 rows
               )) &&
-              (expected
-                ? matchesCompactionCancellation(cancellation, expected)
-                : cancellation.scope.kind === "unresolved"))
+              (!expected || matchesCompactionCancellation(cancellation, expected)))
           ) {
             compactionCondition.onSkipped();
             return Ok(undefined);
@@ -2766,6 +2765,47 @@ export class HistoryService {
         updateFromCurrent,
         onCommitted
       )
+    );
+  }
+
+  async acceptResumeCancellation(
+    workspaceId: string,
+    message: MuxMessage,
+    expectedNonce: string | null,
+    shouldUpdate: (current: MuxMessage) => boolean,
+    onCommitted: () => void
+  ): Promise<Result<void>> {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to accept resume",
+      async () => {
+        // Retry must not stamp an obsolete receipt over a foreign Stop that arrived
+        // during preparation. Compare shared identity and commit under one lock.
+        const current = await this.readCompactionCancellation(workspaceId);
+        // Semantic absence can retain a physical file when witnessed unlink failed.
+        if (
+          (current?.nonce ?? null) !== expectedNonce &&
+          !(
+            expectedNonce === null &&
+            current &&
+            (await this.hasCompactionReplacementWitnessUnlocked(workspaceId, current.nonce))
+          )
+        )
+          return Ok(undefined);
+        return this.updateHistoryUnderWriteLock(
+          workspaceId,
+          message,
+          shouldUpdate,
+          (row) =>
+            expectedNonce === null
+              ? row
+              : {
+                  ...row,
+                  metadata: { ...row.metadata, compactionCancellationNonce: expectedNonce },
+                },
+          onCommitted
+        );
+      }
     );
   }
 

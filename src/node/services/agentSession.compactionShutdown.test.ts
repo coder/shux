@@ -1554,7 +1554,7 @@ test.each(["history failure", "witness no-op", "automatic"] as const)(
         Err("resume history unavailable")
       );
     if (outcome === "witness no-op")
-      spyOn(h.historyService, "updateHistory").mockResolvedValueOnce(Ok(undefined));
+      spyOn(h.historyService, "acceptResumeCancellation").mockResolvedValueOnce(Ok(undefined));
     const stream = spyOn(h.aiService, "streamMessage");
     try {
       await h.session.resumeStream(options, { automatic: outcome === "automatic" });
@@ -1803,13 +1803,20 @@ test("failed cleanup cannot narrow a foreign replacement's newer Stop and preser
   }
 });
 
-test.each(["legacy", "failed apply", "failed apply compact"] as const)(
-  "direct %s handoff honors another backend's durable Stop during preparation",
-  async (kind) => {
+test.each([
+  ["legacy", false],
+  ["failed apply", false],
+  ["failed apply compact", false],
+  ["legacy", true],
+  ["failed apply", true],
+  ["failed apply compact", true],
+] as const)(
+  "direct %s handoff honors another backend's durable Stop during preparation (narrowed=%s)",
+  async (kind, narrowed) => {
     const h = await setup();
     await h.historyService.appendToHistory(
       workspaceId,
-      createMuxMessage("original", "user", "Work")
+      narrowed ? { ...summary(), id: "original" } : createMuxMessage("original", "user", "Work")
     );
     const context = { modelString: options.model, options, providersConfig: null };
     const direct = h.session as unknown as {
@@ -1851,9 +1858,36 @@ test.each(["legacy", "failed apply", "failed apply compact"] as const)(
         ? direct.interruptForCompaction()
         : direct.finishContinuousCompaction(false, context, token!);
     const stream = spyOn(h.aiService, "streamMessage");
+    let cleanupForeign: (() => Promise<void>) | undefined;
     try {
       await entered.promise;
-      await new CompactionCancellation(new HistoryService(h.config), workspaceId).cancel();
+      const foreignHistory = new HistoryService(h.config);
+      await new CompactionCancellation(foreignHistory, workspaceId).cancel();
+      if (narrowed) {
+        const foreign = await createAgentSessionHarness({
+          workspaceId,
+          config: h.config,
+          historyService: foreignHistory,
+        });
+        const writes = foreignHistory as unknown as {
+          writeGuardedHistory(
+            path: string,
+            serialized: string,
+            guard: () => boolean
+          ): Promise<boolean>;
+        };
+        const failure = spyOn(writes, "writeGuardedHistory").mockRejectedValue(
+          new Error("foreign summary rewrite failed")
+        );
+        cleanupForeign = async () => {
+          failure.mockRestore();
+          await foreign.session.dispose();
+        };
+        await foreign.session.runStartupRecovery();
+        expect((await foreignHistory.readCompactionCancellation(workspaceId))?.scope.kind).toBe(
+          "summary"
+        );
+      }
       release.resolve();
       await pending;
       expect(stream).not.toHaveBeenCalled();
@@ -1862,6 +1896,7 @@ test.each(["legacy", "failed apply", "failed apply compact"] as const)(
     } finally {
       release.resolve();
       await pending.catch(() => undefined);
+      await cleanupForeign?.();
       if (token) h.internals.coordinator.finishCompactionObservation(token);
       await h.session.dispose();
       await h.cleanup();
@@ -1959,6 +1994,122 @@ test("overlapping Stops wait for the newest publication when the older write bec
     secondRelease.resolve();
     await first;
     await second;
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test.each([false, true])(
+  "explicit Retry rejects a foreign Stop after capture (initial Stop=%s)",
+  async (initialStop) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(workspaceId, createMuxMessage("user", "user", "Work"));
+    if (initialStop) await h.session.interruptStream({ abandonPartial: true });
+    const capture = h.session.getCompactionCancellationNonce.bind(h.session);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spyOn(h.session, "getCompactionCancellationNonce").mockImplementationOnce(async () => {
+      const nonce = await capture();
+      entered.resolve();
+      await release.promise;
+      return nonce;
+    });
+    const stream = spyOn(h.aiService, "streamMessage");
+    const pending = h.session.resumeStream(options);
+    try {
+      await entered.promise;
+      const foreign = new CompactionCancellation(new HistoryService(h.config), workspaceId);
+      await foreign.cancel();
+      const stopped = await foreign.read();
+      release.resolve();
+      expect(await pending).toEqual(Ok({ started: false }));
+      expect(stream).not.toHaveBeenCalled();
+      const rows = await h.historyService.getLastMessages(workspaceId, 1);
+      expect(rows.success && rows.data[0].metadata).not.toHaveProperty(
+        "compactionCancellationNonce"
+      );
+      expect(await new HistoryService(h.config).readCompactionCancellation(workspaceId)).toEqual(
+        stopped
+      );
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each([
+  "absent",
+  "witnessed debt",
+  "retirement failure",
+  "shared read failure",
+  "witness write failure",
+] as const)("explicit Retry locked acceptance handles %s", async (state) => {
+  const h = await setup();
+  const user = createMuxMessage("user", "user", "Work");
+  await h.historyService.appendToHistory(workspaceId, user);
+  const cancellation = (h.session as unknown as { compactionCancellation: CompactionCancellation })
+    .compactionCancellation;
+  const debt = state === "witnessed debt" || state === "retirement failure";
+  let restoreWrites: (() => void) | undefined;
+  if (debt) {
+    await h.session.interruptStream({ abandonPartial: true });
+    const record = await cancellation.read();
+    if (!record) throw new Error("Expected Stop");
+    const write = h.historyService.writeCompactionCancellation.bind(h.historyService);
+    const writes = spyOn(h.historyService, "writeCompactionCancellation").mockImplementation(
+      async (...args) => {
+        if (args[1] === null) throw new Error("unlink unavailable");
+        return write(...args);
+      }
+    );
+    restoreWrites = () => writes.mockRestore();
+    if (state === "witnessed debt") {
+      await h.historyService.updateHistory(workspaceId, {
+        ...user,
+        metadata: { ...user.metadata, compactionCancellationNonce: record.nonce },
+      });
+      await cancellation.retireReplacement(record.nonce).catch(() => undefined);
+      expect(await cancellation.read()).toBeNull();
+    }
+  }
+  if (state === "shared read failure") {
+    const capture = h.session.getCompactionCancellationNonce.bind(h.session);
+    spyOn(h.session, "getCompactionCancellationNonce").mockImplementationOnce(async () => {
+      const nonce = await capture();
+      spyOn(h.historyService, "readCompactionCancellation").mockRejectedValueOnce(
+        new Error("shared storage unavailable")
+      );
+      return nonce;
+    });
+  }
+  if (state === "witness write failure") {
+    const writes = h.historyService as unknown as {
+      writeGuardedHistory(path: string, serialized: string, guard: () => boolean): Promise<boolean>;
+    };
+    spyOn(writes, "writeGuardedHistory").mockRejectedValueOnce(
+      new Error("witness storage unavailable")
+    );
+  }
+  const stream = spyOn(h.aiService, "streamMessage");
+  try {
+    const result = await h.session.resumeStream(options);
+    const storageFailure = state === "shared read failure" || state === "witness write failure";
+    if (storageFailure) {
+      expect(result.success).toBe(false);
+      expect(JSON.stringify(result)).toContain("storage unavailable");
+    } else expect(result).toEqual(Ok({ started: true }));
+    expect(stream).toHaveBeenCalledTimes(storageFailure ? 0 : 1);
+    expect(cancellation.needsPersistence).toBe(debt);
+    if (debt) expect(h.session.hasBlockingCompactionCleanup).toBe(false);
+    const rows = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(
+      rows.success && rows.data.filter((row) => row.role === "user").map((row) => row.id)
+    ).toEqual([user.id]);
+  } finally {
+    restoreWrites?.();
     await h.session.dispose();
     await h.cleanup();
   }

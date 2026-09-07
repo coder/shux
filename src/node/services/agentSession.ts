@@ -785,7 +785,7 @@ interface PreparationAttempt {
   failureAttempts?: number;
   failure?: SendMessageError;
   onFailure?: (error: SendMessageError) => Promise<void> | void;
-  resumeCancellation?: { nonce: string; epoch: number };
+  resumeCancellation?: { nonce: string | null; epoch: number };
 }
 
 export class AgentSession {
@@ -4716,7 +4716,7 @@ export class AgentSession {
           this.coordinator.closing
         )
           return Ok({ started: false });
-        if (nonce) attempt.resumeCancellation = { nonce, epoch };
+        attempt.resumeCancellation = { nonce: nonce ?? null, epoch };
       }
       this.setAutoRetryResumeState(
         optionsForStream,
@@ -6055,27 +6055,22 @@ export class AgentSession {
         let committed = false;
         // Retry is explicit user intent but reuses its existing row. Persist that
         // acceptance before engine entry; failed preflight or a guarded no-op keeps Stop.
-        const witnessed = await this.historyService.updateHistory(
+        const witnessed = await this.historyService.acceptResumeCancellation(
           this.workspaceId,
           resumedUser,
+          resumedCancellation.nonce,
           (current) =>
             !isStreamStartAborted() &&
             this.coordinator.compactionIntent.epoch === resumedCancellation.epoch &&
             current.id === resumedUser.id &&
             current.role === "user" &&
             current.metadata?.historySequence === resumedUser.metadata?.historySequence,
-          (current) => ({
-            ...current,
-            metadata: {
-              ...current.metadata,
-              compactionCancellationNonce: resumedCancellation.nonce,
-            },
-          }),
           () => {
             committed = true;
           }
         );
-        if (committed) await this.compactionCancellation.retire(resumedCancellation.nonce);
+        if (committed && resumedCancellation.nonce !== null)
+          await this.retireWitnessedCompactionCancellation(resumedCancellation.nonce);
         if (!witnessed.success) return await fail(createUnknownSendMessageError(witnessed.error));
         if (
           !committed ||
