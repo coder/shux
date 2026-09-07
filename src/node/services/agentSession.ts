@@ -3,6 +3,8 @@ import type { StreamManager } from "./streamManager";
 import * as path from "path";
 import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
+import { Effect, Fiber } from "effect";
+import { StartupRecovery, type StartupRecoveryOutcome } from "./startupRecovery";
 import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
@@ -538,10 +540,6 @@ export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
   "Workspace history is being cleared or reset. Please wait and try again.";
 const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message was not sent.";
 
-const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
-const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
-const MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS = 4;
-
 export interface AgentSessionChatEvent {
   workspaceId: string;
   message: WorkspaceChatMessage;
@@ -671,8 +669,6 @@ interface AgentSessionOptions {
    */
   hasExternalSendPreflight?: () => boolean;
 }
-
-type StartupAutoRetryCheckOutcome = "completed" | "deferred";
 
 interface CachedMemoryContext {
   context: MemorySessionContext | null;
@@ -848,13 +844,28 @@ export class AgentSession {
 
   private readonly retryManager: RetryManager;
   private lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-  /** Startup recovery should run once per session to avoid duplicate retry timers on reconnect. */
-  private startupRecoveryScheduled = false;
-  private startupRecoveryPromise: Promise<void> | null = null;
-  private startupAutoRetryCheckScheduled = false;
-  private startupAutoRetryCheckPromise: Promise<void> | null = null;
-  private startupAutoRetryHistoryReadFailureCount = 0;
-  private startupAutoRetryDeferredRetryDelayMs = 0;
+  private readonly startupRecovery = new StartupRecovery({
+    signal: this.coordinator.closingSignal,
+    // Persisted compaction follow-ups precede goal continuation recovery. Each successful
+    // step is checkpointed, so retrying a later read cannot replay an earlier side effect.
+    steps: [
+      () =>
+        this.runStartupRecoveryStep(() => this.requireGoalAcknowledgmentForCrashRecoveredPartial()),
+      () => this.runStartupRecoveryStep(() => this.continuousCompactor.recover()),
+      () => this.runStartupRecoveryStep(() => this.dispatchPendingFollowUp()),
+      () =>
+        this.runStartupRecoveryStep(() =>
+          this.workspaceGoalService?.recoverPendingDispatchAfterRestart(this.workspaceId)
+        ),
+    ],
+    check: () => this.scheduleStartupAutoRetryIfNeeded(),
+    wait: (delayMs) => this.waitForStartupAutoRetryRerunWindow(delayMs),
+    report: (error) =>
+      log.warn("Failed to run startup recovery", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      }),
+  });
   private autoRetryEnabledPreference: boolean | null = null;
   private legacyAutoRetryEnabledHint: boolean | null = null;
   private startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null = null;
@@ -1146,11 +1157,13 @@ export class AgentSession {
 
     this.retryManager = new RetryManager(
       this.workspaceId,
-      async () => {
-        await this.retryActiveStream();
-      },
-      (event) => this.handleRetryStatusChange(event),
-      this.streamManager.effectRunner
+      (isCurrent, signal) => this.retryActiveStream(isCurrent, signal),
+      (event) => this.emitRetryEvent(event),
+      this.streamManager.effectRunner,
+      () => {
+        const retry = this.coordinator.beginRetry();
+        return { [Symbol.dispose]: () => this.coordinator.finishRetry(retry) };
+      }
     );
 
     // App close can interrupt the guardian synchronously. Attach only after retry/compaction
@@ -1442,15 +1455,6 @@ export class AgentSession {
     this.preparingRuntimeStatus = null;
   }
 
-  private handleRetryStatusChange(event: RetryStatusEvent): void {
-    if (event.type === "auto-retry-starting") {
-      this.coordinator.beginRetry();
-    } else if (event.type === "auto-retry-scheduled" || event.type === "auto-retry-abandoned") {
-      this.coordinator.clearRetryStarting();
-    }
-    this.emitRetryEvent(event);
-  }
-
   private emitRetryEvent(event: RetryStatusEvent): void {
     if (this.coordinator.disposed) {
       return;
@@ -1458,20 +1462,23 @@ export class AgentSession {
     this.emitChatEvent(event);
   }
 
-  private async handleStreamFailureForAutoRetry(error: RetryFailureError): Promise<void> {
+  private async handleStreamFailureForAutoRetry(
+    error: RetryFailureError,
+    isCurrent = this.retryManager.captureGeneration()
+  ): Promise<void> {
     assert(
       typeof error.type === "string" && error.type.length > 0,
       "handleStreamFailureForAutoRetry requires a non-empty error.type"
     );
-    if (this.coordinator.closing) {
+    if (this.coordinator.closing || !isCurrent()) {
       return;
     }
 
     // Load persisted preference before scheduling retries so an on-disk opt-out is
     // honored even when the first failure happens before startup recovery runs.
     const turn = this.coordinator.turnId;
-    await this.loadAutoRetryEnabledPreference();
-    if (this.coordinator.closing || !this.coordinator.isCurrentTurn(turn)) return;
+    await this.loadAutoRetryEnabledPreference(isCurrent);
+    if (this.coordinator.closing || !isCurrent() || !this.coordinator.isCurrentTurn(turn)) return;
     this.retryManager.handleStreamFailure(error);
   }
 
@@ -1506,64 +1513,75 @@ export class AgentSession {
     return undefined;
   }
 
-  private async retryActiveStream(): Promise<void> {
-    if (this.coordinator.closing) return;
+  private async retryActiveStream(
+    isCurrent = this.retryManager.captureGeneration(),
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (this.coordinator.closing || !isCurrent()) return;
     using _execution = this.coordinator.enterExecution();
-    const retry = this.coordinator.beginRetry();
-    try {
-      const request = this.lastAutoRetryResumeRequest;
-      if (!request) {
-        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
-        return;
-      }
+    const request = this.lastAutoRetryResumeRequest;
+    if (!request) {
+      this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
+      return;
+    }
 
-      // Archive only interrupts a live stream; a backoff timer armed before it keeps ticking.
-      if (this.isWorkspaceArchivedOnDisk()) {
-        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "workspace_archived" });
-        return;
-      }
+    // Archive only interrupts a live stream; a backoff timer armed before it keeps ticking.
+    if (this.isWorkspaceArchivedOnDisk()) {
+      this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "workspace_archived" });
+      return;
+    }
 
-      const result = await this.resumeStream(request.options, {
-        agentInitiated: request.agentInitiated === true ? true : undefined,
-        goalKind: request.goalKind,
-        goalId: request.goalId,
-      });
-      if (result.success) {
-        if (!result.data.started) {
-          // resumeStream can defer when a turn is still PREPARING/COMPLETING.
-          // Treat this as retriable so auto-retry keeps progressing instead of
-          // stalling after the "auto-retry-starting" status event.
-          await this.handleStreamFailureForAutoRetry({
+    const result = await this.resumeStream(request.options, {
+      agentInitiated: request.agentInitiated === true ? true : undefined,
+      goalKind: request.goalKind,
+      goalId: request.goalId,
+      retrySignal: signal,
+    });
+    // Interrupting the scheduling fiber cannot cancel resumeStream's original Promise.
+    // Its late settlement must not mutate a replacement retry or accepted manual turn.
+    if (this.coordinator.closing || !isCurrent()) return;
+    if (result.success) {
+      if (!result.data.started) {
+        // resumeStream can defer when a turn is still PREPARING/COMPLETING.
+        // Treat this as retriable so auto-retry keeps progressing instead of
+        // stalling after the "auto-retry-starting" status event.
+        await this.handleStreamFailureForAutoRetry(
+          {
             type: "unknown",
             message: "retry_deferred_busy",
-          });
-          return;
-        }
-
-        // Retry resumed the stream successfully. Clear stale startup-abandon markers now
-        // (not only on stream-end) so a crash/restart mid-stream doesn't suppress recovery.
-        await this.clearStartupAutoRetryAbandon();
+          },
+          isCurrent
+        );
         return;
       }
 
-      if (result.failureHandled === true) {
-        return;
-      }
+      // Retry resumed the stream successfully. Clear stale startup-abandon markers now
+      // (not only on stream-end) so a crash/restart mid-stream doesn't suppress recovery.
+      await this.clearStartupAutoRetryAbandon(() => !this.coordinator.closing && isCurrent());
+      return;
+    }
 
-      // Fallback: resumeStream() can fail before stream error handlers run
-      // (for example commitPartial/history read failures). Handle those here so
-      // auto-retry continues instead of stalling after auto-retry-starting.
-      await this.handleStreamFailureForAutoRetry({
+    if (result.failureHandled === true) {
+      return;
+    }
+
+    // Fallback: resumeStream() can fail before stream error handlers run
+    // (for example commitPartial/history read failures). Handle those here so
+    // auto-retry continues instead of stalling after auto-retry-starting.
+    // Persist this generation's result before publishing a successor's scheduled event.
+    await this.updateStartupAutoRetryAbandonFromFailure(
+      result.error.type,
+      this.activeStreamUserMessageId,
+      () => !this.coordinator.closing && isCurrent()
+    );
+    if (this.coordinator.closing || !isCurrent()) return;
+    await this.handleStreamFailureForAutoRetry(
+      {
         type: result.error.type,
         message: this.extractRetryFailureMessage(result.error),
-      });
-      await this.updateStartupAutoRetryAbandonFromFailure(
-        result.error.type,
-        this.activeStreamUserMessageId
-      );
-    } finally {
-      this.coordinator.finishRetry(retry);
-    }
+      },
+      isCurrent
+    );
   }
 
   private getAutoRetryPreferencePath(): string {
@@ -1607,7 +1625,7 @@ export class AgentSession {
     };
   }
 
-  private async loadAutoRetryEnabledPreference(): Promise<boolean> {
+  private async loadAutoRetryEnabledPreference(isCurrent = () => true): Promise<boolean> {
     if (this.autoRetryEnabledPreference !== null) {
       return this.autoRetryEnabledPreference;
     }
@@ -1615,6 +1633,7 @@ export class AgentSession {
     const preferencePath = this.getAutoRetryPreferencePath();
     try {
       const raw = await readFile(preferencePath, "utf-8");
+      if (this.coordinator.closing || !isCurrent()) return false;
       const parsed = JSON.parse(raw) as {
         enabled?: unknown;
         startupAutoRetryAbandon?: unknown;
@@ -1628,6 +1647,7 @@ export class AgentSession {
       this.retryManager.setEnabled(enabled);
       return enabled;
     } catch (error) {
+      if (this.coordinator.closing || !isCurrent()) return false;
       // Missing preference file is the default path. Use any legacy frontend hint
       // (captured at onChat subscribe time) before falling back to enabled.
       const errno =
@@ -1657,51 +1677,53 @@ export class AgentSession {
     }
   }
 
-  private async persistAutoRetryState(): Promise<void> {
+  private autoRetryPersistence: Promise<void> = Promise.resolve();
+
+  private persistAutoRetryState(isCurrent = () => true): Promise<void> {
+    if (!isCurrent()) return Promise.resolve();
     const preferencePath = this.getAutoRetryPreferencePath();
     const enabled = this.autoRetryEnabledPreference !== false;
-    const hasStartupAbandonState = this.startupAutoRetryAbandon !== null;
-
-    if (enabled && !hasStartupAbandonState) {
-      try {
-        await unlink(preferencePath);
-      } catch (error) {
-        const errno =
-          typeof error === "object" && error !== null && "code" in error
-            ? (error as { code?: unknown }).code
-            : undefined;
-        if (errno !== "ENOENT") {
-          log.debug("Failed to clear auto-retry preference file", {
+    const abandon = this.startupAutoRetryAbandon;
+    // Capture the admitted update, then serialize every writer (including success policy
+    // and public opt-out). Generation checks cannot cancel an already-issued unlink: it
+    // must settle before a newer preference commits, or it can erase the user's opt-out.
+    // Once memory reflects this admitted snapshot it must commit even if its generation
+    // retires while queued; a later clear may already see null and have nothing to enqueue.
+    const payload =
+      enabled && !abandon
+        ? undefined
+        : JSON.stringify({
+            ...(!enabled ? { enabled: false } : {}),
+            ...(abandon ? { startupAutoRetryAbandon: abandon } : {}),
+          }) + "\n";
+    const execution = this.coordinator.enterExecution();
+    const persisted = this.autoRetryPersistence
+      .then(async () => {
+        try {
+          if (payload === undefined) {
+            await unlink(preferencePath);
+          } else {
+            await mkdir(path.dirname(preferencePath), { recursive: true });
+            await writeFile(preferencePath, payload, "utf-8");
+          }
+        } catch (error) {
+          if (
+            payload === undefined &&
+            typeof error === "object" &&
+            error !== null &&
+            "code" in error &&
+            error.code === "ENOENT"
+          )
+            return;
+          log.warn("Failed to persist auto-retry preference", {
             workspaceId: this.workspaceId,
             error: getErrorMessage(error),
           });
         }
-      }
-      return;
-    }
-
-    const payload: {
-      enabled?: false;
-      startupAutoRetryAbandon?: { reason: string; userMessageId?: string };
-    } = {};
-
-    if (!enabled) {
-      payload.enabled = false;
-    }
-
-    if (this.startupAutoRetryAbandon) {
-      payload.startupAutoRetryAbandon = this.startupAutoRetryAbandon;
-    }
-
-    try {
-      await mkdir(path.dirname(preferencePath), { recursive: true });
-      await writeFile(preferencePath, JSON.stringify(payload) + "\n", "utf-8");
-    } catch (error) {
-      log.warn("Failed to persist auto-retry preference", {
-        workspaceId: this.workspaceId,
-        error: getErrorMessage(error),
-      });
-    }
+      })
+      .finally(() => execution[Symbol.dispose]());
+    this.autoRetryPersistence = persisted;
+    return persisted;
   }
 
   private async persistAutoRetryEnabledPreference(enabled: boolean): Promise<void> {
@@ -1711,22 +1733,25 @@ export class AgentSession {
 
   private async persistStartupAutoRetryAbandon(
     reason: string,
-    userMessageId?: string
+    userMessageId?: string,
+    isCurrent = () => true
   ): Promise<void> {
+    if (!isCurrent()) return;
     this.startupAutoRetryAbandon = {
       reason,
       ...(userMessageId ? { userMessageId } : {}),
     };
-    await this.persistAutoRetryState();
+    await this.persistAutoRetryState(isCurrent);
   }
 
-  private async clearStartupAutoRetryAbandon(): Promise<void> {
+  private async clearStartupAutoRetryAbandon(isCurrent = () => true): Promise<void> {
+    if (!isCurrent()) return;
     if (this.startupAutoRetryAbandon === null) {
       return;
     }
 
     this.startupAutoRetryAbandon = null;
-    await this.persistAutoRetryState();
+    await this.persistAutoRetryState(isCurrent);
   }
 
   async handleProviderConfigChanged(): Promise<void> {
@@ -1742,17 +1767,18 @@ export class AgentSession {
 
   private async updateStartupAutoRetryAbandonFromFailure(
     errorType: string,
-    userMessageId?: string
+    userMessageId?: string,
+    isCurrent = () => true
   ): Promise<void> {
     if (
       isNonRetryableSendError({ type: errorType }) ||
       isNonRetryableStreamError({ type: errorType })
     ) {
-      await this.persistStartupAutoRetryAbandon(errorType, userMessageId);
+      await this.persistStartupAutoRetryAbandon(errorType, userMessageId, isCurrent);
       return;
     }
 
-    await this.clearStartupAutoRetryAbandon();
+    await this.clearStartupAutoRetryAbandon(isCurrent);
   }
 
   private async updateStartupAutoRetryAbandonFromAbort(
@@ -1899,7 +1925,7 @@ export class AgentSession {
 
   private async requireGoalAcknowledgmentForCrashRecoveredPartial(): Promise<void> {
     const goalService = this.workspaceGoalService;
-    if (!goalService) {
+    if (!goalService || this.coordinator.closing) {
       return;
     }
     if (this.isBusy() || this.isAiStreaming()) {
@@ -1909,13 +1935,14 @@ export class AgentSession {
     // Crash recovery restores abandoned assistant partials without knowing whether
     // the model's last action was safe to continue, so goal loops must wait for user acknowledgment.
     const partial = await this.historyService.readPartial(this.workspaceId);
+    if (this.coordinator.closing) return;
     if (partial?.role === "assistant" && !this.isPendingAskUserQuestion(partial)) {
       await goalService.requireUserAcknowledgmentForCrashRecovery(this.workspaceId);
       return;
     }
 
     const historyResult = await this.historyService.getLastMessages(this.workspaceId, 20);
-    if (!historyResult.success) {
+    if (this.coordinator.closing || !historyResult.success) {
       return;
     }
 
@@ -2408,54 +2435,50 @@ export class AgentSession {
     return retryRequest?.model ?? null;
   }
 
-  private resetStartupAutoRetryHistoryReadBackoff(): void {
-    this.startupAutoRetryHistoryReadFailureCount = 0;
-    this.startupAutoRetryDeferredRetryDelayMs = 0;
+  private async runStartupRecoveryStep(step: () => unknown): Promise<void> {
+    if (this.coordinator.closing) return;
+    using _execution = this.coordinator.enterExecution();
+    await step();
   }
 
-  private markStartupAutoRetryHistoryReadFailure(): void {
-    this.startupAutoRetryHistoryReadFailureCount += 1;
-    const attempt = this.startupAutoRetryHistoryReadFailureCount - 1;
-    const exponentialDelay =
-      STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS * 2 ** Math.max(0, attempt);
-    this.startupAutoRetryDeferredRetryDelayMs = Math.min(
-      exponentialDelay,
-      STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS
-    );
-  }
-
-  private async scheduleStartupAutoRetryIfNeeded(): Promise<StartupAutoRetryCheckOutcome> {
+  private async scheduleStartupAutoRetryIfNeeded(): Promise<StartupRecoveryOutcome> {
     if (this.coordinator.closing) return "completed";
     using _execution = this.coordinator.enterExecution();
+    const turn = this.coordinator.turnId;
+    const generation = this.retryManager.captureGeneration();
+    const isCurrent = () =>
+      !this.coordinator.closing && generation() && this.coordinator.isCurrentTurn(turn);
     if (this.coordinator.disposed || this.isBusy() || this.isAiStreaming()) {
-      // Busy/streaming deferrals are state-driven; do not carry history-error backoff.
-      this.startupAutoRetryDeferredRetryDelayMs = 0;
       return "deferred";
     }
 
-    const autoRetryEnabled = await this.loadAutoRetryEnabledPreference();
+    const autoRetryEnabled = await this.loadAutoRetryEnabledPreference(isCurrent);
+    if (!isCurrent()) return "completed";
     if (!autoRetryEnabled) {
-      this.resetStartupAutoRetryHistoryReadBackoff();
       return "completed";
     }
 
-    const [partial, historyResult] = await Promise.all([
+    const reads = await Promise.allSettled([
       this.historyService.readPartial(this.workspaceId),
       this.historyService.getLastMessages(this.workspaceId, 20),
     ]);
+    if (!isCurrent()) return "completed";
+    // A rejected read does not cancel its sibling's disk I/O. Join both before releasing
+    // this probe's physical lease, and retry only the reads rather than the recovery prefix.
+    const [partialRead, historyRead] = reads;
+    if (partialRead.status === "rejected" || historyRead.status === "rejected") {
+      return "retryable";
+    }
+    const partial = partialRead.value;
+    const historyResult = historyRead.value;
 
     if (!historyResult.success) {
-      this.markStartupAutoRetryHistoryReadFailure();
       log.warn("Failed to inspect history for startup auto-retry", {
         workspaceId: this.workspaceId,
         error: historyResult.error,
-        retryDelayMs: this.startupAutoRetryDeferredRetryDelayMs,
-        consecutiveHistoryReadFailures: this.startupAutoRetryHistoryReadFailureCount,
       });
-      return "deferred";
+      return "retryable";
     }
-
-    this.resetStartupAutoRetryHistoryReadBackoff();
 
     if (partial && this.isPendingAskUserQuestion(partial)) {
       return "completed";
@@ -2508,6 +2531,9 @@ export class AgentSession {
         historyTail: historyResult.data,
       });
 
+      // Derivation reads metadata. A manual successor may have installed its own retry
+      // envelope during that await; never overwrite it with this stale disk snapshot.
+      if (!isCurrent()) return "completed";
       if (!retryRequest) {
         this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
         return "completed";
@@ -2520,7 +2546,6 @@ export class AgentSession {
     // Disk reads above may race with user actions; retry once the current work settles
     // instead of permanently suppressing startup auto-retry for this session.
     if (this.coordinator.disposed || this.isBusy() || this.isAiStreaming()) {
-      this.startupAutoRetryDeferredRetryDelayMs = 0;
       return "deferred";
     }
     if (this.isWorkspaceArchivedOnDisk()) {
@@ -2529,24 +2554,33 @@ export class AgentSession {
       });
       return "completed";
     }
-    await this.handleStreamFailureForAutoRetry({
-      type: "unknown",
-      message: "startup_interrupted_stream",
-    });
+    await this.handleStreamFailureForAutoRetry(
+      {
+        type: "unknown",
+        message: "startup_interrupted_stream",
+      },
+      isCurrent
+    );
     return "completed";
   }
 
   private async waitForStartupAutoRetryRerunWindow(retryDelayMs = 0): Promise<void> {
     const delayMs = Math.max(0, Math.trunc(retryDelayMs));
     if (delayMs > 0) {
-      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
-      if (this.coordinator.disposed) {
-        return;
+      const runner = this.streamManager.effectRunner ?? defaultEffectRunner;
+      const sleeper = runner.runFork(Effect.sleep(delayMs));
+      const cancel = () => sleeper.interruptUnsafe();
+      this.closingSignal.addEventListener("abort", cancel, { once: true });
+      if (this.closingSignal.aborted) cancel();
+      try {
+        await runner.runPromise(Fiber.await(sleeper));
+      } finally {
+        this.closingSignal.removeEventListener("abort", cancel);
       }
     }
 
     while (!this.coordinator.closing) {
-      await this.waitForIdle();
+      await this.coordinator.waitForUnbusy(this.closingSignal);
       if (this.coordinator.closing || !this.isAiStreaming()) {
         return;
       }
@@ -2563,18 +2597,24 @@ export class AgentSession {
             return;
           }
 
-          if (this.coordinator.disposed || !this.isAiStreaming()) {
+          if (this.coordinator.closing || !this.isAiStreaming()) {
             cleanup();
             resolve();
           }
         };
 
+        const close = () => {
+          cleanup();
+          resolve();
+        };
         const cleanup = () => {
+          this.closingSignal.removeEventListener("abort", close);
           this.aiService.off("stream-end", maybeResolve);
           this.aiService.off("stream-abort", maybeResolve);
           this.aiService.off("error", maybeResolve);
         };
 
+        this.closingSignal.addEventListener("abort", close, { once: true });
         this.aiService.on("stream-end", maybeResolve);
         this.aiService.on("stream-abort", maybeResolve);
         this.aiService.on("error", maybeResolve);
@@ -2585,155 +2625,31 @@ export class AgentSession {
     }
   }
 
-  ensureStartupAutoRetryCheck(): void {
-    if (
-      this.coordinator.disposed ||
-      this.startupAutoRetryCheckScheduled ||
-      this.startupAutoRetryCheckPromise
-    ) {
-      return;
-    }
-
-    let rerunWhenIdle = false;
-
-    this.startupAutoRetryCheckPromise = this.scheduleStartupAutoRetryIfNeeded()
-      .then((outcome) => {
-        if (outcome === "deferred") {
-          this.startupAutoRetryCheckScheduled = false;
-          rerunWhenIdle = true;
-          return;
-        }
-
-        this.startupAutoRetryCheckScheduled = true;
-      })
-      .catch((error: unknown) => {
-        this.startupAutoRetryCheckScheduled = true;
-        log.warn("Startup auto-retry check failed", {
-          workspaceId: this.workspaceId,
-          error: getErrorMessage(error),
-        });
-      })
-      .finally(() => {
-        this.startupAutoRetryCheckPromise = null;
-
-        if (!rerunWhenIdle || this.coordinator.disposed) {
-          return;
-        }
-
-        const rerunDelayMs = this.startupAutoRetryDeferredRetryDelayMs;
-        this.startupAutoRetryDeferredRetryDelayMs = 0;
-
-        void this.waitForStartupAutoRetryRerunWindow(rerunDelayMs).then(() => {
-          if (!this.coordinator.disposed) {
-            this.ensureStartupAutoRetryCheck();
-          }
-        });
-      });
+  ensureStartupAutoRetryCheck(): Promise<void> {
+    return this.runStartupRecovery();
   }
 
-  async runStartupRecovery(): Promise<void> {
-    if (this.coordinator.disposed || this.coordinator.closing) {
-      return;
-    }
-
-    if (!this.startupRecoveryScheduled && !this.startupRecoveryPromise) {
-      // Crash recovery: check if the last message is a compaction summary with
-      // a pending follow-up that was never dispatched. If so, dispatch it now.
-      // This handles the case where the app crashed after compaction completed
-      // but before the follow-up was sent.
-      // Track actual recovery I/O through its final callback, not the later idle/timer gate.
-      const recoveryExecution = this.coordinator.enterExecution();
-      this.startupRecoveryPromise = this.requireGoalAcknowledgmentForCrashRecoveredPartial()
-        .then(() => this.continuousCompactor.recover())
-        .then(() => this.dispatchPendingFollowUp())
-        .then(() =>
-          // Re-arm pending continuation / budget-wrap-up dispatches that were
-          // lost when the in-memory dispatch state was wiped on restart
-          // (Coder-agents-review P2 DEREM-16). Do this AFTER pending compaction
-          // follow-ups so goal continuations cannot reorder ahead of a saved
-          // follow-up from crash recovery.
-          this.workspaceGoalService?.recoverPendingDispatchAfterRestart(this.workspaceId)
-        )
-        .then(() => {
-          this.startupRecoveryScheduled = true;
-        })
-        .catch((error) => {
-          this.startupRecoveryScheduled = false;
-          log.warn("Failed to run startup recovery", {
-            workspaceId: this.workspaceId,
-            error: getErrorMessage(error),
-          });
-        })
-        .finally(() => {
-          this.startupRecoveryPromise = null;
-          recoveryExecution[Symbol.dispose]();
-        });
-    }
-
-    if (this.startupRecoveryPromise) {
-      await this.startupRecoveryPromise;
-    }
-
-    let deferredAttempts = 0;
-    while (!this.coordinator.disposed && !this.coordinator.closing) {
-      let outcome: StartupAutoRetryCheckOutcome;
-      try {
-        outcome = await this.scheduleStartupAutoRetryIfNeeded();
-      } catch (error) {
-        this.startupAutoRetryCheckScheduled = true;
-        log.warn("Startup auto-retry check failed", {
-          workspaceId: this.workspaceId,
-          error: getErrorMessage(error),
-        });
-        return;
-      }
-
-      if (outcome === "completed") {
-        this.startupAutoRetryCheckScheduled = true;
-        return;
-      }
-
-      this.startupAutoRetryCheckScheduled = false;
-      if (
-        this.isBusy() ||
-        this.streamManager.isStreaming(this.workspaceId) ||
-        this.retryManager.isRetryPending
-      ) {
-        return;
-      }
-
-      deferredAttempts += 1;
-      if (deferredAttempts >= MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS) {
-        this.startupRecoveryScheduled = false;
-        this.startupAutoRetryCheckScheduled = true;
-        log.warn("Startup recovery abandoned after repeated deferred auto-retry checks", {
-          workspaceId: this.workspaceId,
-          deferredAttempts,
-          historyReadFailures: this.startupAutoRetryHistoryReadFailureCount,
-        });
-        return;
-      }
-
-      const rerunDelayMs = this.startupAutoRetryDeferredRetryDelayMs;
-      this.startupAutoRetryDeferredRetryDelayMs = 0;
-      await this.waitForStartupAutoRetryRerunWindow(rerunDelayMs);
-    }
+  runStartupRecovery(): Promise<void> {
+    return this.startupRecovery.run();
   }
 
   shouldRetainAfterStartupRecovery(): boolean {
+    if (this.coordinator.closing) return false;
     return (
+      this.startupRecovery.pending ||
       this.isBusy() ||
       this.streamManager.isStreaming(this.workspaceId) ||
-      this.retryManager.isRetryPending
+      this.hasPendingAutoRetry()
     );
   }
 
   scheduleStartupRecovery(): void {
-    if (this.coordinator.disposed || this.startupRecoveryScheduled || this.startupRecoveryPromise) {
-      return;
-    }
-
-    void this.runStartupRecovery();
+    this.runStartupRecovery().catch((error: unknown) => {
+      log.warn("Failed to schedule startup recovery", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    });
   }
 
   private async emitHistoricalEvents(
@@ -4453,12 +4369,25 @@ export class AgentSession {
 
   async resumeStream(
     options: SendMessageOptions,
-    internal?: { agentInitiated?: boolean; goalKind?: GoalSyntheticMessageKind; goalId?: string }
+    internal?: {
+      agentInitiated?: boolean;
+      goalKind?: GoalSyntheticMessageKind;
+      goalId?: string;
+      retrySignal?: AbortSignal;
+    }
   ): Promise<AgentSessionResult<{ started: boolean }>> {
     this.assertNotDisposed("resumeStream");
-    if (this.coordinator.closing) return Ok({ started: false });
+    if (this.coordinator.closing || internal?.retrySignal?.aborted) return Ok({ started: false });
     using _execution = this.coordinator.enterExecution();
     const expectedTurnId = this.coordinator.turnId;
+    // Cancel retry startup through pricing/history/provider preparation, then detach the link.
+    // Disabling backoff after delivery must not abort the already-running stream.
+    const startupController = internal?.retrySignal ? new AbortController() : undefined;
+    const cancelStartup = () => startupController?.abort();
+    internal?.retrySignal?.addEventListener("abort", cancelStartup, { once: true });
+    using _retryCancellation = {
+      [Symbol.dispose]: () => internal?.retrySignal?.removeEventListener("abort", cancelStartup),
+    };
 
     assert(options, "resumeStream requires options");
     const { model } = options;
@@ -4491,7 +4420,11 @@ export class AgentSession {
     // clears the resume request (discardAutoRetryForContextMutation, r41),
     // so a straggler reschedule self-abandons instead of replaying the
     // discarded context.
-    if (this.coordinator.admissionBlocked) {
+    if (
+      this.coordinator.admissionBlocked ||
+      this.coordinator.closing ||
+      startupController?.signal.aborted
+    ) {
       return Ok({ started: false });
     }
 
@@ -4502,10 +4435,10 @@ export class AgentSession {
       queued: false,
       failureNotified: false,
     };
-    return this.completePreparation(attempt, async () => {
+    return await this.completePreparation(attempt, async () => {
       const admission = this.coordinator.prepare(
         { kind: "fresh", intent: "resume", expectedTurnId },
-        undefined,
+        startupController,
         (turnId) => {
           attempt.owner = turnId;
           this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
@@ -4534,7 +4467,7 @@ export class AgentSession {
         undefined,
         undefined,
         internal?.agentInitiated,
-        undefined,
+        startupController?.signal,
         internal?.goalKind,
         internal?.goalId,
         turnThinkingOverride,

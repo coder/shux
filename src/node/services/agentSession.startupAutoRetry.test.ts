@@ -120,12 +120,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendSnapshotResult.success).toBe(true);
 
-    session.ensureStartupAutoRetryCheck();
-
-    const startupCheckPromise = (
-      session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
 
     const scheduledEvent = events.find((event) => event.type === "auto-retry-scheduled");
     expect(scheduledEvent).toBeDefined();
@@ -182,16 +177,10 @@ describe("AgentSession startup auto-retry recovery", () => {
       return result;
     });
 
-    const privateSession = session as unknown as {
-      startupAutoRetryCheckPromise: Promise<void> | null;
-      startupAutoRetryCheckScheduled: boolean;
-    };
-    session.ensureStartupAutoRetryCheck();
-    await privateSession.startupAutoRetryCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
     // Completed rather than deferred: nothing reruns the check for an archived workspace.
-    expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
 
     await session.dispose();
   });
@@ -328,11 +317,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendResult.success).toBe(true);
 
-    session.ensureStartupAutoRetryCheck();
-    const startupCheckPromise = (
-      session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
     await session.dispose();
@@ -372,11 +357,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       })
     );
 
-    session.ensureStartupAutoRetryCheck();
-    const startupCheckPromise = (
-      session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
     await session.dispose();
@@ -409,11 +390,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       )
     );
 
-    session.ensureStartupAutoRetryCheck();
-    const startupCheckPromise = (
-      session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
     await session.dispose();
@@ -446,12 +423,11 @@ describe("AgentSession startup auto-retry recovery", () => {
       streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
     const privateSession = session as unknown as {
       retryActiveStream: () => Promise<void>;
-      startupAutoRetryCheckPromise: Promise<void> | null;
+
       lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
     };
 
-    session.ensureStartupAutoRetryCheck();
-    await privateSession.startupAutoRetryCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
     expect(privateSession.lastAutoRetryResumeRequest?.options.muxMetadata).toEqual(muxMetadata);
 
     await privateSession.retryActiveStream();
@@ -492,257 +468,13 @@ describe("AgentSession startup auto-retry recovery", () => {
       streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
     const privateSession = session as unknown as {
       retryActiveStream: () => Promise<void>;
-      startupAutoRetryCheckPromise: Promise<void> | null;
     };
 
-    session.ensureStartupAutoRetryCheck();
-    await privateSession.startupAutoRetryCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
     await privateSession.retryActiveStream();
 
     expect(streamMessageMock).toHaveBeenCalledTimes(1);
     expect(streamMessageMock.mock.calls[0]?.[0].muxMetadata).toBeUndefined();
-
-    await session.dispose();
-  });
-
-  test("re-runs startup auto-retry check after busy startup state clears", async () => {
-    const workspaceId = "startup-retry-busy-rerun";
-    const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
-
-    const appendResult = await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "Interrupted while startup was busy", {
-        timestamp: Date.now(),
-      })
-    );
-    expect(appendResult.success).toBe(true);
-
-    const privateSession = session as unknown as {
-      coordinator: TurnCoordinator;
-      startupAutoRetryCheckPromise: Promise<void> | null;
-      startupAutoRetryCheckScheduled: boolean;
-    };
-
-    privateSession.coordinator.prepare({
-      kind: "fresh",
-      intent: "handoff",
-      expectedTurnId: privateSession.coordinator.turnId,
-    });
-    session.ensureStartupAutoRetryCheck();
-
-    const firstCheckPromise = privateSession.startupAutoRetryCheckPromise;
-    await firstCheckPromise;
-
-    expect(privateSession.startupAutoRetryCheckScheduled).toBe(false);
-    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
-
-    privateSession.coordinator.finishTurn(privateSession.coordinator.turnId);
-
-    const deadline = Date.now() + 1500;
-    while (
-      !events.some((event) => event.type === "auto-retry-scheduled") &&
-      Date.now() < deadline
-    ) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-
-    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
-    expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
-
-    await session.dispose();
-  });
-
-  test("re-runs startup auto-retry check after transient history read failures", async () => {
-    const workspaceId = "startup-retry-history-read-rerun";
-    const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
-
-    const appendResult = await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "Interrupted while history read failed", {
-        timestamp: Date.now(),
-      })
-    );
-    expect(appendResult.success).toBe(true);
-
-    const originalGetLastMessages = historyService.getLastMessages.bind(historyService);
-    let getLastMessagesCalls = 0;
-    historyService.getLastMessages = mock((id: string, count: number) => {
-      getLastMessagesCalls += 1;
-      if (getLastMessagesCalls === 1) {
-        return Promise.resolve({
-          success: false as const,
-          error: "temporary history read failure",
-        });
-      }
-
-      return originalGetLastMessages(id, count);
-    }) as unknown as HistoryService["getLastMessages"];
-
-    const privateSession = session as unknown as {
-      startupAutoRetryCheckPromise: Promise<void> | null;
-      startupAutoRetryCheckScheduled: boolean;
-    };
-
-    session.ensureStartupAutoRetryCheck();
-
-    const firstCheckPromise = privateSession.startupAutoRetryCheckPromise;
-    await firstCheckPromise;
-
-    expect(getLastMessagesCalls).toBeGreaterThanOrEqual(1);
-
-    const deadline = Date.now() + 3000;
-    while (
-      !events.some((event) => event.type === "auto-retry-scheduled") &&
-      Date.now() < deadline
-    ) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-
-    expect(getLastMessagesCalls).toBeGreaterThanOrEqual(2);
-    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
-    expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
-
-    await session.dispose();
-  });
-
-  test("backs off reruns after repeated startup history read failures", async () => {
-    const workspaceId = "startup-retry-history-read-backoff";
-    const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
-
-    const appendResult = await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "Interrupted while history is unavailable", {
-        timestamp: Date.now(),
-      })
-    );
-    expect(appendResult.success).toBe(true);
-
-    let getLastMessagesCalls = 0;
-    historyService.getLastMessages = mock(() => {
-      getLastMessagesCalls += 1;
-      return Promise.resolve({
-        success: false as const,
-        error: "persistent history read failure",
-      });
-    }) as unknown as HistoryService["getLastMessages"];
-
-    const privateSession = session as unknown as {
-      startupAutoRetryCheckPromise: Promise<void> | null;
-    };
-
-    session.ensureStartupAutoRetryCheck();
-    await privateSession.startupAutoRetryCheckPromise;
-
-    expect(getLastMessagesCalls).toBe(1);
-
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    expect(getLastMessagesCalls).toBe(1);
-
-    const deadline = Date.now() + 2500;
-    while (getLastMessagesCalls < 2 && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-
-    expect(getLastMessagesCalls).toBeGreaterThanOrEqual(2);
-
-    await session.dispose();
-  });
-
-  test("runStartupRecovery gives up after repeated deferred history-read failures", async () => {
-    const workspaceId = "startup-recovery-deferred-cap";
-    const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
-
-    const appendResult = await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "Interrupted while history keeps failing", {
-        timestamp: Date.now(),
-      })
-    );
-    expect(appendResult.success).toBe(true);
-
-    let getLastMessagesCalls = 0;
-    historyService.getLastMessages = mock(() => {
-      getLastMessagesCalls += 1;
-      return Promise.resolve({
-        success: false as const,
-        error: "persistent history read failure",
-      });
-    }) as unknown as HistoryService["getLastMessages"];
-
-    const privateSession = session as unknown as {
-      runStartupRecovery: () => Promise<void>;
-      waitForStartupAutoRetryRerunWindow: (retryDelayMs?: number) => Promise<void>;
-      startupRecoveryScheduled: boolean;
-      startupAutoRetryCheckScheduled: boolean;
-    };
-    const waitSpy = spyOn(privateSession, "waitForStartupAutoRetryRerunWindow").mockResolvedValue(
-      undefined
-    );
-
-    await privateSession.runStartupRecovery();
-
-    expect(getLastMessagesCalls).toBe(5);
-    expect(waitSpy).toHaveBeenCalledTimes(3);
-    expect(privateSession.startupRecoveryScheduled).toBe(false);
-    expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
-
-    await session.dispose();
-  });
-
-  test("waits for AI streaming to settle before rerunning deferred startup checks", async () => {
-    const workspaceId = "startup-retry-wait-stream-settle";
-    let aiStreaming = true;
-    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({
-      workspaceId,
-      aiServiceOverrides: {
-        isStreaming: mock((_workspaceId: string) => aiStreaming),
-      },
-    });
-    cleanups.push(cleanup);
-
-    const privateSession = session as unknown as {
-      scheduleStartupAutoRetryIfNeeded: () => Promise<"completed" | "deferred">;
-      startupAutoRetryCheckPromise: Promise<void> | null;
-      startupAutoRetryCheckScheduled: boolean;
-    };
-
-    let scheduleCalls = 0;
-    privateSession.scheduleStartupAutoRetryIfNeeded = mock(() => {
-      scheduleCalls += 1;
-      const outcome: "completed" | "deferred" = scheduleCalls === 1 ? "deferred" : "completed";
-      return Promise.resolve(outcome);
-    });
-
-    session.ensureStartupAutoRetryCheck();
-
-    const firstCheckPromise = privateSession.startupAutoRetryCheckPromise;
-    await firstCheckPromise;
-
-    expect(scheduleCalls).toBe(1);
-    expect(privateSession.startupAutoRetryCheckScheduled).toBe(false);
-
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(scheduleCalls).toBe(1);
-
-    aiStreaming = false;
-    void runSessionTerminalPolicy(session, aiEmitter, {
-      type: "stream-abort",
-      workspaceId,
-      messageId: "assistant-1",
-      abortReason: "system",
-    });
-
-    const deadline = Date.now() + 1000;
-    while (scheduleCalls < 2 && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-
-    expect(scheduleCalls).toBe(2);
-    expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
 
     await session.dispose();
   });
@@ -780,12 +512,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     const startupRetryModelHint = await session.getStartupAutoRetryModelHint();
     expect(startupRetryModelHint).toBe("anthropic:claude-sonnet-4-5");
 
-    session.ensureStartupAutoRetryCheck();
-
-    const startupCheckPromise = (
-      session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
 
     const retryOptions = (
       session as unknown as {
@@ -836,9 +563,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendResult.success).toBe(true);
 
-    session.ensureStartupAutoRetryCheck();
-    await (session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null })
-      .startupAutoRetryCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
 
     const retryOptions = (
       session as unknown as {
@@ -889,12 +614,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendResult.success).toBe(true);
 
-    session.ensureStartupAutoRetryCheck();
-
-    const startupCheckPromise = (
-      session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
 
     const retryOptions = (
       session as unknown as {
@@ -926,12 +646,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendResult.success).toBe(true);
 
-    session.ensureStartupAutoRetryCheck();
-
-    const startupCheckPromise = (
-      session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
 
     const replayEvents: WorkspaceChatMessage[] = [];
     await session.replayHistory(({ message }) => {
@@ -982,12 +697,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       captureEvents: true,
     });
 
-    secondSession.ensureStartupAutoRetryCheck();
-
-    const startupCheckPromise = (
-      secondSession as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await secondSession.ensureStartupAutoRetryCheck();
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
@@ -1008,12 +718,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(appendResult.success).toBe(true);
 
     session.setLegacyAutoRetryEnabledHint(false);
-    session.ensureStartupAutoRetryCheck();
-
-    const startupCheckPromise = (
-      session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
@@ -1067,12 +772,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       captureEvents: true,
     });
 
-    secondSession.ensureStartupAutoRetryCheck();
-
-    const startupCheckPromise = (
-      secondSession as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await secondSession.ensureStartupAutoRetryCheck();
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
@@ -1118,56 +818,11 @@ describe("AgentSession startup auto-retry recovery", () => {
       captureEvents: true,
     });
 
-    secondSession.ensureStartupAutoRetryCheck();
-
-    const startupCheckPromise = (
-      secondSession as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await secondSession.ensureStartupAutoRetryCheck();
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
     await secondSession.dispose();
-  });
-
-  test("reports auto-retry as pending while retry resume is starting", async () => {
-    const workspaceId = "startup-retry-starting-pending";
-    const { session, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
-
-    const privateSession = session as unknown as {
-      retryActiveStream: () => Promise<void>;
-      lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-      resumeStream: (
-        options: SendMessageOptions
-      ) => Promise<{ success: true; data: { started: boolean } }>;
-    };
-
-    privateSession.lastAutoRetryResumeRequest = {
-      options: {
-        model: "anthropic:claude-sonnet-4-5",
-        agentId: "exec",
-      },
-    };
-
-    let resolveResume!: (result: { success: true; data: { started: boolean } }) => void;
-    privateSession.resumeStream = mock(
-      (_options: SendMessageOptions) =>
-        new Promise<{ success: true; data: { started: boolean } }>((resolve) => {
-          resolveResume = resolve;
-        })
-    );
-
-    const retryPromise = privateSession.retryActiveStream();
-
-    expect(session.hasPendingAutoRetry()).toBe(true);
-
-    resolveResume({ success: true, data: { started: true } });
-    await retryPromise;
-
-    expect(session.hasPendingAutoRetry()).toBe(false);
-
-    await session.dispose();
   });
 
   test("clears persisted startup abandon state once retry resumes successfully", async () => {
@@ -1893,12 +1548,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(writePartialResult.success).toBe(true);
 
-    session.ensureStartupAutoRetryCheck();
-
-    const startupCheckPromise = (
-      session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
-    ).startupAutoRetryCheckPromise;
-    await startupCheckPromise;
+    await session.ensureStartupAutoRetryCheck();
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 

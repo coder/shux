@@ -489,6 +489,7 @@ export class TurnCoordinator {
     ReturnType<typeof Promise.withResolvers<DecisionOutcome>>
   >();
   private idleWaiters = new Set<() => void>();
+  private unbusyWaiters = new Set<() => void>();
   private prepared?: { id: TurnId; controller: AbortController };
   private thinking: { holder: ActiveTurnThinkingOverride; resource?: Disposable } | null = null;
   private readonly execution = new TurnExecution(defaultEffectRunner);
@@ -584,6 +585,8 @@ export class TurnCoordinator {
       (command) => command.type === "phase" && command.next.phase === "idle"
     );
     const waiters = idle ? this.idleWaiters : undefined;
+    const unbusyWaiters = !this.isBusy() ? this.unbusyWaiters : undefined;
+    if (unbusyWaiters) this.unbusyWaiters = new Set();
     const retiredThinking = idle ? this.thinking : undefined;
     const retiredPrepared =
       idle && this.prepared?.id === result.state.turn.id ? this.prepared : undefined;
@@ -660,6 +663,7 @@ export class TurnCoordinator {
       }
     }
     for (const resolve of waiters ?? []) resolve();
+    for (const resolve of unbusyWaiters ?? []) resolve();
     retiredThinking?.resource?.[Symbol.dispose]();
     // Outcomes live in pure state; the registry holds resources only, including pending waiters.
     const keys = new Set(
@@ -743,6 +747,9 @@ export class TurnCoordinator {
     const waiters = this.idleWaiters;
     this.idleWaiters = new Set();
     for (const finish of waiters) finish();
+    const unbusyWaiters = this.unbusyWaiters;
+    this.unbusyWaiters = new Set();
+    for (const finish of unbusyWaiters) finish();
   }
   dispose(): void {
     this.beginShutdown();
@@ -775,14 +782,24 @@ export class TurnCoordinator {
   }
 
   waitForIdle(signal?: AbortSignal): Promise<void> {
+    return this.waitForIdleState(false, signal);
+  }
+
+  /** Recovery also waits for edits which reserve history while the visible phase stays idle. */
+  waitForUnbusy(signal?: AbortSignal): Promise<void> {
+    return this.waitForIdleState(true, signal);
+  }
+
+  private waitForIdleState(includeEdits: boolean, signal?: AbortSignal): Promise<void> {
     assert(
       signal == null || typeof signal.aborted === "boolean",
       "waitForIdle signal must be an AbortSignal"
     );
     if (signal?.aborted) return Promise.reject(new Error("Waiting for session idle canceled."));
-    if (this.phase === "idle" || this.closing) return Promise.resolve();
+    if ((includeEdits ? !this.isBusy() : this.phase === "idle") || this.closing)
+      return Promise.resolve();
     return new Promise<void>((resolve, reject) => {
-      const batch = this.idleWaiters;
+      const batch = includeEdits ? this.unbusyWaiters : this.idleWaiters;
       let canceled = false;
       const finish = () => resource[Symbol.dispose]();
       const abort = () => {
@@ -810,10 +827,6 @@ export class TurnCoordinator {
   finishRetry(id: symbol): void {
     this.dispatch({ type: "retry-finish", id });
   }
-  clearRetryStarting(): void {
-    if (this.state.retry) this.finishRetry(this.state.retry);
-  }
-
   registerOperation(turnId: TurnId): OperationId {
     const id = Symbol("operation");
     this.settlements.set(id, Promise.withResolvers<void>());
