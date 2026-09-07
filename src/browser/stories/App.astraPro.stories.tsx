@@ -9,10 +9,25 @@ import { getModelKey, getReasoningModeKey, getThinkingLevelKey } from "@/common/
 export default { ...appMeta, title: "App/Astra Pro" };
 
 const workspaceId = "ws-astra-pro";
+const phoneViewport = { name: "Phone", styles: { width: "390px", height: "844px" } };
 
 export const CoderGateway: AppStory = {
-  globals: { viewport: { value: "mobile1", isRotated: false } },
-  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+  // The test-runner ignores viewport globals, so enforce the narrow container there too.
+  decorators: [
+    (Story) => (
+      <div
+        data-testid="astra-pro-phone"
+        style={{ width: `min(${phoneViewport.styles.width}, 100%)`, height: "100%" }}
+      >
+        <Story />
+      </div>
+    ),
+  ],
+  globals: { viewport: { value: "astraPhone", isRotated: false } },
+  parameters: {
+    viewport: { options: { astraPhone: phoneViewport } },
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
+  },
   render: () => (
     <AppWithMocks
       setup={() => {
@@ -56,13 +71,15 @@ export const CoderGateway: AppStory = {
     await expect(trigger).toHaveAccessibleName("Thinking: high");
     await userEvent.click(pro);
     const menu = canvas.getByRole("listbox", { name: "Reasoning effort" });
-    await expect(menu.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
-    await expect(menu.getBoundingClientRect().left).toBeGreaterThanOrEqual(0);
+    const bounds = (canvas.queryByTestId("astra-pro-phone") ?? root).getBoundingClientRect();
+    await expect(menu.getBoundingClientRect().right).toBeLessThanOrEqual(bounds.right);
+    await expect(menu.getBoundingClientRect().left).toBeGreaterThanOrEqual(bounds.left);
   },
 };
 
 export const Desktop: AppStory = {
   ...CoderGateway,
+  decorators: [],
   globals: { viewport: { value: "desktop", isRotated: false } },
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
   play: async (context) => CoderGateway.play!(context),

@@ -7,6 +7,7 @@ import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
 import { wouldRouteOpenAIThroughCodexOauth } from "@/common/utils/providers/codexOauthRouting";
+import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
 
 export interface OpenAIDirectProviderOptionsAvailability {
   /** Settings-resolved route for the canonical model ("direct" = no gateway). */
@@ -36,7 +37,17 @@ export function resolveProviderOptionsRoute(
         gatewayConfig.isEnabled !== false &&
         gatewayDefinition.kind === "gateway" &&
         (origin === explicitGateway ||
-          (gatewayDefinition.routes as readonly string[]).includes(origin)));
+          (gatewayDefinition.routes as readonly string[]).includes(origin)) &&
+        // A removed/catalog-excluded Coder model must use the resolved fallback,
+        // even while the gateway itself remains connected.
+        (explicitGateway !== "coder" ||
+          isGatewayModelAccessibleFromAuthoritativeCatalog(
+            explicitGateway,
+            modelString.slice(modelString.indexOf(":") + 1),
+            gatewayConfig.models,
+            gatewayConfig.discoveredModels,
+            gatewayConfig.removedModels
+          )));
     if (gatewayWinsRoute) {
       return explicitGateway;
     }

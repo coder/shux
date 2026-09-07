@@ -21,6 +21,7 @@
 import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
 import { openaiSupportsProMode } from "@/common/types/thinking";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import {
   openaiDirectProviderOptionsAvailable,
@@ -35,7 +36,8 @@ export function openaiProModeAvailable(
   modelString: string,
   options?: ProModeAvailabilityOptions
 ): boolean {
-  if (resolveProviderOptionsRoute(modelString, options) === "coder") {
+  const route = resolveProviderOptionsRoute(modelString, options);
+  if (route === "coder") {
     if (isCustomProviderConfig(options?.providersConfig?.coder)) {
       return false;
     }
@@ -46,7 +48,12 @@ export function openaiProModeAvailable(
       ? modelString.slice("coder:".length)
       : normalizeToCanonical(modelString).replace(":", "/");
     const wire = resolveCoderWireCanonicalModel(gatewayModelId, options?.providersConfig?.coder);
-    return wire?.providerType === "openai" && openaiSupportsProMode(`openai:${wire.modelId}`);
+    return (
+      wire?.providerType === "openai" &&
+      openaiSupportsProMode(
+        resolveModelForMetadata(`openai:${wire.modelId}`, options?.providersConfig ?? null)
+      )
+    );
   }
 
   const wireFormat =
@@ -54,7 +61,11 @@ export function openaiProModeAvailable(
   if (wireFormat === "chatCompletions") {
     return false;
   }
-  const normalized = normalizeToCanonical(modelString);
+  // An unavailable custom-named Coder instance can fall back to its real upstream.
+  // Keep unknown/compatible instances scoped rather than guessing from their name.
+  const normalized = modelString.startsWith("coder:")
+    ? (resolveCoderGatewayMetadataModel(modelString, options?.providersConfig) ?? modelString)
+    : normalizeToCanonical(modelString);
   const [origin] = normalized.split(":", 2);
   if (origin !== "openai") {
     return false;
@@ -67,5 +78,8 @@ export function openaiProModeAvailable(
     return false;
   }
 
-  return openaiDirectProviderOptionsAvailable(modelString, options);
+  return openaiDirectProviderOptionsAvailable(normalized, {
+    ...options,
+    resolvedRouteProvider: route,
+  });
 }

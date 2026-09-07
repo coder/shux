@@ -217,10 +217,13 @@ describe("advisor tool", () => {
   });
 
   it.each([
-    { optionsRouteProvider: "coder" },
-    { optionsRouteProvider: "mux-gateway" },
-    { optionsMuxProviderOptions: { openai: { wireFormat: "chatCompletions" } } },
-  ] as const)("does not emit advisor Pro on unsupported routes/wires: %j", async (modelOptions) => {
+    { modelOptions: { optionsRouteProvider: "coder" }, expectedMode: "pro" },
+    { modelOptions: { optionsRouteProvider: "mux-gateway" }, expectedMode: undefined },
+    {
+      modelOptions: { optionsMuxProviderOptions: { openai: { wireFormat: "chatCompletions" } } },
+      expectedMode: undefined,
+    },
+  ] as const)("gates advisor Pro by the effective route/wire: %j", async (testCase) => {
     using tempDir = new TestTempDir("advisor-reasoning-route");
     const { config } = createToolConfig(tempDir.path);
     const streamTextSpy = mockStreamTextSuccess({
@@ -238,12 +241,14 @@ describe("advisor tool", () => {
             model: Object.create(null) as LanguageModel,
             optionsModelString: "openai:gpt-5.6",
             optionsProvidersConfig: null,
-            ...modelOptions,
+            ...testCase.modelOptions,
           }),
       },
     });
     await tool.execute!({}, mockToolCallOptions);
-    expect(getStreamTextArgs(streamTextSpy).providerOptions?.openai?.reasoningMode).toBeUndefined();
+    expect(getStreamTextArgs(streamTextSpy).providerOptions?.openai?.reasoningMode).toBe(
+      testCase.expectedMode
+    );
   });
 
   it("reports model usage after a successful advisor call", async () => {

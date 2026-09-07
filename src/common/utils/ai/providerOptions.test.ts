@@ -1249,6 +1249,7 @@ describe("buildProviderOptions - OpenAI", () => {
         isConfigured: true,
         codexOauthSet: true,
         wireFormat: "chatCompletions",
+        models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
       },
       coder: {
         apiKeySet: false,
@@ -1266,6 +1267,8 @@ describe("buildProviderOptions - OpenAI", () => {
       ["coder:openai/gpt-6-astra", true],
       ["coder:prod-openai/gpt-6-astra", true],
       ["openai:gpt-6-astra", true],
+      ["openai:team-astra", true],
+      ["coder:prod-openai/team-astra", true],
       ["coder:openai/gpt-5.6-sol", true],
       ["coder:openai/gpt-6-astra-mini", false],
       ["coder:compat/gpt-6-astra", false],
@@ -1298,6 +1301,65 @@ describe("buildProviderOptions - OpenAI", () => {
         })
       ).toBe(false);
     });
+
+    const fallbackAvailability: Array<Partial<NonNullable<ProvidersConfigMap["coder"]>>> = [
+      { isEnabled: false, isConfigured: true },
+      { isEnabled: true, isConfigured: false },
+      { isEnabled: true, isConfigured: true, discoveredModels: [] },
+      { isEnabled: true, isConfigured: true, removedModels: ["prod-openai/gpt-6-astra"] },
+    ];
+    test.each(fallbackAvailability)(
+      "preserves Pro on custom-instance direct fallback (%j)",
+      (availability) => {
+        const config: ProvidersConfigMap = {
+          ...providersConfig,
+          openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          coder: { ...providersConfig.coder, ...availability },
+        };
+        const model = "coder:prod-openai/gpt-6-astra";
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: config,
+            resolvedRouteProvider: "direct",
+          })
+        ).toBe(true);
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: config,
+            resolvedRouteProvider: "mux-gateway",
+          })
+        ).toBe(false);
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: config,
+            resolvedRouteProvider: "direct",
+            openaiWireFormat: "chatCompletions",
+          })
+        ).toBe(false);
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: { ...config, openai: { ...config.openai, codexOauthSet: true } },
+            resolvedRouteProvider: "direct",
+          })
+        ).toBe(false);
+      }
+    );
+
+    test.each(["compat", "unknown"])(
+      "does not invent an upstream for %s on fallback",
+      (instance) => {
+        expect(
+          openaiProModeAvailable(`coder:${instance}/gpt-6-astra`, {
+            providersConfig: {
+              ...providersConfig,
+              openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+              coder: { ...providersConfig.coder, isEnabled: false },
+            },
+            resolvedRouteProvider: "direct",
+          })
+        ).toBe(false);
+      }
+    );
 
     test.each(["anthropic", "openai-compat"])(
       "does not trust an OpenAI-named instance whose type is %s",
