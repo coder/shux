@@ -1541,6 +1541,29 @@ describe("WorkspaceStore", () => {
       const usage = store.getWorkspaceUsage(workspaceId);
       expect(usage.liveMetadataModel).toBe("anthropic:claude-sonnet-4-20250514");
       expect(usage.liveCostUsage?.input.cost_usd).toBeGreaterThan(0);
+      // Use the live handler below replay buffering, as above we seeded the aggregator directly.
+      getInternal<{
+        processStreamEvent: (
+          id: string,
+          target: typeof aggregator,
+          event: WorkspaceChatMessage
+        ) => void;
+      }>(store).processStreamEvent(workspaceId, aggregator, {
+        type: "stream-metadata",
+        workspaceId,
+        messageId: "msg-live-coder",
+        metadata: {
+          model: "openai:gpt-4o",
+          metadataModel: "openai:gpt-4o",
+          contextWindowTokens: 128_000,
+          routedThroughGateway: false,
+          routeProvider: null,
+        },
+      });
+      // The metadata event must invalidate live pricing even before another usage delta arrives.
+      const afterFallback = store.getWorkspaceUsage(workspaceId);
+      expect(afterFallback.liveMetadataModel).toBe("openai:gpt-4o");
+      expect(afterFallback.liveCostUsage?.input.tokens).toBe(usage.liveCostUsage?.input.tokens);
     });
   });
 

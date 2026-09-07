@@ -8,6 +8,8 @@ import { getInterruptionContext } from "@/common/utils/messages/retryEligibility
 import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 import { MAX_HISTORY_HIDDEN_SEGMENTS } from "./transcriptTruncationPlan";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
+import { applyWorkspaceChatEventToAggregator } from "./applyWorkspaceChatEventToAggregator";
+import type { StreamMetadataEvent } from "@/common/types/stream";
 
 // Test helper: create aggregator with default createdAt for tests
 const TEST_CREATED_AT = "2024-01-01T00:00:00.000Z";
@@ -4708,4 +4710,53 @@ describe("notify tool -> browser notifications", () => {
       expect(rebuilt?.parts).toEqual([{ type: "text", text: "final" }]);
     });
   });
+});
+
+test("fallback metadata refreshes desktop model identity without dropping streamed content or usage", () => {
+  const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT, TEST_WORKSPACE_ID);
+  startTestStream(aggregator);
+  aggregator.handleStreamDelta({
+    type: "stream-delta",
+    workspaceId: TEST_WORKSPACE_ID,
+    messageId: "msg1",
+    delta: "keep text",
+    tokens: 2,
+    timestamp: 10,
+  });
+  const usage = { inputTokens: 1000, outputTokens: 2, totalTokens: 1002 };
+  aggregator.handleUsageDelta({
+    type: "usage-delta",
+    workspaceId: TEST_WORKSPACE_ID,
+    messageId: "msg1",
+    usage,
+    cumulativeUsage: usage,
+  });
+  const original = aggregator.getAllMessages()[0];
+  const event: StreamMetadataEvent = {
+    type: "stream-metadata",
+    workspaceId: TEST_WORKSPACE_ID,
+    messageId: "msg1",
+    metadata: {
+      model: "openai:gpt-4o",
+      metadataModel: "openai:gpt-4o",
+      contextWindowTokens: 400_000,
+      routedThroughGateway: false,
+      routeProvider: null,
+    },
+  };
+  applyWorkspaceChatEventToAggregator(aggregator, { ...event, workspaceId: "different" });
+  applyWorkspaceChatEventToAggregator(aggregator, { ...event, messageId: "different" });
+  expect(aggregator.getCurrentModel()).toBe(TEST_MODEL);
+  expect(applyWorkspaceChatEventToAggregator(aggregator, event)).toBe("immediate");
+  expect(aggregator.getCurrentModel()).toBe("openai:gpt-4o");
+  expect(aggregator.getActiveStreamMetadataModel()).toBe("openai:gpt-4o");
+  expect(aggregator.getAllMessages()[0].parts).toBe(original.parts);
+  expect(aggregator.getAllMessages()[0].metadata?.contextWindowTokens).toBe(400_000);
+  expect(aggregator.getActiveStreamUsage("msg1")).toBe(usage);
+  expect(aggregator.hasInterruptibleActiveStream()).toBe(true);
+  applyWorkspaceChatEventToAggregator(aggregator, {
+    ...event,
+    metadata: { ...event.metadata, contextWindowTokens: null },
+  });
+  expect(aggregator.getAllMessages()[0].metadata?.contextWindowTokens).toBeNull();
 });

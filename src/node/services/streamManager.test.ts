@@ -5,7 +5,11 @@ import * as path from "node:path";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { StreamEndEventSchema, ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
+import {
+  StreamEndEventSchema,
+  StreamMetadataEventSchema,
+  ToolCallStartEventSchema,
+} from "@/common/orpc/schemas/stream";
 import type {
   CompletedMessagePart,
   ToolCallEndEvent,
@@ -4556,6 +4560,133 @@ describe("StreamManager - empty stream completions", () => {
     };
     expect(Object.keys(swappedRequest.tools ?? {})).toEqual(Object.keys(fallbackTools));
     expect(swappedRequest.system).toBe("fallback system");
+  });
+
+  test("fallback metadata is published before each hop's usage without restarting the message", async () => {
+    const manager = new StreamManager(historyService);
+    const events: TurnEngineEvent[] = [];
+    manager.setEventSink((event) => {
+      events.push(event);
+    });
+    const workspaceId = "fallback-live-metadata";
+    const messageId = "fallback-message";
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    const models = [KNOWN_MODELS.SONNET.id, "openai:gpt-4o", "local:unknown"];
+    const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const waiting = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    let hop = 0;
+    Reflect.set(manager, "createStreamResult", () => {
+      const index = hop++;
+      return createStreamResultForTests(
+        (async function* () {
+          yield { type: "text-delta", text: `fallback ${index}` };
+          yield {
+            type: "finish-step",
+            usage: { inputTokens: 100_000, outputTokens: 0, totalTokens: 100_000 },
+          };
+          waiting[index].resolve();
+          await gates[index].promise;
+          yield {
+            type: "finish",
+            finishReason: index === 0 ? "content-filter" : "stop",
+            ...(index === 0 ? { rawFinishReason: "refusal" } : {}),
+          };
+        })()
+      );
+    });
+    const info = createStreamInfoForTests({
+      messageId,
+      model: models[0],
+      metadataModel: models[0],
+      contextWindowTokens: 1_000_000,
+      historySequence: 1,
+      runtime: LOCAL_TEST_RUNTIME,
+      initialMetadata: {
+        routeProvider: "coder",
+        routedThroughGateway: true,
+        contextBudgetLimit: 50_000,
+      },
+      streamResult: createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text: "original" };
+          yield { type: "tool-call", toolCallId: "tool", toolName: "bash", input: {} };
+          yield {
+            type: "tool-result",
+            toolCallId: "tool",
+            toolName: "bash",
+            output: { success: true },
+          };
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })()
+      ),
+      modelFallback: {
+        requestedModel: models[0],
+        refusedModels: [],
+        original: {},
+        options: {
+          chain: models.slice(1),
+          prepare: (modelString: string) =>
+            Promise.resolve(
+              Ok({
+                model: createTestLanguageModel(),
+                modelString,
+                messages: [],
+                system: "",
+                tools: {},
+                contextWindowTokens: modelString === models[1] ? 400_000 : null,
+                initialMetadataPatch: { routeProvider: undefined, routedThroughGateway: false },
+              })
+            ),
+        },
+      },
+    });
+    getWorkspaceStreamsForTests(manager).set(workspaceId, info);
+    const processing = getProcessStreamWithCleanupForTests(manager).call(
+      manager,
+      workspaceId,
+      info,
+      1
+    );
+    try {
+      for (let index = 0; index < gates.length; index++) {
+        await waiting[index].promise;
+        const updates = events.filter((event) => event.type === "stream-metadata");
+        expect(updates).toHaveLength(index + 1);
+        expect(StreamMetadataEventSchema.parse(updates[index]).metadata).toMatchObject({
+          model: models[index + 1],
+          metadataModel: models[index + 1],
+          contextWindowTokens: index === 0 ? 400_000 : null,
+          routeProvider: null,
+          modelFallback: { requestedModel: models[0], refusedModels: models.slice(0, index + 1) },
+        });
+        expect(
+          events.filter((event) => event.type === "stream-start" && !event.replay)
+        ).toHaveLength(1);
+        expect(events.some((event) => event.type === "stream-end")).toBe(false);
+        const nextUsage = events.findIndex(
+          (event, offset) => offset > events.indexOf(updates[index]) && event.type === "usage-delta"
+        );
+        expect(nextUsage).toBeGreaterThan(events.indexOf(updates[index]));
+        await manager.replayStream(workspaceId);
+        const replay = events.findLast((event) => event.type === "stream-start");
+        expect(replay).toMatchObject({
+          replay: true,
+          model: models[index + 1],
+          contextWindowTokens: index === 0 ? 400_000 : null,
+        });
+        const parts = info.parts as Array<{ type: string; text?: string; toolCallId?: string }>;
+        expect(parts.some((part) => part.text === "original")).toBe(true);
+        expect(parts.some((part) => part.toolCallId === "tool")).toBe(true);
+        expect((info.initialMetadata as { contextBudgetLimit: number }).contextBudgetLimit).toBe(
+          50_000
+        );
+        gates[index].resolve();
+      }
+    } finally {
+      for (const gate of gates) gate.resolve();
+      await processing;
+    }
   });
 
   test("partial refusal with a configured fallback continues from cloned partial output", async () => {

@@ -910,6 +910,11 @@ export class WorkspaceStore {
       // fresh recompute regardless of how the previous one was wound down.
       this.streamingStatsStore.bump(workspaceId);
     },
+    "stream-metadata": (workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+      this.states.bump(workspaceId);
+      this.usageStore.bump(workspaceId);
+    },
     "stream-lifecycle": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       this.states.bump(workspaceId);
@@ -4301,6 +4306,7 @@ export class WorkspaceStore {
 
     return (
       data.type === "stream-start" ||
+      data.type === "stream-metadata" ||
       data.type === "stream-end" ||
       data.type === "stream-abort" ||
       data.type === "stream-error"

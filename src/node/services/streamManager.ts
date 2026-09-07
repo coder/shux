@@ -35,6 +35,7 @@ import { Ok, Err } from "@/common/types/result";
 import { log, type Logger } from "./log";
 import type {
   StreamStartEvent,
+  StreamMetadataEvent,
   StreamDeltaEvent,
   StreamEndEvent,
   StreamAbortEvent,
@@ -198,6 +199,7 @@ type StreamToken = string & { __brand: "StreamToken" };
 
 export type TurnEngineEvent =
   | StreamStartEvent
+  | StreamMetadataEvent
   | StreamDeltaEvent
   | StreamEndEvent
   | StreamAbortEvent
@@ -3713,6 +3715,11 @@ export class StreamManager {
     streamInfo.initialMetadata = {
       ...streamInfo.initialMetadata,
       ...prepared.data.initialMetadataPatch,
+      // A direct/custom fallback must clear the previous gateway's attribution.
+      routeProvider: prepared.data.initialMetadataPatch?.routeProvider,
+      routedThroughGateway:
+        prepared.data.initialMetadataPatch?.routedThroughGateway ??
+        prepared.data.modelString.startsWith("mux-gateway:"),
       modelFallback: {
         requestedModel: fallbackState.requestedModel,
         refusedModels: [...fallbackState.refusedModels],
@@ -3724,6 +3731,22 @@ export class StreamManager {
     runLanguageModelCleanup(streamInfo.request.model);
     streamInfo.request = nextRequest;
     streamInfo.streamResult = nextStreamResult;
+    if (!streamInfo.abortController.signal.aborted) {
+      this.emitTurnEvent({
+        type: "stream-metadata",
+        workspaceId,
+        messageId: streamInfo.messageId,
+        metadata: {
+          model: metadataModelIdentity(streamInfo.model),
+          metadataModel: streamInfo.metadataModel,
+          contextWindowTokens: streamInfo.contextWindowTokens,
+          thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel | undefined,
+          routedThroughGateway: streamInfo.initialMetadata.routedThroughGateway ?? false,
+          routeProvider: streamInfo.initialMetadata.routeProvider ?? null,
+          modelFallback: streamInfo.initialMetadata.modelFallback,
+        },
+      });
+    }
     await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
     if (
       consumedSwap &&

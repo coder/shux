@@ -221,3 +221,76 @@ test("backend-confirmed unknown active capacity does not borrow a live configure
     ).maxTokens
   ).toBeUndefined();
 });
+
+test("live fallback metadata updates capacity without resetting parts, usage, or stream identity", () => {
+  let state = applyChatEvent(createTranscriptState(), {
+    ...start,
+    model: "anthropic:claude-sonnet-4-20250514",
+    contextWindowTokens: 1_000_000,
+  });
+  state = applyChatEvent(state, {
+    type: "stream-delta",
+    workspaceId: "w",
+    messageId: "b",
+    delta: "partial answer",
+    tokens: 2,
+    timestamp: 2,
+  });
+  state = applyChatEvent(state, {
+    type: "tool-call-start",
+    workspaceId: "w",
+    messageId: "b",
+    toolCallId: "tool",
+    toolName: "bash",
+    tokens: 1,
+    args: {},
+    timestamp: 3,
+  });
+  state = applyChatEvent(state, {
+    ...delta,
+    usage: { inputTokens: 100_000, outputTokens: 0, totalTokens: 100_000 },
+  });
+  const before = state.messages.find((message) => message.id === "b")!;
+  const current = () =>
+    getContextMeterData(
+      state.messages,
+      { model: "openai:gpt-4o", agentId: "exec" },
+      undefined,
+      state.streamingMessageId
+    );
+  expect(current().totalPercentage).toBe(10);
+  const metadataEvent: Extract<WorkspaceChatMessage, { type: "stream-metadata" }> = {
+    type: "stream-metadata",
+    workspaceId: "w",
+    messageId: "b",
+    metadata: {
+      model: "openai:gpt-4o",
+      metadataModel: "openai:gpt-4o",
+      contextWindowTokens: 400_000,
+      routedThroughGateway: false,
+      routeProvider: null,
+      modelFallback: {
+        requestedModel: "anthropic:claude-sonnet-4-20250514",
+        refusedModels: ["anthropic:claude-sonnet-4-20250514"],
+      },
+    },
+  };
+  expect(applyChatEvent(state, { ...metadataEvent, messageId: "old" })).toBe(state);
+  expect(applyChatEvent(state, { ...metadataEvent, workspaceId: "other" })).toBe(state);
+  state = applyChatEvent(state, metadataEvent);
+  expect(state.streaming).toBe(true);
+  expect(state.streamingMessageId).toBe("b");
+  expect(state.messages.find((message) => message.id === "b")?.parts).toBe(before.parts);
+  expect(state.messages.find((message) => message.id === "b")?.metadata?.contextUsage).toBe(
+    before.metadata?.contextUsage
+  );
+  expect(current().totalPercentage).toBe(25);
+  state = applyChatEvent(state, {
+    ...metadataEvent,
+    metadata: { ...metadataEvent.metadata, contextWindowTokens: null },
+  });
+  expect(current().maxTokens).toBeUndefined();
+  // Next-hop usage must still use unknown, not a configured model's familiar capacity.
+  state = applyChatEvent(state, delta);
+  expect(current().maxTokens).toBeUndefined();
+});

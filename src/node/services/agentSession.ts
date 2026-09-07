@@ -8095,6 +8095,13 @@ export class AgentSession {
         this.emitChatEvent(payload);
       }
     });
+    forward("stream-metadata", (payload) => {
+      if (
+        payload.type === "stream-metadata" &&
+        this.streamManager.getStreamInfo(this.workspaceId)?.messageId === payload.messageId
+      )
+        this.emitChatEvent(payload);
+    });
     forward("stream-delta", (payload) => {
       this.markActiveStreamHadAnyOutput();
       this.emitChatEvent(payload);

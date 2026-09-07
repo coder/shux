@@ -200,6 +200,23 @@ export const StreamStartEventSchema = z.object({
     .meta({ description: "ACP prompt correlation id for matching stream events" }),
 });
 
+// A fallback changes request identity within the same response; unlike stream-start,
+// this snapshot must not reset accumulated parts, usage, or stream lifecycle.
+export const StreamMetadataEventSchema = z.object({
+  type: z.literal("stream-metadata"),
+  workspaceId: z.string(),
+  messageId: z.string(),
+  metadata: z.object({
+    model: z.string(),
+    metadataModel: z.string(),
+    contextWindowTokens: ContextWindowTokensSchema,
+    thinkingLevel: ThinkingLevelSchema.optional(),
+    routedThroughGateway: z.boolean(),
+    routeProvider: z.string().nullable(),
+    modelFallback: ModelFallbackRecordSchema.optional(),
+  }),
+});
+
 export const StreamDeltaEventSchema = z.object({
   type: z.literal("stream-delta"),
   workspaceId: z.string(),
@@ -690,6 +707,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   DeleteMessageSchema,
   StreamLifecycleEventSchema,
   StreamStartEventSchema,
+  StreamMetadataEventSchema,
   StreamDeltaEventSchema,
   StreamEndEventSchema,
   StreamAbortEventSchema,

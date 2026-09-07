@@ -17,6 +17,7 @@ import {
 import {
   copyStreamLifecycleSnapshot,
   type StreamStartEvent,
+  type StreamMetadataEvent,
   type StreamDeltaEvent,
   type UsageDeltaEvent,
   type StreamEndEvent,
@@ -2170,6 +2171,27 @@ export class StreamingMessageAggregator {
     });
 
     this.messages.set(data.messageId, streamingMessage);
+    this.markMessageDirty(data.messageId);
+  }
+
+  handleStreamMetadata(data: StreamMetadataEvent): void {
+    const context = this.activeStreams.get(data.messageId);
+    const message = this.messages.get(data.messageId);
+    if (
+      !context ||
+      context.isComplete ||
+      !message ||
+      this.getActiveStreamEntry()?.[0] !== data.messageId ||
+      (this.workspaceId !== undefined && this.workspaceId !== data.workspaceId)
+    )
+      return;
+    const metadata = { ...data.metadata, routeProvider: data.metadata.routeProvider ?? undefined };
+    context.model = metadata.model;
+    context.metadataModel = metadata.metadataModel;
+    context.thinkingLevel = metadata.thinkingLevel;
+    context.routedThroughGateway = metadata.routedThroughGateway;
+    context.routeProvider = metadata.routeProvider;
+    message.metadata = { ...message.metadata, ...metadata };
     this.markMessageDirty(data.messageId);
   }
 

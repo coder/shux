@@ -8,6 +8,7 @@ import type {
 
 import type {
   StreamStartEvent,
+  StreamMetadataEvent,
   StreamDeltaEvent,
   StreamEndEvent,
   StreamAbortEvent,
@@ -85,6 +86,10 @@ export function isDeleteMessage(msg: WorkspaceChatMessage): msg is DeleteMessage
 
 export function isStreamStart(msg: WorkspaceChatMessage): msg is StreamStartEvent {
   return (msg as { type?: string }).type === "stream-start";
+}
+
+export function isStreamMetadata(msg: WorkspaceChatMessage): msg is StreamMetadataEvent {
+  return msg.type === "stream-metadata";
 }
 
 export function isStreamDelta(msg: WorkspaceChatMessage): msg is StreamDeltaEvent {

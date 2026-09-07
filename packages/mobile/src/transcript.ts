@@ -6,6 +6,7 @@ export interface TranscriptState {
   messages: MuxMessage[];
   streaming: boolean;
   streamingMessageId: string | null;
+  streamingWorkspaceId: string | null;
   error: string | null;
   caughtUp: boolean;
   hasOlderHistory: boolean;
@@ -17,6 +18,7 @@ export function createTranscriptState(): TranscriptState {
     messages: [],
     streaming: false,
     streamingMessageId: null,
+    streamingWorkspaceId: null,
     error: null,
     caughtUp: false,
     hasOlderHistory: false,
@@ -49,7 +51,7 @@ function updateMessage(
 
 function finish(state: TranscriptState, id: string): TranscriptState {
   return state.streamingMessageId === null || state.streamingMessageId === id
-    ? { ...state, streaming: false, streamingMessageId: null }
+    ? { ...state, streaming: false, streamingMessageId: null, streamingWorkspaceId: null }
     : state;
 }
 
@@ -147,6 +149,7 @@ export function applyChatEvent(
         ...state,
         streaming: true,
         streamingMessageId: event.messageId,
+        streamingWorkspaceId: event.workspaceId,
         error: null,
         messages: upsert(state.messages, {
           id: event.messageId,
@@ -165,6 +168,21 @@ export function applyChatEvent(
           },
         }),
       };
+    case "stream-metadata":
+      if (
+        !state.streaming ||
+        state.streamingMessageId !== event.messageId ||
+        state.streamingWorkspaceId !== event.workspaceId
+      )
+        return state;
+      return updateMessage(state, event.messageId, (message) => ({
+        ...message,
+        metadata: {
+          ...message.metadata,
+          ...event.metadata,
+          routeProvider: event.metadata.routeProvider ?? undefined,
+        },
+      }));
     case "stream-delta":
     case "reasoning-delta":
       if (state.streamingMessageId !== event.messageId) return state;
@@ -263,7 +281,9 @@ export function applyChatEvent(
       return {
         ...state,
         messages,
-        ...(removedActive ? { streaming: false, streamingMessageId: null } : {}),
+        ...(removedActive
+          ? { streaming: false, streamingMessageId: null, streamingWorkspaceId: null }
+          : {}),
       };
     }
     case "stream-lifecycle": {
@@ -273,6 +293,7 @@ export function applyChatEvent(
         ...state,
         streaming,
         streamingMessageId: streaming ? state.streamingMessageId : null,
+        streamingWorkspaceId: streaming ? state.streamingWorkspaceId : null,
       };
     }
     // tool-call-delta carries incomplete args; tool-call-start supplies parsed

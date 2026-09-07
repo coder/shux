@@ -19,6 +19,7 @@ import type {
   StreamDeltaEventSchema,
   StreamEndEventSchema,
   StreamStartEventSchema,
+  StreamMetadataEventSchema,
   ToolCallDeltaEventSchema,
   ToolCallEndEventSchema,
   ToolCallExecutionStartEventSchema,
@@ -40,6 +41,7 @@ import type {
 export type CompletedMessagePart = MuxReasoningPart | MuxTextPart | MuxToolPart;
 
 export type StreamStartEvent = z.infer<typeof StreamStartEventSchema>;
+export type StreamMetadataEvent = z.infer<typeof StreamMetadataEventSchema>;
 export type StreamDeltaEvent = z.infer<typeof StreamDeltaEventSchema>;
 export type StreamEndEvent = z.infer<typeof StreamEndEventSchema>;
 export type StreamAbortReason = z.infer<typeof StreamAbortReasonSchema>;
