@@ -127,7 +127,13 @@ describe("AgentSession turn completion", () => {
     h.session.onChatEvent(({ message }) => {
       if (message.type !== "stream-abort") return;
       aborted++;
-      replacement = coordinator.prepare();
+      const admission = coordinator.prepare({
+        kind: "fresh",
+        intent: "handoff",
+        expectedTurnId: coordinator.turnId,
+      });
+      if (admission.status !== "admitted") throw new Error("Expected replacement admission");
+      replacement = admission.turnId;
       coordinator.acceptThinkingOverride(replacementThinking, replacement);
     });
     try {

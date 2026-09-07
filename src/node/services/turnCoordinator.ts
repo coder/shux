@@ -9,6 +9,20 @@ export type TurnId = symbol;
 export type OperationId = symbol;
 export type TurnPhase = "idle" | "preparing" | "streaming" | "completing";
 export type StreamErrorRecoveryOutcome = "retry-started" | "terminal";
+export type QueueDrainTrigger = "idle" | "terminal" | "provider-tool" | "send-immediately";
+export type PreparationRequest =
+  | {
+      kind: "fresh";
+      intent: "direct" | "resume" | "handoff" | QueueDrainTrigger;
+      expectedTurnId: TurnId;
+      editReservation?: symbol;
+    }
+  | { kind: "adopt"; turnId: TurnId };
+export type PreparationAdmission =
+  | { status: "admitted"; turnId: TurnId }
+  | { status: "rejected"; reason: "closing" | "blocked" | "retired" }
+  | { status: "deferred"; reason: "busy" };
+
 type ReservationKind = "admission" | "edit" | "manual";
 type DecisionKind = "error" | "compaction";
 type DecisionOutcome = StreamErrorRecoveryOutcome | boolean;
@@ -47,7 +61,7 @@ export interface CoordinatorState {
 }
 
 export type CoordinatorEvent =
-  | { type: "prepare"; id: TurnId }
+  | { type: "prepare"; id: TurnId; request: PreparationRequest }
   | { type: "finish"; id: TurnId; preparingOnly: boolean }
   | { type: "preempt"; id: TurnId }
   | { type: "forget-compaction"; messageId: string }
@@ -84,13 +98,22 @@ export function initialCoordinatorState(id: TurnId): CoordinatorState {
   return { lifetime: "open", turn: { phase: "idle", id }, reservations: [], decisions: [] };
 }
 
+function hasConflictingEdit(state: CoordinatorState, owner?: symbol): boolean {
+  return state.reservations.some((entry) => entry.kind === "edit" && entry.id !== owner);
+}
+
 /** Pure transition seam: stale events cannot publish, launch policy, or release another owner. */
 export function transition(
   state: CoordinatorState,
   event: CoordinatorEvent
-): { state: CoordinatorState; commands: readonly CoordinatorCommand[] } {
+): {
+  state: CoordinatorState;
+  commands: readonly CoordinatorCommand[];
+  admission?: PreparationAdmission;
+} {
   const commands: CoordinatorCommand[] = [];
   let next = state;
+  let admission: PreparationAdmission | undefined;
   const phase = (turn: Turn) => {
     const previous = next.turn;
     next = { ...next, turn };
@@ -128,17 +151,66 @@ export function transition(
     commands.push({ type: "decision", decision: value });
   };
   const current = state.turn.operation;
-  if (state.lifetime === "disposed") return { state, commands };
+  if (state.lifetime === "disposed")
+    return {
+      state,
+      commands,
+      ...(event.type === "prepare"
+        ? { admission: { status: "rejected", reason: "closing" } as const }
+        : {}),
+    };
   switch (event.type) {
-    case "prepare":
-      if (
-        state.lifetime !== "open" ||
-        state.reservations.some((entry) => entry.kind === "admission")
-      )
+    case "prepare": {
+      if (state.lifetime !== "open") {
+        admission = { status: "rejected", reason: "closing" };
         break;
-      if (current) commands.push({ type: "retire", id: current.id });
-      phase({ phase: "preparing", id: event.id });
+      }
+      if (state.reservations.some((entry) => entry.kind === "admission")) {
+        admission = { status: "rejected", reason: "blocked" };
+        break;
+      }
+      const request = event.request;
+      // An edit owns history before PREPARING. Only its exact reservation can claim the
+      // replacement; sharing the idle turn epoch never authorizes a competing send.
+      const editOwner =
+        request.kind === "fresh" && request.intent === "direct"
+          ? request.editReservation
+          : undefined;
+      if (hasConflictingEdit(state, editOwner)) {
+        admission = { status: "deferred", reason: "busy" };
+        break;
+      }
+      if (request.kind === "adopt") {
+        if (state.turn.id !== request.turnId || state.turn.phase !== "preparing") {
+          admission = { status: "rejected", reason: "retired" };
+          break;
+        }
+        // Adoption attaches startup to the exact queued owner, without retiring or republishing it.
+      } else {
+        if (state.turn.id !== request.expectedTurnId) {
+          admission = { status: "rejected", reason: "retired" };
+          break;
+        }
+        const idleOnly = request.intent === "resume" || request.intent === "idle";
+        const queue =
+          request.intent === "terminal" ||
+          request.intent === "provider-tool" ||
+          request.intent === "send-immediately" ||
+          request.intent === "idle";
+        if (
+          (idleOnly && state.turn.phase !== "idle") ||
+          ((queue || request.intent === "direct") && state.turn.phase === "preparing") ||
+          (request.intent === "direct" && state.turn.phase === "streaming")
+        ) {
+          admission = { status: "deferred", reason: "busy" };
+          break;
+        }
+        if (current) commands.push({ type: "retire", id: current.id });
+        phase({ phase: "preparing", id: event.id });
+      }
+      admission = { status: "admitted", turnId: event.id };
       break;
+    }
     case "preempt":
       if (state.turn.id !== event.id || state.turn.phase !== "preparing") break;
       if (current) commands.push({ type: "retire", id: current.id });
@@ -266,7 +338,7 @@ export function transition(
       commands.push({ type: "dispose" });
       break;
   }
-  return { state: next, commands };
+  return { state: next, commands, admission };
 }
 
 interface CoordinatorCallbacks {
@@ -451,6 +523,9 @@ export class TurnCoordinator {
   get editReserved(): boolean {
     return this.hasReservation("edit");
   }
+  editBlocked(owner?: symbol): boolean {
+    return hasConflictingEdit(this.state, owner);
+  }
   get manualFollowUpPending(): boolean {
     return this.hasReservation("manual");
   }
@@ -475,14 +550,22 @@ export class TurnCoordinator {
   }
 
   private dispatch(
+    event: Extract<CoordinatorEvent, { type: "prepare" }>,
+    install: () => void
+  ): PreparationAdmission;
+  private dispatch(
     event: Extract<CoordinatorEvent, { type: "completion" }>
   ): Promise<void> | undefined;
   private dispatch(event: Exclude<CoordinatorEvent, { type: "completion" }>): void;
-  private dispatch(event: CoordinatorEvent): Promise<void> | undefined {
+  private dispatch(
+    event: CoordinatorEvent,
+    install?: () => void
+  ): Promise<void> | PreparationAdmission | undefined {
     let launchedPolicy: Promise<void> | undefined;
     let publicationError: { error: unknown } | undefined;
     const result = transition(this.state, event);
     this.state = result.state;
+    if (result.admission?.status === "admitted") install?.();
     // Detach before *any* callback. An idle observer may synchronously admit a new turn and waiter.
     const idle = result.commands.some(
       (command) => command.type === "phase" && command.next.phase === "idle"
@@ -573,19 +656,34 @@ export class TurnCoordinator {
     // Publication failures retain their original propagation, but cannot orphan the detached
     // batch or skip disposal's retired resources. A later dispose no longer owns that batch.
     if (publicationError) throw publicationError.error;
-    return launchedPolicy;
+    return result.admission ?? launchedPolicy;
   }
 
-  prepare(controller?: AbortController, reservation?: TurnId): TurnId {
-    const id = reservation ?? Symbol("turn");
-    if (reservation && (!this.isCurrentTurn(reservation) || this.phase !== "preparing"))
-      return Symbol("rejected admission");
-    // Resource publication precedes lifecycle callbacks, just like ownership publication.
-    if (this.state.lifetime !== "open" || this.admissionBlocked)
-      return Symbol("rejected admission");
-    this.prepared = controller ? { id, controller } : undefined;
-    this.dispatch({ type: "prepare", id });
-    return id;
+  prepare(
+    request: PreparationRequest,
+    controller?: AbortController,
+    install?: (turnId: TurnId) => void
+  ): PreparationAdmission {
+    const id = request.kind === "adopt" ? request.turnId : Symbol("turn");
+    let admission: PreparationAdmission;
+    try {
+      admission = this.dispatch({ type: "prepare", id, request }, () => {
+        // Ownership and abort resources precede callbacks, including synchronous shutdown.
+        this.prepared = controller ? { id, controller } : undefined;
+        install?.(id);
+      });
+    } catch (error) {
+      if (!install) this.finishPreparation(id);
+      throw error;
+    }
+    // A PREPARING observer can retire this claim before dispatch returns. Never signal a
+    // service preflight handoff or dequeue on the strength of that obsolete publication.
+    if (
+      admission.status === "admitted" &&
+      (!this.isCurrentTurn(id) || this.closing || this.phase !== "preparing")
+    )
+      return { status: "rejected", reason: "retired" };
+    return admission;
   }
 
   finishPreparation(id: TurnId): void {
@@ -635,10 +733,10 @@ export class TurnCoordinator {
     }
   }
 
-  reserve(kind: ReservationKind): Disposable {
+  reserve(kind: ReservationKind): Disposable & { readonly id: symbol } {
     const id = Symbol(kind);
     this.dispatch({ type: "reserve", id, kind });
-    return { [Symbol.dispose]: () => this.dispatch({ type: "release", id, kind }) };
+    return { id, [Symbol.dispose]: () => this.dispatch({ type: "release", id, kind }) };
   }
 
   registerManualFollowUp(signal?: AbortSignal): () => void {

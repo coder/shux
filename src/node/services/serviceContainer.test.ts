@@ -181,7 +181,13 @@ describe("ServiceContainer", () => {
     expect(services.collectRestartBlockers()).toEqual([]);
     const session = services.workspaceService.getOrCreateSession("restart-test");
     const { coordinator } = session as unknown as { coordinator: TurnCoordinator };
-    const turn = coordinator.prepare();
+    const admission = coordinator.prepare({
+      kind: "fresh",
+      intent: "handoff",
+      expectedTurnId: coordinator.turnId,
+    });
+    if (admission.status !== "admitted") throw new Error("Expected turn admission");
+    const turn = admission.turnId;
     expect(services.collectRestartBlockers()).toContainEqual({ kind: "pending-turns", count: 1 });
     coordinator.finishPreparation(turn);
     session.queueMessage("queued for later");

@@ -33,6 +33,15 @@ function startEvent(messageId: string): StreamStartEvent {
   };
 }
 
+function prepare(coordinator: TurnCoordinator, controller?: AbortController): TurnId {
+  const result = coordinator.prepare(
+    { kind: "fresh", intent: "handoff", expectedTurnId: coordinator.turnId },
+    controller
+  );
+  if (result.status !== "admitted") throw new Error(`Preparation ${result.status}`);
+  return result.turnId;
+}
+
 function setup(overrides: Partial<ConstructorParameters<typeof TurnCoordinator>[0]> = {}) {
   const callbacks = {
     phaseChanged: mock(() => undefined),
@@ -44,9 +53,11 @@ function setup(overrides: Partial<ConstructorParameters<typeof TurnCoordinator>[
   return { coordinator: new TurnCoordinator(callbacks), callbacks };
 }
 
+const initialTurn = Symbol("idle");
+
 // Commands are observable work, so a stale event must not merely leave the phase looking right.
 function reduce(events: CoordinatorEvent[]) {
-  let state = initialCoordinatorState(Symbol("idle"));
+  let state = initialCoordinatorState(initialTurn);
   for (const event of events) state = transition(state, event).state;
   return state;
 }
@@ -56,7 +67,7 @@ describe("TurnCoordinator", () => {
     const scope = Scope.makeUnsafe("parallel");
     const { coordinator } = setup();
     coordinator.supervise(runner, scope, () => coordinator.beginShutdown());
-    const turn = coordinator.prepare();
+    const turn = prepare(coordinator);
     coordinator.acceptThinkingOverride({}, turn);
     const signal = new AbortController();
     const canceled = coordinator.waitForIdle(signal.signal);
@@ -78,7 +89,7 @@ describe("TurnCoordinator", () => {
         order.push("settled");
       },
     });
-    const op = coordinator.registerOperation(coordinator.prepare());
+    const op = coordinator.registerOperation(prepare(coordinator));
     const engine = Promise.resolve(completed);
     const consumed = coordinator.consumeCompletion(op, { messageId: "sync", completion: engine });
     await engine.then(() => order.push("observer"));
@@ -99,7 +110,7 @@ describe("TurnCoordinator", () => {
       },
     });
     coordinator.supervise(runner, scope, () => coordinator.beginShutdown());
-    const turn = coordinator.prepare();
+    const turn = prepare(coordinator);
     const op = coordinator.registerOperation(turn);
     coordinator.streamStarted(startEvent("late"));
     const consumed = coordinator.consumeCompletion(op, {
@@ -111,7 +122,10 @@ describe("TurnCoordinator", () => {
       closed = true;
     });
     expect(coordinator.closing).toBe(true);
-    expect(coordinator.prepare()).not.toBe(coordinator.turnId);
+    expect(
+      coordinator.prepare({ kind: "fresh", intent: "resume", expectedTurnId: coordinator.turnId })
+        .status
+    ).toBe("rejected");
     engine.resolve(completed);
     await entered.promise;
     // Engine completion never joins the policy that may itself need engine cleanup.
@@ -135,7 +149,7 @@ describe("TurnCoordinator", () => {
       },
     });
     coordinator.supervise(runner, scope, () => coordinator.beginShutdown());
-    const turn = coordinator.prepare();
+    const turn = prepare(coordinator);
     const op = coordinator.registerOperation(turn);
     coordinator.streamStarted(startEvent("retired"));
     coordinator.beginErrorDecision("retired");
@@ -145,7 +159,7 @@ describe("TurnCoordinator", () => {
       completion: Promise.resolve(completed),
     });
     await entered.promise;
-    const replacement = coordinator.prepare();
+    const replacement = prepare(coordinator);
     await logical;
     let settled = false;
     const decision = coordinator.waitForErrorDecision("retired").then((outcome) => {
@@ -182,7 +196,7 @@ describe("TurnCoordinator", () => {
         },
       });
       coordinator.supervise(runner, scope, () => coordinator.beginShutdown());
-      const op = coordinator.registerOperation(coordinator.prepare());
+      const op = coordinator.registerOperation(prepare(coordinator));
       coordinator.beginErrorDecision("failed");
       await coordinator.consumeCompletion(op, {
         messageId: "failed",
@@ -201,9 +215,13 @@ describe("TurnCoordinator", () => {
       retryA = Symbol("retry A"),
       retryB = Symbol("retry B");
     const state = reduce([
-      { type: "prepare", id: a },
+      {
+        type: "prepare",
+        id: a,
+        request: { kind: "fresh", intent: "handoff", expectedTurnId: initialTurn },
+      },
       { type: "register", id: op, turnId: a },
-      { type: "prepare", id: b },
+      { type: "prepare", id: b, request: { kind: "fresh", intent: "handoff", expectedTurnId: a } },
       { type: "retry-start", id: retryA },
       { type: "retry-start", id: retryB },
     ]);
@@ -227,14 +245,14 @@ describe("TurnCoordinator", () => {
     const { coordinator } = setup({
       phaseChanged: (phase) => {
         if (phase !== "idle" || replacement) return;
-        replacement = coordinator.prepare();
+        replacement = prepare(coordinator);
         coordinator.acceptThinkingOverride(thinkingB, replacement);
         replacementWait = coordinator.waitForIdle().then(() => {
           bIdle = true;
         });
       },
     });
-    const a = coordinator.prepare();
+    const a = prepare(coordinator);
     coordinator.acceptThinkingOverride(thinkingA, a);
     const aWait = coordinator.waitForIdle();
     coordinator.finishTurn(a);
@@ -253,11 +271,11 @@ describe("TurnCoordinator", () => {
   test("preemption abort callbacks cannot finish or overwrite the replacement", () => {
     const { coordinator } = setup();
     const controller = new AbortController();
-    const a = coordinator.prepare(controller);
+    const a = prepare(coordinator, controller);
     const operation = coordinator.registerOperation(a);
     const thinkingB = {};
     controller.signal.addEventListener("abort", () => {
-      const b = coordinator.prepare();
+      const b = prepare(coordinator);
       coordinator.acceptThinkingOverride(thinkingB, b);
     });
     expect(coordinator.preemptPreparation()).toBe(true);
@@ -280,7 +298,7 @@ describe("TurnCoordinator", () => {
     const controller = new AbortController();
     const aborted = mock(() => undefined);
     controller.signal.addEventListener("abort", aborted);
-    coordinator.prepare(controller);
+    prepare(coordinator, controller);
     const idle = coordinator.waitForIdle();
     disposeOnIdle = true;
     coordinator.dispose();
@@ -288,7 +306,10 @@ describe("TurnCoordinator", () => {
     coordinator.dispose();
     expect(aborted).toHaveBeenCalledTimes(1);
     expect(coordinator.disposed).toBe(true);
-    expect(coordinator.isCurrentTurn(coordinator.prepare())).toBe(false);
+    expect(
+      coordinator.prepare({ kind: "fresh", intent: "resume", expectedTurnId: coordinator.turnId })
+        .status
+    ).toBe("rejected");
     expect(callbacks.drainQueue).not.toHaveBeenCalled();
   });
 
@@ -299,8 +320,12 @@ describe("TurnCoordinator", () => {
     const manual = coordinator.registerManualFollowUp();
     await coordinator.waitForIdle();
     expect(coordinator.isBusy()).toBe(true);
-    const rejected = coordinator.prepare();
-    expect(coordinator.isCurrentTurn(rejected)).toBe(false);
+    const rejected = coordinator.prepare({
+      kind: "fresh",
+      intent: "resume",
+      expectedTurnId: coordinator.turnId,
+    });
+    expect(rejected.status).toBe("rejected");
     admission[Symbol.dispose]();
     admission[Symbol.dispose]();
     expect(callbacks.drainQueue).not.toHaveBeenCalled();
@@ -326,7 +351,7 @@ describe("TurnCoordinator", () => {
         if (phase === "completing") observed = coordinator.waitForCompactionDecision("A", false);
       },
     });
-    const a = coordinator.prepare();
+    const a = prepare(coordinator);
     const operation = coordinator.registerOperation(a);
     coordinator.configureOperation(operation, true);
     coordinator.streamStarted(startEvent("A"));
@@ -342,7 +367,7 @@ describe("TurnCoordinator", () => {
     "stale delivered completion settles A's %s decision without touching B",
     async (kind) => {
       const { coordinator, callbacks } = setup();
-      const a = coordinator.prepare();
+      const a = prepare(coordinator);
       const operation = coordinator.registerOperation(a);
       coordinator.configureOperation(operation, true);
       coordinator.streamStarted(startEvent("A"));
@@ -354,7 +379,7 @@ describe("TurnCoordinator", () => {
         coordinator.rawTerminal("completed", "A");
         oldDecision = coordinator.waitForCompactionDecision("A", false);
       }
-      const b = coordinator.prepare();
+      const b = prepare(coordinator);
       await coordinator.consumeCompletion(operation, {
         messageId: "A",
         completion: Promise.resolve(completed),
@@ -371,11 +396,11 @@ describe("TurnCoordinator", () => {
     let b: TurnId | undefined;
     const { coordinator, callbacks } = setup({
       policy: async () => {
-        b = coordinator.prepare();
+        b = prepare(coordinator);
         await continueA.promise;
       },
     });
-    const a = coordinator.prepare();
+    const a = prepare(coordinator);
     const operation = coordinator.registerOperation(a);
     coordinator.streamStarted(startEvent("A"));
     const hardStop = coordinator.captureInterruptSettlement();
@@ -395,7 +420,7 @@ describe("TurnCoordinator", () => {
   test("hard stop joins started policy, but soft and registered startup stop do not", async () => {
     const done = Promise.withResolvers<void>();
     const { coordinator } = setup({ policy: () => done.promise });
-    const a = coordinator.prepare();
+    const a = prepare(coordinator);
     const operation = coordinator.registerOperation(a);
     expect(coordinator.captureInterruptSettlement()).toBeUndefined();
     coordinator.streamStarted(startEvent("A"));
@@ -421,7 +446,7 @@ describe("TurnCoordinator", () => {
     "delivered startup abort with payload=%s claims only its matching notification",
     async (withPayload) => {
       const { coordinator, callbacks } = setup();
-      const a = coordinator.prepare();
+      const a = prepare(coordinator);
       const operation = coordinator.registerOperation(a);
       coordinator.streamStarting(operation, "synthetic-A");
       await coordinator.consumeCompletion(operation, {
@@ -451,7 +476,7 @@ describe("TurnCoordinator", () => {
       },
     });
     const controller = new AbortController();
-    coordinator.prepare(controller);
+    prepare(coordinator, controller);
     const idle = coordinator.waitForIdle();
     expect(() => coordinator.dispose()).toThrow("observer failed");
     await idle;
@@ -466,10 +491,10 @@ describe("TurnCoordinator", () => {
       streamStarted: () => {
         expect(coordinator.captureInterruptSettlement()).toBeDefined();
         reentered = true;
-        coordinator.prepare();
+        prepare(coordinator);
       },
     });
-    const a = coordinator.prepare();
+    const a = prepare(coordinator);
     coordinator.registerOperation(a);
     expect(coordinator.streamStarted(startEvent("A"))).toBe(false);
     expect(reentered).toBe(true);
@@ -479,7 +504,7 @@ describe("TurnCoordinator", () => {
   test("duplicate stream start cannot reopen a raw-terminal completing turn", () => {
     const streamStarted = mock(() => undefined);
     const { coordinator } = setup({ streamStarted });
-    const a = coordinator.prepare();
+    const a = prepare(coordinator);
     coordinator.registerOperation(a);
     expect(coordinator.streamStarted(startEvent("A"))).toBe(true);
     expect(coordinator.streamStarted(startEvent("A"))).toBe(false);
@@ -495,12 +520,99 @@ describe("TurnCoordinator", () => {
       },
     });
     const controller = new AbortController();
-    const a = coordinator.prepare(controller);
+    const a = prepare(coordinator, controller);
     const idle = coordinator.waitForIdle();
     expect(() => coordinator.preemptPreparation()).toThrow("observer failed");
     await idle;
     expect(controller.signal.aborted).toBe(true);
     // The old reservation cannot restart an idle owner after preemption.
-    expect(coordinator.isCurrentTurn(coordinator.prepare(undefined, a))).toBe(false);
+    expect(coordinator.prepare({ kind: "adopt", turnId: a }).status).toBe("rejected");
+  });
+  test("fresh admission cannot replace a busy direct owner, but exact queue adoption does not republish", () => {
+    const published = mock(() => undefined);
+    const { coordinator } = setup({ phaseChanged: published });
+    const first = coordinator.prepare({
+      kind: "fresh",
+      intent: "direct",
+      expectedTurnId: coordinator.turnId,
+    });
+    if (first.status !== "admitted") throw new Error("Expected admission");
+    const events = published.mock.calls.length;
+    for (const intent of [
+      "direct",
+      "resume",
+      "idle",
+      "terminal",
+      "provider-tool",
+      "send-immediately",
+    ] as const) {
+      expect(
+        coordinator.prepare({ kind: "fresh", intent, expectedTurnId: first.turnId }).status
+      ).toBe("deferred");
+    }
+    expect(coordinator.prepare({ kind: "adopt", turnId: first.turnId })).toEqual(first);
+    expect(published.mock.calls).toHaveLength(events);
+    coordinator.finishPreparation(first.turnId);
+    expect(coordinator.prepare({ kind: "adopt", turnId: first.turnId }).status).toBe("rejected");
+  });
+
+  test("a stale handoff cannot install resources or retire its replacement", () => {
+    const { coordinator } = setup();
+    const first = prepare(coordinator);
+    const replacement = prepare(coordinator);
+    const installed = mock(() => undefined);
+    expect(
+      coordinator.prepare(
+        { kind: "fresh", intent: "handoff", expectedTurnId: first },
+        undefined,
+        installed
+      )
+    ).toEqual({ status: "rejected", reason: "retired" });
+    expect(installed).not.toHaveBeenCalled();
+    expect(coordinator.turnId).toBe(replacement);
+    expect(coordinator.phase).toBe("preparing");
+  });
+
+  test("publication retirement returns rejection even when a replacement also publishes PREPARING", () => {
+    let replace = true;
+    let replacement: TurnId | undefined;
+    const { coordinator } = setup({
+      phaseChanged: (phase) => {
+        if (phase !== "preparing" || !replace) return;
+        replace = false;
+        replacement = prepare(coordinator);
+      },
+    });
+    const result = coordinator.prepare({
+      kind: "fresh",
+      intent: "direct",
+      expectedTurnId: coordinator.turnId,
+    });
+    expect(result).toEqual({ status: "rejected", reason: "retired" });
+    if (replacement == null) throw new Error("Expected replacement admission");
+    expect(coordinator.turnId).toBe(replacement);
+    expect(coordinator.phase).toBe("preparing");
+  });
+  test("only the exact edit reservation can claim its idle replacement", () => {
+    const { coordinator } = setup();
+    using edit = coordinator.reserve("edit");
+    const expectedTurnId = coordinator.turnId;
+    for (const editReservation of [undefined, Symbol("unrelated")]) {
+      expect(
+        coordinator.prepare({ kind: "fresh", intent: "direct", expectedTurnId, editReservation })
+      ).toEqual({ status: "deferred", reason: "busy" });
+    }
+    expect(coordinator.turnId).toBe(expectedTurnId);
+    expect(coordinator.prepare({ kind: "fresh", intent: "handoff", expectedTurnId }).status).toBe(
+      "deferred"
+    );
+    expect(
+      coordinator.prepare({
+        kind: "fresh",
+        intent: "direct",
+        expectedTurnId,
+        editReservation: edit.id,
+      }).status
+    ).toBe("admitted");
   });
 });

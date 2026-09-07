@@ -14,6 +14,7 @@ import {
   TurnCoordinator,
   type TurnPhase,
   type TurnId,
+  type QueueDrainTrigger,
   type OperationId,
   type StreamErrorRecoveryOutcome,
 } from "./turnCoordinator";
@@ -666,6 +667,96 @@ interface CachedMemoryContext {
   includesHotMemories: boolean;
 }
 
+interface SendMessageInternalOptions {
+  preparation?: PreparationAttempt;
+  /** A dequeued send keeps its admission owner through acceptance and startup failure. */
+  turnReservation?: TurnId;
+  synthetic?: boolean;
+  agentInitiated?: boolean;
+  goalContinuation?: boolean;
+  goalKind?: GoalSyntheticMessageKind;
+  /** Goal identity persisted alongside goalKind so chat-tail reconciliation can scope the row. */
+  goalId?: string;
+  startStreamInBackground?: boolean;
+  onAccepted?: () => Promise<void> | void;
+  onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
+  onCanceled?: (reason: string) => Promise<void> | void;
+  cancelState?: { canceledBeforeAcceptance: boolean };
+  cancelSignal?: AbortSignal;
+  /**
+   * For queue-dispatched sends: when the user last added to the queued
+   * entry. Goal safety compares it against the goal's explicit
+   * user-activation consent stamp — a message the user visibly left
+   * pending while activating the goal must not auto-pause it (Codex
+   * security P2 PRRT_kwDOPxxmWM6cSGrq: creation time alone is not
+   * consent).
+   */
+  enqueuedAtMs?: number;
+  /**
+   * Codex P2 (PRRT_kwDOPxxmWM6cSRkH): fired synchronously the moment this
+   * turn claims PREPARING (isBusy() becomes true). WorkspaceService keeps
+   * its session-invisible preflight reservation armed until this fires so
+   * follow-up recovery cannot observe the idle gap between the service
+   * handoff and the busy claim (cancelBeforeAcceptance and the other
+   * admission awaits yield) and admit a synthetic turn ahead of the
+   * accepted manual send. Refusal paths never fire it — the service's
+   * scoped disposal releases the reservation when the call returns.
+   */
+  onTurnAdmissionCommitted?: () => void;
+  /**
+   * Synthetic assistant rows persisted immediately before this turn's user
+   * row (family-message payloads). Persisting them inside turn admission —
+   * instead of a direct history append from the sender — keeps them out of
+   * another turn's PREPARING window, where they could land between that
+   * turn's user row and its assistant response (consecutive assistant
+   * messages a tool-using response makes unmergeable) or silently enter an
+   * in-flight request without their trigger (r30).
+   */
+  preTurnMessages?: MuxMessage[];
+  /**
+   * r54: fired once the pre-turn batch has crossed the rollback horizon —
+   * durably committed AND past the last cancellation/rollback gate. From
+   * that point every failure (goal sync, acceptance, stream start) keeps
+   * the rows in the transcript, so budget-style accounting must treat the
+   * delivery as persisted. Turn ACCEPTANCE is the wrong signal: it can
+   * fail after the rows are already irrevocable.
+   */
+  onPreTurnRowsPersisted?: () => void;
+  /**
+   * r41: staleness probe for this send's admission epoch, captured
+   * synchronously with WorkspaceService's entry checks. Returns true when
+   * a context-discarding mutation COMPLETED after the send entered — the
+   * level-triggered admission block check cannot catch a mutation
+   * that started and finished while the send sat in pre-admission
+   * awaits. Not threaded through queued entries: those dispatch into the
+   * post-mutation context by design.
+   */
+  admissionEpochStale?: () => boolean;
+  /**
+   * Caller-supplied staleness probe that, unlike the epoch probe above, IS threaded
+   * through queued entries (MessageQueue stores it per entry and re-emits it at
+   * dispatch). Peer agent sends use it so a Stop/task_stop landing after dequeue —
+   * where queue clearing can no longer see the entry — still refuses the turn at
+   * these admission gates instead of starting a privileged turn on a stopped target.
+   */
+  admissionStale?: () => boolean;
+}
+
+// Enqueueing creates no preparation attempt. Once dispatched, Promise success alone cannot
+// distinguish cancellation, a background transfer, and delivery to terminal policy.
+interface PreparationAttempt {
+  owner?: TurnId;
+  expectedTurn: TurnId;
+  editReservation?: ReturnType<TurnCoordinator["reserve"]>;
+  outcome: "preparing" | "background" | "delivered" | "canceled";
+  durability: "rollback-eligible" | "durable" | "accepted";
+  queued: boolean;
+  failureNotified: boolean;
+  failureAttempts?: number;
+  failure?: SendMessageError;
+  onFailure?: (error: SendMessageError) => Promise<void> | void;
+}
+
 export class AgentSession {
   private readonly workspaceId: string;
   private readonly config: Config;
@@ -703,7 +794,7 @@ export class AgentSession {
     },
     phaseChanged: (phase, isCurrent) => this.publishTurnPhase(phase, isCurrent),
     drainQueue: () => {
-      if (!this.messageQueue.isEmpty()) this.sendQueuedMessages();
+      if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");
     },
     policy: async (operation, messageId, outcome, started, notifyStartup) => {
       if (!this.coordinator.isCurrentOperation(operation)) return;
@@ -3139,94 +3230,114 @@ export class AgentSession {
   async sendMessage(
     message: string,
     options?: SendMessageOptions & { fileParts?: FilePart[] },
-    internal?: {
-      /** A dequeued send keeps its admission owner through acceptance and startup failure. */
-      turnReservation?: TurnId;
-      synthetic?: boolean;
-      agentInitiated?: boolean;
-      goalContinuation?: boolean;
-      goalKind?: GoalSyntheticMessageKind;
-      /** Goal identity persisted alongside goalKind so chat-tail reconciliation can scope the row. */
-      goalId?: string;
-      startStreamInBackground?: boolean;
-      onAccepted?: () => Promise<void> | void;
-      onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
-      onCanceled?: (reason: string) => Promise<void> | void;
-      cancelState?: { canceledBeforeAcceptance: boolean };
-      cancelSignal?: AbortSignal;
-      /**
-       * For queue-dispatched sends: when the user last added to the queued
-       * entry. Goal safety compares it against the goal's explicit
-       * user-activation consent stamp — a message the user visibly left
-       * pending while activating the goal must not auto-pause it (Codex
-       * security P2 PRRT_kwDOPxxmWM6cSGrq: creation time alone is not
-       * consent).
-       */
-      enqueuedAtMs?: number;
-      /**
-       * Codex P2 (PRRT_kwDOPxxmWM6cSRkH): fired synchronously the moment this
-       * turn claims PREPARING (isBusy() becomes true). WorkspaceService keeps
-       * its session-invisible preflight reservation armed until this fires so
-       * follow-up recovery cannot observe the idle gap between the service
-       * handoff and the busy claim (cancelBeforeAcceptance and the other
-       * admission awaits yield) and admit a synthetic turn ahead of the
-       * accepted manual send. Refusal paths never fire it — the service's
-       * scoped disposal releases the reservation when the call returns.
-       */
-      onTurnAdmissionCommitted?: () => void;
-      /**
-       * Synthetic assistant rows persisted immediately before this turn's user
-       * row (family-message payloads). Persisting them inside turn admission —
-       * instead of a direct history append from the sender — keeps them out of
-       * another turn's PREPARING window, where they could land between that
-       * turn's user row and its assistant response (consecutive assistant
-       * messages a tool-using response makes unmergeable) or silently enter an
-       * in-flight request without their trigger (r30).
-       */
-      preTurnMessages?: MuxMessage[];
-      /**
-       * r54: fired once the pre-turn batch has crossed the rollback horizon —
-       * durably committed AND past the last cancellation/rollback gate. From
-       * that point every failure (goal sync, acceptance, stream start) keeps
-       * the rows in the transcript, so budget-style accounting must treat the
-       * delivery as persisted. Turn ACCEPTANCE is the wrong signal: it can
-       * fail after the rows are already irrevocable.
-       */
-      onPreTurnRowsPersisted?: () => void;
-      /**
-       * r41: staleness probe for this send's admission epoch, captured
-       * synchronously with WorkspaceService's entry checks. Returns true when
-       * a context-discarding mutation COMPLETED after the send entered — the
-       * level-triggered admission block check cannot catch a mutation
-       * that started and finished while the send sat in pre-admission
-       * awaits. Not threaded through queued entries: those dispatch into the
-       * post-mutation context by design.
-       */
-      admissionEpochStale?: () => boolean;
-      /**
-       * Caller-supplied staleness probe that, unlike the epoch probe above, IS threaded
-       * through queued entries (MessageQueue stores it per entry and re-emits it at
-       * dispatch). Peer agent sends use it so a Stop/task_stop landing after dequeue —
-       * where queue clearing can no longer see the entry — still refuses the turn at
-       * these admission gates instead of starting a privileged turn on a stopped target.
-       */
-      admissionStale?: () => boolean;
-    }
+    internal?: SendMessageInternalOptions
   ): Promise<AgentSessionResult<void>> {
     this.assertNotDisposed("sendMessage");
     if (this.coordinator.closing)
       return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
-    // Durable acceptance precedes PREPARING. This physical lease changes no busy/queue policy,
-    // but shutdown must join its writes and acceptance callbacks before dependencies disappear.
-    using _execution = this.coordinator.enterExecution();
+    if (internal?.preparation)
+      return this.prepareMessage(message, options, internal, internal.preparation);
+    const attempt: PreparationAttempt = {
+      owner: internal?.turnReservation,
+      expectedTurn: this.coordinator.turnId,
+      outcome: "preparing",
+      durability: "rollback-eligible",
+      queued: internal?.turnReservation != null,
+      failureNotified: false,
+      onFailure: internal?.onAcceptedPreStreamFailure,
+    };
+    return this.completePreparation(attempt, () =>
+      this.prepareMessage(message, options, internal, attempt)
+    );
+  }
 
+  /** Correlated callbacks settle before publishing idle; teardown joins this whole physical lease. */
+  private async completePreparation<T>(
+    attempt: PreparationAttempt,
+    run: () => Promise<AgentSessionResult<T>>
+  ): Promise<AgentSessionResult<T>> {
+    using _execution = this.coordinator.enterExecution();
+    try {
+      const result = await run();
+      if (!result.success) await this.settlePreparationFailure(attempt, result.error);
+      else if (attempt.outcome === "preparing" && attempt.durability === "accepted") {
+        await this.settlePreparationFailure(
+          attempt,
+          createUnknownSendMessageError("Accepted stream startup was canceled before streaming.")
+        );
+      }
+      return result;
+    } catch (error) {
+      await this.settlePreparationFailure(
+        attempt,
+        createUnknownSendMessageError(getErrorMessage(error))
+      );
+      throw error;
+    } finally {
+      try {
+        if (attempt.outcome !== "background" && attempt.owner != null)
+          this.coordinator.finishPreparation(attempt.owner);
+      } finally {
+        // Failed admission may be idle. The resource follows a background transfer and
+        // releases only after correlated cleanup or a valid handoff to terminal policy.
+        this.releasePreparationEdit(attempt);
+        if (
+          attempt.outcome !== "background" &&
+          attempt.outcome !== "delivered" &&
+          attempt.owner != null &&
+          this.coordinator.isCurrentTurn(attempt.owner)
+        )
+          this.drainQueuedMessagesIfIdle();
+      }
+    }
+  }
+
+  private releasePreparationEdit(attempt: PreparationAttempt): void {
+    const reservation = attempt.editReservation;
+    attempt.editReservation = undefined;
+    reservation?.[Symbol.dispose]();
+  }
+
+  private async settlePreparationFailure(
+    attempt: PreparationAttempt,
+    error: SendMessageError
+  ): Promise<void> {
+    if (attempt.failureNotified || (!attempt.queued && attempt.durability !== "accepted")) return;
+    attempt.failure ??= error;
+    while ((attempt.failureAttempts ?? 0) < 2) {
+      attempt.failureAttempts = (attempt.failureAttempts ?? 0) + 1;
+      try {
+        await attempt.onFailure?.(attempt.failure);
+        attempt.failureNotified = true;
+        return;
+      } catch (callbackError) {
+        // Retry cleanup without rerunning persistence or terminal policy. Even persistent
+        // callback failure must not replace the original error or suppress its retry decision.
+        if (attempt.failureAttempts === 2)
+          log.error("Preparation failure callback failed", {
+            workspaceId: this.workspaceId,
+            error: getErrorMessage(callbackError),
+          });
+      }
+    }
+  }
+
+  private async prepareMessage(
+    message: string,
+    options: (SendMessageOptions & { fileParts?: FilePart[] }) | undefined,
+    internal: SendMessageInternalOptions | undefined,
+    attempt: PreparationAttempt
+  ): Promise<AgentSessionResult<void>> {
     assert(typeof message === "string", "sendMessage requires a string message");
 
     const isManualUserMessage = internal?.synthetic !== true;
 
     // Single admission-staleness predicate for all three turn-admission gates below.
     const isAdmissionStale = () =>
-      internal?.admissionEpochStale?.() === true || internal?.admissionStale?.() === true;
+      internal?.admissionEpochStale?.() === true ||
+      internal?.admissionStale?.() === true ||
+      !this.coordinator.isCurrentTurn(attempt.owner ?? attempt.expectedTurn) ||
+      this.coordinator.editBlocked(attempt.editReservation?.id);
 
     const cancelSignal = internal?.cancelSignal;
     const persistedCancelableMessageIds: string[] = [];
@@ -3261,51 +3372,37 @@ export class AgentSession {
         )
       );
     };
+    const markRowsDurable = (): void => {
+      if (attempt.durability !== "rollback-eligible") return;
+      attempt.durability = "durable";
+      if ((internal?.preTurnMessages?.length ?? 0) > 0) internal?.onPreTurnRowsPersisted?.();
+    };
+    const accept = async (): Promise<void> => {
+      await internal?.onAccepted?.();
+      attempt.durability = "accepted";
+    };
+    const refuseBeforeAcceptance = async (
+      error: SendMessageError
+    ): Promise<AgentSessionResult<void>> => {
+      if (attempt.durability === "rollback-eligible" && !(await rollbackPersistedTurnRows()))
+        markRowsDurable();
+      return Err(error);
+    };
     let cancellationHandled = false;
     let cancellationDisabled = false;
     const cancelBeforeAcceptance = async (): Promise<boolean> => {
       if (cancelSignal?.aborted !== true || cancellationDisabled) return false;
       if (cancellationHandled) return true;
 
-      if (persistedCancelableMessageIds.length > 0) {
-        // History also has non-session writers (for example goal pause boundaries). Delete exactly
-        // this preparing turn's rows in one atomic rewrite so later concurrent rows are preserved.
-        this.continuousCompactor.reset("delete-messages");
-        const rollbackResult = await this.historyService.deleteMessages(
-          this.workspaceId,
-          persistedCancelableMessageIds
-        );
-        if (!rollbackResult.success) {
-          // deleteMessages can fail after its atomic rewrite (for example while refreshing
-          // sequence metadata). Verify the durable result before deciding whether cancellation won.
-          const historyResult = await this.historyService.getHistoryFromLatestBoundary(
-            this.workspaceId
-          );
-          const rollbackCommitted =
-            historyResult.success &&
-            persistedCancelableMessageIds.every(
-              (messageId) => !historyResult.data.some((message) => message.id === messageId)
-            );
-          if (!rollbackCommitted) {
-            // Do not report cancellation (which would supersede the durable monitor wake) unless the
-            // not-yet-accepted row is actually gone. Continue accepting this wake instead of leaving
-            // a hidden synthetic row that can leak into a later provider request.
-            cancellationDisabled = true;
-            log.error("Failed to roll back canceled preparing turn; continuing acceptance", {
-              workspaceId: this.workspaceId,
-              error: rollbackResult.error,
-              verificationError: historyResult.success ? undefined : historyResult.error,
-            });
-            return false;
-          }
-          log.warn("Preparing-turn rollback reported failure after its rewrite committed", {
-            workspaceId: this.workspaceId,
-            error: rollbackResult.error,
-          });
-        }
+      // Delete only this attempt's rows; concurrent non-session history writers survive.
+      if (!(await rollbackPersistedTurnRows())) {
+        // The wake remains provider-visible, so cancellation must not refund or supersede it.
+        cancellationDisabled = true;
+        return false;
       }
 
       cancellationHandled = true;
+      attempt.outcome = "canceled";
       await internal?.onCanceled?.(cancelReasonBeforeAcceptance(cancelSignal));
       if (internal?.cancelState != null) {
         internal.cancelState.canceledBeforeAcceptance = true;
@@ -3341,6 +3438,10 @@ export class AgentSession {
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }
+      if (isAdmissionStale())
+        return refuseBeforeAcceptance(
+          createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+        );
       if (!pricingGate.success) {
         if (isManualUserMessage) {
           const persisted = await this.preserveRejectedManualSend(
@@ -3477,6 +3578,39 @@ export class AgentSession {
       }
     }
 
+    // Validate the actual payload before truncate+replace, including non-PDF attachment shape.
+    const additionalParts =
+      preservedEditFileParts && preservedEditFileParts.length > 0
+        ? preservedEditFileParts
+        : fileParts && fileParts.length > 0
+          ? fileParts.map((part, index) => {
+              assert(
+                typeof part.url === "string",
+                `file part [${index}] must include url string content (got ${typeof part.url}): ${JSON.stringify(part).slice(0, 200)}`
+              );
+              assert(
+                part.url.startsWith("data:"),
+                `file part [${index}] url must be a data URL (got: ${part.url.slice(0, 50)}...)`
+              );
+              assert(
+                typeof part.mediaType === "string" && part.mediaType.trim().length > 0,
+                `file part [${index}] must include a mediaType (got ${typeof part.mediaType}): ${JSON.stringify(part).slice(0, 200)}`
+              );
+              if (part.filename !== undefined) {
+                assert(
+                  typeof part.filename === "string",
+                  `file part [${index}] filename must be a string if present (got ${typeof part.filename}): ${JSON.stringify(part).slice(0, 200)}`
+                );
+              }
+              return {
+                type: "file" as const,
+                url: part.url,
+                mediaType: part.mediaType,
+                filename: part.filename,
+              };
+            })
+          : undefined;
+
     // A fork starts its abandoned-branch summary in the background so the fork
     // itself returns fast; the first send must then await that pending row so
     // it keeps its position BEFORE this turn's user message and request build
@@ -3503,23 +3637,13 @@ export class AgentSession {
       this.emitChatEvent({ ...pendingBranchSummary, type: "message" });
     }
 
-    // r32: reserve turn admission for the whole edit flow. Armed AFTER the
-    // preempt/wait section below (arming earlier would make the edit's own
-    // busy-preemption logic see the reservation as an active turn) and
-    // released automatically on every sendMessage exit: on success the turn
-    // phase has taken over busy-ness by then; on a pre-PREPARING failure the
-    // session returns to idle, so drain anything queued behind the
-    // reservation (mirrors the queued-dispatch failure contract).
-    let editReservation: Disposable | undefined;
-    const editAdmission = {
-      arm: () => {
-        editReservation ??= this.coordinator.reserve("edit");
-      },
-      [Symbol.dispose]: () => editReservation?.[Symbol.dispose](),
-    };
-    using _editAdmission = editAdmission;
-
+    // The shared completion owns the edit reservation: a reentrant PREPARING observer
+    // may retire admission back to idle, but queued work must still wait for failure cleanup.
     if (editMessageId) {
+      if (this.coordinator.editBlocked())
+        return refuseBeforeAcceptance(
+          createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+        );
       this.continuousCompactor.reset("edit");
       // Ensure no in-flight completion code can append after we truncate.
       if (this.isBusy()) {
@@ -3574,16 +3698,21 @@ export class AgentSession {
       // other. The epoch probe (r41) also refuses edits whose target rows a
       // completed mutation already discarded.
       if (this.coordinator.admissionBlocked || isAdmissionStale()) {
-        return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+        return refuseBeforeAcceptance(
+          createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+        );
       }
       if (this.coordinator.closing) {
-        return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
+        return refuseBeforeAcceptance(
+          createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE)
+        );
       }
 
       // Idle (or preempted to idle) now: hold busy-ness from here until the
       // turn phase takes over, so concurrent sends queue instead of racing the
       // truncate + summary + append sequence below.
-      editAdmission.arm();
+      attempt.expectedTurn = this.coordinator.turnId;
+      attempt.editReservation ??= this.coordinator.reserve("edit");
 
       // The edit is about to truncate and rewrite history. Any queued content from
       // the previous turn was written in the old context — return it to the input
@@ -3647,37 +3776,6 @@ export class AgentSession {
     }
 
     const messageId = createUserMessageId();
-    const additionalParts =
-      preservedEditFileParts && preservedEditFileParts.length > 0
-        ? preservedEditFileParts
-        : fileParts && fileParts.length > 0
-          ? fileParts.map((part, index) => {
-              assert(
-                typeof part.url === "string",
-                `file part [${index}] must include url string content (got ${typeof part.url}): ${JSON.stringify(part).slice(0, 200)}`
-              );
-              assert(
-                part.url.startsWith("data:"),
-                `file part [${index}] url must be a data URL (got: ${part.url.slice(0, 50)}...)`
-              );
-              assert(
-                typeof part.mediaType === "string" && part.mediaType.trim().length > 0,
-                `file part [${index}] must include a mediaType (got ${typeof part.mediaType}): ${JSON.stringify(part).slice(0, 200)}`
-              );
-              if (part.filename !== undefined) {
-                assert(
-                  typeof part.filename === "string",
-                  `file part [${index}] filename must be a string if present (got ${typeof part.filename}): ${JSON.stringify(part).slice(0, 200)}`
-                );
-              }
-              return {
-                type: "file" as const,
-                url: part.url,
-                mediaType: part.mediaType,
-                filename: part.filename,
-              };
-            })
-          : undefined;
 
     // toolPolicy is properly typed via Zod schema inference
     const typedToolPolicy = options?.toolPolicy;
@@ -3888,6 +3986,15 @@ export class AgentSession {
           }
         );
 
+        if (this.coordinator.admissionBlocked || isAdmissionStale())
+          return refuseBeforeAcceptance(
+            createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+          );
+        if (this.coordinator.closing)
+          return refuseBeforeAcceptance(
+            createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE)
+          );
+
         // Persist compaction request (NOT the user message — it's the follow-up)
         const appendCompactionResult = await this.historyService.appendToHistory(
           this.workspaceId,
@@ -3926,12 +4033,16 @@ export class AgentSession {
     // after a mutation commits; this check and the PREPARING gate remain
     // backstops for entry-accounting bypasses.
     if (this.coordinator.admissionBlocked || isAdmissionStale()) {
-      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+      return refuseBeforeAcceptance(
+        createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+      );
     }
     // Still pre-persist: a row appended now would read as a dispatched turn on the next startup
     // while streamWithHistory's own latch check keeps its stream from ever running.
     if (this.coordinator.closing) {
-      return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
+      return refuseBeforeAcceptance(
+        createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE)
+      );
     }
 
     // Persist snapshots only when this turn will be sent immediately.
@@ -4060,7 +4171,10 @@ export class AgentSession {
     // leaves no trace for a later human resume to replay into provider context. Past this point
     // rollback is forbidden by design (goal sync observes the durable row), so a Stop landing in
     // the remaining pre-stream awaits refuses the turn at the PREPARING gate with rows retained.
-    if (internal?.admissionStale?.() === true) {
+    if (
+      internal?.admissionStale?.() === true ||
+      !this.coordinator.isCurrentTurn(attempt.owner ?? attempt.expectedTurn)
+    ) {
       const rolledBack = await rollbackPersistedTurnRows();
       // Probe-carrying sends are peer messages whose caller already returned success when the
       // entry was queued — the cancellation hook is their only way to observe this refusal and
@@ -4076,7 +4190,7 @@ export class AgentSession {
         // OUTER refund paths (the direct-call failure branch and sendQueuedMessages'
         // onAcceptedPreStreamFailure). Mark the rows persisted first so those payload-guarded
         // refunds keep the charge — refunding here would leave provider-visible rows uncharged.
-        internal?.onPreTurnRowsPersisted?.();
+        markRowsDurable();
       }
       return Err(
         createUnknownSendMessageError(
@@ -4106,9 +4220,7 @@ export class AgentSession {
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
     // acceptance leaves the payload + trigger rows durable in the transcript.
-    if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
-      internal.onPreTurnRowsPersisted?.();
-    }
+    markRowsDurable();
     try {
       await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
     } catch (error) {
@@ -4117,7 +4229,7 @@ export class AgentSession {
         // finalize this monitor wake. Startup recovery can resume the row without redelivering it,
         // unless a Stop withdrew the wake.
         try {
-          await internal?.onAccepted?.();
+          await accept();
         } finally {
           await abandonWithdrawnSend();
         }
@@ -4138,7 +4250,7 @@ export class AgentSession {
     if (this.coordinator.disposed) {
       if (cancelSignal != null && cancellationDisabled) {
         try {
-          await internal?.onAccepted?.();
+          await accept();
         } finally {
           await abandonWithdrawnSend();
         }
@@ -4151,7 +4263,12 @@ export class AgentSession {
     // await, so a slider change during PREPARING (runtime warmup, model
     // creation) lands in the holder the stream's prepareStep will read.
     const turnThinkingOverride: ActiveTurnThinkingOverride = {};
-    this.coordinator.acceptThinkingOverride(turnThinkingOverride, this.coordinator.turnId);
+    if (isAdmissionStale())
+      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    this.coordinator.acceptThinkingOverride(
+      turnThinkingOverride,
+      attempt.owner ?? attempt.expectedTurn
+    );
 
     // Emit snapshots only for immediately-sent turns. On on-send compaction paths,
     // snapshots are deferred with the follow-up message to avoid duplicate ephemeral
@@ -4196,7 +4313,11 @@ export class AgentSession {
     if (isManualUserMessage) {
       // A fresh accepted user send supersedes any persisted startup-abandon
       // classification from previous turns.
+      if (isAdmissionStale())
+        return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
       await this.clearStartupAutoRetryAbandon();
+      if (isAdmissionStale())
+        return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
       this.retryManager.cancel();
       this.retryManager.setEnabled(true);
       await this.persistAutoRetryEnabledPreference(true);
@@ -4204,9 +4325,11 @@ export class AgentSession {
 
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
+    if (isAdmissionStale())
+      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
     this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
     try {
-      await internal?.onAccepted?.();
+      await accept();
     } catch (error) {
       // Pre-stream failure: identity-guarded so a replacement turn's holder
       // (created while this one unwound) is never cleared by mistake.
@@ -4216,17 +4339,6 @@ export class AgentSession {
       await abandonWithdrawnSend();
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
-
-    let acceptedPreStreamFailureNotified = false;
-    const notifyAcceptedPreStreamFailure = async (error: SendMessageError): Promise<void> => {
-      if (acceptedPreStreamFailureNotified) {
-        return;
-      }
-      await internal?.onAcceptedPreStreamFailure?.(error);
-      // Only suppress duplicate notifications after cleanup succeeds. A transient callback failure
-      // must remain retryable from the surrounding catch path so durable reservations do not stick.
-      acceptedPreStreamFailureNotified = true;
-    };
 
     // r40: a context-discarding mutation (reset, full clear, destructive
     // replace) may have started while this send was validating and persisting
@@ -4246,7 +4358,7 @@ export class AgentSession {
       // delivered in onAccepted and rely on the accepted pre-stream failure
       // callback to revert it — returning without notifying would strand
       // that bookkeeping (r41).
-      await notifyAcceptedPreStreamFailure(error);
+      await this.settlePreparationFailure(attempt, error);
       await abandonWithdrawnSend();
       return Err(error);
     }
@@ -4261,117 +4373,106 @@ export class AgentSession {
     }
 
     const preparedTurnAbortController = new AbortController();
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
-    const preparedTurn = this.coordinator.prepare(
+    const admission = this.coordinator.prepare(
+      attempt.owner != null
+        ? { kind: "adopt", turnId: attempt.owner }
+        : {
+            kind: "fresh",
+            intent: "direct",
+            expectedTurnId: attempt.expectedTurn,
+            editReservation: attempt.editReservation?.id,
+          },
       preparedTurnAbortController,
-      internal?.turnReservation
+      (turnId) => {
+        attempt.owner = turnId;
+        this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
+          optionsForStream.muxMetadata
+        );
+      }
     );
-    // From this synchronous point isBusy() reports the turn — release the
-    // service-side preflight reservation (see onTurnAdmissionCommitted doc).
+    if (admission.status !== "admitted") {
+      return Err(
+        createUnknownSendMessageError(
+          admission.status === "rejected" && admission.reason === "closing"
+            ? SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE
+            : CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
+        )
+      );
+    }
+    const preparedTurn = admission.turnId;
+
     internal?.onTurnAdmissionCommitted?.();
 
-    const startPreparedStream = async (): Promise<AgentSessionResult<void>> => {
-      try {
-        if (
-          !this.coordinator.isCurrentTurn(preparedTurn) ||
-          preparedTurnAbortController.signal.aborted
-        ) {
-          await notifyAcceptedPreStreamFailure(
-            createUnknownSendMessageError("Accepted stream startup was canceled before it began.")
-          );
-          return Ok(undefined);
-        }
-        // Background processes are workspace-scoped, not context-scoped. Compaction must preserve
-        // processes, monitors, and queued wakes so a waiting agent is not stranded.
-        // Note: Follow-up content for compaction is now stored on the summary message
-        // and dispatched via dispatchPendingFollowUp() after compaction completes.
-        // This provides crash safety - the follow-up survives app restarts.
-
-        if (this.coordinator.disposed || preparedTurnAbortController.signal.aborted) {
-          await notifyAcceptedPreStreamFailure(
-            createUnknownSendMessageError("Accepted stream startup was canceled before streaming.")
-          );
-          return Ok(undefined);
-        }
-
-        // Raw terminals reserve COMPLETING; delivered completion runs terminal policy.
-        const streamResult = await this.streamWithHistory(
-          preparedTurn,
-          modelForStream,
-          optionsForStream,
-          undefined,
-          undefined,
-          agentInitiated,
-          preparedTurnAbortController.signal,
-          goalKind,
-          internal?.goalId,
-          turnThinkingOverride
+    const startPreparedStream = async (
+      startup: PreparationAttempt
+    ): Promise<AgentSessionResult<void>> => {
+      if (
+        !this.coordinator.isCurrentTurn(preparedTurn) ||
+        preparedTurnAbortController.signal.aborted
+      ) {
+        await this.settlePreparationFailure(
+          startup,
+          createUnknownSendMessageError("Accepted stream startup was canceled before it began.")
         );
-        if (streamResult.success && preparedTurnAbortController.signal.aborted) {
-          await notifyAcceptedPreStreamFailure(
-            createUnknownSendMessageError(
-              "Accepted stream startup was canceled during preparation."
-            )
-          );
-        }
-        return streamResult;
-      } finally {
-        // Success should advance via stream events; if startup never emitted any, don't leave the
-        // session stuck in PREPARING. Guard by controller identity so an aborted startup cannot
-        // mark the replacement edit's new PREPARING turn idle when it unwinds later.
-        this.coordinator.finishPreparation(preparedTurn);
+        return Ok(undefined);
       }
+      // Background processes are workspace-scoped, not context-scoped. Compaction must preserve
+      // processes, monitors, and queued wakes so a waiting agent is not stranded.
+      // Note: Follow-up content for compaction is now stored on the summary message
+      // and dispatched via dispatchPendingFollowUp() after compaction completes.
+      // This provides crash safety - the follow-up survives app restarts.
+
+      if (this.coordinator.disposed || preparedTurnAbortController.signal.aborted) {
+        await this.settlePreparationFailure(
+          startup,
+          createUnknownSendMessageError("Accepted stream startup was canceled before streaming.")
+        );
+        return Ok(undefined);
+      }
+
+      // Raw terminals reserve COMPLETING; delivered completion runs terminal policy.
+      const streamResult = await this.streamWithHistory(
+        preparedTurn,
+        modelForStream,
+        optionsForStream,
+        undefined,
+        undefined,
+        agentInitiated,
+        preparedTurnAbortController.signal,
+        goalKind,
+        internal?.goalId,
+        turnThinkingOverride,
+        startup
+      );
+      if (streamResult.success && preparedTurnAbortController.signal.aborted) {
+        await this.settlePreparationFailure(
+          startup,
+          createUnknownSendMessageError("Accepted stream startup was canceled during preparation.")
+        );
+      }
+      return streamResult;
     };
 
     if (editMessageId || internal?.startStreamInBackground === true) {
-      // The user turn is already persisted + emitted above. Edits and backend
-      // goal continuations should unblock once the user message exists: for
-      // Resume, that makes chat history the durable source of truth for the
-      // running goal before runtime warmup or streaming can race/fail.
-      const drainQueuedMessagesAfterFailedStartup = (): void => {
-        if (
-          this.coordinator.isCurrentTurn(preparedTurn) &&
-          this.coordinator.phase === "idle" &&
-          !this.messageQueue.isEmpty()
-        ) {
-          this.sendQueuedMessages();
-        }
-      };
-      // Transfer supervision before the foreground lease releases; include failure callbacks.
-      const backgroundExecution = this.coordinator.enterExecution();
-      startPreparedStream()
-        .then(async (result) => {
-          if (!result.success) {
-            await notifyAcceptedPreStreamFailure(result.error);
-          }
-          drainQueuedMessagesAfterFailedStartup();
-        })
-        .catch(async (error: unknown) => {
-          log.error("Accepted background stream failed before startup completed", {
-            workspaceId: this.workspaceId,
-            editMessageId,
-            goalKind,
-            error: getErrorMessage(error),
-          });
-          try {
-            await notifyAcceptedPreStreamFailure(
-              createUnknownSendMessageError(getErrorMessage(error))
-            );
-          } catch (callbackError: unknown) {
-            log.error("Accepted background stream failure callback failed", {
-              workspaceId: this.workspaceId,
-              error: getErrorMessage(callbackError),
-            });
-          }
-          drainQueuedMessagesAfterFailedStartup();
-        })
-        .finally(() => backgroundExecution[Symbol.dispose]());
+      // Transfer physical work before the foreground lease releases. The child has its own
+      // completion outcome so a resolved foreground Ok cannot finish a still-starting turn.
+      attempt.outcome = "background";
+      const backgroundAttempt: PreparationAttempt = { ...attempt, outcome: "preparing" };
+      // Handoff callbacks may already have preempted back to idle. Transfer the edit
+      // exclusion too, so only the child's settled startup can release queued work.
+      attempt.editReservation = undefined;
+      this.completePreparation(backgroundAttempt, () =>
+        startPreparedStream(backgroundAttempt)
+      ).catch((error: unknown) => {
+        log.error("Accepted background stream failed before startup completed", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
       return Ok(undefined);
     }
 
-    // Non-edit sends preserve the old behavior so pre-stream startup failures still propagate to
-    // synchronous callers (draft restore, interrupted-task rollback, etc.).
-    return await startPreparedStream();
+    return await startPreparedStream(attempt);
   }
 
   async resumeStream(
@@ -4381,6 +4482,7 @@ export class AgentSession {
     this.assertNotDisposed("resumeStream");
     if (this.coordinator.closing) return Ok({ started: false });
     using _execution = this.coordinator.enterExecution();
+    const expectedTurnId = this.coordinator.turnId;
 
     assert(options, "resumeStream requires options");
     const { model } = options;
@@ -4417,21 +4519,36 @@ export class AgentSession {
       return Ok({ started: false });
     }
 
-    // A resumed attempt becomes the latest live resume request as soon as we
-    // accept its options, even if startup fails before the stream fully begins.
-    this.setAutoRetryResumeState(
-      optionsForStream,
-      internal?.agentInitiated,
-      internal?.goalKind,
-      internal?.goalId
-    );
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
-    const preparedTurn = this.coordinator.prepare();
-    // Open the mid-turn thinking override window for the resumed turn (after
-    // preparation publication; the coordinator expires the holder when the turn becomes idle).
-    const turnThinkingOverride: ActiveTurnThinkingOverride = {};
-    this.coordinator.acceptThinkingOverride(turnThinkingOverride, preparedTurn);
-    try {
+    const attempt: PreparationAttempt = {
+      expectedTurn: expectedTurnId,
+      outcome: "preparing",
+      durability: "accepted",
+      queued: false,
+      failureNotified: false,
+    };
+    return this.completePreparation(attempt, async () => {
+      const admission = this.coordinator.prepare(
+        { kind: "fresh", intent: "resume", expectedTurnId },
+        undefined,
+        (turnId) => {
+          attempt.owner = turnId;
+          this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
+            optionsForStream.muxMetadata
+          );
+        }
+      );
+      if (admission.status !== "admitted") return Ok({ started: false });
+      const preparedTurn = admission.turnId;
+      this.setAutoRetryResumeState(
+        optionsForStream,
+        internal?.agentInitiated,
+        internal?.goalKind,
+        internal?.goalId
+      );
+      // Open the mid-turn thinking override window for the resumed turn (after
+      // preparation publication; the coordinator expires the holder when the turn becomes idle).
+      const turnThinkingOverride: ActiveTurnThinkingOverride = {};
+      this.coordinator.acceptThinkingOverride(turnThinkingOverride, preparedTurn);
       // Must await here so the finally block runs after streaming completes,
       // not immediately when the Promise is returned.
       const result = await this.streamWithHistory(
@@ -4444,18 +4561,15 @@ export class AgentSession {
         undefined,
         internal?.goalKind,
         internal?.goalId,
-        turnThinkingOverride
+        turnThinkingOverride,
+        attempt
       );
       if (!result.success) {
         return result;
       }
 
-      return Ok({ started: true });
-    } finally {
-      if (this.coordinator.isCurrentTurn(preparedTurn)) {
-        this.coordinator.finishPreparation(preparedTurn);
-      }
-    }
+      return Ok({ started: attempt.outcome === "delivered" });
+    });
   }
 
   async setAutoRetryEnabled(
@@ -5408,8 +5522,15 @@ export class AgentSession {
     operation: OperationId,
     error: SendMessageError,
     acpPromptId?: string,
-    preStartErrors?: StreamErrorPayload[] | null
+    preStartErrors?: StreamErrorPayload[] | null,
+    preparation?: PreparationAttempt
   ): Promise<AgentSessionResult<void>> {
+    if (preparation) {
+      await this.settlePreparationFailure(preparation, error);
+      // Recovery may synchronously claim a follow-up. Its predecessor's callback has
+      // settled, and PREPARING still owns the queue until policy decides the outcome.
+      this.releasePreparationEdit(preparation);
+    }
     // A disposed session must not persist retry/goal state or error rows
     // post-teardown (mirrors delivered completion). Settle collected recovery
     // decisions in memory so waiters cannot hang, then skip all recovery
@@ -5473,8 +5594,22 @@ export class AgentSession {
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
-    activeTurnThinkingOverride?: ActiveTurnThinkingOverride
+    activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
+    preparation?: PreparationAttempt
   ): Promise<AgentSessionResult<void>> {
+    const fail = (
+      error: SendMessageError,
+      acpPromptId?: string,
+      preStartErrors?: StreamErrorPayload[]
+    ) =>
+      this.handleStreamWithHistoryFailure(
+        turn,
+        operation,
+        error,
+        acpPromptId,
+        preStartErrors,
+        preparation
+      );
     // Re-read at every pre-stream checkpoint below: dispose or shutdown can land while a
     // recovery-initiated stream (which carries no abortSignal) awaits commitPartial, file-change
     // detection, or history reads, and must not reach the provider afterwards.
@@ -5510,11 +5645,7 @@ export class AgentSession {
 
       const commitResult = await this.historyService.commitPartial(this.workspaceId);
       if (!commitResult.success) {
-        return await this.handleStreamWithHistoryFailure(
-          turn,
-          operation,
-          createUnknownSendMessageError(commitResult.error)
-        );
+        return await fail(createUnknownSendMessageError(commitResult.error));
       }
 
       if (isStreamStartAborted()) {
@@ -5539,11 +5670,7 @@ export class AgentSession {
           createFileChangeNotificationMessage(fileChangeDetection.attachments)
         );
         if (!notificationAppendResult.success) {
-          return await this.handleStreamWithHistoryFailure(
-            turn,
-            operation,
-            createUnknownSendMessageError(notificationAppendResult.error)
-          );
+          return await fail(createUnknownSendMessageError(notificationAppendResult.error));
         }
         fileChangeDetection.commit();
       }
@@ -5556,11 +5683,7 @@ export class AgentSession {
       }
 
       if (!historyResult.success) {
-        return await this.handleStreamWithHistoryFailure(
-          turn,
-          operation,
-          createUnknownSendMessageError(historyResult.error)
-        );
+        return await fail(createUnknownSendMessageError(historyResult.error));
       }
 
       // A crash between snapshot and user-row appends can leave orphaned prompt
@@ -5568,9 +5691,7 @@ export class AgentSession {
       let requestMessages = filterOrphanedMcpPromptSnapshots(historyResult.data);
 
       if (requestMessages.length === 0) {
-        return await this.handleStreamWithHistoryFailure(
-          turn,
-          operation,
+        return await fail(
           createUnknownSendMessageError(
             "Cannot resume stream: workspace history is empty. Send a new message instead."
           )
@@ -5754,15 +5875,20 @@ export class AgentSession {
           }
           return { success: false, error: streamResult.error, failureHandled: true };
         }
-        return await this.handleStreamWithHistoryFailure(
-          turn,
-          operation,
-          streamResult.error,
-          acpPromptId,
-          preStartErrors
-        );
+        return await fail(streamResult.error, acpPromptId, preStartErrors);
       }
 
+      if (preparation) {
+        preparation.outcome = "delivered";
+        // An already-resolved handle can launch recovery synchronously. Release the
+        // valid edit's history exclusion first; canceled startup keeps it through its callback.
+        if (
+          this.coordinator.isCurrentTurn(turn) &&
+          !this.coordinator.closing &&
+          !abortSignal?.aborted
+        )
+          this.releasePreparationEdit(preparation);
+      }
       this.coordinator.consumeCompletion(operation, streamResult.data).catch((error: unknown) => {
         log.error("Failed to consume turn completion", { error: getErrorMessage(error) });
       });
@@ -5927,6 +6053,8 @@ export class AgentSession {
     messageId: string;
     errorType?: string;
   }): Promise<boolean> {
+    const expectedTurnId = this.coordinator.turnId;
+    const expectedOperationId = this.coordinator.operationId;
     if (data.errorType !== "context_exceeded") {
       return false;
     }
@@ -5998,16 +6126,36 @@ export class AgentSession {
       return false;
     }
 
+    if (!this.coordinator.isCurrentOperation(expectedOperationId)) return false;
+    let claimedTurn: TurnId | undefined;
+    using _preparation = {
+      [Symbol.dispose]: () => {
+        if (claimedTurn != null) this.coordinator.finishPreparation(claimedTurn);
+      },
+    };
+    const admission = this.coordinator.prepare(
+      {
+        kind: "fresh",
+        intent: "handoff",
+        expectedTurnId,
+      },
+      undefined,
+      (turnId) => {
+        claimedTurn = turnId;
+        this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
+          retryOptionsForResume.muxMetadata
+        );
+      }
+    );
+    if (admission.status !== "admitted") return false;
+    const preparedTurn = admission.turnId;
     this.setAutoRetryResumeState(
       retryOptionsForResume,
       retryAgentInitiated,
       retryGoalKind,
       retryGoalId
     );
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
-      retryOptionsForResume.muxMetadata
-    );
-    const preparedTurn = this.coordinator.prepare();
+
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -6049,6 +6197,8 @@ export class AgentSession {
     messageId: string;
     errorType?: string;
   }): Promise<boolean> {
+    const expectedTurnId = this.coordinator.turnId;
+    const expectedOperationId = this.coordinator.operationId;
     if (data.errorType !== "context_exceeded") {
       return false;
     }
@@ -6114,8 +6264,30 @@ export class AgentSession {
     }
 
     // Retry the same request, but without post-compaction injection.
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(context.options?.muxMetadata);
-    const preparedTurn = this.coordinator.prepare();
+    if (!this.coordinator.isCurrentOperation(expectedOperationId)) return false;
+    let claimedTurn: TurnId | undefined;
+    using _preparation = {
+      [Symbol.dispose]: () => {
+        if (claimedTurn != null) this.coordinator.finishPreparation(claimedTurn);
+      },
+    };
+    const admission = this.coordinator.prepare(
+      {
+        kind: "fresh",
+        intent: "handoff",
+        expectedTurnId,
+      },
+      undefined,
+      (turnId) => {
+        claimedTurn = turnId;
+        this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
+          context.options?.muxMetadata
+        );
+      }
+    );
+    if (admission.status !== "admitted") return false;
+    const preparedTurn = admission.turnId;
+
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -6636,7 +6808,7 @@ export class AgentSession {
         // Do not dispatch stream-end follow-ups while the edit flow is waiting
         // for IDLE; truncation must run before any synthetic turn resumes.
       } else {
-        this.sendQueuedMessages();
+        this.sendQueuedMessages("terminal");
       }
 
       if (
@@ -7514,7 +7686,7 @@ export class AgentSession {
       return false;
     }
 
-    this.sendQueuedMessages();
+    this.sendQueuedMessages("provider-tool");
     return true;
   }
 
@@ -7596,7 +7768,7 @@ export class AgentSession {
     if (!this.messageQueue.prioritizeNextUserEntry()) {
       return false;
     }
-    this.sendQueuedMessages();
+    this.sendQueuedMessages("send-immediately");
     return true;
   }
 
@@ -7619,114 +7791,79 @@ export class AgentSession {
     ) {
       return;
     }
-    this.sendQueuedMessages();
+    this.sendQueuedMessages("idle");
   }
 
   /**
    * Send queued messages if any exist.
    * Called when the current turn ends or the user chooses to send immediately.
    */
-  sendQueuedMessages(): void {
-    // sendQueuedMessages can race with teardown (e.g. workspace.remove) because we
-    // trigger it off stream/tool events and disposal does not await stopStream().
-    // If the session is already disposed, do nothing.
-    if (this.coordinator.closing) {
+  sendQueuedMessages(trigger: QueueDrainTrigger = "terminal"): void {
+    if (
+      this.coordinator.closing ||
+      this.deferQueuedFlushUntilAfterEdit ||
+      this.midStreamCompactionPending
+    )
       return;
-    }
-    // Queue publication can reenter shutdown. Register physical ownership before callbacks;
-    // the child below retains it through asynchronous correlated failure/refund settlement.
     using _dispatch = this.coordinator.enterExecution();
-
-    // r40: leave entries queued while a context-discarding mutation blocks
-    // turn admission — dispatching would set PREPARING and stream across the
-    // mutation. The block's release drains the queue (holdTurnAdmission).
-    if (this.coordinator.admissionBlocked) {
+    const candidate = this.messageQueue.peekNext();
+    if (candidate == null) {
+      this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
       return;
     }
-
-    this.queuedProviderToolEndAbortInFlight = false;
-    // Clear the queued message flag (even if queue is empty, to handle race conditions)
-    this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
-
-    if (!this.messageQueue.isEmpty()) {
-      // Entries dispatch one at a time (FIFO): special sends (compaction, agent
-      // skills, workspace-turn follow-ups) own their turn, and anything queued
-      // behind them dispatches on a later drain instead of batching into them.
+    const expectedTurnId = this.coordinator.turnId;
+    const attempt: PreparationAttempt = {
+      expectedTurn: expectedTurnId,
+      outcome: "preparing",
+      durability: "rollback-eligible",
+      queued: false,
+      failureNotified: false,
+    };
+    this.completePreparation(attempt, async () => {
+      const admission = this.coordinator.prepare(
+        { kind: "fresh", intent: trigger, expectedTurnId },
+        undefined,
+        (turnId) => {
+          attempt.owner = turnId;
+          this.dispatchingQueuedEntry = true;
+          this.dispatchingQueuedEntryMuxMetadata = candidate.muxMetadata;
+          this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(candidate.muxMetadata);
+        }
+      );
+      if (admission.status !== "admitted") return Ok(undefined);
+      const preparedTurn = admission.turnId;
+      // PREPARING observers can clear/reorder the head without retiring its owner. Never
+      // consume a replacement entry or notify callbacks already handled by queue removal.
+      if (this.messageQueue.peekNext()?.identity !== candidate.identity) return Ok(undefined);
+      attempt.queued = true;
       const { message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
+      attempt.onFailure = internal?.onAcceptedPreStreamFailure;
       this.dispatchingQueuedEntry = true;
       this.dispatchingQueuedEntryMuxMetadata = options?.muxMetadata;
+      this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(options?.muxMetadata);
+      this.queuedProviderToolEndAbortInFlight = false;
       this.emitQueuedMessageChanged();
-
-      // Re-arm dispatch signals for the remaining entries so the stream we are
-      // about to start drains them at its next tool end (or stream end).
+      if (!this.coordinator.isCurrentTurn(preparedTurn) || this.coordinator.closing) {
+        return Err(
+          createUnknownSendMessageError("Queued preparation was retired before dispatch.")
+        );
+      }
       this.backgroundProcessManager.setMessageQueued(
         this.workspaceId,
         this.messageQueue.getNextDispatchableMode() === "tool-end"
       );
-
-      // Set PREPARING synchronously before the async sendMessage to prevent
-      // incoming messages from bypassing the queue during the await gap.
-      this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(options?.muxMetadata);
-      const preparedTurn = this.coordinator.prepare();
-
-      const queuedExecution = this.coordinator.enterExecution();
-      this.sendMessage(message, options, {
+      return this.sendMessage(message, options, {
         ...internal,
         enqueuedAtMs,
         turnReservation: preparedTurn,
-      })
-        .then(async (result) => {
-          // Keep the dispatch marker through the dequeue-to-stream-start window. A background
-          // send can resolve before startup emits stream-start, and later reports must not claim
-          // that window as the next continuation.
-          // If sendMessage fails before it can start streaming, ensure we don't
-          // leave the session stuck in PREPARING and notify correlated internal callers.
-          if (!result.success) {
-            await internal?.onAcceptedPreStreamFailure?.(result.error);
-            if (this.coordinator.isCurrentTurn(preparedTurn)) {
-              this.coordinator.finishPreparation(preparedTurn);
-            }
-            // No stream started, so no stream-end drain will fire for the
-            // remaining entries — try the next one now (each attempt pops an
-            // entry, so this terminates).
-            if (this.coordinator.isCurrentTurn(preparedTurn)) this.drainQueuedMessagesIfIdle();
-            return;
-          }
-          if (internal?.cancelState?.canceledBeforeAcceptance === true) {
-            // Cancellation can arrive after dequeue while sendMessage is validating or writing
-            // history. No stream will start, so release PREPARING and continue with later entries.
-            if (this.coordinator.isCurrentTurn(preparedTurn)) {
-              this.coordinator.finishPreparation(preparedTurn);
-            }
-            if (this.coordinator.isCurrentTurn(preparedTurn)) this.drainQueuedMessagesIfIdle();
-          }
-        })
-        .catch(async (error: unknown) => {
-          // A REJECTED sendMessage (thrown, not returned Err — e.g. an awaited history or goal
-          // service throwing pre-persistence) must reach the same failure hook as the
-          // returned-error branch above: peer sends refund their family-message reservation
-          // through it (payload-persistence-guarded, so post-persistence throws keep the
-          // charge). Swallowing the rejection here would strand the reservation until restart.
-          try {
-            await internal?.onAcceptedPreStreamFailure?.(
-              createUnknownSendMessageError(error instanceof Error ? error.message : String(error))
-            );
-          } catch (hookError: unknown) {
-            log.error("sendQueuedMessages: onAcceptedPreStreamFailure hook threw", {
-              workspaceId: this.workspaceId,
-              hookError,
-            });
-          }
-          if (!this.coordinator.isCurrentTurn(preparedTurn)) return;
-          this.dispatchingQueuedEntry = false;
-          this.dispatchingQueuedEntryMuxMetadata = undefined;
-          if (this.coordinator.isCurrentTurn(preparedTurn)) {
-            this.coordinator.finishPreparation(preparedTurn);
-          }
-          this.drainQueuedMessagesIfIdle();
-        })
-        .finally(() => queuedExecution[Symbol.dispose]());
-    }
+        preparation: attempt,
+      });
+    }).catch((error: unknown) => {
+      log.error("Queued preparation failed", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    });
   }
 
   /**

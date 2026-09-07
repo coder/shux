@@ -936,6 +936,12 @@ export class MessageQueue {
     return true;
   }
 
+  /** Capture before admission publication; observers may remove or reorder the head. */
+  peekNext(): { identity: object; muxMetadata: unknown } | undefined {
+    const entry = this.entries[0];
+    return entry ? { identity: entry, muxMetadata: entry.muxMetadata } : undefined;
+  }
+
   /**
    * Remove the first entry and return its combined message and options for sending.
    * Later entries stay queued and dispatch on subsequent drains (FIFO).
