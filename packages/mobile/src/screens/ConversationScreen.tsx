@@ -157,9 +157,9 @@ export function ConversationScreen(props: {
     // All draft updates are immutable: only clear this sent version, never newer
     // typing or another queue restoration that arrives while the request is pending.
     const sent = draft;
-    const { finalText, metadata } = prepareUserMessageForSend(sent);
     const signal = controller.current.signal;
     try {
+      const { finalText, metadata } = prepareUserMessageForSend(sent);
       const result = await props.client.workspace.sendMessage(
         {
           workspaceId: props.workspace.id,
@@ -178,7 +178,7 @@ export function ConversationScreen(props: {
           typeof result.error === "string" ? result.error : JSON.stringify(result.error)
         );
       setDraft((current) => (current === sent ? EMPTY_DRAFT : current));
-      setInputHeight(44);
+      // Content-size events resize cleared input without shrinking a newer draft.
       list.current?.scrollToEnd({ animated: true });
     } catch (cause) {
       if (!signal.aborted)
