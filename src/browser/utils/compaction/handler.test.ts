@@ -62,7 +62,7 @@ describe("cancelCompaction", () => {
     });
     expect(interruptStream).toHaveBeenCalledWith({
       workspaceId: "ws-1",
-      options: { abandonPartial: true, retireBashMonitorAttention: true },
+      options: { abandonPartial: true, disableAutoRetry: true, retireBashMonitorAttention: true },
     });
     expect(calls).toEqual(["edit", "interrupt"]);
   });

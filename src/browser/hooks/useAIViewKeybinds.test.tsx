@@ -252,19 +252,15 @@ describe("useAIViewKeybinds", () => {
     await waitFor(() => expect(interruptStream.mock.calls.length).toBe(1));
   });
 
-  test("Escape on the retry barrier issues Stop only after the retry opt-out has landed", async () => {
+  test("Escape on the retry barrier opts out of auto-retry inside the Stop itself", async () => {
     const interruptStream = mock(() =>
       Promise.resolve({ success: true as const, data: undefined })
     );
-    let settleOptOut!: () => void;
-    const setAutoRetryEnabled = mock(
-      () =>
-        new Promise<{ success: true; data: { previousEnabled: boolean; enabled: boolean } }>(
-          (resolve) => {
-            settleOptOut = () =>
-              resolve({ success: true, data: { previousEnabled: true, enabled: false } });
-          }
-        )
+    const setAutoRetryEnabled = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        data: { previousEnabled: true, enabled: false },
+      })
     );
     currentClientMock = {
       workspace: {
@@ -296,13 +292,13 @@ describe("useAIViewKeybinds", () => {
         cancelable: true,
       })
     );
-    await Promise.resolve();
 
-    expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws", enabled: false });
-    expect(interruptStream.mock.calls.length).toBe(0);
-
-    settleOptOut();
     await waitFor(() => expect(interruptStream.mock.calls.length).toBe(1));
+    expect(interruptStream).toHaveBeenCalledWith({
+      workspaceId: "ws",
+      options: { disableAutoRetry: true, retireBashMonitorAttention: true },
+    });
+    expect(setAutoRetryEnabled).not.toHaveBeenCalled();
   });
 
   test.each([

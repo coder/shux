@@ -175,14 +175,14 @@ describe("StreamingBarrier", () => {
 
     fireEvent.click(view.getByRole("button", { name: "Stop streaming" }));
 
-    expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws-1", enabled: false });
     expect(setInterrupting).toHaveBeenCalledWith("ws-1");
     await waitFor(() =>
       expect(interruptStream).toHaveBeenCalledWith({
         workspaceId: "ws-1",
-        options: { retireBashMonitorAttention: true },
+        options: { disableAutoRetry: true, retireBashMonitorAttention: true },
       })
     );
+    expect(setAutoRetryEnabled).not.toHaveBeenCalled();
   });
 
   test("clicking stop during stream-start interrupts without setting interrupting state", async () => {
@@ -200,12 +200,11 @@ describe("StreamingBarrier", () => {
 
     fireEvent.click(stopButton);
 
-    expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws-1", enabled: false });
     expect(setInterrupting).not.toHaveBeenCalled();
     await waitFor(() =>
       expect(interruptStream).toHaveBeenCalledWith({
         workspaceId: "ws-1",
-        options: { retireBashMonitorAttention: true },
+        options: { disableAutoRetry: true, retireBashMonitorAttention: true },
       })
     );
   });
@@ -385,12 +384,11 @@ describe("StreamingBarrier", () => {
 
     fireEvent.click(view.getByRole("button", { name: "Stop streaming" }));
 
-    expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws-1", enabled: false });
     expect(setInterrupting).not.toHaveBeenCalled();
     await waitFor(() =>
       expect(interruptStream).toHaveBeenCalledWith({
         workspaceId: "ws-1",
-        options: { abandonPartial: true, retireBashMonitorAttention: true },
+        options: { abandonPartial: true, disableAutoRetry: true, retireBashMonitorAttention: true },
       })
     );
   });

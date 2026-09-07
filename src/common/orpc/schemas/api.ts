@@ -1657,6 +1657,9 @@ export const workspace = {
           // User Stop only: owed bash-monitor attention is dismissed instead of waking the
           // agent on the output it just stopped around.
           retireBashMonitorAttention: z.boolean().optional(),
+          // Persist the auto-retry opt-out inside the Stop, after attention retirement is
+          // reserved and before the Stop is acknowledged.
+          disableAutoRetry: z.boolean().optional(),
         })
         .optional(),
     }),

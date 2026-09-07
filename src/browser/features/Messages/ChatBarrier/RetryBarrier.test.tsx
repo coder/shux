@@ -398,36 +398,7 @@ describe("RetryBarrier", () => {
     expect(resumeStream).toHaveBeenCalledTimes(1);
   });
 
-  test("the Stop button issues Stop only after the retry opt-out has landed", async () => {
-    currentWorkspaceState = createWorkspaceState({
-      autoRetryStatus: {
-        type: "auto-retry-scheduled",
-        attempt: 1,
-        delayMs: 5_000,
-        scheduledAt: Date.now(),
-      },
-    });
-    let settleOptOut!: () => void;
-    setAutoRetryEnabled.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          settleOptOut = () =>
-            resolve({ success: true as const, data: { previousEnabled: true, enabled: false } });
-        })
-    );
-
-    const view = render(<RetryBarrier workspaceId="ws-1" />);
-    fireEvent.click(view.getByRole("button", { name: /^Stop/ }));
-    await Promise.resolve();
-
-    expect(setAutoRetryEnabled).toHaveBeenCalledTimes(1);
-    expect(interruptStream).not.toHaveBeenCalled();
-
-    settleOptOut();
-    await waitFor(() => expect(interruptStream).toHaveBeenCalledTimes(1));
-  });
-
-  test("the Stop button issues the same attention-retiring Stop as its shortcut", async () => {
+  test("the Stop button opts out of auto-retry inside the same attention-retiring Stop as its shortcut", async () => {
     currentWorkspaceState = createWorkspaceState({
       autoRetryStatus: {
         type: "auto-retry-scheduled",
@@ -441,11 +412,12 @@ describe("RetryBarrier", () => {
 
     fireEvent.click(view.getByRole("button", { name: /^Stop/ }));
 
-    expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws-1", enabled: false });
     await waitFor(() => expect(interruptStream).toHaveBeenCalledTimes(1));
     expect(interruptStream).toHaveBeenCalledWith({
       workspaceId: "ws-1",
-      options: { retireBashMonitorAttention: true },
+      options: { disableAutoRetry: true, retireBashMonitorAttention: true },
     });
+    // No separate opt-out call: it would release the retry idle gate ahead of the Stop.
+    expect(setAutoRetryEnabled).not.toHaveBeenCalled();
   });
 });

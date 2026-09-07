@@ -523,6 +523,19 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(h.internal.pendingBashMonitorWakeIdleWaitsByOwner.has(h.workspaceId)).toBe(false);
       expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
 
+      // An unarchive whose restoration fails rolls back to archived; the wake must not have run
+      // against the half-restored checkout in between.
+      const snapshots = h.internal as unknown as {
+        worktreeArchiveSnapshotService?: { restoreSnapshotAfterUnarchive(): Promise<unknown> };
+      };
+      snapshots.worktreeArchiveSnapshotService = {
+        restoreSnapshotAfterUnarchive: () => Promise.resolve(Err("restore failed")),
+      };
+      expect((await h.service.unarchive(h.workspaceId)).success).toBe(false);
+      await h.reconciler.reconcile(h.workspaceId);
+      expect(send).not.toHaveBeenCalled();
+
+      snapshots.worktreeArchiveSnapshotService = undefined;
       expect((await h.service.unarchive(h.workspaceId)).success).toBe(true);
       await h.reconciler.reconcile(h.workspaceId);
       expect(h.requests).toHaveLength(1);
@@ -905,6 +918,41 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
       await h.addAttention(20);
       expect(h.requests).toHaveLength(1);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("a Stop that disables auto-retry withdraws the wake before releasing the retry gate", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      let wakeWithdrawnAtOptOut: boolean | undefined;
+      const optOut = h.session.setAutoRetryEnabled.bind(h.session);
+      spyOn(h.session, "setAutoRetryEnabled").mockImplementation(async (enabled, options) => {
+        // The opt-out releases the idle gate a pending wake waits behind; retirement must already
+        // have withdrawn the wake's dispatch by then.
+        wakeWithdrawnAtOptOut = h.dispatch.mock.calls[0]?.[0].cancelSignal.aborted;
+        return optOut(enabled, options);
+      });
+      let stop: Promise<Result<void>> | undefined;
+      const unsubscribe = h.session.onChatEvent(({ message: event }) => {
+        if (event.type === "message" && event.role === "user" && stop == null) {
+          stop = h.service.interruptStream(h.workspaceId, {
+            retireBashMonitorAttention: true,
+            disableAutoRetry: true,
+          });
+        }
+      });
+      await h.addAttention(10);
+      unsubscribe();
+      expect((await stop!).success).toBe(true);
+      expect(wakeWithdrawnAtOptOut).toBe(true);
+      expect(h.requests).toHaveLength(0);
+      const sessionInternal = h.session as unknown as { getAutoRetryPreferencePath(): string };
+      const persisted = JSON.parse(
+        await fsPromises.readFile(sessionInternal.getAutoRetryPreferencePath(), "utf-8")
+      ) as { enabled?: boolean };
+      expect(persisted.enabled).toBe(false);
     } finally {
       await h.finish();
     }

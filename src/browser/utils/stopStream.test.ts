@@ -31,44 +31,16 @@ describe("stopStream", () => {
     expect(peekChatError("ws-unrecorded")).toBeUndefined();
   });
 
-  test("disableAutoRetry lands the opt-out, and its failure, before the Stop is issued", async () => {
-    const calls: string[] = [];
-    let settleOptOut!: () => void;
-    const api = {
-      workspace: {
-        setAutoRetryEnabled: () => {
-          calls.push("opt-out");
-          return new Promise((resolve) => {
-            settleOptOut = () => resolve({ success: false, error: "preference unwritable" });
-          });
-        },
-        interruptStream: () => {
-          calls.push("interrupt");
-          return Promise.resolve({ success: true, data: undefined });
-        },
-      },
-    } as unknown as APIClient;
-
-    const stopping = stopStream(api, "ws-opt-out", { disableAutoRetry: true });
-    await Promise.resolve();
-    expect(calls).toEqual(["opt-out"]);
-
-    settleOptOut();
-    await stopping;
-    expect(calls).toEqual(["opt-out", "interrupt"]);
-    expect(peekChatError("ws-opt-out")).toBe("preference unwritable");
-    dismissChatError("ws-opt-out", "preference unwritable");
-  });
-
   test("a recorded Stop retires owed monitor output without a chat error", async () => {
     const { api, calls } = apiReturning({ success: true, data: undefined });
 
-    await stopStream(api, "ws-recorded", { abandonPartial: true });
+    // The retry opt-out is part of the same Stop, never a separate call ahead of it.
+    await stopStream(api, "ws-recorded", { abandonPartial: true, disableAutoRetry: true });
 
     expect(calls).toEqual([
       {
         workspaceId: "ws-recorded",
-        options: { abandonPartial: true, retireBashMonitorAttention: true },
+        options: { abandonPartial: true, disableAutoRetry: true, retireBashMonitorAttention: true },
       },
     ]);
     expect(peekChatError("ws-recorded")).toBeUndefined();

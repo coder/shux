@@ -9019,8 +9019,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!didUnarchive) {
         return Ok(undefined);
       }
-      // Monitor attention held while archived (see dispatchBashMonitorWake) wakes now.
-      this.scheduleBashMonitorWakeReconcile(workspaceId);
 
       // Emit updated metadata
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -9100,6 +9098,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         projects: hookMetadata?.projects,
         subProjectPath: hookMetadata?.subProjectPath,
       });
+
+      // Monitor attention held while archived (see dispatchBashMonitorWake) wakes now, at the
+      // same point as the workflow reconciliation below and for the same reason.
+      this.scheduleBashMonitorWakeReconcile(workspaceId);
 
       // Archived owners park workflow terminal wakes unsettled; reconcile so an idle
       // workspace does not stay silent until the interval sweep. Only AFTER snapshot
@@ -11718,6 +11720,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       abandonPartial?: boolean;
       sendQueuedImmediately?: boolean;
       retireBashMonitorAttention?: boolean;
+      disableAutoRetry?: boolean;
     }
   ): Promise<Result<void>> {
     let releaseHardStopLatch: (() => void) | undefined;
@@ -11769,6 +11772,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               });
             })
         : undefined;
+      // The opt-out lands only after retirement reserved the reconciler lock above: disabling
+      // retry releases the idle gate a pending wake may be waiting behind, and that wake must
+      // find its attention withdrawn, not a window to start a turn after the user's Stop. Its
+      // write is verified below with the abandon marker; a failure there fails the Stop.
+      const disabling = options?.disableAutoRetry === true;
+      if (disabling) {
+        try {
+          await session.setAutoRetryEnabled(false);
+        } catch (error) {
+          log.warn("Failed to disable auto-retry during Stop", { workspaceId, error });
+        }
+      }
       let stopResult: Result<void> | undefined;
       try {
         stopResult = await session.interruptStream(options);
@@ -11786,7 +11801,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Stop, so the obligation is not lost with the joined send.
       await withdrawnWakeSend?.catch(() => undefined);
       const stopRecorded =
-        !retiring || ((await session.recordPendingAutoRetryState()) && retirementRecorded);
+        !(retiring || disabling) ||
+        ((await session.recordPendingAutoRetryState()) && retirementRecorded);
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
