@@ -4,6 +4,7 @@ import {
   isCodexOauthRequiredModel,
 } from "../../../src/common/constants/codexOAuth";
 import { isModelAvailable, resolveRoute } from "../../../src/common/routing";
+import { resolvePersistedAgentId } from "../../../src/common/utils/agentIds";
 import { collectDeclaredAncestorLayers } from "../../../src/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings } from "../../../src/common/utils/ai/resolveAgentAiSettings";
 import { targetWorkspaceBucketToLayer } from "../../../src/common/types/agentAiSettings";
@@ -41,14 +42,21 @@ export type ChatSettings = Pick<
 export const thinkingLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
 
 export function resolveSettings(
-  workspace: Pick<FrontendWorkspaceMetadata, "aiSettingsByAgent" | "agentId" | "aiSettings">,
+  workspace: Pick<
+    FrontendWorkspaceMetadata,
+    "aiSettingsByAgent" | "agentId" | "agentType" | "parentWorkspaceId" | "aiSettings"
+  >,
   data: SettingsData,
-  agentId: string,
+  requestedAgentId: string,
   selection?: ChatSettings | null
 ): ChatSettings {
+  const persistedAgentId = resolvePersistedAgentId(workspace);
+  // A delegated workspace's creation identity is not a user-selectable mode.
+  // Enforce this in request options too, not only in the picker.
+  const agentId = workspace.parentWorkspaceId != null ? persistedAgentId : requestedAgentId;
   const workspaceDefaults =
     workspace.aiSettingsByAgent?.[agentId] ??
-    (workspace.agentId === agentId ? workspace.aiSettings : undefined);
+    (persistedAgentId === agentId ? workspace.aiSettings : undefined);
   const descriptors = new Map(
     data.agents.map((agent) => [
       agent.id,

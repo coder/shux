@@ -14,6 +14,7 @@ import {
 } from "lucide-react-native";
 import type { MobileClient } from "../api";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
+import { resolvePersistedAgentId } from "../../../../src/common/utils/agentIds";
 import { prepareUserMessageForSend } from "../../../../src/common/types/message";
 import type { MuxMessage } from "../../../../src/common/types/message";
 import { Button, IconButton, Loading, Notice } from "../components/Controls";
@@ -103,7 +104,9 @@ export function ConversationScreen(props: {
     if (transcript.streaming) setStartedResumeMessageId(null);
     latestTranscript.current = transcript;
   }, [transcript]);
-  const agentId = props.workspace.agentId ?? "exec";
+  const agentId = resolvePersistedAgentId(props.workspace);
+  const modeLocked = props.workspace.parentWorkspaceId != null;
+  const transcriptOnly = props.workspace.transcriptOnly === true;
   const options = settings
     ? resolveSettings(
         props.workspace,
@@ -124,16 +127,17 @@ export function ConversationScreen(props: {
   const modelBlockReason =
     settings && options ? getModelBlockReason(settings, options.model) : null;
   const settingsReady = ready && settings !== null && !settingsError;
-  const canAct = settingsReady && !modelBlockReason;
-  const latestSettings = useRef({ options, modelBlockReason });
+  const canAct = settingsReady && !modelBlockReason && !transcriptOnly;
+  const latestSettings = useRef({ options, modelBlockReason, transcriptOnly });
   useEffect(() => {
-    latestSettings.current = { options, modelBlockReason };
-  }, [options, modelBlockReason]);
+    latestSettings.current = { options, modelBlockReason, transcriptOnly };
+  }, [options, modelBlockReason, transcriptOnly]);
   const running = ready && transcript.streaming;
   const actionDisabled = !ready || busy || (!running && (!canAct || !hasDraft || !options?.model));
   // A live answer resolves the existing tool, not the next-turn model. Connection,
   // settings and global policy blocks still apply; recovery needs a routable model too.
-  const canAnswer = settingsReady && (running ? !getPolicyStateBlockReason(settings) : canAct);
+  const canAnswer =
+    settingsReady && !transcriptOnly && (running ? !getPolicyStateBlockReason(settings) : canAct);
   const expanded = inputFocused || hasDraft || running || showSettings !== null;
 
   const lastMessage = transcript.messages.at(-1);
@@ -252,13 +256,13 @@ export function ConversationScreen(props: {
       !latest.metadata?.partial
     )
       return;
-    const { options, modelBlockReason } = latestSettings.current;
+    const { options, modelBlockReason, transcriptOnly } = latestSettings.current;
     // The answer is already durable and its form may disappear on tool-call-end.
     // Keep resume failures outside that form, and retry only resume, never the answer.
     setResumeMessageId(messageId);
     // Settings or policy can change while the answer is saved. Preserve recovery
     // while unavailable, but never resume with stale options or a prohibited route.
-    if (!options?.model || modelBlockReason) return;
+    if (!options?.model || modelBlockReason || transcriptOnly) return;
     try {
       const result = await props.client.workspace.resumeStream(
         { workspaceId: props.workspace.id, options },
@@ -449,139 +453,167 @@ export function ConversationScreen(props: {
           />
         </View>
       )}
-      <View
-        style={styles.composerWrap}
-        onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
-      >
-        {modelBlockReason && (
-          <Notice onRetry={!settings?.policy ? props.onReconnect : undefined}>
-            {modelBlockReason}
-          </Notice>
-        )}
-        {actionError && (
-          <Notice
-            onRetry={() => {
-              setActionError(null);
-              return props.onReconnect();
-            }}
-          >
-            {actionError}
-          </Notice>
-        )}
-        <DraftExtras draft={draft} onChange={setDraft} />
-        {/* Keep the input bottommost. Pointer presses retain browser focus until click opens the picker, avoiding blur-driven movement. */}
-        <View style={styles.composerToolbar}>
-          <View style={styles.pickers}>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Choose mode"
-              accessibilityState={{ disabled: !settings || !options }}
-              disabled={!settings || !options}
-              onPointerDown={Platform.OS === "web" ? (event) => event.preventDefault() : undefined}
-              onPress={() => setShowSettings("agent")}
-              style={({ pressed }) => [
-                styles.modelButton,
-                { maxWidth: "45%" },
-                pressed && { opacity: 0.6 },
-              ]}
-            >
-              {options?.agentId === "plan" ? (
-                <ClipboardList size={15} color={colors.plan} />
-              ) : (
-                <View style={styles.modeDot} />
-              )}
-              <Text numberOfLines={1} style={styles.modelLabel}>
-                {settings?.agents.find((agent) => agent.id === options?.agentId)?.name ?? "Mode"}
-              </Text>
-              <ChevronDown size={12} color={colors.muted} />
-            </Pressable>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Choose model"
-              accessibilityState={{ disabled: !settings || !options }}
-              disabled={!settings || !options}
-              onPointerDown={Platform.OS === "web" ? (event) => event.preventDefault() : undefined}
-              onPress={() => setShowSettings("model")}
-              style={({ pressed }) => [styles.modelButton, pressed && { opacity: 0.6 }]}
-            >
-              <Text numberOfLines={1} style={styles.modelLabel}>
-                {options?.model ? modelName(options.model) : "Model"}
-              </Text>
-              {options && (
-                <Text style={styles.effortLabel}>
-                  {(options.thinkingLevel ?? THINKING_LEVEL_OFF).toUpperCase()}
-                </Text>
-              )}
-              <ChevronDown size={12} color={colors.muted} />
-            </Pressable>
-          </View>
-          <ContextUsage data={context} />
-        </View>
+      {transcriptOnly ? (
         <View
-          style={[
-            styles.composer,
-            expanded && styles.expandedComposer,
-            inputFocused && styles.focusedComposer,
-          ]}
+          style={styles.composerWrap}
+          onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
         >
-          <TextInput
-            accessibilityLabel="Message"
-            placeholder={
-              !ready ? "Reconnecting…" : running ? "Write your next message…" : "Message Xum…"
-            }
-            placeholderTextColor={colors.muted}
-            value={draft.text}
-            onChangeText={(text) => setDraft((current) => ({ ...current, text }))}
-            multiline
-            onKeyPress={Platform.OS === "web" ? handleComposerKeyPress : undefined}
-            onFocus={() => setInputFocused(true)}
-            onBlur={() => setInputFocused(false)}
-            onContentSizeChange={
-              Platform.OS === "web"
-                ? undefined
-                : (event) =>
-                    setInputHeight(
-                      Math.max(44, Math.min(132, event.nativeEvent.contentSize.height))
-                    )
-            }
-            style={[
-              styles.input,
-              expanded && styles.expandedInput,
-              Platform.OS === "web"
-                ? webInputSizing
-                : { height: expanded ? Math.max(72, inputHeight) : 44 },
-            ]}
-            selectionColor={colors.accent}
-          />
+          <Text role="note" style={layout.muted}>
+            This workspace's worktree is no longer available. This is a read-only chat transcript.
+          </Text>
+          {actionError && <Notice>{actionError}</Notice>}
+          {/* A missing checkout blocks new work, not stopping a stream that is already live. */}
+          {running && (
+            <Button icon={Square} busy={busy} onPress={interrupt}>
+              Interrupt agent
+            </Button>
+          )}
+        </View>
+      ) : (
+        <View
+          style={styles.composerWrap}
+          onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
+        >
+          {modelBlockReason && (
+            <Notice onRetry={!settings?.policy ? props.onReconnect : undefined}>
+              {modelBlockReason}
+            </Notice>
+          )}
+          {actionError && (
+            <Notice
+              onRetry={() => {
+                setActionError(null);
+                return props.onReconnect();
+              }}
+            >
+              {actionError}
+            </Notice>
+          )}
+          <DraftExtras draft={draft} onChange={setDraft} />
+          {/* Keep the input bottommost. Pointer presses retain browser focus until click opens the picker, avoiding blur-driven movement. */}
+          <View style={styles.composerToolbar}>
+            <View style={styles.pickers}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Choose mode"
+                accessibilityState={{ disabled: modeLocked || !settings || !options }}
+                disabled={modeLocked || !settings || !options}
+                onPointerDown={
+                  Platform.OS === "web" ? (event) => event.preventDefault() : undefined
+                }
+                onPress={() => setShowSettings("agent")}
+                style={({ pressed }) => [
+                  styles.modelButton,
+                  { maxWidth: "45%" },
+                  pressed && { opacity: 0.6 },
+                ]}
+              >
+                {options?.agentId === "plan" ? (
+                  <ClipboardList size={15} color={colors.plan} />
+                ) : (
+                  <View style={styles.modeDot} />
+                )}
+                <Text numberOfLines={1} style={styles.modelLabel}>
+                  {settings?.agents.find((agent) => agent.id === options?.agentId)?.name ??
+                    options?.agentId ??
+                    "Mode"}
+                </Text>
+                <ChevronDown size={12} color={colors.muted} />
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Choose model"
+                accessibilityState={{ disabled: !settings || !options }}
+                disabled={!settings || !options}
+                onPointerDown={
+                  Platform.OS === "web" ? (event) => event.preventDefault() : undefined
+                }
+                onPress={() => setShowSettings("model")}
+                style={({ pressed }) => [styles.modelButton, pressed && { opacity: 0.6 }]}
+              >
+                <Text numberOfLines={1} style={styles.modelLabel}>
+                  {options?.model ? modelName(options.model) : "Model"}
+                </Text>
+                {options && (
+                  <Text style={styles.effortLabel}>
+                    {(options.thinkingLevel ?? THINKING_LEVEL_OFF).toUpperCase()}
+                  </Text>
+                )}
+                <ChevronDown size={12} color={colors.muted} />
+              </Pressable>
+            </View>
+            <ContextUsage data={context} />
+          </View>
           <View
             style={[
-              styles.send,
-              (canAct || running) &&
-                (running || hasDraft) && {
-                  backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent,
-                },
+              styles.composer,
+              expanded && styles.expandedComposer,
+              inputFocused && styles.focusedComposer,
             ]}
           >
-            <IconButton
-              label={running ? "Interrupt agent" : "Send message"}
-              icon={running ? Square : ArrowUp}
-              color={(canAct || running) && (running || hasDraft) ? colors.bright : colors.muted}
-              disabled={actionDisabled}
-              onPress={running ? interrupt : send}
+            <TextInput
+              accessibilityLabel="Message"
+              placeholder={
+                !ready ? "Reconnecting…" : running ? "Write your next message…" : "Message Xum…"
+              }
+              placeholderTextColor={colors.muted}
+              value={draft.text}
+              onChangeText={(text) => setDraft((current) => ({ ...current, text }))}
+              multiline
+              onKeyPress={Platform.OS === "web" ? handleComposerKeyPress : undefined}
+              onFocus={() => setInputFocused(true)}
+              onBlur={() => setInputFocused(false)}
+              onContentSizeChange={
+                Platform.OS === "web"
+                  ? undefined
+                  : (event) =>
+                      setInputHeight(
+                        Math.max(44, Math.min(132, event.nativeEvent.contentSize.height))
+                      )
+              }
+              style={[
+                styles.input,
+                expanded && styles.expandedInput,
+                Platform.OS === "web"
+                  ? webInputSizing
+                  : { height: expanded ? Math.max(72, inputHeight) : 44 },
+              ]}
+              selectionColor={colors.accent}
             />
+            <View
+              style={[
+                styles.send,
+                (canAct || running) &&
+                  (running || hasDraft) && {
+                    backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent,
+                  },
+              ]}
+            >
+              <IconButton
+                label={running ? "Interrupt agent" : "Send message"}
+                icon={running ? Square : ArrowUp}
+                color={(canAct || running) && (running || hasDraft) ? colors.bright : colors.muted}
+                disabled={actionDisabled}
+                onPress={running ? interrupt : send}
+              />
+            </View>
           </View>
         </View>
-      </View>
-      {showSettings && settings && options && (
-        <ModelSettings
-          initialPage={showSettings}
-          value={options}
-          data={settings}
-          workspace={props.workspace}
-          onClose={() => setShowSettings(null)}
-          onChange={props.onSelectionChange}
-        />
       )}
+      {showSettings &&
+        settings &&
+        options &&
+        !transcriptOnly &&
+        (!modeLocked || showSettings === "model") && (
+          <ModelSettings
+            initialPage={showSettings}
+            value={options}
+            data={settings}
+            workspace={props.workspace}
+            onClose={() => setShowSettings(null)}
+            onChange={props.onSelectionChange}
+          />
+        )}
     </KeyboardAvoidingView>
   );
 }

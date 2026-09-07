@@ -39,8 +39,13 @@ const disabledPolicy: Policy = { source: "none", status: { state: "disabled" }, 
 function fixture(
   messages: WorkspaceChatMessage[] = [],
   wide = false,
-  initialPolicy: Policy | Error = disabledPolicy
+  initialPolicy: Policy | Error = disabledPolicy,
+  initialWorkspaces: FrontendWorkspaceMetadata[] = workspaces
 ) {
+  let workspaceList = initialWorkspaces;
+  const metadataEvents: Array<
+    ReadableStreamDefaultController<{ workspaceId: string; metadata: FrontendWorkspaceMetadata }>
+  > = [];
   Object.defineProperty(document.documentElement, "clientWidth", {
     configurable: true,
     value: wide ? 1200 : 375,
@@ -94,9 +99,9 @@ function fixture(
       calls.push({ path: name, input, signal: options.signal });
       switch (name) {
         case "workspace.onMetadata":
-          return events(options.signal);
+          return events(options.signal, [], (controller) => metadataEvents.push(controller));
         case "workspace.list":
-          return workspaces;
+          return workspaceList;
         case "projects.list":
           return [];
         case "policy.get":
@@ -115,6 +120,7 @@ function fixture(
         case "agents.list":
           return [
             { id: "exec", name: "Exec", uiSelectable: true },
+            { id: "explore", name: "Explore", uiSelectable: false },
             { id: "plan", name: "Plan", uiSelectable: true },
           ];
         case "workspace.onChat": {
@@ -198,9 +204,15 @@ function fixture(
       fireEvent.click(await view.findByRole("button", { name: id }));
       await waitFor(() =>
         expect(
-          view.getByRole("button", { name: "Choose mode" }).getAttribute("aria-disabled")
+          view.getByRole("button", { name: "Choose model" }).getAttribute("aria-disabled")
         ).not.toBe("true")
       );
+    },
+    async updateWorkspace(metadata: FrontendWorkspaceMetadata) {
+      workspaceList = workspaceList.map((workspace) =>
+        workspace.id === metadata.id ? metadata : workspace
+      );
+      await act(async () => metadataEvents.at(-1)!.enqueue({ workspaceId: metadata.id, metadata }));
     },
     setConfigRead(read: typeof configRead) {
       configRead = read;
@@ -222,6 +234,142 @@ function fixture(
     },
   };
 }
+
+test("searched delegated workspaces keep legacy/current identity locked while allowing model changes", async () => {
+  for (const [identity, expected, label] of [
+    [{ agentType: "explore" }, "explore", "Explore"],
+    [{ agentId: "custom-worker" }, "custom-worker", "custom-worker"],
+    [{ agentType: "explore", agentId: "exec" }, "explore", "Explore"],
+  ] as const) {
+    const child = { ...workspaces[0], ...identity, parentWorkspaceId: "beta" };
+    const view = fixture([], false, disabledPolicy, [child, workspaces[1]]);
+    fireEvent.change(await view.findByLabelText("Search workspaces"), {
+      target: { value: "alpha" },
+    });
+    await view.select("alpha");
+    const mode = view.getByRole("button", { name: "Choose mode" });
+    expect(mode.getAttribute("aria-disabled")).toBe("true");
+    expect(mode.textContent).toContain(label);
+    fireEvent.click(mode);
+    expect(view.queryByRole("radio", { name: "Plan" })).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "Choose model" }));
+    fireEvent.click(view.getByRole("radio", { name: "anthropic:allowed" }));
+    fireEvent.change(view.getByLabelText("Message"), {
+      target: { value: "Continue delegated work" },
+    });
+    await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
+    expect(view.calls.find((call) => call.path === "workspace.sendMessage")?.input).toMatchObject({
+      options: { agentId: expected, model: "anthropic:allowed" },
+    });
+    view.unmount();
+  }
+});
+
+test("delegated request options override an earlier remembered root mode for send and recovery", async () => {
+  const view = fixture([answeredPartial()]);
+  await view.select("alpha");
+  fireEvent.click(view.getByRole("button", { name: "Choose mode" }));
+  fireEvent.click(view.getByRole("radio", { name: "Plan" }));
+  await view.updateWorkspace({ ...workspaces[0], parentWorkspaceId: "beta", agentType: "explore" });
+  expect(view.getByRole("button", { name: "Choose mode" }).getAttribute("aria-disabled")).toBe(
+    "true"
+  );
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Keep identity" } });
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Resume agent" })));
+  for (const path of ["workspace.sendMessage", "workspace.resumeStream"]) {
+    expect(view.calls.find((call) => call.path === path)?.input).toMatchObject({
+      options: { agentId: "explore" },
+    });
+  }
+});
+
+test("transcript-only workspaces keep history and drafts but expose no send or recovery controls", async () => {
+  const history: WorkspaceChatMessage = {
+    type: "message",
+    id: "history",
+    role: "user",
+    parts: [{ type: "text", text: "Retained history" }],
+    metadata: { historySequence: 0 },
+  };
+  const view = fixture([history, answeredPartial()]);
+  await view.select("alpha");
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Retained draft" } });
+  const oldInput = view.getByLabelText("Message");
+  act(() => oldInput.focus());
+  const oldResume = view.getByRole("button", { name: "Resume agent" });
+  await view.updateWorkspace({ ...workspaces[0], transcriptOnly: true });
+  expect(view.getByText("Retained history")).toBeDefined();
+  expect(view.getByRole("note").textContent).toContain("read-only");
+  expect(view.queryByLabelText("Message")).toBeNull();
+  expect(view.queryByRole("button", { name: "Send message" })).toBeNull();
+  expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+  fireEvent.click(oldResume);
+  fireEvent.keyDown(oldInput, { key: "Enter", ctrlKey: true });
+  expect(callCount(view, "sendMessage")).toBe(0);
+  expect(callCount(view, "resumeStream")).toBe(0);
+  fireEvent.click(view.getByRole("button", { name: "Back to workspaces" }));
+  fireEvent.click(await view.findByRole("button", { name: "alpha" }));
+  expect(await view.findByRole("note")).toBeDefined();
+  await view.updateWorkspace(workspaces[0]);
+  expect(await view.findByLabelText("Message")).toHaveProperty("value", "Retained draft");
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
+  expect(callCount(view, "sendMessage")).toBe(1);
+});
+
+test("transcript-only metadata arriving during an answer prevents its resume continuation", async () => {
+  const view = fixture([question()]);
+  await view.select("alpha");
+  const answer = deferred<unknown>();
+  view.setAnswer(() => answer.promise);
+  await submitAnswer(view);
+  await view.emit(answered());
+  await view.updateWorkspace({ ...workspaces[0], transcriptOnly: true });
+  await act(async () => answer.resolve({ success: true }));
+  expect(callCount(view, "resumeStream")).toBe(0);
+  expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+});
+
+test("transcript-only pending questions are read-only while live Stop remains available", async () => {
+  for (const live of [false, true]) {
+    const messages: WorkspaceChatMessage[] = live
+      ? [
+          {
+            type: "stream-start",
+            workspaceId: "alpha",
+            messageId: "question",
+            model,
+            historySequence: 1,
+            startTime: 1,
+          },
+          question(),
+        ]
+      : [question()];
+    const view = fixture(messages);
+    await view.select("alpha");
+    fireEvent.click(
+      within(view.getByRole("radiogroup", { name: "Answer question?" })).getByRole("radio", {
+        name: "main",
+      })
+    );
+    await view.updateWorkspace({ ...workspaces[0], transcriptOnly: true });
+    expect(view.getByRole("button", { name: "Send answers" }).getAttribute("aria-disabled")).toBe(
+      "true"
+    );
+    fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+    expect(callCount(view, "answerAskUserQuestion")).toBe(0);
+    if (live) {
+      view.setInterrupt(async () => ({ success: false, error: "Stop failed" }));
+      await act(async () => fireEvent.click(view.getByRole("button", { name: "Interrupt agent" })));
+      expect(callCount(view, "interruptStream")).toBe(1);
+      expect(view.getByRole("alert").textContent).toContain("Stop failed");
+      view.setInterrupt(async () => ({ success: true }));
+      await act(async () => fireEvent.click(view.getByRole("button", { name: "Interrupt agent" })));
+      expect(callCount(view, "interruptStream")).toBe(2);
+    }
+    view.unmount();
+  }
+});
 
 test("failed credential clearing leaves the session usable and reconnectable before retrying disconnect", async () => {
   const view = fixture();

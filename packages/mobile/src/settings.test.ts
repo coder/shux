@@ -361,6 +361,32 @@ describe("mobile model settings", () => {
       providerOptions: undefined,
     });
   });
+  test("delegated identities ignore requested and remembered agent overrides, including legacy metadata", () => {
+    const settings = data();
+    for (const [identity, expected] of [
+      [{ agentType: " Explore " }, "explore"],
+      [{ agentId: "custom-worker" }, "custom-worker"],
+      [{ agentType: "explore", agentId: "exec" }, "explore"],
+    ] as const) {
+      const workspace = {
+        ...identity,
+        parentWorkspaceId: "parent",
+        aiSettings: { model: "saved:model", thinkingLevel: "off" as const },
+      };
+      expect(resolveSettings(workspace, settings, "plan").agentId).toBe(expected);
+      expect(resolveSettings(workspace, settings, "plan").model).toBe("saved:model");
+      const selected = { agentId: "plan", model: "selected:model", thinkingLevel: "high" as const };
+      expect(resolveSettings(workspace, settings, "plan", selected)).toMatchObject({
+        ...selected,
+        agentId: expected,
+      });
+      expect(selected.agentId).toBe("plan");
+    }
+    expect(
+      resolveSettings({}, settings, "plan", { agentId: "plan", model: "root:model" }).agentId
+    ).toBe("plan");
+  });
+
   test("unset effort is Off, including an explicit model with Default effort", () => {
     const config = data();
     expect(resolveSettings({}, config, "exec").thinkingLevel).toBe("off");
