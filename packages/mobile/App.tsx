@@ -1,4 +1,4 @@
-import { createContext, useContext, useState } from "react";
+import { createContext, useContext, useRef, useState } from "react";
 import type { ReactNode, SetStateAction } from "react";
 import { StatusBar, Text, useWindowDimensions, View } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
@@ -66,7 +66,7 @@ export default function App() {
   );
 }
 
-function ConnectedApp(props: { connection: Connection; onDisconnect: () => void }) {
+export function ConnectedApp(props: { connection: Connection; onDisconnect: () => void }) {
   const session = useConnection(props.connection);
   const data = useProjects(session.connection.client, session.signal);
   // Draft text and unsent model choices survive native back/pop and reconnection.
@@ -77,17 +77,23 @@ function ConnectedApp(props: { connection: Connection; onDisconnect: () => void 
   >(null);
   const [disconnectError, setDisconnectError] = useState<string | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
+  const disconnectPending = useRef(false);
   async function disconnect() {
-    session.cancel();
+    if (disconnectPending.current) return;
+    disconnectPending.current = true;
     setDisconnecting(true);
     setDisconnectError(null);
     try {
+      // Secure storage can fail. Keep the live session usable until forgetting succeeds.
       await clearCredentials();
-      props.onDisconnect();
     } catch {
       setDisconnectError("Could not clear saved credentials. Try disconnecting again.");
+      disconnectPending.current = false;
       setDisconnecting(false);
+      return;
     }
+    session.cancel();
+    props.onDisconnect();
   }
   const value: SessionContext = {
     session,
@@ -199,9 +205,29 @@ function WorkspacesRoute(props: NativeStackScreenProps<MobileRoutes, "Workspaces
 function ScreenLayout(props: {
   children: ReactNode;
   workspaceId?: string;
-  navigation: Pick<NativeStackScreenProps<MobileRoutes>["navigation"], "navigate">;
+  navigation: Pick<
+    NativeStackScreenProps<MobileRoutes>["navigation"],
+    "navigate" | "getState" | "reset"
+  >;
 }) {
   const { width } = useWindowDimensions();
+  function selectWorkspace(workspaceId: string) {
+    const state = props.navigation.getState();
+    const active = state.routes[state.index];
+    if (active.name === "Conversation" && active.params?.workspaceId === workspaceId) return;
+    const conversation = state.routes.find(
+      (route) => route.name === "Conversation" && route.params?.workspaceId === workspaceId
+    );
+    // A sidebar selection replaces the detail, not the back stack. Keeping hidden
+    // conversations mounted would retain their live subscriptions indefinitely.
+    props.navigation.reset({
+      index: 1,
+      routes: [
+        { name: "Workspaces", key: state.routes[0].key },
+        { name: "Conversation", key: conversation?.key, params: { workspaceId } },
+      ],
+    });
+  }
   return (
     <SafeAreaView style={[layout.fill, { flexDirection: "row" }]}>
       {width >= WIDE_LAYOUT_MIN_WIDTH && (
@@ -209,7 +235,7 @@ function ScreenLayout(props: {
           <WorkspaceList
             compact
             selectedId={props.workspaceId}
-            onSelect={(workspaceId) => props.navigation.navigate("Conversation", { workspaceId })}
+            onSelect={selectWorkspace}
             onSettings={() => props.navigation.navigate("Settings")}
           />
         </View>

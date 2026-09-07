@@ -63,6 +63,7 @@ export function ConversationScreen(props: {
   const [inputHeight, setInputHeight] = useState(44);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [resumeMessageId, setResumeMessageId] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState<"model" | "agent" | null>(null);
   const [atBottom, setAtBottom] = useState(true);
   const [composerHeight, setComposerHeight] = useState(100);
@@ -78,6 +79,12 @@ export function ConversationScreen(props: {
     setBusy(false);
     return () => abort.abort();
   }, [props.signal]);
+  const latestTranscript = useRef(transcript);
+  // Answer RPCs can outlive stream updates from another client. Consult the latest
+  // committed transcript before starting recovery, not the pre-answer render.
+  useEffect(() => {
+    latestTranscript.current = transcript;
+  }, [transcript]);
   const agentId = props.workspace.agentId ?? "exec";
   const options = settings
     ? resolveSettings(
@@ -92,6 +99,17 @@ export function ConversationScreen(props: {
     props.connected && !props.signal.aborted && transcript.caughtUp && !error && settings !== null;
   const running = ready && transcript.streaming;
   const expanded = inputFocused || draft.length > 0 || running || showSettings !== null;
+
+  const lastMessage = transcript.messages.at(-1);
+  // Only the active stream or the latest persisted partial can still need input.
+  // Historical unanswered tools may have been abandoned by a later user turn.
+  const answerMessage = running
+    ? transcript.messages.find((message) => message.id === transcript.streamingMessageId)
+    : lastMessage?.role === "assistant" && lastMessage.metadata?.partial
+      ? lastMessage
+      : undefined;
+  const canResume =
+    ready && !running && resumeMessageId === lastMessage?.id && lastMessage?.metadata?.partial;
 
   async function send() {
     if (!ready || !options?.model || !draft.trim() || pending.current || running) return;
@@ -153,13 +171,90 @@ export function ConversationScreen(props: {
     }
   }
 
+  async function resumeAnsweredQuestion(messageId: string, signal: AbortSignal) {
+    const current = latestTranscript.current;
+    const latest = current.messages.at(-1);
+    if (
+      signal.aborted ||
+      current.streaming ||
+      latest?.id !== messageId ||
+      !latest.metadata?.partial
+    )
+      return;
+    if (!options?.model) return;
+    // The answer is already durable and its form may disappear on tool-call-end.
+    // Keep resume failures outside that form, and retry only resume, never the answer.
+    setResumeMessageId(messageId);
+    try {
+      const result = await props.client.workspace.resumeStream(
+        { workspaceId: props.workspace.id, options },
+        { signal }
+      );
+      if (signal.aborted) return;
+      if (!result.success)
+        throw new Error(
+          typeof result.error === "string" ? result.error : JSON.stringify(result.error)
+        );
+      setResumeMessageId(null);
+    } catch (cause) {
+      if (!signal.aborted)
+        setActionError(
+          `Answers saved, but the agent could not resume: ${cause instanceof Error ? cause.message : "Unknown error"}`
+        );
+    }
+  }
+
+  async function retryResume() {
+    if (!canResume || !resumeMessageId || pending.current) return;
+    pending.current = true;
+    setBusy(true);
+    setActionError(null);
+    const signal = controller.current.signal;
+    try {
+      await resumeAnsweredQuestion(resumeMessageId, signal);
+    } finally {
+      if (controller.current.signal === signal) {
+        pending.current = false;
+        if (!signal.aborted) setBusy(false);
+      }
+    }
+  }
+
   async function answer(toolCallId: string, answers: Record<string, string>) {
     if (!ready) throw new Error("Reconnect before answering.");
-    const result = await props.client.workspace.answerAskUserQuestion(
-      { workspaceId: props.workspace.id, toolCallId, answers },
-      { signal: controller.current.signal }
-    );
-    if (!result.success) throw new Error(result.error);
+    if (pending.current) throw new Error("Another action is in progress.");
+    if (
+      !answerMessage ||
+      resumeMessageId === answerMessage.id ||
+      !answerMessage.parts.some(
+        (part) =>
+          part.type === "dynamic-tool" &&
+          part.toolName === "ask_user_question" &&
+          part.toolCallId === toolCallId &&
+          part.state === "input-available"
+      )
+    )
+      throw new Error("This question is no longer pending.");
+    if (!running && !options?.model) throw new Error("Choose a model before resuming.");
+    pending.current = true;
+    setBusy(true);
+    setActionError(null);
+    const signal = controller.current.signal;
+    try {
+      const result = await props.client.workspace.answerAskUserQuestion(
+        { workspaceId: props.workspace.id, toolCallId, answers },
+        { signal }
+      );
+      if (signal.aborted)
+        throw new Error("Connection changed. Reload history before answering again.");
+      if (!result.success) throw new Error(result.error);
+      if (!running) await resumeAnsweredQuestion(answerMessage.id, signal);
+    } finally {
+      if (controller.current.signal === signal) {
+        pending.current = false;
+        if (!signal.aborted) setBusy(false);
+      }
+    }
   }
 
   return (
@@ -231,7 +326,9 @@ export function ConversationScreen(props: {
           <Message
             message={item}
             streaming={transcript.streamingMessageId === item.id && running}
-            canAnswer={ready && running}
+            canAnswer={
+              ready && !busy && answerMessage?.id === item.id && resumeMessageId !== item.id
+            }
             onAnswer={answer}
           />
         )}
@@ -251,6 +348,11 @@ export function ConversationScreen(props: {
           <View style={{ gap: 12 }}>
             {error && <Notice onRetry={props.onReconnect}>{error}</Notice>}
             {transcript.error && <Notice>{transcript.error}</Notice>}
+            {canResume && (
+              <Button busy={busy} onPress={retryResume}>
+                Resume agent
+              </Button>
+            )}
             {running && (
               <Text style={[layout.muted, { color: colors.accent }]}>Agent is working…</Text>
             )}

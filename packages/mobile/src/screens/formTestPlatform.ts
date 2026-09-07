@@ -12,6 +12,16 @@ mock.module("react-native-svg", () => ({ default: NativeWeb.View, Circle: icon }
 mock.module("lucide-react-native", () =>
   Object.fromEntries(
     [
+      "ArrowDown",
+      "ArrowUp",
+      "ArrowRight",
+      "Eye",
+      "EyeOff",
+      "GitCompareArrows",
+      "Square",
+      "CheckCircle2",
+      "FileCode",
+      "RefreshCw",
       "AlertCircle",
       "ArrowDown",
       "ArrowUp",
