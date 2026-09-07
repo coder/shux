@@ -995,7 +995,8 @@ test.each(["Which features?", "__proto__"])(
 function prefilledQuestionPart(
   answers: unknown,
   multiSelect = false,
-  toolCallId = "prefilled"
+  toolCallId = "prefilled",
+  questionText = "Which branch?"
 ): MuxToolPart {
   return {
     type: "dynamic-tool",
@@ -1005,7 +1006,7 @@ function prefilledQuestionPart(
     input: {
       questions: [
         {
-          question: "Which branch?",
+          question: questionText,
           header: "Branch",
           options: [
             { label: "main", description: "Stable branch" },
@@ -1124,6 +1125,37 @@ test.each([undefined, null, {}, { "Which branch?": "   " }])(
     );
     expect(view.getByRole("radio", { name: "Other" }).getAttribute("aria-checked")).toBe("false");
     expect(view.queryByLabelText("Other: Which branch?")).toBeNull();
+  }
+);
+
+test.each(["constructor", "__proto__"])(
+  "prefilled answer keys ignore inherited %s values and submit own properties safely",
+  async (question) => {
+    const inheritedAnswers: unknown = Object.create(Object.fromEntries([[question, "main"]]));
+    const submitted: Array<Record<string, string>> = [];
+    const view = render(
+      <Message
+        message={toolMessage(
+          prefilledQuestionPart(inheritedAnswers, false, "key-safety", question)
+        )}
+        canAnswer
+        onAnswer={async (_id, value) => {
+          submitted.push(value);
+        }}
+      />
+    );
+    expect(view.getByRole("radio", { name: "main" }).getAttribute("aria-checked")).toBe("false");
+    expect(view.getByRole("button", { name: "Send answers" }).getAttribute("aria-disabled")).toBe(
+      "true"
+    );
+    fireEvent.click(view.getByRole("radio", { name: "next" }));
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+    });
+    expect(submitted).toHaveLength(1);
+    expect(Object.hasOwn(submitted[0], question)).toBe(true);
+    expect(submitted[0][question]).toBe("next");
+    expect(Object.getPrototypeOf(submitted[0])).toBe(Object.prototype);
   }
 );
 
