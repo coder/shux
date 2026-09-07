@@ -3294,8 +3294,16 @@ export class AgentSession {
      */
     const rollbackPersistedTurnRows = async (): Promise<boolean> => {
       if (persistedCancelableMessageIds.length === 0) return true;
-      this.coordinator.invalidateCompaction();
-      this.continuousCompactor.reset("delete-messages");
+      const handoff = internal?.compactionHandoff;
+      const ownsCleanup = handoff != null && this.coordinator.canClearCompactionFollowUp(handoff);
+      // Stop retains this handoff's summary cleanup even while its user-row append
+      // unwinds. A replaced handoff may delete its own rows, but cannot retire its successor.
+      if (handoff == null || ownsCleanup || this.coordinator.isCurrentCompaction(handoff)) {
+        this.coordinator.invalidateCompaction(
+          ownsCleanup && this.coordinator.compactionIntent.status === "abandoned"
+        );
+        this.continuousCompactor.reset("delete-messages");
+      }
       const rollbackResult = await this.historyService.deleteMessages(
         this.workspaceId,
         persistedCancelableMessageIds

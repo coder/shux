@@ -7,6 +7,118 @@ import { createAgentSessionHarness } from "./agentSession.testHarness";
 
 afterEach(() => mock.restore());
 
+test.each([
+  ["before", false],
+  ["after", false],
+  ["before", true],
+  ["after", true],
+] as const)(
+  "Stop %s handoff append commits clears only its own pending continuation (successor=%s)",
+  async (commitPoint, hasSuccessor) => {
+    const workspaceId = "stopped-appending-compaction";
+    const h = await createAgentSessionHarness({ workspaceId });
+    const options = { model: "openai:gpt-4o", agentId: "exec" };
+    const summary = createMuxMessage("summary", "assistant", "Earlier work", {
+      muxMetadata: {
+        type: "compaction-summary",
+        pendingFollowUp: { text: "Continue", ...options },
+      },
+    });
+    await h.historyService.appendToHistory(workspaceId, summary);
+    const internals = h.session as unknown as {
+      coordinator: TurnCoordinator;
+      dispatchPendingFollowUp(): Promise<boolean>;
+    };
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const append = h.historyService.appendToHistory.bind(h.historyService);
+    spyOn(h.historyService, "appendToHistory").mockImplementation(async (...args) => {
+      const isHandoff =
+        args[1].role === "user" &&
+        args[1].parts.some((part) => part.type === "text" && part.text === "Continue");
+      if (!isHandoff) return append(...args);
+      if (commitPoint === "before") {
+        entered.resolve();
+        await release.promise;
+        return append(...args);
+      }
+      const result = await append(...args);
+      entered.resolve();
+      await release.promise;
+      return result;
+    });
+    const stream = spyOn(h.aiService, "streamMessage");
+    const pending = internals.dispatchPendingFollowUp();
+    let restarted: Awaited<ReturnType<typeof createAgentSessionHarness>> | undefined;
+    try {
+      await entered.promise;
+      await h.session.interruptStream({ abandonPartial: true });
+      let successor: ReturnType<TurnCoordinator["beginCompactionObservation"]>;
+      if (hasSuccessor) {
+        expect((await h.session.sendMessage("manual replacement", options)).success).toBe(true);
+        successor = internals.coordinator.beginCompactionObservation("continuous");
+        expect(successor).toBeDefined();
+        // A's late rollback must not retire B's compaction work or erase a
+        // replacement summary, even when its history row reuses the source ID.
+        await h.historyService.updateHistory(
+          workspaceId,
+          createMuxMessage("summary", "assistant", "Replacement boundary", {
+            ...summary.metadata,
+            muxMetadata: {
+              type: "compaction-summary",
+              pendingFollowUp: { text: "Replacement follow-up", ...options },
+            },
+          })
+        );
+      }
+      release.resolve();
+      expect(await pending).toBe(false);
+      expect(stream).toHaveBeenCalledTimes(hasSuccessor ? 1 : 0);
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      expect(
+        history.data
+          .filter((message) => message.role === "user")
+          .map((message) =>
+            message.parts
+              .filter((part) => part.type === "text")
+              .map((part) => part.text)
+              .join("")
+          )
+      ).toEqual(hasSuccessor ? ["manual replacement"] : []);
+      const source = history.data.find((message) => message.id === summary.id);
+      if (hasSuccessor) {
+        if (!successor) throw new Error("Expected successor compaction");
+        expect(internals.coordinator.isCurrentCompaction(successor)).toBe(true);
+        expect(source?.metadata?.muxMetadata).toHaveProperty(
+          "pendingFollowUp.text",
+          "Replacement follow-up"
+        );
+      } else {
+        expect(source?.metadata?.muxMetadata).not.toHaveProperty("pendingFollowUp");
+        await h.session.dispose();
+        restarted = await createAgentSessionHarness({
+          workspaceId,
+          config: h.config,
+          historyService: h.historyService,
+        });
+        const recovered = restarted.session as unknown as {
+          dispatchPendingFollowUp(): Promise<boolean>;
+        };
+        const resumed = spyOn(restarted.aiService, "streamMessage");
+        expect(await recovered.dispatchPendingFollowUp()).toBe(false);
+        expect(resumed).not.toHaveBeenCalled();
+      }
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      await restarted?.session.dispose();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
 test.each(["before preparation", "during provider startup"] as const)(
   "an accepted handoff stays continued when replaced %s before send returns an error",
   async (replacementPoint) => {
