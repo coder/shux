@@ -171,7 +171,9 @@ test.describe("sidebar drag and drop", () => {
               {
                 type: "tabset",
                 id: "tabset-1",
-                tabs: ["costs", "review"],
+                // Goal is inserted independently for root workspaces; seed it so
+                // this test only exercises the missing Instructions migration.
+                tabs: ["costs", "review", "goal"],
                 activeTab: "costs",
               },
               {
@@ -201,10 +203,13 @@ test.describe("sidebar drag and drop", () => {
     const tablists = await sidebar.getByRole("tablist").all();
     expect(tablists.length).toBe(2);
 
-    // Verify each tablist has expected tabs. The first tabset receives
-    // default-layout tabs injected by the migration (Stats, Review, Instructions).
-    await expect(tablists[0].getByRole("tab")).toHaveCount(3);
-    await expect(tablists[1].getByRole("tab")).toHaveCount(1); // Stats (duplicate costs in split)
+    // Instructions is migrated into the first tabset without disturbing the split.
+    await expect(tablists[0].getByRole("tab")).toHaveCount(4);
+    for (const name of ["Stats", "Review", "Instructions", "Goal"]) {
+      await expect(tablists[0].getByRole("tab", { name, exact: true })).toBeVisible();
+    }
+    await expect(tablists[1].getByRole("tab")).toHaveCount(1);
+    await expect(tablists[1].getByRole("tab", { name: "Stats", exact: true })).toBeVisible();
   });
 
   // Note: Full drag-drop tests require real browser mouse events which
