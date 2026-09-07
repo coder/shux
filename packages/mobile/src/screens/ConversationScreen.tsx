@@ -25,7 +25,12 @@ import { ContextUsage } from "../components/ContextUsage";
 import { getContextMeterData } from "../contextUsage";
 import { useConversation } from "../useConversation";
 import { linkedAbortController } from "../useConnection";
-import { getModelBlockReason, modelName, resolveSettings } from "../settings";
+import {
+  getModelBlockReason,
+  getPolicyStateBlockReason,
+  modelName,
+  resolveSettings,
+} from "../settings";
 import type { ChatSettings } from "../settings";
 import { ModelSettings } from "./ModelSettings";
 import { colors, fontFamily, layout, radii, spacing, typography } from "../theme";
@@ -116,12 +121,16 @@ export function ConversationScreen(props: {
   const loadError = error ?? settingsError;
   const modelBlockReason =
     settings && options ? getModelBlockReason(settings, options.model) : null;
-  const canAct = ready && settings !== null && !settingsError && !modelBlockReason;
+  const settingsReady = ready && settings !== null && !settingsError;
+  const canAct = settingsReady && !modelBlockReason;
   const latestSettings = useRef({ options, modelBlockReason });
   useEffect(() => {
     latestSettings.current = { options, modelBlockReason };
   }, [options, modelBlockReason]);
   const running = ready && transcript.streaming;
+  // A live answer resolves the existing tool, not the next-turn model. Connection,
+  // settings and global policy blocks still apply; recovery needs a routable model too.
+  const canAnswer = settingsReady && (running ? !getPolicyStateBlockReason(settings) : canAct);
   const expanded = inputFocused || hasDraft || running || showSettings !== null;
 
   const lastMessage = transcript.messages.at(-1);
@@ -279,7 +288,7 @@ export function ConversationScreen(props: {
 
   async function answer(toolCallId: string, answers: Record<string, string>) {
     if (!ready) throw new Error("Reconnect before answering.");
-    if (!canAct)
+    if (!canAnswer)
       throw new Error(modelBlockReason ?? settingsError ?? "Wait for settings before answering.");
     if (pending.current) throw new Error("Another action is in progress.");
     if (
@@ -386,7 +395,7 @@ export function ConversationScreen(props: {
             message={item}
             streaming={transcript.streamingMessageId === item.id && running}
             canAnswer={
-              canAct && !busy && answerMessage?.id === item.id && resumeMessageId !== item.id
+              canAnswer && !busy && answerMessage?.id === item.id && resumeMessageId !== item.id
             }
             onAnswer={answer}
           />

@@ -408,44 +408,62 @@ test("the latest recovered partial can be answered once and resumes only after s
   expect(view.queryByRole("button", { name: "Send answers" })).toBeNull();
 });
 
-test("live questions do not resume, and older pending partials stay disabled while streaming", async () => {
-  const view = fixture([
-    question("old"),
-    {
-      type: "stream-start",
-      workspaceId: "alpha",
-      messageId: "live",
-      historySequence: 2,
-      startTime: 1,
-      model,
-    },
-    {
-      type: "tool-call-start",
-      workspaceId: "alpha",
-      messageId: "live",
-      toolCallId: "live",
-      toolName: "ask_user_question",
-      tokens: 1,
-      args: questionInput("live"),
-      timestamp: 1,
-    },
-  ]);
-  await view.select("alpha");
-  expect(
-    within(view.getByRole("radiogroup", { name: "Answer old?" }))
-      .getByRole("radio", { name: "main" })
-      .getAttribute("aria-disabled")
-  ).toBe("true");
-  fireEvent.click(
-    within(view.getByRole("radiogroup", { name: "Answer live?" })).getByRole("radio", {
-      name: "main",
-    })
-  );
-  const buttons = view.getAllByRole("button", { name: "Send answers" });
-  await act(async () => buttons.forEach((button) => fireEvent.click(button)));
-  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
-  expect(callCount(view, "resumeStream")).toBe(0);
-});
+test.each(["ready", "route-lost", "policy-blocked", "settings-failed"] as const)(
+  "live answers bypass only next-turn routing, not global settings blocks (%s)",
+  async (availability) => {
+    const view = fixture([
+      question("old"),
+      {
+        type: "stream-start",
+        workspaceId: "alpha",
+        messageId: "live",
+        historySequence: 2,
+        startTime: 1,
+        model,
+      },
+      {
+        type: "tool-call-start",
+        workspaceId: "alpha",
+        messageId: "live",
+        toolCallId: "live",
+        toolName: "ask_user_question",
+        tokens: 1,
+        args: questionInput("live"),
+        timestamp: 1,
+      },
+    ]);
+    await view.select("alpha");
+    fireEvent.change(view.getByLabelText("Message"), { target: { value: "Next-turn draft" } });
+    if (availability === "route-lost") await view.updateProviders({});
+    if (availability === "policy-blocked")
+      await view.updatePolicy({
+        source: "env",
+        status: { state: "blocked", reason: "minimum_client_version requires server upgrade" },
+        policy: null,
+      });
+    if (availability === "settings-failed") {
+      view.setConfigRead(() => Promise.reject(new Error("settings unavailable")));
+      await view.updateConfig({ agentAiDefaults: {} });
+    }
+    if (availability !== "ready") expect(view.getAllByRole("alert").length).toBeGreaterThan(0);
+    expect(
+      within(view.getByRole("radiogroup", { name: "Answer old?" }))
+        .getByRole("radio", { name: "main" })
+        .getAttribute("aria-disabled")
+    ).toBe("true");
+    fireEvent.click(
+      within(view.getByRole("radiogroup", { name: "Answer live?" })).getByRole("radio", {
+        name: "main",
+      })
+    );
+    const buttons = view.getAllByRole("button", { name: "Send answers" });
+    await act(async () => buttons.forEach((button) => fireEvent.click(button)));
+    const allowed = availability === "ready" || availability === "route-lost";
+    expect(callCount(view, "answerAskUserQuestion")).toBe(allowed ? 1 : 0);
+    expect(callCount(view, "resumeStream")).toBe(0);
+    expect(view.getByLabelText("Message")).toHaveProperty("value", "Next-turn draft");
+  }
+);
 
 for (const latest of [
   question("later", 2),

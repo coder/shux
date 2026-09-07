@@ -94,13 +94,17 @@ function modelRouting(data: SettingsData) {
   };
 }
 
-export function getModelBlockReason(data: SettingsData, model: string): string | null {
+export function getPolicyStateBlockReason(data: SettingsData): string | null {
   if (!data.policy || (data.policy.status.state === "enforced" && !data.policy.policy))
     return "Server policy unavailable. Retry to reload it.";
   // The server owns minimum-client/version semantics, including its blocked reason.
   if (data.policy.status.state === "blocked")
     return data.policy.status.reason || "Blocked by server policy.";
-  return getModelRouteBlockReason(data, model);
+  return null;
+}
+
+export function getModelBlockReason(data: SettingsData, model: string): string | null {
+  return getPolicyStateBlockReason(data) ?? getModelRouteBlockReason(data, model);
 }
 
 function getModelRouteBlockReason(data: SettingsData, model: string): string | null {
