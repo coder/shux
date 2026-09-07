@@ -1,5 +1,6 @@
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import assert from "@/common/utils/assert";
+import { ReviewNoteDataSchema } from "@/common/orpc/schemas/stream";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
@@ -78,6 +79,8 @@ function isAgentPeerMessageMetadata(meta: unknown): boolean {
   const obj = meta as Record<string, unknown>;
   return obj.type === "agent-peer-message" && typeof obj.fromWorkspaceId === "string";
 }
+
+const RestoreReviewsSchema = ReviewNoteDataSchema.array();
 
 // Type guard for metadata with reviews
 interface MetadataWithReviews {
@@ -651,16 +654,16 @@ export class MessageQueue {
         ? "pause"
         : (options?.goalInterventionPolicy ?? entry.goalInterventionPolicy);
 
-    const reviews = hasReviews(options?.muxMetadata) ? options.muxMetadata.reviews : undefined;
-    let restoreText = message;
-    try {
-      restoreText = stripRenderedReviews(message, reviews);
-    } catch {
-      // muxMetadata is a black box: malformed legacy notes must not make enqueue throw.
-    }
+    // Validate the entire black-box array before stripping text: filtering individual
+    // notes could duplicate a mixed array's rendered prefix, and an invalid outgoing
+    // review would reject restoration after the queue has already been cleared.
+    const parsedReviews = hasReviews(options?.muxMetadata)
+      ? RestoreReviewsSchema.safeParse(options.muxMetadata.reviews)
+      : undefined;
+    const reviews = parsedReviews?.success ? parsedReviews.data : undefined;
     entry.restoreMessages.push({
-      text: restoreText,
-      reviews: reviews?.slice(),
+      text: stripRenderedReviews(message, reviews),
+      reviews,
       messageIndex: trimmedMessage.length > 0 ? entry.messages.length : null,
     });
 

@@ -3,6 +3,7 @@ import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 
 import { prepareUserMessageForSend } from "@/common/types/message";
+import { RestoreToInputEventSchema } from "@/common/orpc/schemas/stream";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
@@ -716,6 +717,70 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("restoreQueueToInput preserves text and omits an entire malformed review array before clearing", async () => {
+    const workspaceId = "queue-restore-invalid-reviews";
+    const { session, cleanup } = await createAgentSessionHarness({ workspaceId });
+    const review = {
+      filePath: "file.ts",
+      lineRange: "1",
+      selectedCode: "code",
+      userNote: "Keep this text",
+    };
+    const original = prepareUserMessageForSend({
+      text: "  User body\n",
+      reviews: [review],
+    }).finalText;
+    const invalidReviews: unknown[] = [
+      null,
+      "legacy reviews",
+      [null],
+      ["legacy review"],
+      [{}],
+      [{ ...review, selectedCode: 42 }],
+      [{ ...review, filePath: 42 }],
+      [{ ...review, lineRange: null }],
+      [{ ...review, userNote: false }],
+      // These optional fields are not read by the formatter, so try/catch never detects them.
+      [{ ...review, oldStart: "1" }],
+      [{ ...review, newStart: null }],
+      [review, { ...review, selectedDiff: 42 }],
+    ];
+    const restored: Array<Extract<WorkspaceChatMessage, { type: "restore-to-input" }>> = [];
+    const unsubscribe = session.onChatEvent(({ message }) => {
+      if (message.type === "restore-to-input") restored.push(message);
+    });
+    try {
+      for (const reviews of invalidReviews) {
+        session.queueMessage(original, {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: { reviews },
+        });
+        session.restoreQueueToInput();
+        const event = restored.at(-1);
+        expect(RestoreToInputEventSchema.safeParse(event).success).toBe(true);
+        expect(event?.text).toBe(original);
+        expect(event?.reviews).toBeUndefined();
+        expect(session.hasQueuedMessages()).toBe(false);
+      }
+      expect(restored).toHaveLength(invalidReviews.length);
+      // A later valid enqueue still normalizes and restores its structured reviews.
+      session.queueMessage(original, {
+        model: TEST_MODEL,
+        agentId: "exec",
+        muxMetadata: { reviews: [review] },
+      });
+      session.restoreQueueToInput();
+      const valid = RestoreToInputEventSchema.parse(restored.at(-1));
+      expect(valid.text).toBe("  User body\n");
+      expect(valid.reviews).toEqual([review]);
+    } finally {
+      unsubscribe();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
   test("restoreQueueToInput emits all reviewed bodies once without dispatching or changing cancellation", async () => {
     const workspaceId = "queue-restore-reviewed-input";
     const streamMessage = mock(() =>
@@ -781,7 +846,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(streamMessage).not.toHaveBeenCalled();
     } finally {
       unsubscribe();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });

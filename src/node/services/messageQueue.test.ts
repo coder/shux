@@ -120,6 +120,7 @@ describe("MessageQueue", () => {
     it("does not throw away input when unvalidated metadata contains malformed reviews", () => {
       expect(queue.add("raw input", { ...options, muxMetadata: { reviews: [{}] } })).toBe(true);
       expect(queue.getVisibleRestoreText()).toBe("raw input");
+      expect(queue.getVisibleRestoreReviews()).toBeUndefined();
     });
 
     it("keeps raw commands for compaction and agent-skill restoration", () => {
