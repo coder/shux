@@ -1,3 +1,4 @@
+import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
 import type { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
@@ -1288,6 +1289,7 @@ export class CompactionHandler {
     params: Parameters<CompactionHandler["buildContinuousCompactionRows"]>[0] & {
       prepared?: { boundary: MuxMessage; copies: MuxMessage[] };
       shouldPersist: (messages: MuxMessage[]) => boolean;
+      publication?: ContinuousCompactionPublication;
     }
   ): Promise<boolean> {
     const canComplete = this.captureCompletionGuard?.();
@@ -1310,7 +1312,8 @@ export class CompactionHandler {
       boundary,
       copies,
       false,
-      params.shouldPersist
+      params.shouldPersist,
+      params.publication
     );
     if (!result.success) {
       log.warn("[continuous-compaction] persist failed", result.error);

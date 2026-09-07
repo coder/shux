@@ -2673,8 +2673,8 @@ export class AgentSession {
   private async reconcileCompactionCancellation(): Promise<void> {
     const cancellation = await this.compactionCancellation.read();
     if (!cancellation) return;
-    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-    if (!history.success) throw new Error(history.error);
+    // Empty history is only a snapshot: a foreign producer can still publish
+    // canceled work later. Only explicit replacement evidence retires Stop.
     // A replacement witness is part of the row's atomic commit. The sidecar can
     // safely retire even if the previous process died before its unlink completed.
     if (
@@ -2684,8 +2684,6 @@ export class AgentSession {
       )
     )
       await this.retireWitnessedCompactionCancellation(cancellation.nonce);
-    else if (history.data.length === 0)
-      await this.compactionCancellation.retire(cancellation.nonce);
   }
 
   private async retireWitnessedCompactionCancellation(nonce: string): Promise<void> {

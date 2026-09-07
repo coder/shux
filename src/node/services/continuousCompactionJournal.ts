@@ -2,6 +2,9 @@ import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { addInterruptedSentinel } from "@/browser/utils/messages/modelMessageTransform";
 import { applyCacheControl } from "@/common/utils/ai/cacheStrategy";
 import { promises as fs } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import * as path from "node:path";
+import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import { isDeepStrictEqual } from "node:util";
 import { modelMessageSchema, type ModelMessage } from "ai";
 import writeFileAtomic from "write-file-atomic";
@@ -79,24 +82,94 @@ export async function rebuildContinuousPrefix(
   ];
 }
 
-/** Serialized journal I/O plus a synchronous invalidation fence shared by reset and prepareStep. */
+/** Presence distinguishes a captured legacy generation from an unguarded history mutation. */
+export interface ContinuousCompactionPublication {
+  generation: string | undefined;
+}
+
+interface JournalReadOwnership {
+  isCurrent: () => boolean;
+  shouldDiscard: () => boolean;
+  onRead: (journal: ContinuousCompactionJournal) => void;
+}
+
+/** Journal ownership and publication share the history lock across backend processes. */
 export class ContinuousCompactionJournalStore {
-  private generation = 0;
   private pending: Promise<unknown> = Promise.resolve();
   constructor(
     readonly path: string,
-    private readonly workspaceId: string
+    private readonly workspaceId: string,
+    private readonly withHistoryLock: <T>(operation: () => Promise<T>) => Promise<T>,
+    private readonly canPublishUnderHistoryLock: () => Promise<boolean>
   ) {}
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.pending.then(operation);
+    const result = this.pending.then(() => this.withHistoryLock(operation));
     this.pending = result.catch(() => undefined);
     return result;
   }
 
-  clear(): Promise<void> {
-    this.generation++;
-    return this.enqueue(() => fs.rm(this.path, { force: true }));
+  private async readGenerationUnderHistoryLock(): Promise<string | undefined> {
+    try {
+      // The bytes are an opaque version, not semantic configuration. Damaged
+      // bytes fence older work while fresh capture can still make progress.
+      const bytes = await fs.readFile(
+        path.join(path.dirname(this.path), CONTINUOUS_COMPACTION_GENERATION_FILE)
+      );
+      return createHash("sha256").update(bytes).digest("hex");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  captureGeneration(): Promise<string | undefined> {
+    return this.enqueue(() => this.readGenerationUnderHistoryLock());
+  }
+
+  /** Caller already owns the history lock; never join the queue of writers waiting for it. */
+  async isPublicationCurrentUnderHistoryLock(
+    publication: ContinuousCompactionPublication
+  ): Promise<boolean> {
+    return (
+      publication.generation === (await this.readGenerationUnderHistoryLock()) &&
+      (await this.canPublishUnderHistoryLock())
+    );
+  }
+
+  /** Authoritative repair, unlike an old compactor's identity-scoped cleanup. */
+  async invalidateUnderHistoryLock(): Promise<void> {
+    await writeFileAtomic(
+      path.join(path.dirname(this.path), CONTINUOUS_COMPACTION_GENERATION_FILE),
+      randomUUID(),
+      { mode: 0o600 }
+    );
+    await fs.rm(this.path, { force: true });
+  }
+
+  private async clearOwnedUnderHistoryLock(expected: ContinuousCompactionJournal): Promise<void> {
+    let current: ContinuousCompactionJournal;
+    try {
+      current = ContinuousCompactionJournalSchema.parse(
+        JSON.parse(await fs.readFile(this.path, "utf8"))
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    if (
+      current.boundary.id === expected.boundary.id &&
+      current.publicationGeneration === expected.publicationGeneration
+    ) {
+      await fs.rm(this.path, { force: true });
+    }
+  }
+
+  clear(expected: ContinuousCompactionJournal | undefined): Promise<void> {
+    // No captured owner means no authority to adopt/delete a foreign journal.
+    // Still join this store's existing I/O without acquiring a lock or recreating a directory.
+    if (!expected) return this.pending.then(() => undefined);
+    return this.enqueue(() => this.clearOwnedUnderHistoryLock(expected));
   }
 
   exists(): Promise<boolean> {
@@ -112,23 +185,48 @@ export class ContinuousCompactionJournalStore {
     });
   }
 
-  read(): Promise<ContinuousCompactionJournal | null> {
+  read(ownership?: JournalReadOwnership): Promise<ContinuousCompactionJournal | null> {
     return this.enqueue(async () => {
+      // A queued stale read never owned the journal now on disk (possibly B).
+      if (ownership && !ownership.isCurrent()) return null;
+      let contents: string;
       try {
-        return ContinuousCompactionJournalSchema.parse(
-          JSON.parse(await fs.readFile(this.path, "utf8"))
-        );
+        contents = await fs.readFile(this.path, "utf8");
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-          log.warn("[continuous-compaction] discarded invalid journal", error);
-          await fs
-            .rm(this.path, { force: true })
-            .catch((cleanupError: unknown) =>
-              log.warn("[continuous-compaction] invalid journal cleanup failed", cleanupError)
-            );
-        }
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+          log.warn("[continuous-compaction] journal unavailable", error);
         return null;
       }
+      // Settings changes and shutdown preserve recovery even if the read began.
+      if (ownership && !ownership.isCurrent() && !ownership.shouldDiscard()) return null;
+      let journal: ContinuousCompactionJournal;
+      try {
+        journal = ContinuousCompactionJournalSchema.parse(JSON.parse(contents));
+      } catch (error) {
+        // The shared lock keeps a malformed A cleanup from unlinking a new B.
+        log.warn("[continuous-compaction] discarded invalid journal", error);
+        await fs.rm(this.path, { force: true });
+        return null;
+      }
+      if (ownership && !ownership.isCurrent()) {
+        if (ownership.shouldDiscard()) await this.clearOwnedUnderHistoryLock(journal);
+        return null;
+      }
+      if (
+        !(await this.isPublicationCurrentUnderHistoryLock({
+          generation: journal.publicationGeneration,
+        }))
+      ) {
+        await this.clearOwnedUnderHistoryLock(journal);
+        return null;
+      }
+      if (ownership && !ownership.isCurrent()) {
+        if (ownership.shouldDiscard()) await this.clearOwnedUnderHistoryLock(journal);
+        return null;
+      }
+      // Transfer exact ownership before releasing the lock, through later fold awaits.
+      ownership?.onRead(journal);
+      return journal;
     });
   }
 
@@ -140,16 +238,21 @@ export class ContinuousCompactionJournalStore {
       providerOptions?: Record<string, unknown>;
       system?: string | ModelMessage;
     },
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    onCommitted?: (journal: ContinuousCompactionJournal) => void
   ): Promise<ContinuousCompactionJournal | null> {
-    const generation = this.generation;
     return this.enqueue(async () => {
       try {
+        if (
+          !(await this.isPublicationCurrentUnderHistoryLock({
+            generation: journal.publicationGeneration,
+          }))
+        )
+          return null;
         const current = ContinuousCompactionJournalSchema.parse(
           JSON.parse(await fs.readFile(this.path, "utf8"))
         );
-        if (generation !== this.generation || !isCurrent() || !isDeepStrictEqual(current, journal))
-          return null;
+        if (!isCurrent() || !isDeepStrictEqual(current, journal)) return null;
         const prefix = request.prefix.map(exactJson);
         const parsedPrefix = prefix.map((message) => modelMessageSchema.parse(message));
         assert(
@@ -165,7 +268,7 @@ export class ContinuousCompactionJournalStore {
           isDeepStrictEqual(exactJson(updated), payload),
           "Fallback journal dropped request fields"
         );
-        if (generation !== this.generation || !isCurrent()) return null;
+        if (!isCurrent()) return null;
         await writeFileAtomic(this.path, JSON.stringify(payload), { mode: 0o600 });
         const reread = ContinuousCompactionJournalSchema.parse(
           JSON.parse(await fs.readFile(this.path, "utf8"))
@@ -174,7 +277,9 @@ export class ContinuousCompactionJournalStore {
           isDeepStrictEqual(exactJson(reread), payload),
           "Fallback journal round-trip mismatch"
         );
-        return generation === this.generation && isCurrent() ? reread : null;
+        if (!isCurrent()) return null;
+        onCommitted?.(reread);
+        return reread;
       } catch (error) {
         // Unlike the initial write, this record already describes a consumed request.
         // Failure must keep it available for P1's durable fold or startup recovery.
@@ -190,11 +295,17 @@ export class ContinuousCompactionJournalStore {
   write(
     journal: ContinuousCompactionJournal,
     prefix: ModelMessage[],
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    onCommitted?: (journal: ContinuousCompactionJournal) => void
   ): Promise<ContinuousCompactionJournal | null> {
-    const generation = this.generation;
     return this.enqueue(async () => {
       try {
+        if (
+          !(await this.isPublicationCurrentUnderHistoryLock({
+            generation: journal.publicationGeneration,
+          }))
+        )
+          return null;
         let wire: ContinuousCompactionJournal["prefix"];
         try {
           wire = z.array(z.json()).parse(exactJson(prefix));
@@ -218,20 +329,21 @@ export class ContinuousCompactionJournalStore {
           isDeepStrictEqual(exactJson(parsed), payload),
           "Journal schema dropped request fields"
         );
-        if (generation !== this.generation || !isCurrent()) return null;
+        if (!isCurrent()) return null;
         await writeFileAtomic(this.path, JSON.stringify(payload), { mode: 0o600 });
         const reread = ContinuousCompactionJournalSchema.parse(
           JSON.parse(await fs.readFile(this.path, "utf8"))
         );
         assert(isDeepStrictEqual(exactJson(reread), payload), "Journal round-trip mismatch");
-        if (generation !== this.generation || !isCurrent()) {
-          await fs.rm(this.path, { force: true });
+        if (!isCurrent()) {
+          await this.clearOwnedUnderHistoryLock(journal);
           return null;
         }
+        onCommitted?.(reread);
         return reread;
       } catch (error) {
         log.warn("[continuous-compaction] prefix not swapped: journal failed", error);
-        await fs.rm(this.path, { force: true }).catch(() => undefined);
+        await this.clearOwnedUnderHistoryLock(journal).catch(() => undefined);
         return null;
       }
     });

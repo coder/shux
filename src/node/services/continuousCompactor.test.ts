@@ -1,3 +1,6 @@
+import { CompactionCancellation } from "./compactionCancellation";
+import { HistoryService } from "./historyService";
+import { COMPACTION_CANCELLATION_FILE } from "@/common/constants/compactionCancellation";
 import type { ContinuousPrefixSwap } from "./continuousCompactionJournal";
 import { writeFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
@@ -684,6 +687,98 @@ describe("ContinuousCompactor", () => {
     return { answer, journal, journalStore, dependencies, swap };
   }
 
+  async function repairForeignCancellation() {
+    await writeFile(
+      `${store.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`,
+      "{"
+    );
+    const foreign = new HistoryService(store.config);
+    expect(await new CompactionCancellation(foreign, workspaceId).read()).toBeNull();
+    return foreign;
+  }
+
+  it("foreign repair fences a durable fold that already read its journal", async () => {
+    const { answer, journal } = await activateJournaledSwap();
+    assert(live, "Expected live source");
+    answer.parts = live.parts;
+    await store.historyService.writePartial(workspaceId, answer);
+    streaming = false;
+    live = undefined;
+    const entered = deferred();
+    const release = deferred();
+    const persist = store.historyService.persistBoundaryWithTailCopies.bind(store.historyService);
+    spyOn(store.historyService, "persistBoundaryWithTailCopies").mockImplementationOnce(
+      async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return persist(...args);
+      }
+    );
+    const pending = compactor.observe(context.thresholdPercent, context);
+    try {
+      await entered.promise;
+      await repairForeignCancellation();
+      release.resolve();
+      expect(await pending).not.toBe("applied");
+      expect((await rows()).some((row) => row.id === journal.boundary.id)).toBe(false);
+      expect(completed).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await pending;
+    }
+  });
+
+  it("foreign repair fences non-journal work already awaiting preparation", async () => {
+    await seedConversation();
+    const entered = deferred();
+    const release = deferred();
+    prepare.mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    const { job } = await start();
+    try {
+      await entered.promise;
+      await repairForeignCancellation();
+      release.resolve();
+      await job;
+      expect(await compactor.observe(context.thresholdPercent, context)).not.toBe("applied");
+      expect((await rows())[0].id).toBe("old-user");
+      expect(completed).not.toHaveBeenCalled();
+      // A newly captured generation may compact the still-valid source normally.
+      const freshJob = eagerJob(compactor);
+      jobs.push(freshJob);
+      await freshJob;
+      expect(await compactor.observe(context.thresholdPercent, context)).toBe("applied");
+      expect(completed).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+      await job;
+    }
+  });
+
+  it("a failed repair generation write keeps staged durable publication fenced", async () => {
+    await seedConversation();
+    await stage();
+    await writeFile(
+      `${store.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`,
+      "{"
+    );
+    const original = atomicWrite.default;
+    spyOn(atomicWrite, "default").mockImplementationOnce(
+      Object.assign(() => Promise.reject(new Error("epoch storage unavailable")), {
+        sync: original.sync,
+      })
+    );
+    const failed = await new CompactionCancellation(new HistoryService(store.config), workspaceId)
+      .read()
+      .catch((error: unknown) => error);
+    expect(failed).toBeInstanceOf(Error);
+    expect(await compactor.observe(context.thresholdPercent, context)).not.toBe("applied");
+    expect((await rows())[0].id).toBe("old-user");
+    expect(completed).not.toHaveBeenCalled();
+  });
+
   for (const reason of ["disabled", "threshold-changed", "context-changed"]) {
     it(`preserves consumed journal through ${reason} and finalizes once even after tracker retirement`, async () => {
       const { answer, journal, journalStore } = await activateJournaledSwap();
@@ -841,6 +936,97 @@ describe("ContinuousCompactor", () => {
     expect(fastApply).not.toHaveBeenCalled();
   });
 
+  it.each(
+    ["read lock", "read return", "partial commit"].flatMap((stage) =>
+      ["user-interrupt", "shutdown", "disabled"].map((reason) => [stage, reason] as const)
+    )
+  )("recovery ownership during %s honors %s", async (stage, reason) => {
+    const { answer, journalStore, dependencies } = await activateJournaledSwap();
+    assert(live, "Expected live source");
+    answer.parts = live.parts;
+    await store.historyService.writePartial(workspaceId, answer);
+    compactor.reset("shutdown");
+    streaming = false;
+    live = undefined;
+    compactor = new ContinuousCompactor(dependencies);
+    const entered = deferred();
+    const release = deferred();
+    if (stage === "read lock") {
+      const validate = journalStore.isPublicationCurrentUnderHistoryLock.bind(journalStore);
+      spyOn(journalStore, "isPublicationCurrentUnderHistoryLock").mockImplementationOnce(
+        async (...args) => {
+          const result = await validate(...args);
+          entered.resolve();
+          await release.promise;
+          return result;
+        }
+      );
+    } else {
+      const read = journalStore.read.bind(journalStore);
+      spyOn(journalStore, "read").mockImplementationOnce(async (...args) => {
+        const result = await read(...args);
+        if (stage === "read return") {
+          entered.resolve();
+          await release.promise;
+        } else {
+          const commit = store.historyService.commitPartial.bind(store.historyService);
+          spyOn(store.historyService, "commitPartial").mockImplementationOnce(
+            async (...commitArgs) => {
+              const committed = await commit(...commitArgs);
+              entered.resolve();
+              await release.promise;
+              return committed;
+            }
+          );
+        }
+        return result;
+      });
+    }
+    const pending = compactor.recover();
+    try {
+      await entered.promise;
+      compactor.reset(reason);
+      release.resolve();
+      expect(await pending).toBe(false);
+      expect(await journalStore.exists()).toBe(reason !== "user-interrupt");
+      if (reason !== "user-interrupt") {
+        compactor = new ContinuousCompactor(dependencies);
+        expect(await compactor.recover()).toBe(true);
+      }
+    } finally {
+      release.resolve();
+      await pending;
+    }
+  });
+
+  it("a reset before a queued recovery read starts cannot adopt a foreign journal", async () => {
+    const { journalStore, dependencies, swap } = await activateJournaledSwap();
+    compactor.reset("shutdown");
+    streaming = false;
+    live = undefined;
+    compactor = new ContinuousCompactor(dependencies);
+    const release = deferred();
+    // Hold only the local queue; B must remain able to publish under the real shared lock.
+    (journalStore as unknown as { pending: Promise<unknown> }).pending = release.promise;
+    const pending = (
+      compactor as unknown as { finalizeJournal(): Promise<boolean> }
+    ).finalizeJournal();
+    try {
+      compactor.reset("user-interrupt");
+      const foreign = new HistoryService(store.config).getContinuousCompactionJournal(workspaceId);
+      const b = structuredClone(swap.journal);
+      b.boundary.id = "foreign-after-reset";
+      const published = await foreign.write(b, swap.prefix, () => true);
+      expect(published).not.toBeNull();
+      release.resolve();
+      expect(await pending).toBe(false);
+      expect(await foreign.read()).toEqual(published);
+    } finally {
+      release.resolve();
+      await pending;
+    }
+  });
+
   it("recovers growing crash partials verbatim and retries recovery idempotently after boundary persistence", async () => {
     const { answer, journal, journalStore, dependencies } = await activateJournaledSwap();
     assert(live, "Live fixture missing");
@@ -943,8 +1129,8 @@ describe("ContinuousCompactor", () => {
     const entered = deferred();
     const release = deferred();
     const clear = journalStore.clear.bind(journalStore);
-    spyOn(journalStore, "clear").mockImplementationOnce(async () => {
-      await clear();
+    spyOn(journalStore, "clear").mockImplementationOnce(async (expected) => {
+      await clear(expected);
       entered.resolve();
       await release.promise;
     });

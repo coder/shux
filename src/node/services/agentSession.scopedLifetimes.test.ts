@@ -89,6 +89,7 @@ describe("AgentSession scoped turn lifetimes", () => {
     const h = await createAgentSessionHarness({ workspaceId });
     const stream = spyOn(h.aiService, "streamMessage");
     const release = Promise.withResolvers<void>();
+    const prepareEntered = Promise.withResolvers<void>();
     const { continuousCompactor } = h.session as unknown as {
       continuousCompactor: ContinuousCompactor;
     };
@@ -97,6 +98,7 @@ describe("AgentSession scoped turn lifetimes", () => {
     };
     spyOn(deps, "prepare").mockImplementation(() => {
       h.session.beginShutdown();
+      prepareEntered.resolve();
       return release.promise;
     });
     let closed = false;
@@ -109,6 +111,7 @@ describe("AgentSession scoped turn lifetimes", () => {
         thresholdPercent: 80,
         phase: "on-send",
       });
+      await prepareEntered.promise;
       // Reset detaches the job immediately; its original preparation still owns I/O.
       expect(h.session.closingSignal.aborted).toBe(true);
       expect(h.session.isBusy()).toBe(false);

@@ -1,4 +1,8 @@
 import { z } from "zod";
+import { CompactionCancellation } from "./compactionCancellation";
+import { HistoryService } from "./historyService";
+import { removeSessionDirUnderMemoryLocks } from "./workspaceRemoval";
+import { COMPACTION_CANCELLATION_FILE } from "@/common/constants/compactionCancellation";
 import { assemblePromptPayload } from "./turnContextAssembler";
 import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
 import { prepareMessagesForProvider } from "./messagePipeline";
@@ -7,6 +11,8 @@ import * as ai from "ai";
 import * as atomicWrite from "write-file-atomic";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { readFile, writeFile } from "node:fs/promises";
+import { promises as journalFs } from "node:fs";
+import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import assert from "@/common/utils/assert";
 import { createMuxMessage } from "@/common/types/message";
 import {
@@ -171,6 +177,201 @@ describe("continuous prefix prepareStep and journal", () => {
     const store = history.historyService.getContinuousCompactionJournal(workspaceId);
     return { ...harness, store, tracker, swap, manager };
   }
+
+  it("a foreign repair rejects a prefix prepared before its journal publication", async () => {
+    const { run, tracker, store } = await setup();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const write = store.write.bind(store);
+    spyOn(store, "write").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return write(...args);
+    });
+    const pending = run();
+    try {
+      await entered.promise;
+      await writeFile(
+        `${history.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`,
+        "{"
+      );
+      const foreign = new HistoryService(history.config);
+      expect(await new CompactionCancellation(foreign, workspaceId).read()).toBeNull();
+      release.resolve();
+      const result = await pending;
+      expect(tracker.consumedPrefixSwap).toBeUndefined();
+      expect(result?.messages).toBeUndefined();
+      expect(await foreign.getContinuousCompactionJournal(workspaceId).exists()).toBe(false);
+    } finally {
+      release.resolve();
+      await pending;
+    }
+  });
+
+  it("old identity cleanup cannot invalidate a queued newer journal in the same store", async () => {
+    const { store, swap } = await setup();
+    const a = await store.write(swap.journal, swap.prefix, () => true);
+    assert(a, "Expected A");
+    await store.clear(a);
+    const b = structuredClone(swap.journal);
+    b.boundary.id = "newer-boundary";
+    const writingB = store.write(b, swap.prefix, () => true);
+    await store.clear(a);
+    expect(await writingB).not.toBeNull();
+    expect((await store.read())?.boundary.id).toBe(b.boundary.id);
+  });
+
+  it.each(["generation write", "journal clear"])(
+    "failed repair at %s still rejects old prefix publication",
+    async (failure) => {
+      const { run, tracker, store } = await setup();
+      await writeFile(
+        `${history.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`,
+        "{"
+      );
+      const foreign = new HistoryService(history.config);
+      if (failure === "generation write") {
+        const original = atomicWrite.default;
+        spyOn(atomicWrite, "default").mockImplementationOnce(
+          Object.assign(() => Promise.reject(new Error("generation unavailable")), {
+            sync: original.sync,
+          })
+        );
+      } else {
+        const remove = journalFs.rm;
+        let failed = false;
+        spyOn(journalFs, "rm").mockImplementation(async (...args) => {
+          if (!failed && args[0] === store.path) {
+            failed = true;
+            throw new Error("clear unavailable");
+          }
+          return remove(...args);
+        });
+      }
+      const repair = await new CompactionCancellation(foreign, workspaceId)
+        .read()
+        .catch((error: unknown) => error);
+      expect(repair).toBeInstanceOf(Error);
+      expect(
+        await readFile(
+          `${history.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`,
+          "utf8"
+        )
+      ).toBe("{");
+      await run();
+      expect(tracker.consumedPrefixSwap).toBeUndefined();
+      expect(await store.exists()).toBe(false);
+    }
+  );
+
+  it("opaque corrupt generation bytes fence old work and allow a fresh publication", async () => {
+    const { store, swap } = await setup();
+    const generationPath = `${history.config.sessionsDir}/${workspaceId}/${CONTINUOUS_COMPACTION_GENERATION_FILE}`;
+    await writeFile(generationPath, Buffer.from([0, 255, 123]));
+    expect(await store.write(swap.journal, swap.prefix, () => true)).toBeNull();
+    const fresh = journalFixture();
+    fresh.publicationGeneration = await store.captureGeneration();
+    const prefix = await rebuildContinuousPrefix(fresh, workspaceId);
+    expect(await store.write(fresh, prefix, () => true)).not.toBeNull();
+    const foreign = new HistoryService(history.config).getContinuousCompactionJournal(workspaceId);
+    expect((await foreign.read())?.publicationGeneration).toBe(fresh.publicationGeneration);
+  });
+
+  it("old cleanup and fallback cannot replace a fresh foreign journal after repair", async () => {
+    const { store, swap } = await setup();
+    const original = await store.write(swap.journal, swap.prefix, () => true);
+    assert(original, "Expected original journal");
+    await writeFile(
+      `${history.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`,
+      "{"
+    );
+    const foreignHistory = new HistoryService(history.config);
+    expect(await new CompactionCancellation(foreignHistory, workspaceId).read()).toBeNull();
+    const foreign = foreignHistory.getContinuousCompactionJournal(workspaceId);
+    const fresh = journalFixture();
+    fresh.publicationGeneration = await foreign.captureGeneration();
+    fresh.boundary.id = "foreign-boundary";
+    const prefix = await rebuildContinuousPrefix(fresh, workspaceId);
+    const published = await foreign.write(fresh, prefix, () => true);
+    assert(published, "Expected fresh publication");
+    await store.clear(original);
+    expect(
+      await store.recordFallbackPrefix(
+        original,
+        { modelString: original.parentModel, prefix: swap.prefix },
+        () => true
+      )
+    ).toBeNull();
+    expect(await store.write(original, swap.prefix, () => true)).toBeNull();
+    // A failed stale write/cleanup must not adopt the newer journal it sees.
+    await store.clear(undefined);
+    expect(await foreign.read()).toEqual(published);
+    expect(
+      await foreign.recordFallbackPrefix(
+        published,
+        { modelString: published.parentModel, prefix },
+        () => true
+      )
+    ).not.toBeNull();
+  });
+
+  it("repair does not join a journal writer queued behind its held history lock", async () => {
+    const { swap } = await setup();
+    const foreignHistory = new HistoryService(history.config);
+    const foreign = foreignHistory.getContinuousCompactionJournal(workspaceId);
+    await writeFile(
+      `${history.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`,
+      "{"
+    );
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const invalidate = foreign.invalidateUnderHistoryLock.bind(foreign);
+    spyOn(foreign, "invalidateUnderHistoryLock").mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      return invalidate();
+    });
+    const repair = new CompactionCancellation(foreignHistory, workspaceId).read();
+    let queued: ReturnType<typeof foreign.write> | undefined;
+    try {
+      await entered.promise;
+      queued = foreign.write(swap.journal, swap.prefix, () => true);
+      release.resolve();
+      expect(await repair).toBeNull();
+      expect(await queued).toBeNull();
+      expect(await foreign.exists()).toBe(false);
+    } finally {
+      release.resolve();
+      await repair;
+      await queued;
+    }
+  });
+
+  it("journal capture, publication and old cleanup cannot recreate a removed workspace", async () => {
+    const { store, swap } = await setup();
+    const original = await store.write(swap.journal, swap.prefix, () => true);
+    assert(original, "Expected journal");
+    const sessionDir = `${history.config.sessionsDir}/${workspaceId}`;
+    await removeSessionDirUnderMemoryLocks({
+      rootDir: history.config.rootDir,
+      sessionDir,
+      workspaceId,
+      attemptId: "remove-journal-test",
+    });
+    for (const operation of [
+      () => store.captureGeneration(),
+      () => store.write(original, swap.prefix, () => true),
+      () => store.clear(original),
+    ]) {
+      const result = await operation().catch((error: unknown) => error);
+      expect(result).toHaveProperty("message", expect.stringContaining("removed"));
+    }
+    await store.clear(undefined);
+    expect(await journalFs.stat(sessionDir).catch((error: unknown) => error)).toHaveProperty(
+      "code",
+      "ENOENT"
+    );
+  });
 
   it("journals before returning, swaps once by content identity, and strips retained cache markers", async () => {
     const { run, tracker, store, swap } = await setup();
@@ -461,7 +662,7 @@ describe("continuous prefix prepareStep and journal", () => {
   it.each(["reset-before-write", "abort-after-write"] as const)(
     "%s fences the swap return and deletes the stale journal",
     async (mode) => {
-      const { run, tracker, store, controller } = await setup();
+      const { run, tracker, store, controller, swap } = await setup();
       let release!: () => void;
       const gate = new Promise<void>((resolve) => {
         release = resolve;
@@ -487,7 +688,7 @@ describe("continuous prefix prepareStep and journal", () => {
       let cleared = Promise.resolve();
       if (mode === "reset-before-write") {
         tracker.pendingPrefixSwap = undefined;
-        cleared = store.clear();
+        cleared = store.clear(swap.journal);
       } else {
         controller.abort();
       }

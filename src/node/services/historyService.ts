@@ -28,7 +28,11 @@ import {
   matchesCompactionCancellation,
   type CompactionCancellationRecord,
 } from "./compactionCancellation";
-import { ContinuousCompactionJournalStore } from "./continuousCompactionJournal";
+import {
+  ContinuousCompactionJournalStore,
+  type ContinuousCompactionPublication,
+} from "./continuousCompactionJournal";
+import { CONTINUOUS_COMPACTION_JOURNAL_FILE } from "@/constants/continuousCompaction";
 import writeFileAtomic from "write-file-atomic";
 import assert from "node:assert";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
@@ -339,8 +343,24 @@ export class HistoryService {
     let journal = this.continuousJournals.get(workspaceId);
     if (!journal) {
       journal = new ContinuousCompactionJournalStore(
-        path.join(this.getSessionDir(workspaceId), "continuous-compaction.json"),
-        workspaceId
+        path.join(this.getSessionDir(workspaceId), CONTINUOUS_COMPACTION_JOURNAL_FILE),
+        workspaceId,
+        (operation) =>
+          this.withHistoryWriteFileLock(workspaceId, async () => {
+            if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
+              throw new Error(`workspace ${workspaceId} was removed; refusing journal mutation`);
+            await ensurePrivateDir(this.getSessionDir(workspaceId));
+            return operation();
+          }),
+        async () => {
+          // Raw reads only under the held lock. Even a failed epoch publication
+          // leaves malformed/unresolved Stop authoritative until exact replacement.
+          const cancellation = await this.readCompactionCancellation(workspaceId);
+          return (
+            !cancellation ||
+            (await this.hasCompactionReplacementWitnessUnlocked(workspaceId, cancellation.nonce))
+          );
+        }
       );
       this.continuousJournals.set(workspaceId, journal);
     }
@@ -416,7 +436,7 @@ export class HistoryService {
           flag: "wx",
         });
         if (!isCurrent()) return null;
-        await this.getContinuousCompactionJournal(workspaceId).clear();
+        await this.getContinuousCompactionJournal(workspaceId).invalidateUnderHistoryLock();
         const historyPath = this.getChatHistoryPath(workspaceId);
         const { rows } = await this.readHistoryForRewrite(historyPath);
         let changed = false;
@@ -3323,13 +3343,23 @@ export class HistoryService {
     summaryMessage: MuxMessage,
     tailCopies: readonly MuxMessage[],
     updateExisting: boolean,
-    shouldPersist?: (messages: MuxMessage[]) => boolean
+    shouldPersist?: (messages: MuxMessage[]) => boolean,
+    publication?: ContinuousCompactionPublication
   ): Promise<Result<void>> {
     // Continuous compaction may intentionally keep no tail when no complete turn fits.
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to persist compaction boundary with tail copies",
       async () => {
+        // A prepared summary or already-read journal can outlive foreign repair.
+        // Validate its captured generation under this lock before touching sequences.
+        if (
+          publication &&
+          !(await this.getContinuousCompactionJournal(
+            workspaceId
+          ).isPublicationCurrentUnderHistoryLock(publication))
+        )
+          return Err("Compaction publication was invalidated");
         invalidateHistoryAppendProvenance();
         try {
           // r52: this path assigns fresh sequences (appended summary + every

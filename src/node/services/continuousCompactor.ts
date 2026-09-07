@@ -76,7 +76,13 @@ interface Dependencies {
     apply: (pendingFollowUp?: CompactionFollowUpRequest) => Promise<boolean>
   ): Promise<boolean>;
 }
+interface JournalReadAttempt {
+  discard: boolean;
+  journal?: ContinuousCompactionJournal;
+}
+
 interface StagedSummary {
+  publicationGeneration: string | undefined;
   generation: number;
   epoch: number;
   boundarySequence?: number;
@@ -135,6 +141,7 @@ export class ContinuousCompactor {
   private applying: Promise<Verdict> | null = null;
   private swapAttempted: StagedSummary | null = null;
   private activeSwap: ContinuousPrefixSwap | null = null;
+  private journalRead?: JournalReadAttempt;
 
   constructor(private readonly deps: Dependencies) {
     assert(deps.workspaceId.length > 0, "ContinuousCompactor requires a workspace");
@@ -149,6 +156,7 @@ export class ContinuousCompactor {
     // Hydrating settings must not erase a previous process's journal before recovery.
     // It also keeps the disabled hot path free of journal I/O when no swap ever activated.
     const discardJournal = !settingsOnly || this.activeSwap !== null || this.swapAttempted !== null;
+    const ownedJournal = this.activeSwap?.journal ?? this.journalRead?.journal;
     this.generation++;
     const job = this.job;
     this.job = null;
@@ -157,7 +165,8 @@ export class ContinuousCompactor {
     this.activeSwap = null;
     // Graceful shutdown retains the write-ahead record for ordinary startup recovery.
     if (discardJournal && reason !== "shutdown") {
-      this.clearJournal().catch((error: unknown) =>
+      if (this.journalRead) this.journalRead.discard = true;
+      this.clearJournal(ownedJournal).catch((error: unknown) =>
         log.warn("[continuous-compaction] journal clear failed", error)
       );
     }
@@ -171,9 +180,11 @@ export class ContinuousCompactor {
     log.debug("[continuous-compaction] reset", { workspaceId: this.deps.workspaceId, reason });
   }
 
-  private async clearJournal(): Promise<void> {
+  private async clearJournal(journal: ContinuousCompactionJournal | undefined): Promise<void> {
     using _execution = this.deps.enterExecution?.();
-    await this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId).clear();
+    await this.deps.historyService
+      .getContinuousCompactionJournal(this.deps.workspaceId)
+      .clear(journal);
   }
 
   hasConsumedSwap(): boolean {
@@ -318,6 +329,12 @@ export class ContinuousCompactor {
     job: NonNullable<ContinuousCompactor["job"]>,
     context: ContinuousCompactionContext
   ): Promise<void> {
+    // Capture before any source preparation: a later repair must fence this job
+    // even when the transcript fingerprint itself remains unchanged.
+    const publicationGeneration = await this.deps.historyService
+      .getContinuousCompactionJournal(this.deps.workspaceId)
+      .captureGeneration();
+    if (job.generation !== this.generation) return;
     await this.deps.prepare();
     if (job.generation !== this.generation) return;
     const rows = await this.readSnapshot();
@@ -351,6 +368,7 @@ export class ContinuousCompactor {
       "Rolling head must have a durable sequence"
     );
     const stagedBase = {
+      publicationGeneration,
       generation: job.generation,
       ...boundaryIdentity(rows),
       cut,
@@ -507,6 +525,7 @@ export class ContinuousCompactor {
     try {
       const journal: ContinuousCompactionJournal = {
         version: 1,
+        publicationGeneration: staged.publicationGeneration,
         boundary,
         staticCopies,
         liveTailCopySpec: {
@@ -581,7 +600,20 @@ export class ContinuousCompactor {
   private async finalizeJournal(pendingFollowUp?: CompactionFollowUpRequest): Promise<boolean> {
     const generation = this.generation;
     const store = this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId);
-    const journal = await store.read();
+    const readAttempt: JournalReadAttempt = { discard: false };
+    this.journalRead = readAttempt;
+    using _readOwnership = {
+      [Symbol.dispose]: () => {
+        if (this.journalRead === readAttempt) this.journalRead = undefined;
+      },
+    };
+    const journal = await store.read({
+      isCurrent: () => generation === this.generation,
+      shouldDiscard: () => readAttempt.discard,
+      onRead: (journal) => {
+        readAttempt.journal = journal;
+      },
+    });
     if (generation !== this.generation) return false;
     if (!journal) {
       this.activeSwap = null;
@@ -596,7 +628,7 @@ export class ContinuousCompactor {
       journal.staticCopies.every((copy) => rows.some((row) => row.id === copy.id)) &&
       rows.some((row) => row.id === journal.liveTailCopySpec.copyId);
     if (rows.some((row) => row.id === journal.boundary.id) && copiesPresent) {
-      await store.clear();
+      await store.clear(journal);
       if (generation !== this.generation) return false;
       this.activeSwap = null;
       return true;
@@ -633,7 +665,7 @@ export class ContinuousCompactor {
       log.warn("[continuous-compaction] discarded mismatched journal", {
         workspaceId: this.deps.workspaceId,
       });
-      await store.clear();
+      await store.clear(journal);
       if (generation !== this.generation) return false;
       this.activeSwap = null;
       return false;
@@ -677,6 +709,7 @@ export class ContinuousCompactor {
             journal.postCompactionAttachments
           ).reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0),
           prepared: { boundary, copies: [...journal.staticCopies, liveCopy] },
+          publication: { generation: journal.publicationGeneration },
           shouldPersist: (current) =>
             generation === this.generation &&
             !this.deps.streamManager.isStreaming(this.deps.workspaceId) &&
@@ -686,7 +719,10 @@ export class ContinuousCompactor {
       boundary.id
     );
     if (applied && generation === this.generation) {
-      await store.clear();
+      await store.clear(journal);
+      // This owner has completed cleanup; reset must not queue another unlink
+      // after recovery returns (or race a subsequent recovery of the same journal).
+      readAttempt.journal = undefined;
       // Persistence may finish after an edit/reset. Its old clear is already ordered
       // by the store; a new reset here would enqueue another clear behind replacement work.
       if (generation === this.generation) this.reset("applied");
@@ -736,6 +772,7 @@ export class ContinuousCompactor {
               fingerprint(current) === snapshotFingerprint
             );
           },
+          publication: { generation: staged.publicationGeneration },
           messages: rows,
           text: staged.text,
           model: staged.model,

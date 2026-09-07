@@ -2624,19 +2624,28 @@ export class StreamManager {
               !abortController.signal.aborted &&
               request.thinkingOverrideState?.pending == null &&
               request.thinkingOverrideState?.applied === thinkingLevel;
+            const unswappedMessages = effectiveMessages;
             const journal = await store.write(
               { ...swap.journal, stepNumber },
               swap.prefix,
-              isCurrent
+              isCurrent,
+              (journal) => {
+                // Consume in the publication lock, so repair orders before or after
+                // this receipt instead of racing the return from journal.write().
+                swap.journal = journal;
+                swap.consumed = true;
+                stepTracker.consumedPrefixSwap = swap;
+                effectiveMessages = swapped;
+              }
             );
-            if (journal && isCurrent()) {
-              swap.journal = journal;
-              swap.consumed = true;
-              stepTracker.consumedPrefixSwap = swap;
-              effectiveMessages = swapped;
-            } else if (journal && stepTracker.pendingPrefixSwap === swap) {
-              // A thinking change can also arrive after write()'s last fence.
-              await store.clear();
+            if (journal && !isCurrent()) {
+              // Local thinking/abort changes still win before provider entry.
+              // Cleanup cannot delete a foreign journal published after our receipt.
+              effectiveMessages = unswappedMessages;
+              swap.consumed = false;
+              if (stepTracker.consumedPrefixSwap === swap)
+                stepTracker.consumedPrefixSwap = undefined;
+              await store.clear(journal);
             }
           }
           if (stepTracker.pendingPrefixSwap === swap) stepTracker.pendingPrefixSwap = undefined;
@@ -3622,7 +3631,7 @@ export class StreamManager {
             !streamInfo.abortController.signal.aborted &&
             nextRequest.thinkingOverrideState?.pending == null &&
             nextRequest.thinkingOverrideState?.applied === appliedThinking;
-          const journal = await this.historyService
+          await this.historyService
             .getContinuousCompactionJournal(workspaceId)
             .recordFallbackPrefix(
               consumedSwap.journal,
@@ -3632,12 +3641,13 @@ export class StreamManager {
                 providerOptions: nextRequest.providerOptions,
                 system: nextRequest.system,
               },
-              isCurrent
+              isCurrent,
+              (journal) => {
+                consumedSwap.journal = journal;
+                messages = swapped;
+              }
             );
-          if (journal && isCurrent()) {
-            consumedSwap.journal = journal;
-            messages = swapped;
-          }
+          if (!isCurrent()) messages = null;
         }
       }
       if (messages) nextRequest.messages = messages;

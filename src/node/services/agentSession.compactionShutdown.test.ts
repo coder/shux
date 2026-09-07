@@ -1355,7 +1355,7 @@ test.each(["quarantine", "journal", "history", "unlink"] as const)(
         return write(...args);
       });
     } else if (step === "journal") {
-      spyOn(journal, "clear").mockRejectedValueOnce(failure);
+      spyOn(journal, "invalidateUnderHistoryLock").mockRejectedValueOnce(failure);
     } else if (step === "unlink") {
       const remove = fs.rm;
       let failed = false;
@@ -2191,6 +2191,43 @@ test.each(["accepted", "foreign Stop", "raw reset", "append failure"] as const)(
       expect(rows.success && rows.data.some((row) => row.id === snapshot.id)).toBe(
         action === "accepted"
       );
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(["empty", "raw reset", "journal only"])(
+  "startup retains a settled Stop on %s history against a late foreign summary",
+  async (state) => {
+    const h = await setup();
+    try {
+      await h.session.interruptStream({ abandonPartial: true });
+      if (state === "raw reset") {
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("private", "user", "Old context")
+        );
+        await fs.appendFile(
+          `${h.config.sessionsDir}/${workspaceId}/chat.jsonl`,
+          '{"metadata":{"contextBoundaryKind":"reset"},broken\n'
+        );
+      }
+      if (state === "journal only")
+        await writeFile(
+          h.historyService.getContinuousCompactionJournal(workspaceId).path,
+          "old journal"
+        );
+      const stopped = await h.historyService.readCompactionCancellation(workspaceId);
+      await h.session.runStartupRecovery();
+      const foreign = new HistoryService(h.config);
+      expect(await foreign.readCompactionCancellation(workspaceId)).toEqual(stopped);
+      expect(h.session.hasBlockingCompactionCleanup).toBe(false);
+      await foreign.appendToHistory(workspaceId, summary());
+      await expectNoRecovery(h.config, foreign);
+      expect((await h.session.sendMessage("Explicit replacement", options)).success).toBe(true);
+      expect(await foreign.readCompactionCancellation(workspaceId)).toBeNull();
     } finally {
       await h.session.dispose();
       await h.cleanup();
