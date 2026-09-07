@@ -2,7 +2,6 @@ import { forwardRef } from "react";
 import type { ReactNode } from "react";
 import {
   ActivityIndicator,
-  KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
@@ -16,6 +15,7 @@ import type { TextInputProps } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { AlertCircle, ChevronLeft, Info, TriangleAlert, X } from "lucide-react-native";
 import type { LucideIcon } from "lucide-react-native";
+import { KeyboardAvoidingView } from "./Keyboard";
 import { colors, layout, radii, spacing, typography } from "../theme";
 
 export function IconButton(props: {

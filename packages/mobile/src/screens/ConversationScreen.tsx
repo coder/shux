@@ -1,15 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { SetStateAction } from "react";
-import {
-  FlatList,
-  KeyboardAvoidingView,
-  Platform,
-  Pressable,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
-} from "react-native";
+import { FlatList, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import {
   ArrowDown,
   ArrowUp,
@@ -24,6 +15,7 @@ import type { MobileClient } from "../api";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 import type { MuxMessage } from "../../../../src/common/types/message";
 import { Button, IconButton, Loading, Notice } from "../components/Controls";
+import { KeyboardAvoidingView } from "../components/Keyboard";
 import { Message } from "../components/Message";
 import { ContextUsage } from "../components/ContextUsage";
 import { getContextUsage } from "../contextUsage";

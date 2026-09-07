@@ -15,6 +15,7 @@ import { CreateWorkspace } from "./src/screens/CreateWorkspace";
 import { ChangesScreen } from "./src/screens/ChangesScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
 import { Button, Header, Loading, Notice } from "./src/components/Controls";
+import { KeyboardProvider } from "./src/components/Keyboard";
 import { useProjects } from "./src/useProjects";
 import { useConnection } from "./src/useConnection";
 import { colors, layout, WIDE_LAYOUT_MIN_WIDTH } from "./src/theme";
@@ -51,14 +52,16 @@ export default function App() {
   const [connection, setConnection] = useState<Connection | null>(null);
   return (
     <SafeAreaProvider>
-      <StatusBar barStyle="light-content" backgroundColor={colors.background} />
-      {connection ? (
-        <ConnectedApp connection={connection} onDisconnect={() => setConnection(null)} />
-      ) : (
-        <SafeAreaView style={layout.fill}>
-          <ConnectScreen onConnect={setConnection} />
-        </SafeAreaView>
-      )}
+      <KeyboardProvider>
+        <StatusBar barStyle="light-content" backgroundColor={colors.background} />
+        {connection ? (
+          <ConnectedApp connection={connection} onDisconnect={() => setConnection(null)} />
+        ) : (
+          <SafeAreaView style={layout.fill}>
+            <ConnectScreen onConnect={setConnection} />
+          </SafeAreaView>
+        )}
+      </KeyboardProvider>
     </SafeAreaProvider>
   );
 }

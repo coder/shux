@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Platform, ScrollView, StyleSheet, Text, View } from "react-native";
 import { ArrowRight, Eye, EyeOff, ShieldCheck } from "lucide-react-native";
 import type { TextInput } from "react-native";
 import { connect } from "../connection";
 import { isInsecureEndpoint } from "../endpoint";
 import { loadCredentials, saveCredentials } from "../credentials";
 import { Button, Field, IconButton, Loading, Notice } from "../components/Controls";
+import { KeyboardAvoidingView } from "../components/Keyboard";
 import { colors, layout, spacing, typography } from "../theme";
 
 export type Connection = Awaited<ReturnType<typeof connect>>;

@@ -1,6 +1,5 @@
 import { useState } from "react";
 import {
-  KeyboardAvoidingView,
   Platform,
   Pressable,
   RefreshControl,
@@ -26,6 +25,7 @@ import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/wor
 import type { Projects } from "../useProjects";
 import { excludeSubAgentRows } from "../../../../src/browser/utils/ui/workspaceFiltering";
 import { Button, IconButton, Loading, Notice } from "../components/Controls";
+import { KeyboardAvoidingView } from "../components/Keyboard";
 import {
   colors,
   fontFamily,
@@ -79,6 +79,7 @@ export function Navigator(props: {
   return (
     <KeyboardAvoidingView
       style={[layout.fill, props.compact && styles.sidebar]}
+      enabled={bottomDock}
       behavior={bottomDock ? (Platform.OS === "ios" ? "padding" : "height") : undefined}
     >
       <View style={styles.toolbar}>
