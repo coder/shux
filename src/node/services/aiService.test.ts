@@ -2579,9 +2579,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   });
 
-  it.each(["gpt-6-astra", "team-astra"])(
-    "preserves the actual Coder instance and scoped alias for advisor Pro: %s",
-    async (modelId) => {
+  it.each([
+    { modelId: "gpt-6-astra", refresh: "none" },
+    { modelId: "team-astra", refresh: "none" },
+    { modelId: "team-astra", refresh: "retyped" },
+    { modelId: "team-astra", refresh: "removed" },
+  ])(
+    "preserves the actual Coder instance and scoped alias for advisor Pro: %j",
+    async (testCase) => {
       using xumHome = new DisposableTempDir("ai-service-advisor-coder-pro");
       const projectPath = path.join(xumHome.path, "project");
       await fs.mkdir(projectPath, { recursive: true });
@@ -2590,7 +2595,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         xumHome.path,
         createLocalWorkspaceMetadata(workspaceId, projectPath)
       );
-      const model = `coder:prod-openai/${modelId}`;
+      const model = `coder:prod-openai/${testCase.modelId}`;
       await writeProvidersConfig(xumHome.path, {
         coder: {
           coderOauth: {
@@ -2614,13 +2619,36 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       await startAdvisorStream(harness, workspaceId);
       // Avoid an OAuth exchange; the real option/route adapter below must retain
       // the selected instance instead of re-resolving the unrelated "openai" instance.
-      spyOn(harness.service, "createModel").mockImplementation((_model, options) => {
+      spyOn(harness.service, "createModel").mockImplementation((_model, options, creation) => {
+        expect(creation?.providersConfig?.coder).toMatchObject({
+          discoveredProviders: [
+            { name: "prod-openai", type: "openai" },
+            { name: "openai", type: "openai-compat" },
+          ],
+        });
         if (!options) throw new Error("Expected the adapter's provider-options target");
         options.openai = { wireFormat: "responses" };
         return Promise.resolve({ success: true, data: Object.create(null) as LanguageModel });
       });
       const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
       if (!runtime) throw new Error("Expected advisor runtime");
+      if (testCase.refresh !== "none") {
+        const snapshot = new ProvidersConfigStore(harness.config.rootDir).loadProvidersConfig();
+        if (!snapshot) throw new Error("Expected the initial Coder configuration");
+        // Model creation gets the first read; an independent options-view read
+        // would see a catalog refresh with incompatible or missing metadata.
+        spyOn(ProvidersConfigStore.prototype, "loadProvidersConfig")
+          .mockReturnValue({
+            ...snapshot,
+            coder: {
+              ...snapshot.coder,
+              discoveredProviders:
+                testCase.refresh === "retyped" ? [{ name: "prod-openai", type: "anthropic" }] : [],
+              models: [],
+            },
+          })
+          .mockReturnValueOnce(snapshot);
+      }
       const created = await runtime.createModel(model);
       expect(created.optionsRouteProvider).toBe("coder");
       const options = buildProviderOptions(

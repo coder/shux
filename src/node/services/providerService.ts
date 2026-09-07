@@ -22,7 +22,7 @@
  */
 import { EventEmitter } from "events";
 import { Effect, Schema } from "effect";
-import type { Config, ProjectsConfig } from "@/node/config";
+import type { Config, ProjectsConfig, ProvidersConfig } from "@/node/config";
 import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import {
   PROVIDER_DEFINITIONS,
@@ -363,8 +363,10 @@ export class ProviderService {
   /**
    * Get the full providers config with safe info (no actual API keys)
    */
-  public getConfig(): ProvidersConfigMap {
-    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
+  public getConfig(snapshot?: ProvidersConfig): ProvidersConfigMap {
+    // Request builders can project their creation-time snapshot without racing
+    // a second disk read that changes instance types or scoped model aliases.
+    const providersConfig = snapshot ?? this.providersConfigStore.loadProvidersConfig() ?? {};
     const mainConfig = this.config.loadConfigOrDefault();
     const result: ProvidersConfigMap = {};
     const shadowedCustomProviderIds = this.detectAndLogShadowedProviders(providersConfig);

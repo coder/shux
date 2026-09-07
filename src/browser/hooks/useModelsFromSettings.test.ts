@@ -86,6 +86,7 @@ const useRoutingMock = mock(() => ({
   routePriority,
   routeOverrides,
   resolveRoute: () => ({ route: "direct", isAuto: true, displayName: "Direct" }),
+  resolveEffectiveRoute: () => "direct",
   availableRoutes: () => [],
   setRoutePreferences: () => {
     /* noop */

@@ -2040,10 +2040,10 @@ export class TurnRequestBuilder {
       // on one wire while recording usage under another type.
       const toolProvidersConfig =
         this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
-      // View snapshot captured at creation time for option
-      // building (buildProviderOptions takes the oRPC view, not
-      // the raw config shape).
-      const toolOptionsProvidersConfig = this.dependencies.providerService.getConfig();
+      // Project that same snapshot for option building; raw Coder identities
+      // must not resolve against refreshed instance types or alias metadata.
+      const toolOptionsProvidersConfig =
+        this.dependencies.providerService.getConfig(toolProvidersConfig);
       // Let the factory pin provider-level defaults (especially the OpenAI wire
       // format) without inheriting any options from the parent chat.
       const toolMuxProviderOptions: MuxProviderOptions = {};

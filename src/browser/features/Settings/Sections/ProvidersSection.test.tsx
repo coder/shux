@@ -1,11 +1,12 @@
 import type React from "react";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 import type { APIClient } from "@/browser/contexts/API";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
@@ -64,11 +65,17 @@ void mock.module("@/browser/hooks/useProvidersConfig", () => ({
   }),
 }));
 
+const actualRoutingModule = { ...ActualRoutingModule };
+afterAll(async () => {
+  await mock.module("@/browser/hooks/useRouting", () => actualRoutingModule);
+});
+
 void mock.module("@/browser/hooks/useRouting", () => ({
   useRouting: () => ({
     routePriority: ["direct"],
     routeOverrides: {},
     resolveRoute: () => ({ route: "direct", isAuto: true, displayName: "Direct" }),
+    resolveEffectiveRoute: () => "direct",
     availableRoutes: () => [],
     setRoutePreferences: () => undefined,
     setRoutePriority: () => undefined,
