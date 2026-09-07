@@ -3,6 +3,8 @@ import { tool } from "ai";
 import type { z } from "zod";
 import assert from "@/common/utils/assert";
 import type { MuxMessage } from "@/common/types/message";
+import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
+import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import {
   SESSION_HISTORY_DEFAULT_LIMIT,
   SESSION_HISTORY_RESULT_ENVELOPE_BYTES,
@@ -34,15 +36,21 @@ function historicalText(message: MuxMessage): string {
     message.metadata?.rlmPreservedTailCopy
   )
     return "";
-  const sanitize = (value: unknown, depth: number): unknown => {
+  const sanitize = (
+    value: unknown,
+    depth: number,
+    kind: "json" | "tool" | "calls" | "output"
+  ): unknown => {
     if (depth > 30) return "[nested data omitted]";
-    if (typeof value === "string") return value.startsWith("data:") ? "[media omitted]" : value;
-    if (Array.isArray(value)) return value.map((item) => sanitize(item, depth + 1));
+    if (Array.isArray(value))
+      return value.map((item) => sanitize(item, depth + 1, kind === "calls" ? "tool" : kind));
     if (!value || typeof value !== "object") return value;
     const object = value as Record<string, unknown>;
     if (object.toolName === "session_history") return "[session_history result omitted]";
     if (object.type === "reasoning") return "[reasoning omitted]";
-    if (["file", "image", "image_url", "audio", "video"].includes(String(object.type)))
+    // Only canonical tool-output attachments have recursive media semantics.
+    // SDK-looking JSON and data URLs in ordinary tool arguments/results are text.
+    if (kind === "output" && (isMediaPart(value) || isDisplayOnlyFilePart(value)))
       return "[media omitted]";
     return Object.fromEntries(
       Object.entries(object)
@@ -50,15 +58,29 @@ function historicalText(message: MuxMessage): string {
           ([key]) =>
             !["providerMetadata", "providerOptions", "reasoning", "reasoningContent"].includes(key)
         )
-        .map(([key, item]) => [key, sanitize(item, depth + 1)])
+        .map(([key, item]) => [
+          key,
+          sanitize(
+            item,
+            depth + 1,
+            kind === "tool" && key === "output"
+              ? "output"
+              : kind === "tool" && key === "nestedCalls"
+                ? "calls"
+                : kind === "output"
+                  ? "output"
+                  : "json"
+          ),
+        ])
     );
   };
   return message.parts
     .flatMap((part) => {
       if (!part || typeof part !== "object") return [];
       if (part.type === "reasoning") return [];
+      if (part.type === "file") return ["[media omitted]"];
       if (part.type === "text") return typeof part.text === "string" ? [part.text] : [];
-      return [JSON.stringify(sanitize(part, 0))];
+      return [JSON.stringify(sanitize(part, 0, "tool"))];
     })
     .join("\n");
 }
@@ -225,8 +247,10 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
         result.malformedLines = scan.malformedLines;
         if (scan.cursor && !foundItem)
           result.nextCursor = encodeHistoryCursor({ ...binding, scan: scan.cursor });
-        if (args.action === "read_item" && !foundItem && !scan.cursor)
+        if (args.action === "read_item" && !foundItem && !scan.cursor) {
+          result.success = false;
           result.error = "item_not_found";
+        }
         assert(
           Buffer.byteLength(JSON.stringify(result)) <= SESSION_HISTORY_MAX_RESULT_BYTES,
           "session_history aggregate result exceeds budget"

@@ -63,7 +63,12 @@ async function pages(input: SessionHistoryArgs) {
   let cursor: string | undefined;
   do {
     const result = await call({ ...input, cursor });
-    expect(result.success).toBe(true);
+    if (input.action === "read_item" && result.error === "item_not_found") {
+      expect(result).toMatchObject({ success: false, exhausted: true, items: [] });
+      expect(result.nextCursor).toBeUndefined();
+    } else {
+      expect(result.success).toBe(true);
+    }
     expect(result.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
     expect(result.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
     expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
@@ -1275,6 +1280,104 @@ describe("session_history real disk recovery", () => {
     ).toBe("invalid_cursor");
   });
 
+  test("search and read retain media-shaped ordinary tool JSON and literal data URLs", async () => {
+    const records = ["file", "image", "image_url", "audio", "video", "media"].map((type) => ({
+      type,
+      content: `ordinary-${type} facts 🧭`,
+    }));
+    const input = {
+      type: "file",
+      mediaType: "text/plain",
+      data: "ordinary input facts",
+      example: { type: "media", mediaType: "image/png", data: "ordinary argument bytes" },
+    };
+    const output = {
+      nested: records,
+      image: { type: "image", image: "ordinary image payload" },
+      file: { type: "file", mediaType: "image/png", url: "data:image/png;base64,ordinary literal" },
+    };
+    const message = await append("media-lookalikes", "", undefined, [
+      {
+        type: "dynamic-tool",
+        toolCallId: "ordinary-json",
+        toolName: "bash",
+        state: "output-available",
+        input,
+        output,
+      },
+    ]);
+    for (const query of [
+      ...records.map((record) => record.content),
+      input.data,
+      input.example.data,
+      output.file.url,
+    ]) {
+      const found = (await pages({ action: "search", query })).flatMap((page) => page.items ?? []);
+      expect(found).toHaveLength(1);
+      expect(found[0].text).toContain(query);
+    }
+    let offset: number | undefined = 0;
+    const chunks: string[] = [];
+    while (offset !== undefined) {
+      const read = await call({
+        action: "read_item",
+        item_id: String(message.metadata!.historySequence),
+        offset_chars: offset,
+        limit_chars: 37,
+      });
+      expect(read.success).toBe(true);
+      expect(read.exhausted).toBe(true);
+      expect(read.nextCursor).toBeUndefined();
+      const item = read.items![0];
+      expect(Buffer.from(item.text).toString("utf8")).toBe(item.text);
+      chunks.push(item.text);
+      offset = item.nextCharOffset;
+      expect(chunks.length).toBeLessThan(40);
+    }
+    expect(JSON.parse(chunks.join(""))).toMatchObject({ input, output });
+  });
+
+  test.each([false, true])(
+    "missing item references fail only after scan exhaustion (stale physical reference: %s)",
+    async (stale) => {
+      const target = await append("reference-target", "before rewrite");
+      const reference = await call({
+        action: "read_item",
+        item_id: String(target.metadata!.historySequence),
+      });
+      expect(reference.success).toBe(true);
+      const itemId = stale ? reference.items![0].itemId : "m:missing";
+      const raw = await fs.readFile(chatPath, "utf8");
+      await fs.writeFile(chatPath, raw.replace("before rewrite", "after rewriting"));
+      await appendTrackedHistory(
+        chatPath,
+        Array.from({ length: SESSION_HISTORY_MAX_SCAN_ROWS + 1 }, (_, index) =>
+          JSON.stringify(createMuxMessage(`padding-${index}`, "assistant", "padding"))
+        ).join("\n") + "\n"
+      );
+      const results: SessionHistoryResult[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await call({ action: "read_item", item_id: itemId, cursor });
+        results.push(page);
+        cursor = page.nextCursor;
+        expect(page.items).toEqual([]);
+        expect(results.length).toBeLessThan(10);
+        if (cursor) {
+          expect(page.success).toBe(true);
+          expect(page.exhausted).toBe(false);
+          expect(page.error).toBeUndefined();
+        }
+      } while (cursor);
+      expect(results.length).toBeGreaterThan(1);
+      expect(results.at(-1)).toMatchObject({
+        success: false,
+        exhausted: true,
+        error: "item_not_found",
+      });
+    }
+  );
+
   test("suppresses hidden synthetic requests, copied tails and reasoning; redacts media and nested history", async () => {
     await append("hidden", "private needle", { synthetic: true });
     await append("rejected", "private needle", { contextBudgetRejected: true });
@@ -1292,10 +1395,28 @@ describe("session_history real disk recovery", () => {
         toolName: "code_execution",
         state: "output-available",
         input: {},
+        nestedCalls: [
+          {
+            toolCallId: "nested-media",
+            toolName: "attach_file",
+            state: "output-available",
+            input: { type: "file", content: "nested ordinary needle" },
+            output: { type: "media", mediaType: "image/png", data: "private needle" },
+          },
+        ],
         output: {
           nestedCalls: [
             { toolName: "session_history", output: "private needle" },
-            { toolName: "attach_file", output: { type: "image", data: "private needle" } },
+            {
+              toolName: "attach_file",
+              output: {
+                type: "content",
+                value: [
+                  { type: "media", mediaType: "image/png", data: "private needle" },
+                  { type: "display_file", mediaType: "application/zip", data: "private needle" },
+                ],
+              },
+            },
           ],
           stdout: "safe",
         },
@@ -1308,6 +1429,7 @@ describe("session_history real disk recovery", () => {
       item_id: String(mixed.metadata!.historySequence),
     });
     expect(read.items?.[0]?.text).toContain("safe");
+    expect(read.items?.[0]?.text).toContain("nested ordinary needle");
     expect(read.items?.[0]?.text).not.toContain("private needle");
   });
 
