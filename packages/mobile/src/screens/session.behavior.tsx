@@ -470,6 +470,115 @@ test("a complete historical pending question is not recoverable", async () => {
   ).toBe("true");
 });
 
+function answeredPartial(id = "question", partial = true) {
+  const message = question(id, 1, partial);
+  return {
+    ...message,
+    parts: message.parts.map((part) =>
+      part.type === "dynamic-tool"
+        ? { ...part, state: "output-available" as const, output: { summary: "answered" } }
+        : part
+    ),
+  };
+}
+
+test("replayed saved answers offer manual resume, preserve no-op/error retries, and suppress duplicate starts until reconnect", async () => {
+  const saved = answeredPartial();
+  const view = fixture([saved]);
+  await view.select("alpha");
+  expect(view.queryByRole("button", { name: "Send answers" })).toBeNull();
+  expect(callCount(view, "resumeStream")).toBe(0);
+  view.setResume(async () => ({ success: true, data: { started: false } }));
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Resume agent" })));
+  expect(callCount(view, "resumeStream")).toBe(1);
+  view.setResume(async () => {
+    throw new Error("offline");
+  });
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Resume agent" })));
+  expect(view.getByRole("alert").textContent).toContain("offline");
+  const resume = deferred<unknown>();
+  view.setResume(() => resume.promise);
+  const retry = view.getByRole("button", { name: "Resume agent" });
+  fireEvent.click(retry);
+  fireEvent.click(retry);
+  expect(callCount(view, "resumeStream")).toBe(3);
+  await act(async () => resume.resolve({ success: true, data: { started: true } }));
+  await view.emit(saved);
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Keep draft" } });
+  expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+  expect(callCount(view, "answerAskUserQuestion")).toBe(0);
+  await act(async () => view.chats[0].end());
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Retry" })));
+  await waitFor(() => expect(view.chats).toHaveLength(2));
+  expect(await view.findByRole("button", { name: "Resume agent" })).toBeDefined();
+  expect(callCount(view, "resumeStream")).toBe(3);
+});
+
+test("an answered partial retains manual recovery after switching away and remounting", async () => {
+  const messages: WorkspaceChatMessage[] = [question()];
+  const view = fixture(messages);
+  await view.select("alpha");
+  view.setAnswer(async () => {
+    messages[0] = answeredPartial();
+    view.chats.at(-1)!.events.enqueue(answered());
+    return { success: true };
+  });
+  view.setResume(async () => ({ success: false, error: "provider unavailable" }));
+  await submitAnswer(view);
+  fireEvent.click(view.getByRole("button", { name: "Back to workspaces" }));
+  await view.select("alpha");
+  expect(view.queryByRole("button", { name: "Send answers" })).toBeNull();
+  expect(view.getByRole("button", { name: "Resume agent" })).toBeDefined();
+  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
+  expect(callCount(view, "resumeStream")).toBe(1);
+});
+
+test("completed answers do not enable recovery for historical rows, completed turns or active streams", async () => {
+  const saved = answeredPartial();
+  for (const messages of [
+    [answeredPartial("complete", false)],
+    [saved, question("newer", 2)],
+    [
+      saved,
+      { type: "message", id: "user", role: "user", parts: [], metadata: { historySequence: 2 } },
+    ],
+    [
+      saved,
+      { type: "stream-lifecycle", workspaceId: "alpha", phase: "streaming", hadAnyOutput: true },
+    ],
+  ] satisfies WorkspaceChatMessage[][]) {
+    const view = fixture(messages);
+    await view.select("alpha");
+    expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+    expect(callCount(view, "resumeStream")).toBe(0);
+    view.unmount();
+  }
+});
+
+test("durable answer recovery still waits for policy and live settings", async () => {
+  const view = fixture([answeredPartial()], false, {
+    source: "env",
+    status: { state: "blocked", reason: "upgrade required" },
+    policy: null,
+  });
+  await view.select("alpha");
+  expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+  const config = deferred<SettingsData["config"]>();
+  view.setConfigRead(() => config.promise);
+  await view.updateConfig({ agentAiDefaults: {} });
+  await view.updatePolicy(disabledPolicy);
+  expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+  const providerOptions = { anthropic: { disableBetaFeatures: true } };
+  await act(async () =>
+    config.resolve({ agentAiDefaults: {}, userPreferences: { ai: { providerOptions } } })
+  );
+  await act(async () => fireEvent.click(await view.findByRole("button", { name: "Resume agent" })));
+  expect(callCount(view, "answerAskUserQuestion")).toBe(0);
+  expect(view.calls.find((call) => call.path === "workspace.resumeStream")?.input).toMatchObject({
+    options: { providerOptions },
+  });
+});
+
 test("a successful no-op resume keeps the recovery action without resubmitting the answer", async () => {
   const view = fixture([question()]);
   await view.select("alpha");

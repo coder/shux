@@ -61,6 +61,7 @@ export function ConversationScreen(props: {
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [resumeMessageId, setResumeMessageId] = useState<string | null>(null);
+  const [startedResumeMessageId, setStartedResumeMessageId] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState<"model" | "agent" | null>(null);
   const [atBottom, setAtBottom] = useState(true);
   const [composerHeight, setComposerHeight] = useState(100);
@@ -73,6 +74,7 @@ export function ConversationScreen(props: {
     const abort = linkedAbortController(props.signal);
     controller.current = abort;
     pending.current = false;
+    setStartedResumeMessageId(null);
     setBusy(false);
     return () => abort.abort();
   }, [props.signal]);
@@ -80,6 +82,7 @@ export function ConversationScreen(props: {
   // Answer RPCs can outlive stream updates from another client. Consult the latest
   // committed transcript before starting recovery, not the pre-answer render.
   useEffect(() => {
+    if (transcript.streaming) setStartedResumeMessageId(null);
     latestTranscript.current = transcript;
   }, [transcript]);
   const agentId = props.workspace.agentId ?? "exec";
@@ -118,8 +121,22 @@ export function ConversationScreen(props: {
     : lastMessage?.role === "assistant" && lastMessage.metadata?.partial
       ? lastMessage
       : undefined;
+  // The saved tool result survives remount/reconnect even when the answer RPC's
+  // local recovery state does not. Only the latest interrupted turn is eligible.
+  const resumeTargetId =
+    lastMessage?.role === "assistant" &&
+    lastMessage.metadata?.partial &&
+    (resumeMessageId === lastMessage.id ||
+      lastMessage.parts.some(
+        (part) =>
+          part.type === "dynamic-tool" &&
+          part.toolName === "ask_user_question" &&
+          part.state === "output-available"
+      ))
+      ? lastMessage.id
+      : null;
   const canResume =
-    canAct && !running && resumeMessageId === lastMessage?.id && lastMessage?.metadata?.partial;
+    canAct && !running && resumeTargetId !== null && resumeTargetId !== startedResumeMessageId;
 
   async function send() {
     if (!canAct || !options?.model || !draft.trim() || pending.current || running) return;
@@ -208,8 +225,12 @@ export function ConversationScreen(props: {
         throw new Error(
           typeof result.error === "string" ? result.error : JSON.stringify(result.error)
         );
-      if (result.data.started) setResumeMessageId(null);
-      else setActionError("Answers saved. The agent is busy; try resuming again.");
+      if (result.data.started) {
+        setResumeMessageId(null);
+        // The durable partial may replay before stream-start arrives. Do not offer
+        // a second start until stream activity or a fresh connection reconciles it.
+        if (!latestTranscript.current.streaming) setStartedResumeMessageId(messageId);
+      } else setActionError("Answers saved. The agent is busy; try resuming again.");
     } catch (cause) {
       if (!signal.aborted)
         setActionError(
@@ -219,13 +240,13 @@ export function ConversationScreen(props: {
   }
 
   async function retryResume() {
-    if (!canResume || !resumeMessageId || pending.current) return;
+    if (!canResume || !resumeTargetId || pending.current) return;
     pending.current = true;
     setBusy(true);
     setActionError(null);
     const signal = controller.current.signal;
     try {
-      await resumeAnsweredQuestion(resumeMessageId, signal);
+      await resumeAnsweredQuestion(resumeTargetId, signal);
     } finally {
       if (controller.current.signal === signal) {
         pending.current = false;
