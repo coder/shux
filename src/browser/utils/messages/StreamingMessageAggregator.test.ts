@@ -4712,7 +4712,7 @@ describe("notify tool -> browser notifications", () => {
   });
 });
 
-test("fallback metadata refreshes desktop model identity without dropping streamed content or usage", () => {
+test("fallback metadata resets request usage while preserving streamed content and identity", () => {
   const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT, TEST_WORKSPACE_ID);
   startTestStream(aggregator);
   aggregator.handleStreamDelta({
@@ -4724,13 +4724,6 @@ test("fallback metadata refreshes desktop model identity without dropping stream
     timestamp: 10,
   });
   const usage = { inputTokens: 1000, outputTokens: 2, totalTokens: 1002 };
-  aggregator.handleUsageDelta({
-    type: "usage-delta",
-    workspaceId: TEST_WORKSPACE_ID,
-    messageId: "msg1",
-    usage,
-    cumulativeUsage: usage,
-  });
   const original = aggregator.getAllMessages()[0];
   const event: StreamMetadataEvent = {
     type: "stream-metadata",
@@ -4755,9 +4748,24 @@ test("fallback metadata refreshes desktop model identity without dropping stream
       modelFallback: { requestedModel: TEST_MODEL, refusedModels: [TEST_MODEL] },
     },
   });
+  aggregator.handleUsageDelta({
+    type: "usage-delta",
+    workspaceId: TEST_WORKSPACE_ID,
+    messageId: "msg1",
+    usage,
+    cumulativeUsage: usage,
+  });
+  original.metadata = {
+    ...original.metadata,
+    usage,
+    contextUsage: usage,
+    providerMetadata: { anthropic: { cached: true } },
+    contextProviderMetadata: { anthropic: { cached: true } },
+  };
   applyWorkspaceChatEventToAggregator(aggregator, { ...event, workspaceId: "different" });
   applyWorkspaceChatEventToAggregator(aggregator, { ...event, messageId: "different" });
   expect(aggregator.getCurrentModel()).toBe(TEST_MODEL);
+  expect(aggregator.getActiveStreamUsage("msg1")).toBe(usage);
   expect(applyWorkspaceChatEventToAggregator(aggregator, event)).toBe("immediate");
   expect(aggregator.getCurrentModel()).toBe("openai:gpt-4o");
   expect(aggregator.getActiveStreamMetadataModel()).toBe("openai:gpt-4o");
@@ -4767,11 +4775,30 @@ test("fallback metadata refreshes desktop model identity without dropping stream
   expect(aggregator.getAllMessages()[0].metadata?.routeProvider).toBeUndefined();
   expect(aggregator.getAllMessages()[0].metadata?.modelFallback).toBeUndefined();
 
-  expect(aggregator.getActiveStreamUsage("msg1")).toBe(usage);
+  expect(aggregator.getActiveStreamUsage("msg1")).toBeUndefined();
+  expect(aggregator.getActiveStreamCumulativeUsage("msg1")).toBeUndefined();
+  for (const key of [
+    "usage",
+    "contextUsage",
+    "providerMetadata",
+    "contextProviderMetadata",
+  ] as const) {
+    expect(aggregator.getAllMessages()[0].metadata?.[key]).toBeUndefined();
+  }
+  const freshUsage = { inputTokens: 2000, outputTokens: 3, totalTokens: 2003 };
+  aggregator.handleUsageDelta({
+    type: "usage-delta",
+    workspaceId: TEST_WORKSPACE_ID,
+    messageId: "msg1",
+    usage: freshUsage,
+    cumulativeUsage: freshUsage,
+  });
+  expect(aggregator.getActiveStreamUsage("msg1")).toBe(freshUsage);
   expect(aggregator.hasInterruptibleActiveStream()).toBe(true);
   applyWorkspaceChatEventToAggregator(aggregator, {
     ...event,
     metadata: { ...event.metadata, contextWindowTokens: null },
   });
   expect(aggregator.getAllMessages()[0].metadata?.contextWindowTokens).toBeNull();
+  expect(aggregator.getActiveStreamUsage("msg1")).toBeUndefined();
 });

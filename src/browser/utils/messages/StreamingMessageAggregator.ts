@@ -2186,6 +2186,7 @@ export class StreamingMessageAggregator {
       (this.workspaceId !== undefined && this.workspaceId !== data.workspaceId)
     )
       return;
+    this.activeStreamUsage.delete(data.messageId);
     const metadata = copyStreamMetadataSnapshot(data.metadata);
     context.model = metadata.model;
     context.metadataModel = metadata.metadataModel;

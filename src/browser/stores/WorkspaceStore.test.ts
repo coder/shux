@@ -1541,14 +1541,28 @@ describe("WorkspaceStore", () => {
       const usage = store.getWorkspaceUsage(workspaceId);
       expect(usage.liveMetadataModel).toBe("anthropic:claude-sonnet-4-20250514");
       expect(usage.liveCostUsage?.input.cost_usd).toBeGreaterThan(0);
-      // Use the live handler below replay buffering, as above we seeded the aggregator directly.
-      getInternal<{
+      // Dispatch below replay buffering because this fixture seeded the active aggregator directly.
+      const internal = getInternal<{
         processStreamEvent: (
           id: string,
           target: typeof aggregator,
           event: WorkspaceChatMessage
         ) => void;
-      }>(store).processStreamEvent(workspaceId, aggregator, {
+      }>(store);
+      const dispatch = (event: WorkspaceChatMessage) =>
+        internal.processStreamEvent(workspaceId, aggregator, event);
+      if (!usage.liveCostUsage) throw new Error("Expected refused attempt usage");
+      const refusedModel = "anthropic:claude-sonnet-4-20250514";
+      dispatch({
+        type: "session-usage-delta",
+        workspaceId,
+        sourceWorkspaceId: workspaceId,
+        byModelDelta: { [refusedModel]: usage.liveCostUsage },
+        timestamp: 2_000,
+      });
+      const ledgerBefore = structuredClone(store.getWorkspaceUsage(workspaceId).sessionByModel);
+      expect(ledgerBefore?.[refusedModel].input.tokens).toBe(1000);
+      dispatch({
         type: "stream-metadata",
         workspaceId,
         messageId: "msg-live-coder",
@@ -1560,10 +1574,23 @@ describe("WorkspaceStore", () => {
           routeProvider: null,
         },
       });
-      // The metadata event must invalidate live pricing even before another usage delta arrives.
       const afterFallback = store.getWorkspaceUsage(workspaceId);
       expect(afterFallback.liveMetadataModel).toBe("openai:gpt-4o");
-      expect(afterFallback.liveCostUsage?.input.tokens).toBe(usage.liveCostUsage?.input.tokens);
+      expect(afterFallback.liveUsage).toBeUndefined();
+      expect(afterFallback.liveCostUsage).toBeUndefined();
+      expect(afterFallback.sessionByModel).toEqual(ledgerBefore);
+      dispatch({
+        type: "usage-delta",
+        workspaceId,
+        messageId: "msg-live-coder",
+        usage: { inputTokens: 2000, outputTokens: 200, totalTokens: 2200 },
+        cumulativeUsage: { inputTokens: 2000, outputTokens: 200, totalTokens: 2200 },
+      });
+      const fresh = store.getWorkspaceUsage(workspaceId);
+      expect(fresh.liveMetadataModel).toBe("openai:gpt-4o");
+      expect(fresh.liveCostUsage?.input.tokens).toBe(2000);
+      expect(fresh.liveCostUsage?.input.cost_usd).toBeGreaterThan(0);
+      expect(fresh.sessionByModel).toEqual(ledgerBefore);
     });
   });
 

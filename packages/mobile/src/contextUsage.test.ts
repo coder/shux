@@ -174,8 +174,8 @@ test("active stream capacity survives model selection changes until the stream s
   state = applyChatEvent(state, { ...start, model: activeModel, contextWindowTokens: 1_000_000 });
   const current = () =>
     getContextMeterData(state.messages, options, providers, state.streamingMessageId);
-  // Even before fresh usage arrives, the stream-start metadata owns the capacity.
-  expect(current().maxTokens).toBe(1_000_000);
+  // Before fresh usage arrives, prior requests do not populate the active attempt.
+  expect(current().totalTokens).toBe(0);
   state = applyChatEvent(state, { ...delta, usage: contextUsage });
   expect(current().totalPercentage).toBe(20);
   options.model = activeModel;
@@ -222,10 +222,15 @@ test("backend-confirmed unknown active capacity does not borrow a live configure
   ).toBeUndefined();
 });
 
-test("live fallback metadata updates capacity without resetting parts, usage, or stream identity", () => {
-  let state = applyChatEvent(createTranscriptState(), {
+test("fallback resets only active attempt usage until fresh usage arrives, matching replay", () => {
+  const sourceModel = "anthropic:claude-sonnet-4-20250514";
+  const nextModel = "openai:gpt-4o";
+  const requestUsage = { inputTokens: 100_000, outputTokens: 0, totalTokens: 100_000 };
+  const providerMetadata = { anthropic: { cacheCreationInputTokens: 10 } };
+  const history = applyChatEvent(createTranscriptState(), { type: "message", ...row });
+  let state = applyChatEvent(history, {
     ...start,
-    model: "anthropic:claude-sonnet-4-20250514",
+    model: sourceModel,
     contextWindowTokens: 1_000_000,
   });
   state = applyChatEvent(state, {
@@ -246,64 +251,76 @@ test("live fallback metadata updates capacity without resetting parts, usage, or
     args: {},
     timestamp: 3,
   });
+  const active = state.messages.find((message) => message.id === "b")!;
   state = applyChatEvent(state, {
-    ...delta,
-    usage: { inputTokens: 100_000, outputTokens: 0, totalTokens: 100_000 },
-  });
-  const before = state.messages.find((message) => message.id === "b")!;
-  const current = () =>
-    getContextMeterData(
-      state.messages,
-      { model: "openai:gpt-4o", agentId: "exec" },
-      undefined,
-      state.streamingMessageId
-    );
-  expect(current().totalPercentage).toBe(10);
-  const metadataEvent: Extract<WorkspaceChatMessage, { type: "stream-metadata" }> = {
-    type: "stream-metadata",
-    workspaceId: "w",
-    messageId: "b",
+    type: "message",
+    ...active,
     metadata: {
-      model: "openai:gpt-4o",
-      metadataModel: "openai:gpt-4o",
-      contextWindowTokens: 400_000,
-      routedThroughGateway: false,
-      routeProvider: null,
-      modelFallback: {
-        requestedModel: "anthropic:claude-sonnet-4-20250514",
-        refusedModels: ["anthropic:claude-sonnet-4-20250514"],
-      },
-    },
-  };
-  state = applyChatEvent(state, {
-    ...metadataEvent,
-    metadata: {
-      ...metadataEvent.metadata,
-      model: before.metadata!.model!,
-      metadataModel: before.metadata!.model!,
-      contextWindowTokens: 1_000_000,
+      ...active.metadata,
+      usage: requestUsage,
+      contextUsage: requestUsage,
+      providerMetadata,
+      contextProviderMetadata: providerMetadata,
       routeProvider: "coder",
       routedThroughGateway: true,
       thinkingLevel: "high",
     },
   });
-  expect(applyChatEvent(state, { ...metadataEvent, messageId: "old" })).toBe(state);
-  expect(applyChatEvent(state, { ...metadataEvent, workspaceId: "other" })).toBe(state);
-  state = applyChatEvent(state, metadataEvent);
-  expect(state.streaming).toBe(true);
+  const before = state.messages.find((message) => message.id === "b")!;
+  const options: ChatSettings = { model: nextModel, agentId: "exec" };
+  const current = () =>
+    getContextMeterData(state.messages, options, undefined, state.streamingMessageId);
+  expect(current().totalTokens).toBeGreaterThan(0);
+  const event: Extract<WorkspaceChatMessage, { type: "stream-metadata" }> = {
+    type: "stream-metadata",
+    workspaceId: "w",
+    messageId: "b",
+    metadata: {
+      model: nextModel,
+      metadataModel: nextModel,
+      contextWindowTokens: 400_000,
+      routedThroughGateway: false,
+      routeProvider: null,
+      modelFallback: { requestedModel: sourceModel, refusedModels: [sourceModel] },
+    },
+  };
+  expect(applyChatEvent(state, { ...event, messageId: "old" })).toBe(state);
+  expect(applyChatEvent(state, { ...event, workspaceId: "other" })).toBe(state);
+  state = applyChatEvent(state, event);
+  const after = state.messages.find((message) => message.id === "b")!;
+  expect(after.parts).toBe(before.parts);
+  expect(after.metadata?.historySequence).toBe(before.metadata?.historySequence);
+  expect(state.messages[0]).toBe(history.messages[0]);
   expect(state.streamingMessageId).toBe("b");
-  expect(state.messages.find((message) => message.id === "b")?.parts).toBe(before.parts);
-  expect(state.messages.find((message) => message.id === "b")?.metadata?.contextUsage).toBe(
-    before.metadata?.contextUsage
-  );
-  const metadata = state.messages.find((message) => message.id === "b")?.metadata;
-  expect(metadata?.thinkingLevel).toBeUndefined();
-  expect(metadata?.routeProvider).toBeUndefined();
-  expect(metadata?.routedThroughGateway).toBe(false);
-  expect(metadata?.modelFallback).toEqual(metadataEvent.metadata.modelFallback);
+  expect(state.streaming).toBe(true);
+  for (const key of [
+    "usage",
+    "contextUsage",
+    "providerMetadata",
+    "contextProviderMetadata",
+    "thinkingLevel",
+    "routeProvider",
+  ] as const) {
+    expect(after.metadata?.[key]).toBeUndefined();
+  }
+  expect(after.metadata?.modelFallback).toEqual(event.metadata.modelFallback);
+  expect(after.metadata?.contextWindowTokens).toBe(400_000);
+  expect(current().totalTokens).toBe(0);
+  expect(current().segments).toEqual([]);
+  // Historical usage must not fill the empty new attempt, live or after reconnect.
+  const replay = applyChatEvent(history, {
+    ...start,
+    model: nextModel,
+    contextWindowTokens: 400_000,
+    replay: true,
+  });
+  expect(
+    getContextMeterData(replay.messages, options, undefined, replay.streamingMessageId)
+  ).toEqual(current());
+  state = applyChatEvent(state, { ...delta, usage: requestUsage });
   expect(current().totalPercentage).toBe(25);
   state = applyChatEvent(state, {
-    ...metadataEvent,
+    ...event,
     metadata: {
       model: "local:unknown",
       metadataModel: "local:unknown",
@@ -312,11 +329,11 @@ test("live fallback metadata updates capacity without resetting parts, usage, or
       routeProvider: null,
     },
   });
-  expect(current().maxTokens).toBeUndefined();
+  expect(current().totalTokens).toBe(0);
   expect(
     state.messages.find((message) => message.id === "b")?.metadata?.modelFallback
   ).toBeUndefined();
-  // Next-hop usage must still use unknown, not a configured model's familiar capacity.
-  state = applyChatEvent(state, delta);
+  state = applyChatEvent(state, { ...delta, usage: requestUsage });
   expect(current().maxTokens).toBeUndefined();
+  expect(current().totalTokens).toBe(100_000);
 });

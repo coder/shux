@@ -200,8 +200,8 @@ export const StreamStartEventSchema = z.object({
     .meta({ description: "ACP prompt correlation id for matching stream events" }),
 });
 
-// A fallback changes request identity within the same response; unlike stream-start,
-// this snapshot must not reset accumulated parts, usage, or stream lifecycle.
+// Fallback-only attempt boundary: reset request usage before switching model identity.
+// Preserve accumulated parts, message lifecycle, and the separately recorded session ledger.
 export const StreamMetadataEventSchema = z.object({
   type: z.literal("stream-metadata"),
   workspaceId: z.string(),

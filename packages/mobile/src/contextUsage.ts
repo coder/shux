@@ -37,9 +37,10 @@ export function getContextMeterData(
   streamingMessageId?: string | null
 ) {
   // A picker change targets the next request, not the turn still using this context.
-  const activeMetadata = streamingMessageId
-    ? messages.find((message) => message.id === streamingMessageId)?.metadata
+  const activeMessage = streamingMessageId
+    ? messages.find((message) => message.id === streamingMessageId)
     : undefined;
+  const activeMetadata = activeMessage?.metadata;
   const model = activeMetadata?.model ?? options?.model ?? "unknown";
   const anthropic = options?.providerOptions?.anthropic;
   const canonical = normalizeToCanonical(model);
@@ -54,7 +55,8 @@ export function getContextMeterData(
       ) ??
         false));
   return calculateTokenMeterData(
-    getContextUsage(messages, model),
+    // Never repopulate a reset attempt with an older request's historical usage.
+    getContextUsage(activeMessage ? [activeMessage] : streamingMessageId ? [] : messages, model),
     model,
     use1M,
     false,
