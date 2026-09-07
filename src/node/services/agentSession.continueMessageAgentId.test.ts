@@ -302,60 +302,64 @@ describe("AgentSession continue-message agentId fallback", () => {
     }
   });
 
-  test("a delayed follow-up cleanup cannot overwrite a replacement summary", async () => {
-    const summary = compactionSummaryMessage("summary", {
-      text: "obsolete goal",
-      goalKind: "goal_continuation",
-      agentId: "exec",
-      model: "openai:gpt-4o",
-    });
-    const { session, internals, historyService } = await createSession([summary]);
-    const entered = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
-    const update = historyService.updateHistory.bind(historyService);
-    spyOn(historyService, "updateHistory").mockImplementationOnce(async (...args) => {
-      entered.resolve();
-      await release.promise;
-      return update(...args);
-    });
-    const pending = internals.dispatchPendingFollowUp();
-    try {
-      await entered.promise;
-      using _mutation = session.holdTurnAdmission();
-      expect(
-        (
-          await update("ws", {
-            ...summary,
-            parts: [{ type: "text", text: "replacement summary" }],
-            metadata: {
-              ...summary.metadata,
-              muxMetadata: {
-                type: "compaction-summary",
-                pendingFollowUp: {
-                  text: "replacement request",
-                  agentId: "exec",
-                  model: "openai:gpt-4o",
+  test.each([false, true])(
+    "a delayed follow-up cleanup cannot overwrite a replacement summary (abandoned=%s)",
+    async (abandoned) => {
+      const summary = compactionSummaryMessage("summary", {
+        text: "obsolete goal",
+        goalKind: "goal_continuation",
+        agentId: "exec",
+        model: "openai:gpt-4o",
+      });
+      const { session, internals, historyService } = await createSession([summary]);
+      if (abandoned) await session.interruptStream({ abandonPartial: true });
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const update = historyService.updateHistory.bind(historyService);
+      spyOn(historyService, "updateHistory").mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return update(...args);
+      });
+      const pending = internals.dispatchPendingFollowUp();
+      try {
+        await entered.promise;
+        using _mutation = session.holdTurnAdmission();
+        expect(
+          (
+            await update("ws", {
+              ...summary,
+              parts: [{ type: "text", text: "replacement summary" }],
+              metadata: {
+                ...summary.metadata,
+                muxMetadata: {
+                  type: "compaction-summary",
+                  pendingFollowUp: {
+                    text: "replacement request",
+                    agentId: "exec",
+                    model: "openai:gpt-4o",
+                  },
                 },
               },
-            },
-          })
-        ).success
-      ).toBe(true);
-      release.resolve();
-      expect(await pending).toBe(false);
-      const history = await historyService.getLastMessages("ws", 1);
-      expect(history.success && history.data[0].parts).toEqual([
-        { type: "text", text: "replacement summary" },
-      ]);
-      expect(history.success && history.data[0].metadata?.muxMetadata).toHaveProperty(
-        "pendingFollowUp.text",
-        "replacement request"
-      );
-    } finally {
-      release.resolve();
-      await pending;
+            })
+          ).success
+        ).toBe(true);
+        release.resolve();
+        expect(await pending).toBe(false);
+        const history = await historyService.getLastMessages("ws", 1);
+        expect(history.success && history.data[0].parts).toEqual([
+          { type: "text", text: "replacement summary" },
+        ]);
+        expect(history.success && history.data[0].metadata?.muxMetadata).toHaveProperty(
+          "pendingFollowUp.text",
+          "replacement request"
+        );
+      } finally {
+        release.resolve();
+        await pending;
+      }
     }
-  });
+  );
 
   test("a delayed heartbeat rollback cannot delete a replacement context", async () => {
     const summary = heartbeatBoundaryMessage();
@@ -392,6 +396,29 @@ describe("AgentSession continue-message agentId fallback", () => {
       await pending;
     }
   });
+
+  test.each([false, true])(
+    "Stop before a follow-up claim clears its durable handoff (targeted=%s)",
+    async (targeted) => {
+      const { session, internals, historyService } = await createSession([
+        compactionSummaryMessage("summary", {
+          text: "resume",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+        }),
+      ]);
+      const send = mockAcceptedSend();
+      internals.sendMessage = send;
+      await session.interruptStream({ abandonPartial: true });
+      expect(await internals.dispatchPendingFollowUp(targeted ? "summary" : undefined)).toBe(false);
+      expect(send).not.toHaveBeenCalled();
+      const history = await historyService.getLastMessages("ws", 1);
+      expect(history.success && history.data[0].metadata?.muxMetadata).not.toHaveProperty(
+        "pendingFollowUp"
+      );
+      expect(await internals.dispatchPendingFollowUp()).toBe(false);
+    }
+  );
 
   test("Stop during a held summary read clears the canceled durable handoff", async () => {
     const { session, internals, historyService } = await createSession([

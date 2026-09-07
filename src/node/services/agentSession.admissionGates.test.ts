@@ -211,6 +211,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
     expect(result).toEqual({
       success: false,
       error: { type: "unknown", raw: CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE },
+      superseded: true,
     });
     // Accepted, then notified so delivered-state bookkeeping can revert
     // (terminal-attention outbox contract, r41) — and the stale snapshot

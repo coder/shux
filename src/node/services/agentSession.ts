@@ -227,10 +227,12 @@ type SessionCompactionContext = ContinuousCompactionContext & {
  * Result shape for turn-starting session methods. failureHandled marks errors
  * whose retry/abandon bookkeeping already ran inside streamWithHistory, so
  * callers must not re-handle them (would double-increment backoff attempts).
+ * superseded records ownership loss at the failure source, before cleanup awaits;
+ * an accepted durable handoff remains acknowledged even though its startup retired.
  */
 type AgentSessionResult<T> =
   | { success: true; data: T }
-  | { success: false; error: SendMessageError; failureHandled?: true };
+  | { success: false; error: SendMessageError; failureHandled?: true; superseded?: true };
 
 /**
  * Tracked file state for detecting external edits.
@@ -4289,7 +4291,7 @@ export class AgentSession {
       // callback to revert it — returning without notifying would strand
       // that bookkeeping (r41).
       await this.settlePreparationFailure(attempt, error);
-      return Err(error);
+      return { success: false, error, superseded: true };
     }
 
     const preparedTurnAbortController = new AbortController();
@@ -4312,13 +4314,15 @@ export class AgentSession {
       }
     );
     if (admission.status !== "admitted") {
-      return Err(
-        createUnknownSendMessageError(
+      return {
+        success: false,
+        error: createUnknownSendMessageError(
           admission.status === "rejected" && admission.reason === "closing"
             ? SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE
             : CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
-        )
-      );
+        ),
+        superseded: true,
+      };
     }
     const preparedTurn = admission.turnId;
 
@@ -5476,6 +5480,8 @@ export class AgentSession {
     preStartErrors?: StreamErrorPayload[] | null,
     preparation?: PreparationAttempt
   ): Promise<AgentSessionResult<void>> {
+    const superseded =
+      !this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation);
     if (preparation) {
       await this.settlePreparationFailure(preparation, error);
       // Recovery may synchronously claim a follow-up. Its predecessor's callback has
@@ -5490,7 +5496,12 @@ export class AgentSession {
       for (const payload of preStartErrors ?? []) {
         this.coordinator.resolveErrorDecision(payload.messageId, "terminal");
       }
-      return { success: false, error, failureHandled: true };
+      return {
+        success: false,
+        error,
+        failureHandled: true,
+        superseded: superseded ? true : undefined,
+      };
     }
 
     // Collected pre-start error events own this failure; the branches below
@@ -5824,7 +5835,12 @@ export class AgentSession {
           for (const payload of preStartErrors) {
             this.coordinator.resolveErrorDecision(payload.messageId, "terminal");
           }
-          return { success: false, error: streamResult.error, failureHandled: true };
+          return {
+            success: false,
+            error: streamResult.error,
+            failureHandled: true,
+            superseded: true,
+          };
         }
         return await fail(streamResult.error, acpPromptId, preStartErrors);
       }
@@ -7896,7 +7912,9 @@ export class AgentSession {
     using _execution = this.coordinator.enterExecution();
     // Claim before history I/O: a send admitted and completed during that read
     // must not make an obsolete summary look like a fresh idle continuation.
-    const token = this.coordinator.claimCompactionFollowUp();
+    const token =
+      this.coordinator.claimCompactionFollowUp() ??
+      this.coordinator.claimCompactionFollowUpCleanup();
     if (!token) return false;
     try {
       return await this.dispatchOwnedCompactionFollowUp(token, summaryMessageId, cancelResume);
@@ -8248,15 +8266,15 @@ export class AgentSession {
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
       admissionStale: followUpAdmissionStale,
     });
-    if (!sendResult.success) {
-      if (cancelResume?.()) {
+    if (!sendResult.success && !(accepted && sendResult.superseded)) {
+      if (!accepted && cancelResume?.()) {
         await this.clearPendingFollowUpFromSummary(lastMessage, token);
         return false;
       }
       // A stale-admission refusal is the idle rule (or a goal transition)
       // working as intended, not a recovery failure: route it through the
       // same skip path as the pre-send check instead of throwing.
-      if (followUpAdmissionStale?.() === true) {
+      if (!accepted && followUpAdmissionStale?.() === true) {
         log.info("Pending follow-up refused at send admission; skipping it", {
           workspaceId: this.workspaceId,
           summaryMessageId: lastMessage.id,
@@ -8273,9 +8291,9 @@ export class AgentSession {
       throw new Error(`Failed to dispatch pending follow-up: ${message}`);
     }
 
-    // A successful send can be a pre-acceptance no-op (for example disposal
-    // during branch-summary preparation). Only the durable acceptance callback
-    // acknowledges this handoff. Later manual admission cannot undo that fact.
+    // Success can be a pre-acceptance no-op. Conversely, an accepted send may
+    // return a captured supersession error before startup; that cannot undo its
+    // durable handoff. Genuine startup errors still follow the failure path above.
     if (!accepted) return false;
 
     // Codex P2 (PRRT_kwDOPxxmWM6cRJEE): if the original wrap-up dispatcher

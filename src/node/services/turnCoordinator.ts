@@ -98,7 +98,10 @@ export type CoordinatorEvent =
   | { type: "compaction-stage"; token: CompactionToken; stage: CompactionObservation["stage"] }
   | { type: "compaction-finish"; token: CompactionToken }
   | { type: "compaction-invalidate"; abandon: boolean }
-  | { type: "compaction-follow-up" | "compaction-follow-up-finish"; token: CompactionToken }
+  | {
+      type: "compaction-follow-up" | "compaction-follow-up-cleanup" | "compaction-follow-up-finish";
+      token: CompactionToken;
+    }
   | { type: "compaction-summary"; summaryId: string | null }
   | { type: "shutdown" | "dispose" };
 
@@ -238,6 +241,7 @@ export function transition(
         const handoff = request.compactionHandoff;
         if (handoff != null) {
           if (
+            state.compaction.status !== "ready" ||
             handoff.epoch !== state.compaction.epoch ||
             (state.compaction.observation?.id !== handoff.id &&
               state.compaction.followUp?.id !== handoff.id)
@@ -435,8 +439,11 @@ export function transition(
       };
       break;
     case "compaction-follow-up":
+    case "compaction-follow-up-cleanup":
       if (
         state.lifetime === "open" &&
+        state.compaction.status ===
+          (event.type === "compaction-follow-up" ? "ready" : "abandoned") &&
         !state.compaction.followUp &&
         event.token.epoch === state.compaction.epoch
       )
@@ -644,6 +651,7 @@ export class TurnCoordinator {
   isCurrentCompaction(token: CompactionToken): boolean {
     return (
       !this.closing &&
+      this.state.compaction.status === "ready" &&
       token.epoch === this.state.compaction.epoch &&
       (this.state.compaction.observation?.id === token.id ||
         this.state.compaction.followUp?.id === token.id)
@@ -667,6 +675,17 @@ export class TurnCoordinator {
   claimCompactionFollowUp(): CompactionToken | undefined {
     const token = { id: Symbol("compaction follow-up"), epoch: this.state.compaction.epoch };
     this.dispatch({ type: "compaction-follow-up", token });
+    return this.state.compaction.followUp?.id === token.id ? token : undefined;
+  }
+
+  claimCompactionFollowUpCleanup(): CompactionToken | undefined {
+    // Stop may precede the first dispatch claim. This owner can only clear the
+    // abandoned durable intent; it is never current or admissible for sending.
+    const token = {
+      id: Symbol("compaction follow-up cleanup"),
+      epoch: this.state.compaction.epoch,
+    };
+    this.dispatch({ type: "compaction-follow-up-cleanup", token });
     return this.state.compaction.followUp?.id === token.id ? token : undefined;
   }
 

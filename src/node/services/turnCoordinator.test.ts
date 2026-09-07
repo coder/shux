@@ -63,6 +63,41 @@ function reduce(events: CoordinatorEvent[]) {
 }
 
 describe("TurnCoordinator", () => {
+  test("Stop permits exact follow-up cleanup but refuses dispatch until a new manual turn", () => {
+    const { coordinator } = setup();
+    const retained = coordinator.claimCompactionFollowUp();
+    if (!retained) throw new Error("Expected follow-up owner");
+    coordinator.invalidateCompaction(true);
+    expect(coordinator.claimCompactionFollowUp()).toBeUndefined();
+    expect(coordinator.claimCompactionFollowUpCleanup()).toBeUndefined();
+    expect(coordinator.isCurrentCompaction(retained)).toBe(false);
+    expect(coordinator.canClearCompactionFollowUp(retained)).toBe(true);
+    coordinator.finishCompactionFollowUp(retained);
+
+    const cleanup = coordinator.claimCompactionFollowUpCleanup();
+    if (!cleanup) throw new Error("Expected abandoned cleanup owner");
+    expect(coordinator.isCurrentCompaction(cleanup)).toBe(false);
+    expect(coordinator.canClearCompactionFollowUp(cleanup)).toBe(true);
+    expect(
+      coordinator.prepare({
+        kind: "fresh",
+        intent: "direct",
+        expectedTurnId: coordinator.turnId,
+        compactionHandoff: cleanup,
+      }).status
+    ).toBe("rejected");
+    expect(
+      coordinator.prepare({
+        kind: "fresh",
+        intent: "direct",
+        expectedTurnId: coordinator.turnId,
+      }).status
+    ).toBe("admitted");
+    expect(coordinator.canClearCompactionFollowUp(cleanup)).toBe(false);
+    expect(coordinator.claimCompactionFollowUpCleanup()).toBeUndefined();
+    expect(coordinator.claimCompactionFollowUp()).toBeDefined();
+  });
+
   test("a compaction handoff survives its own admission, but stale completion cannot release its replacement", () => {
     const { coordinator } = setup();
     const token = coordinator.beginCompactionObservation("continuous");
