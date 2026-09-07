@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { ChatSettings } from "./settings";
 import type { MuxMessage, WorkspaceChatMessage } from "./transcript";
 import { applyChatEvent, createTranscriptState } from "./transcript";
 import { getContextUsage, getContextMeterData } from "./contextUsage";
@@ -163,14 +164,14 @@ test("active stream capacity survives model selection changes until the stream s
       models: [{ id: "gpt-4o", contextWindowTokens: 400_000 }],
     },
   };
-  const options = {
+  let options: ChatSettings = {
     model: selectedModel,
     agentId: "exec",
     providerOptions: { anthropic: { use1MContextModels: [activeModel] } },
   };
   const contextUsage = { inputTokens: 200_000, outputTokens: 0, totalTokens: 200_000 };
   let state = applyChatEvent(createTranscriptState(), { type: "message", ...row });
-  state = applyChatEvent(state, { ...start, model: activeModel });
+  state = applyChatEvent(state, { ...start, model: activeModel, contextWindowTokens: 1_000_000 });
   const current = () =>
     getContextMeterData(state.messages, options, providers, state.streamingMessageId);
   // Even before fresh usage arrives, the stream-start metadata owns the capacity.
@@ -181,6 +182,18 @@ test("active stream capacity survives model selection changes until the stream s
   expect(current().totalPercentage).toBe(20);
   options.model = selectedModel;
   expect(current().totalPercentage).toBe(20);
+  options = { ...options, providerOptions: { anthropic: { disableBetaFeatures: true } } };
+  providers.anthropic.models[0].contextWindowTokens = 100_000;
+  expect(current().totalPercentage).toBe(20);
+  // The wire pin also survives an active-stream replay after preferences changed elsewhere.
+  state = applyChatEvent(createTranscriptState(), {
+    ...start,
+    model: activeModel,
+    replay: true,
+    contextWindowTokens: 1_000_000,
+  });
+  state = applyChatEvent(state, { ...delta, usage: contextUsage });
+  expect(current().totalPercentage).toBe(20);
   state = applyChatEvent(state, {
     type: "stream-end",
     workspaceId: "w",
@@ -190,4 +203,21 @@ test("active stream capacity survives model selection changes until the stream s
   });
   expect(current().maxTokens).toBe(400_000);
   expect(current().totalPercentage).toBe(50);
+});
+
+test("backend-confirmed unknown active capacity does not borrow a live configured limit", () => {
+  const state = applyChatEvent(createTranscriptState(), {
+    ...start,
+    model: "openai:gpt-4o",
+    contextWindowTokens: null,
+  });
+  const withUsage = applyChatEvent(state, delta);
+  expect(
+    getContextMeterData(
+      withUsage.messages,
+      { model: "openai:gpt-4o", agentId: "exec" },
+      undefined,
+      withUsage.streamingMessageId
+    ).maxTokens
+  ).toBeUndefined();
 });

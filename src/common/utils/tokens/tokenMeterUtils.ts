@@ -60,11 +60,16 @@ export function calculateTokenMeterData(
   model: string,
   use1M: boolean,
   verticalProportions = false,
-  providersConfig: ProvidersConfigMap | null = null
+  providersConfig: ProvidersConfigMap | null = null,
+  contextLimitOverride?: number | null
 ): TokenMeterData {
   if (!usage) return { segments: [], totalTokens: 0, totalPercentage: 0 };
 
-  const maxTokens = getEffectiveContextLimit(model, use1M, providersConfig) ?? undefined;
+  // Active requests retain their pinned limit, including an explicitly unknown capacity.
+  const maxTokens =
+    (contextLimitOverride !== undefined
+      ? contextLimitOverride
+      : getEffectiveContextLimit(model, use1M, providersConfig)) ?? undefined;
 
   // Total tokens used in the request.
   // For Anthropic prompt caching, cacheCreate tokens are reported separately but still

@@ -157,6 +157,7 @@ export function applyChatEvent(
             timestamp: event.startTime,
             model: event.model,
             metadataModel: event.metadataModel,
+            contextWindowTokens: event.contextWindowTokens,
             agentId: event.agentId,
             mode: event.mode,
             thinkingLevel: event.thinkingLevel,

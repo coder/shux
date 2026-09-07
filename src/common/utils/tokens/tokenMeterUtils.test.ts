@@ -42,6 +42,23 @@ describe("calculateTokenMeterData", () => {
     },
   };
 
+  test("request-pinned capacity overrides live limits for every segment", () => {
+    const result = calculateTokenMeterData(
+      SAMPLE_USAGE,
+      "anthropic:claude-sonnet-4-20250514",
+      false,
+      false,
+      providerConfigWithOverride,
+      1_000_000
+    );
+    expect(result.maxTokens).toBe(1_000_000);
+    expect(result.totalPercentage).toBeCloseTo(1.1);
+    expect(result.segments.find((segment) => segment.type === "input")?.percentage).toBe(1);
+    expect(
+      calculateTokenMeterData(SAMPLE_USAGE, "openai:gpt-4o", false, false, null, null).maxTokens
+    ).toBeUndefined();
+  });
+
   test("uses custom context override for beta Sonnet models", () => {
     const result = calculateTokenMeterData(
       SAMPLE_USAGE,
