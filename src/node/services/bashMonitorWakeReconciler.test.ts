@@ -222,6 +222,97 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[1].cancelSignal.aborted).toBe(false);
   });
 
+  test("consumeCurrent leaves a settlement recorded after the stop request owed", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const stop = Promise.withResolvers<boolean>();
+    const stopRequested = Promise.withResolvers<void>();
+    const consuming = reconciler.consumeCurrent(OWNER, () => {
+      stopRequested.resolve();
+      return stop.promise;
+    });
+    await stopRequested.promise;
+    const terminal: BashMonitorTerminalSummary = {
+      status: "exited",
+      exitCode: 0,
+      settledAt: "2026-08-31T12:00:05.000Z",
+      wakeOnExit: true,
+      terminalStatusShown: false,
+    };
+    live = [liveSnapshot({ terminal })];
+    rows = [{ ...registryRecord(terminal), processId: "proc", taskId: "bash:proc" }];
+    stop.resolve(true);
+    await consuming;
+
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].muxMetadata.records[0]).toMatchObject({
+      processId: "proc",
+      wakeUpdatedAt: terminal.settledAt,
+      terminal: { status: "exited", exitCode: 0 },
+    });
+  });
+
+  test("consumeCurrent leaves a monitor failure recorded after the stop request owed", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const stop = Promise.withResolvers<boolean>();
+    const stopRequested = Promise.withResolvers<void>();
+    const consuming = reconciler.consumeCurrent(OWNER, () => {
+      stopRequested.resolve();
+      return stop.promise;
+    });
+    await stopRequested.promise;
+    live = [liveSnapshot({ retired: true })];
+    rows = [
+      {
+        ...registryRecord(),
+        processId: "proc",
+        taskId: "bash:proc",
+        lost: { reason: "runtime-failure", failedAt: "2026-08-31T12:00:05.000Z" },
+      },
+    ];
+    stop.resolve(true);
+    await consuming;
+
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].muxMetadata.records[0]).toMatchObject({
+      processId: "proc",
+      kind: "monitor-lost",
+    });
+  });
+
+  test("consumeCurrent keeps the registry row of a monitor armed after the stop request", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const stop = Promise.withResolvers<boolean>();
+    const stopRequested = Promise.withResolvers<void>();
+    const consuming = reconciler.consumeCurrent(OWNER, () => {
+      stopRequested.resolve();
+      return stop.promise;
+    });
+    await stopRequested.promise;
+    const later = liveSnapshot({
+      processId: "later",
+      taskId: "bash:later",
+      createdAt: "2026-08-31T12:00:05.000Z",
+    });
+    live = [liveSnapshot(), later];
+    rows = [
+      { ...registryRecord(), processId: "later", taskId: "bash:later", createdAt: later.createdAt },
+    ];
+    stop.resolve(true);
+    await consuming;
+
+    expect(removed).toEqual([]);
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].muxMetadata.records).toEqual([
+      expect.objectContaining({ processId: "later", kind: "match" }),
+    ]);
+  });
+
   test("keeps dead registry evidence until the queued wake is accepted", async () => {
     rows = [registryRecord()];
 

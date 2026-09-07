@@ -633,19 +633,33 @@ export class BashMonitorWakeReconciler {
     state.owedRetirement = undefined;
   }
 
-  /** Live monitors merged with their registry rows, plus registry rows whose process is gone. */
+  /**
+   * Live monitors merged with their registry rows, plus registry rows whose process is gone. The
+   * live set is pulled after the registry read so a monitor armed during the read is never taken
+   * for a dead row. With `asOf`, a frontier snapshotted earlier, registry state is bounded to that
+   * moment: terminal and lost records land only after the monitor settled or stopped in memory, so
+   * a snapshot without terminal was still running and one not retired had not failed, and a row
+   * live now but absent from the snapshot was armed since. Whatever arose since stays owed.
+   */
   private async candidates(
     ownerWorkspaceId: string,
-    live: readonly BashMonitorProcessSnapshot[] = this.args.processManager.pullMonitorWakeSignals(
-      ownerWorkspaceId
-    )
+    asOf?: readonly BashMonitorProcessSnapshot[]
   ): Promise<Array<{ snapshot: BashMonitorProcessSnapshot; deadRegistryRow: boolean }>> {
     const registryRows = await this.args.registry.listAll(ownerWorkspaceId);
+    const current = this.args.processManager.pullMonitorWakeSignals(ownerWorkspaceId);
+    const live = asOf ?? current;
     const registryByKey = new Map(
       registryRows.map((record) => [signalKey(record.processId, record.createdAt), record] as const)
     );
     const liveKeys = new Set(
       live.map((snapshot) => signalKey(snapshot.processId, snapshot.createdAt))
+    );
+    const armedSince = new Set(
+      asOf == null
+        ? []
+        : current
+            .map((snapshot) => signalKey(snapshot.processId, snapshot.createdAt))
+            .filter((key) => !liveKeys.has(key))
     );
     return [
       ...live.map((snapshot) => {
@@ -653,16 +667,21 @@ export class BashMonitorWakeReconciler {
         return {
           snapshot: {
             ...snapshot,
-            ...(snapshot.terminal == null && record?.terminal != null
+            ...(asOf == null && snapshot.terminal == null && record?.terminal != null
               ? { terminal: record.terminal }
               : {}),
-            ...(record?.lost != null ? { lost: record.lost } : {}),
+            ...(record?.lost != null && (asOf == null || snapshot.retired)
+              ? { lost: record.lost }
+              : {}),
           },
           deadRegistryRow: false,
         };
       }),
       ...registryRows
-        .filter((record) => !liveKeys.has(signalKey(record.processId, record.createdAt)))
+        .filter((record) => {
+          const key = signalKey(record.processId, record.createdAt);
+          return !liveKeys.has(key) && !armedSince.has(key);
+        })
         .map((record) => ({
           snapshot: this.fromRegistry(record, ownerWorkspaceId),
           deadRegistryRow: true,

@@ -699,9 +699,12 @@ const WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE =
 const IDLE_ONLY_BUSY_SKIP_MESSAGE = "Workspace is busy; idle-only send was skipped.";
 const BASH_MONITOR_PERSIST_RETRY_DELAYS_MS = [50, 200] as const;
 
-/** Returned by a user Stop whose startup abandon marker could not be written (see interruptStream). */
+/**
+ * Returned by a user Stop whose startup abandon marker or monitor-attention retirement could not
+ * be written (see interruptStream).
+ */
 export const STOP_UNRECORDED_MESSAGE =
-  "Stop could not be recorded on disk, so the stopped turn may resume on restart.";
+  "Stop could not be recorded on disk, so the stopped work may resume on restart.";
 
 /** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
 const SEND_ADMISSION_STALE_MESSAGE =
@@ -11637,18 +11640,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // lock ahead of the reconcile this abort's idle transition triggers, so the abort itself
       // never waits behind acceptance I/O. The durable consumption commits only once the stop
       // succeeded: a failed stop leaves the agent running, so its output stays owed. Monitors stay
-      // armed for new output. Retirement I/O that fails does not fail the Stop; the reconciler
-      // keeps it owed and retries it before any dispatch. Never behind the history lock (a wake
-      // admission holds it across stream construction).
+      // armed for new output. Retirement I/O that fails keeps the frontier owed in memory (the
+      // reconciler retries it before any dispatch, as does the next Stop) but fails this Stop
+      // below: that obligation is not durable, so a restart before the retry could wake the agent
+      // on the dismissed output. Never behind the history lock (a wake admission holds it across
+      // stream construction).
       const retiring = options?.retireBashMonitorAttention === true;
       const withdrawnWakeSend = retiring
         ? this.inFlightBashMonitorWakeSendsByOwner.get(workspaceId)
         : undefined;
       const stopSettled = Promise.withResolvers<boolean>();
+      let retirementRecorded = true;
       const retirement = retiring
         ? this.bashMonitorWakeReconciler
             .consumeCurrent(workspaceId, () => stopSettled.promise)
             .catch((error: unknown) => {
+              retirementRecorded = false;
               log.warn("Failed to retire bash monitor attention before Stop", {
                 workspaceId,
                 error,
@@ -11671,7 +11678,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // the write fails the Stop below, on this and every later Stop, so the obligation is not lost
       // with the joined send.
       await withdrawnWakeSend?.catch(() => undefined);
-      const abandonRecorded = !retiring || (await session.recordPendingStartupAutoRetryAbandon());
+      const stopRecorded =
+        !retiring || ((await session.recordPendingStartupAutoRetryAbandon()) && retirementRecorded);
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
@@ -11721,8 +11729,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         session.restoreQueueToInput();
       }
 
-      if (!abandonRecorded) {
-        log.error("Stop left the stopped turn eligible for startup replay", { workspaceId });
+      if (!stopRecorded) {
+        log.error("Stop left stopped work eligible to resume on restart", { workspaceId });
         return Err(STOP_UNRECORDED_MESSAGE);
       }
       return Ok(undefined);

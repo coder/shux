@@ -652,28 +652,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
-  test("hard Stop succeeds when retiring owed attention fails", async () => {
-    const h = await createActiveWakeHarness();
-    try {
-      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
-      spyOn(h.reconciler, "consumeCurrent").mockRejectedValueOnce(new Error("watermark write"));
-      spyOn(h.aiService, "stopStream").mockImplementation(async () => {
-        h.abort("user");
-        await h.session.waitForIdle();
-        return Ok(undefined);
-      });
-      spyOn(h.aiService, "isStreaming").mockReturnValue(false);
-      expect(
-        (await h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true }))
-          .success
-      ).toBe(true);
-      expect(h.stopStream).toHaveBeenCalledTimes(1);
-    } finally {
-      await h.finish();
-    }
-  });
-
-  test("attention a hard Stop failed to retire is retired before any later wake", async () => {
+  test("a hard Stop whose retirement failed reports it and the retirement lands before any later wake", async () => {
     const h = await createActiveWakeHarness();
     try {
       await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
@@ -690,10 +669,11 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         return Ok(undefined);
       });
       spyOn(h.aiService, "isStreaming").mockReturnValue(false);
+      // The stream stopped, but the dismissal is only in memory, so the Stop reports it.
       expect(
-        (await h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true }))
-          .success
-      ).toBe(true);
+        await h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true })
+      ).toEqual(Err(STOP_UNRECORDED_MESSAGE));
+      expect(h.stopStream).toHaveBeenCalledTimes(1);
       await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
       await h.reconciler.reconcile(h.workspaceId);
       // The stop's idle reconcile retried the retirement instead of re-dispatching the output.
