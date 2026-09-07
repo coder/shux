@@ -1,4 +1,5 @@
 import type { SessionConfigOption, SessionConfigSelectOption } from "@agentclientprotocol/sdk";
+import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "../../src/common/constants/knownModels";
 import {
   AGENT_MODE_CONFIG_ID,
   buildConfigOptions,
@@ -53,6 +54,7 @@ function createHarness(
   initial: WorkspaceState,
   options?: {
     agents?: AgentDescriptor[];
+    hiddenModels?: string[];
   }
 ): {
   client: ORPCClient;
@@ -88,6 +90,7 @@ function createHarness(
   const availableAgents = options?.agents ?? DEFAULT_AGENT_DESCRIPTORS;
 
   const client = {
+    config: { getConfig: async () => ({ hiddenModels: options?.hiddenModels }) },
     workspace: {
       getInfo: async (): Promise<WorkspaceInfo> => ({
         id: "ws-1",
@@ -171,6 +174,51 @@ function flattenSelectOptions(
 }
 
 describe("ACP config options", () => {
+  it.each([
+    { hiddenModels: undefined, current: KNOWN_MODELS.GPT.id, blue: false, red: false },
+    {
+      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
+      current: KNOWN_MODELS.GPT.id,
+      blue: false,
+      red: false,
+    },
+    { hiddenModels: [], current: KNOWN_MODELS.GPT.id, blue: true, red: true },
+    {
+      hiddenModels: [KNOWN_MODELS.DAYBREAK_BLUE.id],
+      current: KNOWN_MODELS.GPT.id,
+      blue: false,
+      red: true,
+    },
+    {
+      hiddenModels: [KNOWN_MODELS.DAYBREAK_RED.id],
+      current: KNOWN_MODELS.GPT.id,
+      blue: true,
+      red: false,
+    },
+    {
+      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
+      current: KNOWN_MODELS.DAYBREAK_BLUE.id,
+      blue: true,
+      red: false,
+    },
+  ])("respects model visibility while retaining the current selection: %j", async (scenario) => {
+    const harness = createHarness(
+      {
+        agentId: "exec",
+        aiSettings: { model: scenario.current, thinkingLevel: "high" },
+        aiSettingsByAgent: {},
+      },
+      { hiddenModels: scenario.hiddenModels }
+    );
+    const option = getSelectConfigOption(await buildConfigOptions(harness.client, "ws-1"), "model");
+    const values = flattenSelectOptions(option).map((entry) => entry.value);
+    expect(values.includes(KNOWN_MODELS.DAYBREAK_BLUE.id)).toBe(scenario.blue);
+    expect(values.includes(KNOWN_MODELS.DAYBREAK_RED.id)).toBe(scenario.red);
+    expect(values).toContain(scenario.current);
+    expect(new Set(values).size).toBe(values.length);
+    expect(option.currentValue).toBe(scenario.current);
+  });
+
   it("includes agent mode descriptions and model-aware thinking labels for Opus 4.6", async () => {
     const harness = createHarness({
       agentId: "exec",

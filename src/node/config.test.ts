@@ -37,9 +37,22 @@ describe("Config", () => {
     const red = "openai:daybreak-red-latest";
     const unrelated = "openrouter:openai/gpt-5";
 
-    it.each([null, "invalid", {}])(
+    const malformedHiddenModels = [
+      undefined,
+      null,
+      "invalid",
+      {},
+      [null],
+      [""],
+      ["  "],
+      ["invalid"],
+      ["mux-gateway:openai"],
+      [42, false, {}],
+    ].map((hiddenModels) => ({ hiddenModels }));
+
+    it.each(malformedHiddenModels)(
       "keeps legacy fallback for malformed hides: %j",
-      async (hiddenModels) => {
+      async ({ hiddenModels }) => {
         fs.writeFileSync(
           path.join(tempDir, "config.json"),
           JSON.stringify({ projects: [], hiddenModels })
@@ -51,9 +64,9 @@ describe("Config", () => {
       }
     );
 
-    it.each([undefined, null, "invalid", {}])(
+    it.each(malformedHiddenModels)(
       "reopens preference recovery for malformed hides after migration: %j",
-      async (hiddenModels) => {
+      async ({ hiddenModels }) => {
         fs.writeFileSync(
           path.join(tempDir, "config.json"),
           JSON.stringify({
@@ -73,6 +86,21 @@ describe("Config", () => {
         expect(recovered.hiddenModelsInitialized).toBe(true);
       }
     );
+
+    it("preserves valid hides when discarding malformed entries", async () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [],
+          hiddenModels: [null, unrelated, ""],
+          migrations: { daybreakModelsHidden: true, hiddenModelsInitialized: true },
+        })
+      );
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).getClientConfig();
+      expect(reloaded.hiddenModels).toEqual([unrelated]);
+      expect(reloaded.hiddenModelsInitialized).toBe(true);
+    });
 
     it.each([
       { name: "fresh install", persisted: false, hiddenModels: undefined },

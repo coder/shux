@@ -517,7 +517,7 @@ function normalizeOptionalModelStringArray(value: unknown): string[] | undefined
     out.push(normalized);
   }
 
-  return out;
+  return value.length > 0 && out.length === 0 ? undefined : out;
 }
 
 function normalizeAiDefaultsModelStrings<
@@ -1425,16 +1425,10 @@ export class Config {
         }
 
         if (Array.isArray(parsed.hiddenModels)) {
-          const sourceHiddenModels = parsed.hiddenModels.filter(
-            (model): model is string => typeof model === "string"
-          );
-          const normalizedHiddenModels = sourceHiddenModels.map((model) =>
-            normalizeSelectedModel(model.trim())
-          );
-
+          const normalizedHiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
           if (
-            sourceHiddenModels.length !== parsed.hiddenModels.length ||
-            !areStringArraysEqual(sourceHiddenModels, normalizedHiddenModels)
+            normalizedHiddenModels === undefined ||
+            !areStringArraysEqual(parsed.hiddenModels, normalizedHiddenModels)
           ) {
             parsed.hiddenModels = normalizedHiddenModels;
             configModified = true;
