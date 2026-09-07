@@ -241,6 +241,47 @@ describe("BashMonitorWakeReconciler", () => {
     await held.dispose(OWNER);
   });
 
+  test("a discarded process withdraws an unaccepted wake but leaves an accepted one to stream", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const unaccepted = dispatches[0];
+    await reconciler.discardProcess(OWNER, "proc", CREATED_AT);
+    expect(unaccepted.cancelSignal.aborted).toBe(true);
+
+    // The accepted wake's send is still in flight (row durable, stream not yet started).
+    const send = Promise.withResolvers<BashMonitorWakeDispatchOutcome>();
+    const inFlight: BashMonitorWakeDispatch[] = [];
+    const held = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: () => undefined,
+        dropRetiredMonitor: () => undefined,
+      },
+      registry: {
+        listAll: () => Promise.resolve(rows),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
+      },
+      deliveredWakes: () => Promise.resolve(transcript),
+      onWake: (dispatch) => {
+        inFlight.push(dispatch);
+        return send.promise;
+      },
+    });
+    const reconciling = held.reconcile(OWNER);
+    while (inFlight.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    await inFlight[0].onAccepted();
+    await held.discardProcess(OWNER, "proc", CREATED_AT);
+    expect(inFlight[0].cancelSignal.aborted).toBe(false);
+    send.resolve("in-flight");
+    await reconciling;
+    await held.dispose(OWNER);
+  });
+
   test("consumeCurrent withdraws the wake but keeps signals owed when the commit is refused", async () => {
     live = [liveSnapshot()];
     await reconciler.reconcile(OWNER);

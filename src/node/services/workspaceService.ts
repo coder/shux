@@ -2585,10 +2585,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         let predatesAll = messages.length > 0;
         for (const message of messages) {
           const muxMetadata = message.metadata?.muxMetadata;
-          if (message.role === "user" && muxMetadata?.type === "bash-monitor-wake") {
+          // A wake that triggered on-send compaction persists only the compaction request, with
+          // the wake's metadata nested as its follow-up.
+          const wake =
+            muxMetadata?.type === "bash-monitor-wake"
+              ? muxMetadata
+              : getCompactionFollowUpContent(muxMetadata)?.muxMetadata;
+          if (message.role === "user" && wake?.type === "bash-monitor-wake") {
             // Persisted metadata is unvalidated: a malformed row must degrade to "not delivered"
             // rather than fail the scan, which would hold every wake of this owner.
-            const rows: unknown = muxMetadata.records;
+            const rows: unknown = wake.records;
             if (Array.isArray(rows)) {
               for (const row of rows) {
                 if (
@@ -2621,6 +2627,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await dispatch.onAccepted();
         this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
         return "in-flight";
+      }
+      // sendMessage refuses archived workspaces and no session exists to wait on, so an after-idle
+      // retry would spin; the wake stays owed and unarchive reconciles it.
+      if (
+        this.archivingWorkspaces.has(ownerWorkspaceId) ||
+        isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+      ) {
+        return "deferred";
       }
       const hasPendingTurn = this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
       // Pending mid-stream compaction counts as turn work: the session reads idle between the
@@ -9005,6 +9019,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!didUnarchive) {
         return Ok(undefined);
       }
+      // Monitor attention held while archived (see dispatchBashMonitorWake) wakes now.
+      this.scheduleBashMonitorWakeReconcile(workspaceId);
 
       // Emit updated metadata
       const allMetadata = await this.config.getAllWorkspaceMetadata();

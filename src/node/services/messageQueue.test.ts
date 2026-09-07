@@ -655,6 +655,42 @@ describe("MessageQueue", () => {
       expect(skipped.internal?.onCanceled).toBe(peerCanceled);
     });
 
+    it("ignores a withdrawn predecessor when revalidating correlations after a promotion", () => {
+      const turnMetadata: MuxMessageMetadata = {
+        type: "workspace-turn-task",
+        taskHandleId: "wst_parent",
+        ownerWorkspaceId: "grandparent",
+        turnId: "turn-1",
+      };
+      const withdrawn = new AbortController();
+      queue.add(
+        "withdrawn wake",
+        { ...validOptions, queueDispatchMode: "tool-end" },
+        { ...hidden, cancelSignal: withdrawn.signal }
+      );
+      withdrawn.abort();
+      const peerCanceled = () => undefined;
+      queue.add(
+        "peer message",
+        { ...validOptions, queueDispatchMode: "turn-end", muxMetadata: turnMetadata },
+        { ...hidden, workspaceTurnContinuation: true, onCanceled: peerCanceled }
+      );
+      queue.add(
+        "progress report",
+        { ...validOptions, queueDispatchMode: "tool-end", muxMetadata: turnMetadata },
+        { ...hidden, workspaceTurnContinuation: true, promoteAheadOfHiddenTurnEnd: true }
+      );
+
+      expect(queue.dequeueNext().message).toBe("withdrawn wake");
+      const promoted = queue.dequeueNext();
+      expect(promoted.message).toBe("progress report");
+      expect(promoted.options?.muxMetadata).toEqual(turnMetadata);
+      const skipped = queue.dequeueNext();
+      expect(skipped.message).toBe("peer message");
+      expect(skipped.options?.muxMetadata).toEqual(turnMetadata);
+      expect(skipped.internal?.onCanceled).toBe(peerCanceled);
+    });
+
     it("ignores the hidden turn-end entries a promoted report overtakes when judging its correlation", () => {
       // A queued heartbeat (hidden, turn-end, uncorrelated) would make the plain check report a
       // superseding predecessor and strip the report's correlation before enqueue — yet the

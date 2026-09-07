@@ -433,6 +433,9 @@ export class MessageQueue {
     let priorCorrelation: WorkspaceTurnMetadata | undefined;
 
     for (const entry of this.entries) {
+      // Withdrawn entries drain as no-ops: neither predecessors nor correlation holders, as in
+      // hasAllWorkspaceTurnContinuations.
+      if (entry.cancelSignal?.aborted === true) continue;
       const metadata = isWorkspaceTurnMetadata(entry.muxMetadata) ? entry.muxMetadata : undefined;
       const matchesPriorCorrelation =
         metadata != null &&

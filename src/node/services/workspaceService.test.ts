@@ -466,6 +466,71 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("a wake persisted as an on-send compaction request is consumed without a dispatch", async () => {
+    const h = await createActiveWakeHarness();
+    const acknowledged = spyOn(h.backgroundProcessManager, "acknowledgeMonitorWake");
+    try {
+      await h.historyService.appendToHistory(
+        h.workspaceId,
+        createMuxMessage("wake-compaction", "user", "/compact", {
+          timestamp: Date.now(),
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: {
+              followUpContent: {
+                text: "Monitor matched",
+                model: h.model,
+                agentId: "exec",
+                muxMetadata: {
+                  type: "bash-monitor-wake",
+                  records: ["first", "second"].map((processId) => ({
+                    processId,
+                    wakeUpdatedAt: "2026-01-01T00:00:00.000Z:7",
+                    kind: "match" as const,
+                    displayName: processId,
+                    filter: "READY",
+                    filterExclude: false,
+                  })),
+                },
+              },
+            },
+          },
+        })
+      );
+      await h.addAttention(7);
+      expect(h.dispatch).not.toHaveBeenCalled();
+      expect(acknowledged).toHaveBeenCalledTimes(2);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("an archived owner's wake is held without an idle-retry loop and dispatches on unarchive", async () => {
+    const h = await createActiveWakeHarness();
+    const send = spyOn(h.service, "sendMessage");
+    try {
+      await h.config.editConfig((config) => {
+        for (const project of config.projects.values()) {
+          for (const workspace of project.workspaces) {
+            if (workspace.id === h.workspaceId) workspace.archivedAt = new Date().toISOString();
+          }
+        }
+        return config;
+      });
+      await h.addAttention(7);
+      expect(send).not.toHaveBeenCalled();
+      expect(h.internal.pendingBashMonitorWakeIdleWaitsByOwner.has(h.workspaceId)).toBe(false);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+
+      expect((await h.service.unarchive(h.workspaceId)).success).toBe(true);
+      await h.reconciler.reconcile(h.workspaceId);
+      expect(h.requests).toHaveLength(1);
+    } finally {
+      await h.finish();
+    }
+  });
+
   test("malformed wake metadata in history neither stalls nor consumes an outstanding wake", async () => {
     const h = await createActiveWakeHarness();
     try {

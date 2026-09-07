@@ -455,10 +455,13 @@ export class BashMonitorWakeReconciler {
   ): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, () => {
       const state = this.state(ownerWorkspaceId);
+      // An accepted wake's row is already durable; only a user Stop withdraws it (it joins the send
+      // and verifies the abandon marker), so a discarded process leaves it to stream.
       if (
-        state.dispatch?.signals.some(
+        state.dispatch?.accepted === false &&
+        state.dispatch.signals.some(
           (signal) => signal.processId === processId && signal.createdAt === createdAt
-        ) === true
+        )
       ) {
         state.dispatch.controller.abort();
         state.dispatch = undefined;
