@@ -66,7 +66,7 @@ import {
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
 
 interface CompactionFollowUpAppendCondition {
-  summary: MuxMessage;
+  summary?: MuxMessage;
   allowedTailMessageIds: readonly string[];
   isCurrent: () => boolean;
   onSkipped: () => void;
@@ -274,6 +274,27 @@ export class HistoryService {
     } catch {
       throw new MalformedCompactionCancellationError(contents);
     }
+  }
+
+  async hasCompactionReplacementWitness(workspaceId: string, nonce: string): Promise<boolean> {
+    return this.withRecoveredHistoryLock(workspaceId, () =>
+      this.hasCompactionReplacementWitnessUnlocked(workspaceId, nonce)
+    );
+  }
+
+  private async hasCompactionReplacementWitnessUnlocked(
+    workspaceId: string,
+    nonce: string,
+    active?: MuxMessage[]
+  ): Promise<boolean> {
+    const matches = (rows: MuxMessage[]) =>
+      rows.some((row) => row.metadata?.compactionCancellationNonce === nonce);
+    // A later boundary may archive the receipt while ancillary unlink is still
+    // unavailable. Its exact nonce continues to distinguish a newer explicit Stop.
+    return (
+      matches(active ?? (await this.readChatHistory(workspaceId))) ||
+      matches(await this.readArchivedHistory(workspaceId))
+    );
   }
 
   async repairCompactionCancellation(
@@ -2544,38 +2565,48 @@ export class HistoryService {
           // awaits. Validate its exact intent under the same lock as the new row.
           const rows = await this.readChatHistory(workspaceId);
           const expected = compactionCondition.summary;
-          const expectedMeta = expected.metadata?.muxMetadata;
-          const index = rows.findIndex(
-            (row) =>
-              row.id === expected.id &&
-              row.metadata?.historySequence === expected.metadata?.historySequence
-          );
-          const current = rows[index];
-          const currentMeta = current?.metadata?.muxMetadata;
-          const matches =
-            isNonNegativeInteger(expected.metadata?.historySequence) &&
-            current?.role === "assistant" &&
-            isCompactionSummaryMetadata(expectedMeta) &&
-            expectedMeta.pendingFollowUp != null &&
-            isCompactionSummaryMetadata(currentMeta) &&
-            isDeepStrictEqual(currentMeta.pendingFollowUp, expectedMeta.pendingFollowUp) &&
-            rows
-              .slice(index + 1)
-              .every(
-                (row) =>
-                  row.metadata?.rlmPreservedTailCopy === true ||
-                  compactionCondition.allowedTailMessageIds.includes(row.id)
-              );
-          if (!matches || !compactionCondition.isCurrent()) {
-            compactionCondition.onSkipped();
-            return Ok(undefined);
+          if (expected) {
+            const expectedMeta = expected.metadata?.muxMetadata;
+            const index = rows.findIndex(
+              (row) =>
+                row.id === expected.id &&
+                row.metadata?.historySequence === expected.metadata?.historySequence
+            );
+            const current = rows[index];
+            const currentMeta = current?.metadata?.muxMetadata;
+            const matches =
+              isNonNegativeInteger(expected.metadata?.historySequence) &&
+              current?.role === "assistant" &&
+              isCompactionSummaryMetadata(expectedMeta) &&
+              expectedMeta.pendingFollowUp != null &&
+              isCompactionSummaryMetadata(currentMeta) &&
+              isDeepStrictEqual(currentMeta.pendingFollowUp, expectedMeta.pendingFollowUp) &&
+              rows
+                .slice(index + 1)
+                .every(
+                  (row) =>
+                    row.metadata?.rlmPreservedTailCopy === true ||
+                    compactionCondition.allowedTailMessageIds.includes(row.id)
+                );
+            if (!matches || !compactionCondition.isCurrent()) {
+              compactionCondition.onSkipped();
+              return Ok(undefined);
+            }
           }
           // Raw reads only: malformed/access failures must not authorize an append,
           // and repair would reacquire this lock. A foreign Stop also wins here.
           const cancellation = await this.readCompactionCancellation(workspaceId);
           if (
             !compactionCondition.isCurrent() ||
-            (cancellation && matchesCompactionCancellation(cancellation, current))
+            (cancellation &&
+              !(await this.hasCompactionReplacementWitnessUnlocked(
+                workspaceId,
+                cancellation.nonce,
+                rows
+              )) &&
+              (expected
+                ? matchesCompactionCancellation(cancellation, expected)
+                : cancellation.scope.kind === "unresolved"))
           ) {
             compactionCondition.onSkipped();
             return Ok(undefined);
@@ -3072,7 +3103,7 @@ export class HistoryService {
     messageId: string,
     shouldDelete?: (messages: MuxMessage[]) => boolean,
     onCommitted?: () => void,
-    onAlreadyAbsent?: () => void
+    onAlreadyAbsent?: (remaining: MuxMessage[]) => void
   ): Promise<Result<void>> {
     assert(
       !(onCommitted ?? onAlreadyAbsent) || shouldDelete,
@@ -3094,7 +3125,7 @@ export class HistoryService {
     messageId: string,
     shouldDelete?: (messages: MuxMessage[]) => boolean,
     onCommitted?: () => void,
-    onAlreadyAbsent?: () => void
+    onAlreadyAbsent?: (remaining: MuxMessage[]) => void
   ): Promise<Result<void>> {
     try {
       // Structural rewrite requires full file content
@@ -3107,13 +3138,14 @@ export class HistoryService {
         if (shouldDelete) {
           // Another backend may already have deleted this exact active target.
           // An archived row is a replaced context, never an invitation to restore it.
+          const archived = onAlreadyAbsent ? await this.readArchivedHistory(workspaceId) : [];
           if (
             onAlreadyAbsent &&
-            !(await this.readArchivedHistory(workspaceId)).some((row) => row.id === messageId) &&
+            !archived.some((row) => row.id === messageId) &&
             shouldDelete(messages)
           ) {
             try {
-              onAlreadyAbsent();
+              onAlreadyAbsent([...archived, ...messages]);
             } catch (error) {
               log.error("Absent history cleanup publication failed", {
                 error: getErrorMessage(error),

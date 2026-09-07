@@ -1290,6 +1290,15 @@ export class AgentSession {
     );
   }
 
+  get hasBlockingCompactionCleanup(): boolean {
+    return (
+      this.compactionCancellation.blocksRecovery ||
+      this.compactionCleanupRetry != null ||
+      (this.deferredCompactionCleanup != null &&
+        this.coordinator.canClearCompactionFollowUp(this.deferredCompactionCleanup.token))
+    );
+  }
+
   retryPendingCompactionCleanup(): Promise<void> {
     if (this.compactionCleanupRetry) return this.compactionCleanupRetry;
     if (this.compactionCancellation.needsPersistence)
@@ -2576,10 +2585,25 @@ export class AgentSession {
     // A replacement witness is part of the row's atomic commit. The sidecar can
     // safely retire even if the previous process died before its unlink completed.
     if (
-      history.data.length === 0 ||
-      history.data.some((row) => row.metadata?.compactionCancellationNonce === cancellation.nonce)
+      await this.historyService.hasCompactionReplacementWitness(
+        this.workspaceId,
+        cancellation.nonce
+      )
     )
+      await this.retireWitnessedCompactionCancellation(cancellation.nonce);
+    else if (history.data.length === 0)
       await this.compactionCancellation.retire(cancellation.nonce);
+  }
+
+  private async retireWitnessedCompactionCancellation(nonce: string): Promise<void> {
+    try {
+      await this.compactionCancellation.retireReplacement(nonce);
+    } catch (error) {
+      log.warn("Deferred witnessed compaction cancellation cleanup", {
+        workspaceId: this.workspaceId,
+        error,
+      });
+    }
   }
 
   getCompactionCancellationNonce(): Promise<string | undefined> {
@@ -3399,6 +3423,7 @@ export class AgentSession {
 
     // Single admission-staleness predicate for all three turn-admission gates below.
     const isAdmissionStale = () =>
+      compactionAppendSkipped ||
       internal?.admissionEpochStale?.() === true ||
       internal?.admissionStale?.() === true ||
       !this.coordinator.isCurrentTurn(attempt.owner ?? attempt.expectedTurn) ||
@@ -3407,9 +3432,9 @@ export class AgentSession {
     const cancelSignal = internal?.cancelSignal;
     const persistedCancelableMessageIds: string[] = [];
     let compactionAppendSkipped = false;
-    const compactionAppendCondition = internal?.compactionHandoffSource
+    const compactionAppendCondition = internal?.compactionHandoff
       ? {
-          summary: internal.compactionHandoffSource.summary,
+          summary: internal.compactionHandoffSource?.summary,
           allowedTailMessageIds: persistedCancelableMessageIds,
           isCurrent: () =>
             !isAdmissionStale() && !this.coordinator.closing && cancelSignal?.aborted !== true,
@@ -4355,9 +4380,10 @@ export class AgentSession {
     // is never invoked past this point, so even a failure in goal sync or
     // acceptance leaves the payload + trigger rows durable in the transcript.
     markRowsDurable();
-    // No replacement provider/compaction may produce B before A's fence retires.
+    // The committed row witnesses replacement even if ancillary unlink fails.
+    // Continue acceptance so a visible, durable user send is never reported lost.
     if (compactionCancellationNonce)
-      await this.compactionCancellation.retire(compactionCancellationNonce);
+      await this.retireWitnessedCompactionCancellation(compactionCancellationNonce);
     try {
       await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
     } catch (error) {
@@ -5658,7 +5684,9 @@ export class AgentSession {
     // Startup edits must still preempt a blocked envelope; soft stop only requests
     // a future boundary, so neither joins policy here.
     const interruptedPolicy = this.coordinator.captureInterruptSettlement(options?.soft);
-    if (options?.abandonPartial || this.midStreamCompactionPending) {
+    const publishesCancellation =
+      options?.abandonPartial === true || this.midStreamCompactionPending;
+    if (publishesCancellation) {
       this.coordinator.invalidateCompaction(true);
       // Register durable cancellation before any Stop await. Its independent nonce
       // survives a later manual preparation that fails before committing its row.
@@ -5692,6 +5720,13 @@ export class AgentSession {
     }
 
     await interruptedPolicy;
+    if (publishesCancellation) {
+      try {
+        await this.compactionCancellation.flush();
+      } catch (error) {
+        return Err(getErrorMessage(error));
+      }
+    }
     return Ok(undefined);
   }
 

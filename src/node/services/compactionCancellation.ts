@@ -31,6 +31,7 @@ export class CompactionCancellation {
   private current: CompactionCancellationRecord | null | undefined;
   private generation = 0;
   private repairedHistoryRevision = 0;
+  private replacementNonce?: string;
   private pending: Promise<void> = Promise.resolve();
   private unsettled = false;
   private mutation?: { record: CompactionCancellationRecord | null; retiredNonce?: string };
@@ -44,6 +45,18 @@ export class CompactionCancellation {
     return this.unsettled;
   }
 
+  get blocksRecovery(): boolean {
+    return this.unsettled && !this.isWitnessedRetirement();
+  }
+
+  private isWitnessedRetirement(): boolean {
+    return this.mutation?.record === null && this.mutation.retiredNonce === this.replacementNonce;
+  }
+
+  private effectiveRecord(): CompactionCancellationRecord | null {
+    return this.current?.nonce === this.replacementNonce ? null : (this.current ?? null);
+  }
+
   get repairRevision(): number {
     return this.repairedHistoryRevision;
   }
@@ -51,7 +64,7 @@ export class CompactionCancellation {
   async read(): Promise<CompactionCancellationRecord | null> {
     // Other backends can publish Stop after a previous read (including absence).
     // Local in-flight/failed mutations still own their conservative exclusion.
-    if (this.unsettled) return this.current ?? null;
+    if (this.unsettled && !this.isWitnessedRetirement()) return this.effectiveRecord();
     const generation = this.generation;
     const mutation = this.mutation;
     const isCurrent = () => generation === this.generation && mutation === this.mutation;
@@ -69,7 +82,7 @@ export class CompactionCancellation {
       // An obsolete read must not trigger explicit repair over a newer local Stop.
       if (isCurrent()) throw error;
     }
-    return this.current ?? null;
+    return this.effectiveRecord();
   }
 
   cancel(): Promise<void> {
@@ -113,8 +126,27 @@ export class CompactionCancellation {
     return matchesCompactionCancellation(record, summary);
   }
 
-  flush(): Promise<void> {
-    return this.pending;
+  async flush(): Promise<void> {
+    // An obsolete publication may have become a no-op behind a newer Stop.
+    // Success acknowledges the latest mutation, never an absent superseded write.
+    for (;;) {
+      const pending = this.pending;
+      try {
+        await pending;
+      } catch (error) {
+        if (pending !== this.pending) continue;
+        if (!this.isWitnessedRetirement()) throw error;
+      }
+      if (pending === this.pending) return;
+    }
+  }
+
+  retireReplacement(nonce: string): Promise<void> {
+    if (this.current?.nonce !== nonce) return Promise.resolve();
+    // Only callers holding an actual durable row witness may retire intent before
+    // unlink succeeds. The physical deletion mutation remains observable/retryable.
+    this.replacementNonce = nonce;
+    return this.retire(nonce);
   }
 
   retry(): Promise<void> {

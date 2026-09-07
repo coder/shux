@@ -4119,7 +4119,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return;
     }
 
-    if (this.failedCompactionCleanups.has(trimmed)) {
+    if (this.hasBlockingCompactionCleanup(trimmed)) {
       this.retryFailedCompactionCleanup(trimmed).then(
         () => {
           if (!this.shuttingDown) this.startStartupRecovery(trimmed);
@@ -4166,14 +4166,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       });
   }
 
+  private hasBlockingCompactionCleanup(workspaceId: string): boolean {
+    return [...(this.failedCompactionCleanups.get(workspaceId)?.owners ?? [])].some(
+      (owner) => owner.hasBlockingCompactionCleanup
+    );
+  }
+
   private assertCompactionCleanupSettled(workspaceId: string): void {
     if (this.failedCompactionCleanups.has(workspaceId)) {
       this.retryFailedCompactionCleanup(workspaceId).catch((error: unknown) =>
         log.warn("Stopped compaction cleanup retry failed", { workspaceId, error })
       );
-      throw new Error(
-        "Stopped compaction cleanup is still pending. Please retry opening this workspace."
-      );
+      if (this.hasBlockingCompactionCleanup(workspaceId))
+        throw new Error(
+          "Stopped compaction cleanup is still pending. Please retry opening this workspace."
+        );
     }
   }
 

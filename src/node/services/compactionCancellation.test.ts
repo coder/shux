@@ -446,3 +446,130 @@ test.each([
     await h.cleanup();
   }
 });
+
+test("witnessed deletion debt refreshes a foreign Stop without losing its own retry identity", async () => {
+  const h = await createTestHistoryService();
+  const workspaceId = "witnessed-debt";
+  const state = new CompactionCancellation(h.historyService, workspaceId);
+  await state.cancel();
+  const original = await state.read();
+  if (!original) throw new Error("Expected Stop");
+  await h.historyService.appendToHistory(
+    workspaceId,
+    createMuxMessage("replacement", "user", "Replacement", {
+      compactionCancellationNonce: original.nonce,
+    })
+  );
+  const failure = spyOn(h.historyService, "writeCompactionCancellation").mockRejectedValueOnce(
+    new Error("unlink unavailable")
+  );
+  await state.retireReplacement(original.nonce).catch(() => undefined);
+  try {
+    expect(await state.read()).toBeNull();
+    await state.flush();
+    expect(state.needsPersistence).toBe(true);
+    expect(state.blocksRecovery).toBe(false);
+    const foreign = new CompactionCancellation(new HistoryService(h.config), workspaceId);
+    await foreign.cancel();
+    const current = await foreign.read();
+    expect(await state.read()).toEqual(current);
+    expect(state.needsPersistence).toBe(true);
+    failure.mockRestore();
+    await state.retry();
+    expect(await new HistoryService(h.config).readCompactionCancellation(workspaceId)).toEqual(
+      current
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("an archived replacement witness authorizes B without masking a newer Stop", async () => {
+  const h = await createTestHistoryService();
+  const workspaceId = "archived-witness";
+  const state = new CompactionCancellation(h.historyService, workspaceId);
+  await state.cancel();
+  const original = await state.read();
+  if (!original) throw new Error("Expected Stop");
+  await h.historyService.appendToHistory(
+    workspaceId,
+    createMuxMessage("replacement", "user", "Replacement", {
+      compactionCancellationNonce: original.nonce,
+    })
+  );
+  const source = createMuxMessage("summary-b", "assistant", "B", {
+    compacted: "user",
+    compactionBoundary: true,
+    compactionEpoch: 1,
+    muxMetadata: {
+      type: "compaction-summary",
+      pendingFollowUp: { text: "Continue B", model: "openai:gpt-4o", agentId: "exec" },
+    },
+  });
+  await h.historyService.appendToHistory(workspaceId, source);
+  const foreign = new HistoryService(h.config);
+  const skipped = mock(() => undefined);
+  const condition = {
+    summary: source,
+    allowedTailMessageIds: [] as string[],
+    isCurrent: () => true,
+    onSkipped: skipped,
+  };
+  try {
+    expect(await foreign.hasCompactionReplacementWitness(workspaceId, original.nonce)).toBe(true);
+    expect(
+      (
+        await foreign.appendToHistory(
+          workspaceId,
+          createMuxMessage("b-user", "user", "Continue B"),
+          condition
+        )
+      ).success
+    ).toBe(true);
+    expect(skipped).not.toHaveBeenCalled();
+    await foreign.deleteMessage(workspaceId, "b-user");
+    await new CompactionCancellation(foreign, workspaceId).cancel();
+    expect(
+      (
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("stopped", "user", "Continue B"),
+          condition
+        )
+      ).success
+    ).toBe(true);
+    expect(skipped).toHaveBeenCalledTimes(1);
+    const rows = await foreign.getLastMessages(workspaceId, 1);
+    expect(rows.success && rows.data[0].id).toBe(source.id);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("a stale replacement receipt cannot make newer witnessed deletion debt blocking", async () => {
+  const h = await createTestHistoryService();
+  const workspaceId = "stale-receipt";
+  const state = new CompactionCancellation(h.historyService, workspaceId);
+  await state.cancel();
+  const a = await state.read();
+  await state.cancel();
+  const b = await state.read();
+  if (!a || !b) throw new Error("Expected distinct Stops");
+  await h.historyService.appendToHistory(
+    workspaceId,
+    createMuxMessage("replacement-b", "user", "B", { compactionCancellationNonce: b.nonce })
+  );
+  spyOn(h.historyService, "writeCompactionCancellation").mockRejectedValueOnce(
+    new Error("unlink unavailable")
+  );
+  await state.retireReplacement(b.nonce).catch(() => undefined);
+  try {
+    await state.retireReplacement(a.nonce);
+    expect(await state.read()).toBeNull();
+    expect(state.blocksRecovery).toBe(false);
+    expect(state.needsPersistence).toBe(true);
+    await state.flush();
+  } finally {
+    await h.cleanup();
+  }
+});

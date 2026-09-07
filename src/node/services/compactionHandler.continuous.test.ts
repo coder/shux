@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { HistoryService } from "./historyService";
 import { CompactionHandler } from "./compactionHandler";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { createTestHistoryService } from "./testHistoryService";
@@ -151,7 +152,13 @@ describe("continuous compaction provider replay", () => {
     }
   );
 
-  it.each(["missing", "replacement sequence"] as const)(
+  it.each([
+    "missing",
+    "replacement sequence",
+    "foreign clear",
+    "foreign replacement",
+    "empty predecessor",
+  ] as const)(
     "settles local heartbeat rollback after a shared-history change (%s)",
     async (state) => {
       const sessionDir = path.join(store.tempDir, "pending");
@@ -178,7 +185,8 @@ describe("continuous compaction provider replay", () => {
           output: { success: true, diff: "recent change" },
         },
       ];
-      await store.historyService.appendToHistory(workspaceId, recent);
+      if (state !== "empty predecessor")
+        await store.historyService.appendToHistory(workspaceId, recent);
       const emitter = new EventEmitter();
       const handler = new CompactionHandler({
         workspaceId,
@@ -195,9 +203,15 @@ describe("continuous compaction provider replay", () => {
       const boundary = rows.data[0];
       // A second backend can commit the shared history deletion without touching
       // this handler's captured rollback or its post-reset memory.
-      expect((await store.historyService.deleteMessage(workspaceId, boundary.id)).success).toBe(
-        true
-      );
+      const foreign = new HistoryService(store.config);
+      if (state === "foreign clear" || state === "foreign replacement") {
+        expect((await foreign.clearHistory(workspaceId)).success).toBe(true);
+        if (state === "foreign replacement")
+          await foreign.appendToHistory(
+            workspaceId,
+            createMuxMessage("new-context", "user", "New context")
+          );
+      } else expect((await foreign.deleteMessage(workspaceId, boundary.id)).success).toBe(true);
       if (state === "replacement sequence") {
         await store.historyService.appendToHistory(workspaceId, {
           ...boundary,
@@ -205,7 +219,8 @@ describe("continuous compaction provider replay", () => {
         });
       }
       const before = await handler.peekPendingState();
-      expect(before?.diffs.map((diff) => diff.path)).toContain("/tmp/recent.ts");
+      if (state !== "empty predecessor")
+        expect(before?.diffs.map((diff) => diff.path)).toContain("/tmp/recent.ts");
       const emit = spyOn(emitter, "emit");
       const published = mock(() => {
         expect(handler.peekCachedFilePaths()).toEqual([priorDiff.path]);
@@ -319,10 +334,12 @@ describe("continuous compaction provider replay", () => {
       }
       return unlink(file);
     });
-    const internals = handler as unknown as { captureHeartbeatResetRollbackState(): void };
+    const internals = handler as unknown as {
+      captureHeartbeatResetRollbackState(messages: MuxMessage[]): void;
+    };
     const capture = internals.captureHeartbeatResetRollbackState.bind(handler);
-    spyOn(internals, "captureHeartbeatResetRollbackState").mockImplementation(() => {
-      capture();
+    spyOn(internals, "captureHeartbeatResetRollbackState").mockImplementation((messages) => {
+      capture(messages);
       captured.resolve();
     });
     const rollingBack = handler.rollbackHeartbeatContextResetBoundary(first.data[0]);

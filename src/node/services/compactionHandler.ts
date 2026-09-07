@@ -97,6 +97,7 @@ interface PersistedPostCompactionStateV1 {
 }
 
 interface HeartbeatResetRollbackState {
+  sourceRows: Array<{ id: string; sequence: number | undefined }>;
   postCompactionAttachmentsPending: boolean;
   cachedFileDiffs: FileEditDiff[];
   cachedLoadedSkills: LoadedSkillSnapshot[];
@@ -618,8 +619,9 @@ export class CompactionHandler {
     }
   }
 
-  private captureHeartbeatResetRollbackState(): void {
+  private captureHeartbeatResetRollbackState(messages: MuxMessage[]): void {
     this.heartbeatResetRollbackState = {
+      sourceRows: messages.map((row) => ({ id: row.id, sequence: row.metadata?.historySequence })),
       postCompactionAttachmentsPending: this.postCompactionAttachmentsPending,
       cachedFileDiffs: [...this.cachedFileDiffs],
       cachedLoadedSkills: [...this.cachedLoadedSkills],
@@ -824,7 +826,7 @@ export class CompactionHandler {
 
     const messages = historyResult.data;
     await this.loadPersistedPendingStateIfNeeded();
-    this.captureHeartbeatResetRollbackState();
+    this.captureHeartbeatResetRollbackState(messages);
     await this.preparePendingStateFromMessages(messages);
 
     const nextCompactionEpoch = getNextCompactionEpoch(messages);
@@ -919,6 +921,7 @@ export class CompactionHandler {
         onCommitted?.();
       }
     };
+    const sourceRows = this.heartbeatResetRollbackState?.sourceRows ?? [];
     const deleteResult = await this.historyService.deleteMessage(
       this.workspaceId,
       summaryMessage.id,
@@ -930,7 +933,16 @@ export class CompactionHandler {
             message.metadata?.historySequence === summaryMessage.metadata?.historySequence
         ),
       () => restore(true),
-      () => restore(false)
+      (remaining) => {
+        // Absence alone also describes a foreign clear/replacement. Restore only
+        // with positive evidence that this heartbeat's predecessor still survives.
+        const sequences = new Map(remaining.map((row) => [row.id, row.metadata?.historySequence]));
+        if (
+          sourceRows.length > 0 &&
+          sourceRows.every((row) => row.sequence != null && sequences.get(row.id) === row.sequence)
+        )
+          restore(false);
+      }
     );
     // Physical persistence outlives ownership. A later admission may not veto a
     // committed rollback; the existing write queue orders it before successor state.
