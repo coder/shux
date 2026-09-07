@@ -256,6 +256,53 @@ describe("useRouting", () => {
     ).toBe(false);
   });
 
+  test.each(["direct", "mux-gateway"])(
+    "policy-hidden Coder metadata preserves the %s fallback for Pro",
+    async (fallback) => {
+      const model = "coder:prod-openai/gpt-6-astra";
+      providersConfig = {
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+        "mux-gateway": { apiKeySet: true, isEnabled: true, isConfigured: true },
+        coder: {
+          apiKeySet: false,
+          isEnabled: false,
+          isConfigured: false,
+          discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+        },
+      };
+      routePriority = ["coder", fallback];
+      policyResponse = {
+        source: "env",
+        status: { state: "enforced" },
+        policy: {
+          policyFormatVersion: "0.1",
+          providerAccess: [
+            { id: "openai", allowedModels: null },
+            { id: "mux-gateway", allowedModels: null },
+          ],
+          mcp: { allowUserDefined: { stdio: true, remote: true } },
+          runtimes: null,
+        },
+      };
+      getProvidersConfigStore().setClient(stubClient);
+      getAppConfigStore().setClient(stubClient);
+      const { result } = renderHook(() => useRouting(), { wrapper });
+      await waitFor(() => expect(result.current.routePriority).toEqual(routePriority));
+      expect(result.current.resolveEffectiveRoute(model)).toBe(fallback);
+      expect(
+        result.current
+          .availableRoutes("openai:gpt-6-astra")
+          .some((route) => route.route === "coder")
+      ).toBe(false);
+      expect(
+        openaiProModeAvailable(model, {
+          providersConfig,
+          effectiveRouteProvider: result.current.resolveEffectiveRoute(model),
+        })
+      ).toBe(fallback === "direct");
+    }
+  );
+
   test("hook instances share one config fetch via the AppConfigStore", async () => {
     routeOverrides = { "openai:gpt-5.4": "mux-gateway" };
     let configFetchCount = 0;

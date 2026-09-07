@@ -14,6 +14,9 @@ import { Config } from "@/node/config";
 import { log } from "@/node/services/log";
 import { PolicyService } from "@/node/services/policyService";
 import { ProviderService } from "./providerService";
+import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import { getAllowedProvidersForUi, isGatewayModelAccessibleForUi } from "@/browser/utils/policyUi";
 
 const OPENAI_API_KEY = "sk-test";
 const LOCAL_VLLM_BASE_URL = "http://localhost:8000/v1";
@@ -754,6 +757,109 @@ describe("ProviderService.getConfig", () => {
         // Without a stored credential the denied provider stays fully hidden.
         new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           coder: { deploymentUrl: "https://coder.example.com" },
+        });
+        expect(service.getConfig().coder).toBeUndefined();
+      }
+    );
+  });
+
+  it("retains only non-routable Coder instance metadata for policy-allowed upstream fallback", async () => {
+    await withTempPolicyProviderService(
+      { policy_format_version: "0.1", provider_access: [{ id: "openai" }] },
+      (config, service, policyService) => {
+        const store = new ProvidersConfigStore(config.rootDir);
+        store.saveProvidersConfig({
+          openai: { apiKey: OPENAI_API_KEY },
+          coder: {
+            deploymentUrl: "https://private.coder.example.com",
+            apiKey: "private-key",
+            baseUrl: "https://private.example.com",
+            coderOauth: {
+              type: "oauth",
+              sessionId: "test",
+              deploymentUrl: "https://private.coder.example.com",
+              access: "private-access",
+              refresh: "private-refresh",
+              expires: Date.now() + 3_600_000,
+              clientId: "private-client",
+              clientSecret: "private-secret",
+            },
+            models: ["prod-openai/gpt-6-astra"],
+            discoveredModels: ["prod-openai/gpt-6-astra"],
+            discoveredProviders: [
+              { name: "prod-openai", type: "openai" },
+              { name: "openai", type: "openai" },
+            ],
+            additionalProviders: [{ name: "openai", type: "openai-compat" }],
+          },
+        });
+        const view = service.getConfig();
+        // This allowlist is a redaction boundary, not an exhaustive config projection.
+        expect(view.coder).toEqual({
+          apiKeySet: false,
+          isEnabled: false,
+          isConfigured: false,
+          coderOauthCredentialStored: true,
+          discoveredProviders: [
+            { name: "prod-openai", type: "openai" },
+            { name: "openai", type: "openai" },
+          ],
+          additionalProviders: [{ name: "openai", type: "openai-compat" }],
+        });
+        const selection = "coder:prod-openai/gpt-6-astra";
+        expect(resolveCoderGatewayMetadataModel(selection, view)).toBe("openai:gpt-6-astra");
+        expect(
+          openaiProModeAvailable(selection, {
+            providersConfig: view,
+            effectiveRouteProvider: "direct",
+          })
+        ).toBe(true);
+        expect(
+          openaiProModeAvailable(selection, {
+            providersConfig: view,
+            effectiveRouteProvider: "mux-gateway",
+          })
+        ).toBe(false);
+        // Keep cross-typed overrides: dropping them would invent an OpenAI fallback.
+        expect(
+          openaiProModeAvailable("coder:openai/gpt-6-astra", {
+            providersConfig: view,
+            effectiveRouteProvider: "direct",
+          })
+        ).toBe(false);
+        expect(
+          openaiProModeAvailable("coder:unknown/gpt-6-astra", {
+            providersConfig: view,
+            effectiveRouteProvider: "direct",
+          })
+        ).toBe(false);
+        expect(service.list()).not.toContain("coder");
+        expect(getAllowedProvidersForUi(policyService.getEffectivePolicy(), view)).not.toContain(
+          "coder"
+        );
+        expect(
+          isGatewayModelAccessibleForUi(
+            policyService.getEffectivePolicy(),
+            view,
+            "coder",
+            "prod-openai/gpt-6-astra"
+          )
+        ).toBe(false);
+        const snapshot = store.loadProvidersConfig();
+        store.saveProvidersConfig({
+          ...snapshot,
+          coder: { ...snapshot?.coder, coderOauth: undefined },
+        });
+        expect(resolveCoderGatewayMetadataModel(selection, service.getConfig())).toBe(
+          "openai:gpt-6-astra"
+        );
+        expect(service.getConfig().coder.coderOauthCredentialStored).toBeUndefined();
+        store.saveProvidersConfig({
+          coder: {
+            providerType: "openai-responses",
+            baseUrl: "https://custom.example.com",
+            discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+          },
         });
         expect(service.getConfig().coder).toBeUndefined();
       }

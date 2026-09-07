@@ -649,25 +649,25 @@ export class ProviderService {
       );
     }
 
-    // A policy that denies coder hides the provider entirely (above), but a
-    // stored OAuth credential is still live on its deployment. Surface its
-    // PRESENCE so the Disconnect command stays reachable — otherwise the
-    // full-privilege credential would have no revocation path until the
-    // policy broadens. Presence only: no URL/models/config leaks, the entry
-    // is unconfigured/disabled, and the policy-filtered Providers UI still
-    // hides the card (this map key is consumed by the palette command's
-    // visibility gate). Skipped when a custom provider shadows "coder" —
-    // that entry owns the key and has no OAuth flow.
+    // Policy-hidden Coder selections still need instance types to resolve an
+    // allowed upstream fallback, and credential presence for Disconnect. Keep
+    // this view non-routable: no models, endpoint settings or authentication data.
+    // A custom provider shadowing "coder" owns the key and has no gateway metadata.
     if (!result.coder && !shadowedCustomProviderIds.has("coder")) {
-      const coderOauth = parseCoderOauthAuth(
-        (providersConfig.coder as { coderOauth?: unknown } | undefined)?.coderOauth
-      );
-      if (coderOauth !== null) {
+      const coderConfig = providersConfig.coder as
+        | { coderOauth?: unknown; discoveredProviders?: unknown; additionalProviders?: unknown }
+        | undefined;
+      const coderOauth = parseCoderOauthAuth(coderConfig?.coderOauth);
+      const discoveredProviders = parseCoderGatewayProviders(coderConfig?.discoveredProviders);
+      const additionalProviders = parseCoderGatewayProviders(coderConfig?.additionalProviders);
+      if (coderOauth !== null || discoveredProviders.length > 0 || additionalProviders.length > 0) {
         result.coder = {
           apiKeySet: false,
           isEnabled: false,
           isConfigured: false,
-          coderOauthCredentialStored: true,
+          ...(coderOauth !== null && { coderOauthCredentialStored: true }),
+          ...(discoveredProviders.length > 0 && { discoveredProviders }),
+          ...(additionalProviders.length > 0 && { additionalProviders }),
         };
       }
     }
