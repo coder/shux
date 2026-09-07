@@ -63,6 +63,34 @@ function reduce(events: CoordinatorEvent[]) {
 }
 
 describe("TurnCoordinator", () => {
+  test("observed terminal publishes before idle/drain and cannot retire a reentrant replacement", () => {
+    const order: string[] = [];
+    const { coordinator, callbacks } = setup({
+      phaseChanged: () => {
+        order.push(coordinator.phase);
+      },
+      drainQueue: () => {
+        order.push("drain");
+      },
+    });
+    expect(coordinator.observeStreamReplay("A")).toBe(true);
+    expect(coordinator.isBusy()).toBe(true);
+    order.length = 0;
+    expect(coordinator.finishObservedStream("stale", () => order.push("wrong"))).toBe(false);
+    expect(coordinator.finishObservedStream("A", () => order.push("terminal"))).toBe(true);
+    expect(order).toEqual(["terminal", "idle", "drain"]);
+    expect(callbacks.policy).not.toHaveBeenCalled();
+    expect(coordinator.observeStreamReplay("B")).toBe(true);
+    let replacement: TurnId | undefined;
+    coordinator.finishObservedStream("B", () => {
+      replacement = prepare(coordinator);
+    });
+    expect(replacement).toBeDefined();
+    expect(replacement === coordinator.turnId).toBe(true);
+    expect(coordinator.phase).toBe("preparing");
+    coordinator.dispose();
+  });
+
   test("replay eligibility observes existing streams without starting or reviving operations", () => {
     const streamStarted = mock(() => undefined);
     const { coordinator, callbacks } = setup({ streamStarted });

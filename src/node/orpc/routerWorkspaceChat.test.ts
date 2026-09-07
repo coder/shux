@@ -100,7 +100,7 @@ test("active-operation reconnect replays the stream envelope and live deltas bef
     // The same envelope must not become a second live admission or resurrect a
     // terminal operation; mismatched engine identity is also rejected.
     const startsBefore = harness.events.filter((event) => event.type === "stream-start").length;
-    expect(startsBefore).toBe(2);
+    expect(startsBefore).toBe(1);
     expect(startPolicy).toHaveBeenCalledTimes(1);
     emitEngineStart(false);
     emitter.emit("stream-start", {

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { TurnStreamHandle } from "./streamManager";
 import type { StreamManager } from "./streamManager";
 import * as path from "path";
@@ -766,6 +767,10 @@ interface PreparationAttempt {
 }
 
 export class AgentSession {
+  private readonly replayPublication = new AsyncLocalStorage<{
+    listener: (event: AgentSessionChatEvent) => void;
+    emittedStreamEvents: boolean;
+  }>();
   private readonly workspaceId: string;
   private readonly config: Config;
   private readonly historyService: HistoryService;
@@ -1250,7 +1255,15 @@ export class AgentSession {
         emitIfMissing: false,
       })
     );
-    const invalidated = cleanup("invalidate", () => this.coordinator.dispose());
+    const invalidated = cleanup("invalidate", () => {
+      try {
+        this.coordinator.dispose();
+      } finally {
+        // Release Node's async-context registration only after late replay events
+        // are suppressed; disabling while merely closing could broadcast them live.
+        if (this.coordinator.disposed) this.replayPublication.disable();
+      }
+    });
     const compactionStopped = cleanup("compaction", () =>
       this.continuousCompactor.reset("dispose")
     );
@@ -1300,7 +1313,7 @@ export class AgentSession {
     assert(typeof listener === "function", "listener must be a function");
 
     const unsubscribe = this.onChatEvent(listener);
-    await this.emitHistoricalEvents(listener);
+    await this.replayHistory(listener);
 
     this.scheduleStartupRecovery();
 
@@ -1313,7 +1326,9 @@ export class AgentSession {
   ): Promise<void> {
     this.assertNotDisposed("replayHistory");
     assert(typeof listener === "function", "listener must be a function");
-    await this.emitHistoricalEvents(listener, mode);
+    await this.replayPublication.run({ listener, emittedStreamEvents: false }, () =>
+      this.emitHistoricalEvents(listener, mode)
+    );
   }
 
   emitMetadata(metadata: FrontendWorkspaceMetadata | null): void {
@@ -2721,25 +2736,6 @@ export class AgentSession {
       }
     };
 
-    let emittedReplayStreamEvents = false;
-    const replayStreamEventTracker = (event: AgentSessionChatEvent) => {
-      if (event.workspaceId !== this.workspaceId) {
-        return;
-      }
-
-      const message = event.message;
-      if (typeof message !== "object" || message === null) {
-        return;
-      }
-
-      if (!("replay" in message) || message.replay !== true) {
-        return;
-      }
-
-      emittedReplayStreamEvents = true;
-    };
-    this.emitter.on("chat-event", replayStreamEventTracker);
-
     const shouldReplayTerminalState = mode?.type !== "live";
 
     // try/catch/finally guarantees caught-up is always sent, even if replay fails.
@@ -2992,7 +2988,11 @@ export class AgentSession {
       // Keep append/live semantics when we've already emitted incremental payload.
       // Downgrading to full at that point would make the frontend apply replace-mode to
       // a partial replay buffer and temporarily hide older transcript rows.
-      if (replayMode !== "full" && !emittedReplayMessages && !emittedReplayStreamEvents) {
+      if (
+        replayMode !== "full" &&
+        !emittedReplayMessages &&
+        !this.replayPublication.getStore()?.emittedStreamEvents
+      ) {
         replayMode = "full";
       }
       if (mode?.type === "since" && replayMode === "full") {
@@ -3002,8 +3002,6 @@ export class AgentSession {
       // Replay failed, so do not advertise a trustworthy reconnect cursor.
       serverCursor = undefined;
     } finally {
-      this.emitter.off("chat-event", replayStreamEventTracker);
-
       if (shouldReplayTerminalState) {
         // Replay the latest terminal/preparing state one last time before caught-up in case the
         // stream changed while history was replaying (for example PREPARING -> failed/idle).
@@ -6815,7 +6813,7 @@ export class AgentSession {
         // admitted. Replay must not rerun start policy or revive a retired attempt.
         if (
           this.streamManager.getStreamInfo(this.workspaceId)?.messageId === payload.messageId &&
-          this.coordinator.canReplayStreamStart(payload.messageId)
+          this.coordinator.observeStreamReplay(payload.messageId)
         )
           this.emitChatEvent(payload);
         return;
@@ -7021,6 +7019,7 @@ export class AgentSession {
     forward("stream-abort", (payload) => {
       if (payload.type !== "stream-abort") return;
       if (this.forwardDisposalTerminal(payload)) return;
+      if (this.finishObservedStream(payload.messageId, payload)) return;
       if (this.coordinator.observeStartupAbort(payload)) return this.handleStartupAbort(payload);
       this.coordinator.rawTerminal("aborted", payload.messageId);
     });
@@ -7034,6 +7033,7 @@ export class AgentSession {
     forward("stream-end", (payload) => {
       if (payload.type !== "stream-end") return;
       if (this.forwardDisposalTerminal(payload)) return;
+      if (this.finishObservedStream(payload.messageId, payload)) return;
       this.coordinator.rawTerminal("completed", payload.messageId);
     });
 
@@ -7048,6 +7048,14 @@ export class AgentSession {
         return;
       }
       const data = raw as StreamErrorPayload & { workspaceId: string };
+      if (
+        this.finishObservedStream(data.messageId, {
+          ...data,
+          type: "stream-error",
+          errorType: data.errorType ?? "unknown",
+        })
+      )
+        return;
       // Begin synchronously at event emission so completion waiters always find
       // this attempt's decision before they run.
       this.coordinator.beginErrorDecision(data.messageId);
@@ -7096,6 +7104,10 @@ export class AgentSession {
     return true;
   }
 
+  private finishObservedStream(messageId: string, payload: WorkspaceChatMessage): boolean {
+    return this.coordinator.finishObservedStream(messageId, () => this.emitChatEvent(payload));
+  }
+
   // Public method to emit chat events (used by init hooks and other workspace events)
   emitChatEvent(message: WorkspaceChatMessage): void {
     // Destructive disposal keeps raw terminal presentation separate from late policy work.
@@ -7103,10 +7115,16 @@ export class AgentSession {
       return;
     }
 
-    this.emitter.emit("chat-event", {
-      workspaceId: this.workspaceId,
-      message,
-    } satisfies AgentSessionChatEvent);
+    const event = { workspaceId: this.workspaceId, message } satisfies AgentSessionChatEvent;
+    const replay = this.replayPublication.getStore();
+    if (replay && "replay" in message && message.replay === true) {
+      // Async-local routing isolates concurrent reconnects without redirecting live
+      // provider events or resetting another subscriber's active-stream queue state.
+      replay.emittedStreamEvents = true;
+      replay.listener(event);
+      return;
+    }
+    this.emitter.emit("chat-event", event);
   }
 
   private publishTurnPhase(next: TurnPhase, isCurrent: () => boolean): void {
