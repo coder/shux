@@ -63,6 +63,34 @@ function reduce(events: CoordinatorEvent[]) {
 }
 
 describe("TurnCoordinator", () => {
+  test("replay eligibility observes existing streams without starting or reviving operations", () => {
+    const streamStarted = mock(() => undefined);
+    const { coordinator, callbacks } = setup({ streamStarted });
+    expect(coordinator.canReplayStreamStart("existing-engine")).toBe(true);
+    expect(coordinator.phase).toBe("idle");
+    expect(callbacks.phaseChanged).not.toHaveBeenCalled();
+    expect(streamStarted).not.toHaveBeenCalled();
+    const op = coordinator.registerOperation(prepare(coordinator));
+    expect(coordinator.canReplayStreamStart("active")).toBe(false);
+    coordinator.streamStarted(startEvent("active"));
+    expect(coordinator.canReplayStreamStart("active")).toBe(true);
+    expect(coordinator.canReplayStreamStart("stale")).toBe(false);
+    expect(streamStarted).toHaveBeenCalledTimes(1);
+    coordinator.rawTerminal("completed", "active");
+    expect(coordinator.canReplayStreamStart("active")).toBe(false);
+    coordinator.finishStartup(op);
+    coordinator.dispose();
+
+    const closing = setup().coordinator;
+    const closingOp = closing.registerOperation(prepare(closing));
+    closing.streamStarted(startEvent("closing"));
+    expect(closing.canReplayStreamStart("closing")).toBe(true);
+    closing.beginShutdown();
+    expect(closing.canReplayStreamStart("closing")).toBe(false);
+    closing.finishStartup(closingOp);
+    closing.dispose();
+  });
+
   test("session scope releases thinking and idle listeners even without another idle event", async () => {
     const scope = Scope.makeUnsafe("parallel");
     const { coordinator } = setup();

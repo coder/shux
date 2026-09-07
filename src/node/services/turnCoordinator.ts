@@ -841,6 +841,20 @@ export class TurnCoordinator {
   streamStarting(id: OperationId, messageId: string): void {
     this.dispatch({ type: "starting", id, messageId });
   }
+  canReplayStreamStart(messageId: string): boolean {
+    if (this.closing) return false;
+    const operation = this.state.turn.operation;
+    // A newly constructed session can observe an existing engine without owning
+    // its operation. The caller also verifies the engine's current message ID.
+    if (!operation) return this.phase === "idle" || this.phase === "streaming";
+    return (
+      this.phase === "streaming" &&
+      operation.stage === "started" &&
+      operation.delivery === "waiting" &&
+      operation.messageId === messageId
+    );
+  }
+
   streamStarted(payload: StreamStartEvent): boolean {
     const previous = this.state;
     const turn = this.turnId;

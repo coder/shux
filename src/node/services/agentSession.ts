@@ -6810,6 +6810,16 @@ export class AgentSession {
     };
 
     forward("stream-start", (payload) => {
+      if (payload.type === "stream-start" && payload.replay === true) {
+        // Reconnect needs the stream envelope even when its live start was already
+        // admitted. Replay must not rerun start policy or revive a retired attempt.
+        if (
+          this.streamManager.getStreamInfo(this.workspaceId)?.messageId === payload.messageId &&
+          this.coordinator.canReplayStreamStart(payload.messageId)
+        )
+          this.emitChatEvent(payload);
+        return;
+      }
       if (payload.type === "stream-start" && this.coordinator.streamStarted(payload)) {
         this.emitChatEvent(payload);
       }
