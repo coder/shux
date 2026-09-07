@@ -6,9 +6,10 @@ import { linkedAbortController } from "./useConnection";
 
 export function useConversation(client: MobileClient, workspaceId: string, signal: AbortSignal) {
   const [transcript, setTranscript] = useState(createTranscriptState);
-  const [settings, setSettings] = useState<SettingsData | null>(null);
+  const [settings, setSettings] = useState<Omit<SettingsData, "policy"> | null>(null);
+  const [policy, setPolicy] = useState<SettingsData["policy"]>(null);
   const [error, setError] = useState<string | null>(null);
-  const [owner, setOwner] = useState(() => client);
+  const [owner, setOwner] = useState(() => ({ client, workspaceId, signal }));
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const historyRequest = useRef<AbortController | null>(null);
@@ -20,12 +21,37 @@ export function useConversation(client: MobileClient, workspaceId: string, signa
     const controller = linkedAbortController(signal);
     setTranscript(createTranscriptState());
     setSettings(null);
+    setPolicy(null);
     setError(null);
-    setOwner(() => client);
+    setOwner({ client, workspaceId, signal });
     setLoadingOlder(false);
     setHistoryError(null);
     historyCursor.current = null;
     if (signal.aborted) return;
+    async function subscribePolicy() {
+      // Subscribe before the initial read so changes during that read are not lost.
+      const events = await client.policy.onChanged(undefined, { signal: controller.signal });
+      async function refresh() {
+        if (controller.signal.aborted) return;
+        setPolicy(null);
+        try {
+          const next = await client.policy.get(undefined, { signal: controller.signal });
+          if (!controller.signal.aborted) setPolicy(next);
+        } catch {
+          // Fail closed, but keep the subscription alive so a later change can heal it.
+        }
+      }
+      await refresh();
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Notifications have no payload.
+      for await (const _ of events) {
+        if (controller.signal.aborted) return;
+        await refresh();
+      }
+      if (!controller.signal.aborted) setPolicy(null);
+    }
+    subscribePolicy().catch(() => {
+      if (!controller.signal.aborted) setPolicy(null);
+    });
     async function subscribe() {
       const [config, providers, agents] = await Promise.all([
         client.config.getConfig(undefined, { signal: controller.signal }),
@@ -68,9 +94,14 @@ export function useConversation(client: MobileClient, workspaceId: string, signa
       historyRequest.current = null;
     };
   }, [client, workspaceId, signal]);
+  const owned =
+    owner.client === client &&
+    owner.workspaceId === workspaceId &&
+    owner.signal === signal &&
+    !signal.aborted;
   async function loadOlder() {
     if (
-      owner !== client ||
+      !owned ||
       signal.aborted ||
       !transcript.caughtUp ||
       !transcript.hasOlderHistory ||
@@ -126,9 +157,9 @@ export function useConversation(client: MobileClient, workspaceId: string, signa
   // A replacement client must never inherit the old socket’s caught-up flag, even
   // for the render before the subscription effect runs. Draft state lives above this hook.
   return {
-    transcript: owner === client ? transcript : createTranscriptState(),
-    settings: owner === client ? settings : null,
-    error: owner === client ? error : null,
+    transcript: owned ? transcript : createTranscriptState(),
+    settings: owned && settings ? { ...settings, policy } : null,
+    error: owned ? error : null,
     loadingOlder,
     historyError,
     loadOlder,

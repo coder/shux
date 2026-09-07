@@ -1,10 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { KNOWN_MODELS } from "../../../src/common/constants/knownModels";
-import { modelChoices, modelMatchesSearch, resolveSettings, type SettingsData } from "./settings";
+import {
+  getPolicyBlockReason,
+  modelChoices,
+  modelMatchesSearch,
+  resolveSettings,
+  type SettingsData,
+} from "./settings";
 
 function data(): SettingsData {
   return {
     config: { agentAiDefaults: {} },
+    policy: { source: "none", status: { state: "disabled" }, policy: null },
     providers: {
       anthropic: { isConfigured: true, isEnabled: true, apiKeySet: true },
       openai: { isConfigured: true, isEnabled: false, apiKeySet: true },
@@ -13,6 +20,99 @@ function data(): SettingsData {
     agents: [],
   };
 }
+
+describe("server policy", () => {
+  test("keeps a denied current selection visible without silently replacing it", () => {
+    const settings = data();
+    const current = KNOWN_MODELS.SONNET.id;
+    settings.policy = {
+      source: "env",
+      status: { state: "enforced" },
+      policy: {
+        policyFormatVersion: "0.1",
+        providerAccess: [{ id: "anthropic", allowedModels: ["allowed"] }],
+        mcp: { allowUserDefined: { stdio: true, remote: true } },
+        runtimes: null,
+      },
+    };
+    settings.config.defaultModel = current;
+    settings.providers.anthropic.models = ["allowed"];
+    expect(resolveSettings({}, settings, "exec").model).toBe(current);
+    expect(modelChoices(settings, current)).toEqual([current, "anthropic:allowed"]);
+    expect(modelChoices(settings, "")).not.toContain(current);
+    expect(getPolicyBlockReason(settings, current)).not.toBeNull();
+    expect(getPolicyBlockReason(settings, "anthropic:allowed")).toBeNull();
+  });
+
+  test("checks resolved gateway identity and falls back to an allowed direct route", () => {
+    const settings = data();
+    const model = "openai:gpt-4o";
+    settings.providers.openai = {
+      isEnabled: true,
+      isConfigured: true,
+      apiKeySet: true,
+      models: ["gpt-4o"],
+    };
+    settings.providers.coder = {
+      isEnabled: true,
+      isConfigured: true,
+      apiKeySet: false,
+      models: ["openai/gpt-4o"],
+    };
+    settings.config.routePriority = ["coder", "direct"];
+    settings.policy = {
+      source: "env",
+      status: { state: "enforced" },
+      policy: {
+        policyFormatVersion: "0.1",
+        providerAccess: [{ id: "coder", allowedModels: ["openai/gpt-4o"] }],
+        mcp: { allowUserDefined: { stdio: true, remote: true } },
+        runtimes: null,
+      },
+    };
+    expect(modelChoices(settings, "")).toContain(model);
+    expect(getPolicyBlockReason(settings, model)).toBeNull();
+    settings.config.routeOverrides = { [model]: "direct" };
+    expect(modelChoices(settings, "")).not.toContain(model);
+    expect(getPolicyBlockReason(settings, model)).not.toBeNull();
+    settings.config.routeOverrides = {};
+    settings.policy.policy!.providerAccess = [{ id: "openai", allowedModels: ["gpt-4o"] }];
+    expect(modelChoices(settings, "")).toContain(model);
+    expect(getPolicyBlockReason(settings, model)).toBeNull();
+    settings.providers.openai.isEnabled = false;
+    expect(modelChoices(settings, "")).not.toContain(model);
+    settings.policy.policy!.providerAccess = [{ id: "anthropic" }];
+    expect(getPolicyBlockReason(settings, model)).not.toBeNull();
+  });
+
+  test("uses backend blocked status rather than independently comparing mobile versions", () => {
+    const settings = data();
+    settings.policy = {
+      source: "env",
+      status: { state: "blocked", reason: "minimum_client_version 999 required by server" },
+      policy: null,
+    };
+    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBe(
+      settings.policy.status.reason!
+    );
+    settings.policy.status.reason = "";
+    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBeTruthy();
+    settings.policy = null;
+    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).not.toBeNull();
+    settings.policy = { source: "env", status: { state: "enforced" }, policy: null };
+    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).not.toBeNull();
+    settings.policy.policy = {
+      policyFormatVersion: "0.1",
+      minimumClientVersion: "999.0.0",
+      providerAccess: null,
+      mcp: { allowUserDefined: { stdio: true, remote: true } },
+      runtimes: null,
+    };
+    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBeNull();
+    settings.policy = { source: "none", status: { state: "disabled" }, policy: null };
+    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBeNull();
+  });
+});
 
 describe("mobile model settings", () => {
   test("exposes built-ins for configured providers even without a custom catalog", () => {

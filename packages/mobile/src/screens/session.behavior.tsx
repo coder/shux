@@ -32,7 +32,13 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function fixture(messages: WorkspaceChatMessage[] = [], wide = false) {
+type Policy = Awaited<ReturnType<MobileClient["policy"]["get"]>>;
+const disabledPolicy: Policy = { source: "none", status: { state: "disabled" }, policy: null };
+function fixture(
+  messages: WorkspaceChatMessage[] = [],
+  wide = false,
+  initialPolicy: Policy | Error = disabledPolicy
+) {
   Object.defineProperty(document.documentElement, "clientWidth", {
     configurable: true,
     value: wide ? 1200 : 375,
@@ -45,6 +51,8 @@ function fixture(messages: WorkspaceChatMessage[] = [], wide = false) {
     end: () => void;
   }> = [];
   const calls: Array<{ path: string; input: unknown; signal?: AbortSignal }> = [];
+  let policy = initialPolicy;
+  const policyEvents: ReadableStreamDefaultController<void>[] = [];
   let closed = 0;
   let reconnected = 0;
   let disconnected = 0;
@@ -80,10 +88,22 @@ function fixture(messages: WorkspaceChatMessage[] = [], wide = false) {
           return workspaces;
         case "projects.list":
           return [];
+        case "policy.get":
+          if (policy instanceof Error) throw policy;
+          return policy;
+        case "policy.onChanged":
+          return events<void>(options.signal, [], (controller) => policyEvents.push(controller));
         case "config.getConfig":
           return { agentAiDefaults: {}, defaultModel: model };
         case "providers.getConfig":
-          return {};
+          return {
+            anthropic: {
+              isConfigured: true,
+              isEnabled: true,
+              apiKeySet: true,
+              models: ["allowed"],
+            },
+          };
         case "agents.list":
           return [
             { id: "exec", name: "Exec", uiSelectable: true },
@@ -165,6 +185,10 @@ function fixture(messages: WorkspaceChatMessage[] = [], wide = false) {
           view.getByRole("button", { name: "Choose mode" }).getAttribute("aria-disabled")
         ).not.toBe("true")
       );
+    },
+    async updatePolicy(next: Policy) {
+      policy = next;
+      await act(async () => policyEvents.at(-1)!.enqueue());
     },
     async emit(event: WorkspaceChatMessage) {
       await act(async () => chats.at(-1)!.events.enqueue(event));
@@ -522,4 +546,125 @@ test("reconnect cancels the old answer's resume continuation and reconciles pend
   await submitAnswer(view);
   expect(callCount(view, "answerAskUserQuestion")).toBe(2);
   expect(callCount(view, "resumeStream")).toBe(1);
+});
+
+test("blocked initial model stays selected and editable while a permitted choice unlocks sending", async () => {
+  const view = fixture([], false, {
+    source: "env",
+    status: { state: "enforced" },
+    policy: {
+      policyFormatVersion: "0.1",
+      providerAccess: [{ id: "anthropic", allowedModels: ["allowed"] }],
+      mcp: { allowUserDefined: { stdio: true, remote: true } },
+      runtimes: null,
+    },
+  });
+  await view.select("alpha");
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Keep draft" } });
+  expect(view.getByRole("alert")).toBeDefined();
+  expect(view.getByRole("button", { name: "Send message" }).getAttribute("aria-disabled")).toBe(
+    "true"
+  );
+  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+  expect(callCount(view, "sendMessage")).toBe(0);
+  fireEvent.click(view.getByRole("button", { name: "Choose model" }));
+  expect(view.getByRole("radio", { name: model }).getAttribute("aria-checked")).toBe("true");
+  fireEvent.click(view.getByRole("radio", { name: "anthropic:allowed" }));
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
+  expect(callCount(view, "sendMessage")).toBe(1);
+  expect(view.calls.find((call) => call.path === "workspace.sendMessage")?.input).toMatchObject({
+    message: "Keep draft",
+    options: { model: "anthropic:allowed" },
+  });
+});
+
+test("server minimum-client block disables answers and sending until live policy recovery", async () => {
+  const blocked: Policy = {
+    source: "env",
+    status: { state: "blocked", reason: "minimum_client_version requires server upgrade" },
+    policy: null,
+  };
+  const view = fixture([question()], false, blocked);
+  await view.select("alpha");
+  expect(view.getByRole("alert").textContent).toContain(blocked.status.reason!);
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Retained" } });
+  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+  expect(callCount(view, "sendMessage")).toBe(0);
+  expect(view.getByRole("button", { name: "Send answers" }).getAttribute("aria-disabled")).toBe(
+    "true"
+  );
+  fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+  expect(callCount(view, "answerAskUserQuestion")).toBe(0);
+  await view.updatePolicy(disabledPolicy);
+  await waitFor(() => expect(view.queryByRole("alert")).toBeNull());
+  await submitAnswer(view);
+  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
+  expect(callCount(view, "resumeStream")).toBe(1);
+});
+
+test("policy changes during a saved answer prevent automatic resume and permit resume-only recovery", async () => {
+  const view = fixture([question()]);
+  await view.select("alpha");
+  const pending = deferred<unknown>();
+  view.setAnswer(() => pending.promise);
+  await submitAnswer(view);
+  await view.updatePolicy({
+    source: "env",
+    status: { state: "blocked", reason: "upgrade required" },
+    policy: null,
+  });
+  await act(async () => pending.resolve({ success: true }));
+  expect(callCount(view, "resumeStream")).toBe(0);
+  expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+  await view.updatePolicy(disabledPolicy);
+  await act(async () => fireEvent.click(await view.findByRole("button", { name: "Resume agent" })));
+  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
+  expect(callCount(view, "resumeStream")).toBe(1);
+});
+
+test("an initial policy read failure exposes retry and preserves model access and draft without permitting a send", async () => {
+  const view = fixture([], false, new Error("policy unavailable"));
+  await view.select("alpha");
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Keep me" } });
+  expect(view.getByRole("alert")).toBeDefined();
+  expect(view.getByRole("button", { name: "Choose model" }).getAttribute("aria-disabled")).not.toBe(
+    "true"
+  );
+  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+  expect(callCount(view, "sendMessage")).toBe(0);
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Retry" })));
+  await waitFor(() =>
+    expect(view.calls.filter((call) => call.path === "policy.get")).toHaveLength(2)
+  );
+  expect(view.reconnected).toBe(1);
+  await view.updatePolicy(disabledPolicy);
+  await waitFor(() => expect(view.queryByRole("alert")).toBeNull());
+  expect(view.getByLabelText("Message")).toHaveProperty("value", "Keep me");
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
+  expect(callCount(view, "sendMessage")).toBe(1);
+});
+
+test("answer continuation resumes with the same latest selection that policy permits", async () => {
+  const view = fixture([question()]);
+  await view.select("alpha");
+  const pending = deferred<unknown>();
+  view.setAnswer(() => pending.promise);
+  await submitAnswer(view);
+  fireEvent.click(view.getByRole("button", { name: "Choose model" }));
+  fireEvent.click(view.getByRole("radio", { name: "anthropic:allowed" }));
+  await view.updatePolicy({
+    source: "env",
+    status: { state: "enforced" },
+    policy: {
+      policyFormatVersion: "0.1",
+      providerAccess: [{ id: "anthropic", allowedModels: ["allowed"] }],
+      mcp: { allowUserDefined: { stdio: true, remote: true } },
+      runtimes: null,
+    },
+  });
+  await act(async () => pending.resolve({ success: true }));
+  expect(callCount(view, "resumeStream")).toBe(1);
+  expect(view.calls.find((call) => call.path === "workspace.resumeStream")?.input).toMatchObject({
+    options: { model: "anthropic:allowed" },
+  });
 });

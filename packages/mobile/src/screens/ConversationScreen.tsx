@@ -21,7 +21,7 @@ import { ContextUsage } from "../components/ContextUsage";
 import { getContextMeterData } from "../contextUsage";
 import { useConversation } from "../useConversation";
 import { linkedAbortController } from "../useConnection";
-import { modelName, resolveSettings } from "../settings";
+import { getPolicyBlockReason, modelName, resolveSettings } from "../settings";
 import type { ChatSettings } from "../settings";
 import { ModelSettings } from "./ModelSettings";
 import { colors, fontFamily, layout, radii, spacing, typography } from "../theme";
@@ -97,6 +97,13 @@ export function ConversationScreen(props: {
   const context = getContextMeterData(transcript.messages, options, settings?.providers);
   const ready =
     props.connected && !props.signal.aborted && transcript.caughtUp && !error && settings !== null;
+  const policyBlockReason =
+    settings && options ? getPolicyBlockReason(settings, options.model) : null;
+  const canAct = ready && !policyBlockReason;
+  const latestSettings = useRef({ options, policyBlockReason });
+  useEffect(() => {
+    latestSettings.current = { options, policyBlockReason };
+  }, [options, policyBlockReason]);
   const running = ready && transcript.streaming;
   const expanded = inputFocused || draft.length > 0 || running || showSettings !== null;
 
@@ -109,10 +116,10 @@ export function ConversationScreen(props: {
       ? lastMessage
       : undefined;
   const canResume =
-    ready && !running && resumeMessageId === lastMessage?.id && lastMessage?.metadata?.partial;
+    canAct && !running && resumeMessageId === lastMessage?.id && lastMessage?.metadata?.partial;
 
   async function send() {
-    if (!ready || !options?.model || !draft.trim() || pending.current || running) return;
+    if (!canAct || !options?.model || !draft.trim() || pending.current || running) return;
     pending.current = true;
     setBusy(true);
     setActionError(null);
@@ -181,10 +188,14 @@ export function ConversationScreen(props: {
       !latest.metadata?.partial
     )
       return;
+    const { options, policyBlockReason } = latestSettings.current;
     if (!options?.model) return;
     // The answer is already durable and its form may disappear on tool-call-end.
     // Keep resume failures outside that form, and retry only resume, never the answer.
     setResumeMessageId(messageId);
+    // A policy update can arrive while the answer is being saved. Keep the resume
+    // recovery affordance, but never start a newly prohibited turn.
+    if (policyBlockReason) return;
     try {
       const result = await props.client.workspace.resumeStream(
         { workspaceId: props.workspace.id, options },
@@ -223,6 +234,7 @@ export function ConversationScreen(props: {
 
   async function answer(toolCallId: string, answers: Record<string, string>) {
     if (!ready) throw new Error("Reconnect before answering.");
+    if (policyBlockReason) throw new Error(policyBlockReason);
     if (pending.current) throw new Error("Another action is in progress.");
     if (
       !answerMessage ||
@@ -328,7 +340,7 @@ export function ConversationScreen(props: {
             message={item}
             streaming={transcript.streamingMessageId === item.id && running}
             canAnswer={
-              ready && !busy && answerMessage?.id === item.id && resumeMessageId !== item.id
+              canAct && !busy && answerMessage?.id === item.id && resumeMessageId !== item.id
             }
             onAnswer={answer}
           />
@@ -373,6 +385,11 @@ export function ConversationScreen(props: {
         style={styles.composerWrap}
         onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
       >
+        {policyBlockReason && (
+          <Notice onRetry={!settings?.policy ? props.onReconnect : undefined}>
+            {policyBlockReason}
+          </Notice>
+        )}
         {actionError && (
           <Notice
             onRetry={() => {
@@ -470,7 +487,7 @@ export function ConversationScreen(props: {
           <View
             style={[
               styles.send,
-              ready &&
+              (canAct || running) &&
                 (running || Boolean(draft.trim())) && {
                   backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent,
                 },
@@ -479,8 +496,14 @@ export function ConversationScreen(props: {
             <IconButton
               label={running ? "Interrupt agent" : "Send message"}
               icon={running ? Square : ArrowUp}
-              color={ready && (running || Boolean(draft.trim())) ? colors.bright : colors.muted}
-              disabled={!ready || busy || (!running && (!draft.trim() || !options?.model))}
+              color={
+                (canAct || running) && (running || Boolean(draft.trim()))
+                  ? colors.bright
+                  : colors.muted
+              }
+              disabled={
+                !ready || busy || (!running && (!canAct || !draft.trim() || !options?.model))
+              }
               onPress={running ? interrupt : send}
             />
           </View>

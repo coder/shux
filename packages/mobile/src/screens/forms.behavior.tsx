@@ -324,6 +324,7 @@ const pickerValue: ChatSettings = {
   },
 };
 const pickerData: SettingsData = {
+  policy: { source: "none", status: { state: "disabled" }, policy: null },
   config: { agentAiDefaults: {}, defaultModel: "local:one", hiddenModels: ["other:hidden"] },
   providers: {
     local: {
@@ -400,6 +401,14 @@ test.each([
     const client = createORPCClient<MobileClient>({
       call: async (path, input, request) => {
         switch (path.join(".")) {
+          case "policy.get":
+            return pickerData.policy;
+          case "policy.onChanged":
+            return new ReadableStream<void>({
+              start(controller) {
+                request.signal?.addEventListener("abort", () => controller.close(), { once: true });
+              },
+            }).values();
           case "config.getConfig":
             return {
               agentAiDefaults: {},

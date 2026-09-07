@@ -10,12 +10,18 @@ import { targetWorkspaceBucketToLayer } from "../../../src/common/types/agentAiS
 import { normalizeToCanonical } from "../../../src/common/utils/ai/models";
 import { formatModelDisplayName } from "../../../src/common/utils/ai/modelDisplay";
 import { isProviderModelAccessibleFromAuthoritativeCatalog } from "../../../src/common/utils/providers/gatewayModelCatalog";
+import {
+  isGatewayModelAccessibleForUi,
+  isModelAllowedByPolicy,
+} from "../../../src/browser/utils/policyUi";
 import type { MobileClient } from "./api";
 import type { FrontendWorkspaceMetadata } from "../../../src/common/types/workspace";
 import type { SendMessageOptions } from "../../../src/common/orpc/types";
 import type { ThinkingLevel } from "../../../src/common/types/thinking";
 
 export type SettingsData = {
+  // Null is unavailable, never an implicit policy-disabled fallback.
+  policy: Awaited<ReturnType<MobileClient["policy"]["get"]>> | null;
   config: Pick<
     Awaited<ReturnType<MobileClient["config"]["getConfig"]>>,
     | "agentAiDefaults"
@@ -76,6 +82,37 @@ export function resolveSettings(
   };
 }
 
+function modelRouting(data: SettingsData) {
+  const policy = data.policy?.status.state === "enforced" ? data.policy.policy : null;
+  return {
+    policy,
+    isConfigured: (provider: string) =>
+      data.providers[provider]?.isConfigured === true &&
+      data.providers[provider]?.isEnabled !== false,
+    isAccessible: (gateway: string, modelId: string) =>
+      isGatewayModelAccessibleForUi(policy, data.providers, gateway, modelId),
+  };
+}
+
+export function getPolicyBlockReason(data: SettingsData, model: string): string | null {
+  if (!data.policy || (data.policy.status.state === "enforced" && !data.policy.policy))
+    return "Server policy unavailable. Retry to reload it.";
+  // The server owns minimum-client/version semantics, including its blocked reason.
+  if (data.policy.status.state === "blocked")
+    return data.policy.status.reason || "Blocked by server policy.";
+  const { policy, isConfigured, isAccessible } = modelRouting(data);
+  const route = resolveRoute(
+    model,
+    data.config.routePriority ?? ["direct"],
+    data.config.routeOverrides ?? {},
+    isConfigured,
+    isAccessible
+  );
+  return isModelAllowedByPolicy(policy, `${route.routeProvider}:${route.routeModelId}`)
+    ? null
+    : "The selected model's route is blocked by server policy. Choose another model.";
+}
+
 export function modelChoices(data: SettingsData, currentModel: string): string[] {
   const models = new Set<string>();
   if (currentModel) models.add(currentModel);
@@ -88,10 +125,8 @@ export function modelChoices(data: SettingsData, currentModel: string): string[]
     }
   }
   for (const model of Object.values(KNOWN_MODELS)) models.add(model.id);
-  const isConfigured = (provider: string) =>
-    data.providers[provider]?.isConfigured === true &&
-    data.providers[provider]?.isEnabled !== false;
-  const isAccessible = (provider: string, modelId: string) => {
+  const { isConfigured, isAccessible } = modelRouting(data);
+  const isAuthoritativeModelAccessible = (provider: string, modelId: string) => {
     const config = data.providers[provider];
     return isProviderModelAccessibleFromAuthoritativeCatalog(
       provider,
@@ -106,7 +141,11 @@ export function modelChoices(data: SettingsData, currentModel: string): string[]
     if (model === currentModel) return true;
     if (data.config.hiddenModels?.includes(model)) return false;
     const colon = model.indexOf(":");
-    if (!isAccessible(model.slice(0, colon), model.slice(colon + 1))) return false;
+    if (!isAuthoritativeModelAccessible(model.slice(0, colon), model.slice(colon + 1)))
+      return false;
+    // Keep Settings available during a global block; model restrictions follow the
+    // resolved route, not the canonical identity (gateways own their credentials/policy).
+    if (data.policy?.status.state === "enforced" && getPolicyBlockReason(data, model)) return false;
     if (
       !isModelAvailable(
         model,
