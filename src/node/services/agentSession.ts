@@ -4221,6 +4221,19 @@ export class AgentSession {
         await this.updateStartupAutoRetryAbandonFromAbort("user", userMessage.id);
       }
     };
+    // A stale refusal past this point keeps the durable row, which the manual turn that made the
+    // admission stale consumes as context. A cancelable wake is therefore finalized here rather
+    // than left owed: unaccepted, its dispatcher would deliver the same attention again once idle.
+    const refuseStaleDurableSend = async (): Promise<AgentSessionResult<void>> => {
+      if (cancelSignal != null) {
+        try {
+          await accept();
+        } finally {
+          await abandonWithdrawnSend();
+        }
+      }
+      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    };
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
     // acceptance leaves the payload + trigger rows durable in the transcript.
@@ -4267,8 +4280,7 @@ export class AgentSession {
     // await, so a slider change during PREPARING (runtime warmup, model
     // creation) lands in the holder the stream's prepareStep will read.
     const turnThinkingOverride: ActiveTurnThinkingOverride = {};
-    if (isAdmissionStale())
-      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    if (isAdmissionStale()) return refuseStaleDurableSend();
     this.coordinator.acceptThinkingOverride(
       turnThinkingOverride,
       attempt.owner ?? attempt.expectedTurn
@@ -4317,11 +4329,9 @@ export class AgentSession {
     if (isManualUserMessage) {
       // A fresh accepted user send supersedes any persisted startup-abandon
       // classification from previous turns.
-      if (isAdmissionStale())
-        return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+      if (isAdmissionStale()) return refuseStaleDurableSend();
       await this.clearStartupAutoRetryAbandon();
-      if (isAdmissionStale())
-        return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+      if (isAdmissionStale()) return refuseStaleDurableSend();
       this.retryManager.cancel();
       this.retryManager.setEnabled(true);
       await this.persistAutoRetryEnabledPreference(true);
@@ -4329,8 +4339,7 @@ export class AgentSession {
 
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
-    if (isAdmissionStale())
-      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    if (isAdmissionStale()) return refuseStaleDurableSend();
     this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
     try {
       await accept();

@@ -1223,6 +1223,85 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("a wake whose admission goes stale during goal sync is finalized, not left owed", async () => {
+    const workspaceId = "queue-dispatch-stale-after-goal-sync";
+    let markSyncStarted: () => void = () => undefined;
+    const syncStarted = new Promise<void>((resolve) => {
+      markSyncStarted = resolve;
+    });
+    let releaseSync: () => void = () => undefined;
+    const syncRelease = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    const syncGoalModeWithChatTail = mock(async () => {
+      markSyncStarted();
+      await syncRelease;
+      return null;
+    });
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+      syncGoalModeWithChatTail,
+    } as unknown as WorkspaceGoalService;
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      workspaceGoalService,
+      aiServiceOverrides: { streamMessage },
+    });
+
+    try {
+      const controller = new AbortController();
+      // Stands in for the requireIdle preflight probe: a manual send enters preflight while the
+      // wake's durable row is already past the rollback horizon.
+      let manualSendInPreflight = false;
+      let accepted = false;
+      let preStreamFailures = 0;
+      const sendPromise = session.sendMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+          admissionStale: () => manualSendInPreflight,
+          onAccepted: () => {
+            accepted = true;
+          },
+          onAcceptedPreStreamFailure: () => {
+            preStreamFailures += 1;
+          },
+        }
+      );
+
+      await syncStarted;
+      manualSendInPreflight = true;
+      releaseSync();
+      const result = await sendPromise;
+
+      expect(result.success).toBe(false);
+      expect(accepted).toBe(true);
+      expect(preStreamFailures).toBe(1);
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(session.isBusy()).toBe(false);
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(
+          history.data.some((message) =>
+            message.parts.some(
+              (part) => part.type === "text" && part.text === "Background monitor wake"
+            )
+          )
+        ).toBe(true);
+      }
+    } finally {
+      releaseSync();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("disposed sessions finalize durable wakes after goal sync completes", async () => {
     const workspaceId = "queue-dispatch-disposed-after-goal-sync";
     let markSyncStarted: () => void = () => undefined;
