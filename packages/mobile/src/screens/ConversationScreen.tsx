@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { SetStateAction } from "react";
+import type { TextInputKeyPressEvent } from "react-native";
 import { FlatList, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import {
   ArrowDown,
@@ -23,6 +24,7 @@ import type { ChatDraft } from "../draft";
 import { Message } from "../components/Message";
 import { ContextUsage } from "../components/ContextUsage";
 import { getContextMeterData } from "../contextUsage";
+import { getWebComposerKeyAction } from "../composerKeyboard";
 import { useConversation } from "../useConversation";
 import { linkedAbortController } from "../useConnection";
 import {
@@ -128,6 +130,7 @@ export function ConversationScreen(props: {
     latestSettings.current = { options, modelBlockReason };
   }, [options, modelBlockReason]);
   const running = ready && transcript.streaming;
+  const actionDisabled = !ready || busy || (!running && (!canAct || !hasDraft || !options?.model));
   // A live answer resolves the existing tool, not the next-turn model. Connection,
   // settings and global policy blocks still apply; recovery needs a routable model too.
   const canAnswer = settingsReady && (running ? !getPolicyStateBlockReason(settings) : canAct);
@@ -157,6 +160,16 @@ export function ConversationScreen(props: {
       : null;
   const canResume =
     canAct && !running && resumeTargetId !== null && resumeTargetId !== startedResumeMessageId;
+
+  async function handleComposerKeyPress(event: TextInputKeyPressEvent) {
+    if (actionDisabled || pending.current) return;
+    const action = getWebComposerKeyAction(event.nativeEvent);
+    // Modified Enter is only an idle send here: mobile does not offer turn queueing.
+    if (!action || (action === "send" ? running : !running)) return;
+    event.preventDefault();
+    if (action === "send") await send();
+    else await interrupt();
+  }
 
   async function send() {
     if (!canAct || !options?.model || !hasDraft || pending.current || running) return;
@@ -520,6 +533,7 @@ export function ConversationScreen(props: {
             value={draft.text}
             onChangeText={(text) => setDraft((current) => ({ ...current, text }))}
             multiline
+            onKeyPress={Platform.OS === "web" ? handleComposerKeyPress : undefined}
             onFocus={() => setInputFocused(true)}
             onBlur={() => setInputFocused(false)}
             onContentSizeChange={
@@ -552,7 +566,7 @@ export function ConversationScreen(props: {
               label={running ? "Interrupt agent" : "Send message"}
               icon={running ? Square : ArrowUp}
               color={(canAct || running) && (running || hasDraft) ? colors.bright : colors.muted}
-              disabled={!ready || busy || (!running && (!canAct || !hasDraft || !options?.model))}
+              disabled={actionDisabled}
               onPress={running ? interrupt : send}
             />
           </View>

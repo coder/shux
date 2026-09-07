@@ -1,11 +1,12 @@
 import { secureStore, stackState } from "./sessionTestPlatform";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { createORPCClient } from "@orpc/client";
 import { ConnectedApp } from "../../App";
 import type { Connection } from "./ConnectScreen";
 import type { MobileClient } from "../api";
 import type { SettingsData } from "../settings";
+import { getWebComposerKeyAction } from "../composerKeyboard";
 import type { WorkspaceChatMessage } from "../transcript";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 
@@ -1256,5 +1257,186 @@ test("live direct-auth and routing changes gate the current OpenAI selection wit
   expect(callCount(view, "sendMessage")).toBe(1);
   expect(view.calls.find((call) => call.path === "workspace.sendMessage")?.input).toMatchObject({
     options: { model: "openai:gpt-4o" },
+  });
+});
+
+describe("web composer keyboard", () => {
+  const originalMatchMedia = window.matchMedia;
+  const platform = Object.getOwnPropertyDescriptor(navigator, "platform");
+  afterEach(() => {
+    window.matchMedia = originalMatchMedia;
+    if (platform) Object.defineProperty(navigator, "platform", platform);
+    else Reflect.deleteProperty(navigator, "platform");
+  });
+  function keyboardMedia(fineAndWide: boolean) {
+    const media = originalMatchMedia.call(window, "");
+    Object.defineProperty(media, "matches", { value: fineAndWide });
+    window.matchMedia = () => media;
+  }
+  function key(
+    target: Element | Document,
+    value: string,
+    options: KeyboardEventInit = {},
+    legacyCode?: number
+  ) {
+    const event = new window.KeyboardEvent("keydown", {
+      key: value,
+      bubbles: true,
+      cancelable: true,
+      ...options,
+    });
+    if (legacyCode != null) Object.defineProperty(event, "keyCode", { value: legacyCode });
+    fireEvent(target, event);
+    return event.defaultPrevented;
+  }
+  const live: WorkspaceChatMessage = {
+    type: "stream-start",
+    workspaceId: "alpha",
+    messageId: "keyboard-live",
+    model,
+    historySequence: 1,
+    startTime: 1,
+  };
+
+  test("fine/wide Enter sends once and duplicate keys while busy remain unhandled", async () => {
+    keyboardMedia(true);
+    const view = fixture([], true);
+    await view.select("alpha");
+    const input = view.getByLabelText("Message");
+    fireEvent.change(input, { target: { value: "keyboard message" } });
+    act(() => input.focus());
+    const pendingSend = deferred<unknown>();
+    view.setSend(() => pendingSend.promise);
+    act(() => {
+      expect(key(input, "Enter")).toBe(true);
+      expect(key(input, "Enter")).toBe(false);
+    });
+    expect(callCount(view, "sendMessage")).toBe(1);
+    expect(view.calls.find((call) => call.path === "workspace.sendMessage")?.input).toMatchObject({
+      workspaceId: "alpha",
+      message: "keyboard message",
+    });
+    expect(key(input, "Escape")).toBe(false);
+    expect(callCount(view, "interruptStream")).toBe(0);
+    await act(async () => pendingSend.resolve({ success: true }));
+  });
+
+  test.each(["ctrlKey", "metaKey"] as const)(
+    "narrow/coarse Enter stays a newline and idle %s+Enter sends",
+    async (modifier) => {
+      keyboardMedia(false);
+      Object.defineProperty(navigator, "platform", { configurable: true, value: "MacIntel" });
+      const view = fixture();
+      await view.select("alpha");
+      const input = view.getByLabelText("Message");
+      fireEvent.change(input, { target: { value: "keep software Enter" } });
+      act(() => input.focus());
+      expect(key(input, "Enter")).toBe(false);
+      expect(key(input, "Enter", { shiftKey: true })).toBe(false);
+      expect(callCount(view, "sendMessage")).toBe(0);
+      await act(async () => {
+        expect(key(input, "Enter", { [modifier]: true })).toBe(true);
+      });
+      expect(callCount(view, "sendMessage")).toBe(1);
+    }
+  );
+
+  test("IME, repeat, extra modifiers, lost focus and modal focus do not send", async () => {
+    keyboardMedia(true);
+    const view = fixture([], true);
+    await view.select("alpha");
+    const input = view.getByLabelText("Message");
+    fireEvent.change(input, { target: { value: "compose safely" } });
+    act(() => input.focus());
+    expect(getWebComposerKeyAction({ key: "Enter", target: input })).toBeUndefined();
+    const claimed = new window.KeyboardEvent("keydown", {
+      key: "Enter",
+      bubbles: true,
+      cancelable: true,
+    });
+    claimed.preventDefault();
+    fireEvent(input, claimed);
+    for (const options of [
+      { shiftKey: true },
+      { altKey: true },
+      { ctrlKey: true, shiftKey: true },
+      { repeat: true },
+      { isComposing: true },
+    ]) {
+      expect(key(input, "Enter", options)).toBe(false);
+    }
+    expect(key(input, "Enter", {}, 229)).toBe(false);
+    act(() => input.blur());
+    expect(key(input, "Enter")).toBe(false);
+    expect(key(document, "Enter")).toBe(false);
+    fireEvent.click(view.getByRole("button", { name: "Choose model" }));
+    expect(key(view.getByLabelText("Search models"), "Enter")).toBe(false);
+    act(() => input.focus());
+    expect(key(input, "Enter")).toBe(false);
+    expect(callCount(view, "sendMessage")).toBe(0);
+  });
+
+  test("empty, route-blocked and disconnected sends do not consume Enter", async () => {
+    keyboardMedia(true);
+    const view = fixture([], true);
+    await view.select("alpha");
+    const input = view.getByLabelText("Message");
+    act(() => input.focus());
+    expect(key(input, "Enter")).toBe(false);
+    fireEvent.change(input, { target: { value: "blocked draft" } });
+    await view.updateProviders({});
+    expect(key(input, "Enter")).toBe(false);
+    expect(key(input, "Enter", { ctrlKey: true })).toBe(false);
+    await act(async () => view.chats[0].end());
+    expect(key(input, "Enter")).toBe(false);
+    expect(callCount(view, "sendMessage")).toBe(0);
+    expect(callCount(view, "interruptStream")).toBe(0);
+  });
+
+  test("only focused eligible Escape stops; Enter never stops or queues a running turn", async () => {
+    keyboardMedia(true);
+    const view = fixture([live], true);
+    await view.select("alpha");
+    const input = view.getByLabelText("Message");
+    fireEvent.change(input, { target: { value: "next draft" } });
+    expect(key(document, "Escape")).toBe(false);
+    act(() => input.blur());
+    expect(key(input, "Escape")).toBe(false);
+    act(() => input.focus());
+    expect(key(input, "Escape", { isComposing: true })).toBe(false);
+    expect(key(input, "Escape", {}, 229)).toBe(false);
+    expect(key(input, "Escape", { repeat: true })).toBe(false);
+    expect(key(input, "Escape", { ctrlKey: true })).toBe(false);
+    expect(key(input, "Enter")).toBe(false);
+    expect(key(input, "Enter", { ctrlKey: true })).toBe(false);
+    const pendingStop = deferred<unknown>();
+    view.setInterrupt(() => pendingStop.promise);
+    act(() => {
+      expect(key(input, "Escape")).toBe(true);
+      expect(key(input, "Escape")).toBe(false);
+    });
+    expect(callCount(view, "sendMessage")).toBe(0);
+    expect(callCount(view, "interruptStream")).toBe(1);
+    expect(view.calls.find((call) => call.path === "workspace.interruptStream")?.input).toEqual({
+      workspaceId: "alpha",
+      options: { retireBashMonitorAttention: true, disableAutoRetry: true },
+    });
+    await act(async () => pendingStop.resolve({ success: true }));
+  });
+
+  test("Escape retains active Stop eligibility when the next route is blocked", async () => {
+    keyboardMedia(false);
+    const view = fixture([live]);
+    await view.select("alpha");
+    await view.updateProviders({});
+    const input = view.getByLabelText("Message");
+    act(() => input.focus());
+    await act(async () => {
+      expect(key(input, "Escape")).toBe(true);
+    });
+    expect(callCount(view, "interruptStream")).toBe(1);
+    await act(async () => view.chats[0].end());
+    expect(key(input, "Escape")).toBe(false);
+    expect(callCount(view, "interruptStream")).toBe(1);
   });
 });
