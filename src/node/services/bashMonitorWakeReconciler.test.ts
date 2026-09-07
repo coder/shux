@@ -13,6 +13,7 @@ import {
   type BashMonitorProcessSnapshot,
   type BashMonitorWakeDeliveryState,
   type BashMonitorWakeDispatch,
+  type BashMonitorWakeDispatchOutcome,
 } from "@/node/services/bashMonitorWakeReconciler";
 
 const OWNER = "owner";
@@ -188,6 +189,56 @@ describe("BashMonitorWakeReconciler", () => {
     expect(acknowledged).toHaveLength(1);
     await reconciler.reconcile(OWNER);
     expect(dispatches).toHaveLength(1);
+  });
+
+  test("an accepted wake stays withdrawable until its send settles", async () => {
+    live = [liveSnapshot()];
+    const send = Promise.withResolvers<BashMonitorWakeDispatchOutcome>();
+    const inFlight: BashMonitorWakeDispatch[] = [];
+    const held = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: (processId, _generation, matchedThroughOffset) => {
+          acknowledged.push({
+            processId,
+            ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
+          });
+        },
+        dropRetiredMonitor: () => undefined,
+      },
+      registry: {
+        listAll: () => Promise.resolve(rows),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
+      },
+      deliveredWakes: () => Promise.resolve(transcript),
+      onWake: (dispatch) => {
+        inFlight.push(dispatch);
+        return send.promise;
+      },
+    });
+    const reconciling = held.reconcile(OWNER);
+    while (inFlight.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    // The row is durable, so the wake is accepted while its send is still in preflight.
+    await inFlight[0].onAccepted();
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+    // A Stop landing before the stream starts still withdraws it.
+    await held.consumeCurrent(OWNER);
+    expect(inFlight[0].cancelSignal.aborted).toBe(true);
+    send.resolve("in-flight");
+    await reconciling;
+
+    live = [
+      liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
+    ];
+    await held.reconcile(OWNER);
+    expect(inFlight).toHaveLength(2);
+    expect(inFlight[1].cancelSignal.aborted).toBe(false);
+    await held.dispose(OWNER);
   });
 
   test("consumeCurrent withdraws the wake but keeps signals owed when the commit is refused", async () => {

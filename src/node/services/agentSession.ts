@@ -3345,6 +3345,7 @@ export class AgentSession {
       if ((internal?.preTurnMessages?.length ?? 0) > 0) internal?.onPreTurnRowsPersisted?.();
     };
     const accept = async (): Promise<void> => {
+      if (attempt.durability === "accepted") return;
       await internal?.onAccepted?.();
       attempt.durability = "accepted";
     };
@@ -4184,36 +4185,33 @@ export class AgentSession {
         await this.updateStartupAutoRetryAbandonFromAbort("user", userMessage.id);
       }
     };
-    // A stale refusal past this point keeps the durable row, which the manual turn that made the
-    // admission stale consumes as context. A cancelable wake is therefore finalized here rather
-    // than left owed: unaccepted, its dispatcher would deliver the same attention again once idle.
+    // A stale refusal past this point keeps the durable, already accepted row, which the manual
+    // turn that made the admission stale consumes as context.
     const refuseStaleDurableSend = async (): Promise<AgentSessionResult<void>> => {
-      if (cancelSignal != null) {
-        try {
-          await accept();
-        } finally {
-          await abandonWithdrawnSend();
-        }
-      }
+      await abandonWithdrawnSend();
       return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
     };
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
     // acceptance leaves the payload + trigger rows durable in the transcript.
     markRowsDurable();
+    // A cancelable wake is accepted the moment its row is durable, before goal sync: its
+    // dispatcher treats the transcript row as proof of acceptance (a restart consumes a signal
+    // whose row is already there), so no later await may leave a durable, unaccepted row behind
+    // a crash. Startup recovery resumes the row without redelivering it, unless a Stop withdrew
+    // the wake.
+    if (cancelSignal != null) {
+      try {
+        await accept();
+      } catch (error) {
+        await abandonWithdrawnSend();
+        return Err(createUnknownSendMessageError(getErrorMessage(error)));
+      }
+    }
     try {
       await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
     } catch (error) {
-      if (cancelSignal != null) {
-        // The durable row crossed the point of no return, so every later goal-sync failure must still
-        // finalize this monitor wake. Startup recovery can resume the row without redelivering it,
-        // unless a Stop withdrew the wake.
-        try {
-          await accept();
-        } finally {
-          await abandonWithdrawnSend();
-        }
-      }
+      await abandonWithdrawnSend();
       throw error;
     }
 
@@ -4225,16 +4223,9 @@ export class AgentSession {
     }
 
     // Workspace may be tearing down while we await filesystem IO.
-    // If so, skip event emission + streaming to avoid races with dispose(). A cancelable monitor
-    // wake past the point of no return is already durable, so finalize it before leaving.
+    // If so, skip event emission + streaming to avoid races with dispose().
     if (this.coordinator.disposed) {
-      if (cancelSignal != null && cancellationDisabled) {
-        try {
-          await accept();
-        } finally {
-          await abandonWithdrawnSend();
-        }
-      }
+      await abandonWithdrawnSend();
       return Ok(undefined);
     }
 

@@ -61,7 +61,7 @@ import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessi
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
 import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
@@ -460,6 +460,26 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(h.dispatch).not.toHaveBeenCalled();
       expect(acknowledged).toHaveBeenCalledTimes(2);
       await h.addAttention(12);
+      expect(h.dispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("malformed wake metadata in history neither stalls nor consumes an outstanding wake", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      await h.historyService.appendToHistory(
+        h.workspaceId,
+        createMuxMessage("wake-corrupt", "user", "Monitor matched", {
+          timestamp: Date.now(),
+          muxMetadata: {
+            type: "bash-monitor-wake",
+            records: [null, "junk", { processId: "first" }],
+          } as unknown as MuxMessageMetadata,
+        })
+      );
+      await h.addAttention(7);
       expect(h.dispatch).toHaveBeenCalledTimes(1);
     } finally {
       await h.finish();

@@ -154,8 +154,14 @@ interface DispatchState {
   signature: string;
   controller: AbortController;
   signals: readonly DerivedSignal[];
+  /** Row durable and consumption at least owed. */
   accepted: boolean;
+  /** onWake returned: the send is streaming or has exited and can no longer be withdrawn. */
+  settled: boolean;
 }
+
+/** Identity a persisted wake row carries per process, see buildMetadata. */
+export type DeliveredWakeRecord = Pick<BashMonitorWakeDisplayRecord, "processId" | "wakeUpdatedAt">;
 
 interface ReconcileState {
   requested: boolean;
@@ -381,13 +387,13 @@ export class BashMonitorWakeReconciler {
       processManager: BashMonitorWakeReconcilerProcessManager;
       registry: BashMonitorWakeReconcilerRegistry;
       /**
-       * Wake records the owner's transcript carries in rows stamped at or after `since`, the
+       * Wake identities the owner's transcript carries in rows stamped at or after `since`, the
        * creation time of the oldest process being checked. A rejection holds dispatch.
        */
       deliveredWakes(
         ownerWorkspaceId: string,
         since: string
-      ): Promise<readonly BashMonitorWakeDisplayRecord[]>;
+      ): Promise<readonly DeliveredWakeRecord[]>;
       onWake(
         dispatch: BashMonitorWakeDispatch
       ): Promise<BashMonitorWakeDispatchOutcome> | BashMonitorWakeDispatchOutcome;
@@ -568,6 +574,7 @@ export class BashMonitorWakeReconciler {
         controller: new AbortController(),
         signals,
         accepted: false,
+        settled: false,
       };
       state.dispatch = next;
       return next;
@@ -584,6 +591,7 @@ export class BashMonitorWakeReconciler {
         onDeferred: async () => this.defer(ownerWorkspaceId, dispatch),
       });
       if (outcome === "deferred") await this.defer(ownerWorkspaceId, dispatch);
+      else await this.settle(ownerWorkspaceId, dispatch);
     } catch (error) {
       await this.locks.withLock(ownerWorkspaceId, () => {
         const state = this.state(ownerWorkspaceId);
@@ -601,6 +609,14 @@ export class BashMonitorWakeReconciler {
       return Promise.resolve();
     });
   }
+  private async settle(ownerWorkspaceId: string, dispatch: DispatchState): Promise<void> {
+    await this.locks.withLock(ownerWorkspaceId, () => {
+      dispatch.settled = true;
+      this.release(ownerWorkspaceId, dispatch);
+      return Promise.resolve();
+    });
+    if (dispatch.accepted) this.scheduleReconcile(ownerWorkspaceId);
+  }
   private async accept(ownerWorkspaceId: string, dispatch: DispatchState): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, async () => {
       if (dispatch.accepted || dispatch.controller.signal.aborted) return;
@@ -617,11 +633,20 @@ export class BashMonitorWakeReconciler {
           error,
         });
       } finally {
-        // Still registered during the I/O so a Stop landing then can withdraw the wake.
-        if (state.dispatch === dispatch) state.dispatch = undefined;
+        this.release(ownerWorkspaceId, dispatch);
       }
     });
-    this.scheduleReconcile(ownerWorkspaceId);
+    if (dispatch.settled) this.scheduleReconcile(ownerWorkspaceId);
+  }
+  /**
+   * Under the lock. An accepted wake keeps its slot until its send settles (onWake returned), so
+   * a Stop landing anywhere before the stream starts can still withdraw it through abortDispatch.
+   */
+  private release(ownerWorkspaceId: string, dispatch: DispatchState): void {
+    const state = this.states.get(ownerWorkspaceId);
+    if (state?.dispatch === dispatch && dispatch.accepted && dispatch.settled) {
+      state.dispatch = undefined;
+    }
   }
 
   private async acceptOwed(ownerWorkspaceId: string, state: ReconcileState): Promise<void> {

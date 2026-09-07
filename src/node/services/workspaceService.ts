@@ -118,6 +118,7 @@ import {
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { createContextResetBoundaryMessageId } from "@/node/services/utils/messageIds";
 import { fileExists } from "@/node/utils/runtime/fileExists";
@@ -195,7 +196,6 @@ import {
   getCompactionFollowUpContent,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
-  type BashMonitorWakeDisplayRecord,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
   type MuxMessage,
@@ -320,6 +320,7 @@ import {
   type BashMonitorWakeDispatch,
   type BashMonitorWakeDispatchOutcome,
   type BashMonitorWakeReconcilerSnapshot,
+  type DeliveredWakeRecord,
 } from "@/node/services/bashMonitorWakeReconciler";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
 import {
@@ -2572,9 +2573,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private async listDeliveredBashMonitorWakes(
     ownerWorkspaceId: string,
     since: string
-  ): Promise<readonly BashMonitorWakeDisplayRecord[]> {
+  ): Promise<readonly DeliveredWakeRecord[]> {
     const oldest = Date.parse(since);
-    const records: BashMonitorWakeDisplayRecord[] = [];
+    const records: DeliveredWakeRecord[] = [];
     const result = await this.historyService.iterateFullHistory(
       ownerWorkspaceId,
       "backward",
@@ -2585,7 +2586,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         for (const message of messages) {
           const muxMetadata = message.metadata?.muxMetadata;
           if (message.role === "user" && muxMetadata?.type === "bash-monitor-wake") {
-            records.push(...muxMetadata.records);
+            // Persisted metadata is unvalidated: a malformed row must degrade to "not delivered"
+            // rather than fail the scan, which would hold every wake of this owner.
+            const rows: unknown = muxMetadata.records;
+            if (Array.isArray(rows)) {
+              for (const row of rows) {
+                if (
+                  isPlainObject(row) &&
+                  typeof row.processId === "string" &&
+                  typeof row.wakeUpdatedAt === "string"
+                ) {
+                  records.push({ processId: row.processId, wakeUpdatedAt: row.wakeUpdatedAt });
+                }
+              }
+            }
           }
           const timestamp = message.metadata?.timestamp;
           if (!(typeof timestamp === "number" && timestamp < oldest)) predatesAll = false;

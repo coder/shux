@@ -1412,6 +1412,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       );
 
       await syncStarted;
+      // Accepted before goal sync began: a crash anywhere past the durable row leaves an accepted
+      // row, never one the reconciler's transcript lookup would misread as delivered.
+      expect(accepted).toBe(true);
       releaseSync();
       let syncError: unknown;
       try {
@@ -1422,7 +1425,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(syncError).toBeInstanceOf(Error);
       expect((syncError as Error).message).toContain("injected goal sync failure");
 
-      expect(accepted).toBe(true);
       expect(canceledReasons).toEqual([]);
       expect(cancelState.canceledBeforeAcceptance).toBe(false);
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
