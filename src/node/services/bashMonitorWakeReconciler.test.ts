@@ -527,6 +527,26 @@ describe("BashMonitorWakeReconciler", () => {
     await fresh.dispose(OWNER);
   });
 
+  test.each(["9", "not-a-date"])(
+    "a recovered process with the noncanonical age %j is still checked against the transcript",
+    async (createdAt) => {
+      // The registry accepts any createdAt string, and both sort after an ISO instance stamp: a string
+      // comparison would take the process for a live one and redeliver the wake its row already holds.
+      live = [liveSnapshot({ createdAt })];
+      transcript.push({
+        processId: "proc",
+        wakeUpdatedAt: createdAt + ":12",
+        kind: "match",
+        displayName: "CI watcher",
+        filter: "READY",
+        filterExclude: false,
+      });
+      await reconciler.reconcile(OWNER);
+      expect(dispatches).toEqual([]);
+      expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+    }
+  );
+
   test("a wake the transcript already carries is consumed after restart, not redelivered", async () => {
     live = [liveSnapshot()];
     await reconciler.reconcile(OWNER);

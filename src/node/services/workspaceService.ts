@@ -2402,8 +2402,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             : undefined,
       },
       registry: this.bashMonitorRegistryStore,
-      deliveredWakes: (ownerWorkspaceId, since) =>
-        this.listDeliveredBashMonitorWakes(ownerWorkspaceId, since),
+      deliveredWakes: (ownerWorkspaceId, sinceMs) =>
+        this.listDeliveredBashMonitorWakes(ownerWorkspaceId, sinceMs),
       onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
     });
     if (typeof this.backgroundProcessManager.on === "function") {
@@ -2565,16 +2565,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Wake records in transcript rows written since `since`, scanning newest-first across the
+   * Wake records in transcript rows written since `sinceMs`, scanning newest-first across the
    * compaction archive too because a delivered row stays proof of delivery after it leaves the
    * window the model sees. A failed read rejects so the reconciler holds dispatch in its retry
    * backoff instead of risking a duplicate row.
    */
   private async listDeliveredBashMonitorWakes(
     ownerWorkspaceId: string,
-    since: string
+    sinceMs: number
   ): Promise<readonly DeliveredWakeRecord[]> {
-    const oldest = Date.parse(since);
     const records: DeliveredWakeRecord[] = [];
     const result = await this.historyService.iterateFullHistory(
       ownerWorkspaceId,
@@ -2608,7 +2607,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             }
           }
           const timestamp = message.metadata?.timestamp;
-          if (!(typeof timestamp === "number" && timestamp < oldest)) predatesAll = false;
+          if (!(typeof timestamp === "number" && timestamp < sinceMs)) predatesAll = false;
         }
         return !predatesAll;
       }

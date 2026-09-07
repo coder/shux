@@ -381,7 +381,7 @@ export class BashMonitorWakeReconciler {
   private readonly retryAttempts = new Map<string, number>();
   private readonly defunctWorkspaces = new Set<string>();
   /** Processes created before this instance can carry acceptances that lived only in a previous one. */
-  private readonly constructedAt = new Date().toISOString();
+  private readonly constructedAtMs = Date.now();
 
   constructor(
     private readonly args: {
@@ -389,12 +389,13 @@ export class BashMonitorWakeReconciler {
       processManager: BashMonitorWakeReconcilerProcessManager;
       registry: BashMonitorWakeReconcilerRegistry;
       /**
-       * Wake identities the owner's transcript carries in rows stamped at or after `since`, the
-       * creation time of the oldest process being checked. A rejection holds dispatch.
+       * Wake identities the owner's transcript carries in rows stamped at or after `sinceMs`, the
+       * creation time of the oldest process being checked (-Infinity when an age is unparseable).
+       * A rejection holds dispatch.
        */
       deliveredWakes(
         ownerWorkspaceId: string,
-        since: string
+        sinceMs: number
       ): Promise<readonly DeliveredWakeRecord[]>;
       onWake(
         dispatch: BashMonitorWakeDispatch
@@ -679,13 +680,17 @@ export class BashMonitorWakeReconciler {
     const keyOf = (signal: DerivedSignal) => wakeKey(signal.processId, wakeUpdatedAt(signal));
     const checked = state.transcriptChecked ?? new Set<string>();
     let delivered: DerivedSignal[] = [];
-    const recovered = signals.filter((signal) => signal.createdAt < this.constructedAt);
+    // Persisted ages are unvalidated strings: compare parsed times and, like startup recovery,
+    // count an unparseable age as recovered rather than let it sort past the instance stamp.
+    const createdAtMs = (signal: DerivedSignal) => Date.parse(signal.createdAt);
+    const recovered = signals.filter((signal) => {
+      const ms = createdAtMs(signal);
+      return !Number.isFinite(ms) || ms < this.constructedAtMs;
+    });
     if (recovered.some((signal) => !checked.has(keyOf(signal)))) {
-      const since = recovered.reduce(
-        (oldest, signal) => (signal.createdAt < oldest ? signal.createdAt : oldest),
-        recovered[0].createdAt
-      );
-      const rows = await this.args.deliveredWakes(ownerWorkspaceId, since);
+      const ages = recovered.map(createdAtMs);
+      const sinceMs = ages.every(Number.isFinite) ? Math.min(...ages) : -Infinity;
+      const rows = await this.args.deliveredWakes(ownerWorkspaceId, sinceMs);
       const inTranscript = new Set(
         rows.flatMap((row) =>
           row.processId != null && row.wakeUpdatedAt != null
