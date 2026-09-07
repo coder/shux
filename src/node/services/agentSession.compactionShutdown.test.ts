@@ -941,8 +941,11 @@ test("an exact cancellation survives failed summary writes across a fresh servic
   const h = await setup();
   await h.historyService.appendToHistory(workspaceId, summary());
   await h.session.interruptStream({ abandonPartial: true });
-  const update = spyOn(h.historyService, "updateHistory").mockResolvedValue(
-    Err("history rewrite unavailable")
+  const historyWrites = h.historyService as unknown as {
+    writeGuardedHistory(path: string, serialized: string, guard: () => boolean): Promise<boolean>;
+  };
+  const update = spyOn(historyWrites, "writeGuardedHistory").mockRejectedValue(
+    new Error("history rewrite unavailable")
   );
   try {
     await h.internals.dispatchPendingFollowUp().catch(() => undefined);
@@ -1218,3 +1221,172 @@ test.each(["user row", "summary only", "failed unlink"] as const)(
     }
   }
 );
+
+test.each(["cached absence", "changed nonce"] as const)(
+  "a live backend observes another backend's durable Stop after %s",
+  async (cached) => {
+    const a = await setup();
+    const bHistory = new HistoryService(a.config);
+    const b = await createAgentSessionHarness({
+      workspaceId,
+      config: a.config,
+      historyService: bHistory,
+    });
+    const bDispatch = (
+      b.session as unknown as { dispatchPendingFollowUp(): Promise<boolean> }
+    ).dispatchPendingFollowUp.bind(b.session);
+    const bWrites = bHistory as unknown as {
+      writeGuardedHistory(path: string, serialized: string, guard: () => boolean): Promise<boolean>;
+    };
+    const failedCleanup = spyOn(bWrites, "writeGuardedHistory").mockRejectedValue(
+      new Error("cleanup unavailable in backend B")
+    );
+    const stream = spyOn(a.aiService, "streamMessage");
+    try {
+      await a.historyService.appendToHistory(workspaceId, summary());
+      if (cached === "changed nonce") {
+        await b.session.interruptStream({ abandonPartial: true });
+        await b.session.retryPendingCompactionCleanup();
+        await bDispatch().catch(() => undefined);
+        expect((await bHistory.readCompactionCancellation(workspaceId))?.scope.kind).toBe(
+          "summary"
+        );
+      }
+      const cachedNonce = await a.session.getCompactionCancellationNonce();
+      if (cached === "changed nonce") {
+        await bHistory.clearHistory(workspaceId);
+        await b.session.contextMutationCommitted();
+        await bHistory.appendToHistory(
+          workspaceId,
+          createMuxMessage("summary-b", "assistant", "B compacted", {
+            muxMetadata: {
+              type: "compaction-summary",
+              pendingFollowUp: { text: "Continue B", ...options },
+            },
+          })
+        );
+      }
+      await b.session.interruptStream({ abandonPartial: true });
+      await b.session.retryPendingCompactionCleanup();
+      await bDispatch().catch(() => undefined);
+      expect(
+        (await new HistoryService(a.config).readCompactionCancellation(workspaceId))?.nonce
+      ).not.toBe(cachedNonce);
+      expect(await a.internals.dispatchPendingFollowUp()).toBe(false);
+      expect(stream).not.toHaveBeenCalled();
+    } finally {
+      failedCleanup.mockRestore();
+      await a.session.dispose().catch(() => undefined);
+      await b.session.dispose().catch(() => undefined);
+      await a.cleanup();
+    }
+  }
+);
+
+test("stale cross-backend summary cleanup cannot narrow or retire a successor Stop", async () => {
+  const a = await setup();
+  await a.historyService.appendToHistory(workspaceId, summary());
+  const bHistory = new HistoryService(a.config);
+  const b = await createAgentSessionHarness({
+    workspaceId,
+    config: a.config,
+    historyService: bHistory,
+  });
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const read = a.historyService.readCompactionCancellation.bind(a.historyService);
+  spyOn(a.historyService, "readCompactionCancellation").mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return read(...args);
+  });
+  const stale = a.internals.dispatchPendingFollowUp();
+  try {
+    await entered.promise;
+    await bHistory.clearHistory(workspaceId);
+    await bHistory.appendToHistory(
+      workspaceId,
+      createMuxMessage("summary-b", "assistant", "B compacted", {
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: { text: "Continue B", ...options },
+        },
+      })
+    );
+    await b.session.interruptStream({ abandonPartial: true });
+    await b.session.retryPendingCompactionCleanup();
+    const canceledB = await bHistory.readCompactionCancellation(workspaceId);
+    release.resolve();
+    expect(await stale).toBe(false);
+    expect(await new HistoryService(a.config).readCompactionCancellation(workspaceId)).toEqual(
+      canceledB
+    );
+    await expectNoRecovery(a.config, new HistoryService(a.config));
+  } finally {
+    release.resolve();
+    await stale;
+    await a.session.dispose();
+    await b.session.dispose();
+    await a.cleanup();
+  }
+});
+
+test("failed cleanup cannot narrow a foreign replacement's newer Stop and preserves its original error", async () => {
+  const a = await setup();
+  await a.historyService.appendToHistory(workspaceId, summary());
+  await a.session.interruptStream({ abandonPartial: true });
+  await a.session.retryPendingCompactionCleanup();
+  const bHistory = new HistoryService(a.config);
+  const b = await createAgentSessionHarness({
+    workspaceId,
+    config: a.config,
+    historyService: bHistory,
+  });
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const writes = a.historyService as unknown as {
+    writeGuardedHistory(path: string, serialized: string, guard: () => boolean): Promise<boolean>;
+  };
+  spyOn(writes, "writeGuardedHistory").mockRejectedValueOnce(
+    new Error("original guarded rewrite failed")
+  );
+  const update = a.historyService.updateHistory.bind(a.historyService);
+  spyOn(a.historyService, "updateHistory").mockImplementationOnce(async (...args) => {
+    const result = await update(...args);
+    entered.resolve();
+    await release.promise;
+    return result;
+  });
+  const cleanup = a.internals.dispatchPendingFollowUp().catch((error: unknown) => error);
+  try {
+    await entered.promise;
+    await bHistory.clearHistory(workspaceId);
+    await bHistory.appendToHistory(
+      workspaceId,
+      createMuxMessage("summary-b", "assistant", "B compacted", {
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: { text: "Continue B", ...options },
+        },
+      })
+    );
+    await b.session.interruptStream({ abandonPartial: true });
+    await b.session.retryPendingCompactionCleanup();
+    const canceledB = await bHistory.readCompactionCancellation(workspaceId);
+    release.resolve();
+    expect(await cleanup).toHaveProperty(
+      "message",
+      expect.stringContaining("original guarded rewrite failed")
+    );
+    expect(await new HistoryService(a.config).readCompactionCancellation(workspaceId)).toEqual(
+      canceledB
+    );
+    await expectNoRecovery(a.config, new HistoryService(a.config));
+  } finally {
+    release.resolve();
+    await cleanup;
+    await a.session.dispose();
+    await b.session.dispose();
+    await a.cleanup();
+  }
+});

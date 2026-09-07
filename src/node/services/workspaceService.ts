@@ -3068,13 +3068,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /** r41: mark a context-discarding mutation as durably committed (see contextMutationEpochs). */
-  private async advanceContextMutationEpoch(workspaceId: string): Promise<Result<void>> {
+  private async advanceContextMutationEpoch(
+    workspaceId: string,
+    cancellationNonce?: string | null
+  ): Promise<Result<void>> {
     this.contextMutationEpochs.set(
       workspaceId,
       (this.contextMutationEpochs.get(workspaceId) ?? 0) + 1
     );
     try {
-      await this.sessions.get(workspaceId)?.contextMutationCommitted();
+      await this.sessions.get(workspaceId)?.contextMutationCommitted(cancellationNonce);
       return Ok(undefined);
     } catch (error) {
       // History already changed. Callers must finish its other cleanup before
@@ -12473,6 +12476,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         refuseRowRemoval: truncationScope === "none",
         requireFullDelete: truncationScope === "all",
       });
+    const cancellationNonce = isFullClear
+      ? ((await this.getOrCreateSession(workspaceId).getCompactionCancellationNonce()) ?? null)
+      : null;
     const truncateResult =
       effectivePercentage > 0
         ? await this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, truncate, {
@@ -12486,7 +12492,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // r41: the discard is durable — sends that entered before it must not be
     // admitted afterwards (their content references the discarded context).
     const cancellationRetirement = isFullClear
-      ? await this.advanceContextMutationEpoch(workspaceId)
+      ? await this.advanceContextMutationEpoch(workspaceId, cancellationNonce)
       : Ok(undefined);
     // r43: a fork's settled branch-summary registration stays consumable
     // until the first send; its row was just deleted, so drop the
@@ -12634,6 +12640,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           );
         }
       }
+      const cancellationNonce =
+        await this.getOrCreateSession(workspaceId).getCompactionCancellationNonce();
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!historyResult.success) {
         return Err(`Failed to read active context before reset: ${historyResult.error}`);
@@ -12675,7 +12683,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           );
         }
         try {
-          await this.getOrCreateSession(workspaceId).retireCompactionCancellation();
+          await this.getOrCreateSession(workspaceId).retireCompactionCancellation(
+            cancellationNonce ?? null
+          );
         } catch (error) {
           return Err(
             `Nothing to reset, but canceled compaction state could not be retired: ${getErrorMessage(error)}`
@@ -12691,8 +12701,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         {
           timestamp: Date.now(),
           contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
-          compactionCancellationNonce:
-            await this.getOrCreateSession(workspaceId).getCompactionCancellationNonce(),
+          compactionCancellationNonce: cancellationNonce,
         }
       );
 
@@ -12703,7 +12712,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // r41: the boundary is durable — sends that entered before it must not
       // be admitted afterwards (their content references the discarded
       // context).
-      const cancellationRetirement = await this.advanceContextMutationEpoch(workspaceId);
+      const cancellationRetirement = await this.advanceContextMutationEpoch(
+        workspaceId,
+        boundaryMessage.metadata?.compactionCancellationNonce ?? null
+      );
       // r43: drop any settled-but-unconsumed branch-summary registration —
       // its row now sits behind the new boundary, and the next send would
       // otherwise re-emit that pre-reset summary into the live transcript.
@@ -12937,6 +12949,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             );
           }
         }
+        const cancellationNonce = !isCompaction
+          ? ((await this.getOrCreateSession(workspaceId).getCompactionCancellationNonce()) ?? null)
+          : null;
+        if (cancellationNonce) {
+          // The replacement row itself proves supersession if sidecar retirement
+          // fails. Capture before destructive I/O so a newer Stop keeps its nonce.
+          messageToAppend = {
+            ...messageToAppend,
+            metadata: {
+              ...messageToAppend.metadata,
+              compactionCancellationNonce: cancellationNonce,
+            },
+          };
+        }
         this.sessions.get(workspaceId)?.clearUsageState();
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(
           workspaceId,
@@ -12949,7 +12975,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         if (!isCompaction) {
           // r41: the destructive replacement is durable — refuse sends that
           // entered before it (see contextMutationEpochs).
-          cancellationRetirement = await this.advanceContextMutationEpoch(workspaceId);
+          cancellationRetirement = await this.advanceContextMutationEpoch(
+            workspaceId,
+            cancellationNonce
+          );
           // r43: same branch-summary hygiene as full clear, and same r44
           // ordering — drop the registration only after the clear commits
           // (see truncateHistory).
@@ -13001,7 +13030,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         deletedSequences = clearResult.data;
       }
 
-      if (!cancellationRetirement.success) return cancellationRetirement;
       const appendResult = await this.historyService.appendToHistory(workspaceId, messageToAppend);
       if (!appendResult.success) {
         return Err(`Failed to append summary message: ${appendResult.error}`);
@@ -13042,7 +13070,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.sessions.get(workspaceId)?.clearFileState();
       }
 
-      return Ok(undefined);
+      return cancellationRetirement;
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to replace history: ${message}`);

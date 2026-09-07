@@ -7540,15 +7540,19 @@ export class AgentSession {
     return this.coordinator.reserve("admission");
   }
 
-  async contextMutationCommitted(): Promise<void> {
+  async contextMutationCommitted(cancellationNonce?: string | null): Promise<void> {
     this.coordinator.invalidateCompaction(false);
     this.continuousCompactor.reset("context-mutation");
-    await this.retireCompactionCancellation();
+    await this.retireCompactionCancellation(cancellationNonce);
   }
 
-  async retireCompactionCancellation(): Promise<void> {
-    const cancellation = await this.compactionCancellation.readForReplacement();
-    if (cancellation) await this.compactionCancellation.retire(cancellation.nonce);
+  async retireCompactionCancellation(cancellationNonce?: string | null): Promise<void> {
+    // null captures absence before a mutation; undefined preserves explicit repair callers.
+    const nonce =
+      cancellationNonce === undefined
+        ? (await this.compactionCancellation.readForReplacement())?.nonce
+        : cancellationNonce;
+    if (nonce) await this.compactionCancellation.retire(nonce);
   }
 
   /**
@@ -8769,9 +8773,8 @@ export class AgentSession {
     if (!this.coordinator.canClearCompactionFollowUp(token)) return;
     const canceled =
       cancellation != null && this.compactionCancellation.matches(cancellation, summaryMessage);
-    if (canceled) await this.compactionCancellation.narrow(cancellation.nonce, summaryMessage);
-    if (!this.coordinator.canClearCompactionFollowUp(token)) return;
-
+    let matched = false;
+    let committed = false;
     const updateResult = await this.historyService.updateHistory(
       this.workspaceId,
       summaryMessage,
@@ -8789,6 +8792,7 @@ export class AgentSession {
         );
       },
       (current) => {
+        matched = true;
         const currentMeta = current.metadata?.muxMetadata;
         assert(isCompactionSummaryMetadata(currentMeta), "Cleanup requires the guarded summary");
         const { pendingFollowUp: _pendingFollowUp, ...muxMetadataWithoutFollowUp } = currentMeta;
@@ -8796,12 +8800,27 @@ export class AgentSession {
           ...current,
           metadata: { ...current.metadata, muxMetadata: muxMetadataWithoutFollowUp },
         };
+      },
+      () => {
+        committed = true;
       }
     );
     if (!updateResult.success) {
+      // Only a target verified under the write lock may narrow an unresolved Stop.
+      // A conditional no-op for obsolete A must leave a foreign successor C intact.
+      if (canceled && matched && this.coordinator.canClearCompactionFollowUp(token)) {
+        try {
+          await this.compactionCancellation.narrow(cancellation.nonce, summaryMessage);
+        } catch (error) {
+          log.warn("Failed to narrow canceled compaction cleanup", {
+            workspaceId: this.workspaceId,
+            error,
+          });
+        }
+      }
       throw new Error(`Failed to clear skipped pending follow-up: ${updateResult.error}`);
     }
-    if (canceled && this.coordinator.canClearCompactionFollowUp(token))
+    if (committed && canceled && this.coordinator.canClearCompactionFollowUp(token))
       await this.compactionCancellation.retire(cancellation.nonce);
   }
 

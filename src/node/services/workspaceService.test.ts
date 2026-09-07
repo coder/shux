@@ -26,7 +26,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { Config, SecretsStore } from "@/node/config";
-import type { HistoryService } from "./historyService";
+import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { SessionTimingService } from "./sessionTimingService";
 import { SessionUsageService } from "./sessionUsageService";
@@ -7259,6 +7259,250 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  test.each([false, true])(
+    "no-op reset preserves a foreign Stop during cleanup (prior Stop=%s)",
+    async (priorStop) => {
+      const { config, workspaceService, cleanup } = await createServices();
+      const workspaceId = "noop-reset-cancellation";
+      await config.addWorkspace("/tmp/noop-reset-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "noop-reset-project",
+        projectPath: "/tmp/noop-reset-project",
+        runtimeConfig: { type: "local" },
+      });
+      const session = workspaceService.getOrCreateSession(workspaceId);
+      if (priorStop) {
+        await session.interruptStream({ abandonPartial: true });
+        await session.retryPendingCompactionCleanup();
+      }
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const clear = session.clearPostCompactionState.bind(session);
+      spyOn(session, "clearPostCompactionState").mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        await clear();
+      });
+      const reset = workspaceService.resetContext(workspaceId);
+      const foreignHistory = new HistoryService(config);
+      const foreign = await createAgentSessionHarness({
+        workspaceId,
+        config,
+        historyService: foreignHistory,
+      });
+      try {
+        await entered.promise;
+        await foreignHistory.appendToHistory(
+          workspaceId,
+          createMuxMessage("foreign-summary", "assistant", "foreign context", {
+            muxMetadata: {
+              type: "compaction-summary",
+              pendingFollowUp: {
+                text: "Continue foreign",
+                model: "openai:gpt-4o",
+                agentId: "exec",
+              },
+            },
+          })
+        );
+        await foreign.session.interruptStream({ abandonPartial: true });
+        await foreign.session.retryPendingCompactionCleanup();
+        const stopped = await foreignHistory.readCompactionCancellation(workspaceId);
+        release.resolve();
+        expect(await reset).toEqual(Ok("noop"));
+        expect(await new HistoryService(config).readCompactionCancellation(workspaceId)).toEqual(
+          stopped
+        );
+      } finally {
+        release.resolve();
+        await reset;
+        await foreign.session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
+  test("destructive replacement publishes its durable witness before reporting failed retirement", async () => {
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "replacement-retirement-witness";
+    await config.addWorkspace("/tmp/replacement-witness-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "replacement-witness-project",
+      projectPath: "/tmp/replacement-witness-project",
+      runtimeConfig: { type: "local" },
+    });
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("old-user", "user", "old context")
+    );
+    const session = workspaceService.getOrCreateSession(workspaceId);
+    await session.interruptStream({ abandonPartial: true });
+    await session.retryPendingCompactionCleanup();
+    const nonce = await session.getCompactionCancellationNonce();
+    const events: WorkspaceChatMessage[] = [];
+    const detach = session.onChatEvent(({ message }) => events.push(message));
+    const write = historyService.writeCompactionCancellation.bind(historyService);
+    const failedRetire = spyOn(historyService, "writeCompactionCancellation").mockImplementation(
+      async (...args) => {
+        if (args[1] === null) throw new Error("replacement retirement unavailable");
+        return write(...args);
+      }
+    );
+    try {
+      const result = await workspaceService.replaceHistory(
+        workspaceId,
+        createMuxMessage("replacement", "assistant", "new context", {
+          muxMetadata: {
+            type: "compaction-summary",
+            pendingFollowUp: {
+              text: "Continue replacement",
+              model: "openai:gpt-4o",
+              agentId: "exec",
+            },
+          },
+        })
+      );
+      expect(!result.success && result.error).toContain("replacement retirement unavailable");
+      const freshHistory = new HistoryService(config);
+      const rows = await freshHistory.getHistoryFromLatestBoundary(workspaceId);
+      expect(
+        rows.success && rows.data.map((row) => [row.id, row.metadata?.compactionCancellationNonce])
+      ).toEqual([["replacement", nonce]]);
+      expect(
+        events
+          .filter((event) => event.type === "delete" || event.type === "message")
+          .map((event) => event.type)
+      ).toEqual(["delete", "message"]);
+      expect(await freshHistory.readCompactionCancellation(workspaceId)).not.toBeNull();
+      const restarted = await createAgentSessionHarness({
+        workspaceId,
+        config,
+        historyService: freshHistory,
+      });
+      const stream = spyOn(restarted.aiService, "streamMessage");
+      try {
+        await restarted.session.runStartupRecovery();
+        expect(stream).toHaveBeenCalledTimes(1);
+        expect(await freshHistory.readCompactionCancellation(workspaceId)).toBeNull();
+        const tail = await freshHistory.getLastMessages(workspaceId, 1);
+        expect(tail.success && tail.data[0].parts).toMatchObject([
+          { type: "text", text: "Continue replacement" },
+        ]);
+      } finally {
+        await restarted.session.dispose();
+      }
+    } finally {
+      detach();
+      failedRetire.mockRestore();
+      await cleanup();
+    }
+  });
+
+  test.each([
+    ["reset", false],
+    ["reset", true],
+    ["clear", false],
+    ["clear", true],
+    ["replace", false],
+    ["replace", true],
+  ] as const)(
+    "%s preserves a newer Stop after its durable write (prior Stop=%s)",
+    async (operation, priorStop) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "context-captured-cancellation";
+      await config.addWorkspace("/tmp/context-cancellation-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "context-cancellation-project",
+        projectPath: "/tmp/context-cancellation-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("old-user", "user", "old context")
+      );
+      const session = workspaceService.getOrCreateSession(workspaceId);
+      if (priorStop) {
+        await session.interruptStream({ abandonPartial: true });
+        await session.retryPendingCompactionCleanup();
+      }
+      const oldNonce = await session.getCompactionCancellationNonce();
+      let newNonce: string | undefined;
+      const stop = async () => {
+        await session.interruptStream({ abandonPartial: true });
+        newNonce = await session.getCompactionCancellationNonce();
+      };
+      if (operation === "reset") {
+        const append = historyService.appendToHistory.bind(historyService);
+        spyOn(historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
+          const result = await append(...args);
+          await stop();
+          return result;
+        });
+      } else if (operation === "clear") {
+        const truncate = historyService.truncateHistory.bind(historyService);
+        spyOn(historyService, "truncateHistory").mockImplementationOnce(async (...args) => {
+          const result = await truncate(...args);
+          await stop();
+          return result;
+        });
+      } else {
+        const clear = historyService.clearHistory.bind(historyService);
+        spyOn(historyService, "clearHistory").mockImplementationOnce(async (...args) => {
+          const result = await clear(...args);
+          await stop();
+          return result;
+        });
+      }
+      try {
+        const result =
+          operation === "reset"
+            ? await workspaceService.resetContext(workspaceId)
+            : operation === "clear"
+              ? await workspaceService.truncateHistory(workspaceId)
+              : await workspaceService.replaceHistory(
+                  workspaceId,
+                  createMuxMessage("replacement", "assistant", "new context", {
+                    muxMetadata: {
+                      type: "compaction-summary",
+                      pendingFollowUp: {
+                        text: "Continue replacement",
+                        model: "openai:gpt-4o",
+                        agentId: "exec",
+                      },
+                    },
+                  })
+                );
+        expect(result.success).toBe(true);
+        await session.retryPendingCompactionCleanup();
+        expect(newNonce).toBeDefined();
+        expect(newNonce).not.toBe(oldNonce);
+        const freshHistory = new HistoryService(config);
+        expect((await freshHistory.readCompactionCancellation(workspaceId))?.nonce).toBe(newNonce);
+        if (operation === "replace") {
+          const rows = await freshHistory.getHistoryFromLatestBoundary(workspaceId);
+          expect(rows.success && rows.data[0].metadata?.compactionCancellationNonce).toBe(oldNonce);
+          const restarted = await createAgentSessionHarness({
+            workspaceId,
+            config,
+            historyService: freshHistory,
+          });
+          const stream = spyOn(restarted.aiService, "streamMessage");
+          try {
+            await restarted.session.runStartupRecovery();
+            expect(stream).not.toHaveBeenCalled();
+          } finally {
+            await restarted.session.dispose();
+          }
+        }
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+
   test.each(["reset", "clear", "replace"] as const)(
     "committed %s still publishes invalidation and hygiene when cancellation retirement fails",
     async (operation) => {
@@ -7304,6 +7548,10 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         expect(result.success).toBe(false);
         expect(!result.success && result.error).toContain("cancel unlink unavailable");
         expect(epochs.get(workspaceId)).toBe(before + 1);
+        if (operation === "replace") {
+          const persisted = await historyService.getHistoryFromLatestBoundary(workspaceId);
+          expect(persisted.success && persisted.data.map((row) => row.id)).toEqual(["replacement"]);
+        }
         if (operation !== "replace") expect(clearState).toHaveBeenCalled();
         expect(clearCarryover).toHaveBeenCalled();
         expect(discard).toHaveBeenCalled();

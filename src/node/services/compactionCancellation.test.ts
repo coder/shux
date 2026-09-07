@@ -141,3 +141,92 @@ test("failed initial publication cannot be acknowledged by exact narrowing", asy
     await h.cleanup();
   }
 });
+
+test.each([
+  ["cancel", false],
+  ["cancel", true],
+  ["narrow", false],
+  ["narrow", true],
+  ["retire", false],
+  ["retire", true],
+] as const)(
+  "a held shared read cannot overwrite local %s (read error=%s)",
+  async (action, reject) => {
+    const h = await createTestHistoryService();
+    const workspaceId = "cancel-refresh-race";
+    const state = new CompactionCancellation(h.historyService, workspaceId);
+    await state.cancel();
+    const initial = await state.read();
+    if (!initial) throw new Error("Expected initial cancellation");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const read = h.historyService.readCompactionCancellation.bind(h.historyService);
+    spyOn(h.historyService, "readCompactionCancellation").mockImplementationOnce(
+      async (...args) => {
+        const result = await read(...args);
+        entered.resolve();
+        await release.promise;
+        if (reject) throw new Error("obsolete shared read failed");
+        return result;
+      }
+    );
+    const reading = state.readForReplacement();
+    try {
+      await entered.promise;
+      if (action === "cancel") await state.cancel();
+      if (action === "retire") await state.retire(initial.nonce);
+      if (action === "narrow")
+        await state.narrow(
+          initial.nonce,
+          createMuxMessage("summary", "assistant", "summary", {
+            historySequence: 1,
+            muxMetadata: {
+              type: "compaction-summary",
+              pendingFollowUp: { text: "Continue", model: "openai:gpt-4o", agentId: "exec" },
+            },
+          })
+        );
+      const committed = await new HistoryService(h.config).readCompactionCancellation(workspaceId);
+      release.resolve();
+      expect(await reading).toEqual(committed);
+      expect(await state.read()).toEqual(committed);
+      expect(state.needsPersistence).toBe(false);
+    } finally {
+      release.resolve();
+      await reading;
+      await h.cleanup();
+    }
+  }
+);
+
+test("refreshing a foreign nonce does not reactivate settled mutation debt", async () => {
+  const h = await createTestHistoryService();
+  const workspaceId = "cancel-refresh-debt";
+  const a = new CompactionCancellation(h.historyService, workspaceId);
+  const b = new CompactionCancellation(new HistoryService(h.config), workspaceId);
+  try {
+    await a.cancel();
+    const old = await a.read();
+    if (!old) throw new Error("Expected old cancellation");
+    await b.cancel();
+    const current = await b.read();
+    expect(await a.read()).toEqual(current);
+    await a.retry();
+    await a.retire(old.nonce);
+    await a.narrow(
+      old.nonce,
+      createMuxMessage("old", "assistant", "old", {
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: { text: "A", model: "openai:gpt-4o", agentId: "exec" },
+        },
+      })
+    );
+    expect(a.needsPersistence).toBe(false);
+    expect(await new HistoryService(h.config).readCompactionCancellation(workspaceId)).toEqual(
+      current
+    );
+  } finally {
+    await h.cleanup();
+  }
+});

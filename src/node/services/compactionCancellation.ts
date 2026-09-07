@@ -37,10 +37,19 @@ export class CompactionCancellation {
   }
 
   async read(): Promise<CompactionCancellationRecord | null> {
-    if (this.current !== undefined) return this.current;
+    // Other backends can publish Stop after a previous read (including absence).
+    // Local in-flight/failed mutations still own their conservative exclusion.
+    if (this.unsettled) return this.current ?? null;
     const generation = this.generation;
-    const record = await this.history.readCompactionCancellation(this.workspaceId);
-    if (generation === this.generation) this.current = record;
+    const mutation = this.mutation;
+    const isCurrent = () => generation === this.generation && mutation === this.mutation;
+    try {
+      const record = await this.history.readCompactionCancellation(this.workspaceId);
+      if (isCurrent()) this.current = record;
+    } catch (error) {
+      // An obsolete read must not trigger explicit repair over a newer local Stop.
+      if (isCurrent()) throw error;
+    }
     return this.current ?? null;
   }
 
