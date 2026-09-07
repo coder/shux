@@ -520,7 +520,11 @@ describe("AgentSession startup auto-retry recovery", () => {
       startupAutoRetryCheckScheduled: boolean;
     };
 
-    privateSession.coordinator.prepare();
+    privateSession.coordinator.prepare({
+      kind: "fresh",
+      intent: "handoff",
+      expectedTurnId: privateSession.coordinator.turnId,
+    });
     session.ensureStartupAutoRetryCheck();
 
     const firstCheckPromise = privateSession.startupAutoRetryCheckPromise;
@@ -1757,7 +1761,11 @@ describe("AgentSession startup auto-retry recovery", () => {
     };
 
     privateSession.activeStreamUserMessageId = "user-1";
-    privateSession.coordinator.prepare();
+    privateSession.coordinator.prepare({
+      kind: "fresh",
+      intent: "handoff",
+      expectedTurnId: privateSession.coordinator.turnId,
+    });
 
     void runSessionTerminalPolicy(session, aiEmitter, {
       type: "stream-abort",

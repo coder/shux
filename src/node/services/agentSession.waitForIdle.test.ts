@@ -24,7 +24,11 @@ describe("AgentSession.waitForIdle", () => {
     const internalSession = session as unknown as IdleWaiterTestSession;
 
     try {
-      internalSession.coordinator.prepare();
+      internalSession.coordinator.prepare({
+        kind: "fresh",
+        intent: "handoff",
+        expectedTurnId: internalSession.coordinator.turnId,
+      });
       const controller = new AbortController();
       const waitResult = captureWaitForIdleResult(session.waitForIdle(controller.signal));
 
@@ -104,7 +108,11 @@ describe("AgentSession.waitForIdle", () => {
     const internalSession = session as unknown as IdleWaiterTestSession;
 
     try {
-      internalSession.coordinator.prepare();
+      internalSession.coordinator.prepare({
+        kind: "fresh",
+        intent: "handoff",
+        expectedTurnId: internalSession.coordinator.turnId,
+      });
       const waits = Array.from({ length: 3 }, () => {
         const controller = new AbortController();
         return {

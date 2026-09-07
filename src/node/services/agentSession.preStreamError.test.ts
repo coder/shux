@@ -296,7 +296,11 @@ describe("AgentSession pre-stream errors", () => {
       coordinator: TurnCoordinator;
     };
 
-    privateSession.coordinator.prepare();
+    privateSession.coordinator.prepare({
+      kind: "fresh",
+      intent: "handoff",
+      expectedTurnId: privateSession.coordinator.turnId,
+    });
     aiEmitter.emit("runtime-status", {
       type: "runtime-status",
       workspaceId,
