@@ -1,6 +1,6 @@
 import { secureStore, stackState } from "./sessionTestPlatform";
 import { afterEach, expect, test } from "bun:test";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { createORPCClient } from "@orpc/client";
 import { ConnectedApp } from "../../App";
 import type { Connection } from "./ConnectScreen";
@@ -279,6 +279,22 @@ test("settings opened from the wide workspace root retains the back anchor when 
   expect(view.chats[0].signal.aborted).toBe(false);
 });
 
+function questionInput(id: string) {
+  return {
+    questions: [
+      {
+        question: `Answer ${id}?`,
+        header: "Branch",
+        options: [
+          { label: "main", description: "Stable branch" },
+          { label: "next", description: "Upcoming release" },
+        ],
+        multiSelect: false,
+      },
+    ],
+  };
+}
+
 function question(
   id = "question",
   sequence = 1,
@@ -295,7 +311,7 @@ function question(
         toolName: "ask_user_question",
         toolCallId: id,
         state: "input-available",
-        input: { questions: [{ question: `Answer ${id}?` }] },
+        input: questionInput(id),
       },
     ],
   };
@@ -315,7 +331,11 @@ function callCount(view: ReturnType<typeof fixture>, name: string) {
   return view.calls.filter((call) => call.path === `workspace.${name}`).length;
 }
 async function submitAnswer(view: ReturnType<typeof fixture>, id = "question") {
-  fireEvent.change(view.getByLabelText(`Answer ${id}?`), { target: { value: "main" } });
+  fireEvent.click(
+    within(view.getByRole("radiogroup", { name: `Answer ${id}?` })).getByRole("radio", {
+      name: "main",
+    })
+  );
   await act(async () => fireEvent.click(view.getByRole("button", { name: "Send answers" })));
 }
 
@@ -356,13 +376,21 @@ test("live questions do not resume, and older pending partials stay disabled whi
       toolCallId: "live",
       toolName: "ask_user_question",
       tokens: 1,
-      args: { questions: [{ question: "Answer live?" }] },
+      args: questionInput("live"),
       timestamp: 1,
     },
   ]);
   await view.select("alpha");
-  expect(view.getByLabelText("Answer old?").getAttribute("readonly")).not.toBeNull();
-  fireEvent.change(view.getByLabelText("Answer live?"), { target: { value: "main" } });
+  expect(
+    within(view.getByRole("radiogroup", { name: "Answer old?" }))
+      .getByRole("radio", { name: "main" })
+      .getAttribute("aria-disabled")
+  ).toBe("true");
+  fireEvent.click(
+    within(view.getByRole("radiogroup", { name: "Answer live?" })).getByRole("radio", {
+      name: "main",
+    })
+  );
   const buttons = view.getAllByRole("button", { name: "Send answers" });
   await act(async () => buttons.forEach((button) => fireEvent.click(button)));
   expect(callCount(view, "answerAskUserQuestion")).toBe(1);
@@ -382,7 +410,11 @@ for (const latest of [
   test(`an old recovered question is not re-enabled by a later ${latest.role} message`, async () => {
     const view = fixture([question("old"), latest]);
     await view.select("alpha");
-    expect(view.getByLabelText("Answer old?").getAttribute("readonly")).not.toBeNull();
+    expect(
+      within(view.getByRole("radiogroup", { name: "Answer old?" }))
+        .getByRole("radio", { name: "main" })
+        .getAttribute("aria-disabled")
+    ).toBe("true");
     expect(callCount(view, "answerAskUserQuestion")).toBe(0);
   });
 }
@@ -390,7 +422,11 @@ for (const latest of [
 test("a complete historical pending question is not recoverable", async () => {
   const view = fixture([question("complete", 1, false)]);
   await view.select("alpha");
-  expect(view.getByLabelText("Answer complete?").getAttribute("readonly")).not.toBeNull();
+  expect(
+    within(view.getByRole("radiogroup", { name: "Answer complete?" }))
+      .getByRole("radio", { name: "main" })
+      .getAttribute("aria-disabled")
+  ).toBe("true");
 });
 
 test("a successful no-op resume keeps the recovery action without resubmitting the answer", async () => {
