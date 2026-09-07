@@ -571,6 +571,51 @@ test("changing effort returns to the model picker and closing retains the immedi
   expect(closed).toBe(1);
 });
 
+test.each([
+  { source: "pro", target: "standard", bucket: true, expected: "standard" },
+  { source: "pro", target: undefined, bucket: true, expected: "standard" },
+  { source: "standard", target: "pro", bucket: true, expected: "pro" },
+  { source: "pro", target: undefined, bucket: false, expected: "pro" },
+] as const)("mode selection uses the target reasoning mode: %j", (scenario) => {
+  const changes: ChatSettings[] = [];
+  const selected: ChatSettings = {
+    ...pickerValue,
+    model: "coder:openai/gpt-6-astra",
+    reasoningMode: scenario.source,
+  };
+  const view = render(
+    <ModelSettings
+      initialPage="agent"
+      value={selected}
+      data={{
+        ...pickerData,
+        config: {
+          ...pickerData.config,
+          agentAiDefaults: scenario.bucket
+            ? { plan: { reasoningMode: scenario.target === "pro" ? "standard" : "pro" } }
+            : {},
+        },
+      }}
+      workspace={{
+        ...workspace,
+        aiSettingsByAgent: scenario.bucket
+          ? {
+              plan: {
+                model: "local:other",
+                thinkingLevel: "low",
+                ...(scenario.target ? { reasoningMode: scenario.target } : {}),
+              },
+            }
+          : {},
+      }}
+      onChange={(next) => changes.push(next)}
+      onClose={() => {}}
+    />
+  );
+  fireEvent.click(view.getByRole("radio", { name: /Plan/ }));
+  expect(changes).toEqual([{ ...selected, agentId: "plan", reasoningMode: scenario.expected }]);
+});
+
 test("mode selection preserves an explicit model and effort rather than resetting to agent defaults", () => {
   const changes: ChatSettings[] = [];
   let closed = 0;

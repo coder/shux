@@ -173,12 +173,19 @@ export function ModelSettings(props: {
                 selected={agent.id === props.value.agentId}
                 onPress={() => {
                   // Mode and model are separate controls: choosing a mode must not replace an explicit model/effort.
-                  if (agent.id !== props.value.agentId)
+                  if (agent.id !== props.value.agentId) {
+                    // Reasoning belongs to the target agent; legacy buckets resolve to Standard.
+                    const target = resolveSettings(props.workspace, props.data, agent.id);
                     props.onChange(
                       props.value.model
-                        ? { ...props.value, agentId: agent.id }
-                        : resolveSettings(props.workspace, props.data, agent.id)
+                        ? {
+                            ...props.value,
+                            agentId: agent.id,
+                            reasoningMode: target.reasoningMode ?? props.value.reasoningMode,
+                          }
+                        : target
                     );
+                  }
                   props.onClose();
                 }}
               />
