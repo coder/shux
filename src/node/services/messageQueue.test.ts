@@ -123,6 +123,24 @@ describe("MessageQueue", () => {
       expect(queue.getVisibleRestoreReviews()).toBeUndefined();
     });
 
+    it("validates display reviews per first-entry metadata without altering dispatch or later restore notes", () => {
+      const invalidMetadata = { reviews: [reviews[0], { ...reviews[1], selectedDiff: 42 }] };
+      queue.add("invalid first", { ...options, muxMetadata: invalidMetadata, fileParts: [file] });
+      queue.add("valid batched", { ...options, muxMetadata: { reviews: [reviews[1]] } });
+      expect(queue.getVisibleReviews()).toBeUndefined();
+      expect(queue.getVisibleRestoreReviews()).toEqual([reviews[1]]);
+      queue.add(
+        "valid separate",
+        { ...options, muxMetadata: { reviews: [reviews[0]] } },
+        { sealed: true }
+      );
+      expect(queue.getVisibleReviews()).toEqual([reviews[0]]);
+      expect(queue.getVisibleDisplayText()).toBe("invalid first\nvalid batched\nvalid separate");
+      const dispatched = queue.dequeueNext();
+      expect(dispatched.options?.muxMetadata).toBe(invalidMetadata);
+      expect(dispatched.options?.fileParts).toEqual([file]);
+    });
+
     it("keeps raw commands for compaction and agent-skill restoration", () => {
       for (const metadata of [
         { type: "compaction-request", rawCommand: "/compact" },

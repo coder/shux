@@ -3,7 +3,10 @@ import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 
 import { prepareUserMessageForSend } from "@/common/types/message";
-import { RestoreToInputEventSchema } from "@/common/orpc/schemas/stream";
+import {
+  QueuedMessageChangedEventSchema,
+  RestoreToInputEventSchema,
+} from "@/common/orpc/schemas/stream";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
@@ -717,7 +720,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("restoreQueueToInput preserves text and omits an entire malformed review array before clearing", async () => {
+  test("queue enqueue, full replay and restoration preserve text while omitting malformed review arrays", async () => {
     const workspaceId = "queue-restore-invalid-reviews";
     const { session, cleanup } = await createAgentSessionHarness({ workspaceId });
     const review = {
@@ -746,9 +749,12 @@ describe("AgentSession queued message tool-call dispatch", () => {
       [review, { ...review, selectedDiff: 42 }],
     ];
     const restored: Array<Extract<WorkspaceChatMessage, { type: "restore-to-input" }>> = [];
-    const unsubscribe = session.onChatEvent(({ message }) => {
+    const queued: Array<Extract<WorkspaceChatMessage, { type: "queued-message-changed" }>> = [];
+    const observe = ({ message }: { message: WorkspaceChatMessage }) => {
       if (message.type === "restore-to-input") restored.push(message);
-    });
+      if (message.type === "queued-message-changed") queued.push(message);
+    };
+    const unsubscribe = session.onChatEvent(observe);
     try {
       for (const reviews of invalidReviews) {
         session.queueMessage(original, {
@@ -756,7 +762,18 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentId: "exec",
           muxMetadata: { reviews },
         });
+        const live = QueuedMessageChangedEventSchema.parse(queued.at(-1));
+        expect(live).toMatchObject({
+          displayText: original.trim(),
+          queuedMessages: [original.trim()],
+        });
+        expect(live.reviews).toBeUndefined();
+        const beforeReplay = queued.length;
+        await session.replayHistory(observe, { type: "full" });
+        expect(queued).toHaveLength(beforeReplay + 1);
+        expect(QueuedMessageChangedEventSchema.parse(queued.at(-1))).toEqual(live);
         session.restoreQueueToInput();
+        expect(QueuedMessageChangedEventSchema.parse(queued.at(-1)).queuedMessages).toEqual([]);
         const event = restored.at(-1);
         expect(RestoreToInputEventSchema.safeParse(event).success).toBe(true);
         expect(event?.text).toBe(original);
@@ -770,7 +787,16 @@ describe("AgentSession queued message tool-call dispatch", () => {
         agentId: "exec",
         muxMetadata: { reviews: [review] },
       });
+      expect(QueuedMessageChangedEventSchema.parse(queued.at(-1)).reviews).toEqual([review]);
+      await session.replayHistory(observe, { type: "full" });
+      expect(QueuedMessageChangedEventSchema.parse(queued.at(-1)).reviews).toEqual([review]);
       session.restoreQueueToInput();
+      expect(
+        queued.every((event) => QueuedMessageChangedEventSchema.safeParse(event).success)
+      ).toBe(true);
+      expect(restored.every((event) => RestoreToInputEventSchema.safeParse(event).success)).toBe(
+        true
+      );
       const valid = RestoreToInputEventSchema.parse(restored.at(-1));
       expect(valid.text).toBe("  User body\n");
       expect(valid.reviews).toEqual([review]);

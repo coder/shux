@@ -80,17 +80,14 @@ function isAgentPeerMessageMetadata(meta: unknown): boolean {
   return obj.type === "agent-peer-message" && typeof obj.fromWorkspaceId === "string";
 }
 
-const RestoreReviewsSchema = ReviewNoteDataSchema.array();
+const ReviewsSchema = ReviewNoteDataSchema.array();
 
-// Type guard for metadata with reviews
-interface MetadataWithReviews {
-  reviews?: ReviewNoteData[];
-}
-
-function hasReviews(meta: unknown): meta is MetadataWithReviews {
-  if (typeof meta !== "object" || meta === null) return false;
-  const obj = meta as Record<string, unknown>;
-  return Array.isArray(obj.reviews);
+// Both live/replayed queue snapshots and restored input cross a strict event schema.
+// Reject whole malformed arrays rather than partially stripping their rendered prefixes.
+function getValidatedReviews(meta: unknown): ReviewNoteData[] | undefined {
+  if (typeof meta !== "object" || meta === null || !("reviews" in meta)) return undefined;
+  const parsed = ReviewsSchema.safeParse(meta.reviews);
+  return parsed.success ? parsed.data : undefined;
 }
 
 type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
@@ -654,13 +651,7 @@ export class MessageQueue {
         ? "pause"
         : (options?.goalInterventionPolicy ?? entry.goalInterventionPolicy);
 
-    // Validate the entire black-box array before stripping text: filtering individual
-    // notes could duplicate a mixed array's rendered prefix, and an invalid outgoing
-    // review would reject restoration after the queue has already been cleared.
-    const parsedReviews = hasReviews(options?.muxMetadata)
-      ? RestoreReviewsSchema.safeParse(options.muxMetadata.reviews)
-      : undefined;
-    const reviews = parsedReviews?.success ? parsedReviews.data : undefined;
+    const reviews = getValidatedReviews(options?.muxMetadata);
     entry.restoreMessages.push({
       text: stripRenderedReviews(message, reviews),
       reviews,
@@ -807,9 +798,7 @@ export class MessageQueue {
   }
 
   private getReviewsForEntries(entries: readonly QueueEntry[]): ReviewNoteData[] | undefined {
-    const reviews = entries.flatMap((entry) =>
-      hasReviews(entry.muxMetadata) ? (entry.muxMetadata.reviews ?? []) : []
-    );
+    const reviews = entries.flatMap((entry) => getValidatedReviews(entry.muxMetadata) ?? []);
     return reviews.length > 0 ? reviews : undefined;
   }
 
