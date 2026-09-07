@@ -1326,12 +1326,13 @@ export class AgentSession {
 
   async replayHistory(
     listener: (event: AgentSessionChatEvent) => void,
-    mode?: OnChatMode
+    mode?: OnChatMode,
+    beforeReplayCompletion?: () => void
   ): Promise<void> {
     this.assertNotDisposed("replayHistory");
     assert(typeof listener === "function", "listener must be a function");
     await this.replayPublication.run({ listener, emittedStreamEvents: false }, () =>
-      this.emitHistoricalEvents(listener, mode)
+      this.emitHistoricalEvents(listener, mode, beforeReplayCompletion)
     );
   }
 
@@ -2673,7 +2674,8 @@ export class AgentSession {
 
   private async emitHistoricalEvents(
     listener: (event: AgentSessionChatEvent) => void,
-    mode?: OnChatMode
+    mode?: OnChatMode,
+    beforeReplayCompletion?: () => void
   ): Promise<void> {
     let replayMode: "full" | "since" | "live" = "full";
     let hasOlderHistory: boolean | undefined;
@@ -3010,6 +3012,8 @@ export class AgentSession {
       // Replay failed, so do not advertise a trustworthy reconnect cursor.
       serverCursor = undefined;
     } finally {
+      // Flush overlapping live events before authoritative final snapshots, including on replay failure.
+      beforeReplayCompletion?.();
       if (shouldReplayTerminalState) {
         // Replay the latest terminal/preparing state one last time before caught-up in case the
         // stream changed while history was replaying (for example PREPARING -> failed/idle).

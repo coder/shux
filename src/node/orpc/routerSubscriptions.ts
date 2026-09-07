@@ -297,8 +297,9 @@ export function subscribeWorkspaceChat(
     },
     initialize: async () => {
       await session.replayHistory(
-        ({ message }) => replayRelay.handleSessionMessage(message),
-        input.mode
+        ({ message }) => replayRelay.handleReplayMessage(message),
+        input.mode,
+        replayRelay.finishReplay
       );
       replayRelay.finishReplay();
       session.scheduleStartupRecovery();
