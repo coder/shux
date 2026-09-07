@@ -6992,6 +6992,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "Enable [server access](/config/server-access), or start `xum server`. Use a trusted HTTPS endpoint accessible from the device and enter the server's bearer token separately. Include any reverse-proxy path prefix in the endpoint. A Coder login page or another upstream authentication layer may require additional network access; the Xum token does not authenticate to that outer layer.",
       "",
+      "During development, run the mobile client and server from the same branch/revision. Their shared API contract evolves together; for example, the multi-repository changes view requires the server's bulk project-diff endpoint.",
+      "",
       "The token grants access to the server, including its code-execution capabilities. Treat it like a password. Native builds save connection details in device secure storage. The web preview keeps them in memory only; refreshing requires entering them again. Disconnect clears the saved native connection.",
       "",
       "Public endpoints require HTTPS. Literal private LAN and loopback HTTP addresses are accepted for development, with a plaintext-token warning. Mobile platform transport policies may still restrict cleartext networking; prefer HTTPS on devices. A phone's `localhost` refers to the phone, not your development computer.",
