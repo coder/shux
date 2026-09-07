@@ -95,7 +95,7 @@ describe("WorkspaceModeAISync", () => {
     expect(consumeWorkspaceModelChange(workspaceId, planModel)).toBe("agent");
   });
 
-  test("prefers configured agent defaults over workspace-by-agent overrides", async () => {
+  test("preserves unsent workspace choices over configured agent defaults", async () => {
     const workspaceId = nextWorkspaceId();
 
     const configuredModel = "anthropic:claude-haiku-4-5";
@@ -116,8 +116,8 @@ describe("WorkspaceModeAISync", () => {
     renderSync({ workspaceId, agentId: "exec" });
 
     await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(configuredModel);
-      expect(readPersistedState(getThinkingLevelKey(workspaceId), "high")).toBe(configuredThinking);
+      expect(readPersistedState(getModelKey(workspaceId), "")).toBe("some-legacy-model");
+      expect(readPersistedState(getThinkingLevelKey(workspaceId), "high")).toBe("medium");
     });
   });
 

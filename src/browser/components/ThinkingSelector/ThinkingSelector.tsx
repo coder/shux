@@ -129,7 +129,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
           props.allowProMode !== false &&
           openaiProModeAvailable(props.modelString, {
             providersConfig,
-            resolvedRouteProvider: resolvedRoute,
+            effectiveRouteProvider: routing.resolveEffectiveRoute(props.modelString),
           }),
         fastModeProvider:
           props.allowFastMode !== false && providersConfig != null

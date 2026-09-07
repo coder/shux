@@ -70,7 +70,6 @@ async function createPreparationHarness() {
       throw new Error("not used by request preparation tests");
     },
     shouldAllowLegacyInvalidWorkflowAgentOutputSchema: () => Promise.resolve(false),
-    createModel: () => Promise.reject(new Error("not used by request preparation tests")),
     isStreaming: () => false,
     trackPendingDevToolsRunMetadata: () => undefined,
   });

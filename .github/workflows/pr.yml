@@ -201,6 +201,7 @@ jobs:
             # when sharing the monolithic process; keep them in fresh isolated processes.
             src/node/services/workflows/WorkflowRunner.test.ts
             src/node/services/ptc/quickjsRuntime.test.ts
+            src/node/services/tools/code_execution.test.ts
             src/node/services/sandbox/sandboxHostService.test.ts
             src/node/services/agentPlugins/hookService.test.ts
             src/node/orpc/router.test.ts

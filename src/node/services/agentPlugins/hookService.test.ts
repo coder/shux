@@ -420,8 +420,17 @@ describe("AgentPluginHookService", () => {
       },
     });
     attachLanguageModelCleanup(sdkModel, cleanup);
-    const create = spyOn(h.aiService, "createModelWithPinnedMetadata").mockResolvedValue(
-      Ok({ model: sdkModel, metadataModel: "openai:gpt-4o" })
+    const create = spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok({
+        model: sdkModel,
+        metadataModel: "openai:gpt-4o",
+        effectiveModelString: "openai:gpt-4o",
+        wireProviderName: "openai",
+        optionsModelString: "openai:gpt-4o",
+        optionsProvidersConfig: {},
+        optionsMuxProviderOptions: {},
+        optionsRouteProvider: "openai",
+      })
     );
     const record = mock(() => Promise.resolve(undefined));
     try {

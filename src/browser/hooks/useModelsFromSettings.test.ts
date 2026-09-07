@@ -86,6 +86,7 @@ const useRoutingMock = mock(() => ({
   routePriority,
   routeOverrides,
   resolveRoute: () => ({ route: "direct", isAuto: true, displayName: "Direct" }),
+  resolveEffectiveRoute: () => "direct",
   availableRoutes: () => [],
   setRoutePreferences: () => {
     /* noop */
@@ -572,6 +573,29 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
     expect(result.current.models).not.toContain(KNOWN_MODELS.GPT_PRO.id);
     expect(result.current.models).not.toContain("openai:gpt-5.2-pro");
+  });
+
+  test("policy-hidden Coder metadata does not expose Coder models or routes", () => {
+    providersConfig = {
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      coder: {
+        apiKeySet: false,
+        isEnabled: false,
+        isConfigured: false,
+        discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+      },
+    };
+    routePriority = ["coder", "direct"];
+    enforcedPolicy = buildEnforcedPolicy([{ id: "openai", allowedModels: null }]);
+    const { result } = renderHook(() => useModelsFromSettings());
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT_6_ASTRA.id);
+    expect(result.current.models.some((model) => model.startsWith("coder:"))).toBe(false);
+    expect(getSuggestedModels(providersConfig).some((model) => model.startsWith("coder:"))).toBe(
+      false
+    );
+    expect(result.current.isAllowedByPolicyOnActiveRoute("coder:prod-openai/gpt-6-astra")).toBe(
+      false
+    );
   });
 
   test("a gateway-only policy keeps models whose active route is that gateway", () => {

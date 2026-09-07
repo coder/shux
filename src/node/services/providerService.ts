@@ -22,7 +22,7 @@
  */
 import { EventEmitter } from "events";
 import { Effect, Schema } from "effect";
-import type { Config, ProjectsConfig } from "@/node/config";
+import type { Config, ProjectsConfig, ProvidersConfig } from "@/node/config";
 import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import {
   PROVIDER_DEFINITIONS,
@@ -363,8 +363,10 @@ export class ProviderService {
   /**
    * Get the full providers config with safe info (no actual API keys)
    */
-  public getConfig(): ProvidersConfigMap {
-    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
+  public getConfig(snapshot?: ProvidersConfig): ProvidersConfigMap {
+    // Request builders can project their creation-time snapshot without racing
+    // a second disk read that changes instance types or scoped model aliases.
+    const providersConfig = snapshot ?? this.providersConfigStore.loadProvidersConfig() ?? {};
     const mainConfig = this.config.loadConfigOrDefault();
     const result: ProvidersConfigMap = {};
     const shadowedCustomProviderIds = this.detectAndLogShadowedProviders(providersConfig);
@@ -647,25 +649,25 @@ export class ProviderService {
       );
     }
 
-    // A policy that denies coder hides the provider entirely (above), but a
-    // stored OAuth credential is still live on its deployment. Surface its
-    // PRESENCE so the Disconnect command stays reachable — otherwise the
-    // full-privilege credential would have no revocation path until the
-    // policy broadens. Presence only: no URL/models/config leaks, the entry
-    // is unconfigured/disabled, and the policy-filtered Providers UI still
-    // hides the card (this map key is consumed by the palette command's
-    // visibility gate). Skipped when a custom provider shadows "coder" —
-    // that entry owns the key and has no OAuth flow.
+    // Policy-hidden Coder selections still need instance types to resolve an
+    // allowed upstream fallback, and credential presence for Disconnect. Keep
+    // this view non-routable: no models, endpoint settings or authentication data.
+    // A custom provider shadowing "coder" owns the key and has no gateway metadata.
     if (!result.coder && !shadowedCustomProviderIds.has("coder")) {
-      const coderOauth = parseCoderOauthAuth(
-        (providersConfig.coder as { coderOauth?: unknown } | undefined)?.coderOauth
-      );
-      if (coderOauth !== null) {
+      const coderConfig = providersConfig.coder as
+        | { coderOauth?: unknown; discoveredProviders?: unknown; additionalProviders?: unknown }
+        | undefined;
+      const coderOauth = parseCoderOauthAuth(coderConfig?.coderOauth);
+      const discoveredProviders = parseCoderGatewayProviders(coderConfig?.discoveredProviders);
+      const additionalProviders = parseCoderGatewayProviders(coderConfig?.additionalProviders);
+      if (coderOauth !== null || discoveredProviders.length > 0 || additionalProviders.length > 0) {
         result.coder = {
           apiKeySet: false,
           isEnabled: false,
           isConfigured: false,
-          coderOauthCredentialStored: true,
+          ...(coderOauth !== null && { coderOauthCredentialStored: true }),
+          ...(discoveredProviders.length > 0 && { discoveredProviders }),
+          ...(additionalProviders.length > 0 && { additionalProviders }),
         };
       }
     }

@@ -1240,6 +1240,201 @@ describe("buildProviderOptions - OpenAI", () => {
     });
   });
 
+  describe("Coder Pro mode", () => {
+    const providersConfig: ProvidersConfigMap = {
+      // Direct OpenAI settings must not disable Coder's independent Responses route.
+      openai: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+        wireFormat: "chatCompletions",
+        models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+      },
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [
+          { name: "prod-openai", type: "openai" },
+          { name: "compat", type: "openai-compat" },
+        ],
+      },
+      openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    };
+
+    test.each([
+      ["coder:openai/gpt-6-astra", true],
+      ["coder:prod-openai/gpt-6-astra", true],
+      ["openai:gpt-6-astra", true],
+      ["openai:team-astra", true],
+      ["coder:prod-openai/team-astra", true],
+      ["coder:openai/gpt-5.6-sol", true],
+      ["coder:openai/gpt-6-astra-mini", false],
+      ["coder:compat/gpt-6-astra", false],
+      ["coder:unknown/gpt-6-astra", false],
+      ["openrouter:openai/gpt-6-astra", false],
+    ] as const)("gates the picker and request consistently for %s", (model, available) => {
+      expect(
+        openaiProModeAvailable(model, { providersConfig, resolvedRouteProvider: "coder" })
+      ).toBe(available);
+      // The request builder pins wireFormat to the Coder instance's protocol.
+      const options = buildProviderOptions(
+        model,
+        "high",
+        undefined,
+        undefined,
+        { openai: { wireFormat: "responses" } },
+        undefined,
+        undefined,
+        providersConfig,
+        "coder",
+        undefined,
+        "pro"
+      );
+      expect(getOpenAIOptions(options)?.reasoningMode).toBe(available ? "pro" : undefined);
+      // Pro eligibility must not broaden the shared direct-only Fast mode gate.
+      expect(
+        openaiDirectProviderOptionsAvailable(model, {
+          providersConfig,
+          resolvedRouteProvider: "coder",
+        })
+      ).toBe(false);
+    });
+
+    test.each([
+      { scoped: "openai:gpt-6-astra", upstream: "openai:gpt-5.2", type: "openai", pro: true },
+      { scoped: "openai:gpt-5.2", upstream: "openai:gpt-6-astra", type: "openai", pro: false },
+      {
+        scoped: "openai:gpt-6-astra",
+        upstream: "openai:gpt-6-astra",
+        type: "openai-compat",
+        pro: false,
+      },
+    ])("scoped aliases control capabilities, not Coder's wire: %j", (testCase) => {
+      const model = "coder:prod-openai/team-astra";
+      const config: ProvidersConfigMap = {
+        openai: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          models: [{ id: "team-astra", mappedToModel: testCase.upstream }],
+        },
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          discoveredProviders: [{ name: "prod-openai", type: testCase.type }],
+          models: [{ id: "prod-openai/team-astra", mappedToModel: testCase.scoped }],
+        },
+      };
+      expect(openaiProModeAvailable(model, { providersConfig: config })).toBe(testCase.pro);
+      const options = buildProviderOptions(
+        model,
+        "high",
+        undefined,
+        undefined,
+        { openai: { wireFormat: "responses" } },
+        undefined,
+        undefined,
+        config,
+        "coder",
+        undefined,
+        "pro"
+      );
+      expect(getOpenAIOptions(options)?.reasoningMode).toBe(testCase.pro ? "pro" : undefined);
+    });
+
+    const fallbackAvailability: Array<Partial<NonNullable<ProvidersConfigMap["coder"]>>> = [
+      { isEnabled: false, isConfigured: true },
+      { isEnabled: true, isConfigured: false },
+      { isEnabled: true, isConfigured: true, discoveredModels: [] },
+      { isEnabled: true, isConfigured: true, removedModels: ["prod-openai/gpt-6-astra"] },
+    ];
+    test.each(fallbackAvailability)(
+      "preserves Pro on custom-instance direct fallback (%j)",
+      (availability) => {
+        const config: ProvidersConfigMap = {
+          ...providersConfig,
+          openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          coder: { ...providersConfig.coder, ...availability },
+        };
+        const model = "coder:prod-openai/gpt-6-astra";
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: config,
+            resolvedRouteProvider: "direct",
+          })
+        ).toBe(true);
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: config,
+            resolvedRouteProvider: "mux-gateway",
+          })
+        ).toBe(false);
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: config,
+            resolvedRouteProvider: "direct",
+            openaiWireFormat: "chatCompletions",
+          })
+        ).toBe(false);
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: { ...config, openai: { ...config.openai, codexOauthSet: true } },
+            resolvedRouteProvider: "direct",
+          })
+        ).toBe(false);
+      }
+    );
+
+    test.each(["compat", "unknown"])(
+      "does not invent an upstream for %s on fallback",
+      (instance) => {
+        expect(
+          openaiProModeAvailable(`coder:${instance}/gpt-6-astra`, {
+            providersConfig: {
+              ...providersConfig,
+              openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+              coder: { ...providersConfig.coder, isEnabled: false },
+            },
+            resolvedRouteProvider: "direct",
+          })
+        ).toBe(false);
+      }
+    );
+
+    test.each(["anthropic", "openai-compat"])(
+      "does not trust an OpenAI-named instance whose type is %s",
+      (type) => {
+        const config = {
+          ...providersConfig,
+          coder: {
+            ...providersConfig.coder,
+            discoveredProviders: [{ name: "openai", type }],
+          },
+        };
+        expect(
+          openaiProModeAvailable("coder:openai/gpt-6-astra", { providersConfig: config })
+        ).toBe(false);
+      }
+    );
+
+    test("does not treat a custom provider shadowing coder as the gateway", () => {
+      expect(
+        openaiProModeAvailable("coder:openai/gpt-6-astra", {
+          providersConfig: {
+            coder: {
+              ...providersConfig.coder,
+              providerType: "openai-responses",
+            },
+          },
+          resolvedRouteProvider: "coder",
+        })
+      ).toBe(false);
+    });
+  });
+
   describe("native pro reasoning mode", () => {
     const buildWithMode = (
       model: string,
@@ -1316,9 +1511,13 @@ describe("buildProviderOptions - OpenAI", () => {
       );
     });
 
-    test.each(["gpt-5.6-sol", "gpt-6-astra"])(
-      "serializes native max and pro for %s through the OpenAI SDK",
-      async (model) => {
+    test.each([
+      ["gpt-5.6-sol", "openai"],
+      ["gpt-6-astra", "openai"],
+      ["gpt-6-astra", "coder"],
+    ] as const)(
+      "serializes native max and pro for %s via %s through the OpenAI SDK",
+      async (model, routeProvider) => {
         const capturedBodies: Array<Record<string, unknown>> = [];
         const captureFetch = Object.assign(
           (
@@ -1368,9 +1567,11 @@ describe("buildProviderOptions - OpenAI", () => {
           baseURL: "https://example.test/v1",
           fetch: captureFetch,
         });
-        const responsesOptions = buildWithMode(`openai:${model}`, "pro", {
-          thinkingLevel: "max",
-        });
+        const responsesOptions = buildWithMode(
+          routeProvider === "coder" ? `coder:openai/${model}` : `openai:${model}`,
+          "pro",
+          { thinkingLevel: "max", routeProvider }
+        );
         if (!responsesOptions) {
           throw new Error("Expected OpenAI Responses provider options");
         }
@@ -2278,8 +2479,8 @@ describe("buildRequestHeaders", () => {
   });
 
   describe("openaiProModeAvailable", () => {
-    // UI gating must mirror provider-option delivery: only direct OpenAI routes
-    // surface the toggle while gateways still drop or reject the field.
+    // UI gating must mirror provider-option delivery: direct OpenAI and Coder
+    // Responses surface the toggle; other gateways still drop or reject it.
     const cases: Array<[string, boolean]> = [
       ["openai:gpt-5.6-sol", true],
       ["openai:gpt-5.6-terra", true],
@@ -2290,7 +2491,7 @@ describe("buildRequestHeaders", () => {
       ["openai:gpt-6-astra-2026-09-03", true],
       ["mux-gateway:openai/gpt-6-astra", false],
       ["openai:gpt-6-astra-mini", false],
-      // All gateways fail closed — mux-gateway drops the field server-side.
+      // Other gateways fail closed — mux-gateway drops the field server-side.
       ["mux-gateway:openai/gpt-5.6-sol", false],
       ["openrouter:openai/gpt-5.6-sol", false],
       ["github-copilot:gpt-5.6-sol", false],

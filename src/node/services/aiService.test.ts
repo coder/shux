@@ -69,6 +69,7 @@ import * as toolAssembly from "./toolAssembly";
 import type { ToolModelUsageEvent } from "@/common/utils/tools/tools";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as systemMessageModule from "./systemMessage";
 
@@ -2607,6 +2608,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     await startAdvisorStream(harness, workspaceId);
     const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
     if (!runtime) throw new Error("Expected advisor runtime");
+    const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+    spyOn(factory, "resolveAndCreateModel").mockImplementation(
+      ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
+    );
     const created = await runtime.createModel(testCase.model);
     providersStore.saveProvidersConfig({
       openai: { apiKey: "changed-key", wireFormat: "responses" },
@@ -2618,6 +2623,110 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(created.optionsMuxProviderOptions?.openai?.wireFormat).toBe(testCase.wireFormat);
     }
   });
+
+  it.each([
+    { modelId: "gpt-6-astra", refresh: "none" },
+    { modelId: "team-astra", refresh: "none" },
+    { modelId: "team-astra", refresh: "retyped" },
+    { modelId: "team-astra", refresh: "removed" },
+  ])(
+    "preserves the actual Coder instance and scoped alias for advisor Pro: %j",
+    async (testCase) => {
+      using xumHome = new DisposableTempDir("ai-service-advisor-coder-pro");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workspace-advisor-coder-pro";
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath)
+      );
+      const model = `coder:prod-openai/${testCase.modelId}`;
+      await writeProvidersConfig(xumHome.path, {
+        coder: {
+          coderOauth: {
+            type: "oauth",
+            sessionId: "test",
+            deploymentUrl: "https://coder.example.com",
+            access: "test-access",
+            refresh: "test-refresh",
+            expires: Date.now() + 3_600_000,
+            clientId: "test",
+            clientSecret: "test",
+          },
+          discoveredProviders: [
+            { name: "prod-openai", type: "openai" },
+            { name: "openai", type: "openai-compat" },
+          ],
+          models: [{ id: "prod-openai/team-astra", mappedToModel: "openai:gpt-6-astra" }],
+        },
+      });
+      await enableAdvisorForHarness(harness, model);
+      await startAdvisorStream(harness, workspaceId);
+      // Avoid an OAuth exchange; the real option/route adapter below must retain
+      // the selected instance instead of re-resolving the unrelated "openai" instance.
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      spyOn(factory, "resolveAndCreateModel").mockImplementation(
+        (_model, _thinking, options, creation) => {
+          expect(creation?.providersConfig?.coder).toMatchObject({
+            discoveredProviders: [
+              { name: "prod-openai", type: "openai" },
+              { name: "openai", type: "openai-compat" },
+            ],
+          });
+          if (!options) throw new Error("Expected the adapter's provider-options target");
+          options.openai = { wireFormat: "responses" };
+          return Promise.resolve({
+            success: true,
+            data: {
+              model: Object.create(null) as LanguageModel,
+              effectiveModelString: model,
+              canonicalModelString: "openai:gpt-6-astra",
+              canonicalProviderName: "openai",
+              canonicalModelId: "gpt-6-astra",
+              wireProviderName: "openai",
+              routeProvider: "coder",
+              routedThroughGateway: false,
+            },
+          });
+        }
+      );
+      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
+      if (!runtime) throw new Error("Expected advisor runtime");
+      if (testCase.refresh !== "none") {
+        const snapshot = new ProvidersConfigStore(harness.config.rootDir).loadProvidersConfig();
+        if (!snapshot) throw new Error("Expected the initial Coder configuration");
+        // Model creation gets the first read; an independent options-view read
+        // would see a catalog refresh with incompatible or missing metadata.
+        spyOn(ProvidersConfigStore.prototype, "loadProvidersConfig")
+          .mockReturnValue({
+            ...snapshot,
+            coder: {
+              ...snapshot.coder,
+              discoveredProviders:
+                testCase.refresh === "retyped" ? [{ name: "prod-openai", type: "anthropic" }] : [],
+              models: [],
+            },
+          })
+          .mockReturnValueOnce(snapshot);
+      }
+      const created = await runtime.createModel(model);
+      expect(created.optionsRouteProvider).toBe("coder");
+      const options = buildProviderOptions(
+        created.optionsModelString,
+        "high",
+        undefined,
+        undefined,
+        created.optionsMuxProviderOptions,
+        undefined,
+        undefined,
+        created.optionsProvidersConfig,
+        created.optionsRouteProvider,
+        undefined,
+        "pro"
+      );
+      expect(options).toMatchObject({ openai: { reasoningMode: "pro" } });
+    }
+  );
 
   it("freezes advisor tool-call snapshots at the tool-call boundary", async () => {
     using xumHome = new DisposableTempDir("ai-service-advisor-step-snapshot-boundary");
@@ -3046,12 +3155,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const resolveModel = spyOn(factory, "resolveAndCreateModel").mockImplementation(
         ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
       );
-      const createModel = spyOn(harness.service, "createModel");
       const created = await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
-      const creationOptions =
-        toolName === "advisor"
-          ? createModel.mock.calls.at(-1)?.[2]
-          : resolveModel.mock.calls.at(-1)?.[3];
+      const creationOptions = resolveModel.mock.calls.at(-1)?.[3];
       expect(creationOptions).toMatchObject({
         agentInitiated: true,
         workspaceId,

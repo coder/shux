@@ -566,6 +566,54 @@ function streamEnd(
 }
 
 describe("ACP prompt stream correlation", () => {
+  it.each(["unchanged", "loadSession", "resumeSession"] as const)(
+    "sends session-local picker settings after %s despite unchanged workspace metadata",
+    async (method) => {
+      const harness = createHarness();
+      await initializeDefaultAgent(harness);
+      const { sessionId } = await createDefaultSession(harness);
+      for (const [configId, value] of [
+        ["agentMode", "plan"],
+        ["model", "openai:gpt-5.2"],
+        ["thinkingLevel", "high"],
+        ["agentMode", "plan"],
+      ]) {
+        await harness.agent.setSessionConfigOption({ sessionId, configId, value });
+      }
+      expect(harness.sendMessageCalls).toHaveLength(0);
+      const restored =
+        method === "unchanged"
+          ? undefined
+          : await harness.agent[method]({
+              sessionId,
+              cwd: "/repo/acp-go-sdk",
+              mcpServers: [],
+            });
+
+      const { promptPromise, promptCorrelationId } = await startPromptTurn(harness, sessionId);
+      harness.pushChatEvent(
+        streamStart(sessionId, "assistant-local", { acpPromptId: promptCorrelationId })
+      );
+      harness.pushChatEvent(streamEnd(sessionId, "assistant-local"));
+      await expect(promptPromise).resolves.toMatchObject({ stopReason: "end_turn" });
+      harness.closeConnection();
+      await harness.connectionClosed;
+      expect(harness.sendMessageCalls[0]?.options).toMatchObject({
+        agentId: "plan",
+        model: "openai:gpt-5.2",
+        thinkingLevel: "high",
+      });
+      if (restored) {
+        expect(restored.configOptions).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ id: "model", currentValue: "openai:gpt-5.2" }),
+            expect.objectContaining({ id: "thinkingLevel", currentValue: "high" }),
+          ])
+        );
+      }
+    }
+  );
+
   it("ignores unrelated stream-start/end pairs while waiting for this prompt turn", async () => {
     const harness = createHarness();
     const { newSessionResponse, promptPromise, promptCorrelationId } =
