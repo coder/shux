@@ -218,13 +218,17 @@ async function findProviderHistoryStart(
         : classifyHistoryScanRow(Buffer.concat(parts.reverse()).toString("utf8"), probe);
     if (message) unreadableRunEnd = null;
     else unreadableRunEnd ??= rowEnd;
-    if (message && isDurableContextBoundaryMarker(message)) {
-      oldestBoundary = start;
-      if (boundaryCount++ === skip) return start;
-    } else if (isManualHistoryReset(message, probe.possibleReset)) {
+    const durableBoundary = message !== null && isDurableContextBoundaryMarker(message);
+    if (isManualHistoryReset(message, probe.possibleReset)) {
+      // Retain readable reset markers, but never count them as skippable boundaries.
+      if (durableBoundary) return start;
       // A fragmented marker may end several rows to the right of the key that
       // completed recognition. Never return any of that unreadable evidence.
       return unreadableRunEnd ?? rowEnd;
+    }
+    if (durableBoundary) {
+      oldestBoundary = start;
+      if (boundaryCount++ === skip) return start;
     }
     if (message) {
       probe.resetProbe = "";

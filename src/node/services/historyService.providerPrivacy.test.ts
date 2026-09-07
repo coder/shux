@@ -180,6 +180,63 @@ describe("HistoryService provider-only raw privacy floors", () => {
     expect(await providerIds()).toEqual([old.id, "legacy"]);
   });
 
+  test.each(["chat", "archive"])(
+    "readable manual reset in %s cannot be skipped toward an older compaction",
+    async (artifact) => {
+      const reset = createMuxMessage("manual-reset", "assistant", "", {
+        contextBoundaryKind: "reset",
+      });
+      const resetTail = line(reset) + line(publicArchive);
+      await fs.writeFile(
+        archivePath,
+        line(boundary) + line(old) + (artifact === "archive" ? resetTail : "")
+      );
+      await fs.writeFile(chatPath, (artifact === "chat" ? resetTail : "") + line(publicChat));
+      for (const skip of [0, 1, 2, 99]) {
+        const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId, skip);
+        expect(history.success).toBe(true);
+        if (!history.success) throw new Error(history.error);
+        expect(history.data.map((message) => message.id)).toEqual([
+          reset.id,
+          publicArchive.id,
+          publicChat.id,
+        ]);
+        expect(await providerIds(skip)).toEqual([publicArchive.id, publicChat.id]);
+      }
+    }
+  );
+
+  test("skips legal rollovers and compactions but stop at the preceding manual reset", async () => {
+    const reset = createMuxMessage("manual-reset", "assistant", "", {
+      contextBoundaryKind: "reset",
+    });
+    await fs.writeFile(archivePath, line(boundary) + line(old) + line(reset) + line(publicArchive));
+    await fs.writeFile(
+      chatPath,
+      JSON.stringify({
+        id: "automatic-rollover",
+        role: "assistant",
+        parts: [],
+        metadata: rollover,
+      }) +
+        "\n" +
+        line({ ...boundary, id: "new-summary" }) +
+        line(publicChat)
+    );
+    for (const [skip, expected] of [
+      [0, ["new-summary", publicChat.id]],
+      [1, ["automatic-rollover", "new-summary", publicChat.id]],
+      [2, [reset.id, publicArchive.id, "automatic-rollover", "new-summary", publicChat.id]],
+      [99, [reset.id, publicArchive.id, "automatic-rollover", "new-summary", publicChat.id]],
+    ] as const) {
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId, skip);
+      expect(history.success).toBe(true);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.map((message) => message.id)).toEqual([...expected]);
+      expect(await providerIds(skip)).toEqual(["new-summary", publicChat.id]);
+    }
+  });
+
   test("skip falls back within the newest malformed floor instead of an older archive boundary", async () => {
     await fs.writeFile(archivePath, line(boundary) + line(old));
     const raw = '{"metadata":{"contextBoundaryKind" : "reset"},broken\n';
