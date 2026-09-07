@@ -1,7 +1,11 @@
 import React from "react";
 import { AlertTriangle } from "lucide-react";
 import { TokenMeter } from "./TokenMeter";
-import { HorizontalThresholdSlider, type AutoCompactionConfig } from "./ThresholdSlider";
+import {
+  HorizontalThresholdSlider,
+  getAutoCompactionLabel,
+  type AutoCompactionConfig,
+} from "./ThresholdSlider";
 import { formatTokens, type TokenMeterData } from "@/common/utils/tokens/tokenMeterUtils";
 import { Toggle1MContext } from "@/browser/components/Toggle1MContext/Toggle1MContext";
 
@@ -54,6 +58,11 @@ const ContextUsageBarComponent: React.FC<ContextUsageBarProps> = ({
         )}
       </div>
 
+      {autoCompaction?.rolloverEnabled && data.maxTokens && (
+        <div className="text-muted counter-nums text-[11px]">
+          {getAutoCompactionLabel(autoCompaction)}
+        </div>
+      )}
       {model && <Toggle1MContext model={model} />}
 
       {showWarning && (

@@ -1,3 +1,8 @@
+import { resolveToolPolicyForAgent } from "./agentDefinitions/resolveToolPolicy";
+import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
+import { resolveAgentFrontmatter } from "./agentDefinitions/agentDefinitionsService";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { ToolBridge } from "./ptc/toolBridge";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -540,5 +545,130 @@ describe("resolveBackendGatedPtcExperiments", () => {
   test("preserves unrelated experiment flags untouched", () => {
     const resolved = resolveBackendGatedPtcExperiments({ memory: true }, isEnabled);
     expect(resolved.memory).toBe(true);
+  });
+});
+
+describe("token budget history policy", () => {
+  test.each([
+    { add: [], allowed: false },
+    { add: ["file_read"], allowed: false },
+    { add: ["session_history"], allowed: true },
+    { add: ["session_.*"], allowed: true },
+    { add: [".*"], allowed: true },
+  ])("recovery follows the agent allowlist: $add", async ({ add, allowed }) => {
+    const policy = resolveToolPolicyForAgent({
+      agents: [{ tools: { add } }],
+      isSubagent: false,
+      disableTaskToolsForDepth: false,
+    });
+    expect(isSessionHistoryDisabled(policy)).toBe(!allowed);
+    const history = executableTool("History");
+    const result = await applyToolPolicyAndExperiments({
+      allTools: { session_history: history, file_read: executableTool("Read") },
+      effectiveToolPolicy: policy,
+      experiments: { tokenBudget: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    if (allowed) {
+      expect(result.session_history).toBe(history);
+    } else {
+      expect(result.session_history).toBeUndefined();
+    }
+  });
+
+  test.each(["exec", "plan", "explore"])(
+    "%s retains recovery through its built-in inherited policy",
+    async (agentId) => {
+      using tempDir = new DisposableTempDir("history-policy");
+      const agent = await resolveAgentFrontmatter(
+        new LocalRuntime(tempDir.path),
+        tempDir.path,
+        agentId
+      );
+      const policy = resolveToolPolicyForAgent({
+        agents: [agent],
+        isSubagent: agentId === "explore",
+        disableTaskToolsForDepth: false,
+      });
+      const history = executableTool("History");
+      const result = await applyToolPolicyAndExperiments({
+        allTools: { session_history: history },
+        effectiveToolPolicy: policy,
+        experiments: { tokenBudget: true },
+        emitNestedToolEvent: () => undefined,
+      });
+      expect(isSessionHistoryDisabled(policy)).toBe(false);
+      expect(result.session_history).toBe(history);
+    }
+  );
+
+  test.each(["session_history", "^session_history$", "session_.*", ".*"])(
+    "explicit %s disable blocks assembly and rollover gate",
+    async (name) => {
+      const policy = resolveToolPolicyForAgent({
+        agents: [{ tools: { remove: [name] } }, { tools: { add: [".*"] } }],
+        isSubagent: false,
+        disableTaskToolsForDepth: false,
+      });
+      expect(isSessionHistoryDisabled(policy)).toBe(true);
+      const result = await applyToolPolicyAndExperiments({
+        allTools: { session_history: executableTool("History") },
+        effectiveToolPolicy: policy,
+        experiments: { tokenBudget: true },
+        emitNestedToolEvent: () => undefined,
+      });
+      expect(result.session_history).toBeUndefined();
+    }
+  );
+
+  test("the last matching regex rule controls history access", async () => {
+    const policy = [
+      { regex_match: "session_history", action: "disable" as const },
+      { regex_match: ".*", action: "enable" as const },
+    ];
+    const assemble = (effectiveToolPolicy: typeof policy) =>
+      applyToolPolicyAndExperiments({
+        allTools: { session_history: executableTool("History") },
+        effectiveToolPolicy,
+        experiments: { tokenBudget: true },
+        emitNestedToolEvent: () => undefined,
+      });
+    expect(isSessionHistoryDisabled(policy)).toBe(false);
+    expect((await assemble(policy)).session_history).toBeDefined();
+    const disabledAgain = [...policy, { regex_match: "session_.*", action: "disable" as const }];
+    expect(isSessionHistoryDisabled(disabledAgain)).toBe(true);
+    expect((await assemble(disabledAgain)).session_history).toBeUndefined();
+  });
+
+  test("PTC leaves recovery direct and does not offer it inside the sandbox", async () => {
+    const history = executableTool("History");
+    const bridge = new ToolBridge({ session_history: history });
+    expect(bridge.getNonBridgeableTools().session_history).toBe(history);
+    const result = await applyToolPolicyAndExperiments({
+      allTools: { session_history: history, file_read: executableTool("Read") },
+      effectiveToolPolicy: [
+        { regex_match: ".*", action: "disable" },
+        { regex_match: "file_read", action: "enable" },
+        { regex_match: "session_history", action: "enable" },
+      ],
+      experiments: { tokenBudget: true, programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(result.session_history).toBe(history);
+    const execution = (await result.code_execution.execute!(
+      { code: "return typeof mux.session_history;" },
+      { toolCallId: "history-ptc", messages: [], context: undefined }
+    )) as { success: boolean; result?: unknown };
+    expect(execution).toMatchObject({ success: true, result: "undefined" });
+  });
+
+  test("token budget honors renderer override before backend default", () => {
+    expect(resolveBackendGatedPtcExperiments(undefined, () => true).tokenBudget).toBe(true);
+    expect(resolveBackendGatedPtcExperiments({ tokenBudget: false }, () => true).tokenBudget).toBe(
+      false
+    );
+    expect(resolveBackendGatedPtcExperiments({ tokenBudget: true }, () => false).tokenBudget).toBe(
+      true
+    );
   });
 });

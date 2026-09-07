@@ -1,9 +1,15 @@
+import type { HistoryService } from "@/node/services/historyService";
+import { createSessionHistoryTool } from "@/node/services/tools/session_history";
 import { xai } from "@ai-sdk/xai";
 import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
-import { isGrokFrontierModel, type OpenAIReasoningMode } from "@/common/types/thinking";
+import {
+  isGrokFrontierModel,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import type { ProviderName } from "@/common/constants/providers";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
@@ -100,6 +106,8 @@ export interface ToolModelUsageEvent {
   source: "tool";
   toolName: string;
   model: string;
+  /** Pricing identity pinned by this invocation, independent of other creations of the same model. */
+  metadataModel?: string;
   usage: LanguageModelV2Usage;
   providerMetadata?: Record<string, unknown>;
   toolCallId?: string;
@@ -194,6 +202,7 @@ export interface ToolConfiguration {
   /** Pre-resolved mux-managed resource scope (global ~/.xum vs project root). */
   xumScope?: XumToolScope;
   /** Memory service for the memory tool (present only when the memory experiment is enabled). */
+  historyService?: HistoryService;
   memoryService?: MemoryService;
   timelineService?: TimelineService;
   /** Per-scope memory write policy for the current agent (defaults to read-only). */
@@ -292,6 +301,7 @@ export interface ToolConfiguration {
     rlm?: boolean;
     advisorTool?: boolean;
     dynamicWorkflows?: boolean;
+    tokenBudget?: boolean;
     memory?: boolean;
     timeline?: boolean;
     workspaceHeartbeats?: boolean;
@@ -321,6 +331,7 @@ export interface ToolConfiguration {
   /** Pinned, host-only recall runtime; present only for eligible parent turns. */
   intuitionRuntime?: {
     modelString: string;
+    thinkingLevel?: ThinkingLevel;
     maxUsesPerTurn: number;
     /** Shared by every tool rebuild in this parent turn (including refusal fallback). */
     usesThisTurn: number;
@@ -355,6 +366,7 @@ export interface ToolConfiguration {
      */
     createModel: (modelString: string) => Promise<{
       model: LanguageModel;
+      metadataModel?: string;
       optionsModelString: string;
       /**
        * Providers snapshot captured at model-creation time for option
@@ -814,6 +826,9 @@ export async function getToolsForModel(
     bash_background_terminate: wrap(createBashBackgroundTerminateTool(config)),
 
     web_fetch: wrap(createWebFetchTool(config)),
+    ...(config.experiments?.tokenBudget
+      ? { session_history: wrap(createSessionHistoryTool(config)) }
+      : {}),
 
     // Agent memory (experiment-gated; off => no tool, no context cost)
     ...(config.memoryService && config.experiments?.memory
@@ -1018,6 +1033,7 @@ export async function getToolsForModel(
       ),
       enableAdvisor: Boolean(config.advisorRuntime),
       enableIntuition: Boolean(config.intuitionRuntime),
+      enableSessionHistory: config.experiments?.tokenBudget === true,
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
       enableTimelineEvent: Boolean(config.timelineService && config.experiments?.timeline),
       enableToolSearch: Boolean(config.toolSearchRuntime),

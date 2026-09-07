@@ -1,3 +1,5 @@
+export const EXPERIMENTS_WRITE_TIMEOUT_MS = 10_000;
+
 /**
  * Experiments System
  *
@@ -22,10 +24,12 @@ export const EXPERIMENT_IDS = {
   MEMORY_CONSOLIDATION: "memory-consolidation",
   TOOL_SEARCH: "tool-search",
   CLAUDE_SKILLS_COMPAT: "claude-skills-compat",
+  CLAUDE_DESIGN_MCP: "claude-design-mcp",
   AGENT_PLUGINS: "agent-plugins",
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
   TIMELINE: "timeline",
   CONTINUOUS_COMPACTION: "continuous-compaction",
+  TOKEN_BUDGET: "tokenBudget",
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
@@ -93,6 +97,22 @@ export interface ExperimentDefinition {
  * Use Record<ExperimentId, ExperimentDefinition> to ensure exhaustive coverage.
  */
 export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
+  [EXPERIMENT_IDS.TOKEN_BUDGET]: {
+    id: EXPERIMENT_IDS.TOKEN_BUDGET,
+    name: "Token-budget context windows",
+    description:
+      "Start fresh context windows instead of automatic summaries, with session_history for retrieval. Requires session_history; continuous compaction and RLM take precedence.",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: {
+    id: EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
+    name: "Claude Design MCP",
+    description:
+      "Optionally reuse Claude Code credentials read-only for Claude Design. Configure credential access separately in MCP settings; Claude Code owns login, consent, and refresh.",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
   [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: {
     id: EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
     name: "Continuous Compaction",

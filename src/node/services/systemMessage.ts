@@ -627,7 +627,6 @@ export async function buildSystemMessage(
   // Get runtime type from metadata (defaults to "local" for legacy workspaces without runtimeConfig)
   const runtimeType = metadata.runtimeConfig?.type ?? "local";
 
-  // Build system message
   let systemMessage = `${PRELUDE.trim()}\n\n${buildEnvironmentContext(
     workspacePath,
     runtimeType,

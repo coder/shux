@@ -1,3 +1,6 @@
+import type { RestartBlocker } from "@/common/orpc/types";
+import { inFlightProcedureCount } from "@/node/orpc/inFlightProcedures";
+import { inProcessWorkflowWorkspaceCount } from "@/node/services/workflows/workflowArchiveAdmission";
 import assert from "@/common/utils/assert";
 import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
@@ -202,7 +205,7 @@ export class ServiceContainer {
   public readonly memoryConsolidationService: CoreServices["memoryConsolidationService"];
   public readonly refineService: RefineService;
   private readonly extensionMetadata: CoreServices["extensionMetadata"];
-  private readonly backgroundProcessManager: CoreServices["backgroundProcessManager"];
+  public readonly backgroundProcessManager: CoreServices["backgroundProcessManager"];
   // Desktop-only services (`di/layers/desktop.ts`)
   public readonly projectService: ProjectService;
   public readonly muxGatewayOauthService: MuxGatewayOauthService;
@@ -637,6 +640,32 @@ export class ServiceContainer {
     this.terminalService.setTerminalWindowManager(manager);
   }
 
+  /** Background process statuses refresh lazily, so refresh them before a blocker snapshot. */
+  async refreshRestartBlockers(): Promise<void> {
+    await this.backgroundProcessManager.list();
+  }
+
+  collectRestartBlockers(): RestartBlocker[] {
+    const blockers = this.workspaceService.collectRestartBlockers();
+    const counts: Array<[RestartBlocker["kind"], number]> = [
+      ["active-streams", this.streamManager.getActiveStreams().length],
+      ["workflows", inProcessWorkflowWorkspaceCount()],
+      ["projects", this.projectService.getMutationCount()],
+      ["requests", inFlightProcedureCount()],
+      ["terminals", this.terminalService.getOpenSessionCount()],
+      ["desktop-sessions", this.desktopSessionManager.getSessionCount()],
+      ["background-processes", this.backgroundProcessManager.getRunningProcessCount()],
+    ];
+    for (const [kind, count] of counts) {
+      if (count > 0) {
+        const existing = blockers.find((blocker) => blocker.kind === kind);
+        if (existing) existing.count += count;
+        else blockers.push({ kind, count });
+      }
+    }
+    return blockers;
+  }
+
   /**
    * Dispose all services. Called on app quit to clean up resources.
    * Terminates all background processes to prevent orphans. Idempotent:
@@ -670,7 +699,11 @@ export class ServiceContainer {
     // Chat recovery that housekeeping scheduled runs past its own promise and observes neither the
     // abort nor the join, so latch every session before the wait: nothing may start a stream inside
     // it, and nothing may dispatch through the provider/runtime services torn down below.
+    shutdownStep("serverService.beginShutdown", () => this.serverService.beginShutdown());
     shutdownStep("workspaceService.beginShutdown", () => this.workspaceService.beginShutdown());
+    shutdownStep("terminalService.beginShutdown", () => this.terminalService.beginShutdown());
+    shutdownStep("projectService.beginShutdown", () => this.projectService.beginShutdown());
+    await shutdownStep("updateService.beginShutdown", () => this.updateService.beginShutdown());
     const housekeepingSettled = this.startupHousekeepingSettled;
     if (housekeepingSettled != null) {
       await shutdownStep("startupHousekeeping.join", async () => {

@@ -1770,6 +1770,29 @@ describe("MCPServerManager", () => {
     });
   });
 
+  test("a client closed during catalog refresh is excluded from the returned tools", async () => {
+    const workspaceId = "closed-during-refresh";
+    configService.listServers = mock(() => Promise.resolve({ server: stdioConfig("cmd") }));
+    const instance = testInstance("server", { tools: { work: testTool() } });
+    access.startServers = mock(() =>
+      Promise.resolve({
+        instances: new Map([["server", instance]]),
+        failedServerNames: [],
+      })
+    );
+    const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(first.tools)).toEqual(["server_work"]);
+    const refreshTools = mock(() => {
+      instance.isClosed = true;
+      return Promise.resolve();
+    });
+    (instance as { refreshTools?: typeof refreshTools }).refreshTools = refreshTools;
+    const next = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(refreshTools).toHaveBeenCalledTimes(1);
+    expect(next.tools).toEqual({});
+    expect(next.toolServerNames).toEqual({});
+  });
+
   test("getToolsForWorkspace re-polls legacy and modern prompt catalogs each stream", async () => {
     const workspaceId = "ws-prompt-freshness";
     configService.listServers = mock(() =>

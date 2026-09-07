@@ -297,6 +297,19 @@ export class ServerService {
   private serverInfo: ServerInfo | null = null;
   private readonly mdnsAdvertiser = new MdnsAdvertiserService();
   private sshHost: string | undefined = undefined;
+  private shuttingDown = false;
+
+  /**
+   * Process teardown has begun. The HTTP/WS server keeps accepting connections until stopServer()
+   * runs last, so the RPC layer consults this to refuse new procedure calls in the meantime.
+   */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+  }
+
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
 
   /**
    * Set the launch project path

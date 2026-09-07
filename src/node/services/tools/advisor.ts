@@ -254,6 +254,7 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
       try {
         const {
           model,
+          metadataModel,
           optionsModelString,
           optionsProvidersConfig,
           optionsMuxProviderOptions,
@@ -353,6 +354,7 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
               source: "tool",
               toolName: "advisor",
               model: advisorModelString,
+              metadataModel,
               usage,
               providerMetadata,
               toolCallId,

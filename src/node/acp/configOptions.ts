@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import type { SessionConfigOption, SessionConfigSelectOption } from "@agentclientprotocol/sdk";
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { AgentDefinitionFrontmatter } from "@/common/types/agentDefinition";
 import { getThinkingOptionLabel, isThinkingLevel } from "@/common/types/thinking";
 import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
@@ -217,11 +217,14 @@ function buildAgentModeSelectOptions(
   return options;
 }
 
-function buildModelSelectOptions(currentModel: string): SessionConfigSelectOption[] {
-  const options: SessionConfigSelectOption[] = Object.values(KNOWN_MODELS).map((model) => ({
-    value: model.id,
-    name: model.id,
-  }));
+function buildModelSelectOptions(
+  currentModel: string,
+  hiddenModels: readonly string[]
+): SessionConfigSelectOption[] {
+  const hidden = new Set(hiddenModels);
+  const options: SessionConfigSelectOption[] = Object.values(KNOWN_MODELS)
+    .filter((model) => !hidden.has(model.id))
+    .map((model) => ({ value: model.id, name: model.id }));
 
   if (!options.some((option) => option.value === currentModel)) {
     options.unshift({ value: currentModel, name: currentModel });
@@ -272,9 +275,10 @@ export async function buildConfigOptions(
 
   const workspace = await getWorkspaceInfoOrThrow(client, workspaceId);
   const overrideAgentId = args?.activeAgentId?.trim();
-  const [exposedAgentModes, availableAgentIds] = await Promise.all([
+  const [exposedAgentModes, availableAgentIds, config] = await Promise.all([
     resolveExposedAgentModes(client, workspaceId),
     resolveAvailableAgentIds(client, workspaceId),
+    client.config.getConfig(),
   ]);
   const currentAgentId = resolveCurrentAgentId(
     typeof overrideAgentId === "string" && overrideAgentId.length > 0
@@ -310,7 +314,10 @@ export async function buildConfigOptions(
       type: "select",
       category: "model",
       currentValue: currentAiSettings.model,
-      options: buildModelSelectOptions(currentAiSettings.model),
+      options: buildModelSelectOptions(
+        currentAiSettings.model,
+        config.hiddenModels ?? DEFAULT_HIDDEN_MODELS
+      ),
     },
     {
       id: THINKING_LEVEL_CONFIG_ID,

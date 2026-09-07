@@ -99,7 +99,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
 
 import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
-import { AboutDialogProvider } from "./contexts/AboutDialogContext";
+import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogContext";
 import { ConfirmDialogProvider, useConfirmDialog } from "./contexts/ConfirmDialogContext";
 import { AboutDialog } from "./features/About/AboutDialog";
 import { SettingsPage } from "@/browser/features/Settings/SettingsPage";
@@ -184,6 +184,7 @@ function AppInner() {
   } = useRouter();
   const { themePreference, setTheme, toggleTheme } = useTheme();
   const { open: openSettings, isOpen: isSettingsOpen } = useSettings();
+  const { open: openAboutDialog } = useAboutDialog();
   const { confirm: confirmDialog } = useConfirmDialog();
   const setThemePreference = useCallback(
     (nextTheme: ThemePreference) => {
@@ -1019,6 +1020,7 @@ function AppInner() {
     onToggleTheme: toggleTheme,
     onSetTheme: setThemePreference,
     onOpenSettings: openSettings,
+    onOpenAbout: openAboutDialog,
     layoutPresets,
     onApplyLayoutSlot: (workspaceId, slot) => {
       void applySlotToWorkspace(workspaceId, slot).catch(() => {

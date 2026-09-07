@@ -1,3 +1,8 @@
+import { useClaudeDesignRevision } from "@/browser/contexts/ExperimentsContext";
+import { ClaudeDesignCard } from "./ClaudeDesignCard";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useAPI } from "@/browser/contexts/API";
@@ -717,6 +722,9 @@ const RemoteMCPOAuthSection: React.FC<{
 };
 
 export const MCPSettingsSection: React.FC = () => {
+  const designEnabled = useExperimentValue(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
+  const designRevision = useClaudeDesignRevision();
+  const refreshRequest = useRef({ id: 0 });
   const { api } = useAPI();
   const policyState = usePolicy();
   const mcpAllowUserDefined =
@@ -797,15 +805,18 @@ export const MCPSettingsSection: React.FC = () => {
 
   const refresh = useCallback(async () => {
     if (!api) return;
+    const request = ++refreshRequest.current.id;
     setLoading(true);
     try {
       const mcpResult = await api.mcp.list({});
+      if (request !== refreshRequest.current.id) return;
       setServers(mcpResult ?? {});
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load MCP servers");
+      if (request === refreshRequest.current.id)
+        setError(err instanceof Error ? err.message : "Failed to load MCP servers");
     } finally {
-      setLoading(false);
+      if (request === refreshRequest.current.id) setLoading(false);
     }
   }, [api]);
 
@@ -835,8 +846,13 @@ export const MCPSettingsSection: React.FC = () => {
   }, [api]);
 
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    // A sibling can change reuse/server settings while the experiment stays enabled.
+    const requests = refreshRequest.current;
+    refresh().catch(() => undefined);
+    return () => {
+      requests.id++;
+    };
+  }, [refresh, designEnabled, designRevision]);
 
   // Clear new-server test result when transport/value/headers change
   useEffect(() => {
@@ -1133,6 +1149,18 @@ export const MCPSettingsSection: React.FC = () => {
         </p>
       </div>
 
+      {designEnabled && (
+        <ClaudeDesignCard
+          onChange={refresh}
+          remoteDisabled={mcpAllowUserDefined?.remote === false}
+          conflict={Boolean(
+            servers[CLAUDE_DESIGN_SERVER_NAME] &&
+            (servers[CLAUDE_DESIGN_SERVER_NAME].transport === "stdio" ||
+              !("managed" in servers[CLAUDE_DESIGN_SERVER_NAME]))
+          )}
+        />
+      )}
+
       {/* MCP Servers */}
       <div>
         <h3 className="text-foreground mb-4 text-sm font-medium">MCP Servers</h3>
@@ -1167,6 +1195,7 @@ export const MCPSettingsSection: React.FC = () => {
                   // Agent Plugin servers are read-only config entries: no
                   // global enable/edit/remove; enable them per workspace.
                   const isPluginEntry = entry.plugin !== undefined;
+                  const isDesignEntry = remoteEntry?.managed === "claude-design";
                   const displayName = entry.plugin
                     ? `${entry.plugin.pluginName}/${entry.plugin.serverName}`
                     : name;
@@ -1337,7 +1366,7 @@ export const MCPSettingsSection: React.FC = () => {
                                 <TooltipContent side="top">Test connection</TooltipContent>
                               </Tooltip>
                               {/* Plugin entries are read-only: no edit/remove. */}
-                              {!isPluginEntry && (
+                              {!isPluginEntry && !isDesignEntry && (
                                 <>
                                   <Tooltip>
                                     <TooltipTrigger asChild>
@@ -1377,7 +1406,7 @@ export const MCPSettingsSection: React.FC = () => {
                             </>
                           )}
                         </div>
-                        {!isEditing && remoteEntry && (
+                        {!isEditing && remoteEntry && !isDesignEntry && (
                           <div
                             className={cn(
                               "col-start-2 col-span-2 min-w-0",
@@ -1400,7 +1429,7 @@ export const MCPSettingsSection: React.FC = () => {
                             <span>{cached.result.error}</span>
                           </div>
 
-                          {cached.result.oauthChallenge && (
+                          {cached.result.oauthChallenge && !isDesignEntry && (
                             <div className="mt-2">
                               <MCPOAuthRequiredCallout
                                 serverName={name}

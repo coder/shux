@@ -1,3 +1,9 @@
+import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
+import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
+import {
+  checkAssembledRequestBudgetForModel,
+  estimateToolResultTokensForModel,
+} from "./contextBudgetCounting";
 import {
   applyCacheControl,
   getAnthropicCacheTtl,
@@ -210,8 +216,14 @@ export type TurnEngineEventSink = (event: TurnEngineEvent) => void | Promise<voi
 
 // Turn identity lives on TurnStreamHandle.messageId; completions cannot diverge from it.
 export type TurnCompletion =
-  | { status: "completed" }
-  | { status: "aborted"; abortReason: StreamAbortReason }
+  | { status: "completed"; streamEnd: Omit<StreamEndEvent, "messageId"> }
+  | {
+      status: "aborted";
+      abortReason: StreamAbortReason;
+      // Absent for startup cancellation / cleanup without a delivered terminal event.
+      streamAbort?: Omit<StreamAbortEvent, "messageId" | "abortReason">;
+      systemMessageTokens?: number;
+    }
   | { status: "failed"; streamError: StreamErrorPayload & { errorType: StreamErrorType } };
 
 export interface TurnStreamHandle {
@@ -242,6 +254,21 @@ export function createTurnCompletionController(): TurnCompletionController {
 
 // Request-construction options shared by the primary turn and model-fallback
 // hops (fallbacks rebuild these from the prepared fallback request).
+export interface SettledStepBudget {
+  model: string;
+  usage: LanguageModelV2Usage | undefined;
+  providerMetadata?: Record<string, unknown>;
+  toolResultChars: number;
+  imageParts: number;
+  toolResultTokens?: number;
+  sessionHistoryAvailable: boolean;
+  memoryWritable: boolean;
+}
+
+export type OnStepSettled = (
+  step: SettledStepBudget
+) => Promise<"continue" | "warn" | "rollover" | "block">;
+
 interface StreamRequestOptions {
   model: LanguageModel;
   modelString: string;
@@ -256,6 +283,9 @@ interface StreamRequestOptions {
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
+  onStepSettled?: OnStepSettled;
+  contextBudgetMemoryWritable?: boolean;
+  contextBudgetLimit?: number;
   toolSearchState?: ToolSearchStreamState;
   thinkingOverrideState?: ActiveTurnThinkingOverride;
   rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
@@ -295,7 +325,9 @@ interface StepMessageTracker {
 }
 interface StreamRequestConfig {
   cacheEnabled?: boolean;
+  budgetMetadataModel?: string;
   model: LanguageModel;
+  modelString: string;
   messages: ModelMessage[];
   /** Provider-ready system instructions from TurnContextAssembler. */
   system?: string | SystemModelMessage;
@@ -310,6 +342,9 @@ interface StreamRequestConfig {
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
   onStepMessages?: (messages: ModelMessage[]) => void;
+  onStepSettled?: OnStepSettled;
+  contextBudgetMemoryWritable?: boolean;
+  contextBudgetLimit?: number;
   toolPolicy?: ToolPolicy;
   /**
    * Tool-search deferral state (tool-search experiment). Owned and mutated by
@@ -347,6 +382,8 @@ interface StreamRequestConfig {
  */
 interface PreparedModelFallback {
   contextWindowTokens?: number | null;
+  contextBudgetMemoryWritable?: boolean;
+  contextBudgetLimit?: number;
   model: LanguageModel;
   /** Canonical model string of the fallback attempt (drives metadata + tokenizer). */
   modelString: string;
@@ -423,7 +460,12 @@ export interface ModelFallbackOptions {
   prepare: (
     nextModelString: string,
     options?: ModelFallbackPrepareOptions
-  ) => Promise<Result<PreparedModelFallback, string>>;
+  ) => Promise<
+    Result<
+      PreparedModelFallback,
+      string | Extract<SendMessageError, { type: "context_budget_exceeded" }>
+    >
+  >;
 }
 
 function isKnownProviderName(provider: string): provider is keyof typeof PROVIDER_DEFINITIONS {
@@ -745,6 +787,7 @@ interface WorkspaceStreamInfo {
   // when registration fails. Optional: whitebox test fixtures register stream
   // infos without a resource scope.
   resourceScope?: Scope.Closeable;
+  resourceCleanup?: Promise<void>;
   // Cumulative usage across all steps (for live cost display during streaming)
   cumulativeUsage: LanguageModelV2Usage;
   // Cumulative provider metadata across all steps (for live cost display with cache tokens)
@@ -787,9 +830,17 @@ interface PendingStreamStartHandle {
   finish(): void;
 }
 
+export interface StopStreamOptions {
+  soft?: boolean;
+  abandonPartial?: boolean;
+  abortReason?: StreamAbortReason;
+  /** Teardown of an already-settled attempt must not manufacture a second raw terminal. */
+  emitIfMissing?: boolean;
+}
+
 interface MockStreamLifecycle {
   isStreaming(workspaceId: string): boolean;
-  stop(workspaceId: string): Promise<void>;
+  stop(workspaceId: string, options?: StopStreamOptions): Promise<void>;
   replayStream(workspaceId: string): Promise<void>;
 }
 
@@ -801,6 +852,7 @@ export class StreamManager {
       abortController: AbortController;
       startTime: number;
       syntheticMessageId: string;
+      abortDelivery?: Promise<void>;
       acpPromptId?: string;
     }
   >();
@@ -907,6 +959,11 @@ export class StreamManager {
 
   setMockStreamLifecycle(lifecycle: MockStreamLifecycle | undefined): void {
     this.mockStreamLifecycle = lifecycle;
+  }
+
+  getStartupAbortReason(signal?: AbortSignal): StreamAbortReason {
+    const reason: unknown = signal?.reason;
+    return reason === "user" || reason === "system" || reason === "startup" ? reason : "startup";
   }
 
   beginStreamStart(input: {
@@ -1846,19 +1903,16 @@ export class StreamManager {
       return streamInfo.cancelPromise;
     }
     streamInfo.cancelPromise = (async () => {
+      streamInfo.state = StreamState.STOPPING;
       try {
-        streamInfo.state = StreamState.STOPPING;
-        // Flush any pending partial write immediately (preserves work on interruption)
+        // A failed best-effort flush must not prevent the provider from being stopped.
         await this.flushPartialWrite(workspaceId, streamInfo);
-
-        streamInfo.abortController.abort();
-
-        // Unlike checkSoftCancelStream, await cleanup (blocking)
-        await this.cleanupAbortedStream(workspaceId, streamInfo, abortReason, abandonPartial);
       } catch (error) {
-        log.error("Error during stream cancellation:", error);
-        // Force cleanup even if cancellation fails
-        this.workspaceStreams.delete(workspaceId);
+        log.error("Failed to flush partial before cancellation", { error });
+      } finally {
+        streamInfo.abortController.abort();
+        // Unlike checkSoftCancelStream, await cleanup (blocking).
+        await this.cleanupAbortedStream(workspaceId, streamInfo, abortReason, abandonPartial);
       }
     })();
     return streamInfo.cancelPromise;
@@ -1876,7 +1930,9 @@ export class StreamManager {
 
       // Flush any pending partial write immediately (preserves work on interruption)
       await this.flushPartialWrite(workspaceId, streamInfo);
-
+    } catch (error) {
+      log.error("Failed to flush partial before soft cancellation", { error });
+    } finally {
       streamInfo.abortController.abort();
 
       // Return back to the stream loop so we can wait for it to finish before
@@ -1892,11 +1948,39 @@ export class StreamManager {
         abortReason,
         abandonPartial
       );
-    } catch (error) {
-      log.error("Error during stream cancellation:", error);
-      // Force cleanup even if cancellation fails
-      this.workspaceStreams.delete(workspaceId);
     }
+  }
+
+  private closeStreamResources(streamInfo: WorkspaceStreamInfo): Promise<void> {
+    if (streamInfo.resourceCleanup) return streamInfo.resourceCleanup;
+    const closed = Promise.withResolvers<void>();
+    streamInfo.resourceCleanup = closed.promise;
+    (async () => {
+      // Retire scheduled writes before joining their original Promise I/O. Scope close
+      // interrupts debounce fibers; remote temp-directory removal remains best effort
+      // (its registered finalizer only initiates removal, never awaits SSH).
+      streamInfo.partialRetired = true;
+      try {
+        if (streamInfo.resourceScope) {
+          await this.effectRunner.runPromise(Scope.close(streamInfo.resourceScope, Exit.void));
+        }
+      } catch (error) {
+        log.error("Stream resource cleanup failed", { error });
+      }
+      try {
+        this.interruptPartialWriteFiber(streamInfo);
+        await this.awaitPendingPartialWrite(streamInfo);
+      } catch (error) {
+        // A cleanup defect must not orphan a completed/failed handle or skip raw teardown.
+        log.error("Pending partial write cleanup failed", { error });
+      }
+
+      runLanguageModelCleanup(streamInfo.request?.model);
+
+      streamInfo.unlinkAbortSignal?.();
+      streamInfo.unlinkAbortSignal = undefined;
+    })().then(closed.resolve, closed.reject);
+    return closed.promise;
   }
 
   private async cleanupAbortedStream(
@@ -1908,7 +1992,13 @@ export class StreamManager {
     // CRITICAL: Wait for processing to fully complete before cleanup
     // This prevents race conditions where the old stream is still running
     // while a new stream starts (e.g., old stream writing to partial.json)
-    await streamInfo.processingPromise;
+    try {
+      await streamInfo.processingPromise;
+    } catch (error) {
+      // The provider has exited even when teardown failed. Cancellation still owns
+      // an aborted terminal unless the loop already published another outcome.
+      log.error("Stream processing failed during cancellation", { error });
+    }
 
     // The cancel lost the race: the loop had already left the fullStream and
     // finished as completed/failed (terminalCompletion set, stream-end/error
@@ -1920,6 +2010,12 @@ export class StreamManager {
       return;
     }
 
+    // Also covers registered STARTING attempts: their envelope callback may itself await
+    // stopStream, so join owned resources here without joining that callback back into itself.
+    // The envelope only journals; its original callback/mutex lifetime stays independently
+    // leased. Canceled engine model/temp/debounce resources retire before raw terminal delivery.
+    await this.closeStreamResources(streamInfo);
+
     // For aborts, use our tracked cumulativeUsage directly instead of AI SDK's totalUsage.
     // cumulativeUsage is updated on each finish-step event (before tool execution),
     // so it has accurate data even when the stream is interrupted mid-tool-call.
@@ -1928,7 +2024,6 @@ export class StreamManager {
     const usage = hasTokenUsage(streamInfo.cumulativeUsage)
       ? streamInfo.cumulativeUsage
       : undefined;
-    await this.backfillReasoningTokensFromParts(streamInfo, usage);
 
     // For context window display, use last step's usage (inputTokens = current context size)
     const contextUsage = streamInfo.lastStepUsage;
@@ -1940,47 +2035,81 @@ export class StreamManager {
       streamInfo.initialMetadata?.costsIncluded
     );
 
-    // Record session usage for aborted streams (mirrors stream-end path)
-    // This ensures tokens consumed before abort are tracked for cost display
-    await this.recordSessionUsage(
+    const streamAbort: StreamAbortEvent = {
+      type: "stream-abort",
       workspaceId,
-      streamInfo.model,
-      usage,
-      providerMetadata,
-      "Failed to record session usage on abort",
-      "error",
-      streamInfo
-    );
-
-    // Stamp the aborted turn's usage onto the partial message BEFORE emitting
-    // stream-abort (whose handler commits the partial to chat.jsonl). Analytics
-    // prices history rows from metadata.usage, so without this every
-    // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
-    // would ingest as $0 even though the provider billed all completed steps.
-    if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+      messageId: streamInfo.messageId,
+      metadata: { usage, contextUsage, duration, providerMetadata, contextProviderMetadata },
+      abortReason,
+      abandonPartial,
+      acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+    };
+    try {
       try {
-        await this.awaitPendingPartialWrite(streamInfo);
-        const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
-          metadata: {
-            ...(usage !== undefined ? { usage: cloneUsage(usage) } : {}),
-            ...(providerMetadata !== undefined ? { providerMetadata } : {}),
-            ...(contextUsage !== undefined ? { contextUsage } : {}),
-            ...(contextProviderMetadata !== undefined ? { contextProviderMetadata } : {}),
-            duration,
-            ...(streamInfo.toolModelUsages.length > 0
-              ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
-              : {}),
-          },
-        });
-        await this.historyService.writePartial(workspaceId as string, partialMessage);
+        await this.backfillReasoningTokensFromParts(streamInfo, usage);
+      } catch (error) {
+        // Estimation is optional: preserve provider usage and the user's abort reason.
+        log.error("Failed to estimate reasoning usage on abort", { error });
+      }
 
-        // Tool-only aborts (Esc while a tool is still running): commitPartial
-        // refuses to commit partials whose only parts are input-available tool
-        // calls, so the usage stamped above would die with the deleted
-        // partial. Route that spend through the headless-usage sidecar
-        // instead. Same predicate commitPartial applies, so exactly one of
-        // {chat row, sidecar row} carries this turn's usage.
-        if (!hasCommitWorthyParts(partialMessage.parts)) {
+      // Record session usage for aborted streams (mirrors stream-end path)
+      // This ensures tokens consumed before abort are tracked for cost display
+      await this.recordSessionUsage(
+        workspaceId,
+        streamInfo.model,
+        usage,
+        providerMetadata,
+        "Failed to record session usage on abort",
+        "error",
+        streamInfo
+      );
+
+      // Stamp the aborted turn's usage onto the partial message BEFORE committing
+      // it and delivering stream-abort. Analytics
+      // prices history rows from metadata.usage, so without this every
+      // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
+      // would ingest as $0 even though the provider billed all completed steps.
+      if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+        try {
+          await this.awaitPendingPartialWrite(streamInfo);
+          const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
+            metadata: {
+              ...(usage !== undefined ? { usage: cloneUsage(usage) } : {}),
+              ...(providerMetadata !== undefined ? { providerMetadata } : {}),
+              ...(contextUsage !== undefined ? { contextUsage } : {}),
+              ...(contextProviderMetadata !== undefined ? { contextProviderMetadata } : {}),
+              duration,
+              ...(streamInfo.toolModelUsages.length > 0
+                ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
+                : {}),
+            },
+          });
+          await this.historyService.writePartial(workspaceId as string, partialMessage);
+
+          // Tool-only aborts (Esc while a tool is still running): commitPartial
+          // refuses to commit partials whose only parts are input-available tool
+          // calls, so the usage stamped above would die with the deleted
+          // partial. Route that spend through the headless-usage sidecar
+          // instead. Same predicate commitPartial applies, so exactly one of
+          // {chat row, sidecar row} carries this turn's usage.
+          if (!hasCommitWorthyParts(partialMessage.parts)) {
+            await this.recordDroppedPartialUsageInSidecar(
+              workspaceId,
+              streamInfo,
+              usage,
+              providerMetadata,
+              "aborted_stream"
+            );
+          }
+        } catch (error) {
+          log.error("Failed to persist aborted-stream usage on partial message", { error });
+        }
+      } else if (abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+        // Abandoned aborts (edit/discard of the streaming turn): the partial is
+        // deliberately dropped and its content never reaches chat.jsonl, but
+        // the provider still billed every completed step. The sidecar is the
+        // only route to the events table for this spend.
+        try {
           await this.recordDroppedPartialUsageInSidecar(
             workspaceId,
             streamInfo,
@@ -1988,50 +2117,51 @@ export class StreamManager {
             providerMetadata,
             "aborted_stream"
           );
+        } catch (error) {
+          log.error("Failed to record abandoned-abort usage in headless sidecar", { error });
         }
-      } catch (error) {
-        log.error("Failed to persist aborted-stream usage on partial message", { error });
       }
-    } else if (abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
-      // Abandoned aborts (edit/discard of the streaming turn): the partial is
-      // deliberately dropped and its content never reaches chat.jsonl, but
-      // the provider still billed every completed step. The sidecar is the
-      // only route to the events table for this spend.
+    } catch (error) {
+      log.error("Failed abort bookkeeping; delivering preserved terminal metadata", { error });
+    } finally {
       try {
-        await this.recordDroppedPartialUsageInSidecar(
-          workspaceId,
-          streamInfo,
-          usage,
-          providerMetadata,
-          "aborted_stream"
-        );
+        // Cancellation owns this attempt through disk cleanup and raw delivery. Keeping
+        // the registration until then makes replacement startup join the same fence.
+        const result = abandonPartial
+          ? await this.historyService.deletePartialIfMessageIdMatches(
+              workspaceId,
+              streamInfo.messageId
+            )
+          : await this.historyService.commitPartial(workspaceId, streamInfo.messageId);
+        // commitPartial already deletes on success. On failure retain recovery data;
+        // an unconditional delete here would silently discard an uncommitted answer.
+        if (!result.success)
+          log.error("Failed partial cleanup during stream-abort", {
+            workspaceId,
+            error: result.error,
+          });
       } catch (error) {
-        log.error("Failed to record abandoned-abort usage in headless sidecar", { error });
+        log.error("Failed partial cleanup during stream-abort", { workspaceId, error });
+      }
+      try {
+        await this.eventSink(streamAbort);
+      } catch (error) {
+        log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
+      } finally {
+        if (this.workspaceStreams.get(workspaceId) === streamInfo) {
+          this.workspaceStreams.delete(workspaceId);
+        }
+        streamInfo.terminalCompletion = {
+          status: "aborted",
+          abortReason,
+          streamAbort,
+          systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
+        };
+        // Session policy consumes this promise separately. It may start a replacement,
+        // so neither this fence nor the raw sink may join that policy.
+        streamInfo.completionController?.settle(streamInfo.terminalCompletion);
       }
     }
-
-    // Emit abort asynchronously as before; completion settles only after the facade's
-    // partial cleanup and external stream-abort emission have finished.
-    const abortDelivery = this.emitStreamAbort(
-      workspaceId,
-      streamInfo.messageId,
-      { usage, contextUsage, duration, providerMetadata, contextProviderMetadata },
-      abortReason,
-      abandonPartial,
-      streamInfo.initialMetadata?.acpPromptId
-    );
-
-    // Clean up immediately
-    this.workspaceStreams.delete(workspaceId);
-    void abortDelivery
-      .catch((error) => {
-        // Contain sink rejections: .finally alone would re-propagate them as
-        // an unhandled rejection after completion settles.
-        log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
-      })
-      .finally(() => {
-        streamInfo.completionController?.settle({ status: "aborted", abortReason });
-      });
   }
 
   /**
@@ -2156,6 +2286,9 @@ export class StreamManager {
       headers,
       onChunk,
       onStepMessages,
+      onStepSettled,
+      contextBudgetMemoryWritable,
+      contextBudgetLimit,
       toolSearchState,
       onToolExecutionStart,
       thinkingOverrideState,
@@ -2192,9 +2325,11 @@ export class StreamManager {
 
     return {
       model,
+      modelString,
       messages,
       system,
       cacheEnabled: supportsAnthropicCache(modelString, requestProvidersConfig),
+      budgetMetadataModel: resolveModelForMetadata(modelString, requestProvidersConfig),
       // Keep provider-level parallel tool planning enabled, but serialize sibling
       // execute() handlers inside this stream so shared mutable state cannot race.
       tools: withSequentialExecution(tools, onToolExecutionStart),
@@ -2206,6 +2341,9 @@ export class StreamManager {
       hasQueuedMessages,
       onChunk,
       onStepMessages,
+      onStepSettled,
+      contextBudgetMemoryWritable,
+      contextBudgetLimit,
       toolPolicy,
       toolSearchState,
       thinkingOverrideState,
@@ -2216,7 +2354,16 @@ export class StreamManager {
   }
 
   private createStopWhenCondition(
-    request: Pick<StreamRequestConfig, "hasQueuedMessages" | "toolPolicy">
+    request: Pick<
+      StreamRequestConfig,
+      | "hasQueuedMessages"
+      | "toolPolicy"
+      | "onStepSettled"
+      | "modelString"
+      | "tools"
+      | "contextBudgetMemoryWritable"
+      | "budgetMetadataModel"
+    >
   ): Array<ReturnType<typeof stepCountIs>> {
     // Completion-tool stop check: completion/routing tools use explicit
     // success/ok markers (agent_report, propose_plan).
@@ -2262,7 +2409,34 @@ export class StreamManager {
       // The SDK evaluates stop conditions only after every sibling tool result in the
       // model's current step settles. Do not move this to individual tool-call-end events:
       // that would abort the remaining calls the model emitted in the same batch.
-      () => request.hasQueuedMessages?.("tool-end") ?? false,
+      async ({ steps }) => {
+        const step = steps.at(-1);
+        if (request.onStepSettled && step && !(await hasSuccessfulRequiredToolResult({ steps }))) {
+          const outputs = step.toolResults.map((result) => result.output);
+          const size = estimateToolResultSize(outputs);
+          const toolResultTokens = await estimateToolResultTokensForModel(outputs, {
+            model: request.modelString,
+            metadataModel: request.budgetMetadataModel,
+          });
+          const decision = await request.onStepSettled({
+            model: request.modelString,
+            usage: normalizeUsage(step.usage),
+            providerMetadata: step.providerMetadata,
+            ...size,
+            toolResultTokens,
+            sessionHistoryAvailable: request.tools?.session_history != null,
+            memoryWritable: request.contextBudgetMemoryWritable === true,
+          });
+          // All siblings have settled: stop before another provider step without discarding results.
+          if (decision === "block")
+            throw new ContextBudgetBlockedError(
+              "The settled tool results exceed the context budget. Use /compact or start a new context before continuing."
+            );
+          // Budget stops are authoritative even when only a turn-end message is queued.
+          if (decision !== "continue") return true;
+        }
+        return request.hasQueuedMessages?.("tool-end") ?? false;
+      },
       hasSuccessfulRequiredToolResult,
     ];
   }
@@ -2527,6 +2701,27 @@ export class StreamManager {
               error: getErrorMessage(error),
             });
           }
+        }
+        if (request.contextBudgetLimit != null) {
+          const exceeded = await checkAssembledRequestBudgetForModel(
+            {
+              system: request.system,
+              messages: rebuiltFirstStepMessages ?? effectiveMessages,
+              tools: request.tools,
+            },
+            {
+              model: request.modelString,
+              metadataModel: request.budgetMetadataModel,
+              modelContextLimit: request.contextBudgetLimit,
+              activeTools,
+            }
+          );
+          // Step zero can follow executed tools on a fallback. This late hard stop
+          // preserves settled results; it must not reset/replay the activated catalog.
+          if (exceeded)
+            throw new ContextBudgetBlockedError(
+              `The next request exceeds the safe context budget for ${exceeded.model} (${exceeded.estimate} > ${exceeded.hardCeiling}). Use /compact or reduce the active tool/context payload.`
+            );
         }
         if (
           effectiveMessages === stepMessages &&
@@ -2995,7 +3190,7 @@ export class StreamManager {
     }
   }
 
-  private emitStreamAbort(
+  private async emitStreamAbort(
     workspaceId: WorkspaceId,
     messageId: string,
     metadata: Record<string, unknown>,
@@ -3344,7 +3539,7 @@ export class StreamManager {
           }
         : undefined;
     streamInfo.stepTracker.pendingPrefixSwap = undefined;
-    let prepared: Result<PreparedModelFallback, string>;
+    let prepared: Awaited<ReturnType<ModelFallbackOptions["prepare"]>>;
     try {
       prepared = await fallbackState.options.prepare(nextModelString, prepareCallOptions);
     } catch (error) {
@@ -3357,6 +3552,7 @@ export class StreamManager {
       };
     }
     if (!prepared.success) {
+      if (typeof prepared.error !== "string") throw new ContextBudgetExceededError(prepared.error);
       return {
         kind: "terminal",
         terminalNote: `Configured fallback model ${nextModelString} could not be started: ${prepared.error}`,
@@ -3380,6 +3576,9 @@ export class StreamManager {
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
+      onStepSettled: streamInfo.request.onStepSettled,
+      contextBudgetMemoryWritable: prepared.data.contextBudgetMemoryWritable,
+      contextBudgetLimit: prepared.data.contextBudgetLimit,
       // Same state object: aiService's fallback prepare() rebuilt it in place
       // against the fallback toolset, so prepareStep keeps reading live state.
       toolSearchState: streamInfo.request.toolSearchState,
@@ -4317,7 +4516,7 @@ export class StreamManager {
             // before updateHistory completes, compaction can clear the file and then
             // updateHistory writes stale data back.
             this.emitTurnEvent(streamEndEvent);
-            streamInfo.terminalCompletion = { status: "completed" };
+            streamInfo.terminalCompletion = { status: "completed", streamEnd: streamEndEvent };
           }
           break;
         } catch (error) {
@@ -4363,25 +4562,16 @@ export class StreamManager {
     } finally {
       this.mcpServerManager?.releaseLease(workspaceId as string);
 
-      // Guaranteed cleanup in all code paths: close the stream's resource
-      // scope. Finalizers run in reverse acquisition order — the scope-tied
-      // debounce fiber is interrupted first (replaces manual clearTimeout
-      // bookkeeping; a pending partial flush must not fire after the stream
-      // ends and resurrect partial.json), then the temp-dir release runs (the
-      // fire-and-forget rm registered by acquireRelease in startStream; don't
-      // block stream completion on directory deletion — especially on SSH
-      // where rm -rf can take 500ms-2s). Scope.close is idempotent, so the
-      // never-registered path in startStream can never double-release.
-      if (streamInfo.resourceScope) {
-        Effect.runFork(Scope.close(streamInfo.resourceScope, Exit.void));
+      await this.closeStreamResources(streamInfo);
+
+      // Aborts keep their registration until cleanupAbortedStream completes its disk
+      // transaction and raw delivery. A stale finally must never remove a replacement.
+      if (
+        streamInfo.terminalCompletion != null &&
+        this.workspaceStreams.get(workspaceId) === streamInfo
+      ) {
+        this.workspaceStreams.delete(workspaceId);
       }
-
-      runLanguageModelCleanup(streamInfo.request?.model);
-
-      streamInfo.unlinkAbortSignal?.();
-      streamInfo.unlinkAbortSignal = undefined;
-
-      this.workspaceStreams.delete(workspaceId);
 
       // Lifecycle spine event: emitted from the guaranteed-cleanup path so
       // EVERY terminal outcome (completion, abort/Escape, provider failure)
@@ -4461,6 +4651,24 @@ export class StreamManager {
     // For categorization, use the cause if available (preserves the original error structure)
     if (error instanceof Error && error.cause) {
       actualError = error.cause;
+    }
+
+    if (actualError instanceof ContextBudgetBlockedError) {
+      return {
+        messageId: streamInfo.messageId,
+        error: actualError.message,
+        errorType: "context_budget_blocked",
+        acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+      };
+    }
+    if (actualError instanceof ContextBudgetExceededError) {
+      return {
+        messageId: streamInfo.messageId,
+        error: actualError.message,
+        errorType: "context_budget_blocked",
+        contextBudgetExceeded: actualError.details,
+        acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+      };
     }
 
     let errorType = this.categorizeError(actualError);
@@ -4850,15 +5058,6 @@ export class StreamManager {
       };
     }
 
-    // TODO: Add more specific error types as needed
-    // if (APICallError.isInstance(error)) {
-    //   if (error.statusCode === 401) return { type: "authentication", ... };
-    //   if (error.statusCode === 429) return { type: "rate_limit", ... };
-    // }
-    // if (RetryError.isInstance(error)) {
-    //   return { type: "retry_failed", ... };
-    // }
-
     // Fallback for unknown errors
     const message = getErrorMessage(error);
     return { type: "unknown", raw: message };
@@ -4868,6 +5067,8 @@ export class StreamManager {
    * Categorizes errors for better error handling (used for event emission)
    */
   private categorizeError(error: unknown): StreamErrorType {
+    if (error instanceof ContextBudgetExceededError || error instanceof ContextBudgetBlockedError)
+      return "context_budget_blocked";
     if (error instanceof StreamTruncatedError) {
       return "stream_truncated";
     }
@@ -5059,7 +5260,10 @@ export class StreamManager {
     const completionController = createTurnCompletionController();
     const handle: TurnStreamHandle = { messageId, completion: completionController.promise };
     const settleStartupAbort = (): Result<TurnStreamHandle, SendMessageError> => {
-      completionController.settle({ status: "aborted", abortReason: "startup" });
+      completionController.settle({
+        status: "aborted",
+        abortReason: this.getStartupAbortReason(abortSignal),
+      });
       return Ok(handle);
     };
 
@@ -5078,6 +5282,7 @@ export class StreamManager {
     }
     const mutex = this.streamLocks.get(typedWorkspaceId)!;
 
+    let registeredStream: WorkspaceStreamInfo | undefined;
     try {
       // Acquire lock - guarantees only one startStream per workspace
       // Lock is automatically released when scope exits via Symbol.asyncDispose
@@ -5095,7 +5300,17 @@ export class StreamManager {
       // fiber). Ownership transfers to processStreamWithCleanup once the
       // stream registers; otherwise the finally below closes it.
       const resourceScope = Scope.makeUnsafe();
-      let streamRegistered = false;
+      let processingStarted = false;
+      const cleanupStartup = async (): Promise<void> => {
+        if (registeredStream) return this.closeStreamResources(registeredStream);
+        runLanguageModelCleanup(model);
+        unlinkAbortSignal();
+        try {
+          await this.effectRunner.runPromise(Scope.close(resourceScope, Exit.void));
+        } catch (error) {
+          log.error("Startup resource cleanup failed", { error });
+        }
+      };
 
       try {
         // Step 1: Cancel any existing stream before proceeding
@@ -5108,6 +5323,7 @@ export class StreamManager {
         // If the stream was interrupted while we were waiting on async setup (mutex,
         // temp dir creation, etc), avoid starting the stream entirely.
         if (streamAbortController.signal.aborted) {
+          await cleanupStartup();
           return settleStartupAbort();
         }
 
@@ -5144,6 +5360,7 @@ export class StreamManager {
         );
 
         if (streamAbortController.signal.aborted) {
+          await cleanupStartup();
           return settleStartupAbort();
         }
 
@@ -5156,18 +5373,21 @@ export class StreamManager {
           completionController,
         });
 
+        registeredStream = streamInfo;
+        streamInfo.unlinkAbortSignal = unlinkAbortSignal;
+
         // Guard against a narrow race:
         // - stopStream() may abort while we're between the last aborted-check and stream registration.
         // - If we start processStreamWithCleanup anyway, it would emit stream-start, but no one would
         //   subsequently call stopStream() again (it already ran), so we'd never emit stream-abort/end.
         // In that case, immediately drop the registered stream and rely on the caller to handle UI.
         if (streamAbortController.signal.aborted) {
-          this.workspaceStreams.delete(typedWorkspaceId);
+          if (this.workspaceStreams.get(typedWorkspaceId) === streamInfo)
+            this.workspaceStreams.delete(typedWorkspaceId);
+          await cleanupStartup();
           return settleStartupAbort();
         }
 
-        streamInfo.unlinkAbortSignal = unlinkAbortSignal;
-        streamRegistered = true;
         // Supervise from registration on: a shutdown landing during the envelope
         // write below must find this STARTING stream and cancel it inside the
         // scope close (the hard-interrupt path documented after the await),
@@ -5189,15 +5409,18 @@ export class StreamManager {
           streamAbortController.signal.aborted ||
           this.workspaceStreams.get(typedWorkspaceId) !== streamInfo
         ) {
-          if (this.workspaceStreams.get(typedWorkspaceId) === streamInfo) {
+          // The envelope may return while abort persistence/raw delivery is still held.
+          // Joining its existing fence preserves the first reason and attempt registration.
+          await streamInfo.cancelPromise;
+          await cleanupStartup();
+          if (this.workspaceStreams.get(typedWorkspaceId) === streamInfo)
             this.workspaceStreams.delete(typedWorkspaceId);
-          }
-          streamRegistered = false;
           return settleStartupAbort();
         }
 
         // Step 5: Track the processing promise for guaranteed cleanup
         // This allows cancelStreamSafely to wait for full exit
+        processingStarted = true;
         streamInfo.processingPromise = this.processStreamWithCleanup(
           typedWorkspaceId,
           streamInfo,
@@ -5208,22 +5431,22 @@ export class StreamManager {
 
         return Ok(handle);
       } finally {
-        if (!streamRegistered) {
-          runLanguageModelCleanup(model);
-          unlinkAbortSignal();
-          // Releases the temp dir if it was acquired (no-op otherwise). The
-          // finalizer is synchronous and runFork executes it before returning
-          // control, mirroring the previous direct cleanup call.
-          Effect.runFork(Scope.close(resourceScope, Exit.void));
-        }
+        if (!processingStarted) await cleanupStartup();
       }
     } catch (error) {
-      // Guaranteed cleanup on any failure
-      this.workspaceStreams.delete(typedWorkspaceId);
+      // An envelope failure may arrive after an old stop and replacement registration.
+      // Preserve both the captured cancellation fence and the replacement's map entry.
+      await registeredStream?.cancelPromise;
+      if (registeredStream && this.workspaceStreams.get(typedWorkspaceId) === registeredStream) {
+        this.workspaceStreams.delete(typedWorkspaceId);
+      }
       // No handle is handed out on this path, so the completion is observed only
       // by a supervisor forked at registration: settle it so that fiber exits
       // instead of cancelling this never-started stream at shutdown.
-      completionController.settle({ status: "aborted", abortReason: "startup" });
+      completionController.settle({
+        status: "aborted",
+        abortReason: this.getStartupAbortReason(abortSignal),
+      });
       // Convert to strongly-typed error
       return Err(this.convertToSendMessageError(error));
     }
@@ -5236,8 +5459,8 @@ export class StreamManager {
    * during shutdown, cancels the stream through the user-stop path
    * (`cancelStreamSafely`, abort reason `"system"`) and waits for the turn to
    * settle — i.e. for the partial to be flushed with usage, `stream-abort`
-   * delivered (AIService commits the partial into chat.jsonl and deletes
-   * partial.json) and `completion` resolved. `closeScopeBounded` awaits that
+   * delivered after attempt-owned partial persistence, and `completion` resolved.
+   * `closeScopeBounded` awaits that
    * finalizer, so dispose() proceeds to tear down bridges and sessions only once
    * every in-flight stream is durably settled. Supervision starts at
    * registration (before the awaited turn-envelope write), so a STARTING stream
@@ -5271,9 +5494,7 @@ export class StreamManager {
           Effect.promise(async () => {
             const startedAt = performance.now();
             await this.cancelStreamSafely(workspaceId, streamInfo, "system");
-            // Abort delivery (partial commit, downstream stream-abort listeners)
-            // settles the completion asynchronously after cancelStreamSafely
-            // returns; shutdown must not proceed until it has.
+            // The engine fence includes persistence and raw delivery, never session policy.
             await streamInfo.completionController.promise;
             // Per-stream cost inside the AppFiberScope close (shutdownStep style).
             log.debug("[shutdown] streamManager.abortStream", {
@@ -5439,73 +5660,73 @@ export class StreamManager {
    * Stops an active stream for a workspace
    * If soft is true, performs a soft interrupt (cancels at next block boundary)
    */
-  async stopStream(
-    workspaceId: string,
-    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
-  ): Promise<Result<void>> {
+  async stopStream(workspaceId: string, options?: StopStreamOptions): Promise<Result<void>> {
     const typedWorkspaceId = workspaceId as WorkspaceId;
+    // Capture every target before abort callbacks or raw startup delivery can reenter and
+    // register a replacement. Never look up a new engine after an asynchronous stop step.
     const pending = this.pendingStreamStarts.get(workspaceId);
-    const isActuallyStreaming = this.mockStreamLifecycle
-      ? this.mockStreamLifecycle.isStreaming(workspaceId)
+    const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
+    const mockLifecycle = this.mockStreamLifecycle;
+    const isActuallyStreaming = mockLifecycle
+      ? mockLifecycle.isStreaming(workspaceId)
       : this.isStreaming(workspaceId);
 
-    if (pending) {
-      pending.abortController.abort();
-      if (!isActuallyStreaming) {
-        await this.emitStreamAbort(
-          typedWorkspaceId,
-          pending.syntheticMessageId,
-          { duration: Date.now() - pending.startTime },
-          options?.abortReason ?? "startup",
-          options?.abandonPartial,
-          pending.acpPromptId
-        );
-      }
-    }
-
-    if (this.mockStreamLifecycle) {
-      await this.mockStreamLifecycle.stop(workspaceId);
-      return Ok(undefined);
-    }
-
     try {
-      const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
-      if (!streamInfo) {
-        if (!pending) {
-          void this.emitStreamAbort(
+      // Invoke against the captured mock before pending abort can synchronously start another.
+      const mockStop = mockLifecycle?.stop(workspaceId, options);
+      let engineStop: Promise<void> | undefined;
+      if (!mockLifecycle && streamInfo) {
+        const abortReason = options?.abortReason ?? "system";
+        if (options?.soft) {
+          streamInfo.softInterrupt = {
+            pending: true,
+            abandonPartial: options.abandonPartial ?? false,
+            abortReason,
+          };
+        } else {
+          engineStop = this.cancelStreamSafely(
             typedWorkspaceId,
-            "",
-            {},
-            options?.abortReason ?? "startup",
+            streamInfo,
+            abortReason,
             options?.abandonPartial
-          ).catch((error) => {
-            log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
-          });
+          );
         }
-        return Ok(undefined);
+      }
+      let startupDelivery: Promise<void> | undefined;
+      if (pending) {
+        if (!isActuallyStreaming && !streamInfo && !pending.abortDelivery) {
+          const delivery = Promise.withResolvers<void>();
+          pending.abortDelivery = delivery.promise;
+          pending.abortController.abort(options?.abortReason ?? "startup");
+          this.emitStreamAbort(
+            typedWorkspaceId,
+            pending.syntheticMessageId,
+            { duration: Date.now() - pending.startTime },
+            this.getStartupAbortReason(pending.abortController.signal),
+            options?.abandonPartial,
+            pending.acpPromptId
+          ).then(delivery.resolve, delivery.reject);
+        } else {
+          pending.abortController.abort(options?.abortReason ?? "startup");
+        }
+        startupDelivery = pending.abortDelivery;
       }
 
-      const abortReason = options?.abortReason ?? "system";
-      const soft = options?.soft ?? false;
-
-      if (soft) {
-        streamInfo.softInterrupt = {
-          pending: true,
-          abandonPartial: options?.abandonPartial ?? false,
-          abortReason,
-        };
-      } else {
-        await this.cancelStreamSafely(
+      if (!mockLifecycle && !streamInfo && !pending && options?.emitIfMissing !== false) {
+        startupDelivery = this.emitStreamAbort(
           typedWorkspaceId,
-          streamInfo,
-          abortReason,
+          "",
+          {},
+          options?.abortReason ?? "startup",
           options?.abandonPartial
         );
       }
+      const outcomes = await Promise.allSettled([startupDelivery, engineStop, mockStop]);
+      const failure = outcomes.find((outcome) => outcome.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
       return Ok(undefined);
     } catch (error) {
-      const message = getErrorMessage(error);
-      return Err("Failed to stop stream: " + message);
+      return Err("Failed to stop stream: " + getErrorMessage(error));
     }
   }
 
@@ -5541,7 +5762,10 @@ export class StreamManager {
    * Returns undefined if no active stream exists
    * Used to re-establish streaming context on frontend reconnection
    */
-  getStreamInfo(workspaceId: string):
+  getStreamInfo(
+    workspaceId: string,
+    includeFinalizing = false
+  ):
     | {
         messageId: string;
         model: string;
@@ -5561,7 +5785,9 @@ export class StreamManager {
     // Only return info if stream is actively running
     if (
       streamInfo &&
-      (streamInfo.state === StreamState.STARTING || streamInfo.state === StreamState.STREAMING)
+      (includeFinalizing ||
+        streamInfo.state === StreamState.STARTING ||
+        streamInfo.state === StreamState.STREAMING)
     ) {
       return {
         messageId: streamInfo.messageId,

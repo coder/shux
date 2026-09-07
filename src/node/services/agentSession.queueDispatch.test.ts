@@ -1,3 +1,5 @@
+import type { StreamAbortEvent } from "@/common/types/stream";
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 
 import { prepareUserMessageForSend } from "@/common/types/message";
@@ -38,10 +40,7 @@ function streamStartEvent(workspaceId: string): Record<string, unknown> {
   };
 }
 
-function streamAbortEvent(
-  workspaceId: string,
-  abortReason: "system" | "user"
-): Record<string, unknown> {
+function streamAbortEvent(workspaceId: string, abortReason: "system" | "user"): StreamAbortEvent {
   return {
     type: "stream-abort",
     workspaceId,
@@ -63,6 +62,39 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 500): Prom
 }
 
 describe("AgentSession queued message tool-call dispatch", () => {
+  test("a queued provider startup failure drains its successor after accepted-turn cleanup", async () => {
+    const successor = Promise.withResolvers<void>();
+    let calls = 0;
+    const streamMessage = mock(() => {
+      if (++calls === 1)
+        return Promise.resolve(
+          Err({ type: "api_key_not_found" as const, provider: "anthropic" as const })
+        );
+      successor.resolve();
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+    });
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-provider-startup-failure",
+      aiServiceOverrides: { streamMessage },
+    });
+    try {
+      session.queueMessage(
+        "failed startup",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true }
+      );
+      session.queueMessage("successor", { model: TEST_MODEL, agentId: "exec" });
+      session.sendQueuedMessages();
+      await successor.promise;
+      await session.waitForIdle();
+      expect(calls).toBe(2);
+      expect(session.hasQueuedMessages()).toBe(false);
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
   test.each(["returned error", "rejection"] as const)(
     "reserves queued startup synchronously and drains after %s cleanup",
     async (failureKind) => {
@@ -72,7 +104,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const successorStarted = Promise.withResolvers<void>();
       const streamMessage = mock(() => {
         successorStarted.resolve();
-        return Promise.resolve(Ok(createStartedTurnHandle()));
+        return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
       });
       const { session, historyService, cleanup } = await createAgentSessionHarness({
         workspaceId,
@@ -130,7 +162,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       } finally {
         releaseFailure.resolve();
         append.mockRestore();
-        session.dispose();
+        await session.dispose();
         await cleanup();
       }
     }
@@ -157,24 +189,24 @@ describe("AgentSession queued message tool-call dispatch", () => {
         }
       | undefined;
     const streamMessage = mock(() => {
-      const session = sessionHolder.current;
+      const observedSession = sessionHolder.current;
       preparingState = {
-        sameTurn: session?.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION) === true,
+        sameTurn: observedSession?.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION) === true,
         differentTurn:
-          session?.hasQueuedOrDispatchingEntry({
+          observedSession?.hasQueuedOrDispatchingEntry({
             ...WORKSPACE_TURN_CORRELATION,
             turnId: "turn-different",
           }) === true,
-        uncorrelated: session?.hasQueuedOrDispatchingEntry() === true,
+        uncorrelated: observedSession?.hasQueuedOrDispatchingEntry() === true,
         pendingSameTurn:
-          session?.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION) === true,
+          observedSession?.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION) === true,
         pendingDifferentTurn:
-          session?.hasPendingWorkspaceTurnContinuation({
+          observedSession?.hasPendingWorkspaceTurnContinuation({
             ...WORKSPACE_TURN_CORRELATION,
             turnId: "turn-different",
           }) === true,
       };
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "queue-dispatch-preparing-predecessor",
@@ -202,7 +234,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       });
       expect(session.hasQueuedOrDispatchingEntry()).toBe(false);
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -247,7 +279,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(session.hasQueuedOrDispatchingEntry(differentCorrelation)).toBe(true);
       sendMessage.mockRestore();
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -289,7 +321,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(engaged?.muxMetadata).toBeUndefined();
       sendMessage.mockRestore();
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -319,7 +351,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(cutter?.stage).toBe("dispatching");
       expect(cutter?.muxMetadata).toBeUndefined();
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -358,7 +390,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       );
       sendMessage.mockRestore();
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -386,7 +418,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(stopStream).not.toHaveBeenCalled();
       expect(sendQueuedMessages).not.toHaveBeenCalled();
 
-      aiEmitter.emit("stream-end", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-end",
         workspaceId,
         messageId: "assistant-1",
@@ -405,7 +437,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     } finally {
       sendQueuedMessages.mockRestore();
       stopStream.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -435,14 +467,14 @@ describe("AgentSession queued message tool-call dispatch", () => {
         abortReason: "system",
       });
 
-      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
       const didDispatch = await waitForCondition(() => sendQueuedMessages.mock.calls.length > 0);
       expect(didDispatch).toBe(true);
       expect(sendQueuedMessages).toHaveBeenCalledTimes(1);
     } finally {
       sendQueuedMessages.mockRestore();
       stopStream.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -491,7 +523,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(queuedSignals).toEqual([true, false]);
     } finally {
       stopStream.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -522,7 +554,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           })
         ).toBe(liveMode);
       } finally {
-        session.dispose();
+        await session.dispose();
         await cleanup();
       }
     }
@@ -576,7 +608,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(stopStream).toHaveBeenCalledTimes(1);
     } finally {
       stopStream.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -612,7 +644,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       // The next turn (e.g. a descendant-task terminal wake) starts and ends.
       aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
-      aiEmitter.emit("stream-end", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-end",
         workspaceId,
         messageId: "assistant-1",
@@ -635,7 +667,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(session.hasQueuedDedupeKey("heartbeat-request")).toBe(false);
     } finally {
       sendMessage.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -679,14 +711,16 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(setMessageQueued).toHaveBeenLastCalledWith(workspaceId, false);
       expect(session.hasQueuedMessages()).toBe(true);
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
 
   test("restoreQueueToInput emits all reviewed bodies once without dispatching or changing cancellation", async () => {
     const workspaceId = "queue-restore-reviewed-input";
-    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: { streamMessage },
@@ -792,7 +826,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       unsubscribeUser();
       expect(restoredTexts).toEqual(["my own words"]);
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -844,7 +878,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(canceledReasons).toHaveLength(1);
       expect(session.hasQueuedMessages()).toBe(false);
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -923,7 +957,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     } finally {
       releaseAppend();
       appendSpy.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -999,7 +1033,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       releaseAppend();
       deleteMessagesSpy.mockRestore();
       appendSpy.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -1080,7 +1114,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       releaseAppend();
       deleteMessagesSpy.mockRestore();
       appendSpy.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -1159,7 +1193,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }
     } finally {
       releaseInitialSync();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -1188,7 +1222,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       workspaceGoalService,
     });
 
-    let disposed = false;
     try {
       const controller = new AbortController();
       const cancelState = { canceledBeforeAcceptance: false };
@@ -1208,8 +1241,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       );
 
       await syncStarted;
-      session.dispose();
-      disposed = true;
+      session.beginDispose();
       releaseSync();
       const result = await sendPromise;
 
@@ -1218,7 +1250,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(cancelState.canceledBeforeAcceptance).toBe(false);
     } finally {
       releaseSync();
-      if (!disposed) session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -1296,7 +1328,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }
     } finally {
       releaseSync();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -1324,14 +1356,14 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const interruptResult = await session.interruptStream();
       expect(interruptResult.success).toBe(true);
       // The native soft-stop can still win the event race after the hard user interrupt.
-      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
 
       await new Promise((resolve) => setTimeout(resolve, 25));
       expect(sendQueuedMessages).not.toHaveBeenCalled();
     } finally {
       sendQueuedMessages.mockRestore();
       stopStream.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -1363,7 +1395,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(failures[0]).toContain("pricing gate exploded");
       sendMessage.mockRestore();
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });

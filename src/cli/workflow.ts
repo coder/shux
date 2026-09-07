@@ -3,6 +3,7 @@
  * `xum workflow` - Headless CLI runner for durable workflow scripts.
  */
 
+import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -286,7 +287,9 @@ async function disposeWorkflowResources(input: {
             { name: "appFiberScope.close", run: () => closeScopeBounded(services.appFiberScope) },
           ]
         : []),
-      { name: "session.dispose", run: () => input.session?.dispose() },
+      // The service guardian joins disposal inside closeScopeBounded. After a timeout,
+      // only initiate cleanup here: a second unbounded join would prevent CLI exit.
+      { name: "session.dispose", run: () => input.session?.beginDispose() },
       { name: "mcpServerManager.dispose", run: () => services?.mcpServerManager.dispose() },
       { name: "codexOauthService.dispose", run: () => input.codexOauthService?.dispose() },
       { name: "coderOauthService.dispose", run: () => input.coderOauthService?.dispose() },
@@ -397,6 +400,8 @@ async function createWorkflowContext(options: {
     // below would lose TypeScript's definite-assignment narrowing.
     const workspaceServiceForSanitize = services.workspaceService;
     session = new AgentSession({
+      effectRunner: services.runtime.get(EffectRunnerTag),
+      appFiberScope: services.appFiberScope,
       workspaceId,
       config,
       historyService: services.historyService,

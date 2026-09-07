@@ -13,6 +13,7 @@ export interface ExperimentValues {
   memoryIntuition: boolean | undefined;
   toolSearch: boolean | undefined;
   continuousCompaction: boolean | undefined;
+  tokenBudget: boolean | undefined;
 }
 
 export interface SendMessageOptionsInput {

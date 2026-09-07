@@ -1462,7 +1462,6 @@ ${scriptWithEnv}`;
               );
 
               if (migrateResult.success) {
-                // Register the migrated process with the manager
                 config.backgroundProcessManager.registerMigratedProcess(
                   migrateResult.handle,
                   processId,

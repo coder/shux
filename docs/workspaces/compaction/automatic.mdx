@@ -8,6 +8,8 @@ Xum can run `/compact` for you to keep context size manageable. There are two ty
 - **Usage-based**: Compacts when your conversation reaches a configurable percentage of the model's context window
 - **Idle-based**: Optionally compacts inactive workspaces after a period of time
 
+The opt-in [token-budget context windows experiment](/workspaces/compaction/token-budget) replaces usage-triggered summaries with fresh windows and on-demand history retrieval. Manual and idle compaction are unchanged.
+
 ## Usage-based auto-compaction
 
 When enabled, Xum monitors your context usage and:

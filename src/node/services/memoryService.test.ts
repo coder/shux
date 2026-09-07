@@ -1141,6 +1141,33 @@ describe("MemoryService", () => {
       );
     });
 
+    it("preloads never-accessed context notes without changing pins/stats or truncating the stored file", async () => {
+      using fixture = await createFixture();
+      const memoryDir = path.join(fixture.config.sessionsDir, fixture.ctx.workspaceId, "memory");
+      await fsPromises.mkdir(memoryDir, { recursive: true });
+      const notesPath = "/memories/workspace/context-notes.md";
+      const physicalPath = path.join(memoryDir, "context-notes.md");
+      const content = "界😀 facts\n".repeat(2000) + "retained tail";
+      await fsPromises.writeFile(physicalPath, content);
+      const before = await fixture.metaService.getEntries();
+      expect(
+        await fixture.service.listHotMemories(fixture.ctx, {
+          countTokens: (text) => Promise.resolve(Math.ceil(text.length / 3.5)),
+        })
+      ).toEqual([]);
+      const items = await fixture.service.listHotMemories(fixture.ctx, {
+        countTokens: (text) => Promise.resolve(Math.ceil(text.length / 3.5)),
+        tokenBudgetActive: true,
+      });
+      expect(items[0]).toMatchObject({ path: notesPath, pinned: false, truncated: true });
+      expect(items[0].content).not.toContain("retained tail");
+      expect(await fixture.metaService.getEntries()).toEqual(before);
+      expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe(content);
+      const viewed = await fixture.service.view(fixture.ctx, notesPath, { offset: 2001, limit: 1 });
+      expect(viewed.success).toBe(true);
+      if (viewed.success) expect(viewed.output).toContain("retained tail");
+    });
+
     it("preloading hot memories does not itself count as a use", async () => {
       using fixture = await createFixture();
       await fixture.service.create(fixture.ctx, "/memories/global/a.md", "v1", "agent");

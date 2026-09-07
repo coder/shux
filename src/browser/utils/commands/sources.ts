@@ -147,6 +147,7 @@ export interface BuildSourcesParams {
   onToggleTheme: () => void;
   onSetTheme: (theme: ThemePreference) => void;
   onOpenSettings?: (section?: string, options?: OpenSettingsOptions) => void;
+  onOpenAbout?: () => void;
 
   // Layout slots
   layoutPresets?: LayoutPresetsConfig | null;
@@ -1452,6 +1453,57 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       },
     },
   ]);
+
+  // Updates: the About dialog owns the controls and shows status, blockers, and errors, so each
+  // command starts the operation and opens the dialog.
+  if (p.onOpenAbout) {
+    const openAbout = p.onOpenAbout;
+    const updateCommand = (operation: (api: APIClient) => Promise<unknown>) => () => {
+      if (p.api) void operation(p.api).catch(console.error);
+      openAbout();
+    };
+    actions.push(() => [
+      {
+        id: CommandIds.aboutOpen(),
+        title: "About",
+        section: section.help,
+        keywords: ["version", "update", "release"],
+        run: () => openAbout(),
+      },
+      {
+        id: CommandIds.updateCheck(),
+        title: "Check for Updates",
+        section: section.help,
+        keywords: ["update", "upgrade", "version"],
+        run: updateCommand((api) => api.update.check({ source: "manual" })),
+      },
+      {
+        id: CommandIds.updateDownload(),
+        title: "Download Update",
+        section: section.help,
+        keywords: ["update", "upgrade"],
+        run: updateCommand((api) => api.update.download()),
+      },
+      {
+        id: CommandIds.updateInstall(),
+        title: "Install Update and Restart",
+        section: section.help,
+        keywords: ["update", "upgrade", "restart"],
+        run: updateCommand((api) => api.update.install()),
+      },
+      ...(["stable", "nightly"] as const).map((channel) => ({
+        id: CommandIds.updateChannel(channel),
+        title: `Update Channel: ${channel === "stable" ? "Stable" : "Nightly"}`,
+        section: section.help,
+        keywords: ["update", "channel", channel],
+        // The dialog reads the channel once when it opens, so the change must land first.
+        run: async () => {
+          if (p.api) await p.api.update.setChannel({ channel }).catch(console.error);
+          openAbout();
+        },
+      })),
+    ]);
+  }
 
   // Projects
   actions.push(() => {

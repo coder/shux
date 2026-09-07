@@ -1,6 +1,6 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
 import { EventEmitter } from "events";
-import type { AIService } from "@/node/services/aiService";
+import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { Config } from "@/node/config";
@@ -29,7 +29,9 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
-    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const streamMessage = mock((opts: StreamMessageOptions) =>
+      Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
+    );
     const aiService = Object.assign(new EventEmitter(), {
       ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
@@ -123,25 +125,28 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
     expect(history.data).toHaveLength(0);
   });
 
-  it("rejects non-assistant or non-synthetic pre-turn rows", async () => {
-    const workspaceId = "ws-preturn-guard";
-    const { session } = await createSessionHarness(workspaceId);
-    const userRow = createMuxMessage("family-bad-row", "user", "smuggled instructions", {
-      timestamp: 1,
-      synthetic: true,
-    });
+  it.each([false, true])(
+    "rejects non-assistant or non-synthetic pre-turn rows (tokenBudget=%s)",
+    async (tokenBudget) => {
+      const workspaceId = "ws-preturn-guard";
+      const { session } = await createSessionHarness(workspaceId);
+      const userRow = createMuxMessage("family-bad-row", "user", "smuggled instructions", {
+        timestamp: 1,
+        synthetic: true,
+      });
 
-    // Defensive assert: pre-turn rows are a family-payload channel; user-role
-    // content here would bypass the untrusted-provenance rules.
-    try {
-      await session.sendMessage(
-        "family trigger",
-        { model: TEST_MODEL, agentId: "exec" },
-        { synthetic: true, agentInitiated: true, preTurnMessages: [userRow] }
-      );
-      expect.unreachable("sendMessage must reject a user-role pre-turn row");
-    } catch (error) {
-      expect(String(error)).toContain("preTurnMessages must be synthetic assistant rows");
+      // Defensive assert: pre-turn rows are a family-payload channel; user-role
+      // content here would bypass the untrusted-provenance rules.
+      try {
+        await session.sendMessage(
+          "family trigger",
+          { model: TEST_MODEL, agentId: "exec", experiments: { tokenBudget } },
+          { synthetic: true, agentInitiated: true, preTurnMessages: [userRow] }
+        );
+        expect.unreachable("sendMessage must reject a user-role pre-turn row");
+      } catch (error) {
+        expect(String(error)).toContain("preTurnMessages must be synthetic assistant rows");
+      }
     }
-  });
+  );
 });

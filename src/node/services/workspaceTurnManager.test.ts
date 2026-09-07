@@ -3053,6 +3053,48 @@ describe("WorkspaceTurnManager", () => {
     expect(createWorkspace).not.toHaveBeenCalled();
   });
 
+  test.each([false, true])(
+    "continuation failure transfers disposable cleanup after lock and notification (throws=%s)",
+    async (throwNotification) => {
+      const remove = mock(() => Promise.resolve(Ok(undefined)));
+      const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
+        disposable: true,
+        remove,
+      });
+      const jobs: Array<() => Promise<void>> = [];
+      workspaceMocks.workspaceService.deferWorkspaceCleanup = (run) => {
+        jobs.push(run);
+      };
+      if (throwNotification)
+        spyOn(
+          taskService as unknown as {
+            deliverPersistentChildWorkspaceTurnResult(
+              record: WorkspaceTurnTaskHandleRecord
+            ): Promise<void>;
+          },
+          "deliverPersistentChildWorkspaceTurnResult"
+        ).mockRejectedValueOnce(new Error("notification unavailable"));
+      const outcome = await taskService
+        .settleWorkspaceTurnContinuationFailure(
+          "childworkspace",
+          workspaceTurnMuxMetadata(parentId),
+          "error",
+          "preparation failed"
+        )
+        .then(
+          () => undefined,
+          (error: unknown) => error
+        );
+      expect(outcome instanceof Error).toBe(throwNotification);
+      const snapshot = await workspaceTurnSnapshot(taskService, parentId);
+      expect(snapshot?.status).toBe("error");
+      expect(remove).not.toHaveBeenCalled();
+      expect(jobs).toHaveLength(1);
+      await jobs[0]();
+      expect(remove).toHaveBeenCalledWith("childworkspace", true);
+    }
+  );
+
   test("createWorkspaceTurn marks accepted pre-stream failures as handle errors", async () => {
     const sendMessage = mock(
       async (...args: unknown[]): Promise<Result<void, SendMessageError>> => {

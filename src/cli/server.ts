@@ -20,6 +20,7 @@ import { validateProjectPath } from "@/node/utils/pathUtils";
 import { VERSION } from "@/version";
 import { getParseOptions } from "./argv";
 import { resolveServerAuthToken } from "./serverAuthToken";
+import { resolveInstallLayout } from "@/node/services/serverUpdate/installLayout";
 import { appendServerCrashLogSync } from "./serverCrashLogging";
 import { shouldExposeLaunchProject } from "./launchProject";
 
@@ -261,6 +262,7 @@ async function main(): Promise<void> {
     }, SERVICE_TEARDOWN_BUDGET_MS);
 
     try {
+      serviceContainer.terminalService.beginShutdown();
       // Close all PTY sessions first
       shutdownStep("terminalService.closeAllSessions", () =>
         serviceContainer.terminalService.closeAllSessions()
@@ -292,6 +294,22 @@ async function main(): Promise<void> {
       process.exit(1);
     }
   };
+
+  // A generated token dies with this process, so the relaunched server would lock every browser
+  // session out; self-update is offered only when clients can re-authenticate on their own.
+  const updateLayout =
+    resolved.mode === "enabled" && resolved.source === "generated"
+      ? {
+          supported: false as const,
+          reason:
+            "Server updates require a stable auth token: set MUX_SERVER_AUTH_TOKEN or pass --auth-token",
+        }
+      : resolveInstallLayout(process.env, process.argv);
+  await serviceContainer.updateService.enableServerUpdater(updateLayout, {
+    refreshBlockers: () => serviceContainer.refreshRestartBlockers(),
+    collectBlockers: () => serviceContainer.collectRestartBlockers(),
+    restart: cleanup,
+  });
 
   process.on("SIGINT", () => void cleanup());
   process.on("SIGTERM", () => void cleanup());

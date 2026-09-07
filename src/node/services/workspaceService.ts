@@ -1,3 +1,6 @@
+import type { RestartBlocker } from "@/common/orpc/types";
+import { Effect, type Scope } from "effect";
+import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import {
   DesktopInputCoordinator,
   settleArchivedSharedDesktopTask,
@@ -1809,6 +1812,9 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly sessions = new Map<string, AgentSession>();
+  private shuttingDown = false;
+  private readonly shutdownSessions = new Set<AgentSession>();
+  private readonly pendingWorkspaceCleanup = new Set<Promise<void>>();
   private readonly providerConfigChangedListener = (): void => {
     const liveSessions = new Map([
       ...this.sessions.entries(),
@@ -2356,7 +2362,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       config.rootDir
     ),
     private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir),
-    private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
+    private readonly desktopInputCoordinator = new DesktopInputCoordinator(config),
+    private readonly effectRunner: EffectRunner = defaultEffectRunner,
+    private readonly appFiberScope?: Scope.Scope
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -2448,6 +2456,39 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     healRemovalTombstonesForRegisteredWorkspaces(this.config).catch((error: unknown) => {
       log.debug("Removal tombstone self-heal failed at startup", { error });
     });
+    if (this.appFiberScope) {
+      // A sibling of session guardians, never a child of a session being disposed. Producers
+      // can enqueue destructive cleanup while their final callbacks release physical leases.
+      this.effectRunner.runSync(
+        Effect.forkIn(
+          Effect.never.pipe(
+            Effect.onInterrupt(() =>
+              Effect.suspend(() => {
+                this.beginShutdown();
+                // Empty graph rollback must stay synchronous so constructor failures retain
+                // their original error instead of becoming an async runSync failure.
+                if (this.shutdownSessions.size === 0 && this.pendingWorkspaceCleanup.size === 0)
+                  return Effect.void;
+                return Effect.promise(async () => {
+                  await Promise.all(
+                    [...this.shutdownSessions].map((session) =>
+                      session.finishShutdown().catch((error: unknown) => {
+                        log.warn("Session shutdown failed", { error });
+                      })
+                    )
+                  );
+                  while (this.pendingWorkspaceCleanup.size > 0) {
+                    await Promise.all([...this.pendingWorkspaceCleanup]);
+                  }
+                });
+              })
+            )
+          ),
+          this.appFiberScope,
+          { startImmediately: true }
+        )
+      );
+    }
   }
 
   private async recoverBashMonitorRegistryPass(): Promise<boolean> {
@@ -3961,6 +4002,45 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     );
   }
 
+  collectRestartBlockers(): RestartBlocker[] {
+    const sessions = new Map([...this.sessions, ...this.transientStartupRecoverySessions]);
+    const pendingTurns = new Set(this.preflightSendCounts.keys());
+    let queuedMessages = 0;
+    let autoRetries = 0;
+    for (const [workspaceId, session] of sessions) {
+      if (session.hasActiveOrPendingTurnWork()) pendingTurns.add(workspaceId);
+      if (session.hasQueuedMessages()) queuedMessages++;
+      if (session.hasPendingAutoRetry()) autoRetries++;
+    }
+    const blockers: RestartBlocker[] = [
+      { kind: "pending-turns", count: pendingTurns.size },
+      {
+        kind: "workspace-inits",
+        // Controllers exist from the start of provisioning; settlements from init start onward.
+        count: new Set([...this.initAbortControllers.keys(), ...this.initSettlementPromises.keys()])
+          .size,
+      },
+      {
+        kind: "workspace-lifecycle",
+        count: new Set([
+          ...this.renamingWorkspaces,
+          ...this.removingWorkspaces,
+          ...this.archivingWorkspaces,
+          ...this.contextMutationWorkspaces,
+          ...this.preflightForkCounts.keys(),
+          ...this.preflightStagingCounts.keys(),
+        ]).size,
+      },
+      { kind: "queued-messages", count: queuedMessages },
+      { kind: "auto-retries", count: autoRetries },
+      {
+        kind: "background-processes",
+        count: Array.from(this.preflightExecCounts.values()).reduce((sum, count) => sum + count, 0),
+      },
+    ];
+    return blockers.filter((blocker) => blocker.count > 0);
+  }
+
   /**
    * Shutdown: stop startup chat recovery before the services it dispatches through go away.
    * Transient recovery sessions are disposed outright. Sessions that outlived that sweep (promoted
@@ -3968,13 +4048,39 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * on) may own a live stream whose partial the next startup needs, so they only stop dispatching.
    */
   beginShutdown(): void {
-    for (const [workspaceId, session] of this.transientStartupRecoverySessions) {
-      this.transientStartupRecoverySessions.delete(workspaceId);
-      session.dispose();
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    // Capture before disposal can remove transient instances from either registry.
+    for (const session of [
+      ...this.sessions.values(),
+      ...this.transientStartupRecoverySessions.values(),
+    ]) {
+      this.shutdownSessions.add(session);
     }
-    for (const session of this.sessions.values()) {
-      session.beginShutdown();
-    }
+    for (const [workspaceId] of this.transientStartupRecoverySessions)
+      this.disposeSession(workspaceId).catch((error: unknown) =>
+        log.warn("Transient session disposal failed", { workspaceId, error })
+      );
+    for (const session of this.sessions.values()) session.beginShutdown();
+  }
+
+  /** Transfer destructive cleanup out of a callback that still owns a session lease. */
+  deferWorkspaceCleanup(run: () => Promise<void>): void {
+    this.trackWorkspaceCleanup(run).catch((error: unknown) =>
+      log.warn("Deferred workspace cleanup failed", { error })
+    );
+  }
+
+  private trackWorkspaceCleanup(run: () => Promise<void>): Promise<void> {
+    const settled = Promise.withResolvers<void>();
+    this.pendingWorkspaceCleanup.add(settled.promise);
+    (async () => run())()
+      .catch((error: unknown) => log.warn("Workspace cleanup failed", { error }))
+      .finally(() => {
+        this.pendingWorkspaceCleanup.delete(settled.promise);
+        settled.resolve();
+      });
+    return settled.promise;
   }
 
   /**
@@ -3999,23 +4105,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
     void session
       .runStartupRecovery()
-      .then(() => {
+      .then(async () => {
         if (this.transientStartupRecoverySessions.get(trimmed) !== session) {
           return;
         }
 
-        this.transientStartupRecoverySessions.delete(trimmed);
-        if (session.shouldRetainAfterStartupRecovery()) {
+        if (!this.shuttingDown && session.shouldRetainAfterStartupRecovery()) {
           this.registerSession(trimmed, session);
           return;
         }
 
-        session.dispose();
+        await this.disposeSession(trimmed);
       })
-      .catch((error) => {
+      .catch(async (error) => {
         if (this.transientStartupRecoverySessions.get(trimmed) === session) {
-          this.transientStartupRecoverySessions.delete(trimmed);
-          session.dispose();
+          await this.disposeSession(trimmed);
         }
 
         log.warn("Failed to run startup recovery for workspace", {
@@ -4026,7 +4130,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   private createSession(workspaceId: string): AgentSession {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     return new AgentSession({
+      effectRunner: this.effectRunner,
+      appFiberScope: this.appFiberScope,
       workspaceId,
       config: this.config,
       historyService: this.historyService,
@@ -4045,6 +4152,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           args.workspacePath,
           args.runtimeConfig
         ),
+      onContextWindowRollover: () => this.advanceContextMutationEpoch(workspaceId),
       onCompactionComplete: (metadata) => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
         // Compaction marks a long session with accumulated learnings: harvest
@@ -4138,6 +4246,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
         const session =
           this.sessions.get(trimmed) ?? this.transientStartupRecoverySessions.get(trimmed);
+        if (session?.closingSignal.aborted) throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
         if (session?.isBusy() !== true) {
           return;
         }
@@ -4183,34 +4292,29 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return this.sessions.get(trimmed)?.countQueuedAgentPeerMessages() ?? 0;
   }
 
-  public disposeSession(workspaceId: string): void {
+  public disposeSession(workspaceId: string): Promise<void> {
     const trimmed = workspaceId.trim();
     const transientSession = this.transientStartupRecoverySessions.get(trimmed);
-    if (transientSession) {
-      transientSession.dispose();
-      this.transientStartupRecoverySessions.delete(trimmed);
-    }
-
     const session = this.sessions.get(trimmed);
+    const subscriptions = this.sessionSubscriptions.get(trimmed);
     const refreshTimer = this.postCompactionRefreshTimers.get(trimmed);
     if (refreshTimer) {
       clearTimeout(refreshTimer);
       this.postCompactionRefreshTimers.delete(trimmed);
     }
-
-    if (!session) {
-      return;
-    }
-
-    const subscriptions = this.sessionSubscriptions.get(trimmed);
-    if (subscriptions) {
-      subscriptions.chat();
-      subscriptions.metadata();
-      this.sessionSubscriptions.delete(trimmed);
-    }
-
-    session.dispose();
-    this.sessions.delete(trimmed);
+    return this.trackWorkspaceCleanup(async () => {
+      // Start both synchronous admission latches before the first await. Registry identity
+      // remains visible through terminal delivery and prevents a late old disposer removing B.
+      await Promise.all([transientSession?.dispose(), session?.dispose()]);
+      if (this.transientStartupRecoverySessions.get(trimmed) === transientSession) {
+        this.transientStartupRecoverySessions.delete(trimmed);
+      }
+      subscriptions?.chat();
+      subscriptions?.metadata();
+      if (this.sessionSubscriptions.get(trimmed) === subscriptions)
+        this.sessionSubscriptions.delete(trimmed);
+      if (this.sessions.get(trimmed) === session) this.sessions.delete(trimmed);
+    });
   }
 
   private async getPersistedPostCompactionDiffPaths(workspaceId: string): Promise<string[] | null> {
@@ -4731,7 +4835,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return Err(initialConflict);
     }
 
-    // Generate stable workspace ID
     const workspaceId = this.config.generateStableId();
 
     // Create runtime for workspace creation
@@ -5002,7 +5105,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             initAbortController.abort();
             this.initAbortControllers.delete(workspaceId);
             this.initStateManager.clearInMemoryState(workspaceId);
-            this.disposeSession(workspaceId);
+            await this.disposeSession(workspaceId);
             initLogger.logComplete(-1);
             return Err(
               rolledBack
@@ -5530,6 +5633,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   private async removeUnlocked(workspaceId: string, force = false): Promise<Result<void>> {
+    if (this.shuttingDown) return Err("Server is shutting down");
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
       return Ok(undefined);
@@ -5564,50 +5668,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
 
-      // Stop any active stream before deleting metadata/config to avoid tool calls racing with removal.
-      //
-      // IMPORTANT: AIService forwards "stream-abort" asynchronously after partial cleanup. If we roll up
-      // session timing (or delete session files) immediately after stopStream(), we can race the final
-      // abort timing write.
-      const wasStreaming = this.aiService.isStreaming(workspaceId);
-      const streamStoppedEvent: Promise<"abort" | "end" | undefined> | undefined = wasStreaming
-        ? new Promise((resolve) => {
-            const aiService = this.aiService;
-            const targetWorkspaceId = workspaceId;
-            const timeoutMs = 5000;
-
-            let settled = false;
-            let timer: ReturnType<typeof setTimeout> | undefined;
-
-            const cleanup = (result: "abort" | "end" | undefined) => {
-              if (settled) return;
-              settled = true;
-              if (timer) {
-                clearTimeout(timer);
-                timer = undefined;
-              }
-              aiService.off("stream-abort", onAbort);
-              aiService.off("stream-end", onEnd);
-              resolve(result);
-            };
-
-            function onAbort(data: StreamAbortEvent): void {
-              if (data.workspaceId !== targetWorkspaceId) return;
-              cleanup("abort");
-            }
-
-            function onEnd(data: StreamEndEvent): void {
-              if (data.workspaceId !== targetWorkspaceId) return;
-              cleanup("end");
-            }
-
-            aiService.on("stream-abort", onAbort);
-            aiService.on("stream-end", onEnd);
-
-            timer = setTimeout(() => cleanup(undefined), timeoutMs);
-          })
-        : undefined;
-
+      // The captured engine stop joins partial finalization and raw terminal delivery.
       try {
         const stopPromise = this.aiService.stopStream(workspaceId, { abandonPartial: true });
         const stopOutcome = await raceWithAbortAndTimeout(stopPromise, {
@@ -5632,20 +5693,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         log.debug("Failed to stop stream during workspace removal (threw)", { workspaceId, error });
       }
 
-      if (streamStoppedEvent) {
-        const stopEvent = await streamStoppedEvent;
-        if (!stopEvent) {
-          log.debug("Timed out waiting for stream to stop during workspace removal", {
-            workspaceId,
-          });
-        }
-
-        // If session timing is enabled, make sure no pending writes can recreate session files after
-        // we delete the session directory.
-        if (this.sessionTimingService) {
-          await this.sessionTimingService.waitForIdle(workspaceId);
-        }
-      }
+      // Raw terminal listeners may enqueue timing writes; join those before rollup/removal.
+      await this.sessionTimingService?.waitForIdle(workspaceId);
 
       let parentWorkspaceId: string | null = null;
       let childTaskModelString: string | undefined;
@@ -6017,7 +6066,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Dispose the session before deleting its directory: disposal aborts the active stream, and
       // the resulting stream-abort event would otherwise be recorded on the timeline after the
       // delete, recreating the session directory for a workspace the user removed.
-      this.disposeSession(workspaceId);
+      await this.disposeSession(workspaceId);
 
       // Same for in-flight dream/harvest consolidation (r60): abort + drain
       // before the session directory disappears (idempotent; normally
@@ -6138,7 +6187,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await this.mcpServerManager.stopServers(workspaceId);
       }
 
-      // Close any terminal sessions for this workspace
       this.terminalService?.closeWorkspaceSessions(workspaceId);
       await this.closeDesktopSessionBestEffort(workspaceId, "remove");
 
@@ -6493,11 +6541,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       "Configured heartbeat default interval must be within supported bounds"
     );
     return intervalMs;
-  }
-
-  getHeartbeatDefaultIntervalMs(): number {
-    const config = this.config.loadConfigOrDefault();
-    return this.getHeartbeatDefaultIntervalMsFromConfig(config);
   }
 
   async unsetHeartbeatSettings(workspaceId: string): Promise<Result<void, string>> {
@@ -6905,6 +6948,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   async rename(workspaceId: string, newName: string): Promise<Result<{ newWorkspaceId: string }>> {
     try {
+      if (this.shuttingDown) return Err("Server is shutting down");
       if (this.aiService.isStreaming(workspaceId)) {
         return Err(
           "Cannot rename workspace while AI stream is active. Please wait for the stream to complete."
@@ -8403,6 +8447,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     acknowledgedUntrackedPaths?: string[],
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
+    if (this.shuttingDown) return Err("Server is shutting down");
     this.archivingWorkspaces.add(workspaceId);
     let admissionHold: Disposable | undefined;
 
@@ -8747,8 +8792,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // scheduling loop creates later sees the archived entry and is never started.
       const transientRecoverySession = this.transientStartupRecoverySessions.get(workspaceId);
       if (transientRecoverySession) {
-        this.transientStartupRecoverySessions.delete(workspaceId);
-        transientRecoverySession.dispose();
+        await this.disposeSession(workspaceId);
       }
 
       if (!needsSnapshotCapture) {
@@ -10248,12 +10292,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
                   });
                 });
             }
+            await this.disposeSession(newWorkspaceId);
             await fsPromises
               .rm(newSessionDir, { recursive: true, force: true })
               .catch(() => undefined);
             this.initAbortControllers.delete(newWorkspaceId);
             this.initStateManager.clearInMemoryState(newWorkspaceId);
-            this.disposeSession(newWorkspaceId);
             initLogger.logComplete(-1);
             return Err(
               rolledBack
@@ -10790,7 +10834,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // reset/clear/replace that completes while this send is still doing
       // pre-admission work refuses the send instead of letting it append and
       // stream stale content into the fresh context.
-      const admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+      let admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
       const admissionEpochStale = () =>
         (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
       // r41: count this send as in-preflight until it settles so refine
@@ -11246,6 +11290,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
+        onContextWindowRollover: () => {
+          this.advanceContextMutationEpoch(workspaceId);
+          admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+        },
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
         goalKind: internal?.goalKind,
@@ -12032,7 +12080,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return;
     }
 
+    if (session.closingSignal.aborted) throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
     while (session.isBusy() || session.hasQueuedMessages() || session.hasPendingAutoRetry()) {
+      if (session.closingSignal.aborted) throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
       if (session.isBusy()) {
         await session.waitForIdle();
         continue;
@@ -12046,6 +12096,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           }
           settled = true;
           unsubscribe();
+          session.closingSignal.removeEventListener("abort", finish);
           resolve();
         };
         const unsubscribe = session.onChatEvent((event) => {
@@ -12062,11 +12113,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             finish();
           }
         });
-        if (!session.hasQueuedMessages() && !session.hasPendingAutoRetry()) {
+        session.closingSignal.addEventListener("abort", finish, { once: true });
+        if (
+          session.closingSignal.aborted ||
+          (!session.hasQueuedMessages() && !session.hasPendingAutoRetry())
+        ) {
           finish();
         }
       });
     }
+    if (session.closingSignal.aborted) throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
   }
 
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean {
@@ -12612,50 +12668,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // discarded even when no session exists yet (e.g. reset right after
       // an app restart).
       try {
-        await this.getOrCreateSession(workspaceId).clearPostCompactionState();
+        await this.getOrCreateSession(workspaceId).applyContextResetSideEffects();
       } catch (error) {
-        // Same partial-failure posture as the sandbox invalidation below:
-        // the chat-side reset applied, but the stale persisted carryover
-        // would re-inject pre-reset context after a restart, so success must
-        // not be reported while the discard is not durable.
-        log.error(
-          `Failed to durably discard post-compaction carryover for ${workspaceId} after context reset`,
-          error
-        );
+        // The boundary is durable, but success must wait for both persisted
+        // carryover and sandbox invalidation. Preserve the failing stage's diagnosis.
+        log.error(`Failed to durably discard context state for ${workspaceId}`, error);
         return Err(
-          `Context was reset, but the persisted post-compaction carryover could not be durably ` +
-            `discarded (${getErrorMessage(error)}). Pre-reset read/skill context may be ` +
-            `re-injected after a restart; retry once the session storage is writable.`
-        );
-      }
-
-      // Persistent sandbox mounts are scoped to the workspace session; a
-      // context reset ends that session, so sandbox state is DISCARDED (not
-      // snapshotted) — vars must not survive a reset the way they survive
-      // archive/un-archive.
-      try {
-        await sandboxHostService.discardScope(
-          workspaceId,
-          path.join(this.config.sessionsDir, workspaceId)
-        );
-      } catch (error) {
-        // The chat-side reset already applied, but the sandbox invalidation
-        // is NOT durable: the empty-snapshot tombstone failed to publish, and
-        // the only remaining record is the in-memory reset-pending guard,
-        // which blocks mounts and retries for THIS process only. A crash
-        // before a retry lands would let the next process restore — resurrect
-        // — the pre-reset snapshot the user explicitly cleared. Invalidation
-        // must be durable before success is reported, so surface the partial
-        // failure to the caller instead of returning Ok.
-        log.error(
-          `Failed to durably invalidate sandbox state for ${workspaceId} after context reset; ` +
-            `the sandbox kernel stays unavailable until invalidation succeeds`,
-          error
-        );
-        return Err(
-          `Context was reset, but the sandbox kernel state could not be durably invalidated ` +
-            `(${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables ` +
-            `may reappear after a restart; retry once the session storage is writable.`
+          `Context was reset, but ${getErrorMessage(error)} Retry once the session storage is writable.`
         );
       }
 
@@ -14288,6 +14307,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     command?: string,
     args?: string[]
   ): Promise<Result<BashToolResult>> {
+    if (this.shuttingDown) return Err("Server is shutting down");
     // Block bash execution while workspace is being removed to prevent races with directory deletion.
     // A common case: subagent calls agent_report → frontend's GitStatusStore triggers a git status
     // refresh → executeBash arrives while remove() is deleting the directory → spawn fails with ENOENT.
@@ -14478,7 +14498,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Create scoped temp directory for this IPC call
       using tempDir = new DisposableTempDir("mux-ipc-bash");
 
-      // Create bash tool
       const bashTool = createBashTool({
         cwd: cwdForExecution,
         runtime,

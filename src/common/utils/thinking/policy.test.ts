@@ -1054,6 +1054,20 @@ describe("lookupMinThinkingLevelOverride", () => {
   });
 });
 
+describe("Grok 4.1 Fast thinking policy", () => {
+  test("offers a binary ladder without turning legacy non-Off effort off", () => {
+    const model = "xai:grok-4-1-fast";
+    expect(getThinkingPolicyForModel(model)).toEqual(["off", "high"]);
+    expect(getDefaultMinimumThinkingLevel(model)).toBe("off");
+    expect(enforceThinkingPolicy(model, "off")).toBe("off");
+    for (const level of ["low", "medium", "high", "xhigh", "max"] as const) {
+      expect(enforceThinkingPolicy(model, level)).toBe("high");
+    }
+    expect(resolveThinkingInput(1, model)).toBe("high");
+    expect(getAvailableThinkingLevels(model, "medium")).toEqual(["high"]);
+  });
+});
+
 describe("Grok 4.5 thinking policy", () => {
   test("offers only the reasoning efforts accepted by xAI", () => {
     expect(getThinkingPolicyForModel("xai:grok-4.5")).toEqual(["low", "medium", "high"]);

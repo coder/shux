@@ -1,3 +1,4 @@
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, test, mock, afterEach } from "bun:test";
 import { AgentSession } from "./agentSession";
 import type { Config } from "@/node/config";
@@ -85,7 +86,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
       },
     };
 
-    aiEmitter.emit("stream-end", streamEnd);
+    void runSessionTerminalPolicy(session, aiEmitter, streamEnd);
 
     await waitForCondition(() => {
       expect(onCompactionComplete).toHaveBeenCalledTimes(1);
@@ -109,11 +110,11 @@ describe("AgentSession post-compaction refresh trigger", () => {
       text: "The user prefers concise tests.",
     });
 
-    aiEmitter.emit("stream-end", streamEnd);
+    void runSessionTerminalPolicy(session, aiEmitter, streamEnd);
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(onCompactionComplete).toHaveBeenCalledTimes(1);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("reports failed compaction continuation dispatch to lifecycle consumers", async () => {
@@ -156,7 +157,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
     );
     const decision = session.waitForPendingCompactionCompletionDecision("failed-follow-up-summary");
 
-    aiEmitter.emit("stream-end", {
+    void runSessionTerminalPolicy(session, aiEmitter, {
       type: "stream-end",
       workspaceId,
       messageId: "failed-follow-up-summary",
@@ -166,7 +167,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
 
     expect(await decision).toBe(false);
     expect(internals.dispatchPendingFollowUp).toHaveBeenCalledTimes(1);
-    session.dispose();
+    await session.dispose();
   });
 
   test("triggers callback on file_edit_* tool-call-end", async () => {
@@ -255,6 +256,6 @@ describe("AgentSession post-compaction refresh trigger", () => {
 
     expect(onPostCompactionStateChange).toHaveBeenCalledTimes(2);
 
-    session.dispose();
+    await session.dispose();
   });
 });

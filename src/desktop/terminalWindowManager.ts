@@ -5,7 +5,7 @@
  * Each workspace can have multiple terminal windows open simultaneously.
  */
 
-import { app, BrowserWindow, shell } from "electron";
+import { app, BrowserWindow, shell, type BrowserWindowConstructorOptions } from "electron";
 import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { normalizeAndValidateExternalUrl } from "@/desktop/utils/normalizeAndValidateExternalUrl";
@@ -23,7 +23,12 @@ export class TerminalWindowManager {
   private windowCount = 0; // Counter for unique window IDs
   private readonly config: Config;
 
-  constructor(config: Config) {
+  constructor(
+    config: Config,
+    private readonly createWindow: (options: BrowserWindowConstructorOptions) => BrowserWindow = (
+      options
+    ) => new BrowserWindow(options)
+  ) {
     this.config = config;
   }
 
@@ -52,7 +57,7 @@ export class TerminalWindowManager {
       title = `Terminal ${windowId} — ${workspaceId}`;
     }
 
-    const terminalWindow = new BrowserWindow({
+    const terminalWindow = this.createWindow({
       width: 1000,
       height: 600,
       title,
@@ -167,21 +172,5 @@ export class TerminalWindowManager {
       }
       this.windows.delete(workspaceId);
     }
-  }
-
-  /**
-   * Get all windows for a workspace
-   */
-  getWindows(workspaceId: string): BrowserWindow[] {
-    const windowSet = this.windows.get(workspaceId);
-    if (!windowSet) return [];
-    return Array.from(windowSet).filter((w) => !w.isDestroyed());
-  }
-
-  /**
-   * Get count of open terminal windows for a workspace
-   */
-  getWindowCount(workspaceId: string): number {
-    return this.getWindows(workspaceId).length;
   }
 }

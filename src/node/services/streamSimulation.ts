@@ -119,7 +119,7 @@ export async function simulateToolPolicyNoop(
   ctx: SimulationContext,
   effectiveToolPolicy: ToolPolicy | undefined,
   historyService: HistoryService
-): Promise<void> {
+): Promise<StreamEndEvent> {
   const noopMessage = createMuxMessage(ctx.assistantMessageId, "assistant", "", {
     timestamp: Date.now(),
     model: ctx.canonicalModelString,
@@ -190,4 +190,5 @@ export async function simulateToolPolicyNoop(
 
   await historyService.deletePartial(ctx.workspaceId);
   await historyService.updateHistory(ctx.workspaceId, finalAssistantMessage);
+  return streamEndEvent;
 }

@@ -2544,7 +2544,7 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string }
+    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
   ): Promise<Result<ResolveAndCreateModelResult, SendMessageError>> {
     return Effect.runPromise(
       this.resolveAndCreateModelEffect(modelString, thinkingLevel, muxProviderOptions, opts)
@@ -2555,7 +2555,7 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string }
+    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
   ): Effect.Effect<Result<ResolveAndCreateModelResult, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -2567,7 +2567,8 @@ export class ProviderModelFactory {
       // through the built-in machinery instead of the user's custom endpoint.
       // The equivalent guard in resolveGatewayModelString only protects callers
       // that pass raw strings.
-      const providersConfigForShadowCheck = self.providersConfigStore.loadProvidersConfig() ?? {};
+      const providersConfigForShadowCheck =
+        opts?.providersConfig ?? self.providersConfigStore.loadProvidersConfig() ?? {};
       const [rawProviderName] = parseModelString(modelString);
       const rawPrefixShadowedByCustomProvider =
         rawProviderName.length > 0 &&

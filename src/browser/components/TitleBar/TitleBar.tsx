@@ -44,7 +44,6 @@ import {
 } from "@/common/utils/ai/models";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
-// Update check interval
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
 // Tooltip CTAs mirror their triggers so pointer users can act on the copy directly.

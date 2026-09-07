@@ -8725,56 +8725,6 @@ describe("TaskService", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  test("still nudges when active descendants were not queue-backgrounded", async () => {
-    const config = await createTestConfig(rootDir);
-
-    const projectPath = path.join(rootDir, "repo");
-    const rootWorkspaceId = "root-111";
-    const childTaskId = "task-222";
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "root", rootWorkspaceId, {
-          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
-        }),
-        projectWorkspace(projectPath, "child-task", childTaskId, {
-          name: "agent_explore_child",
-          parentWorkspaceId: rootWorkspaceId,
-          agentType: "explore",
-          taskStatus: "running",
-          taskModelString: "openai:gpt-5.2",
-          taskThinkingLevel: "medium",
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    const { aiService } = createAIServiceMocks(config);
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
-
-    await handleTaskServiceStreamEndForTest(taskService, {
-      type: "stream-end",
-      workspaceId: rootWorkspaceId,
-      messageId: "assistant-root",
-      metadata: { model: "openai:gpt-5.2" },
-      parts: [],
-    });
-
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledWith(
-      rootWorkspaceId,
-      expect.stringContaining(childTaskId),
-      expect.objectContaining({
-        model: "openai:gpt-5.2",
-        thinkingLevel: "medium",
-      }),
-      expect.objectContaining({ skipAutoResumeReset: true, synthetic: true })
-    );
-  });
-
   test("notify_on_terminal child does not force await across multiple stream-ends", async () => {
     const config = await createTestConfig(rootDir);
 

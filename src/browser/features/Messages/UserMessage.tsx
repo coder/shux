@@ -155,7 +155,6 @@ export const UserMessage: React.FC<UserMessageProps> = ({
     "UserMessage expects clipboardWriteText to be a callable function."
   );
 
-  // Check if this is a local command output
   const isLocalCommandOutput =
     content.startsWith("<local-command-stdout>") && content.endsWith("</local-command-stdout>");
 

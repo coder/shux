@@ -167,7 +167,6 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<WorkspaceNameUIError | null>(null);
 
-  // Debounce timer
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Message pending in debounce timer (captured at schedule time)
   const pendingMessageRef = useRef<string>("");

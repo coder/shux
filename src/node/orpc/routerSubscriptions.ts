@@ -1,3 +1,4 @@
+import type { ClaudeDesignExperimentSnapshot } from "@/common/orpc/schemas/claudeDesign";
 import type {
   FrontendWorkspaceMetadataSchemaType,
   OnChatMode,
@@ -120,6 +121,22 @@ export function subscribeProviderConfig(
     signal,
     buffer: "latest",
     subscribe: (emit) => context.providerService.onConfigChanged(() => emit.push(undefined)),
+  });
+}
+
+export function subscribeDesignExperiment(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<ClaudeDesignExperimentSnapshot> {
+  const design = context.mcpConfigService.claudeDesign;
+  return runtimeSubscription(context, {
+    signal,
+    buffer: "latest",
+    subscribe: (emit) => design.onExperimentChange(emit.push),
+    initialize: async (emit) => {
+      await design.getStatus();
+      emit.push(design.experimentSnapshot());
+    },
   });
 }
 
@@ -278,8 +295,12 @@ export function subscribeWorkspaceChat(
       replayRelay = createReplayBufferedStreamMessageRelay(emit.push);
       return session.onChatEvent(({ message }) => replayRelay.handleSessionMessage(message));
     },
-    initialize: async (emit) => {
-      await session.replayHistory(({ message }) => emit.push(message), input.mode);
+    initialize: async () => {
+      await session.replayHistory(
+        ({ message }) => replayRelay.handleReplayMessage(message),
+        input.mode,
+        replayRelay.finishReplay
+      );
       replayRelay.finishReplay();
       session.scheduleStartupRecovery();
     },

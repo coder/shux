@@ -3,6 +3,9 @@ import type { AgentTaskIntegration, WorkspaceHost } from "@/node/services/taskWo
 
 export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): WorkspaceHost {
   return {
+    deferWorkspaceCleanup: (run) => {
+      run().catch(() => undefined);
+    },
     sendMessage: () => Promise.resolve(Ok(undefined)),
     resumeStream: () => Promise.resolve(Ok({ started: true })),
     clearQueue: () => Ok(undefined),

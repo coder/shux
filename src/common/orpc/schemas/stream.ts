@@ -731,12 +731,36 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
 ]);
 
 // Update Status
+export const RestartBlockerSchema = z.object({
+  kind: z.enum([
+    "active-streams",
+    "pending-turns",
+    "workspace-inits",
+    "workspace-lifecycle",
+    "workflows",
+    "projects",
+    "requests",
+    "desktop-sessions",
+    "queued-messages",
+    "auto-retries",
+    "terminals",
+    "background-processes",
+  ]),
+  count: z.number().int().positive(),
+});
+
 export const UpdateStatusSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("idle") }),
   z.object({ type: z.literal("checking") }),
   z.object({ type: z.literal("available"), info: z.object({ version: z.string() }) }),
   z.object({ type: z.literal("up-to-date") }),
-  z.object({ type: z.literal("downloading"), percent: z.number() }),
+  z.object({ type: z.literal("unsupported"), reason: z.string() }),
+  z.object({
+    type: z.literal("install-blocked"),
+    info: z.object({ version: z.string() }),
+    blockers: z.array(RestartBlockerSchema),
+  }),
+  z.object({ type: z.literal("downloading"), percent: z.number().nullable() }),
   z.object({ type: z.literal("downloaded"), info: z.object({ version: z.string() }) }),
   z.object({
     type: z.literal("error"),
@@ -798,6 +822,7 @@ export const ExperimentsSchema = z.preprocess(
     workspaceHeartbeats: z.boolean().optional(),
     toolSearch: z.boolean().optional(),
     continuousCompaction: z.boolean().optional(),
+    tokenBudget: z.boolean().optional(),
   })
 );
 

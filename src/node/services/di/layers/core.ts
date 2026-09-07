@@ -1,3 +1,5 @@
+import { readPersistedExperimentEnabled } from "@/node/services/experimentsService";
+import { ClaudeDesignService } from "@/node/services/claudeDesignService";
 import * as os from "os";
 import * as path from "path";
 import { Context, Effect, Layer } from "effect";
@@ -313,6 +315,15 @@ export const MCPConfigLive = Layer.effect(
     // Agent Plugins (agent-plugins experiment): read-only plugin MCP servers are
     // merged into listings; without an ExperimentsService the provider is inert.
     return new MCPConfigService(mcpConfig, {
+      claudeDesign: new ClaudeDesignService({
+        rootDir: mcpConfig.rootDir,
+        readEnabled: () =>
+          readPersistedExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, {
+            xumHome: mcpConfig.rootDir,
+          }),
+        isEnabled: () =>
+          opts.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) === true,
+      }),
       agentPluginsMcpProvider: createAgentPluginsMcpProvider({
         xumHome: mcpConfig.rootDir,
         isEnabled: () =>
@@ -388,7 +399,9 @@ export const WorkspaceLive = Layer.effect(
       yield* StreamManagerTag,
       yield* SecretsStoreTag,
       yield* ProvidersConfigStoreTag,
-      yield* DesktopInputCoordinatorTag
+      yield* DesktopInputCoordinatorTag,
+      yield* EffectRunnerTag,
+      yield* AppFiberScopeTag
     );
   })
 );

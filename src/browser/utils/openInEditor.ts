@@ -1,4 +1,5 @@
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX } from "@/common/constants/remoteConnection";
 import {
   getEditorDeepLink,
   getDockerDeepLink,
@@ -42,7 +43,7 @@ function trimTrailingSlash(path: string): string {
 // Guarded token generator (mirrors createLayoutPresetId/createHeaderRowId): Crypto.randomUUID
 // exists only in secure contexts, and Xum's browser UI can be served from a plain-HTTP remote
 // origin. Throwing here would reject every built-in editor open before the recording RPC's
-// try/catch; the fallback only needs to be unique enough to key one launch's rollback.
+// try/catch; the fallback distinguishes placeholder frames and each launch's rollback.
 function createEditorLaunchToken(): string {
   const maybeCrypto = globalThis.crypto;
   if (maybeCrypto && typeof maybeCrypto.randomUUID === "function") {
@@ -133,8 +134,11 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
   let placeholder: Window | null = null;
   if (isBrowserModeNow() && editorConfig.editor !== "custom") {
     try {
+      // Remote wrappers reject this frame before recording.
+      // Unique names prevent ordinary browsers from reusing a previous editor window.
+      const frameName = `${REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX}${createEditorLaunchToken()}`;
       placeholder =
-        typeof window !== "undefined" && window.open ? window.open("about:blank", "_blank") : null;
+        typeof window !== "undefined" && window.open ? window.open("about:blank", frameName) : null;
     } catch {
       placeholder = null;
     }

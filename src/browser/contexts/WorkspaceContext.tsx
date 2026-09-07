@@ -51,6 +51,8 @@ import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
   readPersistedState,
   readPersistedString,
+  subscribePersistedStateWrites,
+  syncPersistedStateFromBackend,
   updatePersistedState,
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
@@ -77,17 +79,18 @@ import { getErrorMessage } from "@/common/utils/errors";
 import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
 
 /**
- * One-time best-effort migration: if the backend doesn't have model preferences yet,
- * persist explicit localStorage values so future port/origin changes keep them.
- * Called once on startup after backend config is fetched.
- *
+ * Preserve legacy local model choices across port/origin changes.
  * Exported for focused migration tests.
  */
 export function migrateLocalModelPrefsToBackend(
   api: APIClient,
-  cfg: { defaultModel?: string; hiddenModels?: string[] }
-): void {
-  if (!api.config.updateModelPreferences) return;
+  cfg: Pick<
+    Awaited<ReturnType<APIClient["config"]["getConfig"]>>,
+    "defaultModel" | "hiddenModels" | "hiddenModelsInitialized"
+  >,
+  dirtyKeys: ReadonlySet<string> = new Set()
+) {
+  if (!api.config.updateModelPreferences) return cfg;
 
   const localDefaultModelRaw = readPersistedString(DEFAULT_MODEL_KEY);
   const localDefaultModel =
@@ -104,23 +107,31 @@ export function migrateLocalModelPrefsToBackend(
   // localStorage presence implies explicit user choice (usePersistedState never
   // writes fallback defaults). Always migrate to backend so the preference
   // survives future changes to the built-in default constant.
-  if (cfg.defaultModel === undefined && localDefaultModel) {
+  if (!dirtyKeys.has(DEFAULT_MODEL_KEY) && cfg.defaultModel === undefined && localDefaultModel) {
     patch.defaultModel = localDefaultModel;
   }
 
   if (
-    cfg.hiddenModels === undefined &&
-    Array.isArray(localHiddenModels) &&
-    localHiddenModels.length > 0
+    !dirtyKeys.has(HIDDEN_MODELS_KEY) &&
+    (cfg.hiddenModelsInitialized === false ||
+      (cfg.hiddenModels === undefined &&
+        Array.isArray(localHiddenModels) &&
+        localHiddenModels.length > 0))
   ) {
-    patch.hiddenModels = localHiddenModels;
+    // Backend defaults are not evidence that legacy local preferences were imported.
+    patch.hiddenModels = [
+      ...new Set([
+        ...(cfg.hiddenModels ?? []),
+        ...(Array.isArray(localHiddenModels) ? localHiddenModels : []),
+      ]),
+    ];
   }
 
   if (Object.keys(patch).length > 0) {
-    api.config.updateModelPreferences(patch).catch(() => {
-      // Best-effort only.
-    });
+    // Migration persistence must not delay hydration of unrelated settings.
+    api.config.updateModelPreferences(patch).catch(() => undefined);
   }
+  return { ...cfg, ...patch };
 }
 
 /**
@@ -376,7 +387,6 @@ function createWorkspaceDraftId(): string {
 function isDraftEmpty(projectPath: string, draftId: string): boolean {
   const scopeId = getDraftScopeId(projectPath, draftId);
 
-  // Check for input text
   const inputText = readPersistedState<string>(getInputKey(scopeId), "");
   if (inputText.trim().length > 0) {
     return false;
@@ -657,20 +667,53 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   useEffect(() => {
     if (!api?.config?.getConfig) return;
 
-    void api.config
+    let active = true;
+    // Track writes, not just equality: toggling twice is still local intent.
+    const dirtyKeys = new Set<string>();
+    const initialPreferences = [DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY].map((key) => ({
+      key,
+      value: JSON.stringify(readPersistedState<unknown>(key, undefined)),
+    }));
+    const markDirty = (key: string | null) => {
+      for (const preference of initialPreferences) {
+        if (key === null || key === preference.key) dirtyKeys.add(preference.key);
+      }
+    };
+    const unsubscribeWrites = subscribePersistedStateWrites(({ key, source }) => {
+      if (source === "local") markDirty(key);
+    });
+    const storageWindow = window;
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea === storageWindow.localStorage) markDirty(event.key);
+    };
+    storageWindow.addEventListener("storage", onStorage);
+    const stopTrackingWrites = () => {
+      unsubscribeWrites();
+      storageWindow.removeEventListener("storage", onStorage);
+    };
+
+    api.config
       .getConfig()
       .then((cfg) => {
+        if (!active) return;
+        // Cross-tab writes can land before their queued storage events arrive.
+        for (const { key, value } of initialPreferences) {
+          if (JSON.stringify(readPersistedState<unknown>(key, undefined)) !== value)
+            dirtyKeys.add(key);
+        }
+        // Read legacy local preferences before backend hydration can overwrite them.
+        const modelPrefs = migrateLocalModelPrefsToBackend(api, cfg, dirtyKeys);
         updatePersistedState(
           AGENT_AI_DEFAULTS_KEY,
           normalizeAgentAiDefaults(cfg.agentAiDefaults ?? {})
         );
 
         // Seed global model preferences from backend so switching ports doesn't reset the UI.
-        if (cfg.defaultModel !== undefined) {
-          updatePersistedState(DEFAULT_MODEL_KEY, cfg.defaultModel);
+        if (!dirtyKeys.has(DEFAULT_MODEL_KEY) && modelPrefs.defaultModel !== undefined) {
+          syncPersistedStateFromBackend(DEFAULT_MODEL_KEY, modelPrefs.defaultModel);
         }
-        if (cfg.hiddenModels !== undefined) {
-          updatePersistedState(HIDDEN_MODELS_KEY, cfg.hiddenModels);
+        if (!dirtyKeys.has(HIDDEN_MODELS_KEY) && modelPrefs.hiddenModels !== undefined) {
+          syncPersistedStateFromBackend(HIDDEN_MODELS_KEY, modelPrefs.hiddenModels);
         }
 
         // Seed runtime enablement from backend so switching ports doesn't reset the UI.
@@ -683,10 +726,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           updatePersistedState(DEFAULT_RUNTIME_KEY, cfg.defaultRuntime);
         }
 
-        // One-time best-effort migration: if the backend doesn't have model prefs yet,
-        // persist explicit localStorage values so future port changes keep them.
-        migrateLocalModelPrefsToBackend(api, cfg);
-
         // One-time gateway pref migration: if the backend doesn't have gateway prefs yet,
         // check if the user had non-default values in the old localStorage keys.
         // This covers users upgrading from builds that only stored gateway state locally.
@@ -694,7 +733,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       })
       .catch(() => {
         // Best-effort only.
-      });
+      })
+      .finally(stopTrackingWrites);
+
+    return () => {
+      active = false;
+      stopTrackingWrites();
+    };
   }, [api]);
   // Get project refresh function from ProjectContext
   const {

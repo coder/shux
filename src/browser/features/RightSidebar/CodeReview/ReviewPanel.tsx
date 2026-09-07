@@ -1232,7 +1232,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     }
   }, []);
 
-  // Handler for when a hunk's composing state changes
   const handleHunkComposingChange = useCallback(
     (hunkId: string, isComposing: boolean) => {
       if (isComposing) {
@@ -2083,7 +2082,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
       // Find all hunks in the same file
       const fileHunkIds = hunks.filter((h) => h.filePath === hunk.filePath).map((h) => h.id);
 
-      // Mark all hunks in the file as read
       markAsRead(fileHunkIds);
 
       // If marking the selected hunk's file as read and hunks will be filtered out, navigate.

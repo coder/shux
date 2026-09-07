@@ -976,7 +976,6 @@ export class WorktreeManager {
   ): Promise<WorkspaceForkResult> {
     const { projectPath, sourceWorkspaceName, newWorkspaceName, initLogger } = params;
 
-    // Get source workspace path
     const sourceWorkspacePath =
       options?.sourceWorkspacePath ?? this.getWorkspacePath(projectPath, sourceWorkspaceName);
 

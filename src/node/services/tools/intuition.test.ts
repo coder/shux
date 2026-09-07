@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import type { Tool } from "ai";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import {
   MEMORY_INTUITION_MAX_USES_PER_TURN,
   MEMORY_INTUITION_TIMEOUT_MS,
@@ -60,7 +61,7 @@ function reportingModel(
   });
 }
 
-async function fixture(empty = false) {
+async function fixture(empty = false, thinkingLevel?: ThinkingLevel, metadataModel?: string) {
   const temp = new TestTempDir("intuition-tool");
   const root = path.join(temp.path, "xum");
   await fs.mkdir(path.join(root, "memory/global"), { recursive: true });
@@ -75,6 +76,7 @@ async function fixture(empty = false) {
   const createModel = mock((_modelString: string) =>
     Promise.resolve({
       model: reportingModel(),
+      ...(metadataModel ? { metadataModel } : {}),
       optionsModelString: "openai:intuition-model",
       optionsProvidersConfig: null,
     })
@@ -92,6 +94,7 @@ async function fixture(empty = false) {
     reportModelUsage,
     intuitionRuntime: {
       modelString: "openai:intuition-model",
+      thinkingLevel,
       maxUsesPerTurn: MEMORY_INTUITION_MAX_USES_PER_TURN,
       usesThisTurn: 0,
       createModel,
@@ -124,7 +127,7 @@ async function execute(tool: Tool, abortSignal?: AbortSignal) {
 
 describe("intuition tool", () => {
   it("returns verified recall, accounts total usage in the pinned model, and records only unique recognized paths", async () => {
-    using f = await fixture();
+    using f = await fixture(false, undefined, "openai:pinned-pricing-model");
     const result = await execute(createIntuitionTool(f.config));
     expect(result).toMatchObject({
       kind: "recognized",
@@ -142,6 +145,7 @@ describe("intuition tool", () => {
       source: "tool",
       toolName: "intuition",
       model: f.config.intuitionRuntime.modelString,
+      metadataModel: "openai:pinned-pricing-model",
       toolCallId: mockToolCallOptions.toolCallId,
       usage: { inputTokens: 20, outputTokens: 8, totalTokens: 28 },
       providerMetadata: { anthropic: { cacheCreationInputTokens: 4 } },
@@ -174,6 +178,88 @@ describe("intuition tool", () => {
     );
     await execute(createIntuitionTool(f.config));
     expect(calls[0].providerOptions?.openrouter).toBeUndefined();
+  });
+
+  it.each([
+    { thinkingLevel: undefined, model: "openai:gpt-5.6-sol", effort: "none" },
+    { thinkingLevel: "high", model: "openai:gpt-5.6-sol", effort: "high" },
+    { thinkingLevel: "max", model: "openai:gpt-5.2", effort: "xhigh" },
+  ] satisfies Array<{ thinkingLevel: ThinkingLevel | undefined; model: string; effort: string }>)(
+    "sends configured $thinkingLevel effort as $effort for the pinned $model",
+    async ({ thinkingLevel, model, effort }) => {
+      using f = await fixture();
+      const calls: LanguageModelV3CallOptions[] = [];
+      f.config.intuitionRuntime.modelString = "coder:private/recall";
+      f.config.intuitionRuntime.thinkingLevel = thinkingLevel;
+      f.createModel.mockImplementation(() =>
+        Promise.resolve({
+          model: reportingModel([], (options) => calls.push(options)),
+          optionsModelString: model,
+          optionsProvidersConfig: null,
+        })
+      );
+      const result = await execute(createIntuitionTool(f.config));
+      expect(result.kind).toBe("uncertain");
+      expect(calls.length).toBeGreaterThan(0);
+      for (const call of calls) {
+        expect(call.providerOptions?.openai?.reasoningEffort).toBe(effort);
+      }
+    }
+  );
+
+  it.each(["chatCompletions", "responses"] as const)(
+    "uses pinned OpenAI %s options for non-Off reasoning",
+    async (wireFormat) => {
+      using f = await fixture(false, "high");
+      const calls: LanguageModelV3CallOptions[] = [];
+      f.createModel.mockImplementation(() =>
+        Promise.resolve({
+          model: reportingModel([], (options) => calls.push(options)),
+          optionsModelString: "openai:gpt-5.6-sol",
+          optionsProvidersConfig: null,
+          optionsMuxProviderOptions: { openai: { wireFormat } },
+          optionsRouteProvider: "openai",
+        })
+      );
+      const result = await execute(createIntuitionTool(f.config));
+      expect(result.kind).toBe("uncertain");
+      expect(calls.length).toBeGreaterThan(0);
+      for (const call of calls) {
+        const options = call.providerOptions?.openai;
+        expect(options?.reasoningEffort).toBe("high");
+        if (wireFormat === "chatCompletions") {
+          expect(options).not.toHaveProperty("reasoningSummary");
+          expect(options).not.toHaveProperty("include");
+          expect(options).not.toHaveProperty("truncation");
+        } else {
+          expect(options).toMatchObject({
+            reasoningSummary: "detailed",
+            include: ["reasoning.encrypted_content"],
+            truncation: "disabled",
+          });
+        }
+      }
+    }
+  );
+
+  it("uses the pinned gateway route for a canonical origin model", async () => {
+    using f = await fixture(false, "high");
+    const calls: LanguageModelV3CallOptions[] = [];
+    f.createModel.mockImplementation(() =>
+      Promise.resolve({
+        model: reportingModel([], (options) => calls.push(options)),
+        optionsModelString: "openai:gpt-5.6-sol",
+        optionsProvidersConfig: null,
+        optionsRouteProvider: "openrouter",
+      })
+    );
+    const result = await execute(createIntuitionTool(f.config));
+    expect(result.kind).toBe("uncertain");
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call.providerOptions?.openrouter).toMatchObject({ reasoning: { effort: "high" } });
+      expect(call.providerOptions?.openai).toBeUndefined();
+    }
   });
 
   it.each([false, true])(

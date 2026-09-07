@@ -1,4 +1,4 @@
-import { eventSpine } from "./events/eventSpine";
+import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
 // Bun test file - doesn't support Jest mocking, so we skip this test for now
 // These tests would need to be rewritten to work with Bun's test runner
 // For now, the commandProcessor tests demonstrate our testing approach
@@ -536,7 +536,7 @@ describe("AIService turn engine events", () => {
     mock.restore();
   });
 
-  it("forwards stream-abort even when partial cleanup throws", async () => {
+  it("forwards stream-abort without mutating a workspace partial", async () => {
     using harness = createForwardingHarness("ai-service-stream-abort-forwarding");
     const { historyService, service, internals, clearPendingRunMetadataSpy } = harness;
     const cleanupError = new Error("disk full");
@@ -560,7 +560,7 @@ describe("AIService turn engine events", () => {
     await internals.emitEngineEvent(abortEvent);
 
     expect(await forwardedAbortPromise).toEqual(abortEvent);
-    expect(deletePartialSpy).toHaveBeenCalledWith(abortEvent.workspaceId);
+    expect(deletePartialSpy).not.toHaveBeenCalled();
     expect(clearPendingRunMetadataSpy).toHaveBeenCalledWith(abortEvent.workspaceId, "metadata-1");
     expect(internals.pendingDevToolsRunMetadataByMessageId.has(abortEvent.messageId)).toBe(false);
   });
@@ -1270,6 +1270,58 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     mock.restore();
   });
 
+  it.each(["request-row", "idle-row", "agent", "send-metadata", "ordinary", "historical"] as const)(
+    "keeps oversized compaction recovery outside token-budget preflight: %s",
+    async (identity) => {
+      using xumHome = new DisposableTempDir("ai-service-compaction-budget");
+      const metadata = createLocalWorkspaceMetadata("compaction-budget", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata);
+      const compactionMetadata = {
+        type: "compaction-request" as const,
+        rawCommand: "/compact",
+        parsed: {},
+        ...(identity === "idle-row" ? { source: "idle-compaction" as const } : {}),
+      };
+      if (identity === "agent") {
+        const resolved = resolvedAgentResultFor(metadata);
+        if (!resolved.success) throw new Error("Expected resolved agent");
+        resolved.data.effectiveAgentId = "compact";
+        resolved.data.effectiveMode = "compact";
+        spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(resolved);
+      }
+      const currentRowIsCompaction = identity === "request-row" || identity === "idle-row";
+      const messages = [
+        createMuxMessage("large-history", "user", "x".repeat(2_000_000)),
+        ...(identity === "historical"
+          ? [
+              createMuxMessage("previous-compact", "user", "summarize", {
+                muxMetadata: compactionMetadata,
+              }),
+            ]
+          : []),
+        createMuxMessage("latest-user", "user", "continue", {
+          ...(currentRowIsCompaction ? { muxMetadata: compactionMetadata } : {}),
+          ...(identity === "send-metadata" ? { synthetic: true } : {}),
+        }),
+      ];
+      const result = await harness.service.streamMessage({
+        workspaceId: metadata.id,
+        messages,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        experiments: { tokenBudget: true },
+        ...(identity === "send-metadata" ? { muxMetadata: compactionMetadata } : {}),
+      });
+      const shouldBypass = identity !== "ordinary" && identity !== "historical";
+      expect(result.success).toBe(shouldBypass);
+      expect(harness.startStreamCalls).toHaveLength(shouldBypass ? 1 : 0);
+      expect(harness.preparedPayloadMessageIds[0]).toContain("large-history");
+      if (!shouldBypass && !result.success) {
+        expect(result.error.type).toBe("context_budget_exceeded");
+      }
+    }
+  );
+
   it("keeps set_goal disabled for one-shot streams that do not opt into agent-created goals", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-disabled");
     const projectPath = path.join(xumHome.path, "project");
@@ -1425,6 +1477,74 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(harness.streamSystemContextHotMemoriesBlocks).toContain(
       `<hot_memories>${fallbackModel}</hot_memories>`
     );
+  });
+
+  it.each([false, true])("pins assembly across attempts (budget=%s)", async (tokenBudget) => {
+    using xumHome = new DisposableTempDir("ai-pinned-request-assembly");
+    const sourceModel = KNOWN_MODELS.SONNET.id;
+    const fallbackModel = KNOWN_MODELS.GPT.id;
+    await writeMainConfig(xumHome.path, {
+      modelFallbacks: { [sourceModel]: { models: [fallbackModel] } },
+    });
+    const metadata = createLocalWorkspaceMetadata("pinned-request", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, {
+      allTools: { session_history: { inputSchema: jsonSchema({ type: "object" }) } },
+      useRequestedModelString: true,
+    });
+    const seenModels: string[] = [];
+    const unregister = eventSpine.useRequestContext(
+      (ctx) => {
+        seenModels.push(ctx.modelString);
+        ctx.systemMessage += "\npinned-context";
+      },
+      { workspaceId: metadata.id }
+    );
+    let removeLive: (() => void) | undefined;
+    try {
+      const captured = await harness.service.captureRequestAssemblySnapshot(metadata.id);
+      expect(captured.success).toBe(true);
+      if (!captured.success) throw new Error("Expected assembly snapshot");
+      expect(harness.getToolsForModelSpy).not.toHaveBeenCalled();
+      unregister();
+      const live = mock((ctx: RequestAssembleContext) => {
+        delete ctx.tools.session_history;
+      });
+      removeLive = eventSpine.useBefore("request.assemble", live, { workspaceId: metadata.id });
+      const request = {
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: sourceModel,
+        thinkingLevel: "off" as const,
+        experiments: { tokenBudget },
+      };
+      expect(
+        (
+          await harness.service.streamMessage({
+            ...request,
+            requestAssemblySnapshot: captured.data,
+          })
+        ).success
+      ).toBe(true);
+      const primary = harness.startStreamCalls[0];
+      expect(primary.tools?.session_history).toBeDefined();
+      expect(primary.contextBudgetLimit != null).toBe(tokenBudget);
+      const rebuilt = await primary.rebuildFirstStepForThinkingLevel!("low", {});
+      expect(JSON.stringify(rebuilt)).toContain("pinned-context");
+      const fallback = await primary.modelFallback!.prepare(fallbackModel);
+      expect(fallback.success).toBe(true);
+      if (fallback.success) {
+        expect(fallback.data.tools?.session_history).toBeDefined();
+        expect(fallback.data.contextBudgetLimit != null).toBe(tokenBudget);
+      }
+      expect(seenModels).toEqual([sourceModel, fallbackModel]);
+      expect(live).not.toHaveBeenCalled();
+      expect((await harness.service.streamMessage(request)).success).toBe(true);
+      expect(live).toHaveBeenCalledTimes(1);
+      expect(harness.startStreamCalls[1].tools?.session_history).toBeUndefined();
+    } finally {
+      unregister();
+      removeLive?.();
+    }
   });
 
   it("emits startup breadcrumbs as runtime-status events before stream start", async () => {
@@ -1731,7 +1851,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       await harness.config.editConfig((cfg) => {
         cfg.agentAiDefaults = {
           ...cfg.agentAiDefaults,
-          intuition: { modelString: KNOWN_MODELS.SONNET.id, enabled: scenario.agentEnabled },
+          intuition: {
+            modelString: KNOWN_MODELS.SONNET.id,
+            enabled: scenario.agentEnabled,
+            thinkingLevel: "high",
+          },
         };
         return cfg;
       });
@@ -1762,6 +1886,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(runtime !== undefined).toBe(scenario.eligible);
       if (runtime) {
         expect(runtime.modelString).toBe(KNOWN_MODELS.SONNET.id);
+        expect(runtime.thinkingLevel).toBe("high");
         if (frontmatterDisabled !== undefined) {
           await fs.writeFile(
             definitionPath,
@@ -1803,7 +1928,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         );
         await fs.writeFile(
           path.join(agents, "private-base.md"),
-          "---\nname: Private base\nai:\n  model: private:definition-route\n---\nPrivate guidance."
+          "---\nname: Private base\nai:\n  model: private:definition-route\n  thinkingLevel: low\n---\nPrivate guidance."
         );
       }
       await harness.config.editConfig((cfg) => {
@@ -1824,13 +1949,75 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         messages: [createMuxMessage("user", "user", "hello")],
         workspaceId: metadata.id,
         modelString: selected,
+        thinkingLevel: "high",
+        experiments: { memory: true },
+      });
+      expect(result.success).toBe(true);
+      expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.thinkingLevel).toBe(
+        definitionOverride ? "low" : "off"
+      );
+      expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.modelString).toBe(
+        definitionOverride ? "private:definition-route" : selected
+      );
+    }
+  );
+
+  it.each(["off", "high"] as const)(
+    "creates Intuition's effort-dependent model variant with %s reasoning from one provider snapshot",
+    async (thinkingLevel) => {
+      using xumHome = new DisposableTempDir("ai-intuition-model-variant");
+      const metadata = createLocalWorkspaceMetadata("intuition-variant", xumHome.path);
+      const experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHome.path),
+        xumHome: xumHome.path,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+      );
+      const harness = createHarness(xumHome.path, metadata, { experimentsService });
+      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+        harness.config,
+        new MemoryMetaService(xumHome.path)
+      );
+      const providersStore = new ProvidersConfigStore(harness.config.rootDir);
+      providersStore.saveProvidersConfig({ xai: { apiKey: "test-xai-key" } });
+      await harness.config.editConfig((cfg) => ({
+        ...cfg,
+        agentAiDefaults: { intuition: { modelString: "xai:grok-4-1-fast", thinkingLevel } },
+      }));
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId: metadata.id,
+        modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
         experiments: { memory: true },
       });
       expect(result.success).toBe(true);
-      expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.modelString).toBe(
-        definitionOverride ? "private:definition-route" : selected
+      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
+      if (!runtime) throw new Error("Expected Intuition runtime");
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      const resolve = spyOn(factory, "resolveAndCreateModel").mockImplementation((...args) => {
+        // A concurrent config change must not replace the tool's creation-time snapshot.
+        providersStore.saveProvidersConfig({ xai: { enabled: false } });
+        return ProviderModelFactory.prototype.resolveAndCreateModel.apply(factory, args);
+      });
+      const created = await runtime.createModel(runtime.modelString);
+      expect(typeof created.model).not.toBe("string");
+      if (typeof created.model === "string") throw new Error("Expected model instance");
+      expect(created.model.modelId).toBe(
+        thinkingLevel === "off" ? "grok-4-1-fast-non-reasoning" : "grok-4-1-fast-reasoning"
       );
+      expect(resolve).toHaveBeenCalledWith(
+        "xai:grok-4-1-fast",
+        thinkingLevel,
+        expect.anything(),
+        expect.objectContaining({
+          workspaceId: metadata.id,
+          agentInitiated: true,
+          providersConfig: { xai: { apiKey: "test-xai-key" } },
+        })
+      );
+      expect(created.optionsProvidersConfig?.xai?.isEnabled).toBe(true);
     }
   );
 
@@ -2023,6 +2210,54 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     hotSetEnabled = true;
     const withHotSet = await service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2");
     expect(withHotSet?.hotMemoriesBlock).toContain("root fact");
+  });
+
+  it("adds context notes only for an active request with Memory and HotSet allowed", async () => {
+    using root = new DisposableTempDir("ai-service-additive-context-notes");
+    let memoryEnabled = true;
+    let hotSetEnabled = true;
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(root.path),
+      xumHome: root.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) =>
+        (id === EXPERIMENT_IDS.MEMORY && memoryEnabled) ||
+        (id === EXPERIMENT_IDS.MEMORY_HOT_SET && hotSetEnabled)
+    );
+    const { config, service } = createBasicAIService(root.path, { experimentsService });
+    const metaService = new MemoryMetaService(root.path);
+    const memoryService = new MemoryService(config, metaService);
+    service.turnRequestBuilderBindings.memoryService = memoryService;
+    const workspaceId = "additive-context-notes";
+    spyOn(service, "getWorkspaceMetadata").mockResolvedValue({
+      success: true,
+      data: {
+        ...createLocalWorkspaceMetadata(workspaceId, root.path),
+        runtimeConfig: { type: "local" },
+      },
+    });
+    const directory = path.join(config.sessionsDir, workspaceId, "memory");
+    await fs.mkdir(directory, { recursive: true });
+    const file = path.join(directory, "context-notes.md");
+    await fs.writeFile(file, "Unused but important handoff facts");
+    const before = await metaService.getEntries();
+    const build = (options?: Parameters<AIService["buildMemorySessionContext"]>[2]) =>
+      service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2", options);
+    expect((await build())?.hotMemoriesBlock).toBeNull();
+    expect((await build({ tokenBudgetActive: true }))?.hotMemoriesBlock).toContain(
+      "Unused but important handoff facts"
+    );
+    expect((await build({ tokenBudgetActive: false }))?.hotMemoriesBlock).toBeNull();
+    expect(
+      (await build({ tokenBudgetActive: true, includeHotMemories: false }))?.hotMemoriesBlock
+    ).toBeNull();
+    hotSetEnabled = false;
+    expect((await build({ tokenBudgetActive: true }))?.hotMemoriesBlock).toBeNull();
+    memoryEnabled = false;
+    expect(await build({ tokenBudgetActive: true })).toBeNull();
+    expect(await metaService.getEntries()).toEqual(before);
+    expect(await fs.readFile(file, "utf8")).toBe("Unused but important handoff facts");
   });
 
   it("preserves the memory index when hot-memory selection fails", async () => {
@@ -2670,6 +2905,71 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(typeof sessionUsageDeltaRecord.timestamp).toBe("number");
   });
 
+  it("keeps pricing identities independent for overlapping Advisor and Intuition creations of the same model", async () => {
+    using xumHome = new DisposableTempDir("ai-tool-invocation-pricing");
+    const metadata = createLocalWorkspaceMetadata("tool-invocation-pricing", xumHome.path);
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(xumHome.path),
+      xumHome: xumHome.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+    );
+    const harness = createHarness(xumHome.path, metadata, { experimentsService });
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
+    );
+    const model = "xai:grok-4-1-fast";
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      xai: { apiKey: "test-key" },
+    });
+    await enableAdvisorForHarness(harness, model);
+    await harness.config.editConfig((cfg) => ({
+      ...cfg,
+      agentAiDefaults: {
+        ...cfg.agentAiDefaults,
+        intuition: { modelString: model, thinkingLevel: "high" },
+      },
+    }));
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("user", "user", "hello")],
+      workspaceId: metadata.id,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      experiments: { advisorTool: true, memory: true },
+    });
+    expect(result.success).toBe(true);
+    const tools = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+    if (!tools?.advisorRuntime || !tools.intuitionRuntime || !tools.reportModelUsage)
+      throw new Error("Expected both tool runtimes");
+    const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+    spyOn(factory, "resolveAndCreateModel").mockImplementation(
+      ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
+    );
+    const advisor = await tools.advisorRuntime.createModel(model);
+    const intuition = await tools.intuitionRuntime.createModel(model);
+    const streamManager = Reflect.get(harness.service, "streamManager") as StreamManager;
+    const record = spyOn(streamManager, "recordToolModelUsage");
+    for (const [toolName, created] of [
+      ["advisor", advisor],
+      ["intuition", intuition],
+    ] as const) {
+      tools.reportModelUsage({
+        source: "tool",
+        toolName,
+        model,
+        metadataModel: created.metadataModel,
+        usage: { inputTokens: 120, outputTokens: 45, totalTokens: 165 },
+        timestamp: 1,
+      });
+    }
+    expect(record.mock.calls.map((call) => call[2].metadataModel)).toEqual([
+      model,
+      "xai:grok-4-1-fast-reasoning",
+    ]);
+  });
+
   it.each(["advisor", "intuition"] as const)(
     "records API-equivalent costs for %s tool usage through Codex OAuth",
     async (toolName) => {
@@ -2742,9 +3042,17 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const runtime =
         toolName === "advisor" ? toolConfig.advisorRuntime : toolConfig.intuitionRuntime;
       if (!runtime) throw new Error(`Expected ${toolName} runtime`);
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      const resolveModel = spyOn(factory, "resolveAndCreateModel").mockImplementation(
+        ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
+      );
       const createModel = spyOn(harness.service, "createModel");
-      await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
-      expect(createModel.mock.calls.at(-1)?.[2]).toMatchObject({
+      const created = await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const creationOptions =
+        toolName === "advisor"
+          ? createModel.mock.calls.at(-1)?.[2]
+          : resolveModel.mock.calls.at(-1)?.[3];
+      expect(creationOptions).toMatchObject({
         agentInitiated: true,
         workspaceId,
       });
@@ -2766,6 +3074,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         source: "tool",
         toolName,
         model: KNOWN_MODELS.GPT_53_CODEX.id,
+        metadataModel: created.metadataModel,
         usage: {
           inputTokens: 120,
           outputTokens: 45,

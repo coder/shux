@@ -11,10 +11,16 @@
  * later re-closes it idempotently as a backstop.
  *
  * This is the seam for I/O-suspended, long-lived work that shutdown must wait
- * for. Its occupant is the stream engine: `StreamManager.superviseEngine`
+ * for. Its occupants include the stream engine: `StreamManager.superviseEngine`
  * forks one supervisor fiber per stream into it, whose interruption cancels the
  * stream (`"system"` abort) and awaits the turn's settlement, so dispose()
- * commits the partial into chat.jsonl before the bridges stop. It is the
+ * commits the partial into chat.jsonl before the bridges stop. Each AgentSession also
+ * registers a guardian after initialization. The guardian closes admission, joins registered
+ * preparation and physical policy work, then closes its detached resource scope. Engine
+ * completion stays independent of policy: parallel scope close must let engines deliver late
+ * terminal results while the session is still draining. A directly attached child policy scope
+ * could close too early and drop those results. The app's bounded close remains a timeout,
+ * not cancellation of non-cooperative Promise I/O. This scope is the
  * counterpart of `EffectRunner` (`./effectRunner.ts`), which is unsupervised: a
  * fiber forked through the runner is interrupted by neither close. Anything
  * forked here must tolerate interruption at any suspension point and must not

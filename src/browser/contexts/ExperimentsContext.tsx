@@ -5,6 +5,7 @@ import React, {
   useCallback,
   useEffect,
   useState,
+  useRef,
 } from "react";
 import {
   type ExperimentId,
@@ -91,7 +92,7 @@ function getExplicitLocalExperimentOverrides(): Partial<Record<ExperimentId, boo
   const overrides: Partial<Record<ExperimentId, boolean>> = {};
 
   for (const experimentId of Object.keys(EXPERIMENTS) as ExperimentId[]) {
-    if (!isExperimentSupported(experimentId)) {
+    if (experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP || !isExperimentSupported(experimentId)) {
       continue;
     }
 
@@ -168,6 +169,7 @@ function reconcileLegacyPtcExclusiveMirror(
  * Individual experiment values are accessed via useExperimentValue hook.
  */
 interface ExperimentsContextValue {
+  designRevision: number;
   setExperiment: (experimentId: ExperimentId, enabled: boolean) => void;
   backendOverrides: Partial<Record<ExperimentId, boolean>> | null;
 }
@@ -180,6 +182,7 @@ const ExperimentsContext = createContext<ExperimentsContextValue | null>(null);
  */
 export function ExperimentsProvider(props: { children: React.ReactNode }) {
   const apiState = useAPI();
+  const [designRevision, setDesignRevision] = useState(0);
   const [backendOverrides, setBackendOverrides] = useState<Partial<
     Record<ExperimentId, boolean>
   > | null>(null);
@@ -188,34 +191,59 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
     async (experimentId: ExperimentId, enabled: boolean) => {
       // A degraded (slow) connection still has a usable api; only a missing api means offline.
       if (!apiState.api) {
-        return;
+        return false;
       }
 
       try {
         await apiState.api.experiments.setOverride({ experimentId, enabled });
+        return true;
       } catch {
-        // Best effort
+        return false;
       }
     },
     [apiState.api]
   );
 
+  const designTogglePending = useRef(false);
+
   const setExperiment = useCallback(
     (experimentId: ExperimentId, enabled: boolean) => {
-      setExperimentState(experimentId, enabled);
-      setBackendOverrides((prev) => (prev ? { ...prev, [experimentId]: enabled } : prev));
-      void persistOverride(experimentId, enabled);
+      const publish = () => {
+        setExperimentState(experimentId, enabled);
+        setBackendOverrides((prev) => ({ ...prev, [experimentId]: enabled }));
+      };
+      if (experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) {
+        // Hiding credential controls must follow backend shutdown, even offline or
+        // when a write fails. Serialize toggles so late acknowledgements cannot undo one.
+        if (designTogglePending.current) return;
+        designTogglePending.current = true;
+        // The ordered backend stream owns Design state. An acknowledgement/read
+        // can already be stale when it reaches this renderer after a sibling toggle.
+        persistOverride(experimentId, enabled)
+          .finally(() => {
+            designTogglePending.current = false;
+          })
+          .catch(() => undefined);
+        return;
+      }
+      publish();
+      persistOverride(experimentId, enabled).catch(() => undefined);
     },
     [persistOverride]
   );
 
   useEffect(() => {
     if (!apiState.api) {
-      setBackendOverrides(null);
+      setBackendOverrides((previous) =>
+        previous
+          ? { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP] }
+          : null
+      );
       return;
     }
 
     const api = apiState.api;
+    const controller = new AbortController();
     let cancelled = false;
 
     const reconcile = async () => {
@@ -235,12 +263,19 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
       try {
         const overrides = await api.experiments.getOverrides();
         if (!cancelled) {
-          setBackendOverrides(overrides);
+          setBackendOverrides((previous) => ({
+            ...overrides,
+            [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP],
+          }));
           reconcileLegacyPtcExclusiveMirror(overrides);
         }
       } catch {
         if (!cancelled) {
-          setBackendOverrides(null);
+          setBackendOverrides((previous) =>
+            previous
+              ? { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: previous[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP] }
+              : null
+          );
           // Still reconciles the purely-local stale pair (ptc: true,
           // legacy: false/absent) even when the backend is unreachable.
           reconcileLegacyPtcExclusiveMirror(null);
@@ -248,18 +283,46 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
       }
     };
 
-    void reconcile();
+    const followDesign = async () => {
+      let revision = -1;
+      try {
+        const stream = await api.experiments.onDesignChange(undefined, {
+          signal: controller.signal,
+        });
+        for await (const snapshot of stream) {
+          if (cancelled) break;
+          if (snapshot.revision < revision) continue;
+          revision = snapshot.revision;
+          setDesignRevision(snapshot.revision);
+          setBackendOverrides((previous) => ({
+            ...previous,
+            [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: snapshot.enabled,
+          }));
+        }
+      } catch {
+        // Keep credential controls accessible on a lost connection; reconnect
+        // establishes a fresh subscription and revision domain.
+      }
+    };
+    reconcile().catch(() => undefined);
+    followDesign().catch(() => undefined);
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [apiState.api]);
 
   return (
-    <ExperimentsContext.Provider value={{ setExperiment, backendOverrides }}>
+    <ExperimentsContext.Provider value={{ setExperiment, backendOverrides, designRevision }}>
       {props.children}
     </ExperimentsContext.Provider>
   );
+}
+
+/** Settings revisions also cover sibling Disconnect, source, and allowlist changes. */
+export function useClaudeDesignRevision(): number {
+  return useContext(ExperimentsContext)?.designRevision ?? 0;
 }
 
 /**
@@ -287,6 +350,11 @@ export function useExperimentValue(experimentId: ExperimentId): boolean {
   if (!isExperimentSupported(experimentId)) {
     return false;
   }
+
+  // Design consent is backend-authoritative: stale browser storage must never
+  // re-enable it on reconnect or override a confirmed backend disable.
+  if (experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP)
+    return context?.backendOverrides?.[experimentId] ?? false;
 
   // An explicit local toggle wins, which also settles the race against an in-flight
   // backend read: a toggle made while it loads is not overwritten when it resolves.

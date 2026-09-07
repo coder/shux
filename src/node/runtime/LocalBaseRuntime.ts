@@ -498,7 +498,6 @@ export abstract class LocalBaseRuntime implements Runtime {
       return;
     }
 
-    // Create line-buffered loggers
     const loggers = createLineBufferedLoggers(initLogger);
 
     return new Promise<void>((resolve) => {

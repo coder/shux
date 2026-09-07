@@ -141,18 +141,27 @@ const TranscriptAnchorSchema = z.object({
   partIndex: z.number().int().nonnegative(),
 });
 
+const MuxMessagePartsSchema = z.array(
+  z.discriminatedUnion("type", [
+    MuxTextPartSchema,
+    MuxReasoningPartSchema,
+    MuxToolPartSchema,
+    MuxFilePartSchema,
+  ])
+);
+
+export const ContextBudgetRejectedMessageSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  parts: MuxMessagePartsSchema,
+  // Original metadata stays inert until explicitly validated for display.
+  metadata: z.any().optional(),
+});
+
 // XumMessage (simplified)
 export const MuxMessageSchema = z.object({
   id: z.string(),
   role: z.enum(["system", "user", "assistant"]),
-  parts: z.array(
-    z.discriminatedUnion("type", [
-      MuxTextPartSchema,
-      MuxReasoningPartSchema,
-      MuxToolPartSchema,
-      MuxFilePartSchema,
-    ])
-  ),
+  parts: MuxMessagePartsSchema,
   createdAt: z.date().optional(),
   metadata: z
     .object({
@@ -199,6 +208,9 @@ export const MuxMessageSchema = z.object({
       partial: z.boolean().optional(),
       synthetic: z.boolean().optional(),
       uiVisible: z.boolean().optional(),
+      contextBudgetRejected: z.literal(true).optional(),
+      contextBudgetRejectedMessage: ContextBudgetRejectedMessageSchema.optional().catch(undefined),
+      requestPreludeMessageIds: z.array(z.string()).optional(),
       // RLM keep-recent floor: sanitized post-boundary copy of a pre-compaction row.
       rlmPreservedTailCopy: z.boolean().optional(),
       transcriptAnchor: TranscriptAnchorSchema.optional().catch(undefined),

@@ -12,7 +12,6 @@ const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 3;
 const ZOOM_STEP = 0.1;
 
-// Initialize mermaid
 mermaid.initialize({
   startOnLoad: false,
   theme: "dark",

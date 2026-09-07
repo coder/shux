@@ -166,6 +166,16 @@ describe("disposableExec", () => {
     expect(childProc.killed).toBe(false);
   });
 
+  test("cwd option runs the command in the requested directory", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "disposable-exec-cwd-"));
+    try {
+      using command = execFileAsync("node", ["-p", "process.cwd()"], { cwd });
+      expect((await command.result).stdout.trim()).toBe(await fs.realpath(cwd));
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("stdout and stderr are captured correctly", async () => {
     using proc = execAsync("echo 'stdout message' && echo 'stderr message' >&2");
     const childProc = (proc as any).child;

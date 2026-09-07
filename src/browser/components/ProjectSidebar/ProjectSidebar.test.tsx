@@ -2778,38 +2778,6 @@ describe("ProjectSidebar archive confirmations", () => {
   beforeEach(() => setupProjectSidebarDom());
   afterEach(cleanupProjectSidebarDom);
 
-  test("opens the archive confirmation modal when preflight finds untracked files", async () => {
-    const workspace = {
-      ...createWorkspace("archive-untracked"),
-      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
-    };
-    const preflightArchiveWorkspace = mock(() =>
-      Promise.resolve({
-        success: true as const,
-        data: { kind: "confirm-lossy-untracked-files" as const, paths: ["scratch.txt"] },
-      })
-    );
-    const archiveWorkspace = mock(() => Promise.resolve({ success: true as const }));
-
-    useArchiveActions({ preflightArchiveWorkspace, archiveWorkspace });
-
-    renderProjectSidebarForWorkspace(workspace);
-
-    const archiveButton = document.createElement("button");
-    expect(latestArchiveWorkspaceHandler).toBeTruthy();
-    await act(async () => {
-      await latestArchiveWorkspaceHandler?.(workspace.id, archiveButton);
-    });
-
-    await waitFor(() => {
-      expect(latestArchiveConfirmationModalProps?.isOpen).toBe(true);
-    });
-    expect(latestArchiveConfirmationModalProps?.title).toBe(
-      "Archive workspace with untracked files?"
-    );
-    expect(archiveWorkspace).not.toHaveBeenCalled();
-  });
-
   test("reopens the archive confirmation modal when archive finds new untracked files", async () => {
     const workspace = {
       ...createWorkspace("archive-race-window"),

@@ -69,6 +69,7 @@ export class TerminalService {
   private readonly headlessOnDataDisposables = new Map<string, { dispose: () => void }>();
   private readonly titleChangeDisposables = new Map<string, { dispose: () => void }>();
 
+  private shuttingDown = false;
   // Per-session activity tracking for sidebar indicator.
   // Maps sessionId -> { workspaceId, isRunning (derived from terminal title) }.
   private readonly sessionActivity = new Map<string, { workspaceId: string; isRunning: boolean }>();
@@ -233,7 +234,12 @@ export class TerminalService {
     return proxyUriEnv;
   }
 
+  beginShutdown(): void {
+    this.shuttingDown = true;
+  }
+
   async create(params: TerminalCreateParams): Promise<TerminalSession> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     // Reserve the startup synchronously: a creation that has passed its archived check but is
     // still awaiting metadata/secrets/PTY spawn is not yet in sessionActivity, so without this
     // reservation an archive's live-activity gate could pass and the pending creation would
@@ -806,20 +812,6 @@ export class TerminalService {
   }
 
   /**
-   * Open a native terminal and run a command.
-   * Used for opening $EDITOR in a terminal when editing files.
-   * @param command The command to run
-   * @param workspacePath Optional directory to run the command in (defaults to cwd)
-   */
-  async openNativeWithCommand(command: string, workspacePath?: string): Promise<void> {
-    await this.openNativeTerminal({
-      type: "local",
-      workspacePath: workspacePath ?? process.cwd(),
-      command,
-    });
-  }
-
-  /**
    * Open a native terminal (local or SSH) with platform-specific handling.
    * This spawns the user's native terminal emulator, not a web-based terminal.
    */
@@ -1279,6 +1271,13 @@ export class TerminalService {
         this.cleanup(sessionId);
       }
     }
+  }
+
+  getOpenSessionCount(): number {
+    return (
+      this.sessionActivity.size +
+      Array.from(this.pendingSessionCreations.values()).reduce((sum, count) => sum + count, 0)
+    );
   }
 
   /**

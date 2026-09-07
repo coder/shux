@@ -1,3 +1,4 @@
+import type { TurnCoordinator } from "./turnCoordinator";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
 import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/message";
@@ -31,9 +32,7 @@ interface SessionInternals {
     options?: SendOptions,
     internal?: { synthetic?: boolean; agentInitiated?: boolean }
   ) => Promise<SendMessageResult>;
-  scheduleStartupRecovery: () => void;
-  startupRecoveryPromise: Promise<void> | null;
-  startupRecoveryScheduled: boolean;
+  runStartupRecovery: () => Promise<void>;
   lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
 }
 
@@ -144,7 +143,7 @@ describe("AgentSession continue-message agentId fallback", () => {
 
   afterEach(async () => {
     for (const session of sessions.splice(0)) {
-      session.dispose();
+      await session.dispose();
     }
     await historyCleanup?.();
     historyCleanup = undefined;
@@ -449,9 +448,9 @@ describe("AgentSession continue-message agentId fallback", () => {
     const { internals } = await createSession([
       compactionSummaryMessage("summary-completing-turn", idleFollowUp()),
     ]);
-    const completingInternals = internals as SessionInternals & { turnPhase: string };
+    const completingInternals = internals as SessionInternals & { coordinator: TurnCoordinator };
     completingInternals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
-    completingInternals.turnPhase = "completing";
+    completingInternals.coordinator.beginPolicy(completingInternals.coordinator.turnId);
 
     const dispatched = await completingInternals.dispatchPendingFollowUp();
 
@@ -550,9 +549,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       return Promise.resolve({ success: true as const });
     });
 
-    internals.scheduleStartupRecovery();
-    internals.scheduleStartupRecovery();
-    await internals.startupRecoveryPromise;
+    await Promise.all([internals.runStartupRecovery(), internals.runStartupRecovery()]);
 
     expect(sendCount).toBe(1);
   });
@@ -577,17 +574,13 @@ describe("AgentSession continue-message agentId fallback", () => {
       return Promise.resolve({ success: true as const });
     });
 
-    internals.scheduleStartupRecovery();
-    await internals.startupRecoveryPromise;
+    await internals.runStartupRecovery();
 
     expect(sendCount).toBe(1);
-    expect(internals.startupRecoveryScheduled).toBe(false);
 
-    internals.scheduleStartupRecovery();
-    await internals.startupRecoveryPromise;
+    await internals.runStartupRecovery();
 
     expect(sendCount).toBe(2);
-    expect(internals.startupRecoveryScheduled).toBe(true);
   });
 
   // RLM keep-recent floor: post-crash recovery when the compaction summary is
@@ -608,8 +601,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       return Promise.resolve({ success: true as const });
     });
 
-    internals.scheduleStartupRecovery();
-    await internals.startupRecoveryPromise;
+    await internals.runStartupRecovery();
 
     expect(dispatchedMessage).toBe("follow up after tail");
     expect(internals.sendMessage).toHaveBeenCalledTimes(1);

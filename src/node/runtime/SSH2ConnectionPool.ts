@@ -435,7 +435,6 @@ export class SSH2ConnectionPool {
       clearTimeout(entry.idleTimer);
     }
 
-    // Set new idle timer
     entry.idleTimer = setTimeout(() => {
       this.closeIdleConnection(key, entry);
     }, IDLE_TIMEOUT_MS);

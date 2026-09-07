@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from "bun:test";
 import type { APIClient } from "@/browser/contexts/API";
 import { openInEditor } from "./openInEditor";
 import type { RuntimeConfig } from "@/common/types/runtime";
+import { REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX } from "@/common/constants/remoteConnection";
 
 interface GlobalWithOptionalWindow {
   window?: unknown;
@@ -46,7 +47,10 @@ describe("openInEditor", () => {
 
   // Browser-mode window (no `api`): window.open returns a placeholder that records
   // navigations and close() calls, mirroring a real popup.
-  function createBrowserModeWindow(calls: OpenCall[], opts?: { popupBlocked?: boolean }) {
+  function createBrowserModeWindow(
+    calls: OpenCall[],
+    opts?: { popupBlocked?: boolean; denyEditorPlaceholders?: boolean }
+  ) {
     const placeholder = {
       closed: false,
       navigations: [] as string[],
@@ -65,7 +69,10 @@ describe("openInEditor", () => {
       location: { hostname: "localhost" },
       open: (url: string, target?: string) => {
         calls.push([url, target]);
-        return opts?.popupBlocked ? null : placeholder;
+        const wrapperBlocked =
+          opts?.denyEditorPlaceholders &&
+          target?.startsWith(REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX);
+        return opts?.popupBlocked || wrapperBlocked ? null : placeholder;
       },
     };
     return { windowValue, placeholder };
@@ -277,10 +284,33 @@ describe("openInEditor", () => {
     expect(result.success).toBe(true);
     // The only window.open call is the synchronous placeholder; the deep link reaches the
     // already-open window via navigation, immune to popup blocking.
-    expect(calls).toEqual([["about:blank", "_blank"]]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe("about:blank");
+    expect(calls[0][1]?.startsWith(REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX)).toBe(true);
     expect(placeholder.navigations.length).toBe(1);
     expect(placeholder.navigations[0]).toContain("ssh-remote+devbox");
     expect(placeholder.closed).toBe(false);
+  });
+
+  test("browser mode: each editor launch uses a different placeholder name", async () => {
+    const calls: OpenCall[] = [];
+    const { windowValue } = createBrowserModeWindow(calls);
+
+    await withWindow(windowValue, async () => {
+      for (let index = 0; index < 2; index++) {
+        const result = await openInEditor({
+          api: createApiStub(),
+          workspaceId,
+          targetPath: filePath,
+          runtimeConfig: { type: "ssh", host: "devbox", srcBaseDir: "~/xum" },
+          isFile: true,
+        });
+        expect(result.success).toBe(true);
+      }
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0][1]).not.toBe(calls[1][1]);
   });
 
   test("browser mode: closes the placeholder when the open is refused", async () => {
@@ -379,6 +409,29 @@ describe("openInEditor", () => {
     expect(placeholder.navigations.length).toBe(0);
   });
 
+  test("remote wrapper: refuses editor placeholders before recording an open", async () => {
+    const calls: OpenCall[] = [];
+    const { windowValue, placeholder } = createBrowserModeWindow(calls, {
+      denyEditorPlaceholders: true,
+    });
+    const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
+    const api = { general: { recordEditorOpen } } as unknown as APIClient;
+
+    const result = await withWindow(windowValue, () =>
+      openInEditor({
+        api,
+        workspaceId,
+        targetPath: filePath,
+        runtimeConfig: { type: "ssh", host: "devbox", srcBaseDir: "~/xum" },
+        isFile: true,
+      })
+    );
+
+    expect(result.success).toBe(false);
+    expect(recordEditorOpen).not.toHaveBeenCalled();
+    expect(placeholder.navigations).toEqual([]);
+  });
+
   test("browser mode: refuses before recording when the placeholder is popup-blocked", async () => {
     const calls: OpenCall[] = [];
     const { windowValue, placeholder } = createBrowserModeWindow(calls, { popupBlocked: true });
@@ -401,7 +454,9 @@ describe("openInEditor", () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain("popup");
     expect(recordEditorOpen).not.toHaveBeenCalled();
-    expect(calls).toEqual([["about:blank", "_blank"]]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe("about:blank");
+    expect(calls[0][1]?.startsWith(REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX)).toBe(true);
     expect(placeholder.navigations.length).toBe(0);
   });
 });

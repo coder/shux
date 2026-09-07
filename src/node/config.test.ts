@@ -32,6 +32,111 @@ describe("Config", () => {
     await config.editConfig((cfg) => cfg);
   }
 
+  describe("Daybreak visibility migration", () => {
+    const blue = "openai:daybreak-blue-latest";
+    const red = "openai:daybreak-red-latest";
+    const unrelated = "openrouter:openai/gpt-5";
+
+    const malformedHiddenModels = [
+      undefined,
+      null,
+      "invalid",
+      {},
+      [null],
+      [""],
+      ["  "],
+      ["invalid"],
+      ["mux-gateway:openai"],
+      [42, false, {}],
+    ].map((hiddenModels) => ({ hiddenModels }));
+
+    it.each(malformedHiddenModels)(
+      "keeps legacy fallback for malformed hides: %j",
+      async ({ hiddenModels }) => {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({ projects: [], hiddenModels })
+        );
+        await flushConfigEdits();
+        const reloaded = new Config(tempDir).getClientConfig();
+        expect(reloaded.hiddenModels).toEqual([blue, red]);
+        expect(reloaded.hiddenModelsInitialized).toBe(false);
+      }
+    );
+
+    it.each(malformedHiddenModels)(
+      "reopens preference recovery for malformed hides after migration: %j",
+      async ({ hiddenModels }) => {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [],
+            hiddenModels,
+            migrations: { daybreakModelsHidden: true, hiddenModelsInitialized: true },
+          })
+        );
+        await flushConfigEdits();
+        const reloaded = new Config(tempDir).getClientConfig();
+        expect(reloaded.hiddenModels).toBeUndefined();
+        expect(reloaded.hiddenModelsInitialized).toBe(false);
+
+        await config.updateModelPreferences({ hiddenModels: [] });
+        const recovered = new Config(tempDir).getClientConfig();
+        expect(recovered.hiddenModels).toEqual([]);
+        expect(recovered.hiddenModelsInitialized).toBe(true);
+      }
+    );
+
+    it("preserves valid hides when discarding malformed entries", async () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [],
+          hiddenModels: [null, unrelated, ""],
+          migrations: { daybreakModelsHidden: true, hiddenModelsInitialized: true },
+        })
+      );
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).getClientConfig();
+      expect(reloaded.hiddenModels).toEqual([unrelated]);
+      expect(reloaded.hiddenModelsInitialized).toBe(true);
+    });
+
+    it.each([
+      { name: "fresh install", persisted: false, hiddenModels: undefined },
+      { name: "legacy local-only preferences", persisted: true, hiddenModels: undefined },
+      { name: "explicit empty backend preferences", persisted: true, hiddenModels: [] },
+      { name: "existing backend preferences", persisted: true, hiddenModels: [unrelated, blue] },
+    ])("seeds once for $name and preserves later choices", async ({ persisted, hiddenModels }) => {
+      if (persisted) {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [],
+            defaultModel: KNOWN_MODELS.GPT.id,
+            hiddenModels,
+          })
+        );
+      }
+      const seeded = config.getClientConfig();
+      expect(seeded.hiddenModels).toEqual([...new Set([...(hiddenModels ?? []), blue, red])]);
+      expect(seeded.hiddenModelsInitialized).toBe(hiddenModels !== undefined);
+      expect(seeded.defaultModel).toBe(persisted ? KNOWN_MODELS.GPT.id : undefined);
+      await flushConfigEdits();
+
+      for (const visible of [[blue], [red], [blue, red], []]) {
+        const hidden = [unrelated, ...[blue, red].filter((id) => !visible.includes(id))];
+        await config.updateModelPreferences({ hiddenModels: hidden });
+        const reloaded = new Config(tempDir).getClientConfig();
+        expect(reloaded.hiddenModels).toEqual(hidden);
+        expect(reloaded.hiddenModelsInitialized).toBe(true);
+        expect(reloaded.defaultModel).toBe(seeded.defaultModel);
+      }
+      await config.updateModelPreferences({ hiddenModels: [] });
+      expect(new Config(tempDir).getClientConfig().hiddenModels).toEqual([]);
+    });
+  });
+
   describe("loadConfigOrDefault corrupt config recovery", () => {
     function configFilePath(): string {
       return path.join(tempDir, "config.json");

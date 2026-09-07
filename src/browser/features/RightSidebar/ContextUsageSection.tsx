@@ -42,8 +42,11 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
     resolveCompactionModel(configuredCompactionModel) ?? contextDisplayModel;
 
   // Auto-compaction settings: threshold per-model (100 = disabled)
-  const { threshold: autoCompactThreshold, setThreshold: setAutoCompactThreshold } =
-    useAutoCompactionSettings(workspaceId, contextDisplayModel);
+  const {
+    threshold: autoCompactThreshold,
+    setThreshold: setAutoCompactThreshold,
+    rolloverEnabled,
+  } = useAutoCompactionSettings(workspaceId, contextDisplayModel);
 
   const contextUsage = usage.liveUsage ?? usage.lastContextUsage;
   if (!contextUsage) {
@@ -61,7 +64,8 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
   // Warn when the compaction model can't fit the auto-compact threshold to avoid failures.
   const contextWarning = (() => {
     const maxTokens = contextUsageData.maxTokens;
-    if (!maxTokens || autoCompactThreshold >= 100 || !effectiveCompactionModel) return undefined;
+    if (rolloverEnabled || !maxTokens || autoCompactThreshold >= 100 || !effectiveCompactionModel)
+      return undefined;
 
     const thresholdTokens = Math.round((autoCompactThreshold / 100) * maxTokens);
     const compactionMaxTokens = getEffectiveContextLimit(
@@ -89,6 +93,7 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
           threshold: autoCompactThreshold,
           setThreshold: setAutoCompactThreshold,
           contextWarning,
+          rolloverEnabled,
         }}
       />
     </div>

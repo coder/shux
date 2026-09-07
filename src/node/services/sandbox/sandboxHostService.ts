@@ -1100,14 +1100,6 @@ export class SandboxHostService {
     return mount;
   }
 
-  /** Persist the current vars snapshot for a live persistent scope. */
-  async snapshotScope(scopeKey: string): Promise<void> {
-    await using _guard = await this.lockFor(scopeKey).acquire();
-    const mount = this.persistentMounts.get(scopeKey);
-    if (!mount || mount.isDisposed) return;
-    await mount.persistVars();
-  }
-
   /**
    * Best-effort task-terminal delivery into a live persistent mount's
    * host→guest queue (fire-and-forget sub-agents, Track 2 r5). No live mount

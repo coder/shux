@@ -53,6 +53,22 @@ describe("SettingsPage", () => {
     expect(getSettingsSectionRedirect("plugins", false, false, true)).toBeNull();
   });
 
+  test("shows Remote Connection only when the desktop bridge is available", () => {
+    expect(getSettingsSections(false, false, false, true).map((section) => section.id)).toContain(
+      "remote-connection"
+    );
+    expect(getSettingsSections(true, true, true, false).map((section) => section.id)).not.toContain(
+      "remote-connection"
+    );
+  });
+
+  test("redirects an unavailable Remote Connection deep link to General", () => {
+    expect(getSettingsSectionRedirect("remote-connection", true, true, true, false)).toEqual({
+      section: "general",
+    });
+    expect(getSettingsSectionRedirect("remote-connection", false, false, false, true)).toBeNull();
+  });
+
   test("always shows the Backup section", () => {
     expect(getSettingsSections(false, false, false).map((section) => section.id)).toContain(
       "backup"

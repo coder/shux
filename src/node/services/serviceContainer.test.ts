@@ -1,4 +1,7 @@
 import * as path from "path";
+import { EventEmitter } from "events";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
+import type { AgentSession } from "./agentSession";
 import * as fs from "fs";
 import * as os from "os";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
@@ -80,6 +83,8 @@ import {
   type AppTags,
 } from "@/node/services/di/tags";
 import { ServiceContainer, StartupStepTimeoutError } from "./serviceContainer";
+import type { TurnCoordinator } from "@/node/services/turnCoordinator";
+import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 
 /**
  * Independent field → tag listing for every ORPC context field (the production
@@ -169,6 +174,126 @@ describe("ServiceContainer", () => {
       services = undefined;
     }
     fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("collects restart blockers from live sessions, including pre-stream work", () => {
+    services = new ServiceContainer(stores);
+    expect(services.collectRestartBlockers()).toEqual([]);
+    const session = services.workspaceService.getOrCreateSession("restart-test");
+    const { coordinator } = session as unknown as { coordinator: TurnCoordinator };
+    const admission = coordinator.prepare({
+      kind: "fresh",
+      intent: "handoff",
+      expectedTurnId: coordinator.turnId,
+    });
+    if (admission.status !== "admitted") throw new Error("Expected turn admission");
+    const turn = admission.turnId;
+    expect(services.collectRestartBlockers()).toContainEqual({ kind: "pending-turns", count: 1 });
+    coordinator.finishPreparation(turn);
+    session.queueMessage("queued for later");
+    expect(services.collectRestartBlockers()).toEqual([{ kind: "queued-messages", count: 1 }]);
+    session.clearQueue();
+    const retry = coordinator.beginRetry();
+    expect(services.collectRestartBlockers()).toEqual([{ kind: "auto-retries", count: 1 }]);
+    coordinator.finishRetry(retry);
+    expect(services.collectRestartBlockers()).toEqual([]);
+  });
+
+  it("counts server-wide streams, terminal starts, and foreground or background processes", () => {
+    services = new ServiceContainer(stores);
+    const streams = services.streamManager as unknown as { workspaceStreams: Map<string, unknown> };
+    const terminals = services.terminalService as unknown as {
+      pendingSessionCreations: Map<string, number>;
+    };
+    const processes = services.backgroundProcessManager as unknown as {
+      processes: Map<string, { status: string; isForeground: boolean }>;
+    };
+    const desktop = services.desktopSessionManager as unknown as {
+      sessions: Map<string, unknown>;
+      startupPromises: Map<string, Promise<unknown>>;
+    };
+    const project = services.projectService as unknown as { activeGitInits: Set<string> };
+    let releaseWorkflow: (() => void) | undefined;
+    const workspace = services.workspaceService as unknown as {
+      preflightSendCounts: Map<string, number>;
+      preflightExecCounts: Map<string, number>;
+      initSettlementPromises: Map<string, Promise<void>>;
+      initAbortControllers: Map<string, AbortController>;
+      removingWorkspaces: Set<string>;
+      archivingWorkspaces: Set<string>;
+      renamingWorkspaces: Set<string>;
+    };
+    try {
+      streams.workspaceStreams.set("streaming", {});
+      workspace.initSettlementPromises.set("initializing", new Promise<void>(() => undefined));
+      workspace.initAbortControllers.set("initializing", new AbortController());
+      workspace.initAbortControllers.set("provisioning", new AbortController());
+      workspace.removingWorkspaces.add("removing");
+      workspace.archivingWorkspaces.add("archiving");
+      workspace.archivingWorkspaces.add("removing");
+      workspace.renamingWorkspaces.add("renaming");
+      releaseWorkflow = registerInProcessWorkflowRun("workflow-workspace");
+      desktop.sessions.set("desktop-live", { isAlive: () => true });
+      desktop.sessions.set("desktop-exited", { isAlive: () => false });
+      desktop.startupPromises.set("desktop-starting", new Promise(() => undefined));
+      project.activeGitInits.add("/tmp/new-project");
+      terminals.pendingSessionCreations.set("terminal-starting", 2);
+      processes.processes.set("running", { status: "running", isForeground: false });
+      processes.processes.set("foreground", { status: "running", isForeground: true });
+      processes.processes.set("finished", { status: "exited", isForeground: false });
+      workspace.preflightSendCounts.set("preflight", 1);
+      workspace.preflightExecCounts.set("executing", 1);
+      expect(services.collectRestartBlockers()).toEqual([
+        { kind: "pending-turns", count: 1 },
+        { kind: "workspace-inits", count: 2 },
+        { kind: "workspace-lifecycle", count: 3 },
+        { kind: "background-processes", count: 3 },
+        { kind: "active-streams", count: 1 },
+        { kind: "workflows", count: 1 },
+        { kind: "projects", count: 1 },
+        { kind: "terminals", count: 2 },
+        { kind: "desktop-sessions", count: 2 },
+      ]);
+    } finally {
+      streams.workspaceStreams.clear();
+      terminals.pendingSessionCreations.clear();
+      processes.processes.clear();
+      workspace.preflightSendCounts.clear();
+      workspace.preflightExecCounts.clear();
+      workspace.initSettlementPromises.clear();
+      workspace.initAbortControllers.clear();
+      workspace.removingWorkspaces.clear();
+      workspace.archivingWorkspaces.clear();
+      workspace.renamingWorkspaces.clear();
+      releaseWorkflow?.();
+      desktop.sessions.clear();
+      desktop.startupPromises.clear();
+      project.activeGitInits.clear();
+    }
+    expect(services.collectRestartBlockers()).toEqual([]);
+  });
+
+  it("refuses new sessions, commands, and terminals synchronously during disposal", async () => {
+    services = new ServiceContainer(stores);
+    expect(services.serverService.isShuttingDown()).toBe(false);
+    const disposal = services.dispose();
+    expect(services.serverService.isShuttingDown()).toBe(true);
+    expect(() => services!.workspaceService.getOrCreateSession("cold-workspace")).toThrow(
+      "shutting down"
+    );
+    expect(await services.workspaceService.executeBash("cold-workspace", "echo not-run")).toEqual({
+      success: false,
+      error: "Server is shutting down",
+    });
+    let terminalError: unknown;
+    try {
+      await services.terminalService.create({ workspaceId: "cold-workspace", cols: 80, rows: 24 });
+    } catch (error) {
+      terminalError = error;
+    }
+    expect(terminalError).toBeInstanceOf(Error);
+    expect(String(terminalError)).toContain("shutting down");
+    await disposal;
   });
 
   it("attributes multi-project stream-end analytics to the primary project path", async () => {
@@ -319,7 +444,6 @@ describe("ServiceContainer", () => {
     await housekeeping;
     await disposed;
 
-    expect(disposeRecoverySessions).toHaveBeenCalledTimes(1);
     expect(beginShutdown).toHaveBeenCalledTimes(1);
     expect(heartbeatStart).not.toHaveBeenCalled();
     expect(idleCompactionStart).not.toHaveBeenCalled();
@@ -600,107 +724,261 @@ describe("ServiceContainer", () => {
     expect(services.appFiberScope.state._tag).toBe("Closed");
   });
 
-  it("dispose() aborts and awaits an in-flight stream before desktopBridgeServer.stop()", async () => {
-    // The AppFiberScope occupant end to end: a real stream on the container's
-    // StreamManager (wired with the runtime's scope), its provider stubbed to
-    // flow one delta and then block until the stream's AbortSignal fires.
-    // dispose() must abort it as "system", let AIService commit the partial
-    // into chat.jsonl and delete partial.json, and only then stop the bridge.
-    services = new ServiceContainer(stores);
-    const workspaceId = "dispose-in-flight-stream-workspace";
-    const messageId = "dispose-in-flight-stream-message";
-    const steps: string[] = [];
-    Reflect.set(services.streamManager, "tokenTracker", {
-      setModel: () => Promise.resolve(undefined),
-      countTokens: () => Promise.resolve(0),
-    });
-    Reflect.set(
-      services.streamManager,
-      "createStreamResult",
-      (_request: unknown, abortController: AbortController) => ({
-        fullStream: (async function* () {
-          yield { type: "text-delta", text: "hello from a stream shutdown must not lose" };
-          await new Promise<void>((resolve) => {
-            if (abortController.signal.aborted) return resolve();
-            abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+  it.each([false, true])(
+    "dispose() joins engine and session policy before bridge teardown (session=%s)",
+    async (throughSession) => {
+      // The AppFiberScope occupant end to end: a real stream on the container's
+      // StreamManager (wired with the runtime's scope), its provider stubbed to
+      // flow one delta and then block until the stream's AbortSignal fires.
+      // dispose() must abort it as "system", let AIService commit the partial
+      // into chat.jsonl and delete partial.json, and only then stop the bridge.
+      services = new ServiceContainer(stores);
+      const workspaceId = "dispose-in-flight-stream-workspace";
+      const messageId = "dispose-in-flight-stream-message";
+      const steps: string[] = [];
+      Reflect.set(services.streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(undefined),
+        countTokens: () => Promise.resolve(0),
+      });
+      Reflect.set(
+        services.streamManager,
+        "createStreamResult",
+        (_request: unknown, abortController: AbortController) => ({
+          fullStream: (async function* () {
+            yield { type: "text-delta", text: "hello from a stream shutdown must not lose" };
+            await new Promise<void>((resolve) => {
+              if (abortController.signal.aborted) return resolve();
+              abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+          })(),
+          totalUsage: Promise.resolve(undefined),
+          usage: Promise.resolve(undefined),
+          providerMetadata: Promise.resolve(undefined),
+          steps: Promise.resolve([]),
+        })
+      );
+      Reflect.set(services.streamManager, "createTempDirForStream", () =>
+        Promise.resolve(path.join(tempDir, "stream-tempdir"))
+      );
+      Reflect.set(services.streamManager, "cleanupStreamTempDir", () => undefined);
+      services.aiService.on("stream-abort", (event: { abortReason?: string }) => {
+        steps.push(`stream-abort:${event.abortReason ?? "none"}`);
+      });
+      const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
+        steps.push("bridge-stop");
+        return Promise.resolve(undefined);
+      });
+
+      const historyService = services.runtime.get(History);
+      const partialWritten = Promise.withResolvers<void>();
+      const writePartial = historyService.writePartial.bind(historyService);
+      spyOn(historyService, "writePartial").mockImplementation(async (...args) => {
+        const result = await writePartial(...args);
+        partialWritten.resolve();
+        return result;
+      });
+      const startEngine = async () => {
+        const appendResult = await historyService.appendToHistory(workspaceId, {
+          id: messageId,
+          role: "assistant",
+          metadata: { historySequence: 1, partial: true },
+          parts: [],
+        });
+        expect(appendResult.success).toBe(true);
+        return services!.streamManager.startStream({
+          workspaceId,
+          messageId,
+          model: {
+            specificationVersion: "v3",
+            provider: "test",
+            modelId: "dispose-model",
+            supportedUrls: {},
+            doGenerate: () => Promise.reject(new Error("unused")),
+            doStream: () => Promise.reject(new Error("unused")),
+          },
+          messages: [{ role: "user", content: "hello" }],
+          modelString: "openai:gpt-4.1-mini",
+          historySequence: 1,
+          system: "system",
+          runtime: createRuntime({ type: "local", srcBaseDir: tempDir }),
+          providedRuntimeTempDir: "",
+        });
+      };
+      const policyEntered = Promise.withResolvers<void>();
+      const releasePolicy = Promise.withResolvers<void>();
+      const handleDelivered = Promise.withResolvers<Awaited<ReturnType<typeof startEngine>>>();
+      let session: AgentSession | undefined;
+      if (throughSession) {
+        const emitter = new EventEmitter();
+        for (const event of ["stream-start", "stream-abort", "stream-end", "stream-error"]) {
+          services.aiService.on(event, (payload: unknown) => emitter.emit(event, payload));
+        }
+        const h = await createAgentSessionHarness({
+          workspaceId,
+          historyService,
+          aiEmitter: emitter,
+          streamManager: services.streamManager,
+          effectRunner: services.runtime.get(EffectRunnerTag),
+          appFiberScope: services.appFiberScope,
+          aiServiceOverrides: {
+            streamMessage: async () => {
+              const result = await startEngine();
+              handleDelivered.resolve(result);
+              return result;
+            },
+          },
+        });
+        session = h.session;
+        services.workspaceService.registerSession(workspaceId, session);
+        // Hold only session policy. The actual engine still aborts, retires partial.json,
+        // and delivers its independent completion while the app guardian is closing.
+        const policy = session as unknown as {
+          recordGoalAccountingFromUsage(input: unknown): Promise<void>;
+        };
+        const record = policy.recordGoalAccountingFromUsage.bind(session);
+        spyOn(policy, "recordGoalAccountingFromUsage").mockImplementation(async (input) => {
+          policyEntered.resolve();
+          await releasePolicy.promise;
+          await record(input);
+        });
+        session.onChatEvent(({ message }) => {
+          if (message.type === "stream-abort") steps.push("renderer-abort");
+        });
+        expect(
+          (await session.sendMessage("hello", { model: "openai:gpt-4.1-mini", agentId: "exec" }))
+            .success
+        ).toBe(true);
+      } else {
+        handleDelivered.resolve(await startEngine());
+      }
+      const started = await handleDelivered.promise;
+      expect(started.success).toBe(true);
+      if (!started.success) throw new Error("expected the stream to start");
+      // Signal after real disk persistence, so shutdown starts with a partial worth committing.
+      await partialWritten.promise;
+      expect(services.streamManager.isStreaming(workspaceId)).toBe(true);
+
+      const disposing = services.dispose();
+      try {
+        if (throughSession) {
+          await policyEntered.promise;
+          expect(await started.data.completion).toMatchObject({
+            status: "aborted",
+            abortReason: "system",
           });
-        })(),
-        totalUsage: Promise.resolve(undefined),
-        usage: Promise.resolve(undefined),
-        providerMetadata: Promise.resolve(undefined),
-        steps: Promise.resolve([]),
-      })
-    );
-    Reflect.set(services.streamManager, "createTempDirForStream", () =>
-      Promise.resolve(path.join(tempDir, "stream-tempdir"))
-    );
-    Reflect.set(services.streamManager, "cleanupStreamTempDir", () => undefined);
-    services.aiService.on("stream-abort", (event: { abortReason?: string }) => {
-      steps.push(`stream-abort:${event.abortReason ?? "none"}`);
-    });
-    const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
-      steps.push("bridge-stop");
-      return Promise.resolve(undefined);
-    });
+          expect(bridgeStopSpy).not.toHaveBeenCalled();
+          expect(await historyService.readPartial(workspaceId)).toBeNull();
+        }
+      } finally {
+        releasePolicy.resolve();
+        await disposing;
+      }
 
-    const historyService = services.runtime.get(History);
-    const appendResult = await historyService.appendToHistory(workspaceId, {
-      id: messageId,
-      role: "assistant",
-      metadata: { historySequence: 1, partial: true },
-      parts: [],
-    });
-    expect(appendResult.success).toBe(true);
-    const started = await services.streamManager.startStream({
-      workspaceId,
-      messageId,
-      model: {
-        specificationVersion: "v3",
-        provider: "test",
-        modelId: "dispose-model",
-        supportedUrls: {},
-        doGenerate: () => Promise.reject(new Error("unused")),
-        doStream: () => Promise.reject(new Error("unused")),
-      },
-      messages: [{ role: "user", content: "hello" }],
-      modelString: "openai:gpt-4.1-mini",
-      historySequence: 1,
-      system: "system",
-      runtime: createRuntime({ type: "local", srcBaseDir: tempDir }),
-      providedRuntimeTempDir: "",
-    });
-    expect(started.success).toBe(true);
-    if (!started.success) throw new Error("expected the stream to start");
-    // Wait for the delta to reach partial.json so there is something to commit.
-    const deadline = Date.now() + 5_000;
-    while ((await historyService.readPartial(workspaceId)) === null) {
-      if (Date.now() > deadline) throw new Error("partial never written");
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
+      expect(steps).toEqual(
+        throughSession
+          ? ["stream-abort:system", "renderer-abort", "bridge-stop"]
+          : ["stream-abort:system", "bridge-stop"]
+      );
+      expect(await started.data.completion).toMatchObject({
+        status: "aborted",
+        abortReason: "system",
+      });
+      expect(services.streamManager.isStreaming(workspaceId)).toBe(false);
+      // Durable outcome at the moment the bridge stopped: partial.json gone, the
+      // interrupted assistant message (still flagged partial, as every
+      // interrupted turn is) committed to chat.jsonl with its streamed text —
+      // instead of an empty placeholder row plus an orphan partial.json that only
+      // the next load would reconcile.
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (!history.success) throw new Error(history.error);
+      const committed = history.data.find((message) => message.id === messageId);
+      expect(
+        committed?.parts.some(
+          (part) =>
+            part.type === "text" && part.text === "hello from a stream shutdown must not lose"
+        )
+      ).toBe(true);
     }
-    expect(services.streamManager.isStreaming(workspaceId)).toBe(true);
+  );
 
-    await services.dispose();
-
-    expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
-    expect(steps).toEqual(["stream-abort:system", "bridge-stop"]);
-    expect(await started.data.completion).toEqual({ status: "aborted", abortReason: "system" });
-    expect(services.streamManager.isStreaming(workspaceId)).toBe(false);
-    // Durable outcome at the moment the bridge stopped: partial.json gone, the
-    // interrupted assistant message (still flagged partial, as every
-    // interrupted turn is) committed to chat.jsonl with its streamed text —
-    // instead of an empty placeholder row plus an orphan partial.json that only
-    // the next load would reconcile.
-    expect(await historyService.readPartial(workspaceId)).toBeNull();
-    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-    expect(history.success).toBe(true);
-    if (!history.success) throw new Error(history.error);
-    const committed = history.data.find((message) => message.id === messageId);
-    expect(
-      committed?.parts.some(
-        (part) => part.type === "text" && part.text === "hello from a stream shutdown must not lose"
-      )
-    ).toBe(true);
+  it("joins cleanup enqueued by a closing session callback before dependency teardown", async () => {
+    services = new ServiceContainer(stores);
+    const session = services.workspaceService.getOrCreateSession("late-cleanup-owner");
+    const { coordinator } = session as unknown as { coordinator: TurnCoordinator };
+    const lease = coordinator.enterExecution();
+    const cleanupEntered = Promise.withResolvers<void>();
+    const cleanupRelease = Promise.withResolvers<void>();
+    const backgroundEntered = Promise.withResolvers<void>();
+    const backgroundRelease = Promise.withResolvers<void>();
+    spyOn(services.backgroundProcessManager, "cleanup").mockImplementationOnce(async () => {
+      backgroundEntered.resolve();
+      await backgroundRelease.promise;
+    });
+    const bridge = spyOn(services.desktopBridgeServer, "stop").mockResolvedValue(undefined);
+    const disposed = services.dispose();
+    try {
+      // The still-leased producer registers cleanup after the shutdown snapshot.
+      services.workspaceService.deferWorkspaceCleanup(async () => {
+        cleanupEntered.resolve();
+        await cleanupRelease.promise;
+      });
+      lease[Symbol.dispose]();
+      await Promise.all([cleanupEntered.promise, backgroundEntered.promise]);
+      expect(bridge).not.toHaveBeenCalled();
+      backgroundRelease.resolve();
+      await session.dispose();
+      expect(bridge).not.toHaveBeenCalled();
+      cleanupRelease.resolve();
+      await disposed;
+      expect(bridge).toHaveBeenCalledTimes(1);
+    } finally {
+      lease[Symbol.dispose]();
+      backgroundRelease.resolve();
+      cleanupRelease.resolve();
+      await disposed;
+    }
   });
+
+  it.each(["stop", "drain"] as const)(
+    "a rejected session %s cannot skip held background or deferred cleanup",
+    async (failure) => {
+      services = new ServiceContainer(stores);
+      const session = services.workspaceService.getOrCreateSession(`shutdown-${failure}-failure`);
+      const { coordinator } = session as unknown as { coordinator: TurnCoordinator };
+      if (failure === "stop")
+        spyOn(services.streamManager, "stopStream").mockRejectedValueOnce(
+          new Error("adapter stop failure")
+        );
+      else spyOn(coordinator, "drain").mockRejectedValueOnce(new Error("scope drain failure"));
+      const backgroundEntered = Promise.withResolvers<void>();
+      const backgroundRelease = Promise.withResolvers<void>();
+      const cleanupRelease = Promise.withResolvers<void>();
+      spyOn(services.backgroundProcessManager, "cleanup").mockImplementationOnce(async () => {
+        backgroundEntered.resolve();
+        await backgroundRelease.promise;
+      });
+      services.workspaceService.deferWorkspaceCleanup(() => cleanupRelease.promise);
+      const bridge = spyOn(services.desktopBridgeServer, "stop").mockResolvedValue(undefined);
+      const disposed = services.dispose();
+      try {
+        await backgroundEntered.promise;
+        expect(bridge).not.toHaveBeenCalled();
+        backgroundRelease.resolve();
+        await session.dispose();
+        expect(bridge).not.toHaveBeenCalled();
+        cleanupRelease.resolve();
+        await disposed;
+        expect(bridge).toHaveBeenCalledTimes(1);
+      } finally {
+        backgroundRelease.resolve();
+        cleanupRelease.resolve();
+        await disposed;
+      }
+    }
+  );
 
   it("shares one teardown across concurrent dispose() calls", async () => {
     services = new ServiceContainer(stores);

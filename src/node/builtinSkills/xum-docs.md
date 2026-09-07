@@ -63,6 +63,7 @@ Use this index to find a page's:
       - Compaction (`/workspaces/compaction`) → `references/docs/workspaces/compaction/index.mdx`: Managing conversation context size with compaction
       - Manual Compaction (`/workspaces/compaction/manual`) → `references/docs/workspaces/compaction/manual.mdx`: Commands for manually managing conversation context
       - Automatic Compaction (`/workspaces/compaction/automatic`) → `references/docs/workspaces/compaction/automatic.mdx`: Let Xum automatically compact your conversations based on usage or idle time
+      - Token-Budget Context Windows (`/workspaces/compaction/token-budget`) → `references/docs/workspaces/compaction/token-budget.md`: Start fresh context windows without automatic summaries and retrieve earlier work on demand
       - Customization (`/workspaces/compaction/customization`) → `references/docs/workspaces/compaction/customization.mdx`: Customize the compaction system prompt
     - **Runtimes**
       - Runtimes (`/runtime`) → `references/docs/runtime/index.mdx`: Configure where and how Xum executes agent workspaces
@@ -110,7 +111,6 @@ Use this index to find a page's:
     - Terminal Benchmarking (`/reference/benchmarking`) → `references/docs/reference/benchmarking.mdx`: Run Terminal-Bench benchmarks with the Xum adapter
     - Context Boundaries for Compaction and Reset (`/adr/0003-context-boundaries-for-compaction-and-reset`) → `references/docs/adr/0003-context-boundaries-for-compaction-and-reset.md`: Architecture decision for modeling provider context windows separately from transcript history
     - CLI Goal Runs are not strict /goal aliases (`/adr/0004-cli-goal-runs-are-not-strict-goal-aliases`) → `references/docs/adr/0004-cli-goal-runs-are-not-strict-goal-aliases.md`: Architecture decision for giving xum run --goal CLI-specific completion and limit semantics
-    - Research: Claude Code cross-session messaging vs. Mux (`/research/claude-code-cross-session-messaging-comparison`) → `references/docs/research/claude-code-cross-session-messaging-comparison.md`: Feature-by-feature comparison of Claude Code's cross-session messaging against Mux's existing inter-agent messaging, with code-level evidence and gap analysis
     - AGENTS.md (`/AGENTS`) → `references/docs/AGENTS.md`: Agent instructions for AI assistants working on the Xum codebase
 <!-- END DOCS_TREE -->
 

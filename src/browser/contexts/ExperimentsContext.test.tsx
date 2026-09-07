@@ -1,4 +1,6 @@
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { wrapAsyncIterator } from "@orpc/shared";
+import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -129,6 +131,140 @@ describe("ExperimentsProvider", () => {
       await rm(isolatedModuleDir, { recursive: true, force: true });
       isolatedModuleDir = null;
     }
+  });
+
+  test.each([true, false])(
+    "Design disable waits for backend acknowledgement (success=%s)",
+    async (success) => {
+      let backendEnabled = true;
+      const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+      updates.push({ enabled: true, revision: 0 });
+      let finish!: () => void;
+      let reject!: (error: Error) => void;
+      const pending = new Promise<void>((resolve, fail) => {
+        finish = () => {
+          backendEnabled = false;
+          updates.push({ enabled: false, revision: 1 });
+          resolve();
+        };
+        reject = fail;
+      });
+      const setOverride = mock(() => pending);
+      currentClientMock = {
+        experiments: {
+          onDesignChange: (_input, { signal } = {}) => {
+            signal?.addEventListener("abort", updates.end, { once: true });
+            return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
+          },
+          getOverrides: () =>
+            Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: backendEnabled }),
+          setOverride,
+        },
+      };
+      function Toggle() {
+        const [enabled, setEnabled] = useExperiment(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
+        return <button onClick={() => setEnabled(false)}>{String(enabled)}</button>;
+      }
+      const view = render(
+        <APIProvider client={currentClientMock as APIClient}>
+          <ExperimentsProvider>
+            <Toggle />
+          </ExperimentsProvider>
+        </APIProvider>
+      );
+      await waitFor(() => expect(view.getByRole("button").textContent).toBe("true"));
+      fireEvent.click(view.getByRole("button"));
+      expect(setOverride).toHaveBeenCalledTimes(1);
+      expect(view.getByRole("button").textContent).toBe("true");
+      expect(
+        window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP))
+      ).toBeNull();
+      await act(async () => {
+        if (success) finish();
+        else reject(new Error("offline"));
+        await pending.catch(() => undefined);
+      });
+      expect(view.getByRole("button").textContent).toBe(String(!success));
+    }
+  );
+
+  test("ordered Design updates win over delayed reads, toggle acknowledgements, and old revisions", async () => {
+    const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+    updates.push({ enabled: true, revision: 1 });
+    let acknowledge!: () => void;
+    const setOverride = mock(
+      () =>
+        new Promise<void>((resolve) => {
+          acknowledge = resolve;
+        })
+    );
+    let finishRead!: () => void;
+    const getOverrides = mock(
+      () =>
+        new Promise<{ "claude-design-mcp": boolean }>((resolve) => {
+          finishRead = () => resolve({ "claude-design-mcp": false });
+        })
+    );
+    currentClientMock = {
+      experiments: {
+        setOverride,
+        getOverrides,
+        onDesignChange: (_input, { signal } = {}) => {
+          signal?.addEventListener("abort", updates.end, { once: true });
+          return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
+        },
+      },
+    };
+    function Toggle() {
+      const [enabled, setEnabled] = useExperiment(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
+      return <button onClick={() => setEnabled(false)}>{String(enabled)}</button>;
+    }
+    const view = render(
+      <APIProvider client={currentClientMock as APIClient}>
+        <ExperimentsProvider>
+          <Toggle />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+    await waitFor(() => expect(view.getByRole("button").textContent).toBe("true"));
+    fireEvent.click(view.getByRole("button"));
+    await act(async () => {
+      updates.push({ enabled: false, revision: 2 });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.getByRole("button").textContent).toBe("false"));
+    await act(async () => {
+      updates.push({ enabled: true, revision: 3 });
+      updates.push({ enabled: false, revision: 2 });
+      finishRead();
+      acknowledge();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.getByRole("button").textContent).toBe("true"));
+    expect(getOverrides).toHaveBeenCalledTimes(1);
+  });
+
+  test("stale local Design enablement is neither uploaded nor displayed on reconnect", async () => {
+    window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), "true");
+    const setOverride = mock(() => Promise.resolve());
+    currentClientMock = {
+      experiments: {
+        setOverride,
+        getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: false }),
+      },
+    };
+    function Observer() {
+      return <div>{String(useExperimentValue(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP))}</div>;
+    }
+    const view = render(
+      <APIProvider client={currentClientMock as APIClient}>
+        <ExperimentsProvider>
+          <Observer />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+    await waitFor(() => expect(view.getByText("false")).toBeDefined());
+    expect(setOverride).not.toHaveBeenCalled();
   });
 
   test("syncs existing local overrides to the backend on connect", async () => {

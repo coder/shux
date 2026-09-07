@@ -20,6 +20,8 @@ import {
   type WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
+import type { HistoryControlRow } from "@/node/services/historyScanner";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import {
   SUBAGENT_FAILURE_ENVELOPE_TAG,
@@ -57,7 +59,6 @@ import {
 } from "@/common/types/backgroundWorkAttention";
 import {
   createMuxMessage,
-  getCompactionFollowUpContent,
   parseWorkspaceTurnTaskCorrelation,
   type MuxMessage,
   type MuxMessageMetadata,
@@ -334,7 +335,7 @@ const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
   "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report";
 
 /** A human-authored child input that redirects the delegated turn. */
-function isManualChildWorkspaceInput(message: MuxMessage): boolean {
+function isManualChildWorkspaceInput(message: HistoryControlRow): boolean {
   if (message.role !== "user") {
     return false;
   }
@@ -342,10 +343,20 @@ function isManualChildWorkspaceInput(message: MuxMessage): boolean {
     return true;
   }
   const muxMetadata = message.metadata.muxMetadata;
-  return (
-    muxMetadata?.type === "compaction-request" &&
-    muxMetadata.source === "auto-compaction" &&
-    getCompactionFollowUpContent(muxMetadata)?.dispatchOptions?.source !== "internal-resume"
+  if (
+    !isPlainObject(muxMetadata) ||
+    muxMetadata.type !== "compaction-request" ||
+    muxMetadata.source !== "auto-compaction"
+  )
+    return false;
+  // Control rows need not be valid MuxMessages. Read only the guarded dispatch
+  // source, including the legacy continuation field, instead of casting payloads.
+  const parsed = isPlainObject(muxMetadata.parsed) ? muxMetadata.parsed : undefined;
+  const followUp = parsed?.followUpContent ?? parsed?.continueMessage;
+  return !(
+    isPlainObject(followUp) &&
+    isPlainObject(followUp.dispatchOptions) &&
+    followUp.dispatchOptions.source === "internal-resume"
   );
 }
 
@@ -621,21 +632,6 @@ export class WorkspaceTurnManager {
     handleId: string
   ): Promise<WorkspaceTurnTaskHandleRecord | null> {
     return await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
-  }
-
-  async getWorkspaceTurnForExecution(
-    workspaceId: string,
-    executionId: string
-  ): Promise<WorkspaceTurnTaskHandleRecord | null> {
-    const live = this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
-    if (live?.handleId === executionId) {
-      return await this.taskHandleStore.getWorkspaceTurn(live.ownerWorkspaceId, executionId);
-    }
-    return (
-      (await this.taskHandleStore.listAllWorkspaceTurns()).find(
-        (record) => record.handleId === executionId
-      ) ?? null
-    );
   }
 
   private nextWorkspaceTurnCreatedAt(): string {
@@ -2423,7 +2419,11 @@ export class WorkspaceTurnManager {
           params.record.ownerWorkspaceId
         );
         this.taskHost.markTaskForegroundRelevant(params.record.handleId);
-        await this.cleanupDisposableWorkspaceTurn(nextRecord);
+        // A preparation/queue failure callback still owns the target session's physical
+        // lease. Removing that session here would join this very callback under the lock.
+        if (params.cause.kind !== "continuation-failure") {
+          await this.cleanupDisposableWorkspaceTurn(nextRecord);
+        }
         this.taskHost.scheduleMaybeStartQueuedTasks();
 
         // Suppress the owner-scoped wake only when the owner itself received this terminal result.
@@ -2466,78 +2466,88 @@ export class WorkspaceTurnManager {
       settledRecord,
       foregroundWaiterWorkspaceIds = new Set<string>(),
     } = settlementResult;
-    if (settledRecord != null) {
-      await this.deliverPersistentChildWorkspaceTurnResult(
-        settledRecord,
-        foregroundWaiterWorkspaceIds
-      );
-    }
-    if (pendingNotify == null) {
-      return;
-    }
-    if (pendingNotify.kind === "drain_pending") {
-      this.taskHost.scheduleTerminalAttentionDrain(params.record.ownerWorkspaceId);
-      return;
-    }
-
-    // Enqueue the terminal wake-up outside the lock. The persisted notification is the restart-safe
-    // record of intent; only after it is accepted do we set terminalAttentionNotifiedAt on the
-    // handle so a duplicate settlement / stale recovery cannot double-wake.
-    if (pendingNotify.resettled) {
-      const shouldEnqueueCorrectedAttention =
-        settledRecord != null &&
-        (await this.workspaceTurnSettlementLocks.withLock(params.record.handleId, async () => {
-          const current = await this.taskHandleStore.getWorkspaceTurn(
-            params.record.ownerWorkspaceId,
-            params.record.handleId
-          );
-          if (
-            current == null ||
-            current.status !== settledRecord.status ||
-            current.updatedAt !== settledRecord.updatedAt ||
-            current.terminalAttentionNotifiedAt != null
-          ) {
-            return false;
-          }
-          // Delete the stale generation while holding the same lock used by direct-parent
-          // consumption. If consumption wins next, it installs a delivered tombstone before this
-          // method's enqueueIfAbsent; if it already won, the marker above prevents this deletion.
-          if (pendingNotify.staleAttentionRecord != null) {
-            await this.deleteWorkspaceTurnTerminalAttention(pendingNotify.staleAttentionRecord);
-          }
-          return true;
-        }));
-      if (!shouldEnqueueCorrectedAttention) {
+    try {
+      if (settledRecord != null) {
+        await this.deliverPersistentChildWorkspaceTurnResult(
+          settledRecord,
+          foregroundWaiterWorkspaceIds
+        );
+      }
+      if (pendingNotify == null) {
         return;
       }
-    }
-    await this.taskHost.enqueueTerminalAttention({
-      ownerWorkspaceId: params.record.ownerWorkspaceId,
-      sourceKind: "workspace_turn",
-      terminalOutcome: terminalAttentionOutcome(settlementResult.winningStatus),
-      sourceId: params.record.handleId,
-      ...(settledRecord != null
-        ? { generationId: this.workspaceTurnTerminalAttentionGenerationId(settledRecord) }
-        : {}),
-    });
-    await this.workspaceTurnSettlementLocks.withLock(params.record.handleId, async () => {
-      const terminal = await this.taskHandleStore.getWorkspaceTurn(
-        params.record.ownerWorkspaceId,
-        params.record.handleId
-      );
-      if (
-        terminal != null &&
-        (settledRecord == null ||
-          (terminal.status === settledRecord.status &&
-            terminal.updatedAt === settledRecord.updatedAt)) &&
-        terminal.terminalAttentionNotifiedAt == null
-      ) {
-        await this.taskHandleStore.upsertWorkspaceTurn({
-          ...terminal,
-          terminalAttentionNotifiedAt: getIsoNow(),
-        });
+      if (pendingNotify.kind === "drain_pending") {
+        this.taskHost.scheduleTerminalAttentionDrain(params.record.ownerWorkspaceId);
+        return;
       }
-    });
+
+      // Enqueue the terminal wake-up outside the lock. The persisted notification is the restart-safe
+      // record of intent; only after it is accepted do we set terminalAttentionNotifiedAt on the
+      // handle so a duplicate settlement / stale recovery cannot double-wake.
+      if (pendingNotify.resettled) {
+        const shouldEnqueueCorrectedAttention =
+          settledRecord != null &&
+          (await this.workspaceTurnSettlementLocks.withLock(params.record.handleId, async () => {
+            const current = await this.taskHandleStore.getWorkspaceTurn(
+              params.record.ownerWorkspaceId,
+              params.record.handleId
+            );
+            if (
+              current == null ||
+              current.status !== settledRecord.status ||
+              current.updatedAt !== settledRecord.updatedAt ||
+              current.terminalAttentionNotifiedAt != null
+            ) {
+              return false;
+            }
+            // Delete the stale generation while holding the same lock used by direct-parent
+            // consumption. If consumption wins next, it installs a delivered tombstone before this
+            // method's enqueueIfAbsent; if it already won, the marker above prevents this deletion.
+            if (pendingNotify.staleAttentionRecord != null) {
+              await this.deleteWorkspaceTurnTerminalAttention(pendingNotify.staleAttentionRecord);
+            }
+            return true;
+          }));
+        if (!shouldEnqueueCorrectedAttention) {
+          return;
+        }
+      }
+      await this.taskHost.enqueueTerminalAttention({
+        ownerWorkspaceId: params.record.ownerWorkspaceId,
+        sourceKind: "workspace_turn",
+        terminalOutcome: terminalAttentionOutcome(settlementResult.winningStatus),
+        sourceId: params.record.handleId,
+        ...(settledRecord != null
+          ? { generationId: this.workspaceTurnTerminalAttentionGenerationId(settledRecord) }
+          : {}),
+      });
+      await this.workspaceTurnSettlementLocks.withLock(params.record.handleId, async () => {
+        const terminal = await this.taskHandleStore.getWorkspaceTurn(
+          params.record.ownerWorkspaceId,
+          params.record.handleId
+        );
+        if (
+          terminal != null &&
+          (settledRecord == null ||
+            (terminal.status === settledRecord.status &&
+              terminal.updatedAt === settledRecord.updatedAt)) &&
+          terminal.terminalAttentionNotifiedAt == null
+        ) {
+          await this.taskHandleStore.upsertWorkspaceTurn({
+            ...terminal,
+            terminalAttentionNotifiedAt: getIsoNow(),
+          });
+        }
+      });
+    } finally {
+      // Register after lock release even when notification bookkeeping throws. The service
+      // owns the original job independently; cleanup rechecks live successor ownership.
+      if (params.cause.kind === "continuation-failure" && settledRecord?.disposableWorkspace) {
+        this.workspaceService.deferWorkspaceCleanup(() =>
+          this.cleanupDisposableWorkspaceTurn(settledRecord)
+        );
+      }
+    }
   }
 
   async waitForWorkspaceTurn(
@@ -4374,20 +4384,22 @@ export class WorkspaceTurnManager {
 
   private isWorkspaceTurnAnchorForRecord(
     record: WorkspaceTurnTaskHandleRecord,
-    message: MuxMessage
+    message: HistoryControlRow
   ): boolean {
     const muxMetadata = message.metadata?.muxMetadata;
-    if (muxMetadata?.type === "workspace-turn-task") {
+    if (!isPlainObject(muxMetadata)) return false;
+    if (muxMetadata.type === "workspace-turn-task") {
       return (
         muxMetadata.taskHandleId === record.handleId &&
         muxMetadata.ownerWorkspaceId === record.ownerWorkspaceId &&
         muxMetadata.turnId === record.turnId
       );
     }
-    if (muxMetadata?.type === "compaction-summary") {
+    if (muxMetadata.type === "compaction-summary" && isPlainObject(muxMetadata.pendingFollowUp)) {
       const preserved = muxMetadata.pendingFollowUp?.workspaceTurnMetadata;
       return (
-        preserved?.taskHandleId === record.handleId &&
+        isPlainObject(preserved) &&
+        preserved.taskHandleId === record.handleId &&
         preserved.ownerWorkspaceId === record.ownerWorkspaceId &&
         preserved.turnId === record.turnId
       );
@@ -4426,7 +4438,9 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(event.workspaceId);
+    const historyResult = await this.historyService.getControlEvidenceFromLatestBoundary(
+      event.workspaceId
+    );
     if (!historyResult.success) {
       log.warn("Could not compare uncorrelated stream-end history for workspace turn", {
         workspaceId: event.workspaceId,
@@ -4473,11 +4487,12 @@ export class WorkspaceTurnManager {
     if (manualSupersessionInput) {
       // Readable JSON can still contain a malformed message ID. Preserve conservative
       // interruption without inventing manual evidence or letting corrupt history strand waiters.
+      const messageId = manualSupersessionInput.id;
       await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(
         record,
         event,
-        coerceNonEmptyString(manualSupersessionInput.id) != null
-          ? { kind: "manual-supersession", messageId: manualSupersessionInput.id }
+        typeof messageId === "string" && coerceNonEmptyString(messageId) != null
+          ? { kind: "manual-supersession", messageId }
           : { kind: "uncorrelated-conservative-fallback", reason: "invalid-manual-input-id" }
       );
     }
