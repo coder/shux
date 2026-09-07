@@ -1588,7 +1588,7 @@ export class MemoryService extends EventEmitter {
    */
   async listHotMemories(
     ctx: MemoryScopeContext,
-    options: { countTokens: (text: string) => Promise<number> }
+    options: { countTokens: (text: string) => Promise<number>; tokenBudgetActive?: boolean }
   ): Promise<MemoryHotSetItem[]> {
     const entries = await this.listIndexEntries(ctx);
     const meta = await this.metaService.getEntries();
@@ -1605,6 +1605,7 @@ export class MemoryService extends EventEmitter {
     return selectHotMemories({
       candidates,
       countTokens: options.countTokens,
+      tokenBudgetActive: options.tokenBudgetActive,
       readFile: (virtualPath) => {
         const parsed = parseMemoryPath(virtualPath);
         const scope = this.requireFilePath(parsed, virtualPath);

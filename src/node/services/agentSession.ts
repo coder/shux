@@ -630,7 +630,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   buildMemorySessionContext?(
     workspaceId: string,
     modelString: string,
-    options?: { includeHotMemories?: boolean }
+    options?: { includeHotMemories?: boolean; tokenBudgetActive?: boolean }
   ): Promise<MemorySessionContext | null>;
   isClaudeSkillsCompatEnabled?(): boolean;
   isAgentPluginsEnabled?(): boolean;
@@ -694,6 +694,9 @@ type StartupAutoRetryCheckOutcome = "completed" | "deferred";
 interface CachedMemoryContext {
   context: MemorySessionContext | null;
   includesHotMemories: boolean;
+  tokenBudgetActive: boolean;
+  memoryEnabled: boolean;
+  hotSetEnabled: boolean;
 }
 
 export class AgentSession {
@@ -6458,7 +6461,10 @@ export class AgentSession {
       // post-compaction check above: a just-consumed compaction boundary has
       // already reset the segment cache, so this stream recomputes the context.
       resolveMemoryContext: (forModelString, memoryOptions) =>
-        this.resolveMemoryContext(forModelString, memoryOptions),
+        this.resolveMemoryContext(forModelString, {
+          ...memoryOptions,
+          tokenBudgetActive: this.isTokenBudgetActive(options),
+        }),
       allowAgentSetGoal: options?.allowAgentSetGoal === true,
       workspaceGoalService: this.workspaceGoalService,
       experiments: options?.experiments,
@@ -9124,12 +9130,24 @@ export class AgentSession {
    */
   private async resolveMemoryContext(
     modelString: string,
-    options?: { includeHotMemories?: boolean }
+    options?: { includeHotMemories?: boolean; tokenBudgetActive?: boolean }
   ): Promise<MemorySessionContext | undefined> {
     assert(modelString.length > 0, "resolveMemoryContext requires a model string");
     const includeHotMemories = options?.includeHotMemories !== false;
+    const tokenBudgetActive = options?.tokenBudgetActive === true;
+    const enabled = (id: ExperimentId) =>
+      typeof this.aiService.isExperimentEnabled === "function" &&
+      this.aiService.isExperimentEnabled(id);
+    const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
+    const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
     const cached = this.memoryContextByModelString.get(modelString);
-    if (cached && (cached.includesHotMemories || !includeHotMemories)) {
+    // Policy changes must not retain a previously injected extra (including index-only lookups).
+    if (
+      cached?.tokenBudgetActive === tokenBudgetActive &&
+      cached.memoryEnabled === memoryEnabled &&
+      cached.hotSetEnabled === hotSetEnabled &&
+      (cached.includesHotMemories || !includeHotMemories)
+    ) {
       return cached.context ?? undefined;
     }
 
@@ -9138,11 +9156,15 @@ export class AgentSession {
       typeof this.aiService.buildMemorySessionContext === "function"
         ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
             includeHotMemories,
+            tokenBudgetActive,
           })
         : null;
     this.memoryContextByModelString.set(modelString, {
       context,
       includesHotMemories: includeHotMemories,
+      tokenBudgetActive,
+      memoryEnabled,
+      hotSetEnabled,
     });
     return context ?? undefined;
   }

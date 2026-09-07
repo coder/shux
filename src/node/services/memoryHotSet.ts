@@ -2,9 +2,8 @@
  * Hot-memory selection (experiment: "memory") — the middle context tier:
  * index (always) -> hot set (preloaded, this module) -> cold (tool call).
  *
- * The hot set reserves one slot for existing workspace context notes, then
- * selects user-pinned files and auto-hot files ranked by decayed usage
- * frequency from the host-local sidecar stats. Selection is
+ * The hot set is user-pinned files plus the top auto-hot files ranked by
+ * decayed usage frequency from the host-local sidecar stats. Selection is
  * pure and budget-bound (bytes, rendered tokens, and item count); callers
  * recompute it only on the first use of a model in a session segment and at
  * compaction boundaries, so repeated turns keep prompt-cache-stable bytes.
@@ -27,7 +26,7 @@ import {
 export interface MemoryHotSetCandidate {
   /** Virtual path (/memories/<scope>/...). */
   path: string;
-  /** User pin from the sidecar; ranks ahead of ordinary auto-hot files. */
+  /** User pin from the sidecar; pinned files always rank first. */
   pinned: boolean;
   accessCount: number;
   lastAccessedAt: number | null;
@@ -56,25 +55,17 @@ function scoreUsage(
 }
 
 /**
- * Order hot-set candidates: workspace context notes, pins, then decayed usage.
- * Other unpinned files with no recorded usage are excluded (auto-hot is gated
- * on local usage stats). Ties break on path for determinism.
+ * Order hot-set candidates: pinned first, then by decayed usage score.
+ * Unpinned files with no recorded usage are excluded (auto-hot is gated on
+ * local usage stats). Ties break on path for determinism.
  */
 export function rankHotSetCandidates(
   candidates: MemoryHotSetCandidate[],
   now: number
 ): MemoryHotSetCandidate[] {
   return candidates
-    .filter(
-      (candidate) =>
-        candidate.path === CONTEXT_NOTES_MEMORY_PATH ||
-        candidate.pinned ||
-        scoreUsage(candidate, now) > 0
-    )
+    .filter((candidate) => candidate.pinned || scoreUsage(candidate, now) > 0)
     .sort((a, b) => {
-      if ((a.path === CONTEXT_NOTES_MEMORY_PATH) !== (b.path === CONTEXT_NOTES_MEMORY_PATH)) {
-        return a.path === CONTEXT_NOTES_MEMORY_PATH ? -1 : 1;
-      }
       if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
       const scoreDiff = scoreUsage(b, now) - scoreUsage(a, now);
       if (scoreDiff !== 0) return scoreDiff;
@@ -118,6 +109,8 @@ function truncateToBytes(text: string, maxBytes: number): { text: string; trunca
  */
 export async function selectHotMemories(args: {
   candidates: MemoryHotSetCandidate[];
+  /** Effective turn policy, not the raw global experiment override. */
+  tokenBudgetActive?: boolean;
   /** Read a memory file by virtual path; may reject for missing/unreadable files. */
   readFile: (virtualPath: string) => Promise<string>;
   /** Count tokens for the exact rendered hot-memory block using the active model. */
@@ -173,34 +166,10 @@ export async function selectHotMemories(args: {
     // Binary data is useless as prompt context; leave it to cold tool reads.
     if (content.includes("\u0000")) continue;
     const { text, truncated } = truncateToBytes(content, maxItemBytes);
-    let item: MemoryHotSetItem = {
-      path: candidate.path,
-      pinned: candidate.pinned,
-      truncated,
-      content: text,
-    };
-    if (candidate.path === CONTEXT_NOTES_MEMORY_PATH) {
-      // A conventional workspace notebook survives competing pins without
-      // changing user pins/stats or creating a file. Its one slot is part of,
-      // not additional to, the normal hot set. Count its marker and wrappers.
-      try {
-        const fitted = await fitContextNotes(item, {
-          maxBytes: Math.min(CONTEXT_NOTES_RESERVED_BYTES, maxItemBytes, remainingBytes),
-          maxTokens: Math.min(CONTEXT_NOTES_RESERVED_TOKENS, maxTotalTokens),
-          maxTotalTokens,
-          countTokens: args.countTokens,
-        });
-        if (!fitted) continue;
-        item = fitted;
-      } catch {
-        continue;
-      }
-    }
-    const bytes = Buffer.byteLength(
-      candidate.path === CONTEXT_NOTES_MEMORY_PATH ? formatHotMemoryFileBlock(item) : item.content,
-      "utf-8"
-    );
+    const bytes = Buffer.byteLength(text, "utf-8");
     if (bytes > remainingBytes) continue;
+
+    const item = { path: candidate.path, pinned: candidate.pinned, truncated, content: text };
     let tokens: number;
     try {
       // The configured cap applies to the exact injected <hot_memories> block,
@@ -220,35 +189,55 @@ export async function selectHotMemories(args: {
     selectedTokens = tokens;
     items.push(item);
   }
+  // Token-budget notes are additive: never displace a normal selection or spend its budgets.
+  if (args.tokenBudgetActive && !items.some((item) => item.path === CONTEXT_NOTES_MEMORY_PATH)) {
+    const notes = args.candidates.find((candidate) => candidate.path === CONTEXT_NOTES_MEMORY_PATH);
+    if (notes) {
+      try {
+        const content = await args.readFile(notes.path);
+        if (!content.includes("\u0000")) {
+          const { text, truncated } = truncateToBytes(content, CONTEXT_NOTES_RESERVED_BYTES);
+          const fitted = await fitContextNotes(
+            { path: notes.path, pinned: notes.pinned, content: text, truncated },
+            items,
+            selectedTokens,
+            args.countTokens
+          );
+          if (fitted) items.push(fitted);
+        }
+      } catch {
+        // A failed optional read/tokenization must not discard the ordinary hot set.
+      }
+    }
+  }
   return items;
 }
 
-/** Shrink only the reserved excerpt; ordinary hot files retain their existing selection policy. */
+/** Fit only the extra entry, including its incremental rendered wrappers and truncation marker. */
 async function fitContextNotes(
   item: MemoryHotSetItem,
-  budget: {
-    maxBytes: number;
-    maxTokens: number;
-    maxTotalTokens: number;
-    countTokens: (text: string) => Promise<number>;
-  }
+  baseItems: MemoryHotSetItem[],
+  baseTokens: number,
+  countTokens: (text: string) => Promise<number>
 ): Promise<MemoryHotSetItem | undefined> {
+  const baseBytes =
+    baseItems.length === 0 ? 0 : Buffer.byteLength(formatHotMemoriesBlock(baseItems), "utf-8");
   async function fits(candidate: MemoryHotSetItem): Promise<boolean> {
-    const rendered = formatHotMemoryFileBlock(candidate);
-    if (Buffer.byteLength(rendered, "utf-8") > budget.maxBytes) return false;
-    const tokens = await budget.countTokens(rendered);
-    const totalTokens = await budget.countTokens(formatHotMemoriesBlock([candidate]));
+    const rendered = formatHotMemoriesBlock([...baseItems, candidate]);
+    if (Buffer.byteLength(rendered, "utf-8") - baseBytes > CONTEXT_NOTES_RESERVED_BYTES)
+      return false;
+    const tokens = await countTokens(rendered);
     assert(
-      Number.isInteger(tokens) && tokens >= 0 && Number.isInteger(totalTokens) && totalTokens >= 0,
+      Number.isInteger(tokens) && tokens >= 0,
       "Context notes token counter returned an invalid count"
     );
-    return tokens <= budget.maxTokens && totalTokens <= budget.maxTotalTokens;
+    return tokens - baseTokens <= CONTEXT_NOTES_RESERVED_TOKENS;
   }
   if (await fits(item)) return item;
   let best: MemoryHotSetItem = { ...item, content: "", truncated: true };
   if (!(await fits(best))) return undefined;
   let low = 1;
-  let high = Math.min(Buffer.byteLength(item.content, "utf-8"), budget.maxBytes);
+  let high = Math.min(Buffer.byteLength(item.content, "utf-8"), CONTEXT_NOTES_RESERVED_BYTES);
   while (low <= high) {
     const mid = Math.floor((low + high) / 2);
     const candidate = {

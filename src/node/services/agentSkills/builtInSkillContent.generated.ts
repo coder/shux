@@ -8665,7 +8665,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "## Keeping useful context",
       "",
-      "Once per window, a machine-authored warning asks the agent to write important context to the conventional `workspace/context-notes.md` file, up to **8 KiB**, if the workspace is writable. This is an opportunity to preserve notes, not a guarantee that the agent writes them. The notes' reserved hot-set slot still requires both **Memory** and **Memory Hot Set**; this experiment does not enable either.",
+      "Once per window, a machine-authored warning asks the agent to write important context to the conventional `workspace/context-notes.md` file, up to **8 KiB**, if the workspace is writable. This is an opportunity to preserve notes, not a guarantee that the agent writes them. While token-budget mode is active, Xum can preload the notes as an **additional ninth memory**, without replacing the normal eight or using their existing byte/token budgets. The extra excerpt is separately bounded to **8 KiB / 2,000 tokens**, including formatting, and is not duplicated if already selected normally. This still requires **Memory** and **Memory Hot Set**; the experiment does not enable either. With token-budget mode inactive, notes follow the ordinary memory-selection rules.",
       "",
       "The next window receives a model-only lead-in, not a summary. While the experiment is enabled, the agent can use `session_history` to list windows, search, or read earlier messages in the same workspace. Results are capped at **16 KiB** per call, with scans bounded to **2 MiB**, **500 rows**, and **1 MiB per line**. Large histories may require further bounded calls.",
       "",

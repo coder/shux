@@ -2140,6 +2140,54 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(withHotSet?.hotMemoriesBlock).toContain("root fact");
   });
 
+  it("adds context notes only for an active request with Memory and HotSet allowed", async () => {
+    using root = new DisposableTempDir("ai-service-additive-context-notes");
+    let memoryEnabled = true;
+    let hotSetEnabled = true;
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(root.path),
+      xumHome: root.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) =>
+        (id === EXPERIMENT_IDS.MEMORY && memoryEnabled) ||
+        (id === EXPERIMENT_IDS.MEMORY_HOT_SET && hotSetEnabled)
+    );
+    const { config, service } = createBasicAIService(root.path, { experimentsService });
+    const metaService = new MemoryMetaService(root.path);
+    const memoryService = new MemoryService(config, metaService);
+    service.turnRequestBuilderBindings.memoryService = memoryService;
+    const workspaceId = "additive-context-notes";
+    spyOn(service, "getWorkspaceMetadata").mockResolvedValue({
+      success: true,
+      data: {
+        ...createLocalWorkspaceMetadata(workspaceId, root.path),
+        runtimeConfig: { type: "local" },
+      },
+    });
+    const directory = path.join(config.sessionsDir, workspaceId, "memory");
+    await fs.mkdir(directory, { recursive: true });
+    const file = path.join(directory, "context-notes.md");
+    await fs.writeFile(file, "Unused but important handoff facts");
+    const before = await metaService.getEntries();
+    const build = (options?: Parameters<AIService["buildMemorySessionContext"]>[2]) =>
+      service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2", options);
+    expect((await build())?.hotMemoriesBlock).toBeNull();
+    expect((await build({ tokenBudgetActive: true }))?.hotMemoriesBlock).toContain(
+      "Unused but important handoff facts"
+    );
+    expect((await build({ tokenBudgetActive: false }))?.hotMemoriesBlock).toBeNull();
+    expect(
+      (await build({ tokenBudgetActive: true, includeHotMemories: false }))?.hotMemoriesBlock
+    ).toBeNull();
+    hotSetEnabled = false;
+    expect((await build({ tokenBudgetActive: true }))?.hotMemoriesBlock).toBeNull();
+    memoryEnabled = false;
+    expect(await build({ tokenBudgetActive: true })).toBeNull();
+    expect(await metaService.getEntries()).toEqual(before);
+    expect(await fs.readFile(file, "utf8")).toBe("Unused but important handoff facts");
+  });
+
   it("preserves the memory index when hot-memory selection fails", async () => {
     using xumHome = new DisposableTempDir("ai-service-memory-hot-failure");
     const projectPath = path.join(xumHome.path, "project");

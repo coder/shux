@@ -1,3 +1,7 @@
+import {
+  CONTEXT_NOTES_RESERVED_BYTES,
+  CONTEXT_NOTES_RESERVED_TOKENS,
+} from "@/common/constants/contextBudget";
 import { describe, it, expect } from "bun:test";
 
 import {
@@ -76,73 +80,137 @@ describe("rankHotSetCandidates", () => {
   });
 });
 
-describe("reserved context notes", () => {
+describe("additive context notes", () => {
   const notesPath = "/memories/workspace/context-notes.md";
   const countTokens = (text: string) => Promise.resolve(Math.ceil(text.length / 3.5));
 
-  it("reserves one of eight slots ahead of more than eight pins without mutating candidates", async () => {
-    const candidates = Array.from({ length: 10 }, (_, index) =>
+  it("keeps the ordinary eight pins unchanged and adds notes only in token-budget mode", async () => {
+    const pins = Array.from({ length: 10 }, (_, index) =>
       candidate({ path: `/memories/global/pin-${index}.md`, pinned: true })
     );
-    candidates.push(candidate({ path: notesPath }));
+    const candidates = [...pins, candidate({ path: notesPath })];
     const original = structuredClone(candidates);
-    const items = await selectHotMemories({
-      candidates,
-      readFile: () => Promise.resolve("facts"),
-      countTokens,
-      now: NOW,
-    });
-    expect(items).toHaveLength(MEMORY_HOT_SET_MAX_ITEMS);
-    expect(items[0]).toMatchObject({
-      path: notesPath,
-      pinned: false,
-      content: "facts",
-      truncated: false,
-    });
-    expect(items.slice(1)).toHaveLength(7);
+    const args = { readFile: () => Promise.resolve("facts"), countTokens, now: NOW };
+    const ordinary = await selectHotMemories({ ...args, candidates: pins });
+    expect(ordinary).toHaveLength(MEMORY_HOT_SET_MAX_ITEMS);
+    expect(await selectHotMemories({ ...args, candidates })).toEqual(ordinary);
+    const augmented = await selectHotMemories({ ...args, candidates, tokenBudgetActive: true });
+    expect(augmented.slice(0, ordinary.length)).toEqual(ordinary);
+    expect(augmented).toHaveLength(MEMORY_HOT_SET_MAX_ITEMS + 1);
+    expect(augmented.at(-1)).toMatchObject({ path: notesPath, pinned: false, content: "facts" });
     expect(candidates).toEqual(original);
   });
 
+  it("unused notes stay cold when off, while explicitly pinned notes retain ordinary order", async () => {
+    const reads: string[] = [];
+    const args = {
+      readFile: (path: string) => {
+        reads.push(path);
+        return Promise.resolve("facts");
+      },
+      countTokens,
+    };
+    expect(
+      await selectHotMemories({ ...args, candidates: [candidate({ path: notesPath })] })
+    ).toEqual([]);
+    expect(reads).toEqual([]);
+    const candidates = [
+      candidate({ path: notesPath, pinned: true }),
+      candidate({
+        path: "/memories/global/a.md",
+        pinned: true,
+        accessCount: 1,
+        lastAccessedAt: NOW,
+      }),
+    ];
+    const ordinary = await selectHotMemories({ ...args, candidates, now: NOW });
+    expect(ordinary.map((item) => item.path)).toEqual(["/memories/global/a.md", notesPath]);
+    // Already selected normally: no duplicate, extra truncation, or priority boost.
+    expect(
+      await selectHotMemories({ ...args, candidates, now: NOW, tokenBudgetActive: true })
+    ).toEqual(ordinary);
+    const used = await selectHotMemories({
+      ...args,
+      candidates: [candidate({ path: notesPath, accessCount: 1, lastAccessedAt: NOW })],
+      now: NOW,
+    });
+    expect(used.map((item) => item.path)).toEqual([notesPath]);
+  });
+
   it.each(["x".repeat(30_000), "界😀".repeat(8_000)])(
-    "bounds the rendered excerpt including its truncation marker",
+    "bounds the entire extra block when there are no ordinary hot memories",
     async (content) => {
       const items = await selectHotMemories({
         candidates: [candidate({ path: notesPath })],
         readFile: () => Promise.resolve(content),
         countTokens,
+        tokenBudgetActive: true,
       });
       expect(items).toHaveLength(1);
       expect(items[0].truncated).toBe(true);
       expect(content.startsWith(items[0].content)).toBe(true);
       expect(items[0].content).not.toContain("\uFFFD");
-      const renderedFile = /<memory_file[\s\S]*<\/memory_file>/.exec(
-        formatHotMemoriesBlock(items)
-      )![0];
-      expect(renderedFile).toContain("[truncated:");
-      expect(Buffer.byteLength(renderedFile)).toBeLessThanOrEqual(8 * 1024);
-      expect(await countTokens(renderedFile)).toBeLessThanOrEqual(2000);
+      const rendered = formatHotMemoriesBlock(items);
+      expect(rendered).toContain("[truncated:");
+      expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_BYTES);
+      expect(await countTokens(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_TOKENS);
     }
   );
 
-  it("keeps the reserved excerpt within smaller shared byte and token budgets", async () => {
-    const items = await selectHotMemories({
-      candidates: [
-        candidate({ path: notesPath }),
-        candidate({ path: "/memories/global/pinned.md", pinned: true }),
-      ],
-      readFile: () => Promise.resolve("x".repeat(20_000)),
+  it("does not take any of the base byte/token allowance, including wrapper costs", async () => {
+    const baseCandidate = candidate({ path: "/memories/global/pin.md", pinned: true });
+    const readFile = (path: string) =>
+      Promise.resolve(path === notesPath ? "x".repeat(30_000) : "base facts");
+    const base = await selectHotMemories({ candidates: [baseCandidate], readFile, countTokens });
+    const baseBlock = formatHotMemoriesBlock(base);
+    const baseTokens = await countTokens(baseBlock);
+    const augmented = await selectHotMemories({
+      candidates: [candidate({ path: notesPath }), baseCandidate],
+      readFile,
       countTokens,
-      maxTotalBytes: 1000,
-      maxTotalTokens: 200,
+      maxItemBytes: 10,
+      maxTotalBytes: 10,
+      maxTotalTokens: baseTokens,
+      tokenBudgetActive: true,
     });
-    expect(items[0]?.path).toBe(notesPath);
-    expect(await countTokens(formatHotMemoriesBlock(items))).toBeLessThanOrEqual(200);
-    expect(
-      items.reduce((sum, item) => sum + Buffer.byteLength(item.content), 0)
-    ).toBeLessThanOrEqual(1000);
+    expect(augmented.slice(0, base.length)).toEqual(base);
+    expect(augmented).toHaveLength(2);
+    expect(augmented[1].content.length).toBeGreaterThan(10);
+    const combined = formatHotMemoriesBlock(augmented);
+    expect(Buffer.byteLength(combined) - Buffer.byteLength(baseBlock)).toBeLessThanOrEqual(
+      CONTEXT_NOTES_RESERVED_BYTES
+    );
+    expect((await countTokens(combined)) - baseTokens).toBeLessThanOrEqual(
+      CONTEXT_NOTES_RESERVED_TOKENS
+    );
   });
 
-  it("does not reserve an absent global convention or attempt reads when no candidate exists", async () => {
+  it.each(["unreadable", "binary", "tokenizer"])(
+    "retains normal selections when the extra is %s",
+    async (failure) => {
+      const items = await selectHotMemories({
+        candidates: [
+          candidate({ path: notesPath }),
+          candidate({ path: "/memories/global/pin.md", pinned: true }),
+        ],
+        tokenBudgetActive: true,
+        readFile: (path) => {
+          if (path !== notesPath) return Promise.resolve("base facts");
+          if (failure === "unreadable") throw new Error("unreadable");
+          return Promise.resolve(failure === "binary" ? "\u0000" : "notes facts");
+        },
+        countTokens: (text) => {
+          if (failure === "tokenizer" && text.includes(notesPath))
+            throw new Error("tokenizer unavailable");
+          return countTokens(text);
+        },
+      });
+      expect(items.map((item) => item.path)).toEqual(["/memories/global/pin.md"]);
+      expect(items[0].content).toBe("base facts");
+    }
+  );
+
+  it("does not read or create an absent workspace notebook", async () => {
     const reads: string[] = [];
     const items = await selectHotMemories({
       candidates: [candidate({ path: "/memories/global/context-notes.md" })],
@@ -151,6 +219,7 @@ describe("reserved context notes", () => {
         return Promise.resolve("facts");
       },
       countTokens,
+      tokenBudgetActive: true,
     });
     expect(items).toEqual([]);
     expect(reads).toEqual([]);

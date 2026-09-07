@@ -1150,8 +1150,14 @@ describe("MemoryService", () => {
       const content = "界😀 facts\n".repeat(2000) + "retained tail";
       await fsPromises.writeFile(physicalPath, content);
       const before = await fixture.metaService.getEntries();
+      expect(
+        await fixture.service.listHotMemories(fixture.ctx, {
+          countTokens: (text) => Promise.resolve(Math.ceil(text.length / 3.5)),
+        })
+      ).toEqual([]);
       const items = await fixture.service.listHotMemories(fixture.ctx, {
         countTokens: (text) => Promise.resolve(Math.ceil(text.length / 3.5)),
+        tokenBudgetActive: true,
       });
       expect(items[0]).toMatchObject({ path: notesPath, pinned: false, truncated: true });
       expect(items[0].content).not.toContain("retained tail");
