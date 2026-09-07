@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
@@ -2047,6 +2047,109 @@ describe("HistoryService", () => {
       return path.join(config.sessionsDir, workspaceId, "chat-archive.jsonl");
     }
 
+    function rolloverBatch(): MuxMessage[] {
+      return [
+        createMuxMessage("rollover", "assistant", "", {
+          contextBoundaryKind: "reset",
+          synthetic: true,
+          muxMetadata: {
+            type: "context-window-rollover",
+            rolloverId: "rollover-1",
+            reason: "on-send",
+            previousWindowId: "w:0",
+            flushOpportunity: false,
+            contextTokens: 1000,
+            maxTokens: 1000,
+          },
+        }),
+        createMuxMessage("lead-in", "assistant", "prior context notes", {
+          synthetic: true,
+          muxMetadata: { type: "context-window-lead-in", rolloverId: "rollover-1" },
+        }),
+        createMuxMessage("continuation", "user", "Resume the previous task", { synthetic: true }),
+      ];
+    }
+
+    it("batch publication eagerly seals history even after the lazy rotation check", async () => {
+      await appendNumberedMessages(service, wsId, 2);
+      expect((await service.getHistoryFromLatestBoundary(wsId)).success).toBe(true);
+      const batch = rolloverBatch();
+      expect(
+        (
+          await service.appendManyToHistory(wsId, [
+            boundaryMessage("interim-boundary", 1),
+            ...batch,
+          ])
+        ).success
+      ).toBe(true);
+      expect((await readJsonlFile(chatPath(wsId))).map((message) => message.id)).toEqual(
+        batch.map((message) => message.id)
+      );
+      const archived = await readJsonlFile(archivePath(wsId));
+      expect(archived.map((message) => message.id)).toEqual(["msg-0", "msg-1", "interim-boundary"]);
+      const latest = await service.getHistoryFromLatestBoundary(wsId);
+      assert(latest.success);
+      expect(latest.data).toMatchObject(batch);
+      const full = await collectFullHistory(service, wsId);
+      expect(full.map((message) => message.metadata?.historySequence)).toEqual([0, 1, 2, 3, 4, 5]);
+      expect(full.map((message) => message.id)).toEqual([
+        "msg-0",
+        "msg-1",
+        "interim-boundary",
+        ...batch.map((message) => message.id),
+      ]);
+      const archivedBytes = await fs.readFile(archivePath(wsId), "utf8");
+      expect(
+        (
+          await service.updateHistory(wsId, {
+            ...batch[1],
+            parts: [{ type: "text", text: "updated notes" }],
+          })
+        ).success
+      ).toBe(true);
+      expect(await fs.readFile(archivePath(wsId), "utf8")).toBe(archivedBytes);
+      expect((await readJsonlFile(chatPath(wsId))).map((message) => message.id)).toEqual(
+        batch.map((message) => message.id)
+      );
+      const updated = await service.getHistoryFromLatestBoundary(wsId);
+      assert(updated.success);
+      expect(updated.data[1].parts).toEqual([{ type: "text", text: "updated notes" }]);
+    });
+
+    it("a post-publication rotation failure does not report a failed or partial batch", async () => {
+      await appendNumberedMessages(service, wsId, 2);
+      expect((await service.getHistoryFromLatestBoundary(wsId)).success).toBe(true);
+      const internals = service as unknown as {
+        rotateSealedHistoryUnlocked(workspaceId: string): Promise<void>;
+      };
+      const rotation = spyOn(internals, "rotateSealedHistoryUnlocked").mockImplementationOnce(() =>
+        Promise.reject(new Error("archive storage unavailable"))
+      );
+      const batch = rolloverBatch();
+      try {
+        expect((await service.appendManyToHistory(wsId, batch)).success).toBe(true);
+        expect(rotation).toHaveBeenCalledTimes(1);
+        expect((await readJsonlFile(chatPath(wsId))).map((message) => message.id)).toEqual([
+          "msg-0",
+          "msg-1",
+          ...batch.map((message) => message.id),
+        ]);
+      } finally {
+        rotation.mockRestore();
+      }
+      expect(
+        (await service.appendToHistory(wsId, boundaryMessage("later-boundary", 1))).success
+      ).toBe(true);
+      const full = await collectFullHistory(service, wsId);
+      expect(full.map((message) => message.id)).toEqual([
+        "msg-0",
+        "msg-1",
+        ...batch.map((message) => message.id),
+        "later-boundary",
+      ]);
+      expect(full.map((message) => message.metadata?.historySequence)).toEqual([0, 1, 2, 3, 4, 5]);
+    });
+
     it("rotates the sealed prefix into the archive when a boundary is appended", async () => {
       await appendNumberedMessages(service, wsId, 3); // seq 0..2
       await service.appendToHistory(wsId, boundaryMessage("boundary-1", 1)); // seq 3
@@ -2178,6 +2281,32 @@ describe("HistoryService", () => {
 
       const full = await collectFullHistory(restarted, wsId);
       expect(full.map((m) => m.id)).toEqual(["msg-0", "msg-1", "msg-2", "boundary-1", "post-0"]);
+    });
+
+    it("deduplicates verified reset copies while preserving their post-reset archive", async () => {
+      await appendNumberedMessages(service, wsId, 2);
+      await service.appendToHistory(
+        wsId,
+        createMuxMessage("manual-reset", "assistant", "", { contextBoundaryKind: "reset" })
+      );
+      await service.appendToHistory(
+        wsId,
+        createMuxMessage("after-reset", "user", "still recoverable")
+      );
+      await service.appendToHistory(wsId, boundaryMessage("later-boundary", 1));
+      const archived = await fs.readFile(archivePath(wsId), "utf8");
+      const active = await fs.readFile(chatPath(wsId), "utf8");
+      await fs.writeFile(chatPath(wsId), archived + active);
+      const restarted = new HistoryService(config);
+      expect((await restarted.getHistoryFromLatestBoundary(wsId)).success).toBe(true);
+      expect(await fs.readFile(archivePath(wsId), "utf8")).toBe(archived);
+      expect((await collectFullHistory(restarted, wsId)).map((message) => message.id)).toEqual([
+        "msg-0",
+        "msg-1",
+        "manual-reset",
+        "after-reset",
+        "later-boundary",
+      ]);
     });
 
     it("returns the tail across the archive seam from getLastMessages", async () => {

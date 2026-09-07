@@ -8,6 +8,11 @@
  * recompute it only on the first use of a model in a session segment and at
  * compaction boundaries, so repeated turns keep prompt-cache-stable bytes.
  */
+import {
+  CONTEXT_NOTES_MEMORY_PATH,
+  CONTEXT_NOTES_RESERVED_BYTES,
+  CONTEXT_NOTES_RESERVED_TOKENS,
+} from "@/common/constants/contextBudget";
 import assert from "@/common/utils/assert";
 import {
   MEMORY_HOT_SET_DECAY_HALF_LIFE_MS,
@@ -104,6 +109,8 @@ function truncateToBytes(text: string, maxBytes: number): { text: string; trunca
  */
 export async function selectHotMemories(args: {
   candidates: MemoryHotSetCandidate[];
+  /** Effective turn policy, not the raw global experiment override. */
+  tokenBudgetActive?: boolean;
   /** Read a memory file by virtual path; may reject for missing/unreadable files. */
   readFile: (virtualPath: string) => Promise<string>;
   /** Count tokens for the exact rendered hot-memory block using the active model. */
@@ -182,7 +189,68 @@ export async function selectHotMemories(args: {
     selectedTokens = tokens;
     items.push(item);
   }
+  // Token-budget notes are additive: never displace a normal selection or spend its budgets.
+  if (args.tokenBudgetActive && !items.some((item) => item.path === CONTEXT_NOTES_MEMORY_PATH)) {
+    const notes = args.candidates.find((candidate) => candidate.path === CONTEXT_NOTES_MEMORY_PATH);
+    if (notes) {
+      try {
+        const content = await args.readFile(notes.path);
+        if (!content.includes("\u0000")) {
+          const { text, truncated } = truncateToBytes(content, CONTEXT_NOTES_RESERVED_BYTES);
+          const fitted = await fitContextNotes(
+            { path: notes.path, pinned: notes.pinned, content: text, truncated },
+            items,
+            selectedTokens,
+            args.countTokens
+          );
+          if (fitted) items.push(fitted);
+        }
+      } catch {
+        // A failed optional read/tokenization must not discard the ordinary hot set.
+      }
+    }
+  }
   return items;
+}
+
+/** Fit only the extra entry, including its incremental rendered wrappers and truncation marker. */
+async function fitContextNotes(
+  item: MemoryHotSetItem,
+  baseItems: MemoryHotSetItem[],
+  baseTokens: number,
+  countTokens: (text: string) => Promise<number>
+): Promise<MemoryHotSetItem | undefined> {
+  const baseBytes =
+    baseItems.length === 0 ? 0 : Buffer.byteLength(formatHotMemoriesBlock(baseItems), "utf-8");
+  async function fits(candidate: MemoryHotSetItem): Promise<boolean> {
+    const rendered = formatHotMemoriesBlock([...baseItems, candidate]);
+    if (Buffer.byteLength(rendered, "utf-8") - baseBytes > CONTEXT_NOTES_RESERVED_BYTES)
+      return false;
+    const tokens = await countTokens(rendered);
+    assert(
+      Number.isInteger(tokens) && tokens >= 0,
+      "Context notes token counter returned an invalid count"
+    );
+    return tokens - baseTokens <= CONTEXT_NOTES_RESERVED_TOKENS;
+  }
+  if (await fits(item)) return item;
+  let best: MemoryHotSetItem = { ...item, content: "", truncated: true };
+  if (!(await fits(best))) return undefined;
+  let low = 1;
+  let high = Math.min(Buffer.byteLength(item.content, "utf-8"), CONTEXT_NOTES_RESERVED_BYTES);
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = {
+      ...item,
+      content: truncateToBytes(item.content, mid).text,
+      truncated: true,
+    };
+    if (await fits(candidate)) {
+      best = candidate;
+      low = mid + 1;
+    } else high = mid - 1;
+  }
+  return best;
 }
 
 /**

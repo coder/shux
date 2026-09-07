@@ -1167,6 +1167,8 @@ test.each(["summary read", "preparation", "auto compaction preparation"] as cons
         shouldForceCompact: true,
         usagePercentage: 99,
         thresholdPercentage: 85,
+        contextTokens: 99_000,
+        maxTokens: 100_000,
       });
     }
     const foreignHistory = new HistoryService(h.config);
@@ -1836,6 +1838,8 @@ test.each([
         shouldForceCompact: true,
         usagePercentage: 99,
         thresholdPercentage: 85,
+        contextTokens: 99_000,
+        maxTokens: 100_000,
       });
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
@@ -2048,7 +2052,9 @@ test.each([
   "witness write failure",
 ] as const)("explicit Retry locked acceptance handles %s", async (state) => {
   const h = await setup();
-  const user = createMuxMessage("user", "user", "Work");
+  const user = createMuxMessage("user", "user", "Work", {
+    requestPreludeMessageIds: ["owned-prelude"],
+  });
   await h.historyService.appendToHistory(workspaceId, user);
   const cancellation = (h.session as unknown as { compactionCancellation: CompactionCancellation })
     .compactionCancellation;
@@ -2108,9 +2114,86 @@ test.each([
     expect(
       rows.success && rows.data.filter((row) => row.role === "user").map((row) => row.id)
     ).toEqual([user.id]);
+    expect(rows.success && rows.data[0].metadata?.requestPreludeMessageIds).toEqual([
+      "owned-prelude",
+    ]);
   } finally {
     restoreWrites?.();
     await h.session.dispose();
     await h.cleanup();
   }
 });
+
+test.each(["accepted", "foreign Stop", "raw reset", "append failure"] as const)(
+  "token-budget handoff batch preserves locked admission (%s)",
+  async (action) => {
+    const h = await setup();
+    const source = summary();
+    source.metadata = {
+      ...source.metadata,
+      muxMetadata: {
+        type: "compaction-summary",
+        pendingFollowUp: { text: "Continue", ...options, experiments: { tokenBudget: true } },
+      },
+    };
+    await h.historyService.appendToHistory(workspaceId, source);
+    const snapshot = createMuxMessage("owned-snapshot", "assistant", "Expanded context", {
+      synthetic: true,
+    });
+    const materializer = h.session as unknown as {
+      materializeFileAtMentionsSnapshot(text: string): Promise<{
+        snapshotMessage: ReturnType<typeof createMuxMessage>;
+        materializedTokens: string[];
+        fileStates: [];
+      } | null>;
+    };
+    spyOn(materializer, "materializeFileAtMentionsSnapshot").mockResolvedValue({
+      snapshotMessage: snapshot,
+      materializedTokens: [],
+      fileStates: [],
+    });
+    const append = h.historyService.appendManyToHistory.bind(h.historyService);
+    const batch = spyOn(h.historyService, "appendManyToHistory").mockImplementationOnce(
+      async (...args) => {
+        if (action === "foreign Stop")
+          await new CompactionCancellation(new HistoryService(h.config), workspaceId).cancel();
+        if (action === "raw reset")
+          await fs.appendFile(
+            `${h.config.sessionsDir}/${workspaceId}/chat.jsonl`,
+            '{"metadata":{"contextBoundaryKind":"reset"},broken\n'
+          );
+        if (action === "append failure") return Err("batch storage unavailable");
+        return append(...args);
+      }
+    );
+    const send = h.session.sendMessage.bind(h.session);
+    const durable = mock(() => undefined);
+    spyOn(h.session, "sendMessage").mockImplementation((message, sendOptions, internal) =>
+      send(message, sendOptions, {
+        ...internal,
+        onRowsDurable: () => {
+          durable();
+          internal?.onRowsDurable?.();
+        },
+      })
+    );
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      const result = await h.internals.dispatchPendingFollowUp().catch((error: unknown) => error);
+      if (action === "append failure")
+        expect(result).toHaveProperty("message", "batch storage unavailable");
+      else expect(result).toBe(action === "accepted");
+      expect(batch).toHaveBeenCalledTimes(1);
+      expect(batch.mock.calls[0][1]).toHaveLength(2);
+      expect(durable).toHaveBeenCalledTimes(action === "accepted" ? 1 : 0);
+      expect(stream).toHaveBeenCalledTimes(action === "accepted" ? 1 : 0);
+      const rows = await h.historyService.getLastMessages(workspaceId, 10);
+      expect(rows.success && rows.data.some((row) => row.id === snapshot.id)).toBe(
+        action === "accepted"
+      );
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);

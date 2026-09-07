@@ -116,6 +116,27 @@ export class FileChangeTracker {
     this.fileState.set(canonicalPath, state);
   }
 
+  /** Capture only these accepted states, before later tool reads can replace their baseline. */
+  captureSnapshotBaseline(states: readonly FileState[]): { restore(): void; forget(): void } {
+    const accepted = new Set(states);
+    const entries = [...this.fileState]
+      .filter(([, state]) => accepted.has(state))
+      .map(([path, original]) => ({ path, original, snapshot: { ...original } }));
+    return {
+      // Canonical paths and bytes are already known; restoring must not await or reread disk.
+      restore: () => {
+        for (const entry of entries) this.fileState.set(entry.path, entry.snapshot);
+      },
+      forget: () => {
+        for (const entry of entries) {
+          const current = this.fileState.get(entry.path);
+          if (current === entry.original || current === entry.snapshot)
+            this.fileState.delete(entry.path);
+        }
+      },
+    };
+  }
+
   /** Get count of tracked files. */
   get count(): number {
     return this.fileState.size;

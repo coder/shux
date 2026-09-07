@@ -3067,15 +3067,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   }
 
+  private bumpContextMutationEpoch(workspaceId: string): void {
+    this.contextMutationEpochs.set(
+      workspaceId,
+      (this.contextMutationEpochs.get(workspaceId) ?? 0) + 1
+    );
+  }
+
   /** r41: mark a context-discarding mutation as durably committed (see contextMutationEpochs). */
   private async advanceContextMutationEpoch(
     workspaceId: string,
     cancellationNonce?: string | null
   ): Promise<Result<void>> {
-    this.contextMutationEpochs.set(
-      workspaceId,
-      (this.contextMutationEpochs.get(workspaceId) ?? 0) + 1
-    );
+    this.bumpContextMutationEpoch(workspaceId);
     try {
       await this.sessions.get(workspaceId)?.contextMutationCommitted(cancellationNonce);
       return Ok(undefined);
@@ -4208,6 +4212,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           args.workspacePath,
           args.runtimeConfig
         ),
+      onContextWindowRollover: () => this.bumpContextMutationEpoch(workspaceId),
       onCompactionComplete: (metadata) => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
         // Compaction marks a long session with accumulated learnings: harvest
@@ -10908,7 +10913,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // reset/clear/replace that completes while this send is still doing
       // pre-admission work refuses the send instead of letting it append and
       // stream stale content into the fresh context.
-      const admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+      let admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
       const admissionEpochStale = () =>
         (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
       // r41: count this send as in-preflight until it settles so refine
@@ -11364,6 +11369,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
+        onContextWindowRollover: () => {
+          this.bumpContextMutationEpoch(workspaceId);
+          admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+        },
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
         goalKind: internal?.goalKind,
@@ -12756,50 +12765,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // discarded even when no session exists yet (e.g. reset right after
       // an app restart).
       try {
-        await this.getOrCreateSession(workspaceId).clearPostCompactionState();
+        await this.getOrCreateSession(workspaceId).applyContextResetSideEffects();
       } catch (error) {
-        // Same partial-failure posture as the sandbox invalidation below:
-        // the chat-side reset applied, but the stale persisted carryover
-        // would re-inject pre-reset context after a restart, so success must
-        // not be reported while the discard is not durable.
-        log.error(
-          `Failed to durably discard post-compaction carryover for ${workspaceId} after context reset`,
-          error
-        );
+        // The boundary is durable, but success must wait for both persisted
+        // carryover and sandbox invalidation. Preserve the failing stage's diagnosis.
+        log.error(`Failed to durably discard context state for ${workspaceId}`, error);
         return Err(
-          `Context was reset, but the persisted post-compaction carryover could not be durably ` +
-            `discarded (${getErrorMessage(error)}). Pre-reset read/skill context may be ` +
-            `re-injected after a restart; retry once the session storage is writable.`
-        );
-      }
-
-      // Persistent sandbox mounts are scoped to the workspace session; a
-      // context reset ends that session, so sandbox state is DISCARDED (not
-      // snapshotted) — vars must not survive a reset the way they survive
-      // archive/un-archive.
-      try {
-        await sandboxHostService.discardScope(
-          workspaceId,
-          path.join(this.config.sessionsDir, workspaceId)
-        );
-      } catch (error) {
-        // The chat-side reset already applied, but the sandbox invalidation
-        // is NOT durable: the empty-snapshot tombstone failed to publish, and
-        // the only remaining record is the in-memory reset-pending guard,
-        // which blocks mounts and retries for THIS process only. A crash
-        // before a retry lands would let the next process restore — resurrect
-        // — the pre-reset snapshot the user explicitly cleared. Invalidation
-        // must be durable before success is reported, so surface the partial
-        // failure to the caller instead of returning Ok.
-        log.error(
-          `Failed to durably invalidate sandbox state for ${workspaceId} after context reset; ` +
-            `the sandbox kernel stays unavailable until invalidation succeeds`,
-          error
-        );
-        return Err(
-          `Context was reset, but the sandbox kernel state could not be durably invalidated ` +
-            `(${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables ` +
-            `may reappear after a restart; retry once the session storage is writable.`
+          `Context was reset, but ${getErrorMessage(error)} Retry once the session storage is writable.`
         );
       }
 

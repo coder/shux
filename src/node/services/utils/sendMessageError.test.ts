@@ -134,6 +134,22 @@ describe("formatSendMessageError", () => {
     expect(result.message).toBe("Workspace is incompatible");
   });
 
+  test("preserves a terminal budget block and classifies preflight refusals as local budget errors", () => {
+    const message = "The next user request cannot fit after rollover.";
+    expect(formatSendMessageError({ type: "context_budget_blocked", message })).toEqual({
+      message,
+      errorType: "context_budget_blocked",
+    });
+    expect(
+      formatSendMessageError({
+        type: "context_budget_exceeded",
+        model: "fallback-model",
+        estimate: 20000,
+        hardCeiling: 10000,
+      }).errorType
+    ).toBe("context_budget_blocked");
+  });
+
   test("formats unknown errors", () => {
     const result = formatSendMessageError({
       type: "unknown",

@@ -42,6 +42,14 @@ describe("getSendOptionsFromStorage", () => {
     expect(getSendOptionsFromStorage("ws-1").experiments?.continuousCompaction).toBe(enabled);
   });
 
+  test.each([true, false])("preserves explicit token-budget overrides (%s)", (enabled) => {
+    expect(getSendOptionsFromStorage("ws-1").experiments?.tokenBudget).toBeUndefined();
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET), enabled);
+    const options = getSendOptionsFromStorage("ws-1");
+    expect(options.experiments?.tokenBudget).toBe(enabled);
+    expect(SendMessageOptionsSchema.parse(options).experiments?.tokenBudget).toBe(enabled);
+  });
+
   test("preserves explicit gateway-scoped stored model preferences", () => {
     const workspaceId = "ws-1";
     const rawModel = "mux-gateway:anthropic/claude-haiku-4-5";

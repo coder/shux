@@ -1,4 +1,4 @@
-import { writeFile } from "node:fs/promises";
+import { appendFile, readFile, writeFile } from "node:fs/promises";
 import { COMPACTION_CANCELLATION_FILE } from "@/common/constants/compactionCancellation";
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { CompactionCancellation } from "./compactionCancellation";
@@ -341,20 +341,23 @@ test("a local Stop during corrupt repair prevents its obsolete history commit", 
   }
 });
 
-test.each([
-  "unchanged",
-  "summary text",
-  "pending payload",
-  "summary ID",
-  "summary sequence",
-  "foreign synthetic tail",
-  "preserved tail",
-  "own snapshot",
-  "unresolved Stop",
-  "exact Stop",
-  "other exact Stop",
-  "malformed cancellation",
-] as const)("locked follow-up append revalidates %s", async (change) => {
+test.each(
+  [
+    "unchanged",
+    "summary text",
+    "pending payload",
+    "summary ID",
+    "summary sequence",
+    "foreign synthetic tail",
+    "preserved tail",
+    "own snapshot",
+    "unresolved Stop",
+    "exact Stop",
+    "other exact Stop",
+    "malformed cancellation",
+    "malformed reset",
+  ].flatMap((change) => [false, true].map((batch) => [change, batch] as const))
+)("locked follow-up append revalidates %s (batch=%s)", async (change, batch) => {
   const h = await createTestHistoryService();
   const workspaceId = "locked-follow-up";
   const source = createMuxMessage("summary", "assistant", "Earlier work", {
@@ -417,6 +420,11 @@ test.each([
         record.nonce,
         change === "exact Stop" ? source : { ...source, id: "other-summary" }
       );
+  } else if (change === "malformed reset") {
+    await appendFile(
+      `${h.config.sessionsDir}/${workspaceId}/chat.jsonl`,
+      '{"metadata":{"contextBoundaryKind":"reset"},broken\n'
+    );
   } else if (change === "malformed cancellation") {
     await writeFile(`${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`, "{");
   }
@@ -430,12 +438,22 @@ test.each([
     "other exact Stop",
   ].includes(change);
   try {
-    const result = await h.historyService.appendToHistory(workspaceId, candidate, {
+    const condition = {
       summary: captured,
       allowedTailMessageIds,
       isCurrent: () => true,
       onSkipped: skipped,
+    };
+    const prelude = createMuxMessage("prelude", "assistant", "Expanded context", {
+      synthetic: true,
     });
+    const result = batch
+      ? await h.historyService.appendManyToHistory(workspaceId, [prelude, candidate], condition)
+      : await h.historyService.appendToHistory(workspaceId, candidate, condition);
+    if (!allowed) {
+      expect(candidate.metadata?.historySequence).toBeUndefined();
+      expect(prelude.metadata?.historySequence).toBeUndefined();
+    }
     expect(result.success).toBe(change !== "malformed cancellation");
     expect(skipped).toHaveBeenCalledTimes(allowed || change === "malformed cancellation" ? 0 : 1);
     const rows = await foreign.getHistoryFromLatestBoundary(workspaceId);
@@ -569,6 +587,51 @@ test("a stale replacement receipt cannot make newer witnessed deletion debt bloc
     expect(state.blocksRecovery).toBe(false);
     expect(state.needsPersistence).toBe(true);
     await state.flush();
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("cancellation repair preserves raw reset privacy and invalidates an earlier scan cursor", async () => {
+  const h = await createTestHistoryService();
+  const workspaceId = "repair-raw-floor";
+  const source = createMuxMessage("summary", "assistant", "Private summary", {
+    muxMetadata: {
+      type: "compaction-summary",
+      pendingFollowUp: { text: "Continue", model: "openai:gpt-4o", agentId: "exec" },
+    },
+  });
+  const chatPath = `${h.config.sessionsDir}/${workspaceId}/chat.jsonl`;
+  const reset = '{"metadata":{"contextBoundaryKind":"reset"},broken\n';
+  try {
+    await h.historyService.appendToHistory(workspaceId, source);
+    await appendFile(chatPath, reset);
+    await h.historyService.appendManyToHistory(workspaceId, [
+      createMuxMessage("public-one", "user", "Public context"),
+      createMuxMessage("public-two", "assistant", "Public answer"),
+    ]);
+    const scan = await h.historyService.scanHistoryBounded(workspaceId, { visit: () => false });
+    expect(scan.cursor).toBeDefined();
+    await writeFile(`${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`, "{");
+    const cancellation = new CompactionCancellation(h.historyService, workspaceId);
+    expect(await cancellation.read()).toBeNull();
+    expect((await readFile(chatPath, "utf8")).includes(reset)).toBe(true);
+    const provider = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(provider.success && provider.data.map((row) => row.id)).toEqual([
+      "public-one",
+      "public-two",
+    ]);
+    const history = await h.historyService.getLastMessages(workspaceId, 10);
+    expect(history.success && history.data[0].metadata?.muxMetadata).not.toHaveProperty(
+      "pendingFollowUp"
+    );
+    const resumed = await h.historyService
+      .scanHistoryBounded(workspaceId, {
+        cursor: scan.cursor,
+        visit: () => true,
+      })
+      .catch((error: unknown) => error);
+    expect(resumed).toHaveProperty("message", "stale_cursor");
   } finally {
     await h.cleanup();
   }

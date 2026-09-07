@@ -1,3 +1,4 @@
+import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import type {
   MuxMessage,
   MuxMetadata,
@@ -1080,8 +1081,12 @@ export class StreamingMessageAggregator {
         ? normalizedMessage.parts.length
         : 0;
 
-      // Prefer richer content when duplicates arrive (e.g., placeholder vs completed message)
-      if (incomingParts < existingParts) {
+      // Rejection capsules are authoritative despite having no parts; stale payloads cannot revive them.
+      // Otherwise prefer richer content (e.g., placeholder vs completed message).
+      if (
+        !normalizedMessage.metadata?.contextBudgetRejected &&
+        (existing.metadata?.contextBudgetRejected || incomingParts < existingParts)
+      ) {
         return;
       }
     }
@@ -1160,7 +1165,10 @@ export class StreamingMessageAggregator {
         // Since-replay can include a stale boundary row for an active stream message while
         // richer in-memory parts already exist. Keep the richer message to avoid dropping
         // in-flight tool/text parts that filtered replay deltas may not resend.
-        if (incomingParts < existingParts) {
+        if (
+          !normalizedMessage.metadata?.contextBudgetRejected &&
+          (existing.metadata?.contextBudgetRejected || incomingParts < existingParts)
+        ) {
           continue;
         }
 
@@ -1375,7 +1383,10 @@ export class StreamingMessageAggregator {
       if (existing && (incoming.id === preservedActiveStreamMessageId || belowAnchor)) {
         const existingParts = Array.isArray(existing.parts) ? existing.parts.length : 0;
         const incomingParts = Array.isArray(incoming.parts) ? incoming.parts.length : 0;
-        if (incomingParts < existingParts) {
+        if (
+          !incoming.metadata?.contextBudgetRejected &&
+          (existing.metadata?.contextBudgetRejected || incomingParts < existingParts)
+        ) {
           continue;
         }
       }
@@ -3647,7 +3658,8 @@ export class StreamingMessageAggregator {
   getDisplayedMessages(): DisplayedMessage[] {
     if (!this.cache.displayedMessages) {
       const displayedMessages: DisplayedMessage[] = [];
-      const allMessages = this.getAllMessages();
+      // Reconstruct rejected content only in this display projection; the stored history remains inert.
+      const allMessages = this.getAllMessages().map(restoreContextBudgetRejectedMessageForDisplay);
       const showSyntheticMessages =
         typeof window !== "undefined" && window.api?.debugLlmRequest === true;
 
