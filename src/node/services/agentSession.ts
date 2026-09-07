@@ -572,10 +572,18 @@ export interface AgentSessionStreamManager {
   getPrefixSwapPreparation?: StreamManager["getPrefixSwapPreparation"];
   stopStream(
     workspaceId: string,
-    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
+    options?: {
+      soft?: boolean;
+      abandonPartial?: boolean;
+      abortReason?: StreamAbortReason;
+      emitIfMissing?: boolean;
+    }
   ): Promise<Result<void>>;
   isStreaming(workspaceId: string): boolean;
-  getStreamInfo(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
+  getStreamInfo(
+    workspaceId: string,
+    includeFinalizing?: boolean
+  ): AgentSessionActiveStreamInfo | undefined;
   replayStream(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
   /**
    * The runner the stream manager's clock-driven fibers use; the session's
@@ -593,7 +601,12 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   streamMessage(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;
   stopStream?(
     workspaceId: string,
-    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
+    options?: {
+      soft?: boolean;
+      abandonPartial?: boolean;
+      abortReason?: StreamAbortReason;
+      emitIfMissing?: boolean;
+    }
   ): Promise<Result<void>>;
   isStreaming?(workspaceId: string): boolean;
   getStreamInfo?(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
@@ -1165,43 +1178,93 @@ export class AgentSession {
     this.retryManager.cancel();
   }
 
-  dispose(): void {
-    if (this.coordinator.disposed) {
-      return;
+  get closingSignal(): AbortSignal {
+    return this.coordinator.closingSignal;
+  }
+
+  /** Service guardian owns the whole shutdown inside the app's existing bounded budget. */
+  async finishShutdown(): Promise<void> {
+    this.beginShutdown();
+    // Retain/commit the captured partial before destructive disposal. The engine supervisor
+    // joins this same cancellation; no session policy or scope joins itself here.
+    try {
+      try {
+        await this.streamManager.stopStream(this.workspaceId, {
+          abortReason: "system",
+          emitIfMissing: false,
+        });
+      } catch (error) {
+        log.warn("Session shutdown stop failed", { workspaceId: this.workspaceId, error });
+      }
+      await this.coordinator.drain();
+    } finally {
+      // A failed drain/adapter cannot skip background cleanup or listener teardown.
+      await this.dispose();
     }
-    this.coordinator.dispose();
-    this.continuousCompactor.reset("dispose");
+  }
 
-    this.retryManager.dispose();
+  private disposePromise?: Promise<void>;
+  private disposalMessageId?: string;
 
-    // Stop any active stream (fire and forget - disposal shouldn't block).
-    // Contain rejections: an unhandled rejection during CLI teardown would
-    // flip the process exit code after the run already completed.
-    // Promise.resolve guards test doubles that return non-promises.
-    void Promise.resolve(
-      this.streamManager.stopStream(this.workspaceId, { abandonPartial: true })
-    ).catch((error) => {
-      log.debug(`dispose: stopStream failed: ${getErrorMessage(error)}`);
-    });
-    // Terminate background processes for this workspace (skip when flagged for bench/CI)
-    if (!this.keepBackgroundProcesses) {
-      void Promise.resolve(this.backgroundProcessManager.cleanup(this.workspaceId)).catch(
-        (error) => {
-          log.debug(`dispose: background process cleanup failed: ${getErrorMessage(error)}`);
+  /** Initiation is safe inside a leased callback; its caller must join at an outer boundary. */
+  beginDispose(): void {
+    this.dispose().catch((error: unknown) => log.warn("Session disposal failed", { error }));
+  }
+
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    const disposed = Promise.withResolvers<void>();
+    this.disposePromise = disposed.promise;
+    // Register before closing the guardian so app teardown also joins stop/background cleanup.
+    const cleanupExecution = this.coordinator.enterExecution();
+    this.disposalMessageId =
+      this.streamManager.getStreamInfo(this.workspaceId, true)?.messageId ??
+      this.coordinator.terminalMessageId;
+    const cleanup = async (label: string, run: () => unknown): Promise<void> => {
+      try {
+        const result = await run();
+        if (result && typeof result === "object" && "success" in result && !result.success) {
+          log.debug(`dispose: ${label} failed`, { result });
         }
-      );
-    }
-
-    for (const { event, handler } of this.aiListeners) {
-      this.aiService.off(event, handler);
-    }
-    this.aiListeners.length = 0;
-    for (const { event, handler } of this.initListeners) {
-      this.initStateManager.off(event, handler as never);
-    }
-    this.initListeners.length = 0;
-    this.emitter.removeAllListeners();
-    eventSpine.emit("session.end", { workspaceId: this.workspaceId });
+      } catch (error) {
+        log.debug(`dispose: ${label} failed: ${getErrorMessage(error)}`);
+      }
+    };
+    // Latch admission without publishing idle before stopStream captures the old attempt.
+    this.coordinator.beginShutdown();
+    const stopped = cleanup("stopStream", () =>
+      this.streamManager.stopStream(this.workspaceId, {
+        abandonPartial: true,
+        emitIfMissing: false,
+      })
+    );
+    const invalidated = cleanup("invalidate", () => this.coordinator.dispose());
+    const compactionStopped = cleanup("compaction", () =>
+      this.continuousCompactor.reset("dispose")
+    );
+    const retryStopped = cleanup("retry", () => this.retryManager.dispose());
+    const backgroundStopped = this.keepBackgroundProcesses
+      ? undefined
+      : cleanup("background processes", () =>
+          this.backgroundProcessManager.cleanup(this.workspaceId)
+        );
+    Promise.all([stopped, invalidated, compactionStopped, retryStopped, backgroundStopped])
+      .then(async () => {
+        cleanupExecution[Symbol.dispose]();
+        await cleanup("drain", () => this.coordinator.drain());
+        // Raw bridges stay attached through the attempt fence. Destructive disposal suppresses
+        // recovery policy, but still presents its captured terminal exactly once below.
+        for (const { event, handler } of this.aiListeners) this.aiService.off(event, handler);
+        this.aiListeners.length = 0;
+        for (const { event, handler } of this.initListeners)
+          this.initStateManager.off(event, handler as never);
+        this.initListeners.length = 0;
+        this.emitter.removeAllListeners();
+        eventSpine.emit("session.end", { workspaceId: this.workspaceId });
+      })
+      .catch((error: unknown) => log.debug("dispose: final cleanup failed", { error }))
+      .finally(() => disposed.resolve());
+    return disposed.promise;
   }
 
   onChatEvent(listener: (event: AgentSessionChatEvent) => void): () => void {
@@ -2483,9 +2546,9 @@ export class AgentSession {
       }
     }
 
-    while (!this.coordinator.disposed) {
+    while (!this.coordinator.closing) {
       await this.waitForIdle();
-      if (!this.isAiStreaming()) {
+      if (this.coordinator.closing || !this.isAiStreaming()) {
         return;
       }
 
@@ -5409,16 +5472,6 @@ export class AgentSession {
       this.activeToolCallIds.clear();
     }
 
-    // For hard interrupts, delete partial BEFORE stopping to prevent abort handler
-    // from committing it. For soft interrupts, defer to stream-abort handler since
-    // the stream continues running and would recreate the partial.
-    if (options?.abandonPartial && !options?.soft) {
-      const deleteResult = await this.historyService.deletePartial(this.workspaceId);
-      if (!deleteResult.success) {
-        return Err(deleteResult.error);
-      }
-    }
-
     const stopResult = await this.streamManager.stopStream(this.workspaceId, {
       ...options,
       abortReason: "user",
@@ -7025,6 +7078,7 @@ export class AgentSession {
     });
     forward("stream-abort", (payload) => {
       if (payload.type !== "stream-abort") return;
+      if (this.forwardDisposalTerminal(payload)) return;
       if (this.coordinator.observeStartupAbort(payload)) return this.handleStartupAbort(payload);
       this.coordinator.rawTerminal("aborted", payload.messageId);
     });
@@ -7037,6 +7091,7 @@ export class AgentSession {
 
     forward("stream-end", (payload) => {
       if (payload.type !== "stream-end") return;
+      if (this.forwardDisposalTerminal(payload)) return;
       this.coordinator.rawTerminal("completed", payload.messageId);
     });
 
@@ -7087,10 +7142,21 @@ export class AgentSession {
     forward("init-end", (payload) => this.emitChatEvent(payload));
   }
 
+  private forwardDisposalTerminal(payload: StreamAbortEvent | StreamEndEvent): boolean {
+    if (!this.disposePromise) return false;
+    if (payload.messageId && payload.messageId === this.disposalMessageId) {
+      this.disposalMessageId = undefined;
+      this.emitter.emit("chat-event", {
+        workspaceId: this.workspaceId,
+        message: payload,
+      } satisfies AgentSessionChatEvent);
+    }
+    return true;
+  }
+
   // Public method to emit chat events (used by init hooks and other workspace events)
   emitChatEvent(message: WorkspaceChatMessage): void {
-    // NOTE: Workspace teardown does not await in-flight async work (sendMessage(), stopStream(), etc).
-    // Those code paths can still try to emit events after dispose; drop them rather than crashing.
+    // Destructive disposal keeps raw terminal presentation separate from late policy work.
     if (this.coordinator.disposed) {
       return;
     }

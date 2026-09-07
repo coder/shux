@@ -287,7 +287,9 @@ async function disposeWorkflowResources(input: {
             { name: "appFiberScope.close", run: () => closeScopeBounded(services.appFiberScope) },
           ]
         : []),
-      { name: "session.dispose", run: () => input.session?.dispose() },
+      // The service guardian joins disposal inside closeScopeBounded. After a timeout,
+      // only initiate cleanup here: a second unbounded join would prevent CLI exit.
+      { name: "session.dispose", run: () => input.session?.beginDispose() },
       { name: "mcpServerManager.dispose", run: () => services?.mcpServerManager.dispose() },
       { name: "codexOauthService.dispose", run: () => input.codexOauthService?.dispose() },
       { name: "coderOauthService.dispose", run: () => input.coderOauthService?.dispose() },

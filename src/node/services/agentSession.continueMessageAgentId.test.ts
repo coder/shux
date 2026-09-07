@@ -145,7 +145,7 @@ describe("AgentSession continue-message agentId fallback", () => {
 
   afterEach(async () => {
     for (const session of sessions.splice(0)) {
-      session.dispose();
+      await session.dispose();
     }
     await historyCleanup?.();
     historyCleanup = undefined;

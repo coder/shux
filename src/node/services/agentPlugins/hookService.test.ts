@@ -478,7 +478,7 @@ describe("AgentPluginHookService", () => {
       metadata.mockRestore();
       create.mockRestore();
       await harness.service.disposeWorkspace(WORKSPACE_ID);
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });

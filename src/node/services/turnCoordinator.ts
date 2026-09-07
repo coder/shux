@@ -404,7 +404,7 @@ class TurnExecution {
     else this.runner.runFork(Effect.promise(() => this.close()));
   }
 
-  private close(): Promise<void> {
+  close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     const closed = Promise.withResolvers<void>();
     // Publish the close latch before interrupting fibers: their finalizers can reenter disposal.
@@ -476,6 +476,10 @@ class TurnExecution {
  */
 export class TurnCoordinator {
   private state = initialCoordinatorState(Symbol("idle"));
+  private readonly closingController = new AbortController();
+  get closingSignal(): AbortSignal {
+    return this.closingController.signal;
+  }
   private readonly settlements = new Map<
     OperationId,
     ReturnType<typeof Promise.withResolvers<void>>
@@ -502,6 +506,11 @@ export class TurnCoordinator {
     return this.execution.lease();
   }
 
+  /** Physical completion, distinct from semantic idle and operation policy settlement. */
+  drain(): Promise<void> {
+    return this.execution.close();
+  }
+
   get phase(): TurnPhase {
     return this.state.turn.phase;
   }
@@ -510,6 +519,10 @@ export class TurnCoordinator {
   }
   get operationId(): OperationId | undefined {
     return this.state.turn.operation?.id;
+  }
+  get terminalMessageId(): string | undefined {
+    const operation = this.state.turn.operation;
+    return operation?.messageId ?? operation?.startupMessageId;
   }
   get disposed(): boolean {
     return this.state.lifetime === "disposed";
@@ -724,8 +737,15 @@ export class TurnCoordinator {
   }
   beginShutdown(): void {
     this.dispatch({ type: "shutdown" });
+    this.closingController.abort();
+    // Lifetime waits must retire before physical leases: a leased retry/startup callback
+    // can be waiting for idle itself. This does not publish semantic idle or drain jobs.
+    const waiters = this.idleWaiters;
+    this.idleWaiters = new Set();
+    for (const finish of waiters) finish();
   }
   dispose(): void {
+    this.beginShutdown();
     try {
       this.dispatch({ type: "dispose" });
     } finally {
@@ -760,7 +780,7 @@ export class TurnCoordinator {
       "waitForIdle signal must be an AbortSignal"
     );
     if (signal?.aborted) return Promise.reject(new Error("Waiting for session idle canceled."));
-    if (this.phase === "idle") return Promise.resolve();
+    if (this.phase === "idle" || this.closing) return Promise.resolve();
     return new Promise<void>((resolve, reject) => {
       const batch = this.idleWaiters;
       let canceled = false;

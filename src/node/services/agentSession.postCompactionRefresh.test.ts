@@ -114,7 +114,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(onCompactionComplete).toHaveBeenCalledTimes(1);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("reports failed compaction continuation dispatch to lifecycle consumers", async () => {
@@ -167,7 +167,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
 
     expect(await decision).toBe(false);
     expect(internals.dispatchPendingFollowUp).toHaveBeenCalledTimes(1);
-    session.dispose();
+    await session.dispose();
   });
 
   test("triggers callback on file_edit_* tool-call-end", async () => {
@@ -256,6 +256,6 @@ describe("AgentSession post-compaction refresh trigger", () => {
 
     expect(onPostCompactionStateChange).toHaveBeenCalledTimes(2);
 
-    session.dispose();
+    await session.dispose();
   });
 });

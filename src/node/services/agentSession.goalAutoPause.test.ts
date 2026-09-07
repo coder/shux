@@ -48,12 +48,17 @@ async function setGoalOk(
   return result.data;
 }
 
-function createAiService(workspaceId: string): AIService & EventEmitter {
+function createAiService(
+  workspaceId: string,
+  getClosingSignal: () => AbortSignal
+): AIService & EventEmitter {
   const aiEmitter = new EventEmitter();
   return Object.assign(aiEmitter, {
     isStreaming: mock((_workspaceId: string) => false),
     stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-    streamMessage: mock((_request: unknown) => Promise.resolve(Ok(createStartedTurnHandle()))),
+    streamMessage: mock((_request: unknown) =>
+      Promise.resolve(Ok(createStartedTurnHandle(getClosingSignal())))
+    ),
     getStreamInfo: mock((_workspaceId: string) => null),
     getProvidersConfig: mock(() => null),
     getWorkspaceMetadata: mock((_workspaceId: string) =>
@@ -99,7 +104,7 @@ async function createSessionHarness(workspaceId: string): Promise<SessionHarness
     setMessageQueued: mock((_workspaceId: string, _queued: boolean) => undefined),
   } as unknown as BackgroundProcessManager;
 
-  const aiService = createAiService(workspaceId);
+  const aiService = createAiService(workspaceId, () => session.closingSignal);
   const session = new AgentSession({
     workspaceId,
     config,
@@ -139,7 +144,7 @@ describe("AgentSession goal safety hooks", () => {
       "goal_paused",
       expect.objectContaining({ initiator: "auto" })
     );
-    session.dispose();
+    await session.dispose();
   });
 
   test("manual user messages can explicitly pause active goals", async () => {
@@ -159,7 +164,7 @@ describe("AgentSession goal safety hooks", () => {
       "goal_paused",
       expect.objectContaining({ initiator: "auto" })
     );
-    session.dispose();
+    await session.dispose();
   });
 
   for (const status of [
@@ -191,7 +196,7 @@ describe("AgentSession goal safety hooks", () => {
 
       expect(result.success).toBe(true);
       expect(await goalService.getGoal(workspaceId)).toMatchObject({ status });
-      session.dispose();
+      await session.dispose();
     });
   }
 
@@ -246,7 +251,7 @@ describe("AgentSession goal safety hooks", () => {
       status: "budget_limited",
       budgetLimitOriginKind: "user",
     });
-    session.dispose();
+    await session.dispose();
   });
 
   test("a paused goal vetoes a redispatched compaction follow-up continuation", async () => {
@@ -305,7 +310,7 @@ describe("AgentSession goal safety hooks", () => {
       const meta = tail.data[0]?.metadata?.muxMetadata;
       expect(meta && "pendingFollowUp" in meta ? meta.pendingFollowUp : undefined).toBeUndefined();
     }
-    session.dispose();
+    await session.dispose();
   });
 
   test("a manual message queued during redispatch preflight vetoes the follow-up", async () => {
@@ -368,7 +373,7 @@ describe("AgentSession goal safety hooks", () => {
       const meta = history.data.find((message) => message.id === summary.id)?.metadata?.muxMetadata;
       expect(meta && "pendingFollowUp" in meta ? meta.pendingFollowUp : undefined).toBeUndefined();
     }
-    session.dispose();
+    await session.dispose();
   });
 
   test("a service-level send preflight defers redispatched follow-ups", async () => {
@@ -417,7 +422,7 @@ describe("AgentSession goal safety hooks", () => {
       expect(meta && "pendingFollowUp" in meta ? meta.pendingFollowUp : undefined).toBeUndefined();
     }
     sendSpy.mockRestore();
-    session.dispose();
+    await session.dispose();
   });
 
   test("a service preflight starting mid-redispatch flips the live admission probe", async () => {
@@ -477,7 +482,7 @@ describe("AgentSession goal safety hooks", () => {
         )
       ).toBe(false);
     }
-    session.dispose();
+    await session.dispose();
   });
 
   test("a recovered budget wrap-up follow-up installs its missing reservation", async () => {
@@ -537,7 +542,7 @@ describe("AgentSession goal safety hooks", () => {
       budgetLimitInjectedForGoalId: created.goalId,
     });
     sendSpy.mockRestore();
-    session.dispose();
+    await session.dispose();
   });
 
   test("malformed persisted follow-up goal IDs are discarded during recovery", async () => {
@@ -581,7 +586,7 @@ describe("AgentSession goal safety hooks", () => {
       expect(meta && "pendingFollowUp" in meta ? meta.pendingFollowUp : undefined).toBeUndefined();
     }
     sendSpy.mockRestore();
-    session.dispose();
+    await session.dispose();
   });
 
   test("synthetic messages do not auto-pause active goals", async () => {
@@ -597,7 +602,7 @@ describe("AgentSession goal safety hooks", () => {
 
     expect(result.success).toBe(true);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
-    session.dispose();
+    await session.dispose();
   });
 
   test("queued manual messages that predate the goal do not pause it", async () => {
@@ -621,7 +626,7 @@ describe("AgentSession goal safety hooks", () => {
 
     expect(result.success).toBe(true);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
-    session.dispose();
+    await session.dispose();
   });
 
   test("same-millisecond activation and message authoring fail closed to pause", async () => {
@@ -643,7 +648,7 @@ describe("AgentSession goal safety hooks", () => {
 
     expect(result.success).toBe(true);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "paused" });
-    session.dispose();
+    await session.dispose();
   });
 
   test("a legacy goal follow-up without goal identity is discarded", async () => {
@@ -693,7 +698,7 @@ describe("AgentSession goal safety hooks", () => {
       const meta = tail.data[0]?.metadata?.muxMetadata;
       expect(meta && "pendingFollowUp" in meta ? meta.pendingFollowUp : undefined).toBeUndefined();
     }
-    session.dispose();
+    await session.dispose();
   });
 
   test("queued messages predating a model-created goal still pause it", async () => {
@@ -719,7 +724,7 @@ describe("AgentSession goal safety hooks", () => {
 
     expect(result.success).toBe(true);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "paused" });
-    session.dispose();
+    await session.dispose();
   });
 
   test("a user Resume is consent for messages authored before it", async () => {
@@ -748,7 +753,7 @@ describe("AgentSession goal safety hooks", () => {
 
     expect(result.success).toBe(true);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
-    session.dispose();
+    await session.dispose();
   });
 
   test("queued manual messages enqueued after goal creation still pause it", async () => {
@@ -763,7 +768,7 @@ describe("AgentSession goal safety hooks", () => {
 
     expect(result.success).toBe(true);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "paused" });
-    session.dispose();
+    await session.dispose();
   });
 
   // Shared harness for the candidate-suspension tests: a busy runtime keeps
@@ -812,7 +817,7 @@ describe("AgentSession goal safety hooks", () => {
 
     expect(thrown).toBeInstanceOf(Error);
     expect(candidates.has(workspaceId)).toBe(false);
-    session.dispose();
+    await session.dispose();
   });
 
   test("kickoff candidate is not consumable while a manual send is classified", async () => {
@@ -844,7 +849,7 @@ describe("AgentSession goal safety hooks", () => {
     expect(result.success).toBe(true);
     expect(eligibilityDuringAck).toBe("no_pending_candidate");
     expect(candidates.has(workspaceId)).toBe(false);
-    session.dispose();
+    await session.dispose();
   });
 
   test("delayed pre-stop sends do not clear a newer stop's acknowledgment gate", async () => {
@@ -872,7 +877,7 @@ describe("AgentSession goal safety hooks", () => {
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
     const goal = await goalService.getGoal(workspaceId);
     expect(goal?.requireUserAcknowledgmentSinceMs).not.toBeNull();
-    session.dispose();
+    await session.dispose();
   });
 
   test("pre-goal queued sends restore the suspended kickoff candidate", async () => {
@@ -897,7 +902,7 @@ describe("AgentSession goal safety hooks", () => {
     expect(result.success).toBe(true);
     expect(candidates.has(workspaceId)).toBe(true);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
-    session.dispose();
+    await session.dispose();
   });
 
   test("manual user messages are no-ops when no goal exists", async () => {
@@ -909,7 +914,7 @@ describe("AgentSession goal safety hooks", () => {
 
     expect(result.success).toBe(true);
     expect(await goalService.getGoal(workspaceId)).toBeNull();
-    session.dispose();
+    await session.dispose();
   });
 
   test("manual user messages clear acknowledgment flags while pausing by default", async () => {
@@ -926,7 +931,7 @@ describe("AgentSession goal safety hooks", () => {
       status: "paused",
       requireUserAcknowledgmentSinceMs: null,
     });
-    session.dispose();
+    await session.dispose();
   });
 
   test("synthetic messages do not clear acknowledgment flags", async () => {
@@ -946,7 +951,7 @@ describe("AgentSession goal safety hooks", () => {
       status: "active",
       requireUserAcknowledgmentSinceMs: 66_000,
     });
-    session.dispose();
+    await session.dispose();
   });
 
   test("stream errors restore durable goal snapshot after live cost preview", async () => {
@@ -1047,7 +1052,7 @@ describe("AgentSession goal safety hooks", () => {
       goal: { costCents: 0, budgetCents: 2_000 },
     });
     expect(activitySnapshots.at(-1)?.transientGoalOnly).toBeUndefined();
-    session.dispose();
+    await session.dispose();
   });
 
   test("startup recovery gates goal continuations when an assistant partial is restored", async () => {
@@ -1076,7 +1081,7 @@ describe("AgentSession goal safety hooks", () => {
       "goal_crash_gate_set",
       expect.objectContaining({ workspaceIdLengthBucket: "10-49" })
     );
-    session.dispose();
+    await session.dispose();
   });
 
   test("startup recovery ignores restored assistant partials when no goal exists", async () => {
@@ -1096,7 +1101,7 @@ describe("AgentSession goal safety hooks", () => {
       "goal_crash_gate_set",
       expect.any(Object)
     );
-    session.dispose();
+    await session.dispose();
   });
 
   test("manual acknowledgment clears stale gated continuations after restart", async () => {
@@ -1143,7 +1148,7 @@ describe("AgentSession goal safety hooks", () => {
     await dispatcher.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME);
 
     expect(execute).not.toHaveBeenCalled();
-    session.dispose();
+    await session.dispose();
   });
 
   // Auto-completion fallback for the "agent ended a goal-continuation turn
@@ -1223,7 +1228,7 @@ describe("AgentSession goal safety hooks", () => {
       "goal_completed",
       expect.objectContaining({ initiator: "model" })
     );
-    session.dispose();
+    await session.dispose();
   });
 
   test("stream-end with a dynamic-tool part leaves an active goal active", async () => {
@@ -1256,7 +1261,7 @@ describe("AgentSession goal safety hooks", () => {
     // Give the stream-end handler a tick to settle before asserting "no change".
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
-    session.dispose();
+    await session.dispose();
   });
 
   test("text-only stream-end on a manual user message does not auto-complete the goal", async () => {
@@ -1285,7 +1290,7 @@ describe("AgentSession goal safety hooks", () => {
     // auto-completion would have a chance to corrupt the paused state.
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "paused" });
-    session.dispose();
+    await session.dispose();
   });
 
   test("length-truncated text-only stream-end does not auto-complete the goal", async () => {
@@ -1318,7 +1323,7 @@ describe("AgentSession goal safety hooks", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
-    session.dispose();
+    await session.dispose();
   });
 
   test("text-only goal_continuation turn can complete a resumed paused goal", async () => {
@@ -1356,6 +1361,6 @@ describe("AgentSession goal safety hooks", () => {
       status: "complete",
       completionSummary: "All wrapped up.",
     });
-    session.dispose();
+    await session.dispose();
   });
 });

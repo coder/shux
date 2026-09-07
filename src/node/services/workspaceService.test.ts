@@ -1,4 +1,6 @@
 import type { TurnCompletion } from "./streamManager";
+import type { TurnCoordinator } from "./turnCoordinator";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
 import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
@@ -4206,7 +4208,7 @@ describe("WorkspaceService workflow invocation events", () => {
         );
       } finally {
         unsubscribe();
-        workspaceService.disposeSession(workspaceId);
+        await workspaceService.disposeSession(workspaceId);
       }
     } finally {
       await cleanup();
@@ -4272,7 +4274,7 @@ describe("WorkspaceService workflow invocation events", () => {
       );
 
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -4362,7 +4364,7 @@ describe("WorkspaceService workflow invocation events", () => {
       );
 
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -4470,7 +4472,7 @@ describe("WorkspaceService workflow invocation events", () => {
         afterBoundaryMessageId: "workflow-result",
       });
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -4515,7 +4517,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -4580,7 +4582,7 @@ describe("WorkspaceService workflow invocation events", () => {
         })
       );
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -4637,7 +4639,7 @@ describe("WorkspaceService workflow invocation events", () => {
       const clearResult = await workspaceService.truncateHistory(workspaceId, 1.0);
       expect(clearResult.success).toBe(true);
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -4701,7 +4703,7 @@ describe("WorkspaceService workflow invocation events", () => {
         carryoverSpy.mockRestore();
       }
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -4777,7 +4779,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(
         existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -4833,7 +4835,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(
         existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -4905,7 +4907,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(
         existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -4974,7 +4976,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(
         existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(true);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5052,7 +5054,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(
         existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5125,7 +5127,7 @@ describe("WorkspaceService workflow invocation events", () => {
       if (history.success) {
         expect(history.data.length).toBeGreaterThan(0);
       }
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5195,7 +5197,7 @@ describe("WorkspaceService workflow invocation events", () => {
       if (history.success) {
         expect(history.data).toHaveLength(6);
       }
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5257,7 +5259,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(
         existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5336,7 +5338,7 @@ describe("WorkspaceService workflow invocation events", () => {
       if (history.success) {
         expect(history.data).toHaveLength(1);
       }
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5391,7 +5393,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(
         existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5453,7 +5455,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(
         existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(true);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5522,7 +5524,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(
         existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(true);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5604,7 +5606,7 @@ describe("WorkspaceService workflow invocation events", () => {
         )
       );
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5662,7 +5664,7 @@ describe("WorkspaceService workflow invocation events", () => {
         })
       );
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5725,7 +5727,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(await workspaceService.getWorkflowInvocationCurrentness(workspaceId, runId)).toBe(
         "not_current"
       );
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5797,7 +5799,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(await workspaceService.getWorkflowInvocationCurrentness(workspaceId, runId)).toBe(
         "current"
       );
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5866,7 +5868,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(await workspaceService.getWorkflowInvocationCurrentness(workspaceId, runId)).toBe(
         "current"
       );
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -5924,7 +5926,7 @@ describe("WorkspaceService workflow invocation events", () => {
         );
 
         expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-        workspaceService.disposeSession(workspaceId);
+        await workspaceService.disposeSession(workspaceId);
       } finally {
         await cleanup();
       }
@@ -5994,7 +5996,7 @@ describe("WorkspaceService workflow invocation events", () => {
       );
 
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -6056,7 +6058,7 @@ describe("WorkspaceService workflow invocation events", () => {
       );
 
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -6109,7 +6111,7 @@ describe("WorkspaceService workflow invocation events", () => {
       );
 
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -6167,7 +6169,7 @@ describe("WorkspaceService workflow invocation events", () => {
       );
 
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -6275,7 +6277,7 @@ describe("WorkspaceService workflow invocation events", () => {
       );
 
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -6339,7 +6341,7 @@ describe("WorkspaceService workflow invocation events", () => {
       );
 
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
+      await workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
     }
@@ -6454,6 +6456,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       message: { type: string };
     }
     const session = {
+      closingSignal: new AbortController().signal,
       isBusy: mock(() => busy),
       hasQueuedMessages: mock(() => false),
       hasPendingAutoRetry: mock(() => pendingAutoRetry),
@@ -6636,7 +6639,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     const { config, historyService, workspaceService, cleanup } = await createServices();
     const workspaceId = "start-here-clears-usage-state";
     const streamMessage = mock((..._args: unknown[]) =>
-      Promise.resolve(Ok(createStartedTurnHandle()))
+      Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal)))
     );
     const harness = await createAgentSessionHarness({
       workspaceId,
@@ -6712,7 +6715,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       });
       expect(streamMessage).toHaveBeenCalledTimes(1);
     } finally {
-      harness.session.dispose();
+      await harness.session.dispose();
       await cleanup();
     }
   });
@@ -8508,12 +8511,14 @@ describe("WorkspaceService initialize", () => {
     expect(startStartupRecoverySpy).toHaveBeenCalledTimes(1);
   });
 
-  test("beginShutdown disposes transient recovery sessions and halts the rest", () => {
-    const dispose = mock(() => undefined);
+  test("beginShutdown disposes transient recovery sessions and halts the rest", async () => {
+    const release = Promise.withResolvers<void>();
+    const dispose = mock(() => release.promise);
     const beginShutdown = mock(() => undefined);
     const startupAccess = workspaceService as unknown as {
       transientStartupRecoverySessions: Map<string, AgentSession>;
       sessions: Map<string, AgentSession>;
+      pendingWorkspaceCleanup: Set<Promise<void>>;
     };
     startupAccess.transientStartupRecoverySessions.set("ws-a", {
       dispose,
@@ -8531,6 +8536,9 @@ describe("WorkspaceService initialize", () => {
     workspaceService.beginShutdown();
 
     expect(dispose).toHaveBeenCalledTimes(2);
+    expect(startupAccess.transientStartupRecoverySessions.size).toBe(2);
+    release.resolve();
+    await Promise.all(startupAccess.pendingWorkspaceCleanup);
     expect(startupAccess.transientStartupRecoverySessions.size).toBe(0);
     expect(beginShutdown).toHaveBeenCalledTimes(1);
     startupAccess.sessions.delete("ws-promoted");
@@ -9174,7 +9182,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       // Fully settled: no residual reservation leaks.
       expect(probe!()).toBe(false);
     } finally {
-      realSession.dispose();
+      await realSession.dispose();
     }
   });
 
@@ -9216,7 +9224,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       // Fully settled: no residual reservation leaks.
       expect(probe!()).toBe(false);
     } finally {
-      realSession.dispose();
+      await realSession.dispose();
     }
   });
 
@@ -9261,7 +9269,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       // Fully settled: no residual reservation leaks.
       expect(probe!()).toBe(false);
     } finally {
-      realSession.dispose();
+      await realSession.dispose();
     }
   });
 
@@ -12789,6 +12797,8 @@ describe("WorkspaceService remove timing rollup", () => {
     const parentWorkspaceId = "parent-ws";
 
     const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-remove-"));
+    const stopEntered = Promise.withResolvers<void>();
+    const stopRelease = Promise.withResolvers<void>();
     try {
       const sessionRoot = path.join(tempRoot, "sessions");
       await fsPromises.mkdir(path.join(sessionRoot, workspaceId), { recursive: true });
@@ -12799,20 +12809,19 @@ describe("WorkspaceService remove timing rollup", () => {
       class FakeAIService extends EventEmitter {
         isStreaming = mock(() => true);
 
-        stopStream = mock(() => {
-          setTimeout(() => {
-            abortEmitted = true;
-            this.emit("stream-abort", {
-              type: "stream-abort",
-              workspaceId,
-              messageId: "msg",
-              abortReason: "system",
-              metadata: { duration: 123 },
-              abandonPartial: true,
-            });
-          }, 0);
-
-          return Promise.resolve({ success: true as const, data: undefined });
+        stopStream = mock(async () => {
+          stopEntered.resolve();
+          await stopRelease.promise;
+          abortEmitted = true;
+          this.emit("stream-abort", {
+            type: "stream-abort",
+            workspaceId,
+            messageId: "msg",
+            abortReason: "system",
+            metadata: { duration: 123 },
+            abandonPartial: true,
+          });
+          return { success: true as const, data: undefined };
         });
 
         getWorkspaceMetadata = mock(() =>
@@ -12861,11 +12870,16 @@ describe("WorkspaceService remove timing rollup", () => {
         timingService as SessionTimingService
       );
 
-      const removeResult = await workspaceService.remove(workspaceId, true);
+      const removing = workspaceService.remove(workspaceId, true);
+      await stopEntered.promise;
+      expect(timingService.rollUpTimingIntoParent).not.toHaveBeenCalled();
+      stopRelease.resolve();
+      const removeResult = await removing;
       expect(removeResult.success).toBe(true);
       expect(mockInitStateManager.clearInMemoryState).toHaveBeenCalledWith(workspaceId);
       expect(rollUpSawAbort).toBe(true);
     } finally {
+      stopRelease.resolve();
       await fsPromises.rm(tempRoot, { recursive: true, force: true });
     }
   });
@@ -18418,7 +18432,7 @@ describe("WorkspaceService interruptStream", () => {
               completion:
                 streamCount === 1
                   ? completion.promise
-                  : new Promise<TurnCompletion>(() => undefined),
+                  : createStartedTurnHandle(h.session.closingSignal).completion,
             })
           );
         }),
@@ -18477,7 +18491,7 @@ describe("WorkspaceService interruptStream", () => {
     } finally {
       releaseAccounting.resolve();
       await interrupt;
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -20101,6 +20115,147 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
       void realGuardedAppend;
       await fsPromises.rm(projectDir, { recursive: true, force: true });
       await cleanup();
+    }
+  });
+});
+
+describe("WorkspaceService disposal ownership", () => {
+  test.each([false, true])(
+    "leased cleanup removes real session files without a task-tree self-join (external=%s)",
+    async (externalRemoval) => {
+      const h = await createAgentSessionHarness({ workspaceId: "leased-removal" });
+      const workspaceId = "leased-removal";
+      const service = createWorkspaceServiceForTest({
+        config: h.config,
+        historyService: h.historyService,
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(h.config.rootDir, "extensionMetadata.json")
+        ),
+        aiService: createMockAIService({
+          getWorkspaceMetadata: mock(() => Promise.resolve(Err("not found"))),
+        }),
+      });
+      const tree = new MutexMap<string>();
+      service.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          withTaskTreeLifecycleLock: (_id, run) => tree.withLock("tree", run),
+        })
+      );
+      service.registerSession(workspaceId, h.session);
+      await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user", "user", "remove after callback")
+      );
+      const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+      const { coordinator } = h.session as unknown as { coordinator: TurnCoordinator };
+      const lease = coordinator.enterExecution();
+      const disposalEntered = Promise.withResolvers<void>();
+      const originalDispose = h.session.dispose.bind(h.session);
+      spyOn(h.session, "dispose").mockImplementation(() => {
+        disposalEntered.resolve();
+        return originalDispose();
+      });
+      const removed = Promise.withResolvers<Result<void>>();
+      let external: Promise<Result<void>> | undefined;
+      try {
+        if (externalRemoval) {
+          external = service.remove(workspaceId, true);
+          await disposalEntered.promise;
+          expect(existsSync(sessionDir)).toBe(true);
+        }
+        // This is the leased continuation callback's tail: schedule removal without
+        // awaiting it, then return/release. The service owns the actual remove and join.
+        service.deferWorkspaceCleanup(async () => {
+          removed.resolve(await service.remove(workspaceId, true));
+        });
+        lease[Symbol.dispose]();
+        if (external) expect((await external).success).toBe(true);
+        expect((await removed.promise).success).toBe(true);
+        expect(existsSync(sessionDir)).toBe(false);
+      } finally {
+        lease[Symbol.dispose]();
+        await external;
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
+  test.each(["workspace-busy", "queue-busy", "queue-only"] as const)(
+    "shutdown cancels %s wait without pretending the physical lease drained",
+    async (kind) => {
+      const h = await createAgentSessionHarness({ workspaceId: "closing-idle-wait" });
+      const service = createWorkspaceServiceForTest({
+        config: h.config,
+        historyService: h.historyService,
+      });
+      service.registerSession("closing-idle-wait", h.session);
+      const { coordinator } = h.session as unknown as { coordinator: TurnCoordinator };
+      const lease = coordinator.enterExecution();
+      if (kind === "queue-only") h.session.queueMessage("pending");
+      else {
+        const admitted = coordinator.prepare({
+          kind: "fresh",
+          intent: "handoff",
+          expectedTurnId: coordinator.turnId,
+        });
+        expect(admitted.status).toBe("admitted");
+      }
+      const waiting = (
+        kind === "workspace-busy"
+          ? service.waitForWorkspaceIdle("closing-idle-wait")
+          : service.waitForIdleAndNoQueuedMessages("closing-idle-wait")
+      ).then(
+        () => undefined,
+        (error: unknown) => error
+      );
+      h.session.beginShutdown();
+      let drained = false;
+      const drain = coordinator.drain().then(() => {
+        drained = true;
+      });
+      try {
+        expect(await waiting).toBeInstanceOf(Error);
+        expect(drained).toBe(false);
+        if (kind !== "queue-only") expect(coordinator.phase).toBe("preparing");
+      } finally {
+        lease[Symbol.dispose]();
+        await drain;
+        await service.disposeSession("closing-idle-wait");
+        await h.cleanup();
+      }
+    }
+  );
+
+  test("an old disposal cannot remove replacement session subscriptions", async () => {
+    const h = await createAgentSessionHarness({ workspaceId: "dispose-replacement" });
+    const replacement = await createAgentSessionHarness({ workspaceId: "dispose-replacement" });
+    const service = createWorkspaceServiceForTest({
+      config: h.config,
+      historyService: h.historyService,
+    });
+    service.registerSession("dispose-replacement", h.session);
+    const internals = service as unknown as {
+      sessions: Map<string, AgentSession>;
+      sessionSubscriptions: Map<string, { chat: () => void; metadata: () => void }>;
+    };
+    const { coordinator } = h.session as unknown as { coordinator: TurnCoordinator };
+    const lease = coordinator.enterExecution();
+    const disposal = service.disposeSession("dispose-replacement");
+    try {
+      internals.sessions.delete("dispose-replacement");
+      service.registerSession("dispose-replacement", replacement.session);
+      const subscriptions = internals.sessionSubscriptions.get("dispose-replacement");
+      lease[Symbol.dispose]();
+      await disposal;
+      expect(internals.sessions.get("dispose-replacement")).toBe(replacement.session);
+      expect(internals.sessionSubscriptions.get("dispose-replacement")).toBe(subscriptions);
+    } finally {
+      lease[Symbol.dispose]();
+      await disposal;
+      await service.disposeSession("dispose-replacement");
+      await h.cleanup();
+      await replacement.cleanup();
     }
   });
 });

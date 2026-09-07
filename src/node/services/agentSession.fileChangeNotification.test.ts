@@ -26,7 +26,7 @@ describe("AgentSession file-change notification (turn start)", () => {
 
   afterEach(async () => {
     for (const session of sessions.splice(0)) {
-      session.dispose();
+      await session.dispose();
     }
     await historyCleanup?.();
     historyCleanup = undefined;
@@ -48,7 +48,7 @@ describe("AgentSession file-change notification (turn start)", () => {
     const capturedRequests: MuxMessage[][] = [];
     const streamMessage = mock((opts: StreamMessageOptions) => {
       capturedRequests.push(opts.messages);
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),

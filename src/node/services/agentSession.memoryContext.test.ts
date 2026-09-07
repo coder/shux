@@ -122,7 +122,7 @@ describe("AgentSession memory context", () => {
       expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -161,7 +161,7 @@ describe("AgentSession memory context", () => {
       );
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -195,7 +195,7 @@ describe("AgentSession memory context", () => {
       );
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -217,7 +217,7 @@ describe("AgentSession memory context", () => {
       expect(await priv.resolveMemoryContext("test-model")).toBeUndefined();
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -255,7 +255,7 @@ describe("AgentSession memory context", () => {
       );
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 });

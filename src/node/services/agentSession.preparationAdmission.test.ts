@@ -20,7 +20,7 @@ async function harness(workspaceId: string) {
 }
 afterEach(async () => {
   for (const h of harnesses.splice(0)) {
-    h.session.dispose();
+    await h.session.dispose();
     await h.cleanup();
   }
 });
@@ -45,7 +45,7 @@ describe("preparation admission", () => {
     const stream = spyOn(h.aiService, "streamMessage").mockImplementation(async () => {
       started.resolve();
       await release.promise;
-      return Ok(createStartedTurnHandle());
+      return Ok(createStartedTurnHandle(h.session.closingSignal));
     });
     h.session.queueMessage("head", { ...options, muxMetadata: metadata }, { synthetic: true });
     h.session.queueMessage("tail", options);
@@ -79,7 +79,7 @@ describe("preparation admission", () => {
     const started = Promise.withResolvers<void>();
     const stream = spyOn(h.aiService, "streamMessage").mockImplementation(() => {
       started.resolve();
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
     });
     h.session.queueMessage("removed", options, { synthetic: true, onCanceled: canceled });
     let removed = false;
@@ -185,7 +185,7 @@ describe("preparation admission", () => {
       const stream = spyOn(h.aiService, "streamMessage").mockImplementation(() => {
         expect(cleanups).toBe(2);
         started.resolve();
-        return Promise.resolve(Ok(createStartedTurnHandle()));
+        return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
       });
       h.session.queueMessage("failed", options, {
         synthetic: true,
@@ -279,7 +279,7 @@ describe("preparation admission", () => {
     const stream = spyOn(h.aiService, "streamMessage").mockImplementation(async () => {
       provider.resolve();
       await releaseProvider.promise;
-      return Ok(createStartedTurnHandle());
+      return Ok(createStartedTurnHandle(h.session.closingSignal));
     });
     const oldSend = h.session.sendMessage("old", options);
     await appended.promise;
@@ -355,7 +355,7 @@ describe("preparation admission", () => {
     spyOn(h.aiService, "streamMessage").mockImplementation(async () => {
       provider.resolve();
       await releaseProvider.promise;
-      return Ok(createStartedTurnHandle());
+      return Ok(createStartedTurnHandle(h.session.closingSignal));
     });
     const cancel = spyOn(session.retryManager, "cancel");
     const enable = spyOn(session.retryManager, "setEnabled");
@@ -409,7 +409,7 @@ describe("preparation admission", () => {
     });
     const stream = spyOn(h.aiService, "streamMessage").mockImplementation(() => {
       started.resolve();
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
     });
     const edit = h.session.sendMessage("edited", { ...options, editMessageId: "original" });
     await entered.promise;
@@ -446,7 +446,7 @@ describe("preparation admission", () => {
       const started = Promise.withResolvers<void>();
       const stream = spyOn(h.aiService, "streamMessage").mockImplementation(() => {
         started.resolve();
-        return Promise.resolve(Ok(createStartedTurnHandle()));
+        return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
       });
       let retire = true;
       const retireEdit = () => {

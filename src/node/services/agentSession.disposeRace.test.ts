@@ -21,6 +21,7 @@ import {
 import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { StreamMessageOptions } from "./aiService";
 import type { TurnCompletion } from "./streamManager";
+import type { TurnCoordinator } from "./turnCoordinator";
 
 function createDeferred<T>(): {
   promise: Promise<T>;
@@ -107,7 +108,7 @@ describe("AgentSession disposal race conditions", () => {
     expect(inFlight).toBeDefined();
 
     // Dispose while sendMessage() is awaiting appendToHistory.
-    session.dispose();
+    session.beginDispose();
     appendDeferred.resolve(Ok(undefined));
 
     const result = await (inFlight as Promise<Result<void>>);
@@ -128,6 +129,7 @@ describe("AgentSession disposal race conditions", () => {
         startTime: Date.now(),
       })
     ).not.toThrow();
+    await session.dispose();
     await history.cleanup();
   });
 
@@ -224,10 +226,11 @@ describe("AgentSession disposal race conditions", () => {
 
       // Mirror removeWorkspace: dispose the session, cancel + drain the
       // writer, then delete the session directory.
-      session.dispose();
+      session.beginDispose();
       const clearPromise = clearPendingBranchSummary(workspaceId);
       releaseModel();
       await clearPromise;
+      await session.dispose();
       await fs.rm(sessionDir, { recursive: true, force: true });
 
       const result = await sendPromise;
@@ -531,7 +534,7 @@ describe("AgentSession disposal race conditions", () => {
         handleStreamError: (data: unknown) => Promise<void>;
       };
       const handleStreamErrorSpy = spyOn(errorSink, "handleStreamError");
-      session.dispose();
+      session.beginDispose();
       completion.resolve({
         status: "failed",
         streamError: { messageId: "assistant-post-dispose", error: "boom", errorType: "api" },
@@ -539,6 +542,7 @@ describe("AgentSession disposal race conditions", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(handleStreamErrorSpy).not.toHaveBeenCalled();
     } finally {
+      await session.dispose();
       await cleanup();
     }
   });
@@ -563,7 +567,7 @@ describe("AgentSession disposal race conditions", () => {
       });
       // Let the resume park on the pending commitPartial before disposing.
       await new Promise((resolve) => setTimeout(resolve, 10));
-      session.dispose();
+      session.beginDispose();
       commitDeferred.resolve(Err("workspace removed mid-startup"));
 
       const result = await resumePromise;
@@ -574,6 +578,7 @@ describe("AgentSession disposal race conditions", () => {
       expect(handleStreamErrorSpy).not.toHaveBeenCalled();
       expect(autoRetrySpy).not.toHaveBeenCalled();
     } finally {
+      await session.dispose();
       await cleanup();
     }
   });
@@ -649,5 +654,102 @@ describe("AgentSession disposal race conditions", () => {
     // (goal safety uses it to detect messages that predate a fresh goal).
     expect(internal?.synthetic).toBe(true);
     expect(typeof internal?.enqueuedAtMs).toBe("number");
+  });
+});
+
+describe("AgentSession awaitable disposal", () => {
+  test.each([false, true])(
+    "joins stop, background cleanup and original leases; terminal subscriber throws=%s",
+    async (throwSubscriber) => {
+      const stopped = Promise.withResolvers<void>();
+      const background = Promise.withResolvers<void>();
+      const workspaceId = "disposal-fence";
+      const streamManager = {
+        ...createStreamLifecycleMocks(),
+        getStreamInfo: () => ({
+          messageId: "old",
+          model: "openai:gpt-4o",
+          historySequence: 1,
+          startTime: 0,
+          parts: [],
+          currentStepStartIndex: 0,
+          stepStartIndices: [],
+          toolCompletionTimestamps: new Map<string, number>(),
+        }),
+        stopStream: mock(async () => {
+          await stopped.promise;
+          h.aiEmitter.emit("stream-abort", {
+            type: "stream-abort",
+            workspaceId,
+            messageId: "old",
+            abortReason: "system",
+            abandonPartial: true,
+          });
+          return Ok(undefined);
+        }),
+      };
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        streamManager,
+        captureEvents: true,
+        backgroundProcessManagerOverrides: { cleanup: mock(() => background.promise) },
+      });
+      const { coordinator } = h.session as unknown as { coordinator: TurnCoordinator };
+      const originalLease = coordinator.enterExecution();
+      let finished = false;
+      if (throwSubscriber)
+        h.session.onChatEvent(({ message }) => {
+          if (message.type === "stream-abort") throw new Error("terminal subscriber failed");
+        });
+      const disposed = h.session.dispose();
+      const observedDisposal = disposed.then(() => {
+        finished = true;
+      });
+      try {
+        expect(h.session.dispose()).toBe(disposed);
+        expect(coordinator.disposed).toBe(true);
+        expect(h.aiEmitter.listenerCount("stream-abort")).toBeGreaterThan(0);
+        stopped.resolve();
+        await stopped.promise;
+        // The original stop is a separate join from background cleanup and preparation callbacks.
+        expect(finished).toBe(false);
+        background.resolve();
+        await background.promise;
+        expect(finished).toBe(false);
+        originalLease[Symbol.dispose]();
+        await observedDisposal;
+        expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
+        expect(h.aiEmitter.listenerCount("stream-abort")).toBe(0);
+        expect(h.initStateManager.listenerCount("init-start")).toBe(0);
+        expect(streamManager.stopStream).toHaveBeenCalledTimes(1);
+      } finally {
+        stopped.resolve();
+        background.resolve();
+        originalLease[Symbol.dispose]();
+        await disposed;
+        await h.cleanup();
+      }
+    }
+  );
+
+  test("leased callback can initiate disposal before releasing itself", async () => {
+    const h = await createAgentSessionHarness({ workspaceId: "callback-disposal" });
+    const { coordinator } = h.session as unknown as { coordinator: TurnCoordinator };
+    const callbackReturned = Promise.withResolvers<void>();
+    const callback = (async () => {
+      using _lease = coordinator.enterExecution();
+      h.session.beginDispose();
+      await callbackReturned.promise;
+    })();
+    try {
+      expect(coordinator.disposed).toBe(true);
+      callbackReturned.resolve();
+      await callback;
+      await h.session.dispose();
+    } finally {
+      callbackReturned.resolve();
+      await h.session.dispose();
+      await h.cleanup();
+    }
   });
 });

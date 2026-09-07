@@ -144,7 +144,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: ".*", action: "disable" }]);
     expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("startup auto-retry does not dispatch once the workspace is archived on disk", async () => {
@@ -193,7 +193,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     // Completed rather than deferred: nothing reruns the check for an archived workspace.
     expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("auto-retry abandons instead of resuming once the workspace is archived on disk", async () => {
@@ -236,12 +236,14 @@ describe("AgentSession startup auto-retry recovery", () => {
       .map((event) => event.reason);
     expect(abandonedReasons).toEqual(["workspace_archived"]);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("beginShutdown cancels the pending retry and stops re-arming or streaming", async () => {
     const workspaceId = "startup-retry-shutdown";
-    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle("assistant-1"))));
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal, "assistant-1")))
+    );
     const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId, {
       streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
     });
@@ -273,12 +275,14 @@ describe("AgentSession startup auto-retry recovery", () => {
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("beginShutdown during pre-stream awaits stops the stream before the provider", async () => {
     const workspaceId = "startup-retry-shutdown-mid-prepare";
-    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle("assistant-1"))));
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal, "assistant-1")))
+    );
     const { session, historyService, cleanup } = await createSessionBundle(workspaceId, {
       streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
     });
@@ -299,7 +303,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(sendResult.success).toBe(true);
     expect(streamMessage).not.toHaveBeenCalled();
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("visible completed subagent report cards do not schedule startup auto-retry", async () => {
@@ -331,7 +335,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     await startupCheckPromise;
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
-    session.dispose();
+    await session.dispose();
   });
 
   test("visible completed subagent report cards do not mask recoverable assistant partials", async () => {
@@ -375,7 +379,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     await startupCheckPromise;
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
-    session.dispose();
+    await session.dispose();
   });
 
   test("hidden completed subagent reports preserve the existing startup retry fallback", async () => {
@@ -412,7 +416,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     await startupCheckPromise;
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
-    session.dispose();
+    await session.dispose();
   });
 
   test("startup auto-retry reuses workspace-turn metadata from the retry user message", async () => {
@@ -436,7 +440,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(appendResult.success).toBe(true);
     const streamMessageMock = mock(
       (_payload: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
-        Promise.resolve(Ok(createStartedTurnHandle()))
+        Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
     );
     aiService.streamMessage =
       streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
@@ -455,7 +459,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(streamMessageMock).toHaveBeenCalledTimes(1);
     expect(streamMessageMock.mock.calls[0]?.[0]).toMatchObject({ muxMetadata });
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("startup auto-retry does not stamp workflow-result metadata on assistant streams", async () => {
@@ -482,7 +486,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(appendResult.success).toBe(true);
     const streamMessageMock = mock(
       (_payload: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
-        Promise.resolve(Ok(createStartedTurnHandle()))
+        Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
     );
     aiService.streamMessage =
       streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
@@ -498,7 +502,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(streamMessageMock).toHaveBeenCalledTimes(1);
     expect(streamMessageMock.mock.calls[0]?.[0].muxMetadata).toBeUndefined();
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("re-runs startup auto-retry check after busy startup state clears", async () => {
@@ -546,7 +550,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
     expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("re-runs startup auto-retry check after transient history read failures", async () => {
@@ -600,7 +604,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
     expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("backs off reruns after repeated startup history read failures", async () => {
@@ -644,7 +648,7 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     expect(getLastMessagesCalls).toBeGreaterThanOrEqual(2);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("runStartupRecovery gives up after repeated deferred history-read failures", async () => {
@@ -686,7 +690,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(privateSession.startupRecoveryScheduled).toBe(false);
     expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("waits for AI streaming to settle before rerunning deferred startup checks", async () => {
@@ -740,7 +744,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(scheduleCalls).toBe(2);
     expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("restores persisted retry send options for startup auto-retry", async () => {
@@ -805,7 +809,7 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     expect(retryOptions.options.providerOptions?.anthropic?.use1MContext).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("startup auto-retry discards goal attribution when the persisted goal ID is malformed", async () => {
@@ -845,7 +849,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(retryOptions?.goalKind).toBeUndefined();
     expect(retryOptions?.goalId).toBeUndefined();
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("startup auto-retry prefers child workspace agent settings over stale retry metadata", async () => {
@@ -906,7 +910,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(retryOptions.options.model).toBe("openai:gpt-5.5-low");
     expect(retryOptions.options.thinkingLevel).toBe("low");
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("replays pending auto-retry schedule during reconnect catch-up", async () => {
@@ -941,7 +945,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(caughtUpIndex).toBeGreaterThanOrEqual(0);
     expect(scheduledIndex).toBeLessThan(caughtUpIndex);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("respects persisted auto-retry opt-out across restart", async () => {
@@ -966,7 +970,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(appendResult.success).toBe(true);
 
     await firstSession.setAutoRetryEnabled(false);
-    firstSession.dispose();
+    await firstSession.dispose();
 
     const { session: secondSession, events } = await createAgentSessionHarness({
       workspaceId,
@@ -987,7 +991,7 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
-    secondSession.dispose();
+    await secondSession.dispose();
   });
 
   test("respects legacy auto-retry opt-out hint when backend preference is missing", async () => {
@@ -1025,7 +1029,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     };
     expect(persisted.enabled).toBe(false);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("does not persist temporary auto-retry enable across restart", async () => {
@@ -1051,7 +1055,7 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     await firstSession.setAutoRetryEnabled(false);
     await firstSession.setAutoRetryEnabled(true, { persist: false });
-    firstSession.dispose();
+    await firstSession.dispose();
 
     const { session: secondSession, events } = await createAgentSessionHarness({
       workspaceId,
@@ -1072,7 +1076,7 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
-    secondSession.dispose();
+    await secondSession.dispose();
   });
 
   test("does not reschedule startup retries after persisted non-retryable failure", async () => {
@@ -1102,7 +1106,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       }
     ).persistStartupAutoRetryAbandon("runtime_not_ready", "user-1");
 
-    firstSession.dispose();
+    await firstSession.dispose();
 
     const { session: secondSession, events } = await createAgentSessionHarness({
       workspaceId,
@@ -1123,7 +1127,7 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
-    secondSession.dispose();
+    await secondSession.dispose();
   });
 
   test("reports auto-retry as pending while retry resume is starting", async () => {
@@ -1163,7 +1167,7 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     expect(session.hasPendingAutoRetry()).toBe(false);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("clears persisted startup abandon state once retry resumes successfully", async () => {
@@ -1205,7 +1209,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(privateSession.startupAutoRetryAbandon).toBeNull();
     expect(await Bun.file(preferencePath).exists()).toBe(false);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("provider config changes clear credential abandon state without starting a stream", async () => {
@@ -1354,7 +1358,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(resumeStreamMock).toHaveBeenCalledTimes(1);
     expect(scheduledAfter).toBe(scheduledBefore + 1);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("does not re-process retry failures already handled by resumeStream", async () => {
@@ -1391,7 +1395,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(resumeStreamMock).toHaveBeenCalledTimes(1);
     expect(scheduledAfter).toBe(scheduledBefore);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("handles unprocessed resume failures by scheduling the next retry", async () => {
@@ -1427,7 +1431,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(resumeStreamMock).toHaveBeenCalledTimes(1);
     expect(scheduledAfter).toBe(scheduledBefore + 1);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("retryActiveStream resumes the reconstructed follow-up after compaction handoff send fails", async () => {
@@ -1517,7 +1521,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(optionsArg.toolPolicy).toBeUndefined();
     expect(internalArg?.agentInitiated).toBeUndefined();
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("same-session auto-retry preserves ACP correlation fields", async () => {
@@ -1546,7 +1550,7 @@ describe("AgentSession startup auto-retry recovery", () => {
         });
       }
 
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     aiService.streamMessage =
       streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
@@ -1581,7 +1585,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(retryPayload.acpPromptId).toBe(acpPromptId);
     expect(retryPayload.delegatedToolNames).toEqual(delegatedToolNames);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("compaction retry failure preserves the adjusted 1M-context retry request", async () => {
@@ -1701,7 +1705,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     ).toEqual([baseOptions.model]);
     expect(privateSession.lastAutoRetryResumeRequest?.agentInitiated).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("persists startup abandon marker for pre-stream user aborts", async () => {
@@ -1726,7 +1730,9 @@ describe("AgentSession startup auto-retry recovery", () => {
       isStreaming: mock(() => false),
       getStreamInfo: mock(() => undefined),
       replayStream: mock(() => Promise.resolve()),
-      streamMessage: mock(() => Promise.resolve(Ok(createStartedTurnHandle()))),
+      streamMessage: mock(() =>
+        Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+      ),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
     }) as unknown as AgentSessionAIService;
 
@@ -1816,7 +1822,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       userMessageId: "user-1",
     });
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("skips persisting startup abandon marker for non-user abort reasons", async () => {
@@ -1854,7 +1860,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       userMessageId: "user-1",
     });
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("does not schedule startup auto-retry while ask_user_question is waiting", async () => {
@@ -1896,6 +1902,6 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
-    session.dispose();
+    await session.dispose();
   });
 });

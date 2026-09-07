@@ -42,7 +42,7 @@ describe("AgentSession.waitForIdle", () => {
       expect(session.isBusy()).toBe(true);
     } finally {
       internalSession.coordinator.finishTurn(internalSession.coordinator.turnId);
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -71,7 +71,7 @@ describe("AgentSession.waitForIdle", () => {
       release();
       expect(session.hasPendingManualFollowUp()).toBe(false);
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -96,7 +96,7 @@ describe("AgentSession.waitForIdle", () => {
       session.queueMessage("now");
       expect(session.hasQueuedMessages("tool-end")).toBe(true);
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -133,7 +133,7 @@ describe("AgentSession.waitForIdle", () => {
       expect(session.isBusy()).toBe(true);
     } finally {
       internalSession.coordinator.finishTurn(internalSession.coordinator.turnId);
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
