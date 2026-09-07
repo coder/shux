@@ -69,6 +69,13 @@ export function registerInProcessWorkflowRun(workspaceId: string): () => void {
   return incrementInProcessWorkflowWork(workspaceId);
 }
 
+/** Workspaces with a workflow admission or in-process runner, across the whole process. */
+export function inProcessWorkflowWorkspaceCount(): number {
+  let count = 0;
+  for (const value of inProcessWorkflowWorkByWorkspace.values()) if (value > 0) count++;
+  return count;
+}
+
 /** Whether any workflow admission or in-process runner exists for this workspace. */
 export function hasInProcessWorkflowWork(workspaceId: string): boolean {
   return (inProcessWorkflowWorkByWorkspace.get(workspaceId) ?? 0) > 0;

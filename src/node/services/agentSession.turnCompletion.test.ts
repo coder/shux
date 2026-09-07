@@ -1,6 +1,9 @@
 import type { TurnCoordinator } from "./turnCoordinator";
 import { createMuxMessage } from "@/common/types/message";
 import { describe, expect, mock, spyOn, test } from "bun:test";
+import { Exit, Scope } from "effect";
+import { defaultEffectRunner as runner } from "./di/effectRunner";
+import { log } from "./log";
 import { EventEmitter } from "events";
 import type { StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import { Err, Ok } from "@/common/types/result";
@@ -19,6 +22,7 @@ interface InternalSession {
   activeCompactionRequest?: { id: string; modelString: string };
   clearStartupAutoRetryAbandon(): Promise<void>;
   recordGoalAccountingFromUsage(input: unknown): Promise<void>;
+  updateStartupAutoRetryAbandonFromAbort(...args: unknown[]): Promise<void>;
   observeContinuousCompactionAtStreamEnd(...args: unknown[]): Promise<void>;
   coordinator: TurnCoordinator;
   getEditTruncateTargetId(messageId: string): Promise<string>;
@@ -58,6 +62,165 @@ function observePolicy(session: AgentSession) {
 }
 
 describe("AgentSession turn completion", () => {
+  test("late abort bookkeeping failure preserves output in the renderer lifecycle", async () => {
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const emitter = new EventEmitter();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          start(emitter);
+          return Promise.resolve(Ok({ messageId: "assistant-1", completion: completion.promise }));
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    const bookkeeping = spyOn(
+      internal(h.session),
+      "updateStartupAutoRetryAbandonFromAbort"
+    ).mockRejectedValueOnce(new Error("late bookkeeping failure"));
+    try {
+      await h.session.sendMessage("original", sendOptions);
+      emitter.emit("stream-delta", {
+        type: "stream-delta",
+        workspaceId,
+        messageId: "assistant-1",
+        delta: "Visible partial output",
+        tokens: 3,
+        timestamp: Date.now(),
+      });
+      completion.resolve({ status: "aborted", abortReason: "user", streamAbort: abort() });
+      await policyPromise(consumer);
+      expect(bookkeeping).toHaveBeenCalledTimes(1);
+      expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
+      expect(h.events.filter((event) => event.type === "stream-lifecycle").at(-1)).toMatchObject({
+        phase: "interrupted",
+        hadAnyOutput: true,
+        abortReason: "user",
+      });
+    } finally {
+      h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  test("abort failure finalization cannot finish a replacement admitted by its renderer event", async () => {
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const emitter = new EventEmitter();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          start(emitter);
+          return Promise.resolve(Ok({ messageId: "assistant-1", completion: completion.promise }));
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    const coordinator = internal(h.session).coordinator;
+    const replacementThinking = {};
+    let replacement: symbol | undefined;
+    let aborted = 0;
+    h.session.onChatEvent(({ message }) => {
+      if (message.type !== "stream-abort") return;
+      aborted++;
+      replacement = coordinator.prepare();
+      coordinator.acceptThinkingOverride(replacementThinking, replacement);
+    });
+    try {
+      await h.session.sendMessage("original", sendOptions);
+      Reflect.set(h.session, "workspaceGoalService", {
+        recordUserStoppedStream: mock(() => Promise.reject(new Error("accounting failed"))),
+      } satisfies Partial<WorkspaceGoalService>);
+      completion.resolve({ status: "aborted", abortReason: "user", streamAbort: abort() });
+      await policyPromise(consumer);
+      expect(aborted).toBe(1);
+      if (replacement == null) throw new Error("Renderer did not admit the replacement");
+      expect(coordinator.turnId).toBe(replacement);
+      expect(coordinator.phase).toBe("preparing");
+      expect(coordinator.thinkingOverride).toBe(replacementThinking);
+    } finally {
+      h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  test("failed abort accounting releases a waiting edit before app shutdown drains", async () => {
+    const appFiberScope = Scope.makeUnsafe("parallel");
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const accountingEntered = Promise.withResolvers<void>();
+    const releaseAccounting = Promise.withResolvers<void>();
+    const editWaiting = Promise.withResolvers<void>();
+    const emitter = new EventEmitter();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      appFiberScope,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          start(emitter);
+          return Promise.resolve(Ok({ messageId: "assistant-1", completion: completion.promise }));
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    const accountingError = new Error("abort accounting failed");
+    const recordUserStoppedStream = mock(async () => {
+      accountingEntered.resolve();
+      await releaseAccounting.promise;
+      throw accountingError;
+    });
+    const errorLog = spyOn(log, "error");
+    const coordinator = internal(h.session).coordinator;
+    const waitForIdle = coordinator.waitForIdle.bind(coordinator);
+    spyOn(coordinator, "waitForIdle").mockImplementation((signal) => {
+      editWaiting.resolve();
+      return waitForIdle(signal);
+    });
+    let edit: ReturnType<AgentSession["sendMessage"]> | undefined;
+    let closing: Promise<void> | undefined;
+    try {
+      await h.session.sendMessage("original", sendOptions);
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const user = history.data.find((message) => message.role === "user")!;
+      Reflect.set(h.session, "workspaceGoalService", {
+        recordUserStoppedStream,
+        assertPricedModelForBudgetedGoal: () => Promise.resolve(Ok(undefined)),
+      } satisfies Partial<WorkspaceGoalService>);
+      emitter.emit("stream-abort", abort());
+      completion.resolve({ status: "aborted", abortReason: "user", streamAbort: abort() });
+      await accountingEntered.promise;
+      edit = h.session.sendMessage("edited", { ...sendOptions, editMessageId: user.id });
+      await editWaiting.promise;
+      closing = runner.runPromise(Scope.close(appFiberScope, Exit.void));
+      releaseAccounting.resolve();
+      await policyPromise(consumer);
+      // This used to remain COMPLETING forever: the edit lease waited for idle while the
+      // guardian waited for that lease before closing the idle-waiter resource scope.
+      expect(coordinator.phase).toBe("idle");
+      expect((await edit).success).toBe(false);
+      await closing;
+      expect(h.events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
+      expect(spyOn(h.aiService, "streamMessage")).toHaveBeenCalledTimes(1);
+      expect(errorLog).toHaveBeenCalledWith("Failed to consume turn completion", {
+        workspaceId,
+        error: accountingError.message,
+      });
+    } finally {
+      releaseAccounting.resolve();
+      h.session.dispose();
+      await edit;
+      await closing;
+      errorLog.mockRestore();
+      await h.cleanup();
+    }
+  });
+
   test("raw success defers policy; completion uses handle identity and runs policy once", async () => {
     const completion = Promise.withResolvers<TurnCompletion>();
     const emitter = new EventEmitter();

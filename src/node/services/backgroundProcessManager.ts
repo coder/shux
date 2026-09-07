@@ -2381,6 +2381,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     };
   }
 
+  getRunningProcessCount(): number {
+    let count = 0;
+    for (const process of this.processes.values()) {
+      if (process.status === "running") count++;
+    }
+    return count;
+  }
+
   /**
    * Synchronous snapshot: whether any tracked background (non-foreground) process for the
    * workspace is still marked running. Statuses refresh lazily (see list()), so a just-exited

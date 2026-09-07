@@ -88,6 +88,7 @@ import {
   extractCookieValues,
   getFirstHeaderValue,
 } from "./authMiddleware";
+import { inFlightProcedureMiddleware } from "./inFlightProcedures";
 import { clearLogsForApi, getLogFilePath } from "@/node/services/log";
 
 import {
@@ -170,8 +171,16 @@ async function getCurrentServerAuthSessionId(context: ORPCContext): Promise<stri
   return null;
 }
 
+// Config mutations run their whole pre-Effect body in one promise thunk. Uninterruptible, a client
+// abort defers the handler fiber's exit until the write settles instead of detaching the write,
+// so the in-flight procedure count that gates server restarts covers the write itself.
+const atomicPromise = <A>(thunk: () => Promise<A>) => Effect.uninterruptible(Effect.promise(thunk));
+
 export const router = (authToken?: string) => {
-  const t = os.$context<ORPCContext>().use(createAuthMiddleware(authToken));
+  const t = os
+    .$context<ORPCContext>()
+    .use(createAuthMiddleware(authToken))
+    .use(inFlightProcedureMiddleware);
 
   return t.router({
     tokenizer: {
@@ -195,11 +204,10 @@ export const router = (authToken?: string) => {
     // Config-backed procedures ride handlerGen. Interruption posture (also applies to
     // the `config` and `uiLayouts` namespaces below): reads are single Effect.sync
     // steps (interruption is a don't-care); mutations wrap the whole pre-Effect
-    // handler body in one Effect.promise thunk, so they are uninterruptible by
-    // construction — a client abort interrupts the handler fiber, never the in-flight
-    // Semaphore(1)-serialized config edit, and multi-step bodies (mutate + notify)
-    // cannot be torn apart. Rejections become defects, surfacing as the same internal
-    // error the old async handlers produced.
+    // handler body in one atomicPromise thunk, so a client abort never interrupts the
+    // in-flight Semaphore(1)-serialized config edit, multi-step bodies (mutate + notify)
+    // cannot be torn apart, and the handler settles only once the write has. Rejections
+    // become defects, surfacing as the same internal error the old async handlers produced.
     splashScreens: {
       getViewedSplashScreens: t
         .input(schemas.splashScreens.getViewedSplashScreens.input)
@@ -217,9 +225,7 @@ export const router = (authToken?: string) => {
         .output(schemas.splashScreens.markSplashScreenViewed.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () =>
-              context.config.markSplashScreenViewed(input.splashId)
-            );
+            yield* atomicPromise(async () => context.config.markSplashScreenViewed(input.splashId));
           })
         ),
     },
@@ -290,7 +296,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateAgentAiDefaults.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () =>
+            yield* atomicPromise(async () =>
               context.config.updateAgentAiDefaults(input.agentAiDefaults)
             );
           })
@@ -301,7 +307,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateMuxGatewayPrefs.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () => {
+            yield* atomicPromise(async () => {
               await context.config.updateMuxGatewayPrefs(input);
               context.providerService.notifyConfigChanged();
             });
@@ -312,9 +318,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateRoutePreferences.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () =>
-              context.providerService.updateRoutePreferences(input)
-            );
+            yield* atomicPromise(async () => context.providerService.updateRoutePreferences(input));
           })
         ),
 
@@ -323,7 +327,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateMinThinkingLevels.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () =>
+            yield* atomicPromise(async () =>
               context.config.updateMinThinkingLevels(input.minThinkingLevelByModel)
             );
           })
@@ -334,7 +338,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateModelFallbacks.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () =>
+            yield* atomicPromise(async () =>
               context.config.updateModelFallbacks(input.modelFallbacks)
             );
           })
@@ -345,7 +349,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateModelPreferences.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () => context.config.updateModelPreferences(input));
+            yield* atomicPromise(async () => context.config.updateModelPreferences(input));
           })
         ),
 
@@ -354,7 +358,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateCoderPrefs.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () => context.config.updateCoderPrefs(input));
+            yield* atomicPromise(async () => context.config.updateCoderPrefs(input));
           })
         ),
       updateRuntimeEnablement: t
@@ -362,7 +366,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateRuntimeEnablement.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () => context.config.updateRuntimeEnablement(input));
+            yield* atomicPromise(async () => context.config.updateRuntimeEnablement(input));
           })
         ),
 
@@ -371,7 +375,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.saveConfig.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () => {
+            yield* atomicPromise(async () => {
               await context.config.saveUserConfig(input);
               await context.taskService.maybeStartQueuedTasks();
             });
@@ -383,7 +387,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateChatTranscriptFullWidth.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () =>
+            yield* atomicPromise(async () =>
               context.config.updateChatTranscriptFullWidth(input.enabled)
             );
           })
@@ -393,7 +397,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateLlmDebugLogs.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () => context.config.updateLlmDebugLogs(input.enabled));
+            yield* atomicPromise(async () => context.config.updateLlmDebugLogs(input.enabled));
           })
         ),
       updateHeartbeatDefaultPrompt: t
@@ -401,7 +405,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateHeartbeatDefaultPrompt.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () =>
+            yield* atomicPromise(async () =>
               context.config.updateHeartbeatDefaultPrompt(input.defaultPrompt)
             );
           })
@@ -411,7 +415,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateHeartbeatDefaultIntervalMs.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () =>
+            yield* atomicPromise(async () =>
               context.config.updateHeartbeatDefaultIntervalMs(input.intervalMs)
             );
           })
@@ -421,9 +425,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.updateGoalDefaults.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () =>
-              context.config.updateGoalDefaults(input.goalDefaults)
-            );
+            yield* atomicPromise(async () => context.config.updateGoalDefaults(input.goalDefaults));
           })
         ),
       unenrollMuxGovernor: t
@@ -431,7 +433,7 @@ export const router = (authToken?: string) => {
         .output(schemas.config.unenrollMuxGovernor.output)
         .handler(
           handlerGen(function* ({ context }) {
-            yield* Effect.promise(async () => {
+            yield* atomicPromise(async () => {
               await context.config.unenrollMuxGovernor();
               await context.policyService.refreshNow();
             });
@@ -510,9 +512,7 @@ export const router = (authToken?: string) => {
         .output(schemas.uiLayouts.saveAll.output)
         .handler(
           handlerGen(function* ({ context }, input) {
-            yield* Effect.promise(async () =>
-              context.config.saveLayoutPresets(input.layoutPresets)
-            );
+            yield* atomicPromise(async () => context.config.saveLayoutPresets(input.layoutPresets));
           })
         ),
     },

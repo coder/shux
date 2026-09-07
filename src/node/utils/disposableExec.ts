@@ -269,6 +269,7 @@ export function execAsync(command: string, options?: ExecAsyncOptions): Disposab
  * Options for execFileAsync.
  */
 export interface ExecFileAsyncOptions {
+  cwd?: string;
   /** Extra environment variables for the child process. */
   env?: Record<string, string | undefined>;
   /** Optional callback for each stderr data chunk from the process. */
@@ -322,6 +323,7 @@ export function execFileAsync(
   const killsProcessTree =
     options?.maxOutputBytes !== undefined || options?.killTreeOnTermination === true;
   const child = spawn(file, args, {
+    cwd: options?.cwd,
     stdio: ["ignore", "pipe", "pipe"],
     env: options?.env ? { ...process.env, ...options.env } : undefined,
     // Unix tree termination needs a separate process group, but detaching also hides terminal

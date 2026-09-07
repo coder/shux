@@ -54,16 +54,18 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
           hooks,
           resolveAgentBody: () => runtime.resolveAgentBody(),
           modelString: model,
+          thinkingLevel: runtime.thinkingLevel,
           memoryService,
           ctx,
           cue,
           abortSignal: signal,
-          recordUsage: (usage, providerMetadata) =>
+          recordUsage: (usage, providerMetadata, metadataModel) =>
             Promise.resolve(
               config.reportModelUsage?.({
                 source: "tool",
                 toolName: "intuition",
                 model,
+                metadataModel,
                 usage,
                 providerMetadata,
                 toolCallId,

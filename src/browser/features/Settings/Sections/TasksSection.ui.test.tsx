@@ -6,6 +6,10 @@ import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { getModelKey } from "@/common/constants/storage";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { FALLBACK_AGENTS } from "./TasksSection.agents";
 
 let advisorExperimentEnabled = false;
 let experimentValues: Record<string, boolean> = {};
@@ -24,7 +28,7 @@ let selectedWorkspaceMock: { projectPath: string; workspaceId: string } | null =
 
 void mock.module("@/browser/contexts/API", () => ({
   useAPI: () => ({ api: apiMock }),
-  // ThinkingSelectorControl's useMinThinkingLevels degrades to defaults without an API.
+  // Config hooks read the shared store directly; this harness needs no API subscription.
   useOptionalAPI: () => null,
 }));
 
@@ -107,6 +111,7 @@ interface RenderTasksSectionOptions {
   agentAiDefaults?: AgentAiDefaults;
   /** When set, serves this discovered-agent list instead of FALLBACK_AGENTS. */
   agents?: AgentDefinitionDescriptor[];
+  workspaceModel?: string;
 }
 
 function renderTasksSection(options: RenderTasksSectionOptions = {}) {
@@ -123,10 +128,16 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
       getConfig,
       saveConfig,
     },
-    ...(options.agents ? { agents: { list: mock(() => Promise.resolve(options.agents)) } } : {}),
+    ...(options.agents || options.workspaceModel
+      ? { agents: { list: mock(() => Promise.resolve(options.agents ?? FALLBACK_AGENTS)) } }
+      : {}),
   };
   // Discovery only runs for a selected workspace's project.
-  selectedWorkspaceMock = options.agents ? { projectPath: "/proj", workspaceId: "ws-1" } : null;
+  selectedWorkspaceMock =
+    options.agents || options.workspaceModel ? { projectPath: "/proj", workspaceId: "ws-1" } : null;
+  if (options.workspaceModel) {
+    updatePersistedState(getModelKey("ws-1"), options.workspaceModel);
+  }
 
   const view = render(
     <PolicyProvider>
@@ -173,6 +184,7 @@ describe("TasksSection Exec subagent defaults", () => {
 
   beforeEach(() => {
     restoreDom = installDom();
+    getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: {} });
     advisorExperimentEnabled = false;
     experimentValues = {};
     apiMock = null;
@@ -181,6 +193,7 @@ describe("TasksSection Exec subagent defaults", () => {
 
   afterEach(() => {
     cleanup();
+    getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: {} });
     apiMock = null;
     restoreDom?.();
     restoreDom = null;
@@ -218,17 +231,149 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(within(card).queryByLabelText("Toggle intuition advisor")).toBeNull();
     expect(within(card).getAllByRole("switch")).toHaveLength(1);
     expect(within(card).getAllByRole("combobox")).toHaveLength(1);
-    expect(within(card).getAllByRole("button")).toHaveLength(1);
+    expect(within(card).getByRole("button", { name: "Reasoning" }).textContent).toContain("High");
     expect(
       within(getAgentCardByName(view, "Name Workspace")).getByLabelText(
         "Toggle name_workspace advisor"
       )
     ).toBeTruthy();
-    expect(within(card).queryByRole("button", { name: "Reasoning" })).toBeNull();
-    expect(within(card).queryByText("Reasoning")).toBeNull();
+    selectReasoningOption(card, "Medium");
+    await waitFor(() => {
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition).toMatchObject({
+        modelString: "openai:gpt-5.6-sol",
+        thinkingLevel: "medium",
+      });
+    });
+    expect(within(card).queryByRole("button", { name: /Pro mode/ })).toBeNull();
+    const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
+    fireEvent.click(within(listbox).getByRole("option", { name: "Inherit" }));
+    await waitFor(() => {
+      const settings = getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition;
+      expect(settings?.thinkingLevel).toBeUndefined();
+      expect(settings?.modelString).toBe("openai:gpt-5.6-sol");
+    });
     expect(
       within(getAgentCardByName(view, "Name Workspace")).getByRole("button", { name: "Reasoning" })
     ).toBeTruthy();
+  });
+
+  test("Intuition can display and save Off and Low below the chat minimum", async () => {
+    advisorExperimentEnabled = true;
+    getAppConfigStore().updateOptimistically({
+      minThinkingLevelByModel: { "openai:gpt-5.6-sol": "high" },
+    });
+    const view = renderTasksSection({
+      agentAiDefaults: {
+        intuition: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "low" },
+        explore: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "low" },
+      },
+    });
+    await view.findByText("Intuition");
+    const card = getAgentCardByName(view, "Intuition");
+    const reasoning = within(card).getByRole("button", { name: "Reasoning" });
+    expect(reasoning.textContent).toContain("Low");
+    fireEvent.click(reasoning);
+    const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
+    for (const [label, level] of [
+      ["Off", "off"],
+      ["Low", "low"],
+    ] as const) {
+      fireEvent.click(within(listbox).getByRole("option", { name: label }));
+      await waitFor(() => {
+        expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition?.thinkingLevel).toBe(
+          level
+        );
+      });
+      expect(reasoning.textContent).toContain(label);
+    }
+
+    // Ordinary task agents still use the chat floor for the same model.
+    const explore = getAgentCardByName(view, "Explore");
+    const exploreReasoning = within(explore).getByRole("button", { name: "Reasoning" });
+    expect(exploreReasoning.textContent).toContain("High");
+    fireEvent.click(exploreReasoning);
+    expect(within(explore).queryByRole("option", { name: "Off" })).toBeNull();
+    expect(within(explore).queryByRole("option", { name: "Low" })).toBeNull();
+  });
+
+  test.each([undefined, "openai:gpt-5.6-sol"])(
+    "Intuition inherits workspace/default capabilities instead of global Exec (workspace=%s)",
+    async (workspaceModel) => {
+      advisorExperimentEnabled = true;
+      const view = renderTasksSection({
+        workspaceModel,
+        agentAiDefaults: { exec: { modelString: "openai:gpt-5-pro" } },
+      });
+      await view.findByText("Intuition");
+      const card = getAgentCardByName(view, "Intuition");
+      selectReasoningOption(card, "Low");
+      const max = within(card).queryByRole("option", { name: "Max" });
+      if (workspaceModel) expect(max).toBeTruthy();
+      else expect(max).toBeNull();
+      await waitFor(() => {
+        expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition).toEqual({
+          thinkingLevel: "low",
+        });
+      });
+    }
+  );
+
+  test.each([undefined, "openai:gpt-5-pro"])(
+    "Intuition prefers its own model override to its definition, then the parent (override=%s)",
+    async (modelString) => {
+      advisorExperimentEnabled = true;
+      const view = renderTasksSection({
+        agents: FALLBACK_AGENTS.map((agent) =>
+          agent.id === "intuition"
+            ? { ...agent, aiDefaults: { model: "openai:gpt-5.6-sol" } }
+            : agent
+        ),
+        agentAiDefaults: {
+          exec: { modelString: "anthropic:ui-exec" },
+          intuition: { modelString },
+        },
+      });
+      await view.findByText("Intuition");
+      const card = getAgentCardByName(view, "Intuition");
+      fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
+      const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
+      expect(within(listbox).getByRole("option", { name: "High" })).toBeTruthy();
+      if (modelString) {
+        expect(within(listbox).queryByRole("option", { name: "Low" })).toBeNull();
+        expect(within(listbox).queryByRole("option", { name: "Max" })).toBeNull();
+      } else {
+        expect(within(listbox).getByRole("option", { name: "Low" })).toBeTruthy();
+        expect(within(listbox).getByRole("option", { name: "Max" })).toBeTruthy();
+      }
+    }
+  );
+
+  test("Intuition exposes only Off and High for the binary Grok Fast model", async () => {
+    advisorExperimentEnabled = true;
+    const view = renderTasksSection({
+      agentAiDefaults: { intuition: { modelString: "xai:grok-4-1-fast", thinkingLevel: "low" } },
+    });
+    await view.findByText("Intuition");
+    const card = getAgentCardByName(view, "Intuition");
+    expect(within(card).getByRole("button", { name: "Reasoning" }).textContent).toContain("High");
+    selectReasoningOption(card, "Off");
+    const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
+    expect(
+      within(listbox)
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("aria-label"))
+    ).toEqual(["Inherit", "Off", "High"]);
+    await waitFor(() => {
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition?.thinkingLevel).toBe(
+        "off"
+      );
+    });
+    fireEvent.click(within(listbox).getByRole("option", { name: "High" }));
+    await waitFor(() => {
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition?.thinkingLevel).toBe(
+        "high"
+      );
+    });
   });
 
   test("renders a distinct Exec subagent row", async () => {

@@ -106,6 +106,11 @@ export const CommandIds = {
 
   // Help commands
   helpKeybinds: () => "help:keybinds" as const,
+  aboutOpen: () => "about:open" as const,
+  updateCheck: () => "update:check" as const,
+  updateDownload: () => "update:download" as const,
+  updateInstall: () => "update:install" as const,
+  updateChannel: (channel: string) => `update:channel:${channel}` as const,
 } as const;
 
 /**

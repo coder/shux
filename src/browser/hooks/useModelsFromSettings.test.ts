@@ -11,13 +11,15 @@ import {
   getSuggestedModels,
   useModelsFromSettings,
 } from "./useModelsFromSettings";
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
 import type {
   EffectivePolicy,
   ProviderConfigInfo,
   ProviderModelEntry,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
+import { updatePersistedState } from "./usePersistedState";
+import { shouldShowModelInSettings } from "@/browser/features/Settings/Sections/ModelsSection";
 import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
 
 function countOccurrences(haystack: string[], needle: string): number {
@@ -916,7 +918,7 @@ describe("useModelsFromSettings provider availability gating", () => {
 
     expect(result.current.models).toContain(KNOWN_MODELS.OPUS.id);
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.hiddenModelsForSelector.length).toBe(0);
+    expect(result.current.hiddenModelsForSelector).toEqual(DEFAULT_HIDDEN_MODELS);
   });
 
   test("gateway-prefixed custom model stays available via canonical route override when gateway is unavailable", () => {
@@ -1004,5 +1006,46 @@ describe("useModelsFromSettings hidden-model gateway identity", () => {
     await waitFor(() => {
       expect(result.current.models).toContain("coder:openai/claude-opus-4-1");
     });
+  });
+});
+
+describe("Daybreak settings and selector visibility", () => {
+  beforeEach(setupUseModelsHookTest);
+  afterEach(cleanupUseModelsHookTest);
+
+  test.each([
+    ["openai:daybreak-blue-latest", "openai:daybreak-red-latest"],
+    ["openai:daybreak-red-latest", "openai:daybreak-blue-latest"],
+  ])("enables %s independently and preserves visibility across reload", async (first, second) => {
+    providersConfig = { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } };
+    const persist = mock(() => Promise.resolve());
+    apiMock = { config: { updateModelPreferences: persist } };
+    updatePersistedState(DEFAULT_MODEL_KEY, KNOWN_MODELS.GPT.id);
+    let hook = renderHook(() => useModelsFromSettings());
+    for (const id of [first, second]) {
+      expect(
+        getSuggestedModels(providersConfig).filter((m) => shouldShowModelInSettings(m, false))
+      ).toContain(id);
+      expect(hook.result.current.models).not.toContain(id);
+      expect(hook.result.current.hiddenModels).toContain(id);
+    }
+    act(() => hook.result.current.hideModel(KNOWN_MODELS.GPT_PRO.id));
+    act(() => hook.result.current.unhideModel(first));
+    await waitFor(() => expect(hook.result.current.models).toContain(first));
+    expect(hook.result.current.models).not.toContain(second);
+    expect(persist).toHaveBeenLastCalledWith({ hiddenModels: [second, KNOWN_MODELS.GPT_PRO.id] });
+
+    hook.unmount();
+    hook = renderHook(() => useModelsFromSettings());
+    expect(hook.result.current.models).toContain(first);
+    expect(hook.result.current.models).not.toContain(second);
+    expect(hook.result.current.defaultModel).toBe(KNOWN_MODELS.GPT.id);
+    expect(hook.result.current.hiddenModels).toContain(KNOWN_MODELS.GPT_PRO.id);
+
+    act(() => hook.result.current.unhideModel(second));
+    await waitFor(() => expect(hook.result.current.models).toContain(second));
+    act(() => hook.result.current.hideModel(first));
+    await waitFor(() => expect(hook.result.current.models).not.toContain(first));
+    expect(hook.result.current.models).toContain(second);
   });
 });

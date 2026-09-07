@@ -1,5 +1,6 @@
+import { VERSION } from "@/version";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import type { RecursivePartial } from "@/browser/testUtils";
 
@@ -239,6 +240,67 @@ describe("API reconnection", () => {
     expect(setStoredAuthTokenMock.mock.calls).toHaveLength(0);
     expect(MockWebSocket.instances).toHaveLength(0);
   });
+
+  test.each(["changed", "rebuilt", "same", "unreachable", "malformed", "cross-origin"])(
+    "checks the server version on reconnect: %s",
+    async (scenario) => {
+      if (scenario === "cross-origin") process.env.VITE_BACKEND_URL = "https://api.example.com";
+      const reload = spyOn(window.location, "reload").mockImplementation(() => undefined);
+      const requests: string[] = [];
+      fetchImpl = (input) => {
+        requests.push(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+        );
+        if (scenario === "unreachable") return Promise.reject(new Error("offline"));
+        return Promise.resolve(
+          new Response(
+            JSON.stringify(
+              scenario === "malformed"
+                ? {}
+                : {
+                    git_commit:
+                      scenario === "changed" ? "different-server-commit" : VERSION.git_commit,
+                    git_describe: scenario === "rebuilt" ? "v9.9.9-rebuilt" : VERSION.git_describe,
+                  }
+            ),
+            { status: 200 }
+          )
+        );
+      };
+      window.location.href = "https://coder.example.com/@u/ws/apps/mux/";
+      let latestState: UseAPIResult | null = null;
+      render(
+        <APIProvider createWebSocket={createMockWebSocket}>
+          <APIStateObserver
+            onState={(s) => {
+              latestState = s.apiState;
+            }}
+          />
+        </APIProvider>
+      );
+      await act(async () => {
+        MockWebSocket.lastInstance()!.simulateOpen();
+        await Promise.resolve();
+      });
+      expect(latestState!.status).toBe("connected");
+      expect(requests).toEqual([]);
+      act(() => {
+        latestState!.retry();
+      });
+      await act(async () => {
+        MockWebSocket.lastInstance()!.simulateOpen();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual(
+        scenario === "cross-origin" ? [] : ["https://coder.example.com/@u/ws/apps/mux/version"]
+      );
+      const reloads = scenario === "changed" || scenario === "rebuilt" ? 1 : 0;
+      expect(reload).toHaveBeenCalledTimes(reloads);
+      if (reloads === 0) expect(latestState!.status).toBe("connected");
+      reload.mockRestore();
+      delete process.env.VITE_BACKEND_URL;
+    }
+  );
 
   test("reconnects on close without showing auth_required when previously connected", async () => {
     const states: string[] = [];

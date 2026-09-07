@@ -2550,6 +2550,7 @@ export const config = {
       advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.optional(),
       advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.optional(),
       hiddenModels: z.array(z.string()).optional(),
+      hiddenModelsInitialized: z.boolean().optional(),
       coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS),
       worktreeArchiveBehavior: z.enum(WORKTREE_ARCHIVE_BEHAVIORS),
       runtimeEnablement: z.record(z.string(), z.boolean()),

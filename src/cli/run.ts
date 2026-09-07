@@ -8,6 +8,7 @@
  *   xum run --runtime "ssh user@host" "Deploy changes"
  */
 
+import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import { Command } from "commander";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { tool } from "ai";
@@ -735,6 +736,8 @@ async function main(): Promise<number> {
   turnRequestBuilderBindings.extraTools = { set_exit_code: setExitCodeTool };
 
   const session = new AgentSession({
+    effectRunner: coreRuntime.get(EffectRunnerTag),
+    appFiberScope,
     workspaceId,
     config,
     historyService,

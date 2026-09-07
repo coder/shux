@@ -1,4 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
+import { Effect, Exit, Scope } from "effect";
+import { defaultEffectRunner as runner } from "./di/effectRunner";
 import {
   TurnCoordinator,
   initialCoordinatorState,
@@ -50,6 +52,148 @@ function reduce(events: CoordinatorEvent[]) {
 }
 
 describe("TurnCoordinator", () => {
+  test("session scope releases thinking and idle listeners even without another idle event", async () => {
+    const scope = Scope.makeUnsafe("parallel");
+    const { coordinator } = setup();
+    coordinator.supervise(runner, scope, () => coordinator.beginShutdown());
+    const turn = coordinator.prepare();
+    coordinator.acceptThinkingOverride({}, turn);
+    const signal = new AbortController();
+    const canceled = coordinator.waitForIdle(signal.signal);
+    signal.abort();
+    expect(await canceled.catch((error: unknown) => error)).toBeInstanceOf(Error);
+    const idle = coordinator.waitForIdle();
+    await runner.runPromise(Scope.close(scope, Exit.void));
+    await idle;
+    expect(coordinator.thinkingOverride).toBeNull();
+    expect(coordinator.phase).toBe("preparing");
+  });
+
+  test("completion callback reserves synchronously before the next Promise observer", async () => {
+    const order: string[] = [];
+    const { coordinator } = setup({
+      policy: async () => {
+        order.push("policy");
+        await Promise.resolve();
+        order.push("settled");
+      },
+    });
+    const op = coordinator.registerOperation(coordinator.prepare());
+    const engine = Promise.resolve(completed);
+    const consumed = coordinator.consumeCompletion(op, { messageId: "sync", completion: engine });
+    await engine.then(() => order.push("observer"));
+    await consumed;
+    expect(order).toEqual(["policy", "observer", "settled"]);
+    coordinator.dispose();
+  });
+
+  test("app shutdown accepts a registered engine's late terminal and joins its policy", async () => {
+    const scope = Scope.makeUnsafe("parallel");
+    const engine = Promise.withResolvers<TurnCompletion>();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const { coordinator, callbacks } = setup({
+      policy: () => {
+        entered.resolve();
+        return release.promise;
+      },
+    });
+    coordinator.supervise(runner, scope, () => coordinator.beginShutdown());
+    const turn = coordinator.prepare();
+    const op = coordinator.registerOperation(turn);
+    coordinator.streamStarted(startEvent("late"));
+    const consumed = coordinator.consumeCompletion(op, {
+      messageId: "late",
+      completion: engine.promise,
+    });
+    let closed = false;
+    const closing = runner.runPromise(Scope.close(scope, Exit.void)).then(() => {
+      closed = true;
+    });
+    expect(coordinator.closing).toBe(true);
+    expect(coordinator.prepare()).not.toBe(coordinator.turnId);
+    engine.resolve(completed);
+    await entered.promise;
+    // Engine completion never joins the policy that may itself need engine cleanup.
+    expect(await engine.promise).toBe(completed);
+    expect(closed).toBe(false);
+    release.resolve();
+    await Promise.all([consumed, closing]);
+    expect(callbacks.policyError).not.toHaveBeenCalled();
+  });
+
+  test("interruption joins the original policy once and retains retired physical work", async () => {
+    const scope = Scope.makeUnsafe("parallel");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let calls = 0;
+    const { coordinator } = setup({
+      policy: () => {
+        calls++;
+        entered.resolve();
+        return release.promise;
+      },
+    });
+    coordinator.supervise(runner, scope, () => coordinator.beginShutdown());
+    const turn = coordinator.prepare();
+    const op = coordinator.registerOperation(turn);
+    coordinator.streamStarted(startEvent("retired"));
+    coordinator.beginErrorDecision("retired");
+    const logical = coordinator.captureInterruptSettlement();
+    const consumed = coordinator.consumeCompletion(op, {
+      messageId: "retired",
+      completion: Promise.resolve(completed),
+    });
+    await entered.promise;
+    const replacement = coordinator.prepare();
+    await logical;
+    let settled = false;
+    const decision = coordinator.waitForErrorDecision("retired").then((outcome) => {
+      settled = true;
+      return outcome;
+    });
+    let closed = false;
+    const closing = runner.runPromise(Scope.close(scope, Exit.void)).then(() => {
+      closed = true;
+    });
+    // A turn may retire logically while its Promise is still writing. Interruption cannot
+    // finalize its decisions or let app teardown pass that write.
+    await runner.runPromise(Effect.yieldNow);
+    expect(closed).toBe(false);
+    expect(settled).toBe(false);
+    expect(calls).toBe(1);
+    expect(coordinator.turnId).toBe(replacement);
+    release.resolve();
+    await Promise.all([consumed, closing]);
+    expect(await decision).toBe("terminal");
+    expect(calls).toBe(1);
+    expect(coordinator.turnId).toBe(replacement);
+  });
+
+  test.each(["throw", "reject"])(
+    "policy %s finalizes decisions and physical shutdown",
+    async (failure) => {
+      const scope = Scope.makeUnsafe("parallel");
+      const error = new Error("policy failed");
+      const { coordinator, callbacks } = setup({
+        policy: () => {
+          if (failure === "throw") throw error;
+          return Promise.reject(error);
+        },
+      });
+      coordinator.supervise(runner, scope, () => coordinator.beginShutdown());
+      const op = coordinator.registerOperation(coordinator.prepare());
+      coordinator.beginErrorDecision("failed");
+      await coordinator.consumeCompletion(op, {
+        messageId: "failed",
+        completion: Promise.resolve(completed),
+      });
+      await runner.runPromise(Scope.close(scope, Exit.void));
+      expect(await coordinator.waitForErrorDecision("failed")).toBe("terminal");
+      expect(callbacks.policyError).toHaveBeenCalledWith(error);
+    }
+  );
+
   test("retired preparation, operation, reservation and retry events cannot affect their replacements", () => {
     const a = Symbol("A"),
       b = Symbol("B"),

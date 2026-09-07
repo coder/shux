@@ -399,7 +399,9 @@ export const WorkspaceLive = Layer.effect(
       yield* StreamManagerTag,
       yield* SecretsStoreTag,
       yield* ProvidersConfigStoreTag,
-      yield* DesktopInputCoordinatorTag
+      yield* DesktopInputCoordinatorTag,
+      yield* EffectRunnerTag,
+      yield* AppFiberScopeTag
     );
   })
 );

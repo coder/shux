@@ -1,12 +1,13 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-unsafe-argument, @typescript-eslint/require-await, local/no-sync-fs-methods */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { createRouterClient } from "@orpc/server";
+import { createRouterClient, ORPCError } from "@orpc/server";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
 
 import type { ORPCContext } from "./context";
+import { inFlightProcedureCount } from "./inFlightProcedures";
 import { router } from "./router";
 
 describe("router agent skill routes", () => {
@@ -242,5 +243,53 @@ describe("router config transcript mutation", () => {
     await client.config.updateChatTranscriptFullWidth({ enabled: false });
     expect((await client.config.getConfig()).chatTranscriptFullWidth).toBe(false);
     expect(config.loadConfigOrDefault().chatTranscriptFullWidth).toBeUndefined();
+  });
+
+  test("refuses procedure calls once the server has begun shutting down", async () => {
+    let shuttingDown = false;
+    const context = {
+      config,
+      serverService: { isShuttingDown: () => shuttingDown },
+    } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+    expect(await client.general.ping("alive")).toBe("Pong: alive");
+
+    shuttingDown = true;
+    let error: unknown;
+    try {
+      await client.general.ping("late");
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(ORPCError);
+    expect((error as ORPCError<string, unknown>).code).toBe("SERVICE_UNAVAILABLE");
+  });
+
+  test("an aborted config mutation stays in flight until its write settles", async () => {
+    let started!: () => void;
+    const writeStarted = new Promise<void>((resolve) => (started = resolve));
+    let finish!: () => void;
+    const write = new Promise<void>((resolve) => (finish = resolve));
+    const context = {
+      config: {
+        markSplashScreenViewed: () => {
+          started();
+          return write;
+        },
+      },
+    } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+    const controller = new AbortController();
+    const call = client.splashScreens
+      .markSplashScreenViewed({ splashId: "late" }, { signal: controller.signal })
+      .catch((error: unknown) => error);
+    await writeStarted;
+    expect(inFlightProcedureCount()).toBe(1);
+    controller.abort();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(inFlightProcedureCount()).toBe(1);
+    finish();
+    await call;
+    expect(inFlightProcedureCount()).toBe(0);
   });
 });

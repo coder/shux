@@ -54,6 +54,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { LEGACY_MUX_PRODUCT_NAME, LEGACY_MUX_PRODUCT_SLUG } from "@/common/compat/legacyMux";
 import { XUM_PRODUCT_NAME, XUM_PRODUCT_SLUG } from "@/common/constants/product";
+import { DEFAULT_HIDDEN_MODELS } from "@/common/constants/knownModels";
 import { GATEWAY_PROVIDERS } from "@/common/constants/providers";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
@@ -521,7 +522,7 @@ function normalizeOptionalModelStringArray(value: unknown): string[] | undefined
     out.push(normalized);
   }
 
-  return out;
+  return value.length > 0 && out.length === 0 ? undefined : out;
 }
 
 function normalizeAiDefaultsModelStrings<
@@ -1429,16 +1430,10 @@ export class Config {
         }
 
         if (Array.isArray(parsed.hiddenModels)) {
-          const sourceHiddenModels = parsed.hiddenModels.filter(
-            (model): model is string => typeof model === "string"
-          );
-          const normalizedHiddenModels = sourceHiddenModels.map((model) =>
-            normalizeSelectedModel(model.trim())
-          );
-
+          const normalizedHiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
           if (
-            sourceHiddenModels.length !== parsed.hiddenModels.length ||
-            !areStringArraysEqual(sourceHiddenModels, normalizedHiddenModels)
+            normalizedHiddenModels === undefined ||
+            !areStringArraysEqual(parsed.hiddenModels, normalizedHiddenModels)
           ) {
             parsed.hiddenModels = normalizedHiddenModels;
             configModified = true;
@@ -1695,6 +1690,30 @@ export class Config {
           parsed.advisorMaxOutputTokens === null
             ? null
             : parseOptionalPositiveInteger(parsed.advisorMaxOutputTokens);
+        const hiddenMigrations = normalizeConfigMigrations(parsed.migrations);
+        const existingHiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
+        if (
+          existingHiddenModels === undefined &&
+          hiddenMigrations.hiddenModelsInitialized === true
+        ) {
+          hiddenMigrations.hiddenModelsInitialized = false;
+          parsed.migrations = hiddenMigrations;
+          configModified = true;
+        }
+        if (hiddenMigrations.daybreakModelsHidden !== true) {
+          // Seed once, without losing unrelated hides or re-hiding models users later enable.
+          parsed.migrations = {
+            ...hiddenMigrations,
+            daybreakModelsHidden: true,
+            hiddenModelsInitialized:
+              hiddenMigrations.hiddenModelsInitialized === true ||
+              existingHiddenModels !== undefined,
+          };
+          parsed.hiddenModels = [
+            ...new Set([...(existingHiddenModels ?? []), ...DEFAULT_HIDDEN_MODELS]),
+          ];
+          configModified = true;
+        }
         const hiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
         // Legacy root subagentAiDefaults (written by older builds and by the
         // save-time downgrade projection) folds into the canonical nested
@@ -1860,7 +1879,9 @@ export class Config {
       // migration flag rides along so the first save locks in seed-once
       // semantics (later loads never re-apply the defaults).
       modelFallbacks: { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS },
+      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
       migrations: {
+        daybreakModelsHidden: true,
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
@@ -2330,6 +2351,7 @@ export class Config {
       advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
       advisorMaxOutputTokens: config.advisorMaxOutputTokens,
       hiddenModels: config.hiddenModels,
+      hiddenModelsInitialized: config.migrations?.hiddenModelsInitialized === true,
       coderWorkspaceArchiveBehavior:
         config.coderWorkspaceArchiveBehavior ?? DEFAULT_CODER_ARCHIVE_BEHAVIOR,
       worktreeArchiveBehavior: config.worktreeArchiveBehavior ?? DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
@@ -2477,6 +2499,7 @@ export class Config {
       }
       if (input.hiddenModels !== undefined) {
         next.hiddenModels = normalizeOptionalModelStringArray(input.hiddenModels) ?? [];
+        next.migrations = { ...next.migrations, hiddenModelsInitialized: true };
       }
       return next;
     });
