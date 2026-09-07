@@ -1689,6 +1689,19 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       </span>
                     </button>
                   )}
+                  {/* Read-only transcripts need replay feedback without an editable composer. */}
+                  {isHydratingTranscript && !shouldMountStreamingBarrier && (
+                    <ChatDockSurface>
+                      <div
+                        role="status"
+                        data-testid="transcript-loading-status"
+                        className="text-muted flex items-center gap-2 px-3 py-1 text-xs"
+                      >
+                        <Loader2 aria-hidden="true" className="size-3 shrink-0 animate-spin" />
+                        <span>Loading messages...</span>
+                      </div>
+                    </ChatDockSurface>
+                  )}
                   {transcriptOnly ? (
                     // Transcript-only workspaces keep their historical transcript, but the whole
                     // composer surface is replaced with a single read-only notice.
@@ -1702,7 +1715,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       revealDecorations={revealDecorations}
                       isStreamStarting={isStreamStarting}
                       isTranscriptCaughtUp={isTranscriptCaughtUp}
-                      isHydratingTranscript={isHydratingTranscript}
                       runtimeConfig={runtimeConfig}
                       isPreStreamAgentTask={isPreStreamAgentTask}
                       preStreamAgentTaskStatus={
@@ -1784,7 +1796,6 @@ interface ChatInputPaneProps {
   isCompacting: boolean;
   isStreamStarting: boolean;
   isTranscriptCaughtUp: boolean;
-  isHydratingTranscript: boolean;
   shouldShowPinnedTodoList: boolean;
   shouldShowReviewsBanner: boolean;
   concurrentLocalStreamingWorkspaceName: string | null;
@@ -1936,26 +1947,8 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       ),
     });
   }
-  if (props.isHydratingTranscript && !props.isStreamStarting && !props.canInterrupt) {
-    decorationEntries.push(
-      createChatInputDecorationStackItem({
-        key: "transcript-loading",
-        // Cached rows can be stale until replay completes, even before decorations are ready.
-        revealBeforeReady: true,
-        node: (
-          <ChatDockSurface>
-            <div role="status" className="text-muted flex items-center gap-2 px-3 py-1 text-xs">
-              <Loader2 aria-hidden="true" className="size-3 shrink-0 animate-spin" />
-              <span>Loading messages...</span>
-            </div>
-          </ChatDockSurface>
-        ),
-      })
-    );
-  }
   // Keep decorations in the in-flow composer dock so height changes reserve
-  // transcript clearance in the same layout pass. Synchronous chat state bypasses
-  // readiness so hydration does not hide loading feedback or the queued follow-up.
+  // transcript clearance in the same layout pass.
 
   return (
     <>

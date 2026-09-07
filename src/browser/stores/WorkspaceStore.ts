@@ -3846,33 +3846,21 @@ export class WorkspaceStore {
    * Retries on unexpected iterator termination to avoid requiring a full app restart.
    */
   private async runOnChatSubscription(workspaceId: string, signal: AbortSignal): Promise<void> {
-    // Loop-scoped so the observation survives the generation retry: attaching a
-    // client aborts the change signal the waiting attempt captured, and the
-    // retried attempt would otherwise see the client as always-present.
-    let clientWasMissing = false;
     await runSubscriptionLoop({
       name: "onChat(" + workspaceId + ")",
       signal,
-      getClient: async (attemptSignal) => {
-        if (this.client === null) clientWasMissing = true;
-        return this.client ?? (await this.waitForClient(attemptSignal));
-      },
+      getClient: async (attemptSignal) => this.client ?? (await this.waitForClient(attemptSignal)),
       getClientChangeSignal: () => this.clientChangeController.signal,
       subscribe: async (client, attemptSignal, abortAttempt) => {
-        const hadClientAtLoopStart = !clientWasMissing;
-        clientWasMissing = false;
-        const initialTransient = this.chatTransientState.get(workspaceId);
-        if (
-          !hadClientAtLoopStart &&
-          initialTransient &&
-          !initialTransient.caughtUp &&
-          !initialTransient.isHydratingTranscript
-        ) {
-          initialTransient.isHydratingTranscript = true;
-          this.states.bump(workspaceId);
-        }
         const transient = this.chatTransientState.get(workspaceId);
-        if (transient) transient.caughtUp = false;
+        if (transient) {
+          transient.caughtUp = false;
+          // Every attempt replays, including retries that keep the same client and cached rows.
+          if (!transient.isHydratingTranscript) {
+            transient.isHydratingTranscript = true;
+            this.states.bump(workspaceId);
+          }
+        }
         const aggregator = this.aggregators.get(workspaceId);
         let mode: OnChatMode | undefined;
         const attemptContext: OnChatAttemptContext = { abort: abortAttempt };

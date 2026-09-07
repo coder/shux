@@ -1,3 +1,4 @@
+import { wrapAsyncIterator } from "@orpc/shared";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
@@ -16,9 +17,7 @@ import {
 export default { ...appMeta, title: "App/ChatLoading" };
 
 function getLoadingStatus(canvasElement: HTMLElement) {
-  return canvasElement.querySelector<HTMLElement>(
-    '[data-component="ChatInputDecorationStack"] [role="status"]'
-  );
+  return canvasElement.querySelector<HTMLElement>('[data-testid="transcript-loading-status"]');
 }
 
 async function switchWorkspace(canvasElement: HTMLElement, workspaceId: string) {
@@ -39,7 +38,9 @@ async function checkLoadingLayout(canvasElement: HTMLElement) {
     const status = getLoadingStatus(canvasElement);
     await expect(status).toBeVisible();
     const dock = status!.closest('[data-component="ChatDockSurface"]')!;
-    const composer = canvasElement.querySelector('[data-component="ChatInputSurface"]')!;
+    const composer = canvasElement.querySelector(
+      '[data-component="ChatInputSurface"], [data-testid="chat-composer-dock"] [role="note"]'
+    )!;
     const statusRect = status!.getBoundingClientRect();
     const dockRect = dock.getBoundingClientRect();
     const composerRect = composer.getBoundingClientRect();
@@ -64,25 +65,62 @@ function createHydrationStory(workspaceId: string): AppStory {
     name: "caught-up-history",
     projectName: "xum",
   });
+  const monitorWorkspace = createWorkspace({
+    id: workspaceId + "-monitor",
+    name: "waiting-on-monitor",
+    projectName: "xum",
+  });
+  const transcriptWorkspace = createWorkspace({
+    id: workspaceId + "-transcript",
+    name: "read-only-history",
+    projectName: "xum",
+    transcriptOnly: true,
+  });
+  const workspaces = [workspace, otherWorkspace, monitorWorkspace, transcriptWorkspace];
   const history = createAssistantMessage("history", "Previously loaded response.", {
     historySequence: 1,
   });
   let emitChat: (event: WorkspaceChatMessage) => void;
   let subscriptions = 0;
+  let transcriptSubscriptions = 0;
+  let emitTranscript: (event: WorkspaceChatMessage) => void;
 
   function setup() {
     subscriptions = 0;
+    transcriptSubscriptions = 0;
     selectWorkspace(workspace);
     collapseLeftSidebar();
     collapseRightSidebar();
     expandProjects([workspace.projectPath]);
-    return createMockORPCClient({
-      projects: groupWorkspacesByProject([workspace, otherWorkspace]),
-      workspaces: [workspace, otherWorkspace],
+    const client = createMockORPCClient({
+      projects: groupWorkspacesByProject(workspaces),
+      workspaces,
+      workspaceActivitySnapshots: {
+        [monitorWorkspace.id]: {
+          recency: STABLE_TIMESTAMP,
+          streaming: false,
+          lastModel: null,
+          lastThinkingLevel: null,
+          activeBashMonitorCount: 1,
+        },
+      },
       onChat: (workspaceId, emit) => {
         if (workspaceId === workspace.id) {
           emitChat = emit;
           subscriptions += 1;
+        } else if (workspaceId === monitorWorkspace.id) {
+          emit(history);
+        } else if (workspaceId === transcriptWorkspace.id) {
+          emitTranscript = emit;
+          transcriptSubscriptions += 1;
+          if (transcriptSubscriptions === 1) {
+            emit(history);
+            emit({
+              type: "caught-up",
+              hasOlderHistory: false,
+              cursor: { history: { messageId: history.id, historySequence: 1 } },
+            });
+          }
         } else {
           emit(
             createAssistantMessage("other-history", "Another workspace response.", {
@@ -93,6 +131,18 @@ function createHydrationStory(workspaceId: string): AppStory {
         }
       },
     });
+    // Client swaps between stories must release the previous activity snapshot subscription.
+    client.workspace.activity.subscribe = (_input, options) => {
+      async function* iterate() {
+        yield* [];
+        await new Promise<void>((resolve) => {
+          if (options?.signal?.aborted) resolve();
+          else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+      }
+      return Promise.resolve(wrapAsyncIterator(iterate(), {}));
+    };
+    return client;
   }
   const exerciseHydration: AppStory["play"] = async ({ canvasElement, step }) => {
     const canvas = within(canvasElement);
@@ -192,6 +242,39 @@ function createHydrationStory(workspaceId: string): AppStory {
         phase: "idle",
         hadAnyOutput: true,
       });
+    });
+
+    await step("A monitor barrier suppresses duplicate replay status", async () => {
+      await switchWorkspace(canvasElement, monitorWorkspace.id);
+      await expect(
+        await canvas.findByText(/Waiting on background bash monitor/, {}, { timeout: 5000 })
+      ).toBeVisible();
+      await expect(getLoadingStatus(canvasElement)).toBeNull();
+    });
+
+    await step("Read-only cached transcripts retain aligned replay feedback", async () => {
+      await switchWorkspace(canvasElement, transcriptWorkspace.id);
+      await expect(
+        await canvas.findByText("Previously loaded response.", {}, { timeout: 5000 })
+      ).toBeVisible();
+      await expect(getLoadingStatus(canvasElement)).toBeNull();
+      await switchWorkspace(canvasElement, otherWorkspace.id);
+      await expect(await canvas.findByText("Another workspace response.")).toBeVisible();
+      await switchWorkspace(canvasElement, transcriptWorkspace.id);
+      await waitFor(() => expect(transcriptSubscriptions).toBe(2));
+      await checkLoadingLayout(canvasElement);
+      await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
+      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+      await expect(canvas.queryByRole("textbox")).toBeNull();
+      emitTranscript(history);
+      emitTranscript({
+        type: "caught-up",
+        replay: "since",
+        hasOlderHistory: false,
+        cursor: { history: { messageId: history.id, historySequence: 1 } },
+      });
+      await waitFor(() => expect(getLoadingStatus(canvasElement)).toBeNull());
+      await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
     });
 
     await step(

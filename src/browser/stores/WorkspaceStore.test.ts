@@ -1272,6 +1272,64 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(true);
     });
 
+    it.each(["end", "error", "client reconnect"])(
+      "re-arms hydration on %s without losing cached rows",
+      async (termination) => {
+        const workspaceId = "workspace-retry-hydration";
+        const client = getInternal<{ client: Parameters<WorkspaceStore["setClient"]>[0] }>(
+          store
+        ).client;
+        const attempts = Array.from({ length: 3 }, () =>
+          createControllableAsyncIterable<WorkspaceChatMessage>()
+        );
+        let subscriptions = 0;
+        mockOnChat.mockImplementation(async function* (_input, options) {
+          const events = attempts[subscriptions++];
+          options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+          yield* events.iterable;
+          if (termination === "error" && !options?.signal?.aborted) {
+            throw new Error("onChat transport failed");
+          }
+        });
+        createAndAddWorkspace(store, workspaceId);
+        attempts[0].push(createHistoryMessageEvent("history-1", 1));
+        attempts[0].push(fullCaughtUpEvent());
+        expect(
+          await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)
+        ).toBe(true);
+        const cachedMessages = store.getWorkspaceState(workspaceId).messages;
+        expect(cachedMessages).toHaveLength(1);
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (termination === "client reconnect") {
+            store.setClient(null);
+          } else {
+            attempts[attempt].close();
+          }
+          expect(
+            await waitUntil(() => !store.getWorkspaceState(workspaceId).isHydratingTranscript)
+          ).toBe(true);
+          if (termination === "client reconnect") store.setClient(client);
+          expect(await waitUntil(() => subscriptions === attempt + 2)).toBe(true);
+          const replayState = store.getWorkspaceState(workspaceId);
+          expect(replayState.isHydratingTranscript).toBe(true);
+          expect(replayState.isTranscriptCaughtUp).toBe(false);
+          expect(replayState.messages).toEqual(cachedMessages);
+        }
+
+        attempts[2].push(createHistoryMessageEvent("history-1", 1));
+        attempts[2].push(sinceCaughtUpEvent());
+        expect(
+          await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)
+        ).toBe(true);
+        expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
+        expect(store.getWorkspaceState(workspaceId).messages).toEqual(cachedMessages);
+        store.setActiveWorkspaceId(null);
+        expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
+        mockChatScript([], { keepOpen: true });
+      }
+    );
+
     it("preserves optimistic startup across full replay resets", () => {
       const workspaceId = "workspace-full-replay-pending-start";
       const requestedModel = "openai:gpt-4o-mini";
@@ -2008,7 +2066,10 @@ describe("WorkspaceStore", () => {
       const workspaceId = "fine-grained-deltas";
       const flushMicrotasks = () => new Promise<void>((resolve) => queueMicrotask(resolve));
       const messageId = "stream-message";
+      const subscribed = Promise.withResolvers<void>();
+      mockChatScript([() => subscribed.resolve()], { keepOpen: true });
       createAndAddWorkspace(store, workspaceId);
+      await subscribed.promise;
       const rawStore = getInternal<{
         states: { bump: (key: string) => void };
         streamingStatsStore: { bump: (key: string) => void };
@@ -2020,9 +2081,6 @@ describe("WorkspaceStore", () => {
           event: WorkspaceChatMessage
         ) => void;
       }>(store);
-      // Dispatch below the caught-up buffering gate: the mock onChat retry loop
-      // resets transient.caughtUp whenever an await lets it advance, which would
-      // silently buffer later events. Hydration gating is covered elsewhere.
       const dispatch = (event: WorkspaceChatMessage) =>
         rawStore.processStreamEvent(workspaceId, store.getAggregator(workspaceId), event);
 
