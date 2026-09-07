@@ -152,6 +152,22 @@ describe("useChatErrorToasts", () => {
     expect(peekChatError("ws-h")).toBeUndefined();
   });
 
+  test("a displayed error that another toast replaced is pushed again once that toast is dismissed", () => {
+    const input = mountInput("ws-j");
+    act(() => {
+      publishChatError("ws-j", "Stop could not be recorded");
+    });
+    input.show("Stop could not be recorded");
+    // A later toast took the slot before the user dismissed ours.
+    input.show("Thinking level: high");
+    input.dismiss();
+
+    expect(input.shown).toEqual(["Stop could not be recorded", "Stop could not be recorded"]);
+    input.show("Stop could not be recorded");
+    input.dismiss();
+    expect(peekChatError("ws-j")).toBeUndefined();
+  });
+
   test("StrictMode's replayed effect re-pushes the same error instead of consuming the next one", () => {
     publishChatError("ws-i", "first");
     publishChatError("ws-i", "second");

@@ -1290,7 +1290,7 @@ describe("AgentSession startup auto-retry recovery", () => {
 
       // The clear's completion does not acknowledge the marker that is still being written.
       let acknowledged: boolean | undefined;
-      const ack = session.recordPendingStartupAutoRetryAbandon().then((recorded) => {
+      const ack = session.recordPendingAutoRetryState().then((recorded) => {
         acknowledged = recorded;
         return recorded;
       });
@@ -1360,7 +1360,7 @@ describe("AgentSession startup auto-retry recovery", () => {
         enabled: false,
         startupAutoRetryAbandon: { reason: "aborted", userMessageId: "user-2" },
       });
-      expect(await session.recordPendingStartupAutoRetryAbandon()).toBe(true);
+      expect(await session.recordPendingAutoRetryState()).toBe(true);
     } finally {
       readSpy.mockRestore();
     }
@@ -1428,6 +1428,36 @@ describe("AgentSession startup auto-retry recovery", () => {
     await privateSession.persistStartupAutoRetryAbandon("authentication", "user-1");
     await clearProviderConfigFixableAbandonMarkers(config.sessionsDir, new Set([workspaceId]));
     expect(await Bun.file(preferencePath).exists()).toBe(true);
+  });
+
+  test("an auto-retry opt-out whose write failed is not acknowledged as recorded until it is written", async () => {
+    const workspaceId = "startup-retry-unrecorded-opt-out";
+    const { session, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    const preferencePath = (
+      session as unknown as { getAutoRetryPreferencePath: () => string }
+    ).getAutoRetryPreferencePath();
+
+    let failWrites = true;
+    const { writeFile } = fsPromises;
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(
+      async (target, data, options) => {
+        if (target === preferencePath && failWrites) throw new Error("EIO");
+        return writeFile(target, data, options);
+      }
+    );
+    try {
+      // A RetryBarrier Stop with no active stream: the opt-out is the only state it relies on.
+      await session.setAutoRetryEnabled(false);
+      expect(await Bun.file(preferencePath).exists()).toBe(false);
+      expect(await session.recordPendingAutoRetryState()).toBe(false);
+
+      failWrites = false;
+      expect(await session.recordPendingAutoRetryState()).toBe(true);
+      expect(JSON.parse(await Bun.file(preferencePath).text())).toEqual({ enabled: false });
+    } finally {
+      writeSpy.mockRestore();
+    }
   });
 
   test("provider config sweep keeps a persisted auto-retry opt-out while clearing the marker", async () => {

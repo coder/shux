@@ -1611,7 +1611,7 @@ export class AgentSession {
   }
 
   // Best-effort: a failed write only sets autoRetryStateUnrecorded, which the one caller that must
-  // not acknowledge an unrecorded write (a user Stop) checks via recordPendingStartupAutoRetryAbandon.
+  // not acknowledge an unrecorded write (a user Stop) checks via recordPendingAutoRetryState.
   // Writes are serialized and only the latest state change's write marks it recorded, so an older
   // unlink cannot land after a newer marker write with the flag already cleared. Callers change the
   // state only after loadAutoRetryState settled, so the file is never rebuilt from unloaded defaults.
@@ -1681,14 +1681,18 @@ export class AgentSession {
   }
 
   /**
-   * A user Stop is acknowledged only once the startup abandon marker its stopped turn relies on is
-   * on disk; otherwise the trailing row stays eligible for startup replay. A marker write that failed
-   * earlier (a withdrawn monitor wake, an aborted stream) is retried here, so the obligation survives
-   * the Stop that first reported it.
+   * A user Stop is acknowledged only once the auto-retry state its stopped turn relies on is on
+   * disk: the startup abandon marker, or the opt-out a RetryBarrier Stop records while no stream is
+   * active. Otherwise the trailing row stays eligible for startup replay. A write that failed earlier
+   * (a withdrawn monitor wake, an aborted stream, that opt-out) is retried here, so the obligation
+   * survives the Stop that first reported it. The default state owes disk nothing: a file that
+   * outlived a failed unlink can only disable retries or suppress a replay.
    */
-  async recordPendingStartupAutoRetryAbandon(): Promise<boolean> {
+  async recordPendingAutoRetryState(): Promise<boolean> {
     await this.loadAutoRetryState();
-    if (this.startupAutoRetryAbandon === null) return true;
+    if (this.autoRetryEnabledPreference !== false && this.startupAutoRetryAbandon === null) {
+      return true;
+    }
     if (this.autoRetryStateUnrecorded) await this.persistAutoRetryState();
     return !this.autoRetryStateUnrecorded;
   }

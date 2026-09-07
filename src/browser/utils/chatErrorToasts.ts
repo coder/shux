@@ -34,7 +34,8 @@ export function dismissChatError(workspaceId: string, message: string): void {
  * Shows the workspace's retained and later chat errors through `pushToast`, one per toast:
  * `visibleToastMessage` is the input's current toast and the next error is pushed once it is gone.
  * An error leaves the queue only after its toast was rendered and dismissed, so a push that never
- * rendered (React batched another toast over it, or StrictMode replayed the effect) is pushed again.
+ * rendered (React batched another toast over it, or StrictMode replayed the effect) or that another
+ * toast replaced is pushed again.
  */
 export function useChatErrorToasts(
   workspaceId: string | null,
@@ -46,7 +47,9 @@ export function useChatErrorToasts(
     if (workspaceId == null) return;
     const pushed = pushedRef.current;
     if (visibleToastMessage != null) {
-      if (pushed?.message === visibleToastMessage) pushed.displayed = true;
+      // Dismissal is inferred from the slot clearing, so only a toast still showing this error
+      // counts; one that replaced it (a later success toast) means the error must show again.
+      if (pushed != null) pushed.displayed = pushed.message === visibleToastMessage;
       return;
     }
     if (pushed?.displayed) dismissChatError(workspaceId, pushed.message);

@@ -11723,12 +11723,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // exit before it resolves, including a failed goal sync or acceptance (see
       // abandonWithdrawnSend in AgentSession.sendMessage). Stop is acknowledged after it settles: a
       // forced exit right after Stop must not leave the row eligible for startup replay. The send's
-      // own result is the dispatch's to report; a marker still unrecorded after the session retried
-      // the write fails the Stop below, on this and every later Stop, so the obligation is not lost
-      // with the joined send.
+      // own result is the dispatch's to report; a marker (or a RetryBarrier Stop's opt-out) still
+      // unrecorded after the session retried the write fails the Stop below, on this and every later
+      // Stop, so the obligation is not lost with the joined send.
       await withdrawnWakeSend?.catch(() => undefined);
       const stopRecorded =
-        !retiring || ((await session.recordPendingStartupAutoRetryAbandon()) && retirementRecorded);
+        !retiring || ((await session.recordPendingAutoRetryState()) && retirementRecorded);
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
