@@ -1,3 +1,7 @@
+import type { FileReadToolResult } from "@/common/types/tools";
+import * as path from "node:path";
+import { sandboxHostService } from "./sandbox/sandboxHostService";
+import { QuickJSRuntimeFactory } from "./ptc/quickjsRuntime";
 import { ExperimentsService } from "./experimentsService";
 import { TelemetryService } from "./telemetryService";
 import { MemoryService } from "./memoryService";
@@ -61,17 +65,17 @@ async function setup(
   const factory = Reflect.get(service, "providerModelFactory") as ProviderModelFactory;
   const models: LanguageModel[] = [];
   const modelCleanup = mock(() => undefined);
-  spyOn(factory, "resolveAndCreateModel").mockImplementation(() => {
+  spyOn(factory, "resolveAndCreateModel").mockImplementation((requestedModel) => {
     const created = Object.create(null) as LanguageModel;
     models.push(created);
     attachLanguageModelCleanup(created, modelCleanup);
     return Promise.resolve(
       Ok({
         model: created,
-        effectiveModelString: model,
-        canonicalModelString: model,
+        effectiveModelString: requestedModel,
+        canonicalModelString: requestedModel,
         canonicalProviderName: "openai",
-        canonicalModelId: "gpt-4o",
+        canonicalModelId: requestedModel.slice("openai:".length),
         wireProviderName: "openai",
         routedThroughGateway: false,
       })
@@ -446,4 +450,221 @@ describe("pinned full-payload rollover admission", () => {
       }
     }
   );
+  test.each(["dispose", "cancel", "admission-revoked"] as const)(
+    "%s after preparation publishes no stream or accepted history",
+    async (action) => {
+      const fixture = await setup("small");
+      const {
+        h,
+        service,
+        manager,
+        historyService,
+        before,
+        modelCleanup,
+        tempPaths,
+        start,
+        applyReset,
+      } = fixture;
+      const prepared = service.prepareStreamMessage.bind(service);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      spyOn(service, "prepareStreamMessage").mockImplementation(async (options) => {
+        const result = await prepared(options);
+        expect(result.success).toBe(true);
+        entered.resolve();
+        await release.promise;
+        return result;
+      });
+      const beginStart = spyOn(manager, "beginStreamStart");
+      const append = spyOn(historyService, "appendToHistory");
+      const appendBatch = spyOn(historyService, "appendManyToHistory");
+      const accepted = mock(() => undefined);
+      const controller = new AbortController();
+      let revoked = false;
+      const sending = h.session.sendMessage(
+        "Revocable candidate",
+        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        {
+          cancelSignal: controller.signal,
+          admissionStale: () => revoked,
+          onAccepted: accepted,
+        }
+      );
+      let disposal: Promise<void> | undefined;
+      try {
+        await entered.promise;
+        expect(beginStart).not.toHaveBeenCalled();
+        expect(append).not.toHaveBeenCalled();
+        expect(appendBatch).not.toHaveBeenCalled();
+        if (action === "dispose") disposal = h.session.dispose();
+        else if (action === "cancel") controller.abort();
+        else revoked = true;
+        release.resolve();
+        await sending;
+        await disposal;
+        expect(start).not.toHaveBeenCalled();
+        expect(beginStart).not.toHaveBeenCalled();
+        expect(accepted).not.toHaveBeenCalled();
+        expect(applyReset).not.toHaveBeenCalled();
+        expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(before);
+        expect(modelCleanup).toHaveBeenCalledTimes(1);
+        for (const dir of tempPaths)
+          expect(
+            await fs.stat(dir).then(
+              () => true,
+              () => false
+            )
+          ).toBe(false);
+      } finally {
+        release.resolve();
+        await sending;
+        await disposal;
+        await fixture.cleanup();
+      }
+    }
+  );
+
+  test("rollover append failure disposes the prepared request without registering an assistant", async () => {
+    const fixture = await setup("small");
+    const {
+      h,
+      manager,
+      historyService,
+      before,
+      start,
+      applyReset,
+      assembly,
+      modelCleanup,
+      tempPaths,
+    } = fixture;
+    const beginStart = spyOn(manager, "beginStreamStart");
+    const accepted = mock(() => undefined);
+    spyOn(historyService, "appendManyToHistory").mockResolvedValueOnce(
+      Err("injected rollover append failure")
+    );
+    try {
+      expect(
+        await h.session.sendMessage(
+          "Prepared but not committed",
+          { model, agentId: "exec", experiments: { tokenBudget: true } },
+          { onAccepted: accepted }
+        )
+      ).toMatchObject({ success: false, error: { type: "unknown" } });
+      expect(assembly).toHaveBeenCalledTimes(1);
+      expect(applyReset).toHaveBeenCalledTimes(1);
+      expect(accepted).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+      expect(beginStart).not.toHaveBeenCalled();
+      expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(before);
+      expect(modelCleanup).toHaveBeenCalledTimes(1);
+      for (const dir of tempPaths)
+        expect(
+          await fs.stat(dir).then(
+            () => true,
+            () => false
+          )
+        ).toBe(false);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test("real prepared tools retain a usable runtime after old sandbox and cache state is discarded", async () => {
+    const getToolsForModel = toolsModule.getToolsForModel;
+    const fixture = await setup("small");
+    const { h, config, start, assembleTools, assembly, oldCache } = fixture;
+    assembleTools.mockImplementation(getToolsForModel);
+    spyOn(contextLimit, "getEffectiveContextLimit").mockReturnValue(256000);
+    h.session.setAutoCompactionThreshold(0.1);
+    const sessionDir = path.join(config.sessionsDir, workspaceId);
+    const mountOptions = {
+      lifetime: "persistent" as const,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      scopeKey: workspaceId,
+      sessionDir,
+    };
+    try {
+      const oldMount = await sandboxHostService.acquireMount(mountOptions);
+      expect(
+        (await oldMount.runtime.eval("vars.secret = 'old-window'; return true;")).success
+      ).toBe(true);
+      await oldMount.persistVars();
+      const filename = path.join(config.rootDir, "prepared-runtime.txt");
+      await fs.writeFile(filename, "Prepared runtime is usable\n");
+      expect(
+        (
+          await h.session.sendMessage("Start a fresh window", {
+            model,
+            agentId: "exec",
+            experiments: { tokenBudget: true },
+          })
+        ).success
+      ).toBe(true);
+      expect(oldMount.isDisposed).toBe(true);
+      expect(oldCache.size).toBe(0);
+      expect(assembleTools).toHaveBeenCalledTimes(1);
+      expect(assembly).toHaveBeenCalledTimes(1);
+      const preparedTools = start.mock.calls[0][0].tools!;
+      expect(preparedTools.file_read?.execute).toBeDefined();
+      const result = (await preparedTools.file_read.execute!(
+        { path: filename },
+        { toolCallId: "read-after-reset", messages: [], context: undefined }
+      )) as FileReadToolResult;
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error(result.error);
+      expect(result.content).toContain("Prepared runtime is usable");
+      const freshMount = await sandboxHostService.acquireMount(mountOptions);
+      expect(freshMount).not.toBe(oldMount);
+      const vars = await freshMount.runtime.eval("return Object.keys(vars);");
+      expect(vars).toMatchObject({ success: true, result: [] });
+    } finally {
+      await sandboxHostService.dropScope(workspaceId);
+      await fixture.cleanup();
+    }
+  });
+
+  test("prepared primary keeps fallbacks lazy and admits the actual fallback model on demand", async () => {
+    const fixture = await setup("small");
+    const { h, config, start, factory, assembly, assembleTools, modelCleanup } = fixture;
+    const fallbackModel = "openai:gpt-4o-mini";
+    await config.editConfig((cfg) => ({
+      ...cfg,
+      modelFallbacks: { [model]: { models: [fallbackModel] } },
+    }));
+    const created = spyOn(factory, "resolveAndCreateModel");
+    const contextualAssembly = eventSpine.useRequestContext(
+      (ctx) => {
+        if (ctx.modelString === fallbackModel) ctx.systemMessage += "漢".repeat(70000);
+      },
+      { workspaceId }
+    );
+    try {
+      expect(
+        (
+          await h.session.sendMessage("Use a prepared primary", {
+            model,
+            agentId: "exec",
+            experiments: { tokenBudget: true },
+          })
+        ).success
+      ).toBe(true);
+      expect(created.mock.calls.map((call) => call[0])).toEqual([model]);
+      expect(assembleTools).toHaveBeenCalledTimes(1);
+      expect(assembly).toHaveBeenCalledTimes(1);
+      expect(modelCleanup).not.toHaveBeenCalled();
+      const fallback = start.mock.calls[0][0].modelFallback!;
+      expect(fallback.chain).toEqual([fallbackModel]);
+      expect(await fallback.prepare(fallbackModel)).toMatchObject({
+        success: false,
+        error: { type: "context_budget_exceeded", model: fallbackModel },
+      });
+      expect(created.mock.calls.map((call) => call[0])).toEqual([model, fallbackModel]);
+      expect(assembleTools).toHaveBeenCalledTimes(2);
+      expect(assembly).toHaveBeenCalledTimes(2);
+      expect(modelCleanup).toHaveBeenCalledTimes(1);
+    } finally {
+      contextualAssembly();
+      await fixture.cleanup();
+    }
+  });
 });
