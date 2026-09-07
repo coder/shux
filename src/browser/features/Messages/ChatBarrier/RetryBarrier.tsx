@@ -9,6 +9,7 @@ import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { stopStream } from "@/browser/utils/stopStream";
+import { publishChatError } from "@/browser/utils/chatErrorToasts";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -234,13 +235,22 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     }
   };
 
-  const handleStopAutoRetry = () => {
+  const handleStopAutoRetry = async () => {
     setCountdown(0);
     setManualRetryError(null);
-    void api?.workspace.setAutoRetryEnabled?.({ workspaceId: props.workspaceId, enabled: false });
-    if (api) {
-      void stopStream(api, props.workspaceId);
+    if (!api) return;
+    // The Stop is acknowledged only once the session's auto-retry state is on disk, so the opt-out
+    // must reach the session first or its write escapes that check.
+    try {
+      const optOut = await api.workspace.setAutoRetryEnabled?.({
+        workspaceId: props.workspaceId,
+        enabled: false,
+      });
+      if (optOut != null && !optOut.success) publishChatError(props.workspaceId, optOut.error);
+    } catch (error) {
+      publishChatError(props.workspaceId, getErrorMessage(error));
     }
+    await stopStream(api, props.workspaceId);
   };
 
   const lastMessage = getLastMainRetryCandidateMessage(workspaceState.messages);
@@ -305,7 +315,9 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     actionButton = (
       <button
         className="border-warning font-primary text-warning hover:bg-warning-overlay cursor-pointer rounded border bg-transparent px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
-        onClick={handleStopAutoRetry}
+        onClick={() => {
+          void handleStopAutoRetry();
+        }}
       >
         Stop <span className="mobile-hide-shortcut-hints">({stopKeybind})</span>
       </button>
