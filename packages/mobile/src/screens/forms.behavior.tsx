@@ -436,6 +436,8 @@ test.each([
         switch (path.join(".")) {
           case "policy.get":
             return pickerData.policy;
+          case "config.onConfigChanged":
+          case "providers.onConfigChanged":
           case "policy.onChanged":
             return new ReadableStream<void>({
               start(controller) {

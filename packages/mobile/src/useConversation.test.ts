@@ -5,6 +5,7 @@ import { createORPCClient } from "@orpc/client";
 import type { MobileClient } from "./api";
 import type { WorkspaceChatMessage } from "./transcript";
 import { useConversation } from "./useConversation";
+import type { SettingsData } from "./settings";
 
 afterEach(cleanup);
 
@@ -21,7 +22,13 @@ function message(sequence: number, text = `message ${sequence}`): WorkspaceChatM
 type Policy = Awaited<ReturnType<MobileClient["policy"]["get"]>>;
 const disabledPolicy: Policy = { source: "none", status: { state: "disabled" }, policy: null };
 
-function fixture(getPolicy: () => Promise<Policy> = async () => disabledPolicy) {
+function fixture(
+  getPolicy: () => Promise<Policy> = async () => disabledPolicy,
+  reads: {
+    config?: () => Promise<SettingsData["config"]>;
+    providers?: () => Promise<SettingsData["providers"]>;
+  } = {}
+) {
   type Page = Awaited<ReturnType<MobileClient["workspace"]["history"]["loadMore"]>>;
   let complete!: (page: Page) => void;
   const page = new Promise<Page>((resolve) => {
@@ -34,6 +41,34 @@ function fixture(getPolicy: () => Promise<Policy> = async () => disabledPolicy) 
     events: ReadableStreamDefaultController<void>;
     fail: (error: Error) => void;
   }> = [];
+  const configSubscriptions: typeof policySubscriptions = [];
+  const providerSubscriptions: typeof policySubscriptions = [];
+  const settingsRequests: Array<{ path: string; signal: AbortSignal }> = [];
+  const settingsOrder: string[] = [];
+  function notifications(
+    subscriptions: typeof policySubscriptions,
+    signal: AbortSignal,
+    source: string
+  ) {
+    const events = new ReadableStream<void>({
+      start(controller) {
+        const close = () => controller.close();
+        subscriptions.push({
+          signal,
+          events: controller,
+          fail(error) {
+            signal.removeEventListener("abort", close);
+            controller.error(error);
+          },
+        });
+        signal.addEventListener("abort", close, { once: true });
+      },
+    });
+    return (async function* () {
+      settingsOrder.push(`${source}.listen`);
+      yield* events.values();
+    })();
+  }
   const requests: Array<{ input: unknown; signal?: AbortSignal }> = [];
   const client = createORPCClient<MobileClient>({
     call: async (path, input, options) => {
@@ -56,10 +91,20 @@ function fixture(getPolicy: () => Promise<Policy> = async () => disabledPolicy) 
               options.signal?.addEventListener("abort", close, { once: true });
             },
           }).values();
+        case "config.onConfigChanged":
+          settingsOrder.push("config.subscribe");
+          return notifications(configSubscriptions, options.signal!, "config");
+        case "providers.onConfigChanged":
+          settingsOrder.push("providers.subscribe");
+          return notifications(providerSubscriptions, options.signal!, "providers");
         case "config.getConfig":
-          return { agentAiDefaults: {} };
+          settingsOrder.push("config.read");
+          settingsRequests.push({ path: "config", signal: options.signal! });
+          return reads.config ? reads.config() : { agentAiDefaults: {} };
         case "providers.getConfig":
-          return {};
+          settingsOrder.push("providers.read");
+          settingsRequests.push({ path: "providers", signal: options.signal! });
+          return reads.providers ? reads.providers() : {};
         case "agents.list":
           return [];
         case "workspace.onChat":
@@ -79,8 +124,8 @@ function fixture(getPolicy: () => Promise<Policy> = async () => disabledPolicy) 
   });
   const lifetime = new AbortController();
   const view = renderHook(
-    ({ workspaceId }) => useConversation(client, workspaceId, lifetime.signal),
-    { initialProps: { workspaceId: "workspace" } }
+    ({ workspaceId, signal }) => useConversation(client, workspaceId, signal),
+    { initialProps: { workspaceId: "workspace", signal: lifetime.signal } }
   );
   return {
     ...view,
@@ -88,6 +133,10 @@ function fixture(getPolicy: () => Promise<Policy> = async () => disabledPolicy) 
     requests,
     policyRequests,
     policySubscriptions,
+    configSubscriptions,
+    providerSubscriptions,
+    settingsRequests,
+    settingsOrder,
     lifetime,
     async ready() {
       await waitFor(() => expect(eventController).toBeDefined());
@@ -225,7 +274,7 @@ test("switching workspace cancels old policy scope and ignores its late snapshot
     });
   });
   await view.ready();
-  view.rerender({ workspaceId: "other" });
+  view.rerender({ workspaceId: "other", signal: view.lifetime.signal });
   await waitFor(() => expect(view.result.current.settings?.policy).toEqual(blocked));
   expect(view.policySubscriptions).toHaveLength(2);
   expect(view.policySubscriptions[0].signal.aborted).toBe(true);
@@ -234,3 +283,127 @@ test("switching workspace cancels old policy scope and ignores its late snapshot
   expect(view.result.current.settings?.policy).toEqual(blocked);
   expect(view.policySubscriptions[1].signal.aborted).toBe(false);
 });
+
+test("settings subscriptions precede reads and refresh privacy, routes and provider availability", async () => {
+  let config: SettingsData["config"] = { agentAiDefaults: {} };
+  let providers: SettingsData["providers"] = {};
+  const view = fixture(undefined, {
+    config: async () => config,
+    providers: async () => providers,
+  });
+  await view.ready();
+  expect(view.configSubscriptions).toHaveLength(1);
+  expect(view.providerSubscriptions).toHaveLength(1);
+  expect(view.settingsOrder.slice(0, 4)).toEqual([
+    "config.subscribe",
+    "providers.subscribe",
+    "config.listen",
+    "providers.listen",
+  ]);
+  config = {
+    ...config,
+    routePriority: ["coder"],
+    routeOverrides: { "openai:gpt-4o": "direct" },
+    userPreferences: {
+      ai: {
+        providerOptions: { anthropic: { disableBetaFeatures: true }, google: { cache: false } },
+      },
+    },
+  };
+  await act(async () => view.configSubscriptions[0].events.enqueue());
+  await waitFor(() => expect(view.result.current.settings?.config).toEqual(config));
+  providers = {
+    anthropic: { isEnabled: false, isConfigured: true, apiKeySet: true },
+    openai: { isEnabled: true, isConfigured: true, apiKeySet: true, store: false },
+  };
+  await act(async () => view.providerSubscriptions[0].events.enqueue());
+  await waitFor(() => expect(view.result.current.settings?.providers).toEqual(providers));
+  expect(view.result.current.settings?.config).toEqual(config);
+  view.unmount();
+  expect(view.configSubscriptions[0].signal.aborted).toBe(true);
+  expect(view.providerSubscriptions[0].signal.aborted).toBe(true);
+});
+
+test("a newer config event cancels a stale initial read rather than exposing old privacy settings", async () => {
+  let resolve!: (config: SettingsData["config"]) => void;
+  let first = true;
+  const latest: SettingsData["config"] = {
+    agentAiDefaults: {},
+    userPreferences: { ai: { providerOptions: { anthropic: { disableBetaFeatures: true } } } },
+  };
+  const view = fixture(undefined, {
+    config: () => {
+      if (!first) return Promise.resolve(latest);
+      first = false;
+      return new Promise((done) => {
+        resolve = done;
+      });
+    },
+  });
+  await waitFor(() => expect(view.settingsRequests.length).toBeGreaterThan(0));
+  expect(view.configSubscriptions).toHaveLength(1);
+  expect(view.providerSubscriptions).toHaveLength(1);
+  expect(view.result.current.settings).toBeNull();
+  await act(async () => view.configSubscriptions[0].events.enqueue());
+  await waitFor(() => expect(view.result.current.settings?.config).toEqual(latest));
+  expect(view.settingsRequests[0].signal.aborted).toBe(true);
+  await act(async () => resolve({ agentAiDefaults: {} }));
+  expect(view.result.current.settings?.config).toEqual(latest);
+});
+
+test.each(["config", "providers"] as const)(
+  "a failed %s refresh blocks settings until a later notification recovers",
+  async (source) => {
+    let failed = false;
+    const view = fixture(undefined, {
+      config: async () => {
+        if (source === "config" && failed) throw new Error("unavailable");
+        return { agentAiDefaults: {} };
+      },
+      providers: async () => {
+        if (source === "providers" && failed) throw new Error("unavailable");
+        return {};
+      },
+    });
+    await view.ready();
+    failed = true;
+    const subscription =
+      source === "config" ? view.configSubscriptions[0] : view.providerSubscriptions[0];
+    await act(async () => subscription.events.enqueue());
+    await waitFor(() => expect(view.result.current.error).not.toBeNull());
+    expect(view.result.current.settings).toBeNull();
+    failed = false;
+    await act(async () => subscription.events.enqueue());
+    await waitFor(() => expect(view.result.current.settings).not.toBeNull());
+    expect(view.result.current.error).toBeNull();
+    await act(async () => subscription.fail(new Error("disconnected")));
+    await waitFor(() => expect(view.result.current.settings).toBeNull());
+    expect(view.result.current.error).not.toBeNull();
+  }
+);
+
+test.each(["workspace", "connection"])(
+  "replacing the %s cancels old settings subscriptions and ignores pending snapshots",
+  async (scope) => {
+    let resolve!: (config: SettingsData["config"]) => void;
+    let first = true;
+    const current: SettingsData["config"] = { agentAiDefaults: {}, routePriority: ["coder"] };
+    const view = fixture(undefined, {
+      config: () => {
+        if (!first) return Promise.resolve(current);
+        first = false;
+        return new Promise((done) => {
+          resolve = done;
+        });
+      },
+    });
+    await waitFor(() => expect(view.settingsRequests.length).toBeGreaterThan(0));
+    const signal = scope === "connection" ? new AbortController().signal : view.lifetime.signal;
+    view.rerender({ workspaceId: scope === "workspace" ? "other" : "workspace", signal });
+    await waitFor(() => expect(view.result.current.settings?.config).toEqual(current));
+    expect(view.configSubscriptions[0].signal.aborted).toBe(true);
+    expect(view.providerSubscriptions[0].signal.aborted).toBe(true);
+    await act(async () => resolve({ agentAiDefaults: {} }));
+    expect(view.result.current.settings?.config).toEqual(current);
+  }
+);

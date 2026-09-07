@@ -194,13 +194,12 @@ export function ConversationScreen(props: {
     )
       return;
     const { options, policyBlockReason } = latestSettings.current;
-    if (!options?.model) return;
     // The answer is already durable and its form may disappear on tool-call-end.
     // Keep resume failures outside that form, and retry only resume, never the answer.
     setResumeMessageId(messageId);
-    // A policy update can arrive while the answer is being saved. Keep the resume
-    // recovery affordance, but never start a newly prohibited turn.
-    if (policyBlockReason) return;
+    // Settings or policy can change while the answer is saved. Preserve recovery
+    // while unavailable, but never resume with stale options or a prohibited route.
+    if (!options?.model || policyBlockReason) return;
     try {
       const result = await props.client.workspace.resumeStream(
         { workspaceId: props.workspace.id, options },

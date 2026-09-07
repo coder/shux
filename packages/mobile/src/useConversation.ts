@@ -9,6 +9,7 @@ export function useConversation(client: MobileClient, workspaceId: string, signa
   const [settings, setSettings] = useState<Omit<SettingsData, "policy"> | null>(null);
   const [policy, setPolicy] = useState<SettingsData["policy"]>(null);
   const [error, setError] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [owner, setOwner] = useState(() => ({ client, workspaceId, signal }));
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -23,6 +24,7 @@ export function useConversation(client: MobileClient, workspaceId: string, signa
     setSettings(null);
     setPolicy(null);
     setError(null);
+    setSettingsError(null);
     setOwner({ client, workspaceId, signal });
     setLoadingOlder(false);
     setHistoryError(null);
@@ -52,14 +54,59 @@ export function useConversation(client: MobileClient, workspaceId: string, signa
     subscribePolicy().catch(() => {
       if (!controller.signal.aborted) setPolicy(null);
     });
-    async function subscribe() {
-      const [config, providers, agents] = await Promise.all([
-        client.config.getConfig(undefined, { signal: controller.signal }),
-        client.providers.getConfig(undefined, { signal: controller.signal }),
-        client.agents.list({ workspaceId }, { signal: controller.signal }),
+    const settingsController = linkedAbortController(controller.signal);
+    let settingsRequest: AbortController | null = null;
+    async function subscribeSettings() {
+      // Both subscriptions must be registered before reading privacy/routing settings.
+      const [configEvents, providerEvents, agents] = await Promise.all([
+        client.config.onConfigChanged(undefined, { signal: settingsController.signal }),
+        client.providers.onConfigChanged(undefined, { signal: settingsController.signal }),
+        client.agents.list({ workspaceId }, { signal: settingsController.signal }),
       ]);
+      if (settingsController.signal.aborted) return;
+      function refresh() {
+        settingsRequest?.abort();
+        const request = linkedAbortController(settingsController.signal);
+        settingsRequest = request;
+        // A notification invalidates the old privacy options immediately. Consume
+        // further notifications while reading, so an older snapshot cannot win.
+        setSettings(null);
+        setSettingsError(null);
+        Promise.all([
+          client.config.getConfig(undefined, { signal: request.signal }),
+          client.providers.getConfig(undefined, { signal: request.signal }),
+        ])
+          .then(
+            ([config, providers]) => {
+              if (!request.signal.aborted) setSettings({ config, providers, agents });
+            },
+            () => {
+              if (!request.signal.aborted)
+                setSettingsError("Settings unavailable. Retry to reconnect.");
+            }
+          )
+          .finally(() => request.abort());
+      }
+      const watching = Promise.all(
+        [configEvents, providerEvents].map(async (events) => {
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Notifications have no payload.
+          for await (const _ of events) {
+            if (settingsController.signal.aborted) return;
+            refresh();
+          }
+          if (!settingsController.signal.aborted) throw new Error("Settings disconnected");
+        })
+      );
+      refresh();
+      await watching;
+    }
+    subscribeSettings().catch(() => {
       if (controller.signal.aborted) return;
-      setSettings({ config, providers, agents });
+      settingsController.abort();
+      setSettings(null);
+      setSettingsError("Settings unavailable. Retry to reconnect.");
+    });
+    async function subscribe() {
       const events = await client.workspace.onChat(
         { workspaceId, mode: { type: "full" } },
         { signal: controller.signal }
@@ -159,7 +206,7 @@ export function useConversation(client: MobileClient, workspaceId: string, signa
   return {
     transcript: owned ? transcript : createTranscriptState(),
     settings: owned && settings ? { ...settings, policy } : null,
-    error: owned ? error : null,
+    error: owned ? (error ?? settingsError) : null,
     loadingOlder,
     historyError,
     loadOlder,

@@ -5,6 +5,7 @@ import { createORPCClient } from "@orpc/client";
 import { ConnectedApp } from "../../App";
 import type { Connection } from "./ConnectScreen";
 import type { MobileClient } from "../api";
+import type { SettingsData } from "../settings";
 import type { WorkspaceChatMessage } from "../transcript";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 
@@ -51,6 +52,13 @@ function fixture(
     end: () => void;
   }> = [];
   const calls: Array<{ path: string; input: unknown; signal?: AbortSignal }> = [];
+  let config: SettingsData["config"] = { agentAiDefaults: {}, defaultModel: model };
+  let providers: SettingsData["providers"] = {
+    anthropic: { isConfigured: true, isEnabled: true, apiKeySet: true, models: ["allowed"] },
+  };
+  const configEvents: ReadableStreamDefaultController<void>[] = [];
+  const providerEvents: ReadableStreamDefaultController<void>[] = [];
+  let configRead = async () => config;
   let policy = initialPolicy;
   const policyEvents: ReadableStreamDefaultController<void>[] = [];
   let closed = 0;
@@ -93,17 +101,14 @@ function fixture(
           return policy;
         case "policy.onChanged":
           return events<void>(options.signal, [], (controller) => policyEvents.push(controller));
+        case "config.onConfigChanged":
+          return events<void>(options.signal, [], (controller) => configEvents.push(controller));
+        case "providers.onConfigChanged":
+          return events<void>(options.signal, [], (controller) => providerEvents.push(controller));
         case "config.getConfig":
-          return { agentAiDefaults: {}, defaultModel: model };
+          return configRead();
         case "providers.getConfig":
-          return {
-            anthropic: {
-              isConfigured: true,
-              isEnabled: true,
-              apiKeySet: true,
-              models: ["allowed"],
-            },
-          };
+          return providers;
         case "agents.list":
           return [
             { id: "exec", name: "Exec", uiSelectable: true },
@@ -185,6 +190,17 @@ function fixture(
           view.getByRole("button", { name: "Choose mode" }).getAttribute("aria-disabled")
         ).not.toBe("true")
       );
+    },
+    setConfigRead(read: typeof configRead) {
+      configRead = read;
+    },
+    async updateConfig(next: SettingsData["config"]) {
+      config = next;
+      await act(async () => configEvents.at(-1)!.enqueue());
+    },
+    async updateProviders(next: SettingsData["providers"]) {
+      providers = next;
+      await act(async () => providerEvents.at(-1)!.enqueue());
     },
     async updatePolicy(next: Policy) {
       policy = next;
@@ -666,5 +682,109 @@ test("answer continuation resumes with the same latest selection that policy per
   expect(callCount(view, "resumeStream")).toBe(1);
   expect(view.calls.find((call) => call.path === "workspace.resumeStream")?.input).toMatchObject({
     options: { model: "anthropic:allowed" },
+  });
+});
+
+test("live privacy changes replace stale selection options for sending and answer continuation", async () => {
+  const view = fixture([question()]);
+  await view.select("alpha");
+  fireEvent.click(view.getByRole("button", { name: "Choose model" }));
+  fireEvent.click(view.getByRole("radio", { name: "anthropic:allowed" }));
+  const providerOptions = {
+    anthropic: { disableBetaFeatures: true, cacheTtl: "1h" as const },
+    google: { cache: false },
+  };
+  await view.updateConfig({
+    agentAiDefaults: {},
+    defaultModel: "openai:different-default",
+    userPreferences: { ai: { providerOptions } },
+  });
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Private request" } });
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
+  expect(view.calls.find((call) => call.path === "workspace.sendMessage")?.input).toMatchObject({
+    message: "Private request",
+    options: { model: "anthropic:allowed", providerOptions },
+  });
+  const answer = deferred<unknown>();
+  view.setAnswer(() => answer.promise);
+  await submitAnswer(view);
+  const changedOptions = {
+    ...providerOptions,
+    anthropic: { disableBetaFeatures: false },
+  };
+  await view.updateConfig({
+    agentAiDefaults: {},
+    userPreferences: { ai: { providerOptions: changedOptions } },
+  });
+  await act(async () => answer.resolve({ success: true }));
+  expect(view.calls.find((call) => call.path === "workspace.resumeStream")?.input).toMatchObject({
+    options: { model: "anthropic:allowed", providerOptions: changedOptions },
+  });
+});
+
+test("live route and provider changes re-evaluate policy without replacing the selected model", async () => {
+  const view = fixture();
+  await view.select("alpha");
+  fireEvent.click(view.getByRole("button", { name: "Choose model" }));
+  fireEvent.click(view.getByRole("radio", { name: "anthropic:allowed" }));
+  const providers = {
+    anthropic: { isConfigured: true, isEnabled: true, apiKeySet: true },
+    coder: { isConfigured: true, isEnabled: true, apiKeySet: false, models: ["anthropic/allowed"] },
+  };
+  await view.updateProviders(providers);
+  const config = { agentAiDefaults: {}, routePriority: ["coder", "direct"] };
+  await view.updateConfig(config);
+  await view.updatePolicy({
+    source: "env",
+    status: { state: "enforced" },
+    policy: {
+      policyFormatVersion: "0.1",
+      providerAccess: [{ id: "coder" }],
+      mcp: { allowUserDefined: { stdio: true, remote: true } },
+      runtimes: null,
+    },
+  });
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Same model" } });
+  const send = () => view.getByRole("button", { name: "Send message" });
+  expect(send().getAttribute("aria-disabled")).not.toBe("true");
+  await view.updateConfig({ ...config, routeOverrides: { "anthropic:allowed": "direct" } });
+  expect(send().getAttribute("aria-disabled")).toBe("true");
+  fireEvent.click(send());
+  expect(callCount(view, "sendMessage")).toBe(0);
+  await view.updateConfig(config);
+  expect(send().getAttribute("aria-disabled")).not.toBe("true");
+  await view.updateProviders({ ...providers, coder: { ...providers.coder, isEnabled: false } });
+  expect(send().getAttribute("aria-disabled")).toBe("true");
+  await view.updateProviders(providers);
+  await act(async () => fireEvent.click(send()));
+  expect(view.calls.find((call) => call.path === "workspace.sendMessage")?.input).toMatchObject({
+    options: { model: "anthropic:allowed" },
+  });
+  expect(view.calls.filter((call) => call.path === "agents.list")).toHaveLength(1);
+});
+
+test("unavailable live settings prevent send and retain resume-only recovery after an answer is saved", async () => {
+  const view = fixture([question()]);
+  await view.select("alpha");
+  const answer = deferred<unknown>();
+  view.setAnswer(() => answer.promise);
+  await submitAnswer(view);
+  const read = deferred<SettingsData["config"]>();
+  view.setConfigRead(() => read.promise);
+  await view.updateConfig({ agentAiDefaults: {} });
+  await view.emit(answered());
+  await act(async () => answer.resolve({ success: true }));
+  expect(callCount(view, "resumeStream")).toBe(0);
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Wait for settings" } });
+  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+  expect(callCount(view, "sendMessage")).toBe(0);
+  const providerOptions = { anthropic: { disableBetaFeatures: true } };
+  await act(async () =>
+    read.resolve({ agentAiDefaults: {}, userPreferences: { ai: { providerOptions } } })
+  );
+  await act(async () => fireEvent.click(await view.findByRole("button", { name: "Resume agent" })));
+  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
+  expect(view.calls.find((call) => call.path === "workspace.resumeStream")?.input).toMatchObject({
+    options: { providerOptions },
   });
 });
