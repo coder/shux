@@ -180,7 +180,8 @@ function seedWorkspaceLocalStorageFromBackend(
   metadata: FrontendWorkspaceMetadata,
   previous?: FrontendWorkspaceMetadata
 ): void {
-  // Restore on initial load only; later send echoes must not overwrite unsent choices.
+  // Snapshot all main-workspace choices on client load, not on navigation.
+  // Later metadata must not overwrite unsent choices; reload to restore backend settings.
   if (metadata.parentWorkspaceId == null && previous != null) {
     return;
   }
