@@ -380,3 +380,230 @@ test("a failed Stop rollback acknowledges the retained durable continuation", as
     await h.cleanup();
   }
 });
+
+test.each([
+  [false, false, false],
+  [true, false, false],
+  [false, true, false],
+  [true, true, false],
+  [false, false, true],
+  [true, false, true],
+] as const)(
+  "a failed initial follow-up read retries only abandoned ownership (targeted=%s, replacement=%s, result error=%s)",
+  async (targeted, replacement, resultError) => {
+    const h = await setup();
+    const boundary = summary();
+    await h.historyService.appendToHistory(workspaceId, boundary);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const read = targeted ? "getHistoryFromLatestBoundary" : "getLastMessages";
+    spyOn(h.historyService, read).mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      if (resultError) return Err("initial history read failed");
+      throw new Error("initial history read failed");
+    });
+    const stream = spyOn(h.aiService, "streamMessage");
+    const pending = h.internals.dispatchPendingFollowUp(targeted ? boundary.id : undefined);
+    let closing: Promise<void> | undefined;
+    try {
+      await entered.promise;
+      await h.session.interruptStream({ abandonPartial: true });
+      if (replacement) {
+        using _mutation = h.session.holdTurnAdmission();
+        await h.historyService.updateHistory(workspaceId, {
+          ...boundary,
+          metadata: {
+            ...boundary.metadata,
+            muxMetadata: {
+              type: "compaction-summary",
+              pendingFollowUp: { text: "replacement", ...options },
+            },
+          },
+        });
+      }
+      closing = h.session.finishShutdown();
+      release.resolve();
+      const failure = await pending.catch((error: unknown) => error);
+      expect(failure).toHaveProperty(
+        "message",
+        expect.stringContaining("initial history read failed")
+      );
+      await closing;
+      const rows = await h.historyService.getLastMessages(workspaceId, 1);
+      if (replacement)
+        expect(rows.success && rows.data[0].metadata?.muxMetadata).toHaveProperty(
+          "pendingFollowUp.text",
+          "replacement"
+        );
+      else {
+        expect(rows.success && rows.data[0].metadata?.muxMetadata).not.toHaveProperty(
+          "pendingFollowUp"
+        );
+        await expectNoRecovery(h.config, h.historyService);
+      }
+      expect(stream).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      await closing;
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(["fields", "pending request", "message ID", "sequence"] as const)(
+  "abandoned cleanup matches handoff identity and preserves newer summary fields (%s)",
+  async (changed) => {
+    const h = await setup();
+    const boundary = summary();
+    boundary.metadata = {
+      ...boundary.metadata,
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    };
+    await h.historyService.appendToHistory(workspaceId, boundary);
+    await h.session.interruptStream({ abandonPartial: true });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const update = h.historyService.updateHistory.bind(h.historyService);
+    spyOn(h.historyService, "updateHistory").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return update(...args);
+    });
+    const pending = h.internals.dispatchPendingFollowUp();
+    try {
+      await entered.promise;
+      const rewritten = {
+        ...boundary,
+        id: changed === "message ID" ? "replacement-summary" : boundary.id,
+        parts: [{ type: "text" as const, text: "finalized summary" }],
+        metadata: {
+          ...boundary.metadata,
+          model: "openai:gpt-4o",
+          duration: 42,
+          muxMetadata: {
+            type: "compaction-summary" as const,
+            pendingFollowUp: {
+              text: changed === "pending request" ? "replacement" : "Continue",
+              ...options,
+            },
+          },
+        },
+      };
+      if (changed === "sequence") {
+        await h.historyService.deleteMessages(workspaceId, [boundary.id]);
+        await h.historyService.appendToHistory(workspaceId, {
+          ...rewritten,
+          metadata: { ...rewritten.metadata, historySequence: undefined },
+        });
+      } else if (changed === "fields") {
+        // Real late finalization omits compaction metadata; HistoryService must
+        // preserve the handoff before cleanup merges only its pending field away.
+        await update(workspaceId, {
+          ...rewritten,
+          metadata: {
+            historySequence: boundary.metadata?.historySequence,
+            model: "openai:gpt-4o",
+            duration: 42,
+          },
+        });
+      } else await update(workspaceId, rewritten);
+      release.resolve();
+      expect(await pending).toBe(false);
+      const rows = await h.historyService.getLastMessages(workspaceId, 1);
+      expect(rows.success && rows.data[0].parts).toMatchObject([
+        { type: "text", text: "finalized summary" },
+      ]);
+      expect(rows.success && rows.data[0].metadata).toHaveProperty("duration", 42);
+      expect(rows.success && rows.data[0].metadata).toHaveProperty("compactionBoundary", true);
+      if (changed !== "fields")
+        expect(rows.success && rows.data[0].metadata?.muxMetadata).toHaveProperty(
+          "pendingFollowUp"
+        );
+      else {
+        expect(rows.success && rows.data[0].metadata?.muxMetadata).not.toHaveProperty(
+          "pendingFollowUp"
+        );
+        await expectNoRecovery(h.config, h.historyService);
+      }
+    } finally {
+      release.resolve();
+      await pending;
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test("context replacement after Stop dispatches B while A's held cleanup is retired", async () => {
+  const h = await setup();
+  const boundary = summary();
+  await h.historyService.appendToHistory(workspaceId, boundary);
+  await h.session.interruptStream({ abandonPartial: true });
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const update = h.historyService.updateHistory.bind(h.historyService);
+  spyOn(h.historyService, "updateHistory").mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return update(...args);
+  });
+  const stale = h.internals.dispatchPendingFollowUp();
+  const stream = spyOn(h.aiService, "streamMessage");
+  try {
+    await entered.promise;
+    {
+      using _mutation = h.session.holdTurnAdmission();
+      await update(workspaceId, {
+        ...boundary,
+        metadata: {
+          ...boundary.metadata,
+          muxMetadata: {
+            type: "compaction-summary",
+            pendingFollowUp: { text: "replacement", ...options },
+          },
+        },
+      });
+    }
+    expect(await h.internals.dispatchPendingFollowUp()).toBe(true);
+    release.resolve();
+    expect(await stale).toBe(false);
+    expect(stream).toHaveBeenCalledTimes(1);
+    const rows = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(rows.success && rows.data.find((row) => row.role === "user")?.parts).toMatchObject([
+      { type: "text", text: "replacement" },
+    ]);
+    expect(rows.success && rows.data[0].metadata?.muxMetadata).toHaveProperty(
+      "pendingFollowUp.text",
+      "replacement"
+    );
+  } finally {
+    release.resolve();
+    await stale;
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test("a persistently unreadable abandoned follow-up retries once and preserves the initial error", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  await h.session.interruptStream({ abandonPartial: true });
+  const read = spyOn(h.historyService, "getLastMessages")
+    .mockRejectedValueOnce(new Error("original read failure"))
+    .mockRejectedValueOnce(new Error("cleanup read failure"));
+  const stream = spyOn(h.aiService, "streamMessage");
+  try {
+    const failure = await h.internals.dispatchPendingFollowUp().catch((error: unknown) => error);
+    expect(failure).toHaveProperty("message", "original read failure");
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(stream).not.toHaveBeenCalled();
+  } finally {
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});

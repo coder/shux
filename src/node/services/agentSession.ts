@@ -7987,12 +7987,16 @@ export class AgentSession {
       // or already-persisted Continue must never lose its recovery marker here.
       if (
         !dispatch.accepted &&
-        dispatch.summary &&
         this.coordinator.compactionIntent.status === "abandoned" &&
         this.coordinator.canClearCompactionFollowUp(token)
       ) {
         try {
-          await this.clearPendingFollowUpFromSummary(dispatch.summary, token);
+          if (dispatch.summary) await this.clearPendingFollowUpFromSummary(dispatch.summary, token);
+          else {
+            // The initial read can fail before capturing a summary. Retry once under
+            // the same abandoned owner; this path cannot admit a send or reclaim B.
+            await this.dispatchOwnedCompactionFollowUp(token, dispatch, summaryMessageId);
+          }
         } catch (cleanupError) {
           log.warn("Abandoned compaction follow-up cleanup failed", {
             workspaceId: this.workspaceId,
@@ -8468,19 +8472,31 @@ export class AgentSession {
       return;
     }
 
-    const { pendingFollowUp: _pendingFollowUp, ...muxMetadataWithoutFollowUp } = muxMeta;
     const updateResult = await this.historyService.updateHistory(
       this.workspaceId,
-      {
-        ...summaryMessage,
-        metadata: {
-          ...(summaryMessage.metadata ?? {}),
-          muxMetadata: muxMetadataWithoutFollowUp,
-        },
+      summaryMessage,
+      (current) => {
+        const currentMeta = current.metadata?.muxMetadata;
+        // Summary finalization may change content/usage without replacing the
+        // handoff. Only its durable identity and pending request authorize cleanup.
+        return (
+          this.coordinator.canClearCompactionFollowUp(token) &&
+          current.id === summaryMessage.id &&
+          current.metadata?.historySequence === summaryMessage.metadata?.historySequence &&
+          current.role === "assistant" &&
+          isCompactionSummaryMetadata(currentMeta) &&
+          isDeepStrictEqual(currentMeta.pendingFollowUp, muxMeta.pendingFollowUp)
+        );
       },
-      (current) =>
-        this.coordinator.canClearCompactionFollowUp(token) &&
-        isDeepStrictEqual(current, summaryMessage)
+      (current) => {
+        const currentMeta = current.metadata?.muxMetadata;
+        assert(isCompactionSummaryMetadata(currentMeta), "Cleanup requires the guarded summary");
+        const { pendingFollowUp: _pendingFollowUp, ...muxMetadataWithoutFollowUp } = currentMeta;
+        return {
+          ...current,
+          metadata: { ...current.metadata, muxMetadata: muxMetadataWithoutFollowUp },
+        };
+      }
     );
     if (!updateResult.success) {
       throw new Error(`Failed to clear skipped pending follow-up: ${updateResult.error}`);

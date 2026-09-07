@@ -2534,21 +2534,24 @@ export class HistoryService {
    * never in the sealed archive.
    */
   // Optional ownership predicates are synchronous/pure and may run twice (under
-  // the lock and immediately before rename). Losing ownership is a successful no-op.
+  // the lock and immediately before rename). Losing ownership or the target is a successful no-op.
+  // An optional transform derives field edits from the locked row instead of a stale snapshot.
   async updateHistory(
     workspaceId: string,
     message: MuxMessage,
-    shouldUpdate?: (current: MuxMessage) => boolean
+    shouldUpdate?: (current: MuxMessage) => boolean,
+    updateFromCurrent?: (current: MuxMessage) => MuxMessage
   ): Promise<Result<void>> {
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to update history", () =>
-      this.updateHistoryUnderWriteLock(workspaceId, message, shouldUpdate)
+      this.updateHistoryUnderWriteLock(workspaceId, message, shouldUpdate, updateFromCurrent)
     );
   }
 
   private async updateHistoryUnderWriteLock(
     workspaceId: string,
     message: MuxMessage,
-    shouldUpdate?: (current: MuxMessage) => boolean
+    shouldUpdate?: (current: MuxMessage) => boolean,
+    updateFromCurrent?: (current: MuxMessage) => MuxMessage
   ): Promise<Result<void>> {
     try {
       const historyPath = this.getChatHistoryPath(workspaceId);
@@ -2576,6 +2579,9 @@ export class HistoryService {
           assert(existingMessage, "updateHistory matched message must exist");
           if (shouldUpdate && !shouldUpdate(existingMessage)) return Ok(undefined);
           sourceMessage = existingMessage;
+          // Conditional field edits must preserve unrelated late writes. Derive the
+          // replacement from the row read under this same cross-process write lock.
+          const updatedMessage = updateFromCurrent?.(existingMessage) ?? message;
 
           // Preserve compaction boundary metadata during late in-place rewrites.
           // Compaction may update an assistant row first, then a late stream rewrite can
@@ -2583,14 +2589,14 @@ export class HistoryService {
           const preservedCompactionMetadata = getCompactionMetadataToPreserve(
             workspaceId,
             existingMessage,
-            message
+            updatedMessage
           );
 
           // Preserve the historySequence, update everything else.
           messages[i] = {
-            ...message,
+            ...updatedMessage,
             metadata: {
-              ...message.metadata,
+              ...updatedMessage.metadata,
               ...(preservedCompactionMetadata ?? {}),
               historySequence: targetSequence,
             },
@@ -2602,7 +2608,11 @@ export class HistoryService {
       }
 
       if (!found || !persistedMessage) {
-        return Err(`No message found with historySequence ${targetSequence}`);
+        // Conditional cleanup is already settled when its exact target was removed.
+        // It must not chase a replacement row with the same ID in another sequence.
+        return shouldUpdate
+          ? Ok(undefined)
+          : Err(`No message found with historySequence ${targetSequence}`);
       }
 
       // Rewrite entire file

@@ -431,7 +431,8 @@ export function transition(
         compaction: {
           ...state.compaction,
           epoch: state.compaction.epoch + 1,
-          status: event.abandon ? "abandoned" : state.compaction.status,
+          // Abandonment belongs to this canceled epoch, not a replacement context.
+          status: event.abandon ? "abandoned" : "ready",
           // User Stop retains only cleanup ownership for its just-committed boundary.
           // Context mutation retires semantic observation immediately; physical leases remain.
           observation: event.abandon ? state.compaction.observation : undefined,
