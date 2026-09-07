@@ -105,7 +105,7 @@ describe("MessageQueue", () => {
       queue.removeByDedupeKeyPrefix("review-1");
       expect(queue.getVisibleRestoreText()).toBe("tail");
       expect(queue.getVisibleRestoreReviews()).toBeUndefined();
-      const onCanceled = () => {};
+      const onCanceled = () => undefined;
       const hidden = prepareUserMessageForSend({ text: "hidden", reviews });
       queue.add(
         hidden.finalText,

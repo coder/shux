@@ -700,7 +700,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const fileParts = [
       { url: "data:text/plain;base64,dGV4dA==", mediaType: "text/plain", filename: "notes.txt" },
     ];
-    const restored: Extract<WorkspaceChatMessage, { type: "restore-to-input" }>[] = [];
+    const restored: Array<Extract<WorkspaceChatMessage, { type: "restore-to-input" }>> = [];
     const displays: string[] = [];
     const canceled: string[] = [];
     const unsubscribe = session.onChatEvent(({ message }) => {
