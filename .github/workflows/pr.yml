@@ -136,6 +136,9 @@ jobs:
       - run: make -j static-check-full
         env:
           MUX_ESLINT_CONCURRENCY: 4
+      # Mobile has an isolated dependency graph and is excluded from the root checks.
+      - name: Validate mobile companion
+        run: make -j1 mobile-check
 
   flake-hash-check:
     name: Flake Hash Check

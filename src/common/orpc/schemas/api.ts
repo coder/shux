@@ -180,6 +180,18 @@ export const ProjectGitStatusResultSchema = z.object({
 
 export type ProjectGitStatusResult = z.infer<typeof ProjectGitStatusResultSchema>;
 
+export const ProjectGitDiffResultSchema = ProjectRefSchema.and(
+  ResultSchema(
+    z.object({
+      diff: z.string(),
+      truncated: z.boolean(),
+      note: z.string().optional(),
+    }),
+    z.string()
+  )
+);
+export type ProjectGitDiffResult = z.infer<typeof ProjectGitDiffResultSchema>;
+
 export const BackgroundProcessMonitorInfoSchema = z.object({
   filter: z.string(),
   filter_exclude: z.boolean(),
@@ -1489,6 +1501,10 @@ export const workspace = {
   getRuntimeStatuses: {
     input: z.object({ workspaceIds: z.array(z.string()) }),
     output: z.record(z.string(), z.enum(["running", "stopped", "unknown", "unsupported"])),
+  },
+  getProjectDiffs: {
+    input: z.object({ workspaceId: z.string() }),
+    output: z.array(ProjectGitDiffResultSchema),
   },
   getProjectGitStatuses: {
     input: z.object({

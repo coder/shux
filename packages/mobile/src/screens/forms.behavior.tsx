@@ -1,7 +1,7 @@
 import "./formTestPlatform";
 import { afterEach, expect, test } from "bun:test";
 import { createRef, useState } from "react";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { createORPCClient } from "@orpc/client";
 import { View } from "react-native";
 import type { TextInput } from "react-native";
@@ -13,6 +13,7 @@ import { Message } from "../components/Message";
 import { ContextUsage } from "../components/ContextUsage";
 import { Markdown } from "../components/Markdown";
 import { CreateWorkspace } from "./CreateWorkspace";
+import { ChangesScreen } from "./ChangesScreen";
 import { ModelSettings } from "./ModelSettings";
 import { Navigator } from "./Navigator";
 import { SettingsScreen } from "./SettingsScreen";
@@ -28,6 +29,60 @@ const workspace: FrontendWorkspaceMetadata = {
   namedWorkspacePath: "/project/feature",
   runtimeConfig: { type: "local" },
 };
+
+test("changes include secondary repositories in one request and do not hide failed checkouts", async () => {
+  const calls: string[] = [];
+  const client = createORPCClient<MobileClient>({
+    call: async (path) => {
+      const method = path.join(".");
+      calls.push(method);
+      if (method === "workspace.getProjectDiffs")
+        return [
+          {
+            projectName: "Primary",
+            projectPath: "/primary",
+            success: true,
+            data: { diff: "", truncated: false },
+          },
+          {
+            projectName: "Secondary",
+            projectPath: "/secondary",
+            success: true,
+            data: {
+              diff: "diff --git a/secondary.ts b/secondary.ts\n--- a/secondary.ts\n+++ b/secondary.ts\n@@ -1 +1 @@\n-old\n+new\n",
+              truncated: false,
+            },
+          },
+          {
+            projectName: "Offline",
+            projectPath: "/offline",
+            success: false,
+            error: "Checkout unavailable",
+          },
+        ];
+      // The old unqualified request sees a clean primary repository and misses the rest.
+      if (method === "workspace.executeBash")
+        return {
+          success: true,
+          data: { success: true, output: "", exitCode: 0, wall_duration_ms: 0 },
+        };
+      throw new Error(`Unexpected procedure: ${method}`);
+    },
+  });
+  const view = render(
+    <ChangesScreen
+      client={client}
+      workspaceId="multi"
+      signal={new AbortController().signal}
+      onReconnect={async () => {}}
+      onBack={() => {}}
+    />
+  );
+  await waitFor(() => expect(view.getByText("secondary.ts")).toBeDefined());
+  expect(calls).toEqual(["workspace.getProjectDiffs"]);
+  expect(view.getByText("Checkout unavailable")).toBeDefined();
+  expect(view.queryByText("No uncommitted changes")).toBeNull();
+});
 
 test("context meter exposes measured progress without inventing an unknown percentage", () => {
   const data = { segments: [], totalTokens: 200_000, maxTokens: 1_000_000, totalPercentage: 20 };

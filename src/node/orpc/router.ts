@@ -1620,6 +1620,12 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.workspaceService.getRuntimeStatuses(input.workspaceIds)
         ),
+      getProjectDiffs: t
+        .input(schemas.workspace.getProjectDiffs.input)
+        .output(schemas.workspace.getProjectDiffs.output)
+        .handler(async ({ context, input }) =>
+          context.workspaceService.getProjectDiffs(input.workspaceId)
+        ),
       getProjectGitStatuses: t
         .input(schemas.workspace.getProjectGitStatuses.input)
         .output(schemas.workspace.getProjectGitStatuses.output)

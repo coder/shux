@@ -36,6 +36,9 @@ mock.module("lucide-react-native", () =>
       "ShieldCheck",
       "Brain",
       "File",
+      "FileCode",
+      "CheckCircle2",
+      "RefreshCw",
       "Pause",
       "Wrench",
     ].map((name) => [name, icon])
