@@ -424,23 +424,29 @@ function pinCoderInstanceRawProvidersConfig(
 /** Shared assembly path for primary, fallback, and thinking-rebuild provider attempts. */
 export async function assembleBudgetCheckedPromptPayload(
   options: Parameters<typeof assemblePromptPayload>[0],
-  budget: { enabled: boolean; providerOptions?: MuxProviderOptions }
-): ReturnType<typeof assemblePromptPayload> {
+  budget: {
+    enabled: boolean;
+    providerOptions?: MuxProviderOptions;
+    activeTools?: readonly string[];
+  }
+): Promise<Awaited<ReturnType<typeof assemblePromptPayload>> & { contextBudgetLimit?: number }> {
   const payload = await assemblePromptPayload(options);
+  let contextBudgetLimit: number | undefined;
   // Check after provider transforms and system/schema assembly: history-only
   // estimates cannot prevent oversized requests from reaching the provider.
   if (budget.enabled) {
-    const modelContextLimit = getEffectiveContextLimit(
-      options.modelString,
-      isAnthropic1MEffectivelyEnabled(
+    contextBudgetLimit =
+      getEffectiveContextLimit(
         options.modelString,
-        budget.providerOptions,
-        options.providersConfig
-      ),
-      options.providersConfig,
-      { openaiWireFormat: budget.providerOptions?.openai?.wireFormat }
-    );
-    if (modelContextLimit == null) {
+        isAnthropic1MEffectivelyEnabled(
+          options.modelString,
+          budget.providerOptions,
+          options.providersConfig
+        ),
+        options.providersConfig,
+        { openaiWireFormat: budget.providerOptions?.openai?.wireFormat }
+      ) ?? undefined;
+    if (contextBudgetLimit == null) {
       log.warn("Context budget preflight unavailable: model context limit is unknown", {
         workspaceId: options.workspaceId,
         model: options.modelString,
@@ -449,11 +455,12 @@ export async function assembleBudgetCheckedPromptPayload(
     const exceeded = await checkAssembledRequestBudgetForModel(payload, {
       model: options.modelString,
       metadataModel: resolveModelForMetadata(options.modelString, options.providersConfig ?? null),
-      modelContextLimit,
+      modelContextLimit: contextBudgetLimit,
+      activeTools: budget.activeTools,
     });
     if (exceeded) throw new ContextBudgetExceededError(exceeded);
   }
-  return payload;
+  return { ...payload, contextBudgetLimit };
 }
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
@@ -2512,6 +2519,16 @@ export class TurnRequestBuilder {
         const effectiveAnthropicCacheTtl =
           effectiveMuxProviderOptions.anthropic?.cacheTtl ??
           getAnthropicCacheTtl(preparedAttempt.providerOptions);
+        const forcedFirstStepToolNames =
+          seed.routeProvider === "xai"
+            ? getForcedXaiSearchToolNames(
+                seed.capabilityModelString,
+                effectiveMuxProviderOptions.xai?.searchParameters
+              )?.filter((toolName) => toolName in attemptTools)
+            : undefined;
+        const firstStepToolNames = new Set(
+          forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
+        );
         // Shared by the initial build and thinking rebuilds so their assembly
         // inputs cannot drift apart mid-turn.
         const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
@@ -2534,7 +2551,11 @@ export class TurnRequestBuilder {
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
             },
-            { enabled: tokenBudgetEnabled, providerOptions: effectiveMuxProviderOptions }
+            {
+              enabled: tokenBudgetEnabled,
+              providerOptions: effectiveMuxProviderOptions,
+              activeTools: [...firstStepToolNames],
+            }
           );
         const prepareMessagesForProviderStartedAt = Date.now();
         const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
@@ -2545,16 +2566,6 @@ export class TurnRequestBuilder {
           );
         }
         const finalMessages = attemptPayload.messages;
-        const forcedFirstStepToolNames =
-          seed.routeProvider === "xai"
-            ? getForcedXaiSearchToolNames(
-                seed.capabilityModelString,
-                effectiveMuxProviderOptions.xai?.searchParameters
-              )?.filter((toolName) => toolName in attemptTools)
-            : undefined;
-        const firstStepToolNames = new Set(
-          forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
-        );
         const emitEnvelopeWith = async (
           level: string,
           providerOptionsForEnvelope: unknown
@@ -2598,6 +2609,7 @@ export class TurnRequestBuilder {
           messages: finalMessages,
           system: attemptSystem,
           engineSystem: attemptPayload.system,
+          contextBudgetLimit: attemptPayload.contextBudgetLimit,
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
           contextBudgetMemoryWritable:
@@ -2940,6 +2952,7 @@ export class TurnRequestBuilder {
                 system: nextRequest.engineSystem,
                 tools: nextRequest.engineTools,
                 contextBudgetMemoryWritable: nextRequest.contextBudgetMemoryWritable,
+                contextBudgetLimit: nextRequest.contextBudgetLimit,
                 providerOptions: nextRequest.providerOptions,
                 headers: nextHeaders,
                 callSettingsOverrides: nextRequest.resolvedOverrides.standard,
@@ -3023,6 +3036,7 @@ export class TurnRequestBuilder {
       abortSignal: combinedAbortSignal,
       tools: toolsForStream,
       contextBudgetMemoryWritable: primaryRequest.contextBudgetMemoryWritable,
+      contextBudgetLimit: primaryRequest.contextBudgetLimit,
       initialMetadata: {
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
         systemMessageTokens,

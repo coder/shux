@@ -1479,7 +1479,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
   });
 
-  it("uses the admitted snapshot for primary, fallback, and thinking rebuilds without restoring live-denied tools", async () => {
+  it.each([false, true])("pins assembly across attempts (budget=%s)", async (tokenBudget) => {
     using xumHome = new DisposableTempDir("ai-pinned-request-assembly");
     const sourceModel = KNOWN_MODELS.SONNET.id;
     const fallbackModel = KNOWN_MODELS.GPT.id;
@@ -1515,6 +1515,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId: metadata.id,
         modelString: sourceModel,
         thinkingLevel: "off" as const,
+        experiments: { tokenBudget },
       };
       expect(
         (
@@ -1526,11 +1527,15 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       ).toBe(true);
       const primary = harness.startStreamCalls[0];
       expect(primary.tools?.session_history).toBeDefined();
+      expect(primary.contextBudgetLimit != null).toBe(tokenBudget);
       const rebuilt = await primary.rebuildFirstStepForThinkingLevel!("low", {});
       expect(JSON.stringify(rebuilt)).toContain("pinned-context");
       const fallback = await primary.modelFallback!.prepare(fallbackModel);
       expect(fallback.success).toBe(true);
-      if (fallback.success) expect(fallback.data.tools?.session_history).toBeDefined();
+      if (fallback.success) {
+        expect(fallback.data.tools?.session_history).toBeDefined();
+        expect(fallback.data.contextBudgetLimit != null).toBe(tokenBudget);
+      }
       expect(seenModels).toEqual([sourceModel, fallbackModel]);
       expect(live).not.toHaveBeenCalled();
       expect((await harness.service.streamMessage(request)).success).toBe(true);

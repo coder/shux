@@ -85,7 +85,7 @@ describe("real-encoding budget guards", () => {
   test("counts system/schema text but excludes nested media bytes", async () => {
     const count = (bytes: string) =>
       estimateToolResultTokensForModel(
-        { data: [{ type: "image", data: bytes, mimeType: "image/png" }] },
+        { data: [{ type: "media", data: bytes, mediaType: "image/png" }] },
         { model }
       );
     expect(await count("x".repeat(100000))).toBe(await count("abc"));
@@ -103,6 +103,205 @@ describe("real-encoding budget guards", () => {
         ?.type
     ).toBe("context_budget_exceeded");
   });
+
+  test.each(["user", "tool-text", "json-image", "json-file", "json-message"] as const)(
+    "data URLs remain counted text in %s rather than impersonating media",
+    async (kind) => {
+      const data = "data:image/png;base64," + "a0b1c2d3e4f5".repeat(2000);
+      const output =
+        kind === "tool-text"
+          ? { type: "text", value: data }
+          : {
+              type: "json",
+              value:
+                kind === "json-image"
+                  ? { type: "image", image: data, data, mimeType: "image/png" }
+                  : kind === "json-file"
+                    ? { type: "file", url: data, data, mediaType: "image/png" }
+                    : { role: "user", content: [{ type: "image", image: data }] },
+            };
+      const payload = {
+        messages:
+          kind === "user"
+            ? [{ role: "user", content: data }]
+            : [
+                {
+                  role: "tool",
+                  content: [
+                    { type: "tool-result", toolCallId: "result", toolName: "read", output },
+                  ],
+                },
+              ],
+      };
+      expect(
+        (await checkAssembledRequestBudgetForModel(payload, { model, modelContextLimit: 10000 }))
+          ?.type
+      ).toBe("context_budget_exceeded");
+      if (kind === "user")
+        expect(
+          await estimateFreshRequestTokensForModel(
+            { userText: data, systemFloorTokens: 0, modelContextLimit: 10000 },
+            { model }
+          )
+        ).toBeGreaterThan(getContextBudgetHardCeiling(10000));
+      else
+        expect(await estimateToolResultTokensForModel(output, { model })).toBeGreaterThan(
+          getContextBudgetHardCeiling(10000)
+        );
+    }
+  );
+
+  test.each(["image-data", "file-data", "image-url", "file-url", "file"] as const)(
+    "only actual SDK content outputs give %s payloads media semantics",
+    async (type) => {
+      const data = "data:image/png;base64," + "a0b1c2d3e4f5".repeat(2000);
+      const part =
+        type === "file"
+          ? { type, mediaType: "image/png", data: { type: "data", data } }
+          : type.endsWith("-url")
+            ? { type, url: data, mediaType: "image/png" }
+            : { type, data, mediaType: "image/png" };
+      const content = { type: "content", value: [part] };
+      const payload = (output: unknown) => ({
+        messages: [
+          {
+            role: "tool",
+            content: [{ type: "tool-result", toolCallId: "result", toolName: "read", output }],
+          },
+        ],
+      });
+      expect(
+        await checkAssembledRequestBudgetForModel(payload(content), {
+          model,
+          modelContextLimit: 10000,
+        })
+      ).toBeUndefined();
+      expect(
+        (
+          await checkAssembledRequestBudgetForModel(payload({ type: "json", value: content }), {
+            model,
+            modelContextLimit: 10000,
+          })
+        )?.type
+      ).toBe("context_budget_exceeded");
+    }
+  );
+
+  test("SDK inline text-file data remains text rather than an image allowance", async () => {
+    expect(
+      (
+        await checkAssembledRequestBudgetForModel(
+          {
+            messages: [
+              {
+                role: "tool",
+                content: [
+                  {
+                    type: "tool-result",
+                    toolCallId: "result",
+                    toolName: "read",
+                    output: {
+                      type: "content",
+                      value: [
+                        {
+                          type: "file",
+                          mediaType: "text/plain",
+                          data: {
+                            type: "text",
+                            text: "data:image/png;base64," + "a0b1c2d3e4f5".repeat(2000),
+                          },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+          { model, modelContextLimit: 10000 }
+        )
+      )?.type
+    ).toBe("context_budget_exceeded");
+  });
+
+  test("a shared media-shaped object still counts as text when serialized inside tool JSON", async () => {
+    const image = { type: "image", image: "data:image/png;base64," + "a0b1c2d3e4f5".repeat(2000) };
+    expect(
+      (
+        await checkAssembledRequestBudgetForModel(
+          {
+            messages: [
+              { role: "user", content: [image] },
+              {
+                role: "tool",
+                content: [
+                  {
+                    type: "tool-result",
+                    toolCallId: "result",
+                    toolName: "read",
+                    output: { type: "json", value: image },
+                  },
+                ],
+              },
+            ],
+          },
+          { model, modelContextLimit: 10000 }
+        )
+      )?.type
+    ).toBe("context_budget_exceeded");
+  });
+
+  test.each(["image", "file"] as const)(
+    "genuine model %s parts stay bounded but their extra text does not",
+    async (type) => {
+      const payload = (data: string) => ({
+        messages: [
+          {
+            role: "user",
+            content: [
+              type === "image"
+                ? { type, image: data }
+                : { type, data, mediaType: "application/pdf" },
+            ],
+          },
+        ],
+      });
+      for (const data of [
+        "data:image/png;base64,abc",
+        "data:image/png;base64," + "a0b1c2d3e4f5".repeat(2000),
+      ]) {
+        expect(
+          await checkAssembledRequestBudgetForModel(payload(data), {
+            model,
+            modelContextLimit: 10000,
+          })
+        ).toBeUndefined();
+      }
+      expect(
+        (
+          await checkAssembledRequestBudgetForModel(
+            {
+              messages: [
+                {
+                  role: "user",
+                  content: [
+                    {
+                      type,
+                      data: "abc",
+                      image: "abc",
+                      mediaType: "image/png",
+                      caption: "data:image/png;base64," + "a0b1c2d3e4f5".repeat(2000),
+                    },
+                  ],
+                },
+              ],
+            },
+            { model, modelContextLimit: 10000 }
+          )
+        )?.type
+      ).toBe("context_budget_exceeded");
+    }
+  );
 
   test("bounded chunk counts cover direct encoding around Unicode and identifier boundaries", async () => {
     const tokenizer = await tokenizerModule.getTokenizerForModel(model, undefined, {

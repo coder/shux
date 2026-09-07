@@ -1,6 +1,9 @@
 import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
-import { estimateToolResultTokensForModel } from "./contextBudgetCounting";
+import {
+  checkAssembledRequestBudgetForModel,
+  estimateToolResultTokensForModel,
+} from "./contextBudgetCounting";
 import {
   applyCacheControl,
   getAnthropicCacheTtl,
@@ -282,6 +285,7 @@ interface StreamRequestOptions {
   onStepMessages?: (messages: ModelMessage[]) => void;
   onStepSettled?: OnStepSettled;
   contextBudgetMemoryWritable?: boolean;
+  contextBudgetLimit?: number;
   toolSearchState?: ToolSearchStreamState;
   thinkingOverrideState?: ActiveTurnThinkingOverride;
   rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
@@ -338,6 +342,7 @@ interface StreamRequestConfig {
   onStepMessages?: (messages: ModelMessage[]) => void;
   onStepSettled?: OnStepSettled;
   contextBudgetMemoryWritable?: boolean;
+  contextBudgetLimit?: number;
   toolPolicy?: ToolPolicy;
   /**
    * Tool-search deferral state (tool-search experiment). Owned and mutated by
@@ -375,6 +380,7 @@ interface StreamRequestConfig {
  */
 interface PreparedModelFallback {
   contextBudgetMemoryWritable?: boolean;
+  contextBudgetLimit?: number;
   model: LanguageModel;
   /** Canonical model string of the fallback attempt (drives metadata + tokenizer). */
   modelString: string;
@@ -2215,6 +2221,7 @@ export class StreamManager {
       onStepMessages,
       onStepSettled,
       contextBudgetMemoryWritable,
+      contextBudgetLimit,
       toolSearchState,
       onToolExecutionStart,
       thinkingOverrideState,
@@ -2269,6 +2276,7 @@ export class StreamManager {
       onStepMessages,
       onStepSettled,
       contextBudgetMemoryWritable,
+      contextBudgetLimit,
       toolPolicy,
       toolSearchState,
       thinkingOverrideState,
@@ -2626,6 +2634,27 @@ export class StreamManager {
               error: getErrorMessage(error),
             });
           }
+        }
+        if (request.contextBudgetLimit != null) {
+          const exceeded = await checkAssembledRequestBudgetForModel(
+            {
+              system: request.system,
+              messages: rebuiltFirstStepMessages ?? effectiveMessages,
+              tools: request.tools,
+            },
+            {
+              model: request.modelString,
+              metadataModel: request.budgetMetadataModel,
+              modelContextLimit: request.contextBudgetLimit,
+              activeTools,
+            }
+          );
+          // Step zero can follow executed tools on a fallback. This late hard stop
+          // preserves settled results; it must not reset/replay the activated catalog.
+          if (exceeded)
+            throw new ContextBudgetBlockedError(
+              `The next request exceeds the safe context budget for ${exceeded.model} (${exceeded.estimate} > ${exceeded.hardCeiling}). Use /compact or reduce the active tool/context payload.`
+            );
         }
         if (
           effectiveMessages === stepMessages &&
@@ -3479,6 +3508,7 @@ export class StreamManager {
       onStepMessages: streamInfo.request.onStepMessages,
       onStepSettled: streamInfo.request.onStepSettled,
       contextBudgetMemoryWritable: prepared.data.contextBudgetMemoryWritable,
+      contextBudgetLimit: prepared.data.contextBudgetLimit,
       // Same state object: aiService's fallback prepare() rebuilt it in place
       // against the fallback toolset, so prepareStep keeps reading live state.
       toolSearchState: streamInfo.request.toolSearchState,

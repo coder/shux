@@ -135,7 +135,8 @@ export function estimateToolResultSize(result: unknown): {
 
 function measureBudgetContent(
   result: unknown,
-  textParts?: string[]
+  textParts?: string[],
+  kind: "json" | "messages" | "parts" = "json"
 ): {
   toolResultChars: number;
   imageParts: number;
@@ -143,17 +144,19 @@ function measureBudgetContent(
   let toolResultChars = 0;
   let imageParts = 0;
   const ancestors = new Set<object>();
-  const stack: Array<{ value: unknown; leave?: boolean }> = [{ value: result }];
+  const stack: Array<{
+    value: unknown;
+    leave?: boolean;
+    kind?: "json" | "messages" | "message" | "parts" | "part" | "output";
+  }> = [{ value: result, kind }];
   while (stack.length > 0) {
     const entry = stack.pop()!;
     const value = entry.value;
     if (value == null) continue;
     if (typeof value === "string") {
-      if (/^data:[^;,]+;base64,/i.test(value)) imageParts += 1;
-      else {
-        toolResultChars += value.length + 2;
-        textParts?.push(value);
-      }
+      // A data URL in user/tool text is still sent verbatim, not as an attachment.
+      toolResultChars += value.length + 2;
+      textParts?.push(value);
       continue;
     }
     if (typeof value !== "object") {
@@ -168,10 +171,6 @@ function measureBudgetContent(
       continue;
     }
     if (ancestors.has(value)) continue;
-    if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-      imageParts += 1;
-      continue;
-    }
     if (value instanceof URL) {
       toolResultChars += value.href.length;
       textParts?.push(value.href);
@@ -181,27 +180,60 @@ function measureBudgetContent(
     stack.push({ value, leave: true });
     toolResultChars += 2;
     if (Array.isArray(value)) {
-      for (const child of value) stack.push({ value: child });
+      for (const child of value)
+        stack.push({
+          value: child,
+          kind: entry.kind === "messages" ? "message" : entry.kind === "parts" ? "part" : "json",
+        });
       toolResultChars += value.length;
       continue;
     }
     const record = value as Record<string, unknown>;
-    const mediaType = record.mediaType ?? record.mimeType;
     const displayOnly = isDisplayOnlyFilePart(value);
-    const isMedia =
-      isMediaPart(value) ||
-      ["image", "file", "image_url", "image-url", "image-data", "file-data", "file-url"].includes(
-        String(record.type)
-      ) ||
-      (typeof mediaType === "string" && /^(image|audio|video)\//.test(mediaType));
-    if (isMedia && !displayOnly) imageParts += 1;
+    const toolMedia = isMediaPart(value);
+    // Tool JSON can impersonate SDK part shapes. Only direct model-message/fresh
+    // attachment parts get SDK media semantics; canonical tool wrappers are also
+    // safe because the shared attachment sanitizer removes their data recursively.
+    const image = entry.kind === "part" && record.type === "image" && "image" in record;
+    const inlineText =
+      typeof record.data === "object" &&
+      record.data !== null &&
+      "type" in record.data &&
+      record.data.type === "text";
+    const file =
+      entry.kind === "part" &&
+      record.type === "file" &&
+      !inlineText &&
+      ("data" in record || "url" in record);
+    const dataMedia =
+      entry.kind === "part" && (record.type === "image-data" || record.type === "file-data");
+    const urlMedia =
+      entry.kind === "part" && (record.type === "image-url" || record.type === "file-url");
+    if (toolMedia || image || file || dataMedia || urlMedia) imageParts += 1;
     for (const [key, child] of Object.entries(record)) {
-      // Skip only this media object's payload. An outer tool result's `data`
-      // can contain both ordinary text and more media and must still be walked.
-      if ((isMedia || displayOnly) && ["data", "url", "image", "image_url"].includes(key)) continue;
+      if (
+        ((toolMedia || displayOnly) && key === "data") ||
+        (image && key === "image") ||
+        (file && (key === "data" || key === "url")) ||
+        (dataMedia && key === "data") ||
+        (urlMedia && key === "url")
+      )
+        continue;
       toolResultChars += key.length + 4;
       textParts?.push(key);
-      stack.push({ value: child });
+      stack.push({
+        value: child,
+        kind:
+          entry.kind === "message" &&
+          key === "content" &&
+          (record.role === "user" || record.role === "assistant" || record.role === "tool")
+            ? "parts"
+            : entry.kind === "part" && record.type === "tool-result" && key === "output"
+              ? "output"
+              : entry.kind === "output" && record.type === "content" && key === "value"
+                ? "parts"
+                : "json",
+      });
     }
   }
   return { toolResultChars, imageParts };
@@ -214,9 +246,12 @@ export interface BudgetTokenCountInput {
 }
 
 /** The same media-byte exclusion used for step sizing, with text retained for real encoding. */
-export function prepareBudgetTokenCount(content: unknown): BudgetTokenCountInput {
+export function prepareBudgetTokenCount(
+  content: unknown,
+  kind: "json" | "messages" | "parts" = "json"
+): BudgetTokenCountInput {
   const textParts: string[] = [];
-  const size = measureBudgetContent(content, textParts);
+  const size = measureBudgetContent(content, textParts, kind);
   const fixedTokens = size.imageParts * IMAGE_TOKEN_ESTIMATE;
   return {
     text: textParts.join("\n"),
@@ -257,12 +292,17 @@ export function prepareFreshRequestTokenCount(
     Number.isFinite(systemFloorTokens) && systemFloorTokens >= 0,
     "System token floor must be finite and nonnegative"
   );
-  const content = prepareBudgetTokenCount([
-    input.userText,
-    input.leadIn ?? "",
-    ...(input.attachments ?? []),
-    ...(input.prelude ?? []),
-  ]);
+  const content = prepareBudgetTokenCount(
+    [
+      input.userText,
+      input.leadIn ?? "",
+      ...(input.attachments ?? []),
+      ...(input.prelude ?? []).flatMap((parts): unknown[] =>
+        Array.isArray(parts) ? parts : [parts]
+      ),
+    ],
+    "parts"
+  );
   return {
     ...content,
     fixedTokens: content.fixedTokens + systemFloorTokens,
@@ -284,7 +324,7 @@ export interface AssembledRequestBudgetInput {
 export function prepareAssembledRequestTokenCount(
   payload: AssembledRequestBudgetInput
 ): BudgetTokenCountInput {
-  const content = prepareBudgetTokenCount([payload.system, ...payload.messages]);
+  const content = prepareBudgetTokenCount([payload.system, ...payload.messages], "messages");
   const textParts = [content.text];
   let tokens = content.heuristicTokens;
   for (const [name, tool] of Object.entries(payload.tools ?? {})) {

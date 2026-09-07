@@ -77,16 +77,27 @@ export function estimateToolResultTokensForModel(
 
 export async function checkAssembledRequestBudgetForModel(
   payload: AssembledRequestBudgetInput,
-  options: BudgetModel & { modelContextLimit: number | null | undefined }
+  options: BudgetModel & {
+    modelContextLimit: number | null | undefined;
+    activeTools?: readonly string[];
+  }
 ): Promise<ContextBudgetExceeded | undefined> {
   const limit = options.modelContextLimit;
   if (limit == null || !Number.isFinite(limit) || limit <= 0) return undefined;
   const hardCeiling = getContextBudgetHardCeiling(limit);
+  // activeTools scopes provider advertisement, not the executable tool registry.
+  const tools =
+    options.activeTools == null
+      ? payload.tools
+      : Object.fromEntries(
+          options.activeTools.flatMap((name) =>
+            payload.tools && name in payload.tools ? [[name, payload.tools[name]]] : []
+          )
+        );
   const framing =
-    REQUEST_FRAMING_TOKENS *
-    (1 + payload.messages.length + Object.keys(payload.tools ?? {}).length);
+    REQUEST_FRAMING_TOKENS * (1 + payload.messages.length + Object.keys(tools ?? {}).length);
   const estimate = await countBudgetInput(
-    prepareAssembledRequestTokenCount(payload),
+    prepareAssembledRequestTokenCount({ ...payload, tools }),
     options,
     framing,
     hardCeiling

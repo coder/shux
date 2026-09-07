@@ -226,7 +226,7 @@ describe("request estimates", () => {
       data: {
         content: [
           { type: "text", text: "visible facts" },
-          { type: "image", data, mimeType: "image/png" },
+          { type: "media", data, mediaType: "image/png" },
         ],
       },
     });
@@ -251,7 +251,14 @@ describe("request estimates", () => {
       });
     expect(estimate("x".repeat(100_000))).toBe(estimate("abc"));
     expect(estimate("abc")).toBeGreaterThanOrEqual(IMAGE_TOKEN_ESTIMATE);
-    expect(estimateToolResultSize({ nested: new Uint8Array(100_000) }).imageParts).toBe(1);
+    expect(estimateToolResultSize({ nested: new Uint8Array(100) }).imageParts).toBe(0);
+    expect(
+      estimateFreshRequestTokens({
+        userText: "task",
+        systemFloorTokens: 0,
+        attachments: [{ type: "image", image: new Uint8Array(100_000) }],
+      })
+    ).toBeLessThan(IMAGE_TOKEN_ESTIMATE + 100);
   });
 
   test("PDF media and display-only tool attachments never count raw base64 as text", () => {

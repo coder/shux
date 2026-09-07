@@ -1,3 +1,4 @@
+import { computeActiveToolNames, prepareToolSearch } from "@/common/utils/tools/toolCatalog";
 import { tool } from "ai";
 import { z } from "zod";
 import { getContextBudgetHardCeiling } from "@/common/utils/compaction/contextBudget";
@@ -336,6 +337,39 @@ describe("TurnRequestBuilder assembled preflight", () => {
         { enabled: true }
       );
       expect(fitting.messages.length).toBeGreaterThan(0);
+    }
+  );
+
+  it.each(["inactive", "activated", "search-off"] as const)(
+    "budgets only advertised catalog schemas (%s)",
+    async (mode) => {
+      const request = {
+        ...options(),
+        systemMessage: "Short system",
+        tools: {
+          tool_catalog_search: tool({
+            description: "Search the catalog",
+            inputSchema: z.object({}),
+          }),
+          mcp_large: tool({ description: "漢".repeat(10000), inputSchema: z.object({}) }),
+        },
+      };
+      const prepared = prepareToolSearch({ tools: request.tools, mcpToolNames: ["mcp_large"] });
+      expect(prepared.state).toBeDefined();
+      if (mode === "activated") prepared.state!.activatedToolNames.add("mcp_large");
+      const activeTools =
+        mode === "search-off" ? undefined : computeActiveToolNames(prepared.state);
+      const result = await assembleBudgetCheckedPromptPayload(
+        { ...request, tools: prepared.tools },
+        {
+          enabled: true,
+          activeTools,
+        }
+      ).catch((error: unknown) => error);
+      if (mode === "inactive") {
+        expect(result).not.toBeInstanceOf(Error);
+        expect(result).toHaveProperty("tools.mcp_large");
+      } else expect(result).toBeInstanceOf(ContextBudgetExceededError);
     }
   );
 
