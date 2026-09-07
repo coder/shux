@@ -237,6 +237,12 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     setCountdown(0);
     setManualRetryError(null);
     void api?.workspace.setAutoRetryEnabled?.({ workspaceId: props.workspaceId, enabled: false });
+    // Same Stop as the shortcut shown on the button (useAIViewKeybinds): owed monitor output is
+    // dismissed rather than launched as a wake once the retry stops.
+    void api?.workspace.interruptStream({
+      workspaceId: props.workspaceId,
+      options: { retireBashMonitorAttention: true },
+    });
   };
 
   const lastMessage = getLastMainRetryCandidateMessage(workspaceState.messages);

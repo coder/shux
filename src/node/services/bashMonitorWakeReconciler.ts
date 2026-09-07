@@ -72,9 +72,8 @@ export type BashMonitorWakeDeliveryState =
     };
 
 export interface BashMonitorWakeReconcilerProcessManager {
-  pullMonitorWakeSignals(
-    ownerWorkspaceId: string
-  ): Promise<readonly BashMonitorProcessSnapshot[]> | readonly BashMonitorProcessSnapshot[];
+  /** Synchronous so a caller can snapshot the process frontier in the tick it decides to act. */
+  pullMonitorWakeSignals(ownerWorkspaceId: string): readonly BashMonitorProcessSnapshot[];
   getMonitorWakeDeliveryState(
     processId: string,
     originNotAfterMs: number
@@ -162,6 +161,8 @@ interface ReconcileState {
   scheduled: boolean;
   promise?: Promise<void>;
   dispatch?: DispatchState;
+  /** Frontier a committed stop still has to retire; applied before any dispatch. */
+  owedRetirement?: readonly BashMonitorProcessSnapshot[];
 }
 
 function signalKey(processId: string, createdAt: string): string {
@@ -504,6 +505,10 @@ export class BashMonitorWakeReconciler {
 
   private async reconcileOnce(ownerWorkspaceId: string): Promise<void> {
     const dispatch = await this.locks.withLock(ownerWorkspaceId, async () => {
+      // A stop's retirement that failed on transient I/O is retried here first (a throw lands in
+      // the reconcile retry backoff), so dismissed attention never dispatches when the stop's own
+      // idle transition reconciles.
+      await this.retireOwed(ownerWorkspaceId, this.state(ownerWorkspaceId));
       const collected = await this.collect(ownerWorkspaceId, true);
       for (const readSettled of collected.deferredReads) {
         void readSettled.finally(() => this.scheduleReconcile(ownerWorkspaceId));
@@ -600,42 +605,49 @@ export class BashMonitorWakeReconciler {
     // without waiting behind that. The lock slot is reserved synchronously too, ahead of any
     // reconcile the stop's own stream abort triggers.
     this.abortDispatch(ownerWorkspaceId);
+    // Snapshot the process frontier on entry as well, in the same tick: output that arrives while
+    // the stop waits for the lock or settles is new and stays owed to the idle agent, so the
+    // retirement itself can run after the commit, or on a later reconcile if its I/O fails.
+    const frontier = this.args.processManager.pullMonitorWakeSignals(ownerWorkspaceId);
     const committed = await this.locks.withLock(ownerWorkspaceId, async () => {
       this.abortDispatch(ownerWorkspaceId);
-      // Snapshot before waiting on the stop: output that arrives while it settles is new and
-      // stays owed to the idle agent.
-      const collected = await this.collect(ownerWorkspaceId, false);
       if (commit != null && !(await commit())) return false;
-      const consumed = [...collected.signals, ...collected.autoConsumed];
-      await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, consumed);
-      await this.cleanup(consumed);
+      const state = this.state(ownerWorkspaceId);
+      const owed = new Map(
+        (state.owedRetirement ?? []).map((s) => [signalKey(s.processId, s.createdAt), s] as const)
+      );
+      for (const s of frontier) owed.set(signalKey(s.processId, s.createdAt), s);
+      state.owedRetirement = [...owed.values()];
+      await this.retireOwed(ownerWorkspaceId, state);
       return true;
     });
     if (!committed) this.scheduleReconcile(ownerWorkspaceId);
   }
 
-  private async collect(
+  private async retireOwed(ownerWorkspaceId: string, state: ReconcileState): Promise<void> {
+    if (state.owedRetirement == null) return;
+    const collected = await this.collect(ownerWorkspaceId, false, state.owedRetirement);
+    const consumed = [...collected.signals, ...collected.autoConsumed];
+    await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, consumed);
+    await this.cleanup(consumed);
+    state.owedRetirement = undefined;
+  }
+
+  /** Live monitors merged with their registry rows, plus registry rows whose process is gone. */
+  private async candidates(
     ownerWorkspaceId: string,
-    applyFrontier: boolean
-  ): Promise<{
-    signals: DerivedSignal[];
-    autoConsumed: DerivedSignal[];
-    deferredReads: Array<Promise<void>>;
-    watermarks: Map<string, WatermarkEntry>;
-  }> {
-    await this.deleteLegacyWakeDirOnce(ownerWorkspaceId);
-    const [live, registryRows, watermarks] = await Promise.all([
-      this.args.processManager.pullMonitorWakeSignals(ownerWorkspaceId),
-      this.args.registry.listAll(ownerWorkspaceId),
-      this.readWatermarks(ownerWorkspaceId),
-    ]);
+    live: readonly BashMonitorProcessSnapshot[] = this.args.processManager.pullMonitorWakeSignals(
+      ownerWorkspaceId
+    )
+  ): Promise<Array<{ snapshot: BashMonitorProcessSnapshot; deadRegistryRow: boolean }>> {
+    const registryRows = await this.args.registry.listAll(ownerWorkspaceId);
     const registryByKey = new Map(
       registryRows.map((record) => [signalKey(record.processId, record.createdAt), record] as const)
     );
     const liveKeys = new Set(
       live.map((snapshot) => signalKey(snapshot.processId, snapshot.createdAt))
     );
-    const candidates: Array<{ snapshot: BashMonitorProcessSnapshot; deadRegistryRow: boolean }> = [
+    return [
       ...live.map((snapshot) => {
         const record = registryByKey.get(signalKey(snapshot.processId, snapshot.createdAt));
         return {
@@ -656,6 +668,23 @@ export class BashMonitorWakeReconciler {
           deadRegistryRow: true,
         })),
     ];
+  }
+
+  private async collect(
+    ownerWorkspaceId: string,
+    applyFrontier: boolean,
+    liveAsOf?: readonly BashMonitorProcessSnapshot[]
+  ): Promise<{
+    signals: DerivedSignal[];
+    autoConsumed: DerivedSignal[];
+    deferredReads: Array<Promise<void>>;
+    watermarks: Map<string, WatermarkEntry>;
+  }> {
+    await this.deleteLegacyWakeDirOnce(ownerWorkspaceId);
+    const [candidates, watermarks] = await Promise.all([
+      this.candidates(ownerWorkspaceId, liveAsOf),
+      this.readWatermarks(ownerWorkspaceId),
+    ]);
     const activeKeys = new Set(
       candidates.map(({ snapshot }) => signalKey(snapshot.processId, snapshot.createdAt))
     );

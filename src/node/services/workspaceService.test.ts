@@ -1,13 +1,15 @@
 import type { TurnCompletion } from "./streamManager";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
-import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
+import {
+  WorkspaceService,
+  generateForkBranchName,
+  generateForkTitle,
+  STOP_UNRECORDED_MESSAGE,
+} from "./workspaceService";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
-import {
-  CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
-  WITHDRAWN_WAKE_UNRECORDED_MESSAGE,
-} from "./agentSession";
+import { CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE } from "./agentSession";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
@@ -96,6 +98,8 @@ import { sandboxHostService } from "./sandbox/sandboxHostService";
 import type {
   BashMonitorProcessSnapshot,
   BashMonitorWakeReconciler,
+  BashMonitorWakeReconcilerProcessManager,
+  BashMonitorWakeReconcilerRegistry,
   BashMonitorWakeDispatch,
 } from "./bashMonitorWakeReconciler";
 
@@ -247,7 +251,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       cleanup: mock(() => Promise.resolve()),
       notifyMonitorWakeStateChanged: mock(() => undefined),
       getActiveMonitorCount: mock(() => 0),
-      pullMonitorWakeSignals: mock(() => Promise.resolve([])),
+      pullMonitorWakeSignals: mock(() => []),
       getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
       acknowledgeMonitorWake: mock(() => undefined),
       dropRetiredMonitor: mock(() => undefined),
@@ -327,7 +331,9 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       Promise.resolve({ model, agentId: "exec" });
     const signals: BashMonitorProcessSnapshot[] = [];
     let shown = 0;
-    spyOn(backgroundProcessManager, "pullMonitorWakeSignals").mockImplementation(() => signals);
+    spyOn(backgroundProcessManager, "pullMonitorWakeSignals").mockImplementation(() => [
+      ...signals,
+    ]);
     spyOn(backgroundProcessManager, "getMonitorWakeDeliveryState").mockImplementation(() =>
       Promise.resolve({ status: "settled", shownThroughOffset: shown, terminalStatusShown: false })
     );
@@ -667,6 +673,39 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("attention a hard Stop failed to retire is retired before any later wake", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      await h.addAttention(10);
+      const reconcilerInternal = h.reconciler as unknown as {
+        args: { registry: BashMonitorWakeReconcilerRegistry };
+      };
+      spyOn(reconcilerInternal.args.registry, "listAll").mockRejectedValueOnce(
+        new Error("transient registry read")
+      );
+      spyOn(h.aiService, "stopStream").mockImplementation(async () => {
+        h.abort("user");
+        await h.session.waitForIdle();
+        return Ok(undefined);
+      });
+      spyOn(h.aiService, "isStreaming").mockReturnValue(false);
+      expect(
+        (await h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true }))
+          .success
+      ).toBe(true);
+      await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
+      await h.reconciler.reconcile(h.workspaceId);
+      // The stop's idle reconcile retried the retirement instead of re-dispatching the output.
+      expect(h.requests).toHaveLength(1);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      await h.addAttention(20);
+      expect(h.requests).toHaveLength(2);
+    } finally {
+      await h.finish();
+    }
+  });
+
   test("a failed hard Stop keeps owed attention for the idle wake", async () => {
     const h = await createActiveWakeHarness();
     try {
@@ -707,6 +746,30 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("a wake deferred as its idle wait hands off installs the next idle wait", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      const internal = h.internal as typeof h.internal & {
+        scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId: string): void;
+      };
+      const waits = h.internal.pendingBashMonitorWakeIdleWaitsByOwner;
+      internal.scheduleBashMonitorWakeReconcileAfterIdle(h.workspaceId);
+      const handedOff = waits.get(h.workspaceId);
+      let replacedDuringHandoff: boolean | undefined;
+      spyOn(h.reconciler, "scheduleReconcile").mockImplementationOnce(() => {
+        // A turn that started as the wait resolved defers the wake from inside the wait's own
+        // hand-off; the finished wait must not swallow the re-arm as a duplicate.
+        internal.scheduleBashMonitorWakeReconcileAfterIdle(h.workspaceId);
+        replacedDuringHandoff = waits.get(h.workspaceId) !== handedOff;
+      });
+      await handedOff;
+      expect(replacedDuringHandoff).toBe(true);
+      await waits.get(h.workspaceId);
+    } finally {
+      await h.finish();
+    }
+  });
+
   test("hard Stop during a wake's acceptance window keeps the wake from streaming", async () => {
     const h = await createActiveWakeHarness();
     try {
@@ -736,7 +799,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     const release = createDeferred<void>();
     try {
       const sessionInternal = h.session as unknown as {
-        persistAutoRetryState(): Promise<boolean>;
+        persistAutoRetryState(): Promise<void>;
         getAutoRetryPreferencePath(): string;
       };
       const persist = sessionInternal.persistAutoRetryState.bind(h.session);
@@ -778,12 +841,13 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
-  test("hard Stop during a wake's acceptance window fails when the withdrawn wake's abandon marker cannot be written", async () => {
+  test("hard Stop during a wake's acceptance window fails until the withdrawn wake's abandon marker is written", async () => {
     const h = await createActiveWakeHarness();
     try {
       const sessionInternal = h.session as unknown as { getAutoRetryPreferencePath(): string };
+      const preferencePath = sessionInternal.getAutoRetryPreferencePath();
       // A directory at the preference path makes the marker write fail (EISDIR).
-      await fsPromises.mkdir(sessionInternal.getAutoRetryPreferencePath(), { recursive: true });
+      await fsPromises.mkdir(preferencePath, { recursive: true });
       let stop: Promise<Result<void>> | undefined;
       const unsubscribe = h.session.onChatEvent(({ message: event }) => {
         if (event.type === "message" && event.role === "user" && stop == null) {
@@ -793,10 +857,51 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       await h.addAttention(10);
       unsubscribe();
       expect(stop).toBeDefined();
-      expect(await stop!).toEqual(Err(WITHDRAWN_WAKE_UNRECORDED_MESSAGE));
+      expect(await stop!).toEqual(Err(STOP_UNRECORDED_MESSAGE));
       expect(h.requests).toHaveLength(0);
       expect(h.session.isBusy()).toBe(false);
+      // The obligation outlives the joined send: a later Stop retries the write once it can succeed.
+      await fsPromises.rmdir(preferencePath);
+      expect(
+        (await h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true }))
+          .success
+      ).toBe(true);
+      const persisted = JSON.parse(await fsPromises.readFile(preferencePath, "utf-8")) as {
+        startupAutoRetryAbandon?: { reason: string; userMessageId?: string };
+      };
+      expect(persisted.startupAutoRetryAbandon?.reason).toBe("aborted");
+      expect(persisted.startupAutoRetryAbandon?.userMessageId).toBeDefined();
     } finally {
+      await h.finish();
+    }
+  });
+
+  test("output arriving while a hard Stop waits behind a wake's acceptance stays owed", async () => {
+    const h = await createActiveWakeHarness();
+    const release = createDeferred<void>();
+    try {
+      const acknowledging = createDeferred<void>();
+      const reconcilerInternal = h.reconciler as unknown as {
+        args: { processManager: BashMonitorWakeReconcilerProcessManager };
+      };
+      spyOn(reconcilerInternal.args.processManager, "acknowledgeMonitorWake").mockImplementation(
+        async () => {
+          acknowledging.resolve();
+          await release.promise;
+        }
+      );
+      const attention = h.addAttention(10);
+      await acknowledging.promise;
+      // Acceptance holds the reconciler lock; the Stop snapshots the frontier (10) on entry and waits.
+      const stop = h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true });
+      const later = h.addAttention(20);
+      release.resolve();
+      expect((await stop).success).toBe(true);
+      await Promise.all([attention, later]);
+      // Only the frontier the Stop saw was retired; the newer output woke the idle agent.
+      expect(h.requests).toHaveLength(1);
+    } finally {
+      release.resolve();
       await h.finish();
     }
   });

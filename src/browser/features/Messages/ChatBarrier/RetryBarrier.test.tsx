@@ -72,6 +72,7 @@ function createDeferred<T>() {
 let resumeStreamResult: ResumeStreamResult = { success: true, data: { started: true } };
 let previousAutoRetryEnabled = false;
 const resumeStream = mock((_input: unknown) => Promise.resolve(resumeStreamResult));
+const interruptStream = mock((_input: unknown) => Promise.resolve({ success: true as const }));
 const setAutoRetryEnabled = mock((input: unknown) => {
   if (
     typeof input === "object" &&
@@ -107,6 +108,7 @@ void mock.module("@/browser/contexts/API", () => ({
     api: {
       workspace: {
         resumeStream,
+        interruptStream,
         setAutoRetryEnabled,
       },
     },
@@ -152,6 +154,7 @@ describe("RetryBarrier", () => {
     resumeStreamResult = { success: true, data: { started: true } };
     previousAutoRetryEnabled = false;
     resumeStream.mockClear();
+    interruptStream.mockClear();
     setAutoRetryEnabled.mockClear();
   });
 
@@ -393,5 +396,27 @@ describe("RetryBarrier", () => {
       persist: false,
     });
     expect(resumeStream).toHaveBeenCalledTimes(1);
+  });
+
+  test("the Stop button issues the same attention-retiring Stop as its shortcut", () => {
+    currentWorkspaceState = createWorkspaceState({
+      autoRetryStatus: {
+        type: "auto-retry-scheduled",
+        attempt: 1,
+        delayMs: 5_000,
+        scheduledAt: Date.now(),
+      },
+    });
+
+    const view = render(<RetryBarrier workspaceId="ws-1" />);
+
+    fireEvent.click(view.getByRole("button", { name: /^Stop/ }));
+
+    expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws-1", enabled: false });
+    expect(interruptStream).toHaveBeenCalledTimes(1);
+    expect(interruptStream).toHaveBeenCalledWith({
+      workspaceId: "ws-1",
+      options: { retireBashMonitorAttention: true },
+    });
   });
 });

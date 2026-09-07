@@ -45,7 +45,6 @@ import {
   CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
   inheritOpenWorkspaceTurnMetadata,
   type StreamErrorRecoveryOutcome,
-  WITHDRAWN_WAKE_UNRECORDED_MESSAGE,
 } from "@/node/services/agentSession";
 import type { QueueCutCutter } from "@/node/services/messageQueue";
 import { cancelReasonBeforeAcceptance } from "@/node/services/messageQueue";
@@ -699,6 +698,10 @@ const WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE =
 // idle-compaction loop must not count it toward suppression.
 const IDLE_ONLY_BUSY_SKIP_MESSAGE = "Workspace is busy; idle-only send was skipped.";
 const BASH_MONITOR_PERSIST_RETRY_DELAYS_MS = [50, 200] as const;
+
+/** Returned by a user Stop whose startup abandon marker could not be written (see interruptStream). */
+export const STOP_UNRECORDED_MESSAGE =
+  "Stop could not be recorded on disk, so the stopped turn may resume on restart.";
 
 /** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
 const SEND_ADMISSION_STALE_MESSAGE =
@@ -1851,10 +1854,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly constructedAtMs = Date.now();
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
   /** The wake send in flight per owner (at most one: dispatch runs under the history lock). */
-  private readonly inFlightBashMonitorWakeSendsByOwner = new Map<
-    string,
-    Promise<Result<void, SendMessageError>>
-  >();
+  private readonly inFlightBashMonitorWakeSendsByOwner = new Map<string, Promise<unknown>>();
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
   private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
@@ -2375,7 +2375,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         pullMonitorWakeSignals: (ownerWorkspaceId) =>
           typeof monitorManager.pullMonitorWakeSignals === "function"
             ? monitorManager.pullMonitorWakeSignals(ownerWorkspaceId)
-            : Promise.resolve([]),
+            : [],
         getMonitorWakeDeliveryState: (processId, originNotAfterMs) =>
           typeof monitorManager.getMonitorWakeDeliveryState === "function"
             ? monitorManager.getMonitorWakeDeliveryState(processId, originNotAfterMs)
@@ -2511,11 +2511,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           error,
         });
       })
-      .then(() => this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId))
-      .finally(() => {
+      .then(() => {
+        // Release the slot before scheduling: the reconcile may find a new turn already running
+        // and must be able to install the next idle wait.
         if (this.pendingBashMonitorWakeIdleWaitsByOwner.get(ownerWorkspaceId) === promise) {
           this.pendingBashMonitorWakeIdleWaitsByOwner.delete(ownerWorkspaceId);
         }
+        this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
       });
     this.pendingBashMonitorWakeIdleWaitsByOwner.set(ownerWorkspaceId, promise);
   }
@@ -11635,8 +11637,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // lock ahead of the reconcile this abort's idle transition triggers, so the abort itself
       // never waits behind acceptance I/O. The durable consumption commits only once the stop
       // succeeded: a failed stop leaves the agent running, so its output stays owed. Monitors stay
-      // armed for new output. Best-effort, and never behind the history lock (a wake admission
-      // holds it across stream construction).
+      // armed for new output. Retirement I/O that fails does not fail the Stop; the reconciler
+      // keeps it owed and retries it before any dispatch. Never behind the history lock (a wake
+      // admission holds it across stream construction).
       const retiring = options?.retireBashMonitorAttention === true;
       const withdrawnWakeSend = retiring
         ? this.inFlightBashMonitorWakeSendsByOwner.get(workspaceId)
@@ -11663,14 +11666,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // session interrupt above saw idle) records the startup abandon marker for that row on every
       // exit before it resolves, including a failed goal sync or acceptance (see
       // abandonWithdrawnSend in AgentSession.sendMessage). Stop is acknowledged after it settles: a
-      // forced exit right after Stop must not leave the row eligible for startup replay. A marker
-      // the send could not write fails the Stop below; its other outcomes are the dispatch's to
-      // report.
-      const withdrawnWakeResult = await withdrawnWakeSend?.catch(() => undefined);
-      const withdrawnWakeUnrecorded =
-        withdrawnWakeResult?.success === false &&
-        withdrawnWakeResult.error.type === "unknown" &&
-        withdrawnWakeResult.error.raw === WITHDRAWN_WAKE_UNRECORDED_MESSAGE;
+      // forced exit right after Stop must not leave the row eligible for startup replay. The send's
+      // own result is the dispatch's to report; a marker still unrecorded after the session retried
+      // the write fails the Stop below, on this and every later Stop, so the obligation is not lost
+      // with the joined send.
+      await withdrawnWakeSend?.catch(() => undefined);
+      const abandonRecorded = !retiring || (await session.recordPendingStartupAutoRetryAbandon());
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
@@ -11720,11 +11721,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         session.restoreQueueToInput();
       }
 
-      if (withdrawnWakeUnrecorded) {
-        log.error("Stop left a withdrawn monitor wake eligible for startup replay", {
-          workspaceId,
-        });
-        return Err(WITHDRAWN_WAKE_UNRECORDED_MESSAGE);
+      if (!abandonRecorded) {
+        log.error("Stop left the stopped turn eligible for startup replay", { workspaceId });
+        return Err(STOP_UNRECORDED_MESSAGE);
       }
       return Ok(undefined);
     } catch (error) {
