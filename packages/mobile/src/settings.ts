@@ -94,12 +94,16 @@ function modelRouting(data: SettingsData) {
   };
 }
 
-export function getPolicyBlockReason(data: SettingsData, model: string): string | null {
+export function getModelBlockReason(data: SettingsData, model: string): string | null {
   if (!data.policy || (data.policy.status.state === "enforced" && !data.policy.policy))
     return "Server policy unavailable. Retry to reload it.";
   // The server owns minimum-client/version semantics, including its blocked reason.
   if (data.policy.status.state === "blocked")
     return data.policy.status.reason || "Blocked by server policy.";
+  return getModelRouteBlockReason(data, model);
+}
+
+function getModelRouteBlockReason(data: SettingsData, model: string): string | null {
   const { policy, isConfigured, isAccessible } = modelRouting(data);
   const route = resolveRoute(
     model,
@@ -108,9 +112,32 @@ export function getPolicyBlockReason(data: SettingsData, model: string): string 
     isConfigured,
     isAccessible
   );
-  return isModelAllowedByPolicy(policy, `${route.routeProvider}:${route.routeModelId}`)
+  if (!isModelAllowedByPolicy(policy, `${route.routeProvider}:${route.routeModelId}`))
+    return "The selected model's route is blocked by server policy. Choose another model.";
+  // resolveRoute has a direct fallback even when no route is configured. A visible
+  // current selection must still pass the same availability/auth gates as the picker.
+  if (
+    !isModelAvailable(
+      model,
+      data.config.routePriority ?? ["direct"],
+      data.config.routeOverrides ?? {},
+      isConfigured,
+      isAccessible
+    )
+  )
+    return "No configured route can serve the selected model. Choose another model or configure a provider.";
+  // Gate only the actual direct route; gateways supply their own credentials.
+  if (route.routeProvider !== "openai") return null;
+  const openai = data.providers.openai;
+  const supported =
+    openai?.apiKeySet && openai.codexOauthSet
+      ? true
+      : !openai?.apiKeySet && openai?.codexOauthSet
+        ? isCodexOauthAllowedModel(model, data.providers)
+        : !isCodexOauthRequiredModel(model, data.providers);
+  return supported
     ? null
-    : "The selected model's route is blocked by server policy. Choose another model.";
+    : "The selected model is unavailable with the configured OpenAI authentication. Choose another model or update credentials.";
 }
 
 export function modelChoices(data: SettingsData, currentModel: string): string[] {
@@ -125,7 +152,6 @@ export function modelChoices(data: SettingsData, currentModel: string): string[]
     }
   }
   for (const model of Object.values(KNOWN_MODELS)) models.add(model.id);
-  const { isConfigured, isAccessible } = modelRouting(data);
   const isAuthoritativeModelAccessible = (provider: string, modelId: string) => {
     const config = data.providers[provider];
     return isProviderModelAccessibleFromAuthoritativeCatalog(
@@ -145,33 +171,11 @@ export function modelChoices(data: SettingsData, currentModel: string): string[]
       return false;
     // Keep Settings available during a global block; model restrictions follow the
     // resolved route, not the canonical identity (gateways own their credentials/policy).
-    if (data.policy?.status.state === "enforced" && getPolicyBlockReason(data, model)) return false;
-    if (
-      !isModelAvailable(
-        model,
-        data.config.routePriority ?? ["direct"],
-        data.config.routeOverrides ?? {},
-        isConfigured,
-        isAccessible
-      )
-    )
-      return false;
-    // Gate only the actual direct route; gateways supply their own credentials.
-    if (
-      resolveRoute(
-        model,
-        data.config.routePriority ?? ["direct"],
-        data.config.routeOverrides ?? {},
-        isConfigured,
-        isAccessible
-      ).routeProvider !== "openai"
-    )
-      return true;
-    const openai = data.providers.openai;
-    if (openai?.apiKeySet && openai.codexOauthSet) return true;
-    if (!openai?.apiKeySet && openai?.codexOauthSet)
-      return isCodexOauthAllowedModel(model, data.providers);
-    return !isCodexOauthRequiredModel(model, data.providers);
+    return (
+      (data.policy?.status.state === "enforced"
+        ? getModelBlockReason(data, model)
+        : getModelRouteBlockReason(data, model)) === null
+    );
   });
 }
 

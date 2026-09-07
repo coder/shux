@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { KNOWN_MODELS } from "../../../src/common/constants/knownModels";
 import {
-  getPolicyBlockReason,
+  getModelBlockReason,
   modelChoices,
   modelMatchesSearch,
   resolveSettings,
@@ -40,8 +40,8 @@ describe("server policy", () => {
     expect(resolveSettings({}, settings, "exec").model).toBe(current);
     expect(modelChoices(settings, current)).toEqual([current, "anthropic:allowed"]);
     expect(modelChoices(settings, "")).not.toContain(current);
-    expect(getPolicyBlockReason(settings, current)).not.toBeNull();
-    expect(getPolicyBlockReason(settings, "anthropic:allowed")).toBeNull();
+    expect(getModelBlockReason(settings, current)).not.toBeNull();
+    expect(getModelBlockReason(settings, "anthropic:allowed")).toBeNull();
   });
 
   test("checks resolved gateway identity and falls back to an allowed direct route", () => {
@@ -71,18 +71,18 @@ describe("server policy", () => {
       },
     };
     expect(modelChoices(settings, "")).toContain(model);
-    expect(getPolicyBlockReason(settings, model)).toBeNull();
+    expect(getModelBlockReason(settings, model)).toBeNull();
     settings.config.routeOverrides = { [model]: "direct" };
     expect(modelChoices(settings, "")).not.toContain(model);
-    expect(getPolicyBlockReason(settings, model)).not.toBeNull();
+    expect(getModelBlockReason(settings, model)).not.toBeNull();
     settings.config.routeOverrides = {};
     settings.policy.policy!.providerAccess = [{ id: "openai", allowedModels: ["gpt-4o"] }];
     expect(modelChoices(settings, "")).toContain(model);
-    expect(getPolicyBlockReason(settings, model)).toBeNull();
+    expect(getModelBlockReason(settings, model)).toBeNull();
     settings.providers.openai.isEnabled = false;
     expect(modelChoices(settings, "")).not.toContain(model);
     settings.policy.policy!.providerAccess = [{ id: "anthropic" }];
-    expect(getPolicyBlockReason(settings, model)).not.toBeNull();
+    expect(getModelBlockReason(settings, model)).not.toBeNull();
   });
 
   test("uses backend blocked status rather than independently comparing mobile versions", () => {
@@ -92,15 +92,15 @@ describe("server policy", () => {
       status: { state: "blocked", reason: "minimum_client_version 999 required by server" },
       policy: null,
     };
-    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBe(
+    expect(getModelBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBe(
       settings.policy.status.reason!
     );
     settings.policy.status.reason = "";
-    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBeTruthy();
+    expect(getModelBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBeTruthy();
     settings.policy = null;
-    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).not.toBeNull();
+    expect(getModelBlockReason(settings, KNOWN_MODELS.SONNET.id)).not.toBeNull();
     settings.policy = { source: "env", status: { state: "enforced" }, policy: null };
-    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).not.toBeNull();
+    expect(getModelBlockReason(settings, KNOWN_MODELS.SONNET.id)).not.toBeNull();
     settings.policy.policy = {
       policyFormatVersion: "0.1",
       minimumClientVersion: "999.0.0",
@@ -108,10 +108,118 @@ describe("server policy", () => {
       mcp: { allowUserDefined: { stdio: true, remote: true } },
       runtimes: null,
     };
-    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBeNull();
+    expect(getModelBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBeNull();
     settings.policy = { source: "none", status: { state: "disabled" }, policy: null };
-    expect(getPolicyBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBeNull();
+    expect(getModelBlockReason(settings, KNOWN_MODELS.SONNET.id)).toBeNull();
   });
+});
+
+describe("model action availability", () => {
+  test.each(["disabled", "unconfigured", "removed"])(
+    "retains the current model but blocks a %s only route without policy",
+    (state) => {
+      const settings = data();
+      const model = KNOWN_MODELS.SONNET.id;
+      expect(getModelBlockReason(settings, model)).toBeNull();
+      if (state === "disabled") settings.providers.anthropic.isEnabled = false;
+      if (state === "unconfigured") settings.providers.anthropic.isConfigured = false;
+      if (state === "removed") delete settings.providers.anthropic;
+      expect(modelChoices(settings, model)).toContain(model);
+      expect(getModelBlockReason(settings, model)).not.toBeNull();
+      expect(modelChoices(settings, "")).not.toContain(model);
+    }
+  );
+
+  test("catalog removal blocks the only gateway but a valid alternative remains available", () => {
+    const settings = data();
+    const model = "openai:gpt-4o";
+    settings.config.routePriority = ["coder", "openrouter", "direct"];
+    settings.providers.coder = {
+      isConfigured: true,
+      isEnabled: true,
+      apiKeySet: false,
+      models: ["openai/gpt-4o"],
+      discoveredModels: ["openai/gpt-4o"],
+    };
+    expect(getModelBlockReason(settings, model)).toBeNull();
+    settings.providers.coder.removedModels = ["openai/gpt-4o"];
+    expect(getModelBlockReason(settings, model)).not.toBeNull();
+    settings.providers.openrouter = { isConfigured: true, isEnabled: true, apiKeySet: true };
+    expect(getModelBlockReason(settings, model)).toBeNull();
+    settings.providers.coder.removedModels = [];
+    delete settings.providers.openrouter;
+    expect(getModelBlockReason(settings, model)).toBeNull();
+  });
+
+  test.each([
+    {
+      model: "openai:gpt-4o",
+      apiKeySet: true,
+      codexOauthSet: false,
+      isConfigured: true,
+      allowed: true,
+    },
+    {
+      model: "openai:gpt-5.3-codex-spark",
+      apiKeySet: true,
+      codexOauthSet: false,
+      isConfigured: true,
+      allowed: false,
+    },
+    {
+      model: "openai:gpt-4o",
+      apiKeySet: false,
+      codexOauthSet: true,
+      isConfigured: true,
+      allowed: false,
+    },
+    {
+      model: "openai:gpt-5.6-sol",
+      apiKeySet: false,
+      codexOauthSet: true,
+      isConfigured: true,
+      allowed: true,
+    },
+    {
+      model: "openai:gpt-4o",
+      apiKeySet: true,
+      codexOauthSet: true,
+      isConfigured: true,
+      allowed: true,
+    },
+    {
+      model: "openai:gpt-4o",
+      apiKeySet: false,
+      codexOauthSet: false,
+      isConfigured: false,
+      allowed: false,
+    },
+    // Configured via environment credentials: apiKeySet only describes the saved key.
+    {
+      model: "openai:gpt-4o",
+      apiKeySet: false,
+      codexOauthSet: false,
+      isConfigured: true,
+      allowed: true,
+    },
+  ])(
+    "direct auth gates $model with key=$apiKeySet OAuth=$codexOauthSet configured=$isConfigured",
+    (state) => {
+      const settings = data();
+      settings.providers.openai = { ...state, isEnabled: true, models: [state.model.slice(7)] };
+      expect(getModelBlockReason(settings, state.model) === null).toBe(state.allowed);
+      expect(modelChoices(settings, "").includes(state.model)).toBe(state.allowed);
+      expect(modelChoices(settings, state.model)).toContain(state.model);
+      expect(
+        resolveSettings({}, settings, "exec", { model: state.model, agentId: "exec" }).model
+      ).toBe(state.model);
+      // Gateways own their authentication, even when the selected model's direct
+      // provider has an unsupported auth mode or no credentials at all.
+      settings.providers.openrouter = { isConfigured: true, isEnabled: true, apiKeySet: true };
+      settings.config.routePriority = ["openrouter", "direct"];
+      expect(getModelBlockReason(settings, state.model)).toBeNull();
+    }
+  );
 });
 
 describe("mobile model settings", () => {

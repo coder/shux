@@ -25,7 +25,7 @@ import { ContextUsage } from "../components/ContextUsage";
 import { getContextMeterData } from "../contextUsage";
 import { useConversation } from "../useConversation";
 import { linkedAbortController } from "../useConnection";
-import { getPolicyBlockReason, modelName, resolveSettings } from "../settings";
+import { getModelBlockReason, modelName, resolveSettings } from "../settings";
 import type { ChatSettings } from "../settings";
 import { ModelSettings } from "./ModelSettings";
 import { colors, fontFamily, layout, radii, spacing, typography } from "../theme";
@@ -114,13 +114,13 @@ export function ConversationScreen(props: {
   // Settings gate new AI work, not the ability to interrupt an existing live stream.
   const ready = props.connected && !props.signal.aborted && transcript.caughtUp && !error;
   const loadError = error ?? settingsError;
-  const policyBlockReason =
-    settings && options ? getPolicyBlockReason(settings, options.model) : null;
-  const canAct = ready && settings !== null && !settingsError && !policyBlockReason;
-  const latestSettings = useRef({ options, policyBlockReason });
+  const modelBlockReason =
+    settings && options ? getModelBlockReason(settings, options.model) : null;
+  const canAct = ready && settings !== null && !settingsError && !modelBlockReason;
+  const latestSettings = useRef({ options, modelBlockReason });
   useEffect(() => {
-    latestSettings.current = { options, policyBlockReason };
-  }, [options, policyBlockReason]);
+    latestSettings.current = { options, modelBlockReason };
+  }, [options, modelBlockReason]);
   const running = ready && transcript.streaming;
   const expanded = inputFocused || hasDraft || running || showSettings !== null;
 
@@ -226,13 +226,13 @@ export function ConversationScreen(props: {
       !latest.metadata?.partial
     )
       return;
-    const { options, policyBlockReason } = latestSettings.current;
+    const { options, modelBlockReason } = latestSettings.current;
     // The answer is already durable and its form may disappear on tool-call-end.
     // Keep resume failures outside that form, and retry only resume, never the answer.
     setResumeMessageId(messageId);
     // Settings or policy can change while the answer is saved. Preserve recovery
     // while unavailable, but never resume with stale options or a prohibited route.
-    if (!options?.model || policyBlockReason) return;
+    if (!options?.model || modelBlockReason) return;
     try {
       const result = await props.client.workspace.resumeStream(
         { workspaceId: props.workspace.id, options },
@@ -276,7 +276,7 @@ export function ConversationScreen(props: {
   async function answer(toolCallId: string, answers: Record<string, string>) {
     if (!ready) throw new Error("Reconnect before answering.");
     if (!canAct)
-      throw new Error(policyBlockReason ?? settingsError ?? "Wait for settings before answering.");
+      throw new Error(modelBlockReason ?? settingsError ?? "Wait for settings before answering.");
     if (pending.current) throw new Error("Another action is in progress.");
     if (
       !answerMessage ||
@@ -427,9 +427,9 @@ export function ConversationScreen(props: {
         style={styles.composerWrap}
         onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
       >
-        {policyBlockReason && (
+        {modelBlockReason && (
           <Notice onRetry={!settings?.policy ? props.onReconnect : undefined}>
-            {policyBlockReason}
+            {modelBlockReason}
           </Notice>
         )}
         {actionError && (

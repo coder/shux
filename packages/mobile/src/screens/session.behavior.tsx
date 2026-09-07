@@ -1122,3 +1122,120 @@ test("live interruption remains available during pending and failed settings ref
     "true"
   );
 });
+
+test("policy-off live provider loss retains selection and blocks send and answers until restored", async () => {
+  const view = fixture([question()]);
+  await view.select("alpha");
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Keep this draft" } });
+  await view.updateProviders({
+    anthropic: { isEnabled: false, isConfigured: false, apiKeySet: true },
+  });
+  expect(view.getByRole("button", { name: "Send message" }).getAttribute("aria-disabled")).toBe(
+    "true"
+  );
+  expect(view.getByRole("button", { name: "Send answers" }).getAttribute("aria-disabled")).toBe(
+    "true"
+  );
+  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+  expect(callCount(view, "sendMessage")).toBe(0);
+  fireEvent.click(view.getByRole("button", { name: "Choose model" }));
+  expect(view.getByRole("radio", { name: model }).getAttribute("aria-checked")).toBe("true");
+  fireEvent.click(view.getByRole("radio", { name: model }));
+  await view.updateProviders({
+    anthropic: { isEnabled: true, isConfigured: true, apiKeySet: true },
+  });
+  await submitAnswer(view);
+  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
+  expect(callCount(view, "resumeStream")).toBe(1);
+  expect(view.getByLabelText("Message")).toHaveProperty("value", "Keep this draft");
+});
+
+test("lost credentials during answer saving block resume until a valid route is restored", async () => {
+  const view = fixture([question()]);
+  await view.select("alpha");
+  const answer = deferred<unknown>();
+  view.setAnswer(() => answer.promise);
+  await submitAnswer(view);
+  await view.updateProviders({
+    anthropic: { isEnabled: true, isConfigured: false, apiKeySet: false },
+  });
+  await view.emit(answered());
+  await act(async () => answer.resolve({ success: true }));
+  expect(callCount(view, "resumeStream")).toBe(0);
+  expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+  await view.updateProviders({
+    anthropic: { isEnabled: true, isConfigured: true, apiKeySet: true },
+  });
+  await act(async () => fireEvent.click(await view.findByRole("button", { name: "Resume agent" })));
+  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
+  expect(callCount(view, "resumeStream")).toBe(1);
+});
+
+test("an unavailable current route does not disable interruption of its already-running stream", async () => {
+  const view = fixture([
+    {
+      type: "stream-start",
+      workspaceId: "alpha",
+      messageId: "live",
+      historySequence: 1,
+      startTime: 1,
+      model,
+    },
+  ]);
+  await view.select("alpha");
+  await view.updateProviders({});
+  expect(view.getByRole("alert")).toBeDefined();
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Interrupt agent" })));
+  expect(callCount(view, "interruptStream")).toBe(1);
+});
+
+test("live direct-auth and routing changes gate the current OpenAI selection without blocking a valid gateway", async () => {
+  const view = fixture();
+  await view.select("alpha");
+  const openai = {
+    isConfigured: true,
+    isEnabled: true,
+    apiKeySet: true,
+    codexOauthSet: false,
+    models: ["gpt-4o"],
+  };
+  await view.updateProviders({ openai });
+  fireEvent.click(view.getByRole("button", { name: "Choose model" }));
+  fireEvent.click(view.getByRole("radio", { name: "openai:gpt-4o" }));
+  fireEvent.change(view.getByLabelText("Message"), {
+    target: { value: "Use the available route" },
+  });
+  const send = () => view.getByRole("button", { name: "Send message" });
+  expect(send().getAttribute("aria-disabled")).not.toBe("true");
+  const oauthOnly = { ...openai, apiKeySet: false, codexOauthSet: true };
+  await view.updateProviders({ openai: oauthOnly });
+  expect(send().getAttribute("aria-disabled")).toBe("true");
+  const coder = {
+    isConfigured: true,
+    isEnabled: true,
+    apiKeySet: false,
+    models: ["openai/gpt-4o"],
+    discoveredModels: ["openai/gpt-4o"],
+  };
+  await view.updateConfig({ agentAiDefaults: {}, routePriority: ["coder", "direct"] });
+  await view.updateProviders({ openai: oauthOnly, coder });
+  expect(send().getAttribute("aria-disabled")).not.toBe("true");
+  await view.updateConfig({
+    agentAiDefaults: {},
+    routePriority: ["coder", "direct"],
+    routeOverrides: { "openai:gpt-4o": "direct" },
+  });
+  expect(send().getAttribute("aria-disabled")).toBe("true");
+  await view.updateConfig({ agentAiDefaults: {}, routePriority: ["coder", "direct"] });
+  await view.updateProviders({
+    openai: oauthOnly,
+    coder: { ...coder, removedModels: ["openai/gpt-4o"] },
+  });
+  expect(send().getAttribute("aria-disabled")).toBe("true");
+  await view.updateProviders({ openai: oauthOnly, coder });
+  await act(async () => fireEvent.click(send()));
+  expect(callCount(view, "sendMessage")).toBe(1);
+  expect(view.calls.find((call) => call.path === "workspace.sendMessage")?.input).toMatchObject({
+    options: { model: "openai:gpt-4o" },
+  });
+});
