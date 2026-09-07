@@ -14,6 +14,7 @@ import {
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useAPI } from "@/browser/contexts/API";
+import { stopStream } from "@/browser/utils/stopStream";
 
 type StreamingPhase =
   | "starting" // Message sent, waiting for stream-start
@@ -274,10 +275,7 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
         return;
       }
 
-      void api.workspace.interruptStream({
-        workspaceId,
-        options: { abandonPartial: true, retireBashMonitorAttention: true },
-      });
+      void stopStream(api, workspaceId, { abandonPartial: true });
       return;
     }
 
@@ -285,10 +283,7 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
       storeRaw.setInterrupting(workspaceId);
     }
 
-    void api.workspace.interruptStream({
-      workspaceId,
-      options: { retireBashMonitorAttention: true },
-    });
+    void stopStream(api, workspaceId);
   };
 
   // Show settings hint during compaction if no custom compaction model is configured

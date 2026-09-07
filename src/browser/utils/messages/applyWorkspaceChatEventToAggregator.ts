@@ -94,11 +94,9 @@ function dispatchSkillsRefreshRequested(): void {
   window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED));
 }
 
-function dispatchGoalChildBudgetToast(workspaceId: string, message: string): void {
+function dispatchChatErrorToast(workspaceId: string, message: string): void {
   if (typeof window === "undefined") return;
-  window.dispatchEvent(
-    createCustomEvent(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, { workspaceId, message })
-  );
+  window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.CHAT_ERROR_TOAST, { workspaceId, message }));
 }
 
 function dispatchMuxGatewaySessionExpired(): void {
@@ -206,7 +204,7 @@ export function applyWorkspaceChatEventToAggregator(
 
   if (isGoalBudgetLimitedEvent(event)) {
     if (allowSideEffects && event.causedByChild) {
-      dispatchGoalChildBudgetToast(event.workspaceId, event.message);
+      dispatchChatErrorToast(event.workspaceId, event.message);
     }
     return "ignored";
   }

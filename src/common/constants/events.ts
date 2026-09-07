@@ -124,10 +124,11 @@ export const CUSTOM_EVENTS = {
   OPEN_GOAL_TAB: "mux:openGoalTab",
 
   /**
-   * Event to show a toast when a child task pushes the parent's goal over budget.
+   * Event to show an error toast in a workspace's chat input (child goal budget exhaustion,
+   * a Stop the backend could not record, ...).
    * Detail: { workspaceId: string, message: string }
    */
-  GOAL_CHILD_BUDGET_TOAST: "mux:goalChildBudgetToast",
+  CHAT_ERROR_TOAST: "mux:chatErrorToast",
 
   REVEAL_TIMELINE_ANCHOR: "mux:revealTimelineAnchor",
 
@@ -201,7 +202,7 @@ export interface CustomEventPayloads {
     workspaceId: string;
     openCompleteInput?: boolean;
   };
-  [CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST]: {
+  [CUSTOM_EVENTS.CHAT_ERROR_TOAST]: {
     workspaceId: string;
     message: string;
   };

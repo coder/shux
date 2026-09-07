@@ -214,7 +214,7 @@ describe("applyWorkspaceChatEventToAggregator", () => {
       expect(hint).toBe("ignored");
       expect(aggregator.calls).toEqual([]);
       expect(dispatched).toHaveLength(1);
-      expect(dispatched[0]?.type).toBe(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST);
+      expect(dispatched[0]?.type).toBe(CUSTOM_EVENTS.CHAT_ERROR_TOAST);
       expect((dispatched[0] as CustomEvent).detail).toEqual({
         workspaceId: "parent-1",
         message: "Child workspace exceeded the parent's goal budget.",

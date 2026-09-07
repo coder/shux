@@ -1472,7 +1472,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       window.removeEventListener(CUSTOM_EVENTS.THINKING_LEVEL_TOAST, handler as EventListener);
   }, [variant, props, pushToast]);
 
-  // Show the backend's one-shot child-budget warning on the matching parent workspace.
+  // Error toasts addressed to this workspace (child-budget warnings, unrecorded Stops).
   useEffect(() => {
     if (variant !== "workspace") return;
 
@@ -1485,9 +1485,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       pushToast({ type: "error", message: detail.message });
     };
 
-    window.addEventListener(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, handler as EventListener);
+    window.addEventListener(CUSTOM_EVENTS.CHAT_ERROR_TOAST, handler as EventListener);
     return () =>
-      window.removeEventListener(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, handler as EventListener);
+      window.removeEventListener(CUSTOM_EVENTS.CHAT_ERROR_TOAST, handler as EventListener);
   }, [variant, workspaceId, pushToast]);
 
   // Show toast feedback for analytics rebuild command palette action.

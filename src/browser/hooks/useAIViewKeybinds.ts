@@ -12,6 +12,7 @@ import {
 } from "@/browser/utils/ui/keybinds";
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { isCompactingStream, cancelCompaction } from "@/browser/utils/compaction/handler";
+import { stopStream } from "@/browser/utils/stopStream";
 import { useAPI } from "@/browser/contexts/API";
 import type { EditingMessageState } from "@/browser/utils/chatEditing";
 
@@ -121,10 +122,9 @@ export function useAIViewKeybinds({
         if (canInterrupt || showRetryBarrier) {
           e.preventDefault();
           void api?.workspace.setAutoRetryEnabled?.({ workspaceId, enabled: false });
-          void api?.workspace.interruptStream({
-            workspaceId,
-            options: { retireBashMonitorAttention: true },
-          });
+          if (api) {
+            void stopStream(api, workspaceId);
+          }
           return;
         }
       }

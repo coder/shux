@@ -8,6 +8,7 @@ import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
 import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
+import { stopStream } from "@/browser/utils/stopStream";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -237,12 +238,9 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     setCountdown(0);
     setManualRetryError(null);
     void api?.workspace.setAutoRetryEnabled?.({ workspaceId: props.workspaceId, enabled: false });
-    // Same Stop as the shortcut shown on the button (useAIViewKeybinds): owed monitor output is
-    // dismissed rather than launched as a wake once the retry stops.
-    void api?.workspace.interruptStream({
-      workspaceId: props.workspaceId,
-      options: { retireBashMonitorAttention: true },
-    });
+    if (api) {
+      void stopStream(api, props.workspaceId);
+    }
   };
 
   const lastMessage = getLastMainRetryCandidateMessage(workspaceState.messages);

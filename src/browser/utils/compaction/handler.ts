@@ -8,6 +8,7 @@
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { getCompactionFollowUpContent } from "@/common/types/message";
 import type { APIClient } from "@/browser/contexts/API";
+import { stopStream } from "@/browser/utils/stopStream";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
   buildEditingStateFromCompaction,
@@ -100,10 +101,7 @@ export async function cancelCompaction(
 
   // Interrupt stream with abandonPartial flag
   // Backend detects this and skips compaction (Ctrl+C flow)
-  await client.workspace.interruptStream({
-    workspaceId,
-    options: { abandonPartial: true, retireBashMonitorAttention: true },
-  });
+  await stopStream(client, workspaceId, { abandonPartial: true });
 
   return true;
 }
