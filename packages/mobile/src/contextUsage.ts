@@ -33,9 +33,14 @@ export function getContextUsage(messages: MuxMessage[], model: string) {
 export function getContextMeterData(
   messages: MuxMessage[],
   options: ChatSettings | null,
-  providers?: SettingsData["providers"]
+  providers?: SettingsData["providers"],
+  streamingMessageId?: string | null
 ) {
-  const model = options?.model ?? "unknown";
+  // A picker change targets the next request, not the turn still using this context.
+  const activeModel = streamingMessageId
+    ? messages.find((message) => message.id === streamingMessageId)?.metadata?.model
+    : undefined;
+  const model = activeModel ?? options?.model ?? "unknown";
   const anthropic = options?.providerOptions?.anthropic;
   const canonical = normalizeToCanonical(model);
   const metadataModel = resolveModelForMetadata(model, providers ?? null);

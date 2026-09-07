@@ -110,11 +110,15 @@ function ProjectDiff(props: { data: Extract<ProjectGitDiffResult, { success: tru
       )}
       {files.map((file, index) => {
         const lines = file.trimEnd().split("\n");
+        const newPath = lines.find((line) => line.startsWith("+++ "))?.slice(4);
+        // Deletions have no new-side path; retain the old filename before hiding diff headers.
         const filename =
-          lines
-            .find((line) => line.startsWith("+++ "))
-            ?.slice(4)
-            .replace(/^b\//, "") ?? lines[0].replace(/^diff --git /, "");
+          (newPath === "/dev/null"
+            ? lines
+                .find((line) => line.startsWith("--- "))
+                ?.slice(4)
+                .replace(/^a\//, "")
+            : newPath?.replace(/^b\//, "")) ?? lines[0].replace(/^diff --git /, "");
         const content = lines.filter((line) => !/^(diff --git |index |--- |\+\+\+ )/.test(line));
         const additions = content.filter((line) => line.startsWith("+")).length;
         const deletions = content.filter((line) => line.startsWith("-")).length;

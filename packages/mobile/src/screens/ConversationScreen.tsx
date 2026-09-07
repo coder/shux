@@ -94,7 +94,12 @@ export function ConversationScreen(props: {
         props.selection
       )
     : null;
-  const context = getContextMeterData(transcript.messages, options, settings?.providers);
+  const context = getContextMeterData(
+    transcript.messages,
+    options,
+    settings?.providers,
+    transcript.streamingMessageId
+  );
   const ready =
     props.connected && !props.signal.aborted && transcript.caughtUp && !error && settings !== null;
   const policyBlockReason =

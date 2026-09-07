@@ -86,6 +86,39 @@ test("changes include secondary repositories in one request and do not hide fail
   expect(view.queryByText("No uncommitted changes")).toBeNull();
 });
 
+test("changes keep distinct deleted paths while additions use the new-side path", async () => {
+  const diffs = [
+    "diff --git a/removed.ts b/removed.ts\n--- a/removed.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-deleted\n",
+    "diff --git a/old file.ts b/old file.ts\n--- a/old file.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-also deleted\n",
+    "diff --git a/new.ts b/new.ts\n--- /dev/null\n+++ b/new.ts\n@@ -0,0 +1 @@\n+added\n",
+  ];
+  const client = createORPCClient<MobileClient>({
+    call: async () => [
+      {
+        projectName: "Project",
+        projectPath: "/project",
+        success: true,
+        data: { diff: diffs.join(""), truncated: false },
+      },
+    ],
+  });
+  const view = render(
+    <ChangesScreen
+      client={client}
+      workspaceId="workspace"
+      signal={new AbortController().signal}
+      onReconnect={async () => {}}
+      onBack={() => {}}
+    />
+  );
+  await waitFor(() => expect(view.getByText("removed.ts")).toBeDefined());
+  expect(view.getByText("old file.ts")).toBeDefined();
+  expect(view.getByText("new.ts")).toBeDefined();
+  expect(view.queryByText("/dev/null")).toBeNull();
+  expect(view.getByText("-deleted")).toBeDefined();
+  expect(view.getByText("+added")).toBeDefined();
+});
+
 test("context meter exposes measured progress without inventing an unknown percentage", () => {
   const data = { segments: [], totalTokens: 200_000, maxTokens: 1_000_000, totalPercentage: 20 };
   const view = render(<ContextUsage data={data} />);

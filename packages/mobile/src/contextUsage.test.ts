@@ -145,3 +145,49 @@ test("context capacity follows per-model 1M intent without bypassing privacy or 
     1_000_000
   );
 });
+
+test("active stream capacity survives model selection changes until the stream settles", () => {
+  const activeModel = "anthropic:claude-sonnet-4-20250514";
+  const selectedModel = "openai:gpt-4o";
+  const providers = {
+    anthropic: {
+      isConfigured: true,
+      isEnabled: true,
+      apiKeySet: true,
+      models: [{ id: "claude-sonnet-4-20250514", contextWindowTokens: 200_000 }],
+    },
+    openai: {
+      isConfigured: true,
+      isEnabled: true,
+      apiKeySet: true,
+      models: [{ id: "gpt-4o", contextWindowTokens: 400_000 }],
+    },
+  };
+  const options = {
+    model: selectedModel,
+    agentId: "exec",
+    providerOptions: { anthropic: { use1MContextModels: [activeModel] } },
+  };
+  const contextUsage = { inputTokens: 200_000, outputTokens: 0, totalTokens: 200_000 };
+  let state = applyChatEvent(createTranscriptState(), { type: "message", ...row });
+  state = applyChatEvent(state, { ...start, model: activeModel });
+  const current = () =>
+    getContextMeterData(state.messages, options, providers, state.streamingMessageId);
+  // Even before fresh usage arrives, the stream-start metadata owns the capacity.
+  expect(current().maxTokens).toBe(1_000_000);
+  state = applyChatEvent(state, { ...delta, usage: contextUsage });
+  expect(current().totalPercentage).toBe(20);
+  options.model = activeModel;
+  expect(current().totalPercentage).toBe(20);
+  options.model = selectedModel;
+  expect(current().totalPercentage).toBe(20);
+  state = applyChatEvent(state, {
+    type: "stream-end",
+    workspaceId: "w",
+    messageId: "b",
+    parts: [],
+    metadata: { model: activeModel, contextUsage },
+  });
+  expect(current().maxTokens).toBe(400_000);
+  expect(current().totalPercentage).toBe(50);
+});
