@@ -48,10 +48,6 @@ import {
 } from "@/browser/utils/additionalSystemContextStore";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
-import {
-  clearPendingWorkspaceAiSettings,
-  markPendingWorkspaceAiSettings,
-} from "@/browser/utils/workspaceAiSettingsSync";
 import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
 import {
   getModelKey,
@@ -677,43 +673,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             prev && typeof prev === "object" ? prev : {};
           return {
             ...record,
-            // Include reasoningMode so a model change cannot wipe the persisted
-            // pro-mode choice (backend replaces the agent's settings wholesale).
             [normalizedAgentId]: { model: selectedModel, thinkingLevel, reasoningMode },
           };
         },
         {}
       );
-
-      // Workspace variant: persist to backend for cross-device consistency.
-      if (!api) {
-        return;
-      }
-
-      markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
-        model: selectedModel,
-        thinkingLevel,
-        reasoningMode,
-      });
-
-      api.workspace
-        .updateAgentAISettings({
-          workspaceId,
-          agentId: normalizedAgentId,
-          aiSettings: { model: selectedModel, thinkingLevel, reasoningMode },
-        })
-        .then((result) => {
-          if (!result.success) {
-            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-          }
-        })
-        .catch(() => {
-          clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-          // Best-effort only. If offline or backend is old, sendMessage will persist.
-        });
     },
     [
-      api,
       agentId,
       creationParentProjectPath,
       ensureModelInSettings,

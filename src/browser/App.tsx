@@ -85,11 +85,7 @@ import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation } from "./hooks/useStartWorkspaceCreation";
 import { useAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
-import {
-  clearPendingWorkspaceAiSettings,
-  markPendingWorkspaceAiSettings,
-  resolveEffectiveComposerModel,
-} from "@/browser/utils/workspaceAiSettingsSync";
+import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
 import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
@@ -541,8 +537,6 @@ function AppInner() {
       const normalized = THINKING_LEVELS.includes(level) ? level : "off";
       const model = getModelForWorkspace(workspaceId);
       const key = getThinkingLevelKey(workspaceId);
-      // Carry the current pro-mode choice: the backend replaces the agent's
-      // settings wholesale, so omitting reasoningMode would wipe it.
       const reasoningMode = getReasoningModeForWorkspace(workspaceId);
 
       // Use the utility function which handles localStorage and event dispatch
@@ -574,30 +568,7 @@ function AppInner() {
         {}
       );
 
-      // Persist to backend so the palette change follows the workspace across devices.
       if (api) {
-        markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
-          model,
-          thinkingLevel: normalized,
-          reasoningMode,
-        });
-
-        api.workspace
-          .updateAgentAISettings({
-            workspaceId,
-            agentId: normalizedAgentId,
-            aiSettings: { model, thinkingLevel: normalized, reasoningMode },
-          })
-          .then((result) => {
-            if (!result.success) {
-              clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-            }
-          })
-          .catch(() => {
-            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-            // Best-effort only.
-          });
-
         // Mid-turn change: also apply to the active turn's next model step so
         // the palette/keybind path behaves like the selector (ThinkingProvider).
         requestActiveTurnThinkingLevel(api, workspaceId, normalized);
@@ -615,9 +586,7 @@ function AppInner() {
     [api, getModelForWorkspace, getReasoningModeForWorkspace]
   );
 
-  // Palette toggle for the OpenAI pro reasoning mode. Persists like the
-  // thinking-level palette action: localStorage first (ThinkingProvider listens),
-  // then best-effort backend sync with the full settings payload.
+  // Keep palette choices local until a user message sends the full settings.
   const toggleReasoningModeFromPalette = useCallback(
     (workspaceId: string) => {
       if (!workspaceId) {
@@ -655,32 +624,8 @@ function AppInner() {
         },
         {}
       );
-
-      if (api) {
-        markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
-          model,
-          thinkingLevel,
-          reasoningMode: next,
-        });
-
-        api.workspace
-          .updateAgentAISettings({
-            workspaceId,
-            agentId: normalizedAgentId,
-            aiSettings: { model, thinkingLevel, reasoningMode: next },
-          })
-          .then((result) => {
-            if (!result.success) {
-              clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-            }
-          })
-          .catch(() => {
-            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-            // Best-effort only.
-          });
-      }
     },
-    [api, getModelForWorkspace, getReasoningModeForWorkspace, getThinkingLevelForWorkspace]
+    [getModelForWorkspace, getReasoningModeForWorkspace, getThinkingLevelForWorkspace]
   );
 
   const getFastModeActive = useCallback(() => {

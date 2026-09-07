@@ -9611,14 +9611,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     );
   }
 
-  /**
-   * Best-effort persist AI settings from send/resume options.
-   * Skips requests explicitly marked to avoid persistence.
-   */
   private async maybePersistAISettingsFromOptions(
     workspaceId: string,
-    options: SendMessageOptions | undefined,
-    context: "send" | "resume"
+    options: SendMessageOptions | undefined
   ): Promise<void> {
     if (options?.skipAiSettingsPersistence) {
       // One-shot/compaction sends shouldn't overwrite workspace defaults.
@@ -9634,14 +9629,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       agentId,
       extractedSettings,
       {
-        // Normal sends/resumes also persist the selected agent so future backend heartbeat
-        // dispatches can reuse the same workspace default after reloads and reconnects.
+        // Save the selected agent so heartbeats can reuse it after reloads and reconnects.
         persistSelectedAgentId: true,
         ...(options?.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
       }
     );
     if (!persistResult.success) {
-      log.debug(`Failed to persist workspace AI settings from ${context} options`, {
+      log.debug("Failed to persist workspace AI settings from user message", {
         workspaceId,
         error: persistResult.error,
       });
@@ -11055,8 +11049,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err(pricingGate.error);
       }
 
-      // Persist last-used model + thinking level for cross-device consistency.
-      await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "send");
+      // Synthetic turns must not replace the user's remembered model and mode.
+      if (internal?.synthetic !== true) {
+        await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions);
+      }
 
       // Decide queue-or-direct in arrival order: a later send whose awaits above finished
       // first would otherwise enqueue ahead of an earlier one. The decision below runs
@@ -11577,9 +11573,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!pricingGate.success) {
         return Err(pricingGate.error);
       }
-
-      // Persist last-used model + thinking level for cross-device consistency.
-      await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "resume");
 
       // Non-destructive interrupt cascades preserve descendant task workspaces with
       // taskStatus=interrupted. Transition before stream start so task orchestration stream-end

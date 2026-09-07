@@ -566,6 +566,35 @@ function streamEnd(
 }
 
 describe("ACP prompt stream correlation", () => {
+  it("sends session-local picker settings despite unchanged workspace metadata", async () => {
+    const harness = createHarness();
+    await initializeDefaultAgent(harness);
+    const { sessionId } = await createDefaultSession(harness);
+    for (const [configId, value] of [
+      ["agentMode", "plan"],
+      ["model", "openai:gpt-5.2"],
+      ["thinkingLevel", "high"],
+      ["agentMode", "plan"],
+    ]) {
+      await harness.agent.setSessionConfigOption({ sessionId, configId, value });
+    }
+    expect(harness.sendMessageCalls).toHaveLength(0);
+
+    const { promptPromise, promptCorrelationId } = await startPromptTurn(harness, sessionId);
+    expect(harness.sendMessageCalls[0]?.options).toMatchObject({
+      agentId: "plan",
+      model: "openai:gpt-5.2",
+      thinkingLevel: "high",
+    });
+    harness.pushChatEvent(
+      streamStart(sessionId, "assistant-local", { acpPromptId: promptCorrelationId })
+    );
+    harness.pushChatEvent(streamEnd(sessionId, "assistant-local"));
+    await expect(promptPromise).resolves.toMatchObject({ stopReason: "end_turn" });
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+
   it("ignores unrelated stream-start/end pairs while waiting for this prompt turn", async () => {
     const harness = createHarness();
     const { newSessionResponse, promptPromise, promptCorrelationId } =
