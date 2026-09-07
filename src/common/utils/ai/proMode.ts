@@ -5,8 +5,8 @@
  * cannot affect the request:
  * - model must be pro-capable (see openaiSupportsProMode);
  * - pro mode is a Responses API field, so `wireFormat: "chatCompletions"` disables it;
- * - only the direct `openai:` route delivers the mode. Gateways hide it:
- *   non-passthrough ones use another provider schema, and mux-gateway currently
+ * - direct OpenAI and Coder's OpenAI Responses instances deliver the mode.
+ *   Other gateways hide it: non-passthrough ones use another provider schema, and mux-gateway currently
  *   drops `providerOptions.openai.reasoningMode` server-side (verified empirically —
  *   the Responses API echoed `mode: "standard"`), so it fails closed until the
  *   gateway forwards the field;
@@ -18,10 +18,13 @@
  * modelEntries → models); adding it to models.ts would create a cycle.
  */
 
+import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
 import { openaiSupportsProMode } from "@/common/types/thinking";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import {
   openaiDirectProviderOptionsAvailable,
+  resolveProviderOptionsRoute,
   type OpenAIDirectProviderOptionsAvailability,
 } from "@/common/utils/ai/openaiProviderOptionsAvailability";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -32,6 +35,20 @@ export function openaiProModeAvailable(
   modelString: string,
   options?: ProModeAvailabilityOptions
 ): boolean {
+  if (resolveProviderOptionsRoute(modelString, options) === "coder") {
+    if (isCustomProviderConfig(options?.providersConfig?.coder)) {
+      return false;
+    }
+    // Coder forwards native Responses bodies, unlike mux-gateway's SDK proxy.
+    // Resolve the actual instance type before name-based canonicalization; the
+    // direct OpenAI wire format and Codex credentials do not govern this route.
+    const gatewayModelId = modelString.startsWith("coder:")
+      ? modelString.slice("coder:".length)
+      : normalizeToCanonical(modelString).replace(":", "/");
+    const wire = resolveCoderWireCanonicalModel(gatewayModelId, options?.providersConfig?.coder);
+    return wire?.providerType === "openai" && openaiSupportsProMode(`openai:${wire.modelId}`);
+  }
+
   const wireFormat =
     options?.openaiWireFormat ?? options?.providersConfig?.openai?.wireFormat ?? "responses";
   if (wireFormat === "chatCompletions") {

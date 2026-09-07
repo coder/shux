@@ -17,15 +17,12 @@ export interface OpenAIDirectProviderOptionsAvailability {
   openaiWireFormat?: OpenAIWireFormat | null;
 }
 
-export function openaiDirectProviderOptionsAvailable(
+/** Share explicit-gateway precedence between direct-only options and Pro mode. */
+export function resolveProviderOptionsRoute(
   modelString: string,
   options?: OpenAIDirectProviderOptionsAvailability
-): boolean {
-  const normalized = normalizeToCanonical(modelString);
-  const [origin] = normalized.split(":", 2);
-  if (origin !== "openai") {
-    return false;
-  }
+): string {
+  const [origin] = normalizeToCanonical(modelString).split(":", 2);
 
   // Explicit gateway selections only win while that gateway is configured and
   // enabled. Otherwise the backend falls through to the settings-resolved route.
@@ -38,14 +35,23 @@ export function openaiDirectProviderOptionsAvailable(
       (gatewayConfig?.isConfigured === true &&
         gatewayConfig.isEnabled !== false &&
         gatewayDefinition.kind === "gateway" &&
-        (gatewayDefinition.routes as readonly string[]).includes("openai"));
+        (origin === explicitGateway ||
+          (gatewayDefinition.routes as readonly string[]).includes(origin)));
     if (gatewayWinsRoute) {
-      return false;
+      return explicitGateway;
     }
   }
 
-  const resolvedRouteProvider = options?.resolvedRouteProvider;
-  if (resolvedRouteProvider != null && resolvedRouteProvider !== "direct") {
+  return options?.resolvedRouteProvider ?? "direct";
+}
+
+export function openaiDirectProviderOptionsAvailable(
+  modelString: string,
+  options?: OpenAIDirectProviderOptionsAvailability
+): boolean {
+  const normalized = normalizeToCanonical(modelString);
+  const [origin] = normalized.split(":", 2);
+  if (origin !== "openai" || resolveProviderOptionsRoute(modelString, options) !== "direct") {
     return false;
   }
 
