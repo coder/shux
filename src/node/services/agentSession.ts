@@ -754,6 +754,8 @@ export class AgentSession {
   private startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null = null;
   // The preference file may not reflect memory after a failed write (see persistAutoRetryState).
   private autoRetryStateUnrecorded = false;
+  private autoRetryStateVersion = 0;
+  private autoRetryStateWrites: Promise<void> = Promise.resolve();
 
   /** Latest context-usage snapshot used for on-send compaction checks. */
   private lastUsageState?: AutoCompactionUsageState;
@@ -1496,11 +1498,22 @@ export class AgentSession {
 
   // Best-effort: a failed write only sets autoRetryStateUnrecorded, which the one caller that must
   // not acknowledge an unrecorded write (a user Stop) checks via recordPendingStartupAutoRetryAbandon.
-  private async persistAutoRetryState(): Promise<void> {
+  // Writes are serialized and only the latest state change's write marks it recorded, so an older
+  // unlink cannot land after a newer marker write with the flag already cleared.
+  private persistAutoRetryState(): Promise<void> {
+    const version = ++this.autoRetryStateVersion;
+    this.autoRetryStateUnrecorded = true;
+    this.autoRetryStateWrites = this.autoRetryStateWrites.then(() =>
+      this.writeAutoRetryState(version)
+    );
+    return this.autoRetryStateWrites;
+  }
+
+  private async writeAutoRetryState(version: number): Promise<void> {
+    if (version !== this.autoRetryStateVersion) return;
     const preferencePath = this.getAutoRetryPreferencePath();
     const enabled = this.autoRetryEnabledPreference !== false;
     const hasStartupAbandonState = this.startupAutoRetryAbandon !== null;
-    this.autoRetryStateUnrecorded = true;
 
     if (enabled && !hasStartupAbandonState) {
       try {
@@ -1518,7 +1531,7 @@ export class AgentSession {
           return;
         }
       }
-      this.autoRetryStateUnrecorded = false;
+      this.markAutoRetryStateRecorded(version);
       return;
     }
 
@@ -1538,13 +1551,18 @@ export class AgentSession {
     try {
       await mkdir(path.dirname(preferencePath), { recursive: true });
       await writeFile(preferencePath, JSON.stringify(payload) + "\n", "utf-8");
-      this.autoRetryStateUnrecorded = false;
+      this.markAutoRetryStateRecorded(version);
     } catch (error) {
       log.warn("Failed to persist auto-retry preference", {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),
       });
     }
+  }
+
+  private markAutoRetryStateRecorded(version: number): void {
+    // A state change made while this write ran has its own queued write; disk still lags memory.
+    if (version === this.autoRetryStateVersion) this.autoRetryStateUnrecorded = false;
   }
 
   /**

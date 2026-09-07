@@ -1473,7 +1473,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       window.removeEventListener(CUSTOM_EVENTS.THINKING_LEVEL_TOAST, handler as EventListener);
   }, [variant, props, pushToast]);
 
-  useChatErrorToasts(workspaceId, pushToast);
+  useChatErrorToasts(workspaceId, toast?.message ?? null, pushToast);
 
   // Show toast feedback for analytics rebuild command palette action.
   useEffect(() => {

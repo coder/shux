@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { APIClient } from "@/browser/contexts/API";
-import { takeChatErrors } from "./chatErrorToasts";
+import { dismissChatError, peekChatError } from "./chatErrorToasts";
 import { stopStream } from "./stopStream";
 
 describe("stopStream", () => {
@@ -26,7 +26,9 @@ describe("stopStream", () => {
     // must wait for the workspace's input rather than be dropped with a one-shot event.
     await stopStream(api, "ws-unrecorded");
 
-    expect(takeChatErrors("ws-unrecorded")).toEqual(["disk full"]);
+    expect(peekChatError("ws-unrecorded")).toBe("disk full");
+    dismissChatError("ws-unrecorded", "disk full");
+    expect(peekChatError("ws-unrecorded")).toBeUndefined();
   });
 
   test("a recorded Stop retires owed monitor output without a chat error", async () => {
@@ -40,6 +42,6 @@ describe("stopStream", () => {
         options: { abandonPartial: true, retireBashMonitorAttention: true },
       },
     ]);
-    expect(takeChatErrors("ws-recorded")).toEqual([]);
+    expect(peekChatError("ws-recorded")).toBeUndefined();
   });
 });

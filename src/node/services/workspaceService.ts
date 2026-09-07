@@ -11643,11 +11643,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const withdrawnWakeSend = retiring
         ? this.inFlightBashMonitorWakeSendsByOwner.get(workspaceId)
         : undefined;
-      const stopSettled = Promise.withResolvers<boolean>();
+      let settleStop!: (stopped: boolean) => void;
+      const stopSettled = new Promise<boolean>((resolve) => {
+        settleStop = resolve;
+      });
       let retirementRecorded = true;
       const retirement = retiring
         ? this.bashMonitorWakeReconciler
-            .consumeCurrent(workspaceId, () => stopSettled.promise)
+            .consumeCurrent(workspaceId, () => stopSettled)
             .catch((error: unknown) => {
               retirementRecorded = false;
               log.warn("Failed to retire bash monitor attention before Stop", {
@@ -11660,7 +11663,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       try {
         stopResult = await session.interruptStream(options);
       } finally {
-        stopSettled.resolve(stopResult?.success === true);
+        settleStop(stopResult?.success === true);
       }
       await retirement;
       // A wake withdrawn past its point of no return (durable row, not yet PREPARING, so the

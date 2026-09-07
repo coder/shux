@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { takeChatErrors } from "@/browser/utils/chatErrorToasts";
+import { dismissChatError, peekChatError } from "@/browser/utils/chatErrorToasts";
 import type { DeleteMessage, StreamErrorMessage, WorkspaceChatMessage } from "@/common/orpc/types";
 import type {
   ReasoningDeltaEvent,
@@ -178,9 +178,8 @@ describe("applyWorkspaceChatEventToAggregator", () => {
 
     expect(hint).toBe("ignored");
     expect(aggregator.calls).toEqual([]);
-    expect(takeChatErrors("parent-1")).toEqual([
-      "Child workspace exceeded the parent's goal budget.",
-    ]);
+    expect(peekChatError("parent-1")).toBe("Child workspace exceeded the parent's goal budget.");
+    dismissChatError("parent-1", "Child workspace exceeded the parent's goal budget.");
   });
 
   test("stream-abort clears token state before calling handleStreamAbort", () => {

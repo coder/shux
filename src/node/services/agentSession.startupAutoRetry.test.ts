@@ -2,6 +2,8 @@ import type { TurnCoordinator } from "./turnCoordinator";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
+import * as fsPromises from "fs/promises";
+import path from "path";
 import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
@@ -1224,6 +1226,86 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(await Bun.file(preferencePath).exists()).toBe(false);
     expect(streamMessageSpy).not.toHaveBeenCalled();
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+  });
+
+  test("a marker recorded while an older clear is still unlinking is written after it and acknowledged once written", async () => {
+    const workspaceId = "startup-retry-serialized-abandon-writes";
+    const { session, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+
+    const privateSession = session as unknown as {
+      persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
+      clearStartupAutoRetryAbandon: () => Promise<void>;
+      getAutoRetryPreferencePath: () => string;
+    };
+    const preferencePath = privateSession.getAutoRetryPreferencePath();
+
+    // An in-memory preference file whose unlink and marker write the test holds open, so the clear's
+    // unlink and the Stop's marker write can be ordered exactly (real I/O would race them).
+    let fileContent: string | null = null;
+    let markerWrites = 0;
+    let holdMarkerWrites = false;
+    const unlinkEntered = Promise.withResolvers<void>();
+    const releaseUnlink = Promise.withResolvers<void>();
+    const releaseWrite = Promise.withResolvers<void>();
+    const macrotask = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const { unlink, mkdir, writeFile } = fsPromises;
+    const spies = [
+      spyOn(fsPromises, "unlink").mockImplementation(async (target) => {
+        if (target !== preferencePath) return unlink(target);
+        unlinkEntered.resolve();
+        await releaseUnlink.promise;
+        fileContent = null;
+      }),
+      spyOn(fsPromises, "mkdir").mockImplementation(async (target, options) => {
+        if (target !== path.dirname(preferencePath)) await mkdir(target, options);
+      }),
+      spyOn(fsPromises, "writeFile").mockImplementation(async (target, data, options) => {
+        if (target !== preferencePath || typeof data !== "string") {
+          return writeFile(target, data, options);
+        }
+        if (holdMarkerWrites) {
+          markerWrites += 1;
+          await releaseWrite.promise;
+        }
+        fileContent = data;
+      }),
+    ];
+    try {
+      await privateSession.persistStartupAutoRetryAbandon("authentication", "user-1");
+      holdMarkerWrites = true;
+      const clearing = privateSession.clearStartupAutoRetryAbandon();
+      await unlinkEntered.promise;
+      const recording = privateSession.persistStartupAutoRetryAbandon("aborted", "user-2");
+      // A macrotask drains every microtask-resolved fake step the recording could have taken: the
+      // marker write waits for the clear's unlink instead of racing it.
+      await macrotask();
+      expect(markerWrites).toBe(0);
+      releaseUnlink.resolve();
+      await clearing;
+
+      // The clear's completion does not acknowledge the marker that is still being written.
+      let acknowledged: boolean | undefined;
+      const ack = session.recordPendingStartupAutoRetryAbandon().then((recorded) => {
+        acknowledged = recorded;
+        return recorded;
+      });
+      await macrotask();
+      expect(acknowledged).toBeUndefined();
+      releaseWrite.resolve();
+      expect(await ack).toBe(true);
+      await recording;
+      expect(fileContent).not.toBeNull();
+      const persisted = JSON.parse(fileContent!) as {
+        startupAutoRetryAbandon?: { reason: string; userMessageId?: string };
+      };
+      expect(persisted.startupAutoRetryAbandon).toEqual({
+        reason: "aborted",
+        userMessageId: "user-2",
+      });
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
   });
 
   test("provider config changes preserve non-fixable abandon state without starting a stream", async () => {
