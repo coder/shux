@@ -669,18 +669,39 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     if (!api?.config?.getConfig) return;
 
     let active = true;
-    // Track writes, not equality: toggling twice is still local intent.
+    // Track writes, not just equality: toggling twice is still local intent.
     const dirtyKeys = new Set<string>();
-    const unsubscribeWrites = subscribePersistedStateWrites(({ key, source }) => {
-      if (source === "local" && (key === DEFAULT_MODEL_KEY || key === HIDDEN_MODELS_KEY)) {
-        dirtyKeys.add(key);
+    const initialPreferences = [DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY].map((key) => ({
+      key,
+      value: JSON.stringify(readPersistedState<unknown>(key, undefined)),
+    }));
+    const markDirty = (key: string | null) => {
+      for (const preference of initialPreferences) {
+        if (key === null || key === preference.key) dirtyKeys.add(preference.key);
       }
+    };
+    const unsubscribeWrites = subscribePersistedStateWrites(({ key, source }) => {
+      if (source === "local") markDirty(key);
     });
+    const storageWindow = window;
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea === storageWindow.localStorage) markDirty(event.key);
+    };
+    storageWindow.addEventListener("storage", onStorage);
+    const stopTrackingWrites = () => {
+      unsubscribeWrites();
+      storageWindow.removeEventListener("storage", onStorage);
+    };
 
     api.config
       .getConfig()
       .then((cfg) => {
         if (!active) return;
+        // Cross-tab writes can land before their queued storage events arrive.
+        for (const { key, value } of initialPreferences) {
+          if (JSON.stringify(readPersistedState<unknown>(key, undefined)) !== value)
+            dirtyKeys.add(key);
+        }
         // Read legacy local preferences before backend hydration can overwrite them.
         const modelPrefs = migrateLocalModelPrefsToBackend(api, cfg, dirtyKeys);
         updatePersistedState(
@@ -714,11 +735,11 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       .catch(() => {
         // Best-effort only.
       })
-      .finally(unsubscribeWrites);
+      .finally(stopTrackingWrites);
 
     return () => {
       active = false;
-      unsubscribeWrites();
+      stopTrackingWrites();
     };
   }, [api]);
   // Get project refresh function from ProjectContext

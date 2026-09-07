@@ -24,7 +24,11 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { RecursivePartial } from "@/browser/testUtils";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  readPersistedState,
+  syncPersistedStateFromBackend,
+  updatePersistedState,
+} from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 
@@ -121,9 +125,16 @@ describe("WorkspaceContext", () => {
     }
   );
 
-  test.each(["hidden", "default", "hidden-aba"])(
-    "keeps %s edits ahead of stale startup config",
-    async (changed) => {
+  test.each(
+    ["local", "cross-tab", "cross-tab-delayed"].flatMap((source) =>
+      (source === "cross-tab-delayed"
+        ? ["hidden", "default"]
+        : ["hidden", "default", "hidden-aba", "default-aba"]
+      ).map((changed) => [source, changed])
+    )
+  )(
+    "keeps %s %s preference edits ahead of stale startup config until reconnect",
+    async (source, changed) => {
       const blue = "openai:daybreak-blue-latest";
       const red = "openai:daybreak-red-latest";
       const legacyHidden = "openrouter:openai/gpt-5";
@@ -143,12 +154,25 @@ describe("WorkspaceContext", () => {
       const updateModelPreferences = mock(() => Promise.resolve());
       currentClientMock.config = { getConfig: () => pendingConfig, updateModelPreferences };
       await setup();
+      const writePreference = (key: string, value: unknown) => {
+        if (source === "local") {
+          updatePersistedState(key, value);
+          return;
+        }
+        // Seed the shared value without emitting a local write in this tab.
+        syncPersistedStateFromBackend(key, value);
+        if (source === "cross-tab-delayed") return;
+        window.dispatchEvent(
+          new window.StorageEvent("storage", { key, storageArea: window.localStorage })
+        );
+      };
       act(() => {
-        if (changed === "default") {
-          updatePersistedState(DEFAULT_MODEL_KEY, chosenDefault);
+        if (changed.startsWith("default")) {
+          writePreference(DEFAULT_MODEL_KEY, chosenDefault);
+          if (changed === "default-aba") writePreference(DEFAULT_MODEL_KEY, legacyDefault);
         } else {
-          updatePersistedState(HIDDEN_MODELS_KEY, [red, legacyHidden]);
-          if (changed === "hidden-aba") updatePersistedState(HIDDEN_MODELS_KEY, [legacyHidden]);
+          writePreference(HIDDEN_MODELS_KEY, [red, legacyHidden]);
+          if (changed === "hidden-aba") writePreference(HIDDEN_MODELS_KEY, [legacyHidden]);
         }
       });
       resolveConfig({
@@ -164,14 +188,14 @@ describe("WorkspaceContext", () => {
         changed === "default" ? chosenDefault : legacyDefault
       );
       expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual(
-        changed === "default"
+        changed.startsWith("default")
           ? [blue, red, legacyHidden]
           : changed === "hidden"
             ? [red, legacyHidden]
             : [legacyHidden]
       );
       expect(updateModelPreferences).toHaveBeenCalledWith(
-        changed === "default"
+        changed.startsWith("default")
           ? { hiddenModels: [blue, red, legacyHidden] }
           : { defaultModel: legacyDefault }
       );
