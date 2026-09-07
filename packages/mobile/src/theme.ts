@@ -1,28 +1,8 @@
 import { Platform, StyleSheet } from "react-native";
 
-// Keep Xum's mode accents, with quieter surfaces so the conversation—not cards—owns attention.
-export const colors = {
-  background: "hsl(240, 3%, 11%)",
-  panel: "hsl(240, 3%, 15%)",
-  elevated: "hsl(240, 3%, 19%)",
-  border: "hsl(240, 3%, 23%)",
-  text: "hsl(0, 0%, 90%)",
-  bright: "hsl(0, 0%, 97%)",
-  muted: "hsl(240, 3%, 64%)",
-  dim: "hsl(240, 3%, 45%)",
-  sheet: "hsl(240, 3%, 8%)",
-  selection: "hsl(211, 80%, 65%)",
-  accent: "hsl(268.56, 90%, 68%)",
-  accentSurface: "hsla(268.56, 90%, 68%, 0.12)",
-  plan: "hsl(210, 70%, 68%)",
-  danger: "hsl(0, 91%, 71%)",
-  dangerSurface: "hsla(0, 91%, 71%, 0.10)",
-  warning: "hsl(38, 80%, 65%)",
-  warningSurface: "hsla(38, 80%, 65%, 0.10)",
-  success: "hsl(142, 76%, 46%)",
-  user: "hsla(0, 0%, 100%, 0.06)",
-  scrim: "hsla(240, 3%, 3%, 0.58)",
-};
+import { mobileThemeColors as colors } from "../../../src/common/constants/mobileThemeColors.generated";
+
+export { colors };
 
 export const WIDE_LAYOUT_MIN_WIDTH = 900;
 

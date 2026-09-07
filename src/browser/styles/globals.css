@@ -331,6 +331,8 @@
     --color-toast-fatal-border: hsl(0 36% 26%); /* #5a2c2c - fatal error border */
 
     /* Semi-transparent overlays */
+    /* Shared modal scrim, projected into the native companion's backdrop. */
+    --color-overlay-scrim: hsl(240 3% 3% / 0.58);
     --color-danger-overlay: hsl(4 90% 58% / 0.1); /* danger with 10% opacity */
     --color-warning-overlay: hsl(45 100% 51% / 0.1); /* warning with 10% opacity */
     --color-gray-overlay: hsl(0 0% 39% / 0.05); /* gray with 5% opacity */

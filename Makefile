@@ -369,6 +369,8 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 # Keep the default local path fast. Docs link crawling and lockfile-free bench-agent
 # verification stay in static-check-full so local validation remains responsive.
 static-check: lint typecheck fmt-check check-eager-imports check-code-docs-links lint-shellcheck lint-hadolint ## Run fast local static checks
+	@node packages/mobile/scripts/generateTheme.cjs --check
+	@bun test ./packages/mobile/scripts/generateTheme.test.ts
 
 static-check-full: static-check check-bench-agent check-docs-links ## Run the full CI static check suite
 
@@ -638,6 +640,7 @@ mobile-fmt: ## Format mobile source and configuration
 	@cd packages/mobile && ../../node_modules/.bin/prettier --write '**/*.{ts,tsx,json,mjs,cjs}'
 
 mobile-check: mobile-typecheck mobile-test mobile-lint ## Run mobile validation independently of desktop dependencies
+	@node packages/mobile/scripts/generateTheme.cjs --check
 	@cd packages/mobile && ../../node_modules/.bin/prettier --check '**/*.{ts,tsx,json,mjs,cjs}'
 
 ## Benchmarks

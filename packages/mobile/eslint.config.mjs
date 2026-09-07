@@ -9,6 +9,12 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    // Metro loads this build-time generator synchronously from its CommonJS config.
+    files: ["scripts/generateTheme.cjs"],
+    languageOptions: { sourceType: "commonjs", globals: { __dirname: "readonly" } },
+    rules: { "@typescript-eslint/no-require-imports": "off" },
+  },
+  {
     files: ["**/*.{ts,tsx}"],
     plugins: { "react-hooks": reactHooks },
     rules: {

@@ -1,6 +1,9 @@
 const path = require("node:path");
 const { getDefaultConfig } = require("expo/metro-config");
+const { ensureTheme } = require("./scripts/generateTheme.cjs");
 
+// Direct Expo invocations must refresh local colors too; CI only checks for drift.
+ensureTheme();
 const config = getDefaultConfig(__dirname);
 const repositoryRoot = path.resolve(__dirname, "../..");
 // Share protocol contracts, not the desktop React runtime or its DOM components.
