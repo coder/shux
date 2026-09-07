@@ -380,6 +380,8 @@ export class BashMonitorWakeReconciler {
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
   private readonly retryAttempts = new Map<string, number>();
   private readonly defunctWorkspaces = new Set<string>();
+  /** Processes created before this instance can carry acceptances that lived only in a previous one. */
+  private readonly constructedAt = new Date().toISOString();
 
   constructor(
     private readonly args: {
@@ -664,7 +666,9 @@ export class BashMonitorWakeReconciler {
    * Outstanding signals whose wake row the transcript already carries. An acceptance whose
    * consumption I/O kept failing until the app exited leaves the durable row as the only record
    * of delivery; on the next run the signal derives as outstanding again and is consumed here
-   * instead of redelivered. Only this reconciler's own accepts add wake rows, so each outstanding
+   * instead of redelivered. Only processes older than this instance can be in that position (a
+   * failed acceptance from this instance stays owed in memory), so live monitors never trigger a
+   * history scan per match. Only this reconciler's own accepts add wake rows, so each outstanding
    * key is looked up once and the result holds until the key leaves the outstanding set.
    */
   private async deliveredSignals(
@@ -675,10 +679,11 @@ export class BashMonitorWakeReconciler {
     const keyOf = (signal: DerivedSignal) => wakeKey(signal.processId, wakeUpdatedAt(signal));
     const checked = state.transcriptChecked ?? new Set<string>();
     let delivered: DerivedSignal[] = [];
-    if (signals.some((signal) => !checked.has(keyOf(signal)))) {
-      const since = signals.reduce(
+    const recovered = signals.filter((signal) => signal.createdAt < this.constructedAt);
+    if (recovered.some((signal) => !checked.has(keyOf(signal)))) {
+      const since = recovered.reduce(
         (oldest, signal) => (signal.createdAt < oldest ? signal.createdAt : oldest),
-        signals[0].createdAt
+        recovered[0].createdAt
       );
       const rows = await this.args.deliveredWakes(ownerWorkspaceId, since);
       const inTranscript = new Set(
@@ -688,10 +693,10 @@ export class BashMonitorWakeReconciler {
             : []
         )
       );
-      delivered = signals.filter((signal) => inTranscript.has(keyOf(signal)));
+      delivered = recovered.filter((signal) => inTranscript.has(keyOf(signal)));
     }
     state.transcriptChecked = new Set(
-      signals.filter((signal) => !delivered.includes(signal)).map(keyOf)
+      recovered.filter((signal) => !delivered.includes(signal)).map(keyOf)
     );
     return delivered;
   }

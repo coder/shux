@@ -494,6 +494,39 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(2);
   });
 
+  test("a process created in this instance never triggers a transcript scan", async () => {
+    let transcriptReads = 0;
+    const fresh = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: () => undefined,
+        dropRetiredMonitor: () => undefined,
+      },
+      registry: {
+        listAll: () => Promise.resolve(rows),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
+      },
+      deliveredWakes: () => {
+        transcriptReads++;
+        return Promise.resolve(transcript);
+      },
+      onWake: (dispatch) => {
+        dispatches.push(dispatch);
+        return "in-flight";
+      },
+    });
+    // A failed acceptance from this instance stays owed in memory, so only processes older than
+    // the instance can have a delivered row the reconciler does not remember.
+    live = [liveSnapshot({ createdAt: new Date(Date.now() + 1_000).toISOString() })];
+    await fresh.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    expect(transcriptReads).toBe(0);
+    await fresh.dispose(OWNER);
+  });
+
   test("a wake the transcript already carries is consumed after restart, not redelivered", async () => {
     live = [liveSnapshot()];
     await reconciler.reconcile(OWNER);

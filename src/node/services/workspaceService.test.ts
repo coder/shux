@@ -536,9 +536,17 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(send).not.toHaveBeenCalled();
 
       snapshots.worktreeArchiveSnapshotService = undefined;
-      expect((await h.service.unarchive(h.workspaceId)).success).toBe(true);
-      await h.reconciler.reconcile(h.workspaceId);
-      expect(h.requests).toHaveLength(1);
+      // Restoration succeeds but a follow-up step throws: unarchivedAt is already persisted and a
+      // retried unarchive would not run the hooks again, so the held attention must still wake.
+      spyOn(
+        h.internal as unknown as { syncCodeWorkspaceFiles(): Promise<void> },
+        "syncCodeWorkspaceFiles"
+      ).mockImplementationOnce(() => {
+        throw new Error("sync failed");
+      });
+      expect((await h.service.unarchive(h.workspaceId)).success).toBe(false);
+      // Unarchive itself schedules the reconcile; no manual reconcile here.
+      await waitForCondition(() => h.requests.length === 1);
     } finally {
       await h.finish();
     }
@@ -919,6 +927,41 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       await h.addAttention(20);
       expect(h.requests).toHaveLength(1);
     } finally {
+      await h.finish();
+    }
+  });
+
+  test("a Stop that disables auto-retry interrupts the stream without waiting on the opt-out write", async () => {
+    const h = await createActiveWakeHarness();
+    const release = createDeferred<void>();
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      const stopStream = spyOn(h.aiService, "stopStream").mockImplementation(async () => {
+        h.abort("user");
+        await h.session.waitForIdle();
+        return Ok(undefined);
+      });
+      const optOut = h.session.setAutoRetryEnabled.bind(h.session);
+      spyOn(h.session, "setAutoRetryEnabled").mockImplementation(async (enabled, options) => {
+        await release.promise;
+        return optOut(enabled, options);
+      });
+      const stop = h.service.interruptStream(h.workspaceId, {
+        retireBashMonitorAttention: true,
+        disableAutoRetry: true,
+      });
+      // The abort reaches the stream while the preference write is still pending.
+      await waitForCondition(() => stopStream.mock.calls.length === 1);
+      let stopSettled = false;
+      void stop.then(() => {
+        stopSettled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(stopSettled).toBe(false);
+      release.resolve();
+      expect((await stop).success).toBe(true);
+    } finally {
+      release.resolve();
       await h.finish();
     }
   });

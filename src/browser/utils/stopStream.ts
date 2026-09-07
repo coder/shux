@@ -1,5 +1,6 @@
 import type { APIClient } from "@/browser/contexts/API";
 import { publishChatError } from "@/browser/utils/chatErrorToasts";
+import { getErrorMessage } from "@/common/utils/errors";
 
 /**
  * User Stop: interrupts the stream and dismisses owed background monitor output instead of letting
@@ -15,11 +16,14 @@ export async function stopStream(
   workspaceId: string,
   options?: { abandonPartial?: boolean; disableAutoRetry?: boolean }
 ): Promise<void> {
-  const result = await api.workspace.interruptStream({
-    workspaceId,
-    options: { ...options, retireBashMonitorAttention: true },
-  });
-  if (!result.success) {
-    publishChatError(workspaceId, result.error);
+  try {
+    const result = await api.workspace.interruptStream({
+      workspaceId,
+      options: { ...options, retireBashMonitorAttention: true },
+    });
+    if (!result.success) publishChatError(workspaceId, result.error);
+  } catch (error) {
+    // A transport failure (backend gone mid-click) is as invisible as an Err without this.
+    publishChatError(workspaceId, getErrorMessage(error));
   }
 }

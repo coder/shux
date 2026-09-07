@@ -9078,30 +9078,34 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
       }
 
-      // Lifecycle hooks run *after* we persist unarchivedAt.
-      //
-      // Why best-effort: Unarchive is a quick UI action and should not fail permanently due to a
-      // start error (e.g., Coder workspace start).
-      if (this.workspaceLifecycleHooks && hookMetadata) {
-        await this.workspaceLifecycleHooks.runAfterUnarchive({
-          workspaceId,
-          workspaceMetadata: hookMetadata,
+      // Restoration succeeded, so the unarchive is final from here: monitor attention held while
+      // archived (see dispatchBashMonitorWake) wakes after lifecycle startup below, and still
+      // wakes when a follow-up step throws, since a retried unarchive would take the
+      // !didUnarchive exit and never reach this point again.
+      try {
+        // Lifecycle hooks run *after* we persist unarchivedAt.
+        //
+        // Why best-effort: Unarchive is a quick UI action and should not fail permanently due to a
+        // start error (e.g., Coder workspace start).
+        if (this.workspaceLifecycleHooks && hookMetadata) {
+          await this.workspaceLifecycleHooks.runAfterUnarchive({
+            workspaceId,
+            workspaceMetadata: hookMetadata,
+          });
+        }
+
+        if (this.workspaceLifecycleHooks || this.worktreeArchiveSnapshotService) {
+          await this.emitCurrentWorkspaceMetadata(workspaceId);
+        }
+
+        await this.syncCodeWorkspaceFiles({
+          projectPath,
+          projects: hookMetadata?.projects,
+          subProjectPath: hookMetadata?.subProjectPath,
         });
+      } finally {
+        this.scheduleBashMonitorWakeReconcile(workspaceId);
       }
-
-      if (this.workspaceLifecycleHooks || this.worktreeArchiveSnapshotService) {
-        await this.emitCurrentWorkspaceMetadata(workspaceId);
-      }
-
-      await this.syncCodeWorkspaceFiles({
-        projectPath,
-        projects: hookMetadata?.projects,
-        subProjectPath: hookMetadata?.subProjectPath,
-      });
-
-      // Monitor attention held while archived (see dispatchBashMonitorWake) wakes now, at the
-      // same point as the workflow reconciliation below and for the same reason.
-      this.scheduleBashMonitorWakeReconcile(workspaceId);
 
       // Archived owners park workflow terminal wakes unsettled; reconcile so an idle
       // workspace does not stay silent until the interval sweep. Only AFTER snapshot
@@ -11772,18 +11776,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               });
             })
         : undefined;
-      // The opt-out lands only after retirement reserved the reconciler lock above: disabling
+      // The opt-out starts only after retirement reserved the reconciler lock above: disabling
       // retry releases the idle gate a pending wake may be waiting behind, and that wake must
-      // find its attention withdrawn, not a window to start a turn after the user's Stop. Its
-      // write is verified below with the abandon marker; a failure there fails the Stop.
+      // find its attention withdrawn, not a window to start a turn after the user's Stop. The
+      // interrupt does not wait for the opt-out's disk write (a stuck write must not keep the
+      // stream running); the write is joined and verified below, and a failure fails the Stop.
       const disabling = options?.disableAutoRetry === true;
-      if (disabling) {
-        try {
-          await session.setAutoRetryEnabled(false);
-        } catch (error) {
-          log.warn("Failed to disable auto-retry during Stop", { workspaceId, error });
-        }
-      }
+      const optOut = disabling
+        ? session.setAutoRetryEnabled(false).catch((error: unknown) => {
+            log.warn("Failed to disable auto-retry during Stop", { workspaceId, error });
+          })
+        : undefined;
       let stopResult: Result<void> | undefined;
       try {
         stopResult = await session.interruptStream(options);
@@ -11791,6 +11794,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         settleStop(stopResult?.success === true);
       }
       await retirement;
+      await optOut;
       // A wake withdrawn past its point of no return (durable row, not yet PREPARING, so the
       // session interrupt above saw idle) records the startup abandon marker for that row on every
       // exit before it resolves, including a failed goal sync or acceptance (see

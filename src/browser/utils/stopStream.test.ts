@@ -31,6 +31,19 @@ describe("stopStream", () => {
     expect(peekChatError("ws-unrecorded")).toBeUndefined();
   });
 
+  test("a Stop whose request fails in transport is retained as the workspace's chat error", async () => {
+    const api = {
+      workspace: {
+        interruptStream: () => Promise.reject(new Error("backend unreachable")),
+      },
+    } as unknown as APIClient;
+
+    await stopStream(api, "ws-transport");
+
+    expect(peekChatError("ws-transport")).toBe("backend unreachable");
+    dismissChatError("ws-transport", "backend unreachable");
+  });
+
   test("a recorded Stop retires owed monitor output without a chat error", async () => {
     const { api, calls } = apiReturning({ success: true, data: undefined });
 
