@@ -8,6 +8,7 @@ import {
 import * as path from "path";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdate";
 import { EventEmitter } from "events";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import {
@@ -300,6 +301,7 @@ import type {
 } from "@/node/services/workspaceGoalService";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "@/node/services/timelineRecorder";
 import type {
+  BackgroundProcess,
   BackgroundProcessManager,
   MonitorArmedPayload,
   MonitorMatchPayload,
@@ -3999,6 +4001,50 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return (
       message.type === "message" && message.role === "user" && message.metadata?.synthetic !== true
     );
+  }
+
+  async getRestartSafeBashMonitors(
+    processes: readonly BackgroundProcess[]
+  ): Promise<Map<string, string>> {
+    const monitors = processes.flatMap((process) =>
+      process.status === "running" &&
+      !process.isForeground &&
+      process.monitor &&
+      !process.monitor.stopped
+        ? [process.monitor.armMetadata]
+        : []
+    );
+    // Only durable registrations can produce a monitor-lost wake after an update restart.
+    // Read without draining pending writes: a failed or stalled arm write must still block.
+    try {
+      const result = await raceWithAbortAndTimeout(
+        Promise.all(
+          [...new Set(monitors.map((monitor) => monitor.workspaceId))].map((workspaceId) =>
+            this.bashMonitorRegistryStore.listAll(workspaceId)
+          )
+        ),
+        { timeoutMs: SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS }
+      );
+      if (result.kind === "ok") {
+        const records = new Map(result.value.flat().map((record) => [record.processId, record]));
+        return new Map(
+          monitors
+            .filter((monitor) => {
+              const record = records.get(monitor.processId);
+              return (
+                record?.ownerWorkspaceId === monitor.workspaceId &&
+                record.createdAt === monitor.createdAt &&
+                !record.terminal &&
+                !record.lost
+              );
+            })
+            .map((monitor) => [monitor.processId, monitor.createdAt])
+        );
+      }
+    } catch (error) {
+      log.warn("Failed to verify restart-safe bash monitors", { error });
+    }
+    return new Map();
   }
 
   collectRestartBlockers(): RestartBlocker[] {

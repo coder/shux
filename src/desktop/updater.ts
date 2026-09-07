@@ -126,8 +126,9 @@ export class UpdaterService {
 
     this.setupEventHandlers();
 
-    this.currentChannel = initialChannel;
-    this.applyChannel(initialChannel);
+    // A shared config may carry the server-only npm preference.
+    this.currentChannel = initialChannel === "npm" ? "stable" : initialChannel;
+    this.applyChannel(this.currentChannel);
 
     // Parse DEBUG_UPDATER for dev mode and optional fake version/fail phase
     const debugConfig = parseDebugUpdater(
@@ -529,6 +530,7 @@ export class UpdaterService {
   }
 
   setChannel(channel: UpdateChannel): void {
+    if (channel === "npm") throw new Error("The npm update channel is server-only");
     if (this.currentChannel === channel) {
       return;
     }

@@ -287,7 +287,7 @@ function parseOptionalBoolean(value: unknown): boolean | undefined {
 }
 
 function parseUpdateChannel(value: unknown): UpdateChannel | undefined {
-  if (value === "stable" || value === "nightly") {
+  if (value === "stable" || value === "nightly" || value === "npm") {
     return value;
   }
 
@@ -2793,7 +2793,7 @@ export class Config {
 
   getUpdateChannel(): UpdateChannel {
     const config = this.loadConfigOrDefault();
-    return config.updateChannel === "nightly" ? "nightly" : "stable";
+    return config.updateChannel ?? "stable";
   }
 
   getLlmDebugLogsEnabled(): boolean {

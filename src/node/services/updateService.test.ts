@@ -46,6 +46,30 @@ describe("UpdateService channel persistence", () => {
     expect(service.getChannel()).toBe("stable");
   });
 
+  it("offers npm only on the server and rejects unsupported changes before persistence", async () => {
+    const { config, setUpdateChannel } = createMockConfig("stable");
+    const service = new UpdateService(config);
+    expect(service.getSupportedChannels()).toContain("npm");
+    await service.setChannel("npm");
+    expect(service.getChannel()).toBe("npm");
+    const descriptor = Object.getOwnPropertyDescriptor(process.versions, "electron");
+    try {
+      Object.defineProperty(process.versions, "electron", { configurable: true, value: "test" });
+      expect(service.getSupportedChannels()).not.toContain("npm");
+      expect(service.getChannel()).toBe("stable");
+      setUpdateChannel.mockClear();
+      const error = await service.setChannel("npm").then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect(setUpdateChannel).not.toHaveBeenCalled();
+    } finally {
+      if (descriptor) Object.defineProperty(process.versions, "electron", descriptor);
+      else Reflect.deleteProperty(process.versions, "electron");
+    }
+  });
+
   it("leaves the runtime untouched when persistence fails", async () => {
     const { config, setUpdateChannel } = createMockConfig("stable");
     setUpdateChannel.mockRejectedValueOnce(new Error("disk full"));

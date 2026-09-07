@@ -2976,7 +2976,10 @@ export const update = {
   },
   getChannel: {
     input: z.void(),
-    output: UpdateChannelSchema,
+    output: z.object({
+      channel: UpdateChannelSchema,
+      supportedChannels: z.array(UpdateChannelSchema),
+    }),
   },
   setChannel: {
     input: z.object({ channel: UpdateChannelSchema }),

@@ -195,6 +195,7 @@ export interface MockORPCClientOptions {
   updateStatus?: UpdateStatus;
   /** Release channel for update.getChannel. */
   updateChannel?: UpdateChannel;
+  updateChannels?: UpdateChannel[];
   /** Initial route priority for config.getConfig */
   routePriority?: string[];
   /** Initial per-model route overrides for config.getConfig */
@@ -424,6 +425,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     memoryFileContents = new Map<string, string>(),
     updateStatus,
     updateChannel = "stable",
+    updateChannels = ["stable", "nightly"],
     routePriority: initialRoutePriority = ["direct"],
     routeOverrides: initialRouteOverrides = {},
     agentDefinitions: initialAgentDefinitions,
@@ -2009,7 +2011,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         if (updateStatus) yield updateStatus;
         await new Promise<void>(() => undefined);
       },
-      getChannel: () => Promise.resolve(updateChannel),
+      getChannel: () =>
+        Promise.resolve({ channel: updateChannel, supportedChannels: updateChannels }),
       setChannel: () => Promise.resolve(undefined),
     },
     policy: {

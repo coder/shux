@@ -59,6 +59,36 @@ export async function fetchDistTags(
   };
 }
 
+// Tags can lag a publication, so the npm channel follows publish time instead of dist-tags.
+export async function fetchNewestVersion(
+  registry: string,
+  request: RegistryRequest = fetch
+): Promise<string> {
+  const packument = z
+    .object({
+      versions: z.record(z.string(), z.unknown()),
+      time: z.record(z.string(), z.unknown()),
+    })
+    .parse(await fetchJson(request, `${registry}/@coder%2Fxum`));
+  let newest: string | undefined;
+  let newestTime = -Infinity;
+  for (const [version, time] of Object.entries(packument.time)) {
+    if (
+      !isExactVersion(version) ||
+      !Object.hasOwn(packument.versions, version) ||
+      typeof time !== "string"
+    )
+      continue;
+    const publishedAt = Date.parse(time);
+    if (Number.isFinite(publishedAt) && publishedAt > newestTime) {
+      newest = version;
+      newestTime = publishedAt;
+    }
+  }
+  if (!newest) throw new Error("Registry has no published version for the npm channel");
+  return newest;
+}
+
 const manifestSchema = z.object({
   name: z.string(),
   version: z.string(),

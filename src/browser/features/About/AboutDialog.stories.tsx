@@ -21,7 +21,11 @@ function OpenAbout() {
 
 function ServerUpdateStory(props: { status: UpdateStatus }) {
   const [client] = useState(() =>
-    createMockORPCClient({ updateStatus: props.status, updateChannel: "nightly" })
+    createMockORPCClient({
+      updateStatus: props.status,
+      updateChannel: "nightly",
+      updateChannels: ["stable", "nightly", "npm"],
+    })
   );
   return (
     <APIProvider client={client}>
@@ -90,8 +94,14 @@ export const BlockedPhone: Story = {
     const retry = within(dialog).getByRole("button", { name: "Install & restart" });
     await expect(retry).toBeEnabled();
     await expect(within(dialog).getByRole("status")).toBeVisible();
+    const npm = within(dialog).getByRole("radio", { name: "Newest npm" });
+    await userEvent.click(npm);
+    await expect(npm).toHaveAttribute("aria-checked", "true");
     if (window.innerWidth <= 440) {
       await expect(dialog.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+      await expect(npm.getBoundingClientRect().right).toBeLessThanOrEqual(
+        dialog.getBoundingClientRect().right
+      );
       await expect(retry.getBoundingClientRect().right).toBeLessThanOrEqual(
         dialog.getBoundingClientRect().right
       );

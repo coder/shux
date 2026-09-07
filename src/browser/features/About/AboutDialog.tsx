@@ -15,6 +15,17 @@ import {
   ToggleGroupItem,
 } from "@/browser/components/ToggleGroupPrimitive/ToggleGroupPrimitive";
 
+const channelLabels: Record<UpdateChannel, string> = {
+  stable: "Stable",
+  nightly: "Nightly",
+  npm: "Newest npm",
+};
+const channelDescriptions: Record<UpdateChannel, string> = {
+  stable: "Official releases only.",
+  nightly: "Nightly pre-release builds from main.",
+  npm: "Most recently published npm package, including pre-releases.",
+};
+
 const blockerLabels: Record<RestartBlocker["kind"], string> = {
   "active-streams": "Active streams",
   "pending-turns": "Pending turns",
@@ -86,6 +97,7 @@ export function AboutDialog() {
   const { gitDescribe, buildTime } = parseVersionInfo(VERSION satisfies unknown);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ type: "idle" });
   const [channel, setChannel] = useState<UpdateChannel | null>(null);
+  const [supportedChannels, setSupportedChannels] = useState<UpdateChannel[]>([]);
   const [channelLoading, setChannelLoading] = useState(false);
   const [pendingAction, setPendingAction] = useState<"check" | "download" | "install" | null>(null);
   const channelRequestTokenRef = useRef(0);
@@ -131,9 +143,10 @@ export function AboutDialog() {
 
     api.update
       .getChannel()
-      .then((nextChannel) => {
+      .then((result) => {
         if (active && requestToken === channelRequestTokenRef.current) {
-          setChannel(nextChannel);
+          setChannel(result.channel);
+          setSupportedChannels(result.supportedChannels);
         }
       })
       .catch(console.error);
@@ -237,13 +250,13 @@ export function AboutDialog() {
             <>
               {channel !== null && (
                 <div className="space-y-2">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <span className="text-muted text-xs">Channel</span>
                     <ToggleGroup
                       type="single"
                       value={channel}
                       onValueChange={(next) => {
-                        if (next === "stable" || next === "nightly") {
+                        if (next === "stable" || next === "nightly" || next === "npm") {
                           handleChannelChange(next);
                         }
                       }}
@@ -251,19 +264,14 @@ export function AboutDialog() {
                       aria-label="Update channel"
                       size="sm"
                     >
-                      <ToggleGroupItem value="stable" size="sm">
-                        Stable
-                      </ToggleGroupItem>
-                      <ToggleGroupItem value="nightly" size="sm">
-                        Nightly
-                      </ToggleGroupItem>
+                      {supportedChannels.map((option) => (
+                        <ToggleGroupItem key={option} value={option} size="sm">
+                          {channelLabels[option]}
+                        </ToggleGroupItem>
+                      ))}
                     </ToggleGroup>
                   </div>
-                  <div className="text-muted text-xs">
-                    {channel === "stable"
-                      ? "Official releases only."
-                      : "Nightly pre-release builds from main."}
-                  </div>
+                  <div className="text-muted text-xs">{channelDescriptions[channel]}</div>
                 </div>
               )}
 

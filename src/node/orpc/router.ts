@@ -2137,7 +2137,10 @@ export const router = (authToken?: string) => {
       getChannel: t
         .input(schemas.update.getChannel.input)
         .output(schemas.update.getChannel.output)
-        .handler(({ context }) => context.updateService.getChannel()),
+        .handler(({ context }) => ({
+          channel: context.updateService.getChannel(),
+          supportedChannels: context.updateService.getSupportedChannels(),
+        })),
       setChannel: t
         .input(schemas.update.setChannel.input)
         .output(schemas.update.setChannel.output)

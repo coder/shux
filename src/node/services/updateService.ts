@@ -24,7 +24,7 @@ export class UpdateService {
     type: "unsupported",
     reason: "Server updater is not enabled for this process",
   };
-  // Keep the user's stable/nightly preference loaded from config at startup so
+  // Keep the user's channel preference loaded from config at startup so
   // the About dialog and updater initialization share the same persisted value.
   private currentChannel: UpdateChannel;
   private subscribers = new Set<(status: UpdateStatus) => void>();
@@ -126,10 +126,18 @@ export class UpdateService {
       return this.impl.getChannel();
     }
 
-    return this.currentChannel;
+    return process.versions.electron && this.currentChannel === "npm"
+      ? "stable"
+      : this.currentChannel;
+  }
+
+  getSupportedChannels(): UpdateChannel[] {
+    return process.versions.electron ? ["stable", "nightly"] : ["stable", "nightly", "npm"];
   }
 
   async setChannel(channel: UpdateChannel): Promise<void> {
+    if (!this.getSupportedChannels().includes(channel))
+      throw new Error("This update channel is only available on the server");
     // Persist, switch, and roll back run as one transaction: a second change interleaving with
     // them could leave the runtime on one channel and the config on another.
     const change = this.channelChange.then(() => this.changeChannel(channel));

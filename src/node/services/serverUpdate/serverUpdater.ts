@@ -9,7 +9,7 @@ import {
   type InstallLayout,
   type LayoutResult,
 } from "./installLayout";
-import { fetchDistTags } from "./registry";
+import { fetchDistTags, fetchNewestVersion } from "./registry";
 import { stageUpdate } from "./staging";
 
 export interface ServerUpdaterDeps {
@@ -18,6 +18,7 @@ export interface ServerUpdaterDeps {
   collectBlockers: () => RestartBlocker[];
   restart: () => Promise<void>;
   fetchDistTags?: typeof fetchDistTags;
+  fetchNewestVersion?: typeof fetchNewestVersion;
   runInstall?: typeof stageUpdate;
   activate?: typeof activateUpdate;
 }
@@ -94,8 +95,12 @@ export class ServerUpdater {
     const previous = this.status;
     this.setStatus({ type: "checking" });
     try {
-      const tags = await (this.deps.fetchDistTags ?? fetchDistTags)(this.layout.registry);
-      const version = tags[this.channel === "stable" ? "latest" : "next"];
+      const version =
+        this.channel === "npm"
+          ? await (this.deps.fetchNewestVersion ?? fetchNewestVersion)(this.layout.registry)
+          : (await (this.deps.fetchDistTags ?? fetchDistTags)(this.layout.registry))[
+              this.channel === "stable" ? "latest" : "next"
+            ];
       if (!isExactVersion(version))
         throw new Error("Registry has no valid version for the selected channel");
       this.availableVersion = version === this.layout.version ? null : version;

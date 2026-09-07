@@ -105,6 +105,16 @@ describe("UpdaterService", () => {
       });
     });
 
+    it("falls back from a server npm preference and refuses selecting npm on desktop", () => {
+      const desktop = new UpdaterService("npm");
+      expect(desktop.getChannel()).toBe("stable");
+      expect(mockAutoUpdater.channel).toBe("latest");
+      desktop.setChannel("nightly");
+      expect(() => desktop.setChannel("npm")).toThrow();
+      expect(desktop.getChannel()).toBe("nightly");
+      expect(mockAutoUpdater.channel).toBe("nightly");
+    });
+
     it("accepts initial channel 'nightly'", () => {
       mockAutoUpdater.setFeedURL.mockClear();
 

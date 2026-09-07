@@ -32,6 +32,13 @@ describe("Config", () => {
     await config.editConfig((cfg) => cfg);
   }
 
+  it("preserves the npm update channel through save and reload", async () => {
+    await config.setUpdateChannel("npm");
+    expect(new Config(tempDir).getUpdateChannel()).toBe("npm");
+    await config.setUpdateChannel("nightly");
+    expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+  });
+
   describe("Daybreak visibility migration", () => {
     const blue = "openai:daybreak-blue-latest";
     const red = "openai:daybreak-red-latest";

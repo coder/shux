@@ -640,9 +640,14 @@ export class ServiceContainer {
     this.terminalService.setTerminalWindowManager(manager);
   }
 
+  private restartSafeBashMonitors = new Map<string, string>();
+
   /** Background process statuses refresh lazily, so refresh them before a blocker snapshot. */
   async refreshRestartBlockers(): Promise<void> {
-    await this.backgroundProcessManager.list();
+    this.restartSafeBashMonitors.clear();
+    const processes = await this.backgroundProcessManager.list();
+    this.restartSafeBashMonitors =
+      await this.workspaceService.getRestartSafeBashMonitors(processes);
   }
 
   collectRestartBlockers(): RestartBlocker[] {
@@ -654,7 +659,10 @@ export class ServiceContainer {
       ["requests", inFlightProcedureCount()],
       ["terminals", this.terminalService.getOpenSessionCount()],
       ["desktop-sessions", this.desktopSessionManager.getSessionCount()],
-      ["background-processes", this.backgroundProcessManager.getRunningProcessCount()],
+      [
+        "background-processes",
+        this.backgroundProcessManager.getRestartBlockingProcessCount(this.restartSafeBashMonitors),
+      ],
     ];
     for (const [kind, count] of counts) {
       if (count > 0) {

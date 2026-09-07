@@ -11,6 +11,7 @@ import {
   downloadArtifact,
   fetchArtifact,
   fetchDistTags,
+  fetchNewestVersion,
   fetchPublishedDigests,
   type RegistryRequest,
   type ReleaseArtifact,
@@ -679,6 +680,35 @@ describe("server updater", () => {
       "stable"
     );
   });
+  test("stages the newest publication independently of tags and clears it on channel change", async () => {
+    const { layout } = await fixture("bun", "2.0.0-next.1");
+    let newest = "2.0.0-next.3";
+    const installed: string[] = [];
+    const updater = new ServerUpdater({ supported: true, layout }, "npm", {
+      collectBlockers: () => [],
+      restart: () => Promise.resolve(),
+      fetchDistTags: () => Promise.resolve({ latest: "1.0.0", next: layout.version }),
+      fetchNewestVersion: () => Promise.resolve(newest),
+      runInstall: (_layout, version) => {
+        installed.push(version);
+        return Promise.resolve("/staged");
+      },
+    });
+    await updater.checkForUpdates();
+    expect(updater.getStatus()).toEqual({ type: "available", info: { version: newest } });
+    await updater.downloadUpdate();
+    expect(installed).toEqual([newest]);
+    newest = "2.0.0-next.4";
+    await updater.checkForUpdates();
+    expect(updater.getStatus()).toEqual({ type: "available", info: { version: newest } });
+    updater.setChannel("nightly");
+    await updater.checkForUpdates();
+    expect(updater.getStatus().type).toBe("up-to-date");
+    updater.setChannel("npm");
+    newest = layout.version;
+    await updater.checkForUpdates();
+    expect(updater.getStatus().type).toBe("up-to-date");
+  });
   test("reports check and download failures, suppresses automatic check errors, and retries", async () => {
     const { layout } = await fixture();
     let checkFails = true;
@@ -873,6 +903,55 @@ describe("server updater", () => {
 });
 
 describe("registry discovery", () => {
+  test("newest npm follows publication time, including untagged prereleases, not semver", async () => {
+    const newest = "1.0.1-next.2";
+    const result = await fetchNewestVersion(
+      "https://registry.example.com/prefix",
+      (url, options) => {
+        expect(url).toBe("https://registry.example.com/prefix/@coder%2Fxum");
+        expect(options.redirect).toBe("error");
+        expect(options.signal).toBeInstanceOf(AbortSignal);
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              "dist-tags": { latest: "1.0.0", next: "9.0.0-next.1" },
+              versions: {
+                "1.0.0": {},
+                "9.0.0-next.1": {},
+                [newest]: {},
+                "2.0.0": {},
+                "../../invalid": {},
+              },
+              time: {
+                modified: "2030-01-01T00:00:00Z",
+                "1.0.0": "2026-01-01T00:00:00Z",
+                [newest]: "2026-03-01T00:00:00Z",
+                "9.0.0-next.1": "2026-02-01T00:00:00Z",
+                "2.0.0": "invalid-date",
+                "3.0.0": "2026-04-01T00:00:00Z",
+                "../../invalid": "2026-05-01T00:00:00Z",
+              },
+            })
+          )
+        );
+      }
+    );
+    expect(result).toBe(newest);
+  });
+  test("newest npm rejects missing publications and malformed registry responses", async () => {
+    for (const body of [
+      null,
+      {},
+      { versions: {}, time: { modified: "2026-01-01T00:00:00Z" } },
+      { versions: { "1.0.0": {} }, time: { "1.0.0": null } },
+    ]) {
+      await expectFailure(() =>
+        fetchNewestVersion("https://registry.example.com", () =>
+          Promise.resolve(new Response(JSON.stringify(body)))
+        )
+      );
+    }
+  });
   test("requests scoped package dist-tags and accepts only exact versions", async () => {
     let observedUrl = "";
     let hasSignal = false;

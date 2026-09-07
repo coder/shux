@@ -16,7 +16,12 @@ describeIntegration("Server update IPC", () => {
       await client.update.download();
       await client.update.install();
       // An unsupported install must not have started the restart path: the server still answers.
-      expect(await client.update.getChannel()).toBe("stable");
+      expect(await client.update.getChannel()).toEqual({
+        channel: "stable",
+        supportedChannels: ["stable", "nightly", "npm"],
+      });
+      await client.update.setChannel({ channel: "npm" });
+      expect((await client.update.getChannel()).channel).toBe("npm");
     } finally {
       controller.abort();
       await cleanupTestEnvironment(env);

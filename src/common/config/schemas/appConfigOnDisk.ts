@@ -134,7 +134,7 @@ export const AppConfigMigrationsSchema = z
   // their one-time migrations after re-upgrade (see normalizeConfigMigrations).
   .catchall(z.boolean());
 
-export const UpdateChannelSchema = z.enum(["stable", "nightly"]);
+export const UpdateChannelSchema = z.enum(["stable", "nightly", "npm"]);
 
 export const AppConfigOnDiskSchema = z
   .object({
