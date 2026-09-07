@@ -574,6 +574,11 @@ if (!result.success) throw new Error(result.error);
       failed.mockRestore();
     }
     await assertStale(cursor);
+    // Real same-tick writes can retain identical nanosecond stamps. Seed an old
+    // mtime before the cursor so this same-size rewrite deterministically changes
+    // observable metadata; stamp-only provenance cannot detect identical stamps.
+    const oldTime = new Date("2000-01-01T00:00:00Z");
+    await fs.utimes(store.chatPath, oldTime, oldTime);
     const next = await startCursor();
     await using _lock = await acquireProcessFileLock({
       lockPath: historyWriteLockPath(fixture.config.rootDir, ws),
@@ -581,8 +586,15 @@ if (!result.success) throw new Error(result.error);
       label: "test unknown rewrite",
     });
     await store.runMutation(async () => {
+      const before = (await store.stamps()).chat!;
       const text = await fs.readFile(store.chatPath, "utf8");
-      await fs.writeFile(store.chatPath, text.replace("facts 1", "reset 1"));
+      const rewritten = text.replace("facts 1", "reset 1");
+      expect(rewritten).not.toBe(text);
+      await fs.writeFile(store.chatPath, rewritten);
+      expect(await fs.readFile(store.chatPath, "utf8")).toBe(rewritten);
+      const after = (await store.stamps()).chat!;
+      expect(after.size).toBe(before.size);
+      expect(after.mtimeNs).not.toBe(before.mtimeNs);
       await store.appendChat(
         Buffer.from(JSON.stringify(createMuxMessage("after-unknown", "assistant", "append")) + "\n")
       );
