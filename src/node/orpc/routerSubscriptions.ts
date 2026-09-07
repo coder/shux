@@ -295,8 +295,12 @@ export function subscribeWorkspaceChat(
       replayRelay = createReplayBufferedStreamMessageRelay(emit.push);
       return session.onChatEvent(({ message }) => replayRelay.handleSessionMessage(message));
     },
-    initialize: async (emit) => {
-      await session.replayHistory(({ message }) => emit.push(message), input.mode);
+    initialize: async () => {
+      await session.replayHistory(
+        ({ message }) => replayRelay.handleReplayMessage(message),
+        input.mode,
+        replayRelay.finishReplay
+      );
       replayRelay.finishReplay();
       session.scheduleStartupRecovery();
     },

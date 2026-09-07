@@ -1,53 +1,23 @@
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 
-type ReplayBufferedSessionMessage = Extract<
-  WorkspaceChatMessage,
-  {
-    type:
-      | "stream-delta"
-      | "reasoning-delta"
-      | "stream-end"
-      | "stream-abort"
-      | "stream-error"
-      | "init-start"
-      | "init-output"
-      | "init-end";
-  }
->;
-
 type ReplayBufferedDeltaMessage = Extract<
-  ReplayBufferedSessionMessage,
+  WorkspaceChatMessage,
   { type: "stream-delta" | "reasoning-delta" }
 >;
 
-function isReplayBufferedSessionMessage(
-  message: WorkspaceChatMessage
-): message is ReplayBufferedSessionMessage {
-  return (
-    message.type === "stream-delta" ||
-    message.type === "reasoning-delta" ||
-    message.type === "stream-end" ||
-    message.type === "stream-abort" ||
-    message.type === "stream-error" ||
-    message.type === "init-start" ||
-    message.type === "init-output" ||
-    message.type === "init-end"
-  );
-}
-
 function isReplayBufferedDeltaMessage(
-  message: ReplayBufferedSessionMessage
+  message: WorkspaceChatMessage
 ): message is ReplayBufferedDeltaMessage {
   return message.type === "stream-delta" || message.type === "reasoning-delta";
 }
 
 type ReplayBufferedInitMessage = Extract<
-  ReplayBufferedSessionMessage,
+  WorkspaceChatMessage,
   { type: "init-start" | "init-output" | "init-end" }
 >;
 
 function isReplayBufferedInitMessage(
-  message: ReplayBufferedSessionMessage
+  message: WorkspaceChatMessage
 ): message is ReplayBufferedInitMessage {
   return (
     message.type === "init-start" || message.type === "init-output" || message.type === "init-end"
@@ -88,10 +58,11 @@ export function createReplayBufferedStreamMessageRelay(
   push: (message: WorkspaceChatMessage) => void
 ): {
   handleSessionMessage: (message: WorkspaceChatMessage) => void;
+  handleReplayMessage: (message: WorkspaceChatMessage) => void;
   finishReplay: () => void;
 } {
   let isReplaying = true;
-  const bufferedLiveSessionMessages: ReplayBufferedSessionMessage[] = [];
+  const bufferedLiveSessionMessages: WorkspaceChatMessage[] = [];
 
   // Counters (not Sets) so we don't drop more buffered events than were replayed.
   const replayedDeltaKeyCounts = new Map<string, number>();
@@ -135,39 +106,43 @@ export function createReplayBufferedStreamMessageRelay(
     return true;
   };
 
-  const handleSessionMessage = (message: WorkspaceChatMessage) => {
-    if (isReplaying && isReplayBufferedSessionMessage(message)) {
-      if (!isReplayMessage(message)) {
-        // Preserve live ordering during replay buffering. Init events need the same isolation as
-        // stream events so reconnect replay cannot blank the row or drop lines due to reordering.
-        bufferedLiveSessionMessages.push(message);
-        return;
-      }
-
-      // Track replayed deltas/init events so buffered live events from the same window do not
-      // double-apply after `caught-up`.
-      if (isReplayBufferedDeltaMessage(message)) {
-        noteReplayedDelta(message);
-      } else if (isReplayBufferedInitMessage(message)) {
-        noteReplayedInit(message);
-      }
+  const flushBuffered = (count = bufferedLiveSessionMessages.length) => {
+    for (const message of bufferedLiveSessionMessages.splice(0, count)) {
+      if (isReplayBufferedDeltaMessage(message) && shouldDropBufferedDelta(message)) continue;
+      if (isReplayBufferedInitMessage(message) && shouldDropBufferedInit(message)) continue;
+      push(message);
     }
+  };
 
+  const handleReplayMessage = (message: WorkspaceChatMessage) => {
+    if (isReplaying) {
+      if (message.type === "stream-start") {
+        const startIndex = bufferedLiveSessionMessages.findIndex(
+          (event) => event.type === "stream-start" && event.messageId === message.messageId
+        );
+        // Deliver the predecessor terminal and successor's normal start before its replay
+        // snapshot. A normal start delivered later would erase the replayed successor content.
+        if (startIndex >= 0) flushBuffered(startIndex + 1);
+      }
+      if (isReplayBufferedDeltaMessage(message)) noteReplayedDelta(message);
+      else if (isReplayBufferedInitMessage(message)) noteReplayedInit(message);
+    }
     push(message);
   };
 
-  const finishReplay = () => {
-    // Flush buffered live session messages after replay (`caught-up` already queued by replayHistory).
-    for (const message of bufferedLiveSessionMessages) {
-      if (isReplayBufferedDeltaMessage(message) && shouldDropBufferedDelta(message)) {
-        continue;
-      }
-      if (isReplayBufferedInitMessage(message) && shouldDropBufferedInit(message)) {
-        continue;
-      }
+  const handleSessionMessage = (message: WorkspaceChatMessage) => {
+    if (isReplayMessage(message)) {
+      handleReplayMessage(message);
+    } else if (isReplaying) {
+      // Buffer the whole live event family so terminals cannot overtake starts or tools.
+      bufferedLiveSessionMessages.push(message);
+    } else {
       push(message);
     }
+  };
 
+  const finishReplay = () => {
+    flushBuffered();
     isReplaying = false;
 
     // Avoid retaining replay keys for the lifetime of the subscription.
@@ -176,5 +151,5 @@ export function createReplayBufferedStreamMessageRelay(
     bufferedLiveSessionMessages.length = 0;
   };
 
-  return { handleSessionMessage, finishReplay };
+  return { handleSessionMessage, handleReplayMessage, finishReplay };
 }
