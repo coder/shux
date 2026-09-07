@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
-import type { MuxMessageMetadata } from "@/common/types/message";
+import type { BashMonitorWakeDisplayRecord, MuxMessageMetadata } from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { BASH_MONITOR_WAKE_HEADINGS } from "@/common/utils/machineTurnPrompts";
 import type {
@@ -166,10 +166,25 @@ interface ReconcileState {
   owedAcceptance?: readonly DerivedSignal[];
   /** Frontier a committed stop still has to retire; applied before any dispatch. */
   owedRetirement?: readonly BashMonitorProcessSnapshot[];
+  /** Outstanding wake keys already looked up in the transcript (see deliveredSignals). */
+  transcriptChecked?: ReadonlySet<string>;
 }
 
 function signalKey(processId: string, createdAt: string): string {
   return processId + "\u0000" + createdAt;
+}
+
+/** Identifies one wake of a process; changes whenever the process has new attention to report. */
+function wakeUpdatedAt(signal: DerivedSignal): string {
+  return (
+    signal.lost?.failedAt ??
+    signal.terminal?.settledAt ??
+    (signal.matchOffset != null ? signal.createdAt + ":" + signal.matchOffset : signal.createdAt)
+  );
+}
+
+function wakeKey(processId: string, updatedAt: string): string {
+  return processId + "\u0000" + updatedAt;
 }
 
 function normalizedTerminalStatus(
@@ -332,12 +347,7 @@ function buildMetadata(
     type: "bash-monitor-wake",
     records: signals.map((signal) => ({
       processId: signal.processId,
-      wakeUpdatedAt:
-        signal.lost?.failedAt ??
-        signal.terminal?.settledAt ??
-        (signal.matchOffset != null
-          ? signal.createdAt + ":" + signal.matchOffset
-          : signal.createdAt),
+      wakeUpdatedAt: wakeUpdatedAt(signal),
       kind: signal.kind === "monitor-lost" ? "monitor-lost" : "match",
       displayName: signal.displayName ?? signal.processId,
       filter: signal.filter,
@@ -370,6 +380,14 @@ export class BashMonitorWakeReconciler {
       sessionsDir: string;
       processManager: BashMonitorWakeReconcilerProcessManager;
       registry: BashMonitorWakeReconcilerRegistry;
+      /**
+       * Wake records the owner's transcript carries in rows stamped at or after `since`, the
+       * creation time of the oldest process being checked. A rejection holds dispatch.
+       */
+      deliveredWakes(
+        ownerWorkspaceId: string,
+        since: string
+      ): Promise<readonly BashMonitorWakeDisplayRecord[]>;
       onWake(
         dispatch: BashMonitorWakeDispatch
       ): Promise<BashMonitorWakeDispatchOutcome> | BashMonitorWakeDispatchOutcome;
@@ -512,25 +530,27 @@ export class BashMonitorWakeReconciler {
       // reconcile retry backoff): an accepted wake's signals are never redelivered over the row
       // the transcript already carries, and dismissed attention never dispatches when the stop's
       // own idle transition reconciles.
-      const owed = this.state(ownerWorkspaceId);
-      await this.acceptOwed(ownerWorkspaceId, owed);
-      await this.retireOwed(ownerWorkspaceId, owed);
+      const state = this.state(ownerWorkspaceId);
+      await this.acceptOwed(ownerWorkspaceId, state);
+      await this.retireOwed(ownerWorkspaceId, state);
       const collected = await this.collect(ownerWorkspaceId, true);
       for (const readSettled of collected.deferredReads) {
         void readSettled.finally(() => this.scheduleReconcile(ownerWorkspaceId));
       }
-      await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, collected.autoConsumed);
-      await this.cleanup(collected.autoConsumed);
+      const delivered = await this.deliveredSignals(ownerWorkspaceId, state, collected.signals);
+      const consumed = [...collected.autoConsumed, ...delivered];
+      await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, consumed);
+      await this.cleanup(consumed);
 
-      const state = this.state(ownerWorkspaceId);
-      if (collected.signals.length === 0) {
+      const signals = collected.signals.filter((signal) => !delivered.includes(signal));
+      if (signals.length === 0) {
         state.dispatch?.controller.abort();
         state.dispatch = undefined;
         return undefined;
       }
 
       const signature = JSON.stringify(
-        collected.signals.map((signal) => [
+        signals.map((signal) => [
           signal.key,
           signal.kind,
           signal.matchOffset,
@@ -546,7 +566,7 @@ export class BashMonitorWakeReconciler {
         id: randomUUID(),
         signature,
         controller: new AbortController(),
-        signals: collected.signals,
+        signals,
         accepted: false,
       };
       state.dispatch = next;
@@ -610,6 +630,42 @@ export class BashMonitorWakeReconciler {
     await this.advanceWatermarks(ownerWorkspaceId, watermarks, state.owedAcceptance);
     await this.cleanup(state.owedAcceptance);
     state.owedAcceptance = undefined;
+  }
+
+  /**
+   * Outstanding signals whose wake row the transcript already carries. An acceptance whose
+   * consumption I/O kept failing until the app exited leaves the durable row as the only record
+   * of delivery; on the next run the signal derives as outstanding again and is consumed here
+   * instead of redelivered. Only this reconciler's own accepts add wake rows, so each outstanding
+   * key is looked up once and the result holds until the key leaves the outstanding set.
+   */
+  private async deliveredSignals(
+    ownerWorkspaceId: string,
+    state: ReconcileState,
+    signals: readonly DerivedSignal[]
+  ): Promise<DerivedSignal[]> {
+    const keyOf = (signal: DerivedSignal) => wakeKey(signal.processId, wakeUpdatedAt(signal));
+    const checked = state.transcriptChecked ?? new Set<string>();
+    let delivered: DerivedSignal[] = [];
+    if (signals.some((signal) => !checked.has(keyOf(signal)))) {
+      const since = signals.reduce(
+        (oldest, signal) => (signal.createdAt < oldest ? signal.createdAt : oldest),
+        signals[0].createdAt
+      );
+      const rows = await this.args.deliveredWakes(ownerWorkspaceId, since);
+      const inTranscript = new Set(
+        rows.flatMap((row) =>
+          row.processId != null && row.wakeUpdatedAt != null
+            ? [wakeKey(row.processId, row.wakeUpdatedAt)]
+            : []
+        )
+      );
+      delivered = signals.filter((signal) => inTranscript.has(keyOf(signal)));
+    }
+    state.transcriptChecked = new Set(
+      signals.filter((signal) => !delivered.includes(signal)).map(keyOf)
+    );
+    return delivered;
   }
 
   private abortDispatch(ownerWorkspaceId: string): void {

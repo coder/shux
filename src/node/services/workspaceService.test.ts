@@ -299,6 +299,13 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
           requests.push(request);
           const completion = Promise.withResolvers<TurnCompletion>();
           completions.push(completion);
+          // Session shutdown retires an in-flight handle (as createStartedTurnHandle does), so
+          // finish() can drain a turn the test never completed.
+          harness.session.closingSignal.addEventListener(
+            "abort",
+            () => completion.resolve({ status: "aborted", abortReason: "user" }),
+            { once: true }
+          );
           streaming = true;
           const messageId = "assistant-" + requests.length;
           aiEmitter.emit("stream-start", {
@@ -415,6 +422,49 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       },
     };
   }
+
+  test("a wake row already in history is consumed without a dispatch, even behind a compaction boundary", async () => {
+    const h = await createActiveWakeHarness();
+    const acknowledged = spyOn(h.backgroundProcessManager, "acknowledgeMonitorWake");
+    try {
+      // The row is durable but its acceptance never reached the watermark (I/O failed until exit);
+      // a later compaction moved it out of the window the model sees.
+      await h.historyService.appendToHistory(
+        h.workspaceId,
+        createMuxMessage("wake-delivered", "user", "Monitor matched", {
+          timestamp: Date.now(),
+          muxMetadata: {
+            type: "bash-monitor-wake",
+            records: ["first", "second"].map((processId) => ({
+              processId,
+              wakeUpdatedAt: "2026-01-01T00:00:00.000Z:7",
+              kind: "match" as const,
+              displayName: processId,
+              filter: "READY",
+              filterExclude: false,
+            })),
+          },
+        })
+      );
+      await h.historyService.appendToHistory(
+        h.workspaceId,
+        createMuxMessage("summary-1", "assistant", "Summary", {
+          timestamp: Date.now(),
+          compactionBoundary: true,
+          compacted: true,
+          compactionEpoch: 1,
+          muxMetadata: { type: "compaction-summary" },
+        })
+      );
+      await h.addAttention(7);
+      expect(h.dispatch).not.toHaveBeenCalled();
+      expect(acknowledged).toHaveBeenCalledTimes(2);
+      await h.addAttention(12);
+      expect(h.dispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      await h.finish();
+    }
+  });
 
   test("the SDK answers in the original stream after repeated owed wakes are consumed", async () => {
     const h = await createActiveWakeHarness();

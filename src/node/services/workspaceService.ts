@@ -195,6 +195,7 @@ import {
   getCompactionFollowUpContent,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
+  type BashMonitorWakeDisplayRecord,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
   type MuxMessage,
@@ -2400,6 +2401,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             : undefined,
       },
       registry: this.bashMonitorRegistryStore,
+      deliveredWakes: (ownerWorkspaceId, since) =>
+        this.listDeliveredBashMonitorWakes(ownerWorkspaceId, since),
       onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
     });
     if (typeof this.backgroundProcessManager.on === "function") {
@@ -2558,6 +2561,40 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
       });
     this.pendingBashMonitorWakeIdleWaitsByOwner.set(ownerWorkspaceId, promise);
+  }
+
+  /**
+   * Wake records in transcript rows written since `since`, scanning newest-first across the
+   * compaction archive too because a delivered row stays proof of delivery after it leaves the
+   * window the model sees. A failed read rejects so the reconciler holds dispatch in its retry
+   * backoff instead of risking a duplicate row.
+   */
+  private async listDeliveredBashMonitorWakes(
+    ownerWorkspaceId: string,
+    since: string
+  ): Promise<readonly BashMonitorWakeDisplayRecord[]> {
+    const oldest = Date.parse(since);
+    const records: BashMonitorWakeDisplayRecord[] = [];
+    const result = await this.historyService.iterateFullHistory(
+      ownerWorkspaceId,
+      "backward",
+      (messages) => {
+        // A wake row is appended after its process was created, so once a whole chunk predates
+        // every process being checked the rest of history cannot carry one.
+        let predatesAll = messages.length > 0;
+        for (const message of messages) {
+          const muxMetadata = message.metadata?.muxMetadata;
+          if (message.role === "user" && muxMetadata?.type === "bash-monitor-wake") {
+            records.push(...muxMetadata.records);
+          }
+          const timestamp = message.metadata?.timestamp;
+          if (!(typeof timestamp === "number" && timestamp < oldest)) predatesAll = false;
+        }
+        return !predatesAll;
+      }
+    );
+    if (!result.success) throw new Error(result.error);
+    return records;
   }
 
   private async dispatchBashMonitorWake(

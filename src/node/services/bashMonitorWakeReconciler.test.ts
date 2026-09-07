@@ -2,6 +2,7 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { BashMonitorWakeDisplayRecord } from "@/common/types/message";
 import { classifyMachineTurnPromptKind } from "@/common/utils/machineTurnPrompts";
 import type {
   BashMonitorRegistryRecord,
@@ -61,6 +62,7 @@ describe("BashMonitorWakeReconciler", () => {
   let dropped: string[];
   let droppedGenerations: Array<string | undefined>;
   let acknowledgeGate: ReturnType<typeof Promise.withResolvers<void>> | undefined;
+  let transcript: BashMonitorWakeDisplayRecord[];
   let reconciler: BashMonitorWakeReconciler;
 
   beforeEach(async () => {
@@ -76,6 +78,7 @@ describe("BashMonitorWakeReconciler", () => {
     dropped = [];
     droppedGenerations = [];
     acknowledgeGate = undefined;
+    transcript = [];
     reconciler = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: {
@@ -110,6 +113,7 @@ describe("BashMonitorWakeReconciler", () => {
         },
         recordTerminal: () => undefined,
       },
+      deliveredWakes: () => Promise.resolve(transcript),
       onWake: (dispatch) => {
         dispatches.push(dispatch);
         return dispatchOutcome;
@@ -398,6 +402,66 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(2);
   });
 
+  test("a wake the transcript already carries is consumed after restart, not redelivered", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    // The row landed but its consumption I/O never succeeded before the app exited.
+    transcript.push(...dispatches[0].muxMetadata.records);
+    await reconciler.dispose(OWNER);
+
+    let transcriptReads = 0;
+    let transcriptReadFails = true;
+    const afterRestart: BashMonitorWakeDispatch[] = [];
+    const restarted = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: (processId, _generation, matchedThroughOffset) => {
+          acknowledged.push({
+            processId,
+            ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
+          });
+        },
+        dropRetiredMonitor: () => undefined,
+      },
+      registry: {
+        listAll: () => Promise.resolve(rows),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
+      },
+      deliveredWakes: () => {
+        transcriptReads++;
+        return transcriptReadFails
+          ? Promise.reject(new Error("transient transcript read"))
+          : Promise.resolve(transcript);
+      },
+      onWake: (dispatch) => {
+        afterRestart.push(dispatch);
+        return "in-flight";
+      },
+    });
+
+    await expect(restarted.reconcile(OWNER)).rejects.toThrow("transient transcript read");
+    expect(afterRestart).toEqual([]);
+
+    transcriptReadFails = false;
+    await restarted.reconcile(OWNER);
+    expect(afterRestart).toEqual([]);
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+
+    live = [
+      liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
+    ];
+    await restarted.reconcile(OWNER);
+    await restarted.reconcile(OWNER);
+    expect(afterRestart).toHaveLength(1);
+    expect(afterRestart[0].prompt).toContain("READY again");
+    // One lookup per new outstanding key; an unchanged frontier reconciles without another read.
+    expect(transcriptReads).toBe(3);
+    await restarted.dispose(OWNER);
+  });
+
   test("full history clear consumes signals present both before and during the clear", async () => {
     live = [liveSnapshot()];
     const token = await reconciler.beginFullHistoryClear(OWNER);
@@ -473,6 +537,7 @@ describe("BashMonitorWakeReconciler", () => {
         },
         recordTerminal: () => undefined,
       },
+      deliveredWakes: () => Promise.resolve(transcript),
       onWake: (dispatch) => {
         restartedDispatches.push(dispatch);
         return "in-flight";
@@ -555,6 +620,7 @@ describe("BashMonitorWakeReconciler", () => {
         remove: () => undefined,
         recordTerminal: () => undefined,
       },
+      deliveredWakes: () => Promise.resolve(transcript),
       onWake: (dispatch) => {
         afterRestart.push(dispatch);
         return "in-flight";
@@ -821,6 +887,7 @@ describe("BashMonitorWakeReconciler", () => {
         },
         recordTerminal: () => undefined,
       },
+      deliveredWakes: () => Promise.resolve(transcript),
       onWake: (dispatch) => {
         afterRestart.push(dispatch);
         return "in-flight";
@@ -960,6 +1027,7 @@ describe("BashMonitorWakeReconciler", () => {
         remove: () => undefined,
         recordTerminal: () => undefined,
       },
+      deliveredWakes: () => Promise.resolve(transcript),
       onWake: (dispatch) => {
         retryDispatches.push(dispatch);
         return "in-flight";
