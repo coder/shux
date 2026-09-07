@@ -1,3 +1,5 @@
+import { execBuffered } from "@/node/utils/runtime/helpers";
+import { shellQuote } from "@/common/utils/shell";
 import type { OnStepSettled } from "./streamManager";
 import { checkAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
@@ -284,6 +286,8 @@ export interface StreamMessageOptions {
   experiments?: SendMessageOptions["experiments"];
   allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
+  /** Candidate admission previews tool availability only; executions keep the real goal service. */
+  prospectiveGoalStatusForToolAvailability?: GoalRecordV1["status"] | null;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   onStepSettled?: OnStepSettled;
@@ -489,13 +493,14 @@ interface TurnRequestBuildStartupState {
   logSlowStreamStartup?: (details: Record<string, unknown>) => void;
 }
 
-interface TurnRequestBuildContext {
+export interface TurnRequestBuildContext {
   abortSignal: AbortSignal;
   syntheticMessageId: string;
   startTime: number;
   startupPhaseTimingsMs: Record<string, number>;
   startupState: TurnRequestBuildStartupState;
   recordStartupPhaseTiming: (phase: string, phaseStartedAt: number) => void;
+  admissionOnly?: boolean;
 }
 
 type TurnRequestBuildOutcome =
@@ -507,6 +512,18 @@ type TurnRequestBuildOutcome =
       deleteAbortedPlaceholder: (messageId: string) => Promise<void>;
       logStartOutcome: (outcome: "started" | "stream_start_failed", errorType?: string) => void;
     };
+
+export interface PreparedStreamMessage extends AsyncDisposable {
+  start(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;
+}
+
+export interface PreparedTurnRequest extends AsyncDisposable {
+  start(thinkingOverride?: ActiveTurnThinkingOverride): Promise<TurnRequestBuildOutcome>;
+}
+
+type PreparedTurnRequestOutcome =
+  | Extract<TurnRequestBuildOutcome, { type: "finished" }>
+  | { type: "prepared"; request: PreparedTurnRequest };
 
 export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   mcpServerManager?: MCPServerManager;
@@ -770,6 +787,34 @@ export class TurnRequestBuilder {
     opts: StreamMessageOptions,
     context: TurnRequestBuildContext
   ): Promise<TurnRequestBuildOutcome> {
+    const prepared = await this.prepare(opts, context);
+    if (prepared.type === "finished") return prepared;
+    await using request = prepared.request;
+    return await request.start(opts.activeTurnThinkingOverride);
+  }
+
+  async prepare(
+    opts: StreamMessageOptions,
+    context: TurnRequestBuildContext
+  ): Promise<PreparedTurnRequestOutcome> {
+    const resources: { model?: LanguageModel; cleanupTemp?: () => Promise<void> } = {};
+    let retained = false;
+    let transferred = false;
+    const dispose = async () => {
+      if (transferred) return;
+      transferred = true;
+      runLanguageModelCleanup(resources.model);
+      try {
+        await resources.cleanupTemp?.();
+      } catch (error) {
+        log.warn("Failed to clean up unstarted request", { error });
+      }
+    };
+    await using _preparation = {
+      [Symbol.asyncDispose]: async () => {
+        if (!retained) await dispose();
+      },
+    };
     const {
       messages,
       workspaceId,
@@ -800,8 +845,8 @@ export class TurnRequestBuilder {
       openaiTruncationModeOverride,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
-      activeTurnThinkingOverride,
     } = opts;
+    let activeTurnThinkingOverride = opts.activeTurnThinkingOverride;
     const experiments: StreamMessageOptions["experiments"] = resolveBackendGatedPtcExperiments(
       experimentsFromOptions,
       (experimentId) =>
@@ -1033,6 +1078,7 @@ export class TurnRequestBuilder {
     if (!modelResult.success) {
       return { type: "finished", result: Err(modelResult.error) };
     }
+    resources.model = modelResult.data.model;
     const {
       canonicalModelString,
       canonicalProviderName,
@@ -1157,14 +1203,15 @@ export class TurnRequestBuilder {
         detail: breadcrumb.detail,
         elapsedMs: Date.now() - startTime,
       });
-      this.dependencies.emit("runtime-status", {
-        type: "runtime-status",
-        workspaceId,
-        phase: breadcrumb.phase,
-        runtimeType: metadata.runtimeConfig.type,
-        source: "startup",
-        detail: breadcrumb.detail,
-      });
+      if (!context.admissionOnly)
+        this.dependencies.emit("runtime-status", {
+          type: "runtime-status",
+          workspaceId,
+          phase: breadcrumb.phase,
+          runtimeType: metadata.runtimeConfig.type,
+          source: "startup",
+          detail: breadcrumb.detail,
+        });
     };
 
     const runtimeContextResult = this.dependencies.createWorkspaceRuntimeContext(
@@ -1202,14 +1249,15 @@ export class TurnRequestBuilder {
       signal: combinedAbortSignal,
       statusSink: (status) => {
         // Emit runtime-status events for frontend UX (StreamingBarrier)
-        this.dependencies.emit("runtime-status", {
-          type: "runtime-status",
-          workspaceId,
-          phase: status.phase,
-          runtimeType: status.runtimeType,
-          source: "runtime",
-          detail: status.detail,
-        });
+        if (!context.admissionOnly)
+          this.dependencies.emit("runtime-status", {
+            type: "runtime-status",
+            workspaceId,
+            phase: status.phase,
+            runtimeType: status.runtimeType,
+            source: "runtime",
+            detail: status.detail,
+          });
       },
     });
     recordStartupPhaseTiming("ensureReadyMs", ensureReadyStartedAt);
@@ -1232,7 +1280,7 @@ export class TurnRequestBuilder {
         errorType,
         acpPromptId,
       });
-      this.dependencies.emit("error", errorEvent);
+      if (!context.admissionOnly) this.dependencies.emit("error", errorEvent);
       onPreStartError?.(errorEvent);
 
       logSlowStreamStartup({
@@ -1326,7 +1374,7 @@ export class TurnRequestBuilder {
       callerToolPolicy: toolPolicy,
       cfg,
       emitError: (event) => {
-        this.dependencies.emit("error", event);
+        if (!context.admissionOnly) this.dependencies.emit("error", event);
         onPreStartError?.(event);
       },
       isAdvisorExperimentEnabled: advisorExperimentEnabled,
@@ -1397,7 +1445,10 @@ export class TurnRequestBuilder {
       metadata.goalDefaults ?? null
     );
     const goalToolAvailability = getGoalToolAvailability({
-      goalStatus: currentGoalForTools?.status ?? null,
+      goalStatus:
+        opts.prospectiveGoalStatusForToolAvailability !== undefined
+          ? opts.prospectiveGoalStatusForToolAvailability
+          : (currentGoalForTools?.status ?? null),
       parentWorkspaceId: metadata.parentWorkspaceId,
       allowAgentSetGoal,
       agentInheritanceChain,
@@ -1665,6 +1716,21 @@ export class TurnRequestBuilder {
       streamToken,
       runtime
     );
+    resources.cleanupTemp = async () => {
+      const removed = await execBuffered(
+        runtime,
+        `rm -rf ${shellQuote(path.basename(runtimeTempDir))}`,
+        {
+          cwd: path.dirname(runtimeTempDir),
+          timeout: 10,
+        }
+      );
+      if (removed.exitCode !== 0)
+        log.warn("Failed to remove unstarted request directory", {
+          runtimeTempDir,
+          stderr: removed.stderr,
+        });
+    };
     recordStartupPhaseTiming("createTempDirForStreamMs", createTempDirForStreamStartedAt);
 
     const readToolInstructionsStartedAt = Date.now();
@@ -2323,7 +2389,7 @@ export class TurnRequestBuilder {
       providerRequestMessages?: MuxMessage[];
       initializeToolSearch: boolean;
       reusePrePolicySystemContext: boolean;
-      requestHistorySequence: number;
+      requestHistorySequence: () => number;
       partialContinuationMessage?: MuxMessage;
       recordTimings?: boolean;
       cleanupModelOnError?: boolean;
@@ -2580,7 +2646,7 @@ export class TurnRequestBuilder {
             modelString: seed.rawModelString,
             thinkingLevel: level,
             providerOptions: providerOptionsForEnvelope,
-            requestHistorySequence: options.requestHistorySequence,
+            requestHistorySequence: options.requestHistorySequence(),
             sentinelToolNames: toolNamesForSentinel,
             wireProviderName: seed.wireProviderName,
             anthropicCacheTtl: effectiveAnthropicCacheTtl,
@@ -2638,7 +2704,7 @@ export class TurnRequestBuilder {
       }
     };
 
-    const requestHistorySequence = providerRequestMessages.reduce(
+    let requestHistorySequence = providerRequestMessages.reduce(
       (latest, message) => Math.max(latest, message.metadata?.historySequence ?? -1),
       -1
     );
@@ -2651,7 +2717,7 @@ export class TurnRequestBuilder {
         providerRequestMessages,
         initializeToolSearch: true,
         reusePrePolicySystemContext: true,
-        requestHistorySequence,
+        requestHistorySequence: () => requestHistorySequence,
         recordTimings: true,
       });
     } catch (error) {
@@ -2696,414 +2762,443 @@ export class TurnRequestBuilder {
       };
     }
 
-    const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
-      ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
-      timestamp: Date.now(),
-      model: canonicalModelString,
-      routedThroughGateway,
-      systemMessageTokens,
-      agentId: effectiveAgentId,
-    });
-
-    const appendResult = await this.dependencies.historyService.appendToHistory(
-      workspaceId,
-      assistantMessage
-    );
-    if (!appendResult.success) {
-      return { type: "finished", result: Err({ type: "unknown", raw: appendResult.error }) };
-    }
-
-    const historySequence = assistantMessage.metadata?.historySequence ?? 0;
-
-    // Handle simulated stream scenarios (OpenAI SDK testing features).
-    // These emit synthetic stream events without calling an AI provider.
-    const forceContextLimitError =
-      modelString.startsWith("openai:") &&
-      effectiveMuxProviderOptions.openai?.forceContextLimitError === true;
-    const simulateToolPolicyNoopFlag =
-      modelString.startsWith("openai:") &&
-      effectiveMuxProviderOptions.openai?.simulateToolPolicyNoop === true;
-
-    if (forceContextLimitError || simulateToolPolicyNoopFlag) {
-      const simulationCtx: SimulationContext = {
-        workspaceId,
-        assistantMessageId,
-        canonicalModelString,
+    let started = false;
+    const start = async (
+      thinkingOverride?: ActiveTurnThinkingOverride
+    ): Promise<TurnRequestBuildOutcome> => {
+      assert(!started && !transferred, "Prepared request must be started once before disposal");
+      started = true;
+      activeTurnThinkingOverride = thinkingOverride;
+      if (context.admissionOnly)
+        requestHistorySequence = messages.reduce(
+          (latest, row) => Math.max(latest, row.metadata?.historySequence ?? -1),
+          -1
+        );
+      if (combinedAbortSignal.aborted)
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+          ),
+        };
+      const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
+        ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
+        timestamp: Date.now(),
+        model: canonicalModelString,
         routedThroughGateway,
-        ...(routeProvider != null ? { routeProvider } : {}),
-        historySequence,
         systemMessageTokens,
-        effectiveAgentId,
-        effectiveMode,
-        metadataMode: legacyModeForMetadata,
-        effectiveThinkingLevel,
-        emit: (event, data) => this.dependencies.emit(event, data),
-      };
+        agentId: effectiveAgentId,
+      });
 
-      // Simulations emit their synthetic events before returning, so the
-      // handle settles immediately with the matching terminal outcome.
-      if (forceContextLimitError) {
-        const streamError = await simulateContextLimitError(
+      const appendResult = await this.dependencies.historyService.appendToHistory(
+        workspaceId,
+        assistantMessage
+      );
+      if (!appendResult.success) {
+        return { type: "finished", result: Err({ type: "unknown", raw: appendResult.error }) };
+      }
+
+      const historySequence = assistantMessage.metadata?.historySequence ?? 0;
+
+      // Handle simulated stream scenarios (OpenAI SDK testing features).
+      // These emit synthetic stream events without calling an AI provider.
+      const forceContextLimitError =
+        modelString.startsWith("openai:") &&
+        effectiveMuxProviderOptions.openai?.forceContextLimitError === true;
+      const simulateToolPolicyNoopFlag =
+        modelString.startsWith("openai:") &&
+        effectiveMuxProviderOptions.openai?.simulateToolPolicyNoop === true;
+
+      if (forceContextLimitError || simulateToolPolicyNoopFlag) {
+        const simulationCtx: SimulationContext = {
+          workspaceId,
+          assistantMessageId,
+          canonicalModelString,
+          routedThroughGateway,
+          ...(routeProvider != null ? { routeProvider } : {}),
+          historySequence,
+          systemMessageTokens,
+          effectiveAgentId,
+          effectiveMode,
+          metadataMode: legacyModeForMetadata,
+          effectiveThinkingLevel,
+          emit: (event, data) => this.dependencies.emit(event, data),
+        };
+
+        // Simulations emit their synthetic events before returning, so the
+        // handle settles immediately with the matching terminal outcome.
+        if (forceContextLimitError) {
+          const streamError = await simulateContextLimitError(
+            simulationCtx,
+            this.dependencies.historyService
+          );
+          return {
+            type: "finished",
+            result: Ok(
+              this.dependencies.createSettledTurnHandle(assistantMessageId, {
+                status: "failed",
+                streamError,
+              })
+            ),
+          };
+        }
+        const streamEnd = await simulateToolPolicyNoop(
           simulationCtx,
+          effectiveToolPolicy,
           this.dependencies.historyService
         );
         return {
           type: "finished",
           result: Ok(
             this.dependencies.createSettledTurnHandle(assistantMessageId, {
-              status: "failed",
-              streamError,
+              status: "completed",
+              streamEnd,
             })
           ),
         };
       }
-      const streamEnd = await simulateToolPolicyNoop(
-        simulationCtx,
-        effectiveToolPolicy,
-        this.dependencies.historyService
-      );
-      return {
-        type: "finished",
-        result: Ok(
-          this.dependencies.createSettledTurnHandle(assistantMessageId, {
-            status: "completed",
-            streamEnd,
-          })
-        ),
-      };
-    }
 
-    let requestHeaders = primaryRequest.headers;
-    const mergedProviderOptions = primaryRequest.providerOptions;
-    const resolvedOverrides = primaryRequest.resolvedOverrides;
-    const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
-    const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
-    const rebuildProviderOptionsForThinkingLevel =
-      primaryRequest.rebuildProviderOptionsForThinkingLevel;
-    // Debug dump: Log the complete LLM request when MUX_DEBUG_LLM_REQUEST is set
-    if (resolveXumEnvironmentValue("DEBUG_LLM_REQUEST", process.env) === "1") {
-      log.info(
-        `[MUX_DEBUG_LLM_REQUEST] Full LLM request:\n${JSON.stringify(
-          {
-            workspaceId,
-            model: modelString,
-            systemMessage,
-            messages: debugViewMessages,
-            tools: Object.fromEntries(
-              Object.entries(tools).map(([n, t]) => [
-                n,
-                { description: t.description, inputSchema: t.inputSchema },
-              ])
-            ),
-            providerOptions: mergedProviderOptions,
-            thinkingLevel: effectiveThinkingLevel,
-            maxOutputTokens,
-            mode: legacyModeForMetadata,
-            agentId: effectiveAgentId,
-            toolPolicy: effectiveToolPolicy,
-          },
-          null,
-          2
-        )}`
-      );
-
-      if (resolvedOverrides.standard && Object.keys(resolvedOverrides.standard).length > 0) {
-        log.debug("Model parameter overrides (standard):", resolvedOverrides.standard);
-      }
-      if (resolvedOverrides.providerExtras) {
-        log.debug("Model parameter overrides (provider extras):", resolvedOverrides.providerExtras);
-      }
-    }
-
-    if (combinedAbortSignal.aborted) {
-      await deleteAbortedPlaceholder(assistantMessageId);
-      return {
-        type: "finished",
-        result: Ok(
-          this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
-        ),
-      };
-    }
-
-    const snapshot: DebugLlmRequestSnapshot = {
-      capturedAt: Date.now(),
-      workspaceId,
-      messageId: assistantMessageId,
-      model: modelString,
-      providerName: canonicalProviderName,
-      thinkingLevel: effectiveThinkingLevel,
-      mode: legacyModeForMetadata,
-      agentId: effectiveAgentId,
-      maxOutputTokens,
-      systemMessage,
-      messages: debugViewMessages,
-    };
-
-    try {
-      this.dependencies.lastLlmRequestByWorkspace.set(workspaceId, structuredClone(snapshot));
-    } catch (error) {
-      const errMsg = getErrorMessage(error);
-      workspaceLog.warn("Failed to capture debug LLM request snapshot", { error: errMsg });
-    }
-    const toolsForStream = primaryRequest.engineTools;
-
-    const devToolsService = this.dependencies.devToolsService;
-    const canQueueDevToolsRunMetadata =
-      devToolsService?.enabled === true &&
-      typeof modelResult.data.model !== "string" &&
-      modelResult.data.model.specificationVersion === "v4";
-
-    if (canQueueDevToolsRunMetadata) {
-      // Correlate pending run metadata with the specific request that reaches
-      // DevTools middleware to avoid cross-request policy leakage. Queue only
-      // when middleware is guaranteed to run (LanguageModelV3).
-      pendingRunMetadataId = String(streamToken);
-      context.startupState.pendingRunMetadataId = pendingRunMetadataId;
-      devToolsService.setPendingRunMetadata(workspaceId, pendingRunMetadataId, {
-        toolPolicy:
-          effectiveToolPolicy != null && effectiveToolPolicy.length > 0
-            ? effectiveToolPolicy
-            : undefined,
-        // Join key for the replay verifier: re-anchors this recorded run to
-        // its turn-envelope row and assistant message (see DevToolsRun).
-        ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
-      });
-      this.dependencies.trackPendingDevToolsRunMetadata(
-        assistantMessageId,
-        workspaceId,
-        pendingRunMetadataId
-      );
-      requestHeaders = {
-        ...requestHeaders,
-        [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
-      };
-    }
-
-    // --- Refusal fallback chain ---
-    // Resolved from app config by the RAW selection (metadata-aware inside):
-    // a cross-typed Coder instance (coder:openai/x, type anthropic) must use
-    // its own gateway-scoped chain, never the direct provider's. Task
-    // children can opt out via taskOnRefusal: "fail" (see
-    // resolveWorkspaceModelFallbackChain).
-    const modelFallbackChain = resolveWorkspaceModelFallbackChain(
-      this.dependencies.config.loadConfigOrDefault(),
-      workspaceId,
-      modelString,
-      this.dependencies.providerService.getConfig()
-    );
-
-    // Lazily rebuilds the per-model slice of this pipeline (model creation,
-    // provider-specific message prep, provider options, headers, parameter
-    // overrides) when StreamManager swaps to a fallback model after a
-    // refusal. Reusing the original request verbatim would leak
-    // provider-specific options/messages across providers.
-    const modelFallback: ModelFallbackOptions | undefined =
-      modelFallbackChain.length > 0
-        ? {
-            chain: modelFallbackChain,
-            prepare: async (nextModelString, prepareOptions) => {
-              const sourceMessages = prepareOptions?.continuation
-                ? replaceOrAppendMessageById(messages, prepareOptions.continuation.assistantMessage)
-                : messages;
-              const requestedThinkingLevel =
-                prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel;
-              const nextSeedResult = await prepareModelSeed({
-                rawModelString: nextModelString,
-                requestedThinkingLevel,
-                minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
-                  this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
-                  nextModelString
-                ),
-                enforceMinimum: true,
-              });
-              if (!nextSeedResult.success) {
-                return Err(formatSendMessageError(nextSeedResult.error).message);
-              }
-
-              let nextRequest: Awaited<ReturnType<typeof prepareModelRequest>>;
-              try {
-                nextRequest = await prepareModelRequest({
-                  seed: nextSeedResult.data,
-                  sourceMessages,
-                  initializeToolSearch: false,
-                  reusePrePolicySystemContext: false,
-                  requestHistorySequence,
-                  partialContinuationMessage: prepareOptions?.continuation?.assistantMessage,
-                  cleanupModelOnError: true,
-                });
-              } catch (error) {
-                if (error instanceof ContextBudgetExceededError) return Err(error.details);
-                throw error;
-              }
-              let nextHeaders = nextRequest.headers;
-              if (pendingRunMetadataId != null) {
-                nextHeaders = {
-                  ...nextHeaders,
-                  [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
-                };
-              }
-
-              return Ok({
-                onStreamConstructed: nextRequest.onStreamConstructed,
-                rebuildFirstStepForThinkingLevel: nextRequest.rebuildFirstStepForThinkingLevel,
-                model: nextRequest.model,
-                modelString: nextModelString,
-                messages: nextRequest.messages,
-                system: nextRequest.engineSystem,
-                tools: nextRequest.engineTools,
-                contextBudgetMemoryWritable: nextRequest.contextBudgetMemoryWritable,
-                contextBudgetLimit: nextRequest.contextBudgetLimit,
-                providerOptions: nextRequest.providerOptions,
-                headers: nextHeaders,
-                callSettingsOverrides: nextRequest.resolvedOverrides.standard,
-                thinkingLevel: nextRequest.effectiveThinkingLevel,
-                forcedFirstStepToolNames: nextRequest.forcedFirstStepToolNames,
-                rebuildProviderOptionsForThinkingLevel:
-                  nextRequest.rebuildProviderOptionsForThinkingLevel,
-                providersConfig: nextRequest.providersConfig,
-                initialMetadataPatch: {
-                  routedThroughGateway: nextRequest.routedThroughGateway,
-                  ...(nextRequest.routeProvider != null
-                    ? { routeProvider: nextRequest.routeProvider }
-                    : {}),
-                  systemMessageTokens: nextRequest.systemMessageTokens,
-                },
-              });
+      let requestHeaders = primaryRequest.headers;
+      const mergedProviderOptions = primaryRequest.providerOptions;
+      const resolvedOverrides = primaryRequest.resolvedOverrides;
+      const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
+      const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
+      const rebuildProviderOptionsForThinkingLevel =
+        primaryRequest.rebuildProviderOptionsForThinkingLevel;
+      // Debug dump: Log the complete LLM request when MUX_DEBUG_LLM_REQUEST is set
+      if (resolveXumEnvironmentValue("DEBUG_LLM_REQUEST", process.env) === "1") {
+        log.info(
+          `[MUX_DEBUG_LLM_REQUEST] Full LLM request:\n${JSON.stringify(
+            {
+              workspaceId,
+              model: modelString,
+              systemMessage,
+              messages: debugViewMessages,
+              tools: Object.fromEntries(
+                Object.entries(tools).map(([n, t]) => [
+                  n,
+                  { description: t.description, inputSchema: t.inputSchema },
+                ])
+              ),
+              providerOptions: mergedProviderOptions,
+              thinkingLevel: effectiveThinkingLevel,
+              maxOutputTokens,
+              mode: legacyModeForMetadata,
+              agentId: effectiveAgentId,
+              toolPolicy: effectiveToolPolicy,
             },
-          }
-        : undefined;
-
-    const forcedFirstStepToolNames = primaryRequest.forcedFirstStepToolNames;
-
-    // Fold PREPARING-window pending thinking overrides into the ACTUAL
-    // request build, not just the envelope: message preparation is
-    // thinking-level-dependent (Anthropic signed-reasoning transforms), so
-    // recording the new level while streaming old-level messages would make
-    // wire and replay diverge — or send an invalid extended-thinking
-    // request. Consuming pending here (applied set below) is safe:
-    // createStreamAtomically seeds streamInfo.thinkingLevel from `applied`,
-    // and prepareStep simply sees no pending to re-apply.
-    // Loop until pending is quiescent: setActiveTurnThinkingLevel can write
-    // a NEW pending while the awaited message rebuild runs, and stamping the
-    // first level after the await would leave step 0 rebuilding only
-    // provider options while the messages stay at the stale level.
-    let streamThinkingLevel = effectiveThinkingLevel;
-    let streamProviderOptions = mergedProviderOptions;
-    let streamFinalMessages = finalMessages;
-    while (activeTurnThinkingOverride?.pending != null) {
-      const pendingPreparingLevel = activeTurnThinkingOverride.pending;
-      activeTurnThinkingOverride.pending = undefined;
-      const folded = computeRebuiltProviderOptions(pendingPreparingLevel, streamThinkingLevel);
-      if (folded == null) {
-        // No-op fold (same effective level / non-foldable variant swap):
-        // re-check pending — a change may have raced the previous rebuild.
-        continue;
-      }
-      try {
-        streamFinalMessages = await primaryRequest.rebuildMessagesForThinkingLevel(
-          folded.effectiveLevel
+            null,
+            2
+          )}`
         );
-      } catch (error) {
-        if (error instanceof ContextBudgetExceededError) {
-          runLanguageModelCleanup(modelResult.data.model);
-          await deleteAbortedPlaceholder(assistantMessageId);
-          return { type: "finished", result: Err(error.details) };
+
+        if (resolvedOverrides.standard && Object.keys(resolvedOverrides.standard).length > 0) {
+          log.debug("Model parameter overrides (standard):", resolvedOverrides.standard);
         }
-        throw error;
+        if (resolvedOverrides.providerExtras) {
+          log.debug(
+            "Model parameter overrides (provider extras):",
+            resolvedOverrides.providerExtras
+          );
+        }
       }
-      streamProviderOptions = folded.providerOptions;
-      streamThinkingLevel = folded.effectiveLevel;
-      activeTurnThinkingOverride.applied = folded.effectiveLevel;
-      // Keep the mid-turn rebuild baseline in sync so a later identical
-      // request is correctly treated as a no-op.
-      currentEffectiveLevelRef.current = folded.effectiveLevel;
-      // Loop re-checks pending: a change during the awaits above re-folds
-      // against the level just applied.
-    }
 
-    const emitPrimaryEnvelope = (): Promise<void> =>
-      primaryRequest.emitEnvelopeWith(streamThinkingLevel, streamProviderOptions);
-    emitStartupBreadcrumb("starting_stream");
-    const turnExecutionOptions: TurnExecutionOptions = {
-      workspaceId,
-      messages: streamFinalMessages,
-      model: modelResult.data.model,
-      modelString,
-      historySequence,
-      system: primaryRequest.engineSystem,
-      runtime,
-      messageId: assistantMessageId,
-      abortSignal: combinedAbortSignal,
-      tools: toolsForStream,
-      contextBudgetMemoryWritable: primaryRequest.contextBudgetMemoryWritable,
-      contextBudgetLimit: primaryRequest.contextBudgetLimit,
-      initialMetadata: {
-        ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
-        systemMessageTokens,
-        timestamp: Date.now(),
-        agentId: effectiveAgentId,
-        ...(legacyModeForMetadata != null ? { mode: legacyModeForMetadata } : {}),
-        routedThroughGateway,
-        ...(routeProvider != null ? { routeProvider } : {}),
-        ...(muxMetadata !== undefined ? { muxMetadata } : {}),
-        ...(acpPromptId != null ? { acpPromptId } : {}),
-      },
-      providerOptions: streamProviderOptions,
-      maxOutputTokens,
-      toolPolicy: effectiveToolPolicy,
-      providedStreamToken: streamToken,
-      hasQueuedMessages,
-      onStepSettled,
-      workspaceName: metadata.name,
-      thinkingLevel: streamThinkingLevel,
-      headers: requestHeaders,
-      callSettingsOverrides: resolvedOverrides.standard,
-      onChunk: advisorToolEligible ? onAdvisorChunk : undefined,
-      onStepMessages: advisorToolEligible
-        ? (stepMessages) => {
-            advisorTranscriptRef.messages = stepMessages;
-            advisorStepCaptureRef.currentStepText = "";
-            advisorStepCaptureRef.currentStepReasoning = "";
-            advisorStepCaptureRef.frozenSnapshotsByToolCallId.clear();
-          }
-        : undefined,
-      providedRuntimeTempDir: runtimeTempDir,
-      modelFallback,
-      toolSearchState: toolSearchRuntime?.state,
-      thinkingOverrideState: activeTurnThinkingOverride,
-      rebuildProviderOptionsForThinkingLevel,
-      forcedFirstStepToolNames,
-      providersConfigSnapshot: requestProvidersConfig,
-      onStreamConstructed: emitPrimaryEnvelope,
-      rebuildFirstStepForThinkingLevel: primaryRequest.rebuildFirstStepForThinkingLevel,
-    };
+      if (combinedAbortSignal.aborted) {
+        await deleteAbortedPlaceholder(assistantMessageId);
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+          ),
+        };
+      }
 
-    const logStartOutcome = (
-      outcome: "started" | "stream_start_failed",
-      errorType?: string
-    ): void => {
-      logSlowStreamStartup({
-        outcome,
+      const snapshot: DebugLlmRequestSnapshot = {
+        capturedAt: Date.now(),
+        workspaceId,
+        messageId: assistantMessageId,
+        model: modelString,
         providerName: canonicalProviderName,
-        routeProvider,
-        agentId: effectiveAgentId,
+        thinkingLevel: effectiveThinkingLevel,
         mode: legacyModeForMetadata,
-        runtimeType: metadata.runtimeConfig.type,
-        ...(errorType != null ? { errorType } : {}),
-        toolCount: Object.keys(toolsForStream).length,
-        mcpToolCount: Object.keys(mcpTools ?? {}).length,
-        mcpFailedServerCount: mcpStats?.failedServerCount ?? 0,
-        providerRequestMessageCount: providerRequestMessages.length,
-        finalMessageCount: finalMessages.length,
-      });
-    };
+        agentId: effectiveAgentId,
+        maxOutputTokens,
+        systemMessage,
+        messages: debugViewMessages,
+      };
 
-    return {
-      type: "ready",
-      turnExecutionOptions,
-      assistantMessageId,
-      deleteAbortedPlaceholder,
-      logStartOutcome,
+      try {
+        this.dependencies.lastLlmRequestByWorkspace.set(workspaceId, structuredClone(snapshot));
+      } catch (error) {
+        const errMsg = getErrorMessage(error);
+        workspaceLog.warn("Failed to capture debug LLM request snapshot", { error: errMsg });
+      }
+      const toolsForStream = primaryRequest.engineTools;
+
+      const devToolsService = this.dependencies.devToolsService;
+      const canQueueDevToolsRunMetadata =
+        devToolsService?.enabled === true &&
+        typeof modelResult.data.model !== "string" &&
+        modelResult.data.model.specificationVersion === "v4";
+
+      if (canQueueDevToolsRunMetadata) {
+        // Correlate pending run metadata with the specific request that reaches
+        // DevTools middleware to avoid cross-request policy leakage. Queue only
+        // when middleware is guaranteed to run (LanguageModelV3).
+        pendingRunMetadataId = String(streamToken);
+        context.startupState.pendingRunMetadataId = pendingRunMetadataId;
+        devToolsService.setPendingRunMetadata(workspaceId, pendingRunMetadataId, {
+          toolPolicy:
+            effectiveToolPolicy != null && effectiveToolPolicy.length > 0
+              ? effectiveToolPolicy
+              : undefined,
+          // Join key for the replay verifier: re-anchors this recorded run to
+          // its turn-envelope row and assistant message (see DevToolsRun).
+          ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
+        });
+        this.dependencies.trackPendingDevToolsRunMetadata(
+          assistantMessageId,
+          workspaceId,
+          pendingRunMetadataId
+        );
+        requestHeaders = {
+          ...requestHeaders,
+          [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
+        };
+      }
+
+      // --- Refusal fallback chain ---
+      // Resolved from app config by the RAW selection (metadata-aware inside):
+      // a cross-typed Coder instance (coder:openai/x, type anthropic) must use
+      // its own gateway-scoped chain, never the direct provider's. Task
+      // children can opt out via taskOnRefusal: "fail" (see
+      // resolveWorkspaceModelFallbackChain).
+      const modelFallbackChain = resolveWorkspaceModelFallbackChain(
+        this.dependencies.config.loadConfigOrDefault(),
+        workspaceId,
+        modelString,
+        this.dependencies.providerService.getConfig()
+      );
+
+      // Lazily rebuilds the per-model slice of this pipeline (model creation,
+      // provider-specific message prep, provider options, headers, parameter
+      // overrides) when StreamManager swaps to a fallback model after a
+      // refusal. Reusing the original request verbatim would leak
+      // provider-specific options/messages across providers.
+      const modelFallback: ModelFallbackOptions | undefined =
+        modelFallbackChain.length > 0
+          ? {
+              chain: modelFallbackChain,
+              prepare: async (nextModelString, prepareOptions) => {
+                const sourceMessages = prepareOptions?.continuation
+                  ? replaceOrAppendMessageById(
+                      messages,
+                      prepareOptions.continuation.assistantMessage
+                    )
+                  : messages;
+                const requestedThinkingLevel =
+                  prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel;
+                const nextSeedResult = await prepareModelSeed({
+                  rawModelString: nextModelString,
+                  requestedThinkingLevel,
+                  minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
+                    this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
+                    nextModelString
+                  ),
+                  enforceMinimum: true,
+                });
+                if (!nextSeedResult.success) {
+                  return Err(formatSendMessageError(nextSeedResult.error).message);
+                }
+
+                let nextRequest: Awaited<ReturnType<typeof prepareModelRequest>>;
+                try {
+                  nextRequest = await prepareModelRequest({
+                    seed: nextSeedResult.data,
+                    sourceMessages,
+                    initializeToolSearch: false,
+                    reusePrePolicySystemContext: false,
+                    requestHistorySequence: () => requestHistorySequence,
+                    partialContinuationMessage: prepareOptions?.continuation?.assistantMessage,
+                    cleanupModelOnError: true,
+                  });
+                } catch (error) {
+                  if (error instanceof ContextBudgetExceededError) return Err(error.details);
+                  throw error;
+                }
+                let nextHeaders = nextRequest.headers;
+                if (pendingRunMetadataId != null) {
+                  nextHeaders = {
+                    ...nextHeaders,
+                    [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
+                  };
+                }
+
+                return Ok({
+                  onStreamConstructed: nextRequest.onStreamConstructed,
+                  rebuildFirstStepForThinkingLevel: nextRequest.rebuildFirstStepForThinkingLevel,
+                  model: nextRequest.model,
+                  modelString: nextModelString,
+                  messages: nextRequest.messages,
+                  system: nextRequest.engineSystem,
+                  tools: nextRequest.engineTools,
+                  contextBudgetMemoryWritable: nextRequest.contextBudgetMemoryWritable,
+                  contextBudgetLimit: nextRequest.contextBudgetLimit,
+                  providerOptions: nextRequest.providerOptions,
+                  headers: nextHeaders,
+                  callSettingsOverrides: nextRequest.resolvedOverrides.standard,
+                  thinkingLevel: nextRequest.effectiveThinkingLevel,
+                  forcedFirstStepToolNames: nextRequest.forcedFirstStepToolNames,
+                  rebuildProviderOptionsForThinkingLevel:
+                    nextRequest.rebuildProviderOptionsForThinkingLevel,
+                  providersConfig: nextRequest.providersConfig,
+                  initialMetadataPatch: {
+                    routedThroughGateway: nextRequest.routedThroughGateway,
+                    ...(nextRequest.routeProvider != null
+                      ? { routeProvider: nextRequest.routeProvider }
+                      : {}),
+                    systemMessageTokens: nextRequest.systemMessageTokens,
+                  },
+                });
+              },
+            }
+          : undefined;
+
+      const forcedFirstStepToolNames = primaryRequest.forcedFirstStepToolNames;
+
+      // Fold PREPARING-window pending thinking overrides into the ACTUAL
+      // request build, not just the envelope: message preparation is
+      // thinking-level-dependent (Anthropic signed-reasoning transforms), so
+      // recording the new level while streaming old-level messages would make
+      // wire and replay diverge — or send an invalid extended-thinking
+      // request. Consuming pending here (applied set below) is safe:
+      // createStreamAtomically seeds streamInfo.thinkingLevel from `applied`,
+      // and prepareStep simply sees no pending to re-apply.
+      // Loop until pending is quiescent: setActiveTurnThinkingLevel can write
+      // a NEW pending while the awaited message rebuild runs, and stamping the
+      // first level after the await would leave step 0 rebuilding only
+      // provider options while the messages stay at the stale level.
+      let streamThinkingLevel = effectiveThinkingLevel;
+      let streamProviderOptions = mergedProviderOptions;
+      let streamFinalMessages = finalMessages;
+      while (activeTurnThinkingOverride?.pending != null) {
+        const pendingPreparingLevel = activeTurnThinkingOverride.pending;
+        activeTurnThinkingOverride.pending = undefined;
+        const folded = computeRebuiltProviderOptions(pendingPreparingLevel, streamThinkingLevel);
+        if (folded == null) {
+          // No-op fold (same effective level / non-foldable variant swap):
+          // re-check pending — a change may have raced the previous rebuild.
+          continue;
+        }
+        try {
+          streamFinalMessages = await primaryRequest.rebuildMessagesForThinkingLevel(
+            folded.effectiveLevel
+          );
+        } catch (error) {
+          if (error instanceof ContextBudgetExceededError) {
+            runLanguageModelCleanup(modelResult.data.model);
+            await deleteAbortedPlaceholder(assistantMessageId);
+            return { type: "finished", result: Err(error.details) };
+          }
+          throw error;
+        }
+        streamProviderOptions = folded.providerOptions;
+        streamThinkingLevel = folded.effectiveLevel;
+        activeTurnThinkingOverride.applied = folded.effectiveLevel;
+        // Keep the mid-turn rebuild baseline in sync so a later identical
+        // request is correctly treated as a no-op.
+        currentEffectiveLevelRef.current = folded.effectiveLevel;
+        // Loop re-checks pending: a change during the awaits above re-folds
+        // against the level just applied.
+      }
+
+      const emitPrimaryEnvelope = (): Promise<void> =>
+        primaryRequest.emitEnvelopeWith(streamThinkingLevel, streamProviderOptions);
+      emitStartupBreadcrumb("starting_stream");
+      const turnExecutionOptions: TurnExecutionOptions = {
+        workspaceId,
+        messages: streamFinalMessages,
+        model: modelResult.data.model,
+        modelString,
+        historySequence,
+        system: primaryRequest.engineSystem,
+        runtime,
+        messageId: assistantMessageId,
+        abortSignal: combinedAbortSignal,
+        tools: toolsForStream,
+        contextBudgetMemoryWritable: primaryRequest.contextBudgetMemoryWritable,
+        contextBudgetLimit: primaryRequest.contextBudgetLimit,
+        initialMetadata: {
+          ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
+          systemMessageTokens,
+          timestamp: Date.now(),
+          agentId: effectiveAgentId,
+          ...(legacyModeForMetadata != null ? { mode: legacyModeForMetadata } : {}),
+          routedThroughGateway,
+          ...(routeProvider != null ? { routeProvider } : {}),
+          ...(muxMetadata !== undefined ? { muxMetadata } : {}),
+          ...(acpPromptId != null ? { acpPromptId } : {}),
+        },
+        providerOptions: streamProviderOptions,
+        maxOutputTokens,
+        toolPolicy: effectiveToolPolicy,
+        providedStreamToken: streamToken,
+        hasQueuedMessages,
+        onStepSettled,
+        workspaceName: metadata.name,
+        thinkingLevel: streamThinkingLevel,
+        headers: requestHeaders,
+        callSettingsOverrides: resolvedOverrides.standard,
+        onChunk: advisorToolEligible ? onAdvisorChunk : undefined,
+        onStepMessages: advisorToolEligible
+          ? (stepMessages) => {
+              advisorTranscriptRef.messages = stepMessages;
+              advisorStepCaptureRef.currentStepText = "";
+              advisorStepCaptureRef.currentStepReasoning = "";
+              advisorStepCaptureRef.frozenSnapshotsByToolCallId.clear();
+            }
+          : undefined,
+        providedRuntimeTempDir: runtimeTempDir,
+        modelFallback,
+        toolSearchState: toolSearchRuntime?.state,
+        thinkingOverrideState: activeTurnThinkingOverride,
+        rebuildProviderOptionsForThinkingLevel,
+        forcedFirstStepToolNames,
+        providersConfigSnapshot: requestProvidersConfig,
+        onStreamConstructed: emitPrimaryEnvelope,
+        rebuildFirstStepForThinkingLevel: primaryRequest.rebuildFirstStepForThinkingLevel,
+      };
+
+      const logStartOutcome = (
+        outcome: "started" | "stream_start_failed",
+        errorType?: string
+      ): void => {
+        logSlowStreamStartup({
+          outcome,
+          providerName: canonicalProviderName,
+          routeProvider,
+          agentId: effectiveAgentId,
+          mode: legacyModeForMetadata,
+          runtimeType: metadata.runtimeConfig.type,
+          ...(errorType != null ? { errorType } : {}),
+          toolCount: Object.keys(toolsForStream).length,
+          mcpToolCount: Object.keys(mcpTools ?? {}).length,
+          mcpFailedServerCount: mcpStats?.failedServerCount ?? 0,
+          providerRequestMessageCount: providerRequestMessages.length,
+          finalMessageCount: finalMessages.length,
+        });
+      };
+
+      transferred = true;
+      return {
+        type: "ready",
+        turnExecutionOptions,
+        assistantMessageId,
+        deleteAbortedPlaceholder,
+        logStartOutcome,
+      };
     };
+    retained = true;
+    return { type: "prepared", request: { start, [Symbol.asyncDispose]: dispose } };
   }
 }

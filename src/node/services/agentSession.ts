@@ -1,3 +1,5 @@
+import type { GoalRecordV1 } from "@/common/types/goal";
+import type { PreparedStreamMessage } from "./turnRequestBuilder";
 import { estimateFreshRequestTokensForModel } from "./contextBudgetCounting";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
@@ -286,6 +288,32 @@ interface CompactionRequestMetadata {
 }
 
 type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
+
+// Wake continuations must retain their delegated turn correlation through candidate preparation.
+function resolveStreamMuxMetadata(
+  options: MuxMessageMetadata | undefined,
+  retry: MuxMessageMetadata | undefined,
+  messages: MuxMessage[]
+): ReturnType<typeof inheritOpenWorkspaceTurnMetadata> {
+  return options?.type === "workspace-turn-task"
+    ? options
+    : retry?.type === "workspace-turn-task"
+      ? retry
+      : retry?.type === "bash-monitor-wake"
+        ? inheritOpenWorkspaceTurnMetadata(messages)
+        : undefined;
+}
+
+function manualSendPreservesGoalActivation(
+  goal: Pick<GoalRecordV1, "lastUserActivationAtMs"> | null,
+  enqueuedAtMs?: number
+): boolean {
+  return (
+    enqueuedAtMs != null &&
+    goal?.lastUserActivationAtMs != null &&
+    goal.lastUserActivationAtMs > enqueuedAtMs
+  );
+}
 
 interface AutoRetryResumeRequest {
   // Same-session auto-retry must preserve the full normalized request because
@@ -625,6 +653,9 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   on(event: string, listener: (...args: unknown[]) => void): void;
   off(event: string, listener: (...args: unknown[]) => void): void;
   streamMessage(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;
+  prepareStreamMessage?(
+    options: StreamMessageOptions
+  ): Promise<Result<PreparedStreamMessage, SendMessageError>>;
   stopStream?(
     workspaceId: string,
     options?: {
@@ -791,6 +822,7 @@ interface SendMessageInternalOptions {
 // Enqueueing creates no preparation attempt. Once dispatched, Promise success alone cannot
 // distinguish cancellation, a background transfer, and delivery to terminal policy.
 interface PreparationAttempt {
+  preparedRequest?: PreparedStreamMessage;
   owner?: TurnId;
   expectedTurn: TurnId;
   editReservation?: ReturnType<TurnCoordinator["reserve"]>;
@@ -970,7 +1002,7 @@ export class AgentSession {
    * the memory tool; compaction clears the map so repeated turns keep
    * prompt-cache-stable bytes without preserving stale files forever.
    */
-  private readonly memoryContextByModelString = new Map<string, CachedMemoryContext>();
+  private memoryContextByModelString = new Map<string, CachedMemoryContext>();
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
    * when post-compaction context is disabled.
@@ -2070,11 +2102,7 @@ export class AgentSession {
     // Strict ordering (Codex P2 PRRT_kwDOPxxmWM6cS8Bu): millisecond timestamps
     // cannot order same-millisecond events, so equality cannot prove the
     // message was already pending at activation — it fails closed to pause.
-    if (
-      input.enqueuedAtMs != null &&
-      goal?.lastUserActivationAtMs != null &&
-      goal.lastUserActivationAtMs > input.enqueuedAtMs
-    ) {
+    if (manualSendPreservesGoalActivation(goal, input.enqueuedAtMs)) {
       if (suspendedCandidate != null) {
         // The restore re-verifies goal identity + active status under the
         // goal file lock (Codex P2 PRRT_kwDOPxxmWM6cErQ7): a pause landing
@@ -3262,6 +3290,8 @@ export class AgentSession {
         // Failed admission may be idle. The resource follows a background transfer and
         // releases only after correlated cleanup or a valid handoff to terminal policy.
         this.releasePreparationEdit(attempt);
+        if (attempt.outcome !== "background")
+          await attempt.preparedRequest?.[Symbol.asyncDispose]();
         if (
           attempt.outcome !== "background" &&
           attempt.outcome !== "delivered" &&
@@ -4186,6 +4216,30 @@ export class AgentSession {
         };
       }
       const batch = [...contextBudgetPrefix, ...requestPrelude, userMessage];
+      if (contextRollover) {
+        assert(requestAssemblySnapshot != null, "Rollover must pin request assembly");
+        const generation = this.contextBudgetGeneration;
+        const candidate = await this.prepareRolloverRequest(
+          batch,
+          optionsForStream.model,
+          optionsForStream,
+          requestAssemblySnapshot,
+          agentInitiated,
+          cancelSignal,
+          manualGoalInterventionPolicy != null
+            ? { enqueuedAtMs: internal?.enqueuedAtMs }
+            : undefined
+        );
+        if (candidate.success) attempt.preparedRequest = candidate.data;
+        if (await cancelBeforeAcceptance()) return Ok(undefined);
+        if (
+          isAdmissionStale() ||
+          this.coordinator.closing ||
+          generation !== this.contextBudgetGeneration
+        )
+          return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+        if (!candidate.success) return await rejectBudgetSend(candidate.error);
+      }
       try {
         if (contextRollover) {
           if (await cancelBeforeAcceptance()) return Ok(undefined);
@@ -4546,6 +4600,7 @@ export class AgentSession {
       // completion outcome so a resolved foreground Ok cannot finish a still-starting turn.
       attempt.outcome = "background";
       const backgroundAttempt: PreparationAttempt = { ...attempt, outcome: "preparing" };
+      attempt.preparedRequest = undefined;
       // Handoff callbacks may already have preempted back to idle. Transfer the edit
       // exclusion too, so only the child's settled startup can release queued work.
       attempt.editReservation = undefined;
@@ -4938,7 +4993,12 @@ export class AgentSession {
   private async rolloverAfterBudgetFailure(
     model: string,
     estimate?: number
-  ): Promise<Result<RequestAssemblySnapshot | undefined, SendMessageError>> {
+  ): Promise<
+    Result<
+      { snapshot: RequestAssemblySnapshot; request: PreparedStreamMessage } | undefined,
+      SendMessageError
+    >
+  > {
     const turn = this.coordinator.turnId;
     const operation = this.coordinator.operationId;
     const userMessageId = this.activeStreamUserMessageId;
@@ -5100,6 +5160,29 @@ export class AgentSession {
       )
         return Ok(undefined);
       if (!freshBudget.success) return freshBudget;
+      const rows = [...retryPrelude, continuation];
+      const candidate = await this.prepareRolloverRequest(
+        rows,
+        model,
+        context.options,
+        captured.data,
+        context.agentInitiated
+      );
+      if (!candidate.success) return candidate;
+      let transferred = false;
+      await using _candidateOwner = {
+        [Symbol.asyncDispose]: async () => {
+          if (!transferred) await candidate.data[Symbol.asyncDispose]();
+        },
+      };
+      if (
+        !this.coordinator.isCurrentTurn(turn) ||
+        !this.coordinator.isCurrentOperation(operation) ||
+        this.coordinator.closing ||
+        this.coordinator.admissionBlocked ||
+        this.contextBudgetGeneration !== generation
+      )
+        return Ok(undefined);
       await this.applyContextResetSideEffects();
       if (
         !this.coordinator.isCurrentTurn(turn) ||
@@ -5111,7 +5194,6 @@ export class AgentSession {
         this.coordinator.closing
       )
         return Ok(undefined);
-      const rows = [...retryPrelude, continuation];
       const appended = await this.historyService.appendManyToHistory(this.workspaceId, rows);
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return Ok(undefined);
@@ -5122,10 +5204,113 @@ export class AgentSession {
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return Ok(undefined);
       for (const row of rows) this.emitChatEvent({ ...row, type: "message" });
-      return Ok(captured.data);
+      transferred = true;
+      return Ok({ snapshot: captured.data, request: candidate.data });
     } catch (error) {
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
+  }
+
+  private async prepareRolloverRequest(
+    messages: MuxMessage[],
+    modelString: string,
+    options: SendMessageOptions | undefined,
+    snapshot: RequestAssemblySnapshot,
+    agentInitiated?: boolean,
+    signal?: AbortSignal,
+    manualIntervention?: { enqueuedAtMs?: number }
+  ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
+    if (!this.aiService.prepareStreamMessage)
+      return Err({
+        type: "context_budget_blocked",
+        message: "Full request preparation is unavailable; use /compact or restart.",
+      });
+    const cache = new Map<string, CachedMemoryContext>();
+    // Admission must not pause the goal yet, but the pinned tools must match the later manual pause.
+    let prospectiveGoalStatusForToolAvailability: StreamMessageOptions["prospectiveGoalStatusForToolAvailability"];
+    if (manualIntervention && this.workspaceGoalService) {
+      const goal = await this.workspaceGoalService.getGoal(this.workspaceId);
+      prospectiveGoalStatusForToolAvailability =
+        goal?.status === "active" &&
+        !manualSendPreservesGoalActivation(goal, manualIntervention.enqueuedAtMs)
+          ? "paused"
+          : (goal?.status ?? null);
+    }
+
+    const providersConfig = this.getProvidersConfigSafe();
+    const minThinkingLevel = resolveMinimumThinkingLevel(
+      modelString,
+      lookupMinThinkingLevelOverride(
+        this.config.loadConfigOrDefault().minThinkingLevelByModel,
+        modelString
+      ),
+      providersConfig
+    );
+    const optionsMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
+    const prepared = await this.aiService.prepareStreamMessage({
+      workspaceId: this.workspaceId,
+      messages,
+      modelString,
+      abortSignal: signal ? AbortSignal.any([this.closingSignal, signal]) : this.closingSignal,
+      thinkingLevel: options?.thinkingLevel
+        ? enforceThinkingPolicy(
+            modelString,
+            options.thinkingLevel,
+            minThinkingLevel,
+            providersConfig
+          )
+        : undefined,
+      minThinkingLevel,
+      reasoningMode: options?.reasoningMode,
+      toolPolicy: options?.toolPolicy,
+      additionalSystemContext: options?.additionalSystemContext,
+      additionalSystemInstructions: options?.additionalSystemInstructions,
+      maxOutputTokens: options?.maxOutputTokens,
+      muxProviderOptions: options?.providerOptions,
+      agentInitiated,
+      agentId: options?.agentId,
+      acpPromptId:
+        normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(optionsMuxMetadata),
+      delegatedToolNames:
+        normalizeDelegatedToolNames(options?.delegatedToolNames) ??
+        extractAcpDelegatedTools(optionsMuxMetadata),
+      muxMetadata: resolveStreamMuxMetadata(
+        optionsMuxMetadata,
+        this.findLastRetryUserMessage(messages)?.metadata?.muxMetadata,
+        messages
+      ),
+      recordFileState: this.fileChangeTracker.record.bind(this.fileChangeTracker),
+      postCompactionAttachments: null,
+      resolveMemoryContext: (model, memoryOptions) =>
+        this.resolveMemoryContext(
+          model,
+          { ...memoryOptions, tokenBudgetActive: this.isTokenBudgetActive(options) },
+          cache
+        ),
+      workspaceGoalService: this.workspaceGoalService,
+      prospectiveGoalStatusForToolAvailability,
+      allowAgentSetGoal: options?.allowAgentSetGoal === true,
+      experiments: options?.experiments,
+      disableWorkspaceAgents: options?.disableWorkspaceAgents,
+      strictAgentResolution: options?.strictAgentResolution,
+      hasQueuedMessages: this.hasQueuedMessages.bind(this),
+      onStepSettled: (step) => this.onContextBudgetStepSettled(step),
+      requestAssemblySnapshot: snapshot,
+    });
+    if (!prepared.success)
+      return prepared.error.type === "context_budget_exceeded"
+        ? Err({
+            type: "context_budget_blocked",
+            message: `The complete request does not fit in a fresh context window for ${prepared.error.model}. Shorten system instructions or tool schemas, or choose a larger model.`,
+          })
+        : prepared;
+    return Ok({
+      start: (startOptions) => {
+        this.memoryContextByModelString = cache;
+        return prepared.data.start(startOptions);
+      },
+      [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
+    });
   }
 
   private async checkFreshContextBudget(
@@ -6329,8 +6514,10 @@ export class AgentSession {
     activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
     preparation?: PreparationAttempt,
     contextBudgetRetried = false,
-    requestAssemblySnapshot?: RequestAssemblySnapshot
+    requestAssemblySnapshot?: RequestAssemblySnapshot,
+    admittedRequest?: PreparedStreamMessage
   ): Promise<AgentSessionResult<void>> {
+    const preparedRequest = admittedRequest ?? preparation?.preparedRequest;
     const fail = (
       error: SendMessageError,
       acpPromptId?: string,
@@ -6407,7 +6594,10 @@ export class AgentSession {
       // AFTER the notification row is durably appended. A retry after a startup
       // abort or append failure therefore re-detects the same change (nothing is
       // dropped), while a successful append cannot produce a duplicate row.
-      const fileChangeDetection = await this.fileChangeTracker.getChangedAttachments();
+      // Fresh candidates already fix the admitted rows; detect later edits on the next request.
+      const fileChangeDetection = preparedRequest
+        ? { attachments: [], commit: () => undefined }
+        : await this.fileChangeTracker.getChangedAttachments();
       if (isStreamStartAborted()) {
         return Ok(undefined);
       }
@@ -6505,7 +6695,7 @@ export class AgentSession {
 
       // Check if post-compaction attachments should be injected.
       const postCompactionAttachments =
-        disablePostCompactionAttachments === true
+        disablePostCompactionAttachments === true || preparedRequest != null
           ? null
           : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
       if (isStreamStartAborted()) {
@@ -6554,18 +6744,11 @@ export class AgentSession {
       const recordFileState = this.fileChangeTracker.record.bind(this.fileChangeTracker);
 
       const optionsMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
-      const retryMuxMetadata = lastUserMessage?.metadata?.muxMetadata;
-      // Bash-monitor-wake continuations inherit the correlation of a delegated
-      // workspace turn that was cut mid-work by the wake's queued dispatch, so
-      // the turn's eventual terminal stream-end can settle the parent's handle.
-      const streamMuxMetadata =
-        optionsMuxMetadata?.type === "workspace-turn-task"
-          ? optionsMuxMetadata
-          : retryMuxMetadata?.type === "workspace-turn-task"
-            ? retryMuxMetadata
-            : retryMuxMetadata?.type === "bash-monitor-wake"
-              ? inheritOpenWorkspaceTurnMetadata(requestMessages)
-              : undefined;
+      const streamMuxMetadata = resolveStreamMuxMetadata(
+        optionsMuxMetadata,
+        lastUserMessage?.metadata?.muxMetadata,
+        requestMessages
+      );
       // Mid-stream compaction runs after the original send options have already been resolved against
       // history (notably bash-monitor wakes). Persist the actual correlation used by this stream so the
       // post-compaction continuation remains the same delegated workspace turn.
@@ -6583,7 +6766,10 @@ export class AgentSession {
       // collect them so the Err path resolves each exactly once.
       const preStartErrors: StreamErrorPayload[] = [];
       this.coordinator.configureOperation(operation, this.activeCompactionRequest != null);
-      const streamResult = await this.aiService.streamMessage({
+      const startRequest = preparedRequest
+        ? preparedRequest.start.bind(preparedRequest)
+        : this.aiService.streamMessage.bind(this.aiService);
+      const streamResult = await startRequest({
         messages: requestMessages,
         workspaceId: this.workspaceId,
         modelString,
@@ -6649,6 +6835,7 @@ export class AgentSession {
             streamResult.error.model,
             streamResult.error.estimate
           );
+          await using _rolloverRequest = rolled.success ? rolled.data?.request : undefined;
           if (
             !this.coordinator.isCurrentTurn(turn) ||
             !this.coordinator.isCurrentOperation(operation)
@@ -6672,7 +6859,8 @@ export class AgentSession {
               activeTurnThinkingOverride,
               preparation,
               true,
-              rolled.data
+              rolled.data.snapshot,
+              rolled.data.request
             );
           }
           // This row passed send-time admission but never fit the final request.
@@ -7286,6 +7474,7 @@ export class AgentSession {
         model,
         data.contextBudgetExceeded?.estimate
       );
+      await using _rolloverRequest = rolled.success ? rolled.data?.request : undefined;
       if (
         !this.coordinator.isCurrentTurn(turn) ||
         !this.coordinator.isCurrentOperation(operation)
@@ -7330,7 +7519,8 @@ export class AgentSession {
             undefined,
             undefined,
             true,
-            rolled.data
+            rolled.data.snapshot,
+            rolled.data.request
           );
         } finally {
           if (this.coordinator.isCurrentTurn(preparedTurn)) {
@@ -9361,7 +9551,8 @@ export class AgentSession {
    */
   private async resolveMemoryContext(
     modelString: string,
-    options?: { includeHotMemories?: boolean; tokenBudgetActive?: boolean }
+    options?: { includeHotMemories?: boolean; tokenBudgetActive?: boolean },
+    cache = this.memoryContextByModelString
   ): Promise<MemorySessionContext | undefined> {
     assert(modelString.length > 0, "resolveMemoryContext requires a model string");
     const includeHotMemories = options?.includeHotMemories !== false;
@@ -9371,7 +9562,7 @@ export class AgentSession {
       this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
-    const cached = this.memoryContextByModelString.get(modelString);
+    const cached = cache.get(modelString);
     // Policy changes must not retain a previously injected extra (including index-only lookups).
     if (
       cached?.tokenBudgetActive === tokenBudgetActive &&
@@ -9390,7 +9581,7 @@ export class AgentSession {
             tokenBudgetActive,
           })
         : null;
-    this.memoryContextByModelString.set(modelString, {
+    cache.set(modelString, {
       context,
       includesHotMemories: includeHotMemories,
       tokenBudgetActive,

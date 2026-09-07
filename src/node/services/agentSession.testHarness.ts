@@ -129,6 +129,15 @@ function createMockAiService(args: {
     ),
     getProvidersConfig: mock(() => null),
     isExperimentEnabled: mock((_experimentId) => false),
+    prepareStreamMessage: mock(() =>
+      Promise.resolve(
+        Ok({
+          start: (options: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
+            aiService.streamMessage(options),
+          [Symbol.asyncDispose]: () => Promise.resolve(),
+        })
+      )
+    ),
     captureRequestAssemblySnapshot: mock((workspaceId: string) =>
       Promise.resolve(Ok(eventSpine.captureRequestAssembly(workspaceId)))
     ),
