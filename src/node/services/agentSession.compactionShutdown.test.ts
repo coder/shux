@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import { COMPACTION_CANCELLATION_FILE } from "@/common/constants/compactionCancellation";
+import type { CompactionMonitor } from "./compactionMonitor";
 import type { ContinuousCompactor } from "./continuousCompactor";
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
@@ -1124,6 +1125,159 @@ test.each(["goal admission", "preparation", "row persistence"] as const)(
     } finally {
       release.resolve();
       await pending.catch(() => undefined);
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(["summary read", "preparation", "auto compaction preparation"] as const)(
+  "a foreign repair during %s prevents the captured follow-up from committing",
+  async (stage) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(workspaceId, summary());
+    if (stage === "auto compaction preparation") {
+      const monitor = (h.session as unknown as { compactionMonitor: CompactionMonitor })
+        .compactionMonitor;
+      spyOn(monitor, "getThreshold").mockReturnValue(0.85);
+      spyOn(monitor, "checkBeforeSend").mockReturnValue({
+        shouldShowWarning: true,
+        shouldForceCompact: true,
+        usagePercentage: 99,
+        thresholdPercentage: 85,
+      });
+    }
+    const foreignHistory = new HistoryService(h.config);
+    const foreign = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: foreignHistory,
+    });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    if (stage === "summary read") {
+      const read = h.historyService.getLastMessages.bind(h.historyService);
+      spyOn(h.historyService, "getLastMessages").mockImplementationOnce(async (...args) => {
+        const result = await read(...args);
+        entered.resolve();
+        await release.promise;
+        return result;
+      });
+    } else {
+      const pricing = h.goalService.assertPricedModelForBudgetedGoal.bind(h.goalService);
+      spyOn(h.goalService, "assertPricedModelForBudgetedGoal").mockImplementationOnce(
+        async (...args) => {
+          const result = await pricing(...args);
+          entered.resolve();
+          await release.promise;
+          return result;
+        }
+      );
+    }
+    const stream = spyOn(h.aiService, "streamMessage");
+    const foreignStream = spyOn(foreign.aiService, "streamMessage");
+    const pending = h.internals.dispatchPendingFollowUp();
+    try {
+      await entered.promise;
+      await writeFile(
+        `${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`,
+        "{"
+      );
+      await foreign.session.runStartupRecovery();
+      expect(await foreignHistory.readCompactionCancellation(workspaceId)).toBeNull();
+      expect(foreignStream).not.toHaveBeenCalled();
+      release.resolve();
+      expect(await pending).toBe(false);
+      expect(stream).not.toHaveBeenCalled();
+      const rows = await foreignHistory.getHistoryFromLatestBoundary(workspaceId);
+      expect(rows.success && rows.data.some((row) => row.role === "user")).toBe(false);
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      await foreign.session.dispose();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(["clean", "cleanup failure", "guard I/O failure"] as const)(
+  "a skipped follow-up never accepts preparation snapshots (%s)",
+  async (failureMode) => {
+    const cleanupFails = failureMode === "cleanup failure";
+    const h = await setup();
+    await h.historyService.appendToHistory(workspaceId, summary());
+    const ownSnapshot = createMuxMessage("own-preparation", "assistant", "Snapshot", {
+      synthetic: true,
+    });
+    const materializer = h.session as unknown as {
+      materializeFileAtMentionsSnapshot(text: string): Promise<{
+        snapshotMessage: ReturnType<typeof createMuxMessage>;
+        materializedTokens: string[];
+      } | null>;
+    };
+    spyOn(materializer, "materializeFileAtMentionsSnapshot").mockResolvedValue({
+      snapshotMessage: ownSnapshot,
+      materializedTokens: [],
+    });
+    const foreignHistory = new HistoryService(h.config);
+    const foreign = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: foreignHistory,
+    });
+    const append = h.historyService.appendToHistory.bind(h.historyService);
+    spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
+      const result = await append(...args);
+      if (failureMode === "guard I/O failure") {
+        spyOn(h.historyService, "readCompactionCancellation").mockRejectedValueOnce(
+          new Error("guard storage unavailable")
+        );
+      } else {
+        await writeFile(
+          `${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`,
+          "{"
+        );
+        await foreign.session.runStartupRecovery();
+      }
+      return result;
+    });
+    if (cleanupFails)
+      spyOn(h.historyService, "deleteMessages").mockResolvedValueOnce(
+        Err("snapshot cleanup unavailable")
+      );
+    let durableReceipts = 0;
+    const send = h.session.sendMessage.bind(h.session);
+    spyOn(h.session, "sendMessage").mockImplementation((message, sendOptions, internal) =>
+      send(message, sendOptions, {
+        ...internal,
+        onRowsDurable: () => {
+          durableReceipts++;
+          internal?.onRowsDurable?.();
+        },
+      })
+    );
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      const result = await h.internals.dispatchPendingFollowUp().catch((error: unknown) => error);
+      if (failureMode === "guard I/O failure")
+        expect(result).toHaveProperty(
+          "message",
+          "Failed to append history: guard storage unavailable"
+        );
+      else if (cleanupFails)
+        expect(result).toHaveProperty(
+          "message",
+          "Failed to roll back preparation rows after compaction follow-up became stale"
+        );
+      else expect(result).toBe(false);
+      expect(durableReceipts).toBe(0);
+      expect(stream).not.toHaveBeenCalled();
+      const rows = await foreignHistory.getHistoryFromLatestBoundary(workspaceId);
+      expect(rows.success && rows.data.some((row) => row.role === "user")).toBe(false);
+      expect(rows.success && rows.data.some((row) => row.id === ownSnapshot.id)).toBe(cleanupFails);
+    } finally {
+      await foreign.session.dispose();
       await h.session.dispose();
       await h.cleanup();
     }

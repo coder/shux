@@ -340,3 +340,109 @@ test("a local Stop during corrupt repair prevents its obsolete history commit", 
     await h.cleanup();
   }
 });
+
+test.each([
+  "unchanged",
+  "summary text",
+  "pending payload",
+  "summary ID",
+  "summary sequence",
+  "foreign synthetic tail",
+  "preserved tail",
+  "own snapshot",
+  "unresolved Stop",
+  "exact Stop",
+  "other exact Stop",
+  "malformed cancellation",
+] as const)("locked follow-up append revalidates %s", async (change) => {
+  const h = await createTestHistoryService();
+  const workspaceId = "locked-follow-up";
+  const source = createMuxMessage("summary", "assistant", "Earlier work", {
+    muxMetadata: {
+      type: "compaction-summary",
+      pendingFollowUp: { text: "Continue", model: "openai:gpt-4o", agentId: "exec" },
+    },
+  });
+  await h.historyService.appendToHistory(workspaceId, source);
+  const captured = structuredClone(source);
+  const foreign = new HistoryService(h.config);
+  const allowedTailMessageIds: string[] = [];
+  if (change === "summary text") {
+    await foreign.updateHistory(workspaceId, {
+      ...source,
+      parts: [{ type: "text", text: "Refined work" }],
+    });
+  } else if (change === "pending payload") {
+    await foreign.updateHistory(workspaceId, {
+      ...source,
+      metadata: {
+        ...source.metadata,
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: { text: "Different request", model: "openai:gpt-4o", agentId: "exec" },
+        },
+      },
+    });
+  } else if (change === "summary ID") {
+    await foreign.updateHistory(workspaceId, { ...source, id: "replacement" });
+  } else if (change === "summary sequence") {
+    await foreign.clearHistory(workspaceId);
+    await foreign.appendToHistory(workspaceId, createMuxMessage("earlier", "user", "Earlier"));
+    await foreign.appendToHistory(workspaceId, {
+      ...source,
+      metadata: { ...source.metadata, historySequence: undefined },
+    });
+  } else if (
+    change === "foreign synthetic tail" ||
+    change === "preserved tail" ||
+    change === "own snapshot"
+  ) {
+    const tail = createMuxMessage("tail", "assistant", "Tail", {
+      synthetic: true,
+      ...(change === "preserved tail" ? { rlmPreservedTailCopy: true } : {}),
+    });
+    await foreign.appendToHistory(workspaceId, tail);
+    if (change === "own snapshot") allowedTailMessageIds.push(tail.id);
+  } else if (
+    change === "unresolved Stop" ||
+    change === "exact Stop" ||
+    change === "other exact Stop"
+  ) {
+    const cancellation = new CompactionCancellation(foreign, workspaceId);
+    await cancellation.cancel();
+    const record = await cancellation.read();
+    if (!record) throw new Error("Expected cancellation");
+    if (change !== "unresolved Stop")
+      await cancellation.narrow(
+        record.nonce,
+        change === "exact Stop" ? source : { ...source, id: "other-summary" }
+      );
+  } else if (change === "malformed cancellation") {
+    await writeFile(`${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`, "{");
+  }
+  const skipped = mock(() => undefined);
+  const candidate = createMuxMessage("follow-up", "user", "Continue", { synthetic: true });
+  const allowed = [
+    "unchanged",
+    "summary text",
+    "preserved tail",
+    "own snapshot",
+    "other exact Stop",
+  ].includes(change);
+  try {
+    const result = await h.historyService.appendToHistory(workspaceId, candidate, {
+      summary: captured,
+      allowedTailMessageIds,
+      isCurrent: () => true,
+      onSkipped: skipped,
+    });
+    expect(result.success).toBe(change !== "malformed cancellation");
+    expect(skipped).toHaveBeenCalledTimes(allowed || change === "malformed cancellation" ? 0 : 1);
+    const rows = await foreign.getHistoryFromLatestBoundary(workspaceId);
+    expect(rows.success && rows.data.some((row) => row.id === candidate.id)).toBe(allowed);
+    if (change === "summary text")
+      expect(rows.success && rows.data[0].parts).toEqual([{ type: "text", text: "Refined work" }]);
+  } finally {
+    await h.cleanup();
+  }
+});

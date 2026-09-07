@@ -694,6 +694,8 @@ interface CompactionFollowUpDispatch {
 
 interface SendMessageInternalOptions {
   compactionHandoff?: CompactionToken;
+  /** Durable-summary handoffs revalidate their source inside the history append lock. */
+  compactionHandoffSource?: { summary: MuxMessage; onSkipped: () => void };
   preparation?: PreparationAttempt;
   /** A dequeued send keeps its admission owner through acceptance and startup failure. */
   turnReservation?: TurnId;
@@ -3404,6 +3406,19 @@ export class AgentSession {
 
     const cancelSignal = internal?.cancelSignal;
     const persistedCancelableMessageIds: string[] = [];
+    let compactionAppendSkipped = false;
+    const compactionAppendCondition = internal?.compactionHandoffSource
+      ? {
+          summary: internal.compactionHandoffSource.summary,
+          allowedTailMessageIds: persistedCancelableMessageIds,
+          isCurrent: () =>
+            !isAdmissionStale() && !this.coordinator.closing && cancelSignal?.aborted !== true,
+          onSkipped: () => {
+            compactionAppendSkipped = true;
+            internal.compactionHandoffSource?.onSkipped();
+          },
+        }
+      : undefined;
     // Roll back synthetic snapshots if the invoking user row fails to persist, or
     // later provider requests could consume orphaned context.
     /**
@@ -3442,6 +3457,17 @@ export class AgentSession {
         persistedCancelableMessageIds.every(
           (messageId) => !historyResult.data.some((message) => message.id === messageId)
         )
+      );
+    };
+    const refuseSkippedCompactionAppend = async (): Promise<AgentSessionResult<void>> => {
+      // Snapshot leftovers are not acceptance of a user/request row that never
+      // committed. Preserve the cleanup failure without publishing a durable receipt.
+      if (!(await rollbackPersistedTurnRows()))
+        throw new Error(
+          "Failed to roll back preparation rows after compaction follow-up became stale"
+        );
+      return Err(
+        createUnknownSendMessageError("Compaction follow-up source became stale before append")
       );
     };
     const markRowsDurable = (): void => {
@@ -4109,11 +4135,14 @@ export class AgentSession {
         // Persist compaction request (NOT the user message — it's the follow-up)
         const appendCompactionResult = await this.historyService.appendToHistory(
           this.workspaceId,
-          autoCompactionMessage
+          autoCompactionMessage,
+          compactionAppendCondition
         );
         if (!appendCompactionResult.success) {
+          if (compactionAppendCondition) throw new Error(appendCompactionResult.error);
           return Err(createUnknownSendMessageError(appendCompactionResult.error));
         }
+        if (compactionAppendSkipped) return refuseSkippedCompactionAppend();
         persistedCancelableMessageIds.push(autoCompactionMessage.id);
         if (await cancelBeforeAcceptance()) {
           return Ok(undefined);
@@ -4263,11 +4292,19 @@ export class AgentSession {
       // When on-send compaction triggers, the user message is NOT persisted to
       // history (it's sent as follow-up after compaction). Otherwise, persist
       // normally.
-      const appendResult = await this.historyService.appendToHistory(this.workspaceId, userMessage);
+      const appendResult = await this.historyService.appendToHistory(
+        this.workspaceId,
+        userMessage,
+        compactionAppendCondition
+      );
       if (!appendResult.success) {
         await rollbackPersistedTurnRows();
+        // Rollback can retire the local token; that must not disguise a real
+        // locked-read/write failure as an ordinary stale-source skip.
+        if (compactionAppendCondition) throw new Error(appendResult.error);
         return Err(createUnknownSendMessageError(appendResult.error));
       }
+      if (compactionAppendSkipped) return refuseSkippedCompactionAppend();
       persistedCancelableMessageIds.push(userMessage.id);
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
@@ -8533,7 +8570,9 @@ export class AgentSession {
       : undefined;
     // Ordinary durable follow-ups reconstruct the interrupted request and precede
     // queued input. Optional/goal/requireIdle continuations yield to manual work.
+    let sourceAppendSkipped = false;
     const followUpAdmissionStale = () =>
+      sourceAppendSkipped ||
       repairRevision !== this.compactionCancellation.repairRevision ||
       !this.coordinator.isCurrentCompaction(token) ||
       idleRuleStale?.() === true ||
@@ -8646,6 +8685,12 @@ export class AgentSession {
     const sendResult = await this.sendMessage(finalText, options, {
       synthetic: true,
       compactionHandoff: token,
+      compactionHandoffSource: {
+        summary: lastMessage,
+        onSkipped: () => {
+          sourceAppendSkipped = true;
+        },
+      },
       // Goal sync and synchronous message observers run after rollback becomes
       // forbidden but before onAccepted. Stop cannot erase that durable handoff.
       onRowsDurable: () => {

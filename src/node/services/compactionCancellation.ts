@@ -110,16 +110,7 @@ export class CompactionCancellation {
   }
 
   matches(record: CompactionCancellationRecord, summary: MuxMessage): boolean {
-    if (record.scope.kind === "unresolved") return true;
-    const metadata = summary.metadata?.muxMetadata;
-    return (
-      record.scope.id === summary.id &&
-      record.scope.sequence === summary.metadata?.historySequence &&
-      isDeepStrictEqual(
-        record.scope.pendingFollowUp,
-        metadata && "pendingFollowUp" in metadata ? metadata.pendingFollowUp : undefined
-      )
-    );
+    return matchesCompactionCancellation(record, summary);
   }
 
   flush(): Promise<void> {
@@ -165,4 +156,21 @@ export class CompactionCancellation {
     this.pending = result;
     return result;
   }
+}
+
+/** Shared by unlocked policy checks and the locked follow-up append admission. */
+export function matchesCompactionCancellation(
+  record: CompactionCancellationRecord,
+  summary: MuxMessage
+): boolean {
+  if (record.scope.kind === "unresolved") return true;
+  const metadata = summary.metadata?.muxMetadata;
+  return (
+    record.scope.id === summary.id &&
+    record.scope.sequence === summary.metadata?.historySequence &&
+    isDeepStrictEqual(
+      record.scope.pendingFollowUp,
+      metadata && "pendingFollowUp" in metadata ? metadata.pendingFollowUp : undefined
+    )
+  );
 }

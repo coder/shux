@@ -1,11 +1,13 @@
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { renameSync } from "node:fs";
 import * as fs from "fs/promises";
 import { COMPACTION_CANCELLATION_FILE } from "@/common/constants/compactionCancellation";
 import {
   CompactionCancellationSchema,
   MalformedCompactionCancellationError,
+  matchesCompactionCancellation,
   type CompactionCancellationRecord,
 } from "./compactionCancellation";
 import { ContinuousCompactionJournalStore } from "./continuousCompactionJournal";
@@ -62,6 +64,13 @@ import {
  * workspace removal can hold it across its tombstone+delete critical section.
  */
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
+
+interface CompactionFollowUpAppendCondition {
+  summary: MuxMessage;
+  allowedTailMessageIds: readonly string[];
+  isCurrent: () => boolean;
+  onSkipped: () => void;
+}
 
 function hasDurableCompactionBoundary(metadata: MuxMetadata | undefined): boolean {
   if (metadata?.compactionBoundary !== true) {
@@ -2521,9 +2530,59 @@ export class HistoryService {
     }
   }
 
-  async appendToHistory(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
-    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to append history", () =>
-      this.appendToHistoryUnderWriteLock(workspaceId, message)
+  async appendToHistory(
+    workspaceId: string,
+    message: MuxMessage,
+    compactionCondition?: CompactionFollowUpAppendCondition
+  ): Promise<Result<void>> {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to append history",
+      async () => {
+        if (compactionCondition) {
+          // Another backend can consume/repair this summary while send preparation
+          // awaits. Validate its exact intent under the same lock as the new row.
+          const rows = await this.readChatHistory(workspaceId);
+          const expected = compactionCondition.summary;
+          const expectedMeta = expected.metadata?.muxMetadata;
+          const index = rows.findIndex(
+            (row) =>
+              row.id === expected.id &&
+              row.metadata?.historySequence === expected.metadata?.historySequence
+          );
+          const current = rows[index];
+          const currentMeta = current?.metadata?.muxMetadata;
+          const matches =
+            isNonNegativeInteger(expected.metadata?.historySequence) &&
+            current?.role === "assistant" &&
+            isCompactionSummaryMetadata(expectedMeta) &&
+            expectedMeta.pendingFollowUp != null &&
+            isCompactionSummaryMetadata(currentMeta) &&
+            isDeepStrictEqual(currentMeta.pendingFollowUp, expectedMeta.pendingFollowUp) &&
+            rows
+              .slice(index + 1)
+              .every(
+                (row) =>
+                  row.metadata?.rlmPreservedTailCopy === true ||
+                  compactionCondition.allowedTailMessageIds.includes(row.id)
+              );
+          if (!matches || !compactionCondition.isCurrent()) {
+            compactionCondition.onSkipped();
+            return Ok(undefined);
+          }
+          // Raw reads only: malformed/access failures must not authorize an append,
+          // and repair would reacquire this lock. A foreign Stop also wins here.
+          const cancellation = await this.readCompactionCancellation(workspaceId);
+          if (
+            !compactionCondition.isCurrent() ||
+            (cancellation && matchesCompactionCancellation(cancellation, current))
+          ) {
+            compactionCondition.onSkipped();
+            return Ok(undefined);
+          }
+        }
+        return this.appendToHistoryUnderWriteLock(workspaceId, message);
+      }
     );
   }
 
