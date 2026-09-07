@@ -4,7 +4,10 @@ import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./w
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
-import { CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE } from "./agentSession";
+import {
+  CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
+  WITHDRAWN_WAKE_UNRECORDED_MESSAGE,
+} from "./agentSession";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
@@ -733,7 +736,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     const release = createDeferred<void>();
     try {
       const sessionInternal = h.session as unknown as {
-        persistAutoRetryState(): Promise<void>;
+        persistAutoRetryState(): Promise<boolean>;
         getAutoRetryPreferencePath(): string;
       };
       const persist = sessionInternal.persistAutoRetryState.bind(h.session);
@@ -741,7 +744,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       spyOn(sessionInternal, "persistAutoRetryState").mockImplementation(async () => {
         persisting.resolve();
         await release.promise;
-        await persist();
+        return persist();
       });
       let stop: Promise<Result<void>> | undefined;
       const unsubscribe = h.session.onChatEvent(({ message: event }) => {
@@ -771,6 +774,29 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(h.requests).toHaveLength(0);
     } finally {
       release.resolve();
+      await h.finish();
+    }
+  });
+
+  test("hard Stop during a wake's acceptance window fails when the withdrawn wake's abandon marker cannot be written", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      const sessionInternal = h.session as unknown as { getAutoRetryPreferencePath(): string };
+      // A directory at the preference path makes the marker write fail (EISDIR).
+      await fsPromises.mkdir(sessionInternal.getAutoRetryPreferencePath(), { recursive: true });
+      let stop: Promise<Result<void>> | undefined;
+      const unsubscribe = h.session.onChatEvent(({ message: event }) => {
+        if (event.type === "message" && event.role === "user" && stop == null) {
+          stop = h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true });
+        }
+      });
+      await h.addAttention(10);
+      unsubscribe();
+      expect(stop).toBeDefined();
+      expect(await stop!).toEqual(Err(WITHDRAWN_WAKE_UNRECORDED_MESSAGE));
+      expect(h.requests).toHaveLength(0);
+      expect(h.session.isBusy()).toBe(false);
+    } finally {
       await h.finish();
     }
   });

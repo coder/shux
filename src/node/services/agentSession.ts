@@ -536,6 +536,12 @@ export async function clearProviderConfigFixableAbandonMarkers(
 export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
   "Workspace history is being cleared or reset. Please wait and try again.";
 const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message was not sent.";
+/**
+ * Failure of a monitor wake withdrawn by a Stop past its point of no return whose startup abandon
+ * marker could not be written: the durable row stays replayable, so the joining Stop reports it.
+ */
+export const WITHDRAWN_WAKE_UNRECORDED_MESSAGE =
+  "The stopped monitor wake could not record its startup abandon marker.";
 
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
@@ -1492,7 +1498,11 @@ export class AgentSession {
     }
   }
 
-  private async persistAutoRetryState(): Promise<void> {
+  /**
+   * Best-effort for most callers; returns whether the file now reflects the in-memory state so the
+   * one caller that must not acknowledge an unrecorded write (a withdrawn monitor wake) can tell.
+   */
+  private async persistAutoRetryState(): Promise<boolean> {
     const preferencePath = this.getAutoRetryPreferencePath();
     const enabled = this.autoRetryEnabledPreference !== false;
     const hasStartupAbandonState = this.startupAutoRetryAbandon !== null;
@@ -1510,9 +1520,10 @@ export class AgentSession {
             workspaceId: this.workspaceId,
             error: getErrorMessage(error),
           });
+          return false;
         }
       }
-      return;
+      return true;
     }
 
     const payload: {
@@ -1531,11 +1542,13 @@ export class AgentSession {
     try {
       await mkdir(path.dirname(preferencePath), { recursive: true });
       await writeFile(preferencePath, JSON.stringify(payload) + "\n", "utf-8");
+      return true;
     } catch (error) {
       log.warn("Failed to persist auto-retry preference", {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),
       });
+      return false;
     }
   }
 
@@ -1547,21 +1560,21 @@ export class AgentSession {
   private async persistStartupAutoRetryAbandon(
     reason: string,
     userMessageId?: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     this.startupAutoRetryAbandon = {
       reason,
       ...(userMessageId ? { userMessageId } : {}),
     };
-    await this.persistAutoRetryState();
+    return this.persistAutoRetryState();
   }
 
-  private async clearStartupAutoRetryAbandon(): Promise<void> {
+  private async clearStartupAutoRetryAbandon(): Promise<boolean> {
     if (this.startupAutoRetryAbandon === null) {
-      return;
+      return true;
     }
 
     this.startupAutoRetryAbandon = null;
-    await this.persistAutoRetryState();
+    return this.persistAutoRetryState();
   }
 
   async handleProviderConfigChanged(): Promise<void> {
@@ -1578,31 +1591,30 @@ export class AgentSession {
   private async updateStartupAutoRetryAbandonFromFailure(
     errorType: string,
     userMessageId?: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (
       isNonRetryableSendError({ type: errorType }) ||
       isNonRetryableStreamError({ type: errorType })
     ) {
-      await this.persistStartupAutoRetryAbandon(errorType, userMessageId);
-      return;
+      return this.persistStartupAutoRetryAbandon(errorType, userMessageId);
     }
 
-    await this.clearStartupAutoRetryAbandon();
+    return this.clearStartupAutoRetryAbandon();
   }
 
   private async updateStartupAutoRetryAbandonFromAbort(
     abortReason: StreamAbortReason | undefined,
     userMessageId?: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     // "system" and "startup" aborts come from backend-orchestrated flows
     // (for example, mid-stream auto-compaction or canceling a pending startup).
     // They are not user intent and must not poison startup recovery with a
     // persisted non-retryable "aborted" marker.
     if (abortReason === "system" || abortReason === "startup") {
-      return;
+      return true;
     }
 
-    await this.updateStartupAutoRetryAbandonFromFailure("aborted", userMessageId);
+    return this.updateStartupAutoRetryAbandonFromFailure("aborted", userMessageId);
   }
 
   private isAiStreaming(): boolean {
@@ -4021,11 +4033,31 @@ export class AgentSession {
     // startup recovery, so every exit below that skips PREPARING records the same abandon marker a
     // user-aborted stream leaves, before the send resolves (Stop joins the send for this). The
     // withdrawal can land during any await on the way out, including acceptance I/O, so each exit
-    // runs this check after its last other await.
-    const abandonWithdrawnSend = async (): Promise<void> => {
-      if (cancelSignal?.aborted === true) {
-        await this.updateStartupAutoRetryAbandonFromAbort("user", userMessage.id);
+    // runs this check after its last other await. The marker writer is best-effort; a write it could
+    // not make leaves the row replayable, so the send fails with WITHDRAWN_WAKE_UNRECORDED_MESSAGE
+    // instead of its own outcome and the joining Stop is not acknowledged.
+    const abandonWithdrawnSend = async (): Promise<AgentSessionResult<void> | undefined> => {
+      if (cancelSignal?.aborted !== true) return undefined;
+      const recorded = await this.updateStartupAutoRetryAbandonFromAbort("user", userMessage.id);
+      return recorded
+        ? undefined
+        : Err(createUnknownSendMessageError(WITHDRAWN_WAKE_UNRECORDED_MESSAGE));
+    };
+    // Exits that still owe acceptance I/O run the withdrawal check last, since a Stop can land during
+    // that I/O; an unrecorded marker outranks an acceptance failure because only it keeps the row
+    // replayable.
+    const acceptThenAbandonWithdrawnSend = async (): Promise<
+      AgentSessionResult<void> | undefined
+    > => {
+      try {
+        await internal?.onAccepted?.();
+      } catch (error) {
+        return (
+          (await abandonWithdrawnSend()) ??
+          Err(createUnknownSendMessageError(getErrorMessage(error)))
+        );
       }
+      return abandonWithdrawnSend();
     };
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
@@ -4040,10 +4072,13 @@ export class AgentSession {
         // The durable row crossed the point of no return, so every later goal-sync failure must still
         // finalize this monitor wake. Startup recovery can resume the row without redelivering it,
         // unless a Stop withdrew the wake.
-        try {
-          await internal?.onAccepted?.();
-        } finally {
-          await abandonWithdrawnSend();
+        const failure = await acceptThenAbandonWithdrawnSend();
+        if (failure != null) {
+          log.error("Goal sync failed for a monitor wake that could not finalize", {
+            workspaceId: this.workspaceId,
+            error: getErrorMessage(error),
+          });
+          return failure;
         }
       }
       throw error;
@@ -4061,11 +4096,8 @@ export class AgentSession {
     // wake past the point of no return is already durable, so finalize it before leaving.
     if (this.coordinator.disposed) {
       if (cancelSignal != null && cancellationDisabled) {
-        try {
-          await internal?.onAccepted?.();
-        } finally {
-          await abandonWithdrawnSend();
-        }
+        const failure = await acceptThenAbandonWithdrawnSend();
+        if (failure != null) return failure;
       }
       return Ok(undefined);
     }
@@ -4137,8 +4169,9 @@ export class AgentSession {
       if (this.coordinator.thinkingOverride === turnThinkingOverride) {
         this.coordinator.releaseThinkingOverride(turnThinkingOverride);
       }
-      await abandonWithdrawnSend();
-      return Err(createUnknownSendMessageError(getErrorMessage(error)));
+      return (
+        (await abandonWithdrawnSend()) ?? Err(createUnknownSendMessageError(getErrorMessage(error)))
+      );
     }
 
     let acceptedPreStreamFailureNotified = false;
@@ -4171,8 +4204,7 @@ export class AgentSession {
       // callback to revert it — returning without notifying would strand
       // that bookkeeping (r41).
       await notifyAcceptedPreStreamFailure(error);
-      await abandonWithdrawnSend();
-      return Err(error);
+      return (await abandonWithdrawnSend()) ?? Err(error);
     }
     // A withdrawn send must not claim PREPARING (see abandonWithdrawnSend); it resolves Ok without
     // a stream, like cancelBeforeAcceptance and the disposed path above.
@@ -4180,8 +4212,7 @@ export class AgentSession {
       if (this.coordinator.thinkingOverride === turnThinkingOverride) {
         this.coordinator.releaseThinkingOverride(turnThinkingOverride);
       }
-      await abandonWithdrawnSend();
-      return Ok(undefined);
+      return (await abandonWithdrawnSend()) ?? Ok(undefined);
     }
 
     const preparedTurnAbortController = new AbortController();

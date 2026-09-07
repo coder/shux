@@ -45,6 +45,7 @@ import {
   CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
   inheritOpenWorkspaceTurnMetadata,
   type StreamErrorRecoveryOutcome,
+  WITHDRAWN_WAKE_UNRECORDED_MESSAGE,
 } from "@/node/services/agentSession";
 import type { QueueCutCutter } from "@/node/services/messageQueue";
 import { cancelReasonBeforeAcceptance } from "@/node/services/messageQueue";
@@ -1850,7 +1851,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly constructedAtMs = Date.now();
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
   /** The wake send in flight per owner (at most one: dispatch runs under the history lock). */
-  private readonly inFlightBashMonitorWakeSendsByOwner = new Map<string, Promise<unknown>>();
+  private readonly inFlightBashMonitorWakeSendsByOwner = new Map<
+    string,
+    Promise<Result<void, SendMessageError>>
+  >();
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
   private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
@@ -11659,9 +11663,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // session interrupt above saw idle) records the startup abandon marker for that row on every
       // exit before it resolves, including a failed goal sync or acceptance (see
       // abandonWithdrawnSend in AgentSession.sendMessage). Stop is acknowledged after it settles: a
-      // forced exit right after Stop must not leave the row eligible for startup replay. The send's
-      // own result is the dispatch's to report.
-      await withdrawnWakeSend?.catch(() => undefined);
+      // forced exit right after Stop must not leave the row eligible for startup replay. A marker
+      // the send could not write fails the Stop below; its other outcomes are the dispatch's to
+      // report.
+      const withdrawnWakeResult = await withdrawnWakeSend?.catch(() => undefined);
+      const withdrawnWakeUnrecorded =
+        withdrawnWakeResult?.success === false &&
+        withdrawnWakeResult.error.type === "unknown" &&
+        withdrawnWakeResult.error.raw === WITHDRAWN_WAKE_UNRECORDED_MESSAGE;
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
@@ -11711,6 +11720,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         session.restoreQueueToInput();
       }
 
+      if (withdrawnWakeUnrecorded) {
+        log.error("Stop left a withdrawn monitor wake eligible for startup replay", {
+          workspaceId,
+        });
+        return Err(WITHDRAWN_WAKE_UNRECORDED_MESSAGE);
+      }
       return Ok(undefined);
     } catch (error) {
       if (!options?.soft) {
