@@ -30,7 +30,7 @@ export type SettingsData = {
 };
 export type ChatSettings = Pick<
   SendMessageOptions,
-  "model" | "agentId" | "thinkingLevel" | "reasoningMode" | "providerOptions"
+  "model" | "agentId" | "thinkingLevel" | "reasoningMode" | "providerOptions" | "allowAgentSetGoal"
 >;
 export const thinkingLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
 
@@ -69,6 +69,8 @@ export function resolveSettings(
   return {
     ...resolved.selected,
     agentId,
+    // App-initiated turns retain the same goal capability as desktop, including recovery.
+    allowAgentSetGoal: true,
     // Server-synced preferences own privacy/cache settings, even after a local model switch.
     providerOptions: data.config.userPreferences?.ai?.providerOptions,
   };

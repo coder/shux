@@ -118,6 +118,7 @@ describe("mobile model settings", () => {
       )
     ).toEqual({
       agentId: "exec",
+      allowAgentSetGoal: true,
       model: "workspace:exec",
       thinkingLevel: "high",
       reasoningMode: "standard",

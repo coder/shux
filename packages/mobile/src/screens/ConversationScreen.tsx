@@ -195,7 +195,8 @@ export function ConversationScreen(props: {
         throw new Error(
           typeof result.error === "string" ? result.error : JSON.stringify(result.error)
         );
-      setResumeMessageId(null);
+      if (result.data.started) setResumeMessageId(null);
+      else setActionError("Answers saved. The agent is busy; try resuming again.");
     } catch (cause) {
       if (!signal.aborted)
         setActionError(

@@ -474,6 +474,7 @@ test.each([
       model,
       agentId: scenario.selected ? "plan" : "exec",
       thinkingLevel: "off",
+      allowAgentSetGoal: true,
       providerOptions,
     });
     expect(view.getByText(requests[0].options.thinkingLevel!.toUpperCase())).toBeDefined();

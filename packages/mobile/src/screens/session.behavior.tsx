@@ -333,7 +333,7 @@ test("the latest recovered partial can be answered once and resumes only after s
   expect(callCount(view, "resumeStream")).toBe(1);
   expect(view.calls.find((call) => call.path === "workspace.resumeStream")?.input).toMatchObject({
     workspaceId: "alpha",
-    options: { model, agentId: "exec" },
+    options: { model, agentId: "exec", allowAgentSetGoal: true },
   });
   expect(view.queryByRole("button", { name: "Send answers" })).toBeNull();
 });
@@ -391,6 +391,25 @@ test("a complete historical pending question is not recoverable", async () => {
   const view = fixture([question("complete", 1, false)]);
   await view.select("alpha");
   expect(view.getByLabelText("Answer complete?").getAttribute("readonly")).not.toBeNull();
+});
+
+test("a successful no-op resume keeps the recovery action without resubmitting the answer", async () => {
+  const view = fixture([question()]);
+  await view.select("alpha");
+  view.setAnswer(async () => {
+    view.chats.at(-1)!.events.enqueue(answered());
+    return { success: true };
+  });
+  view.setResume(async () => ({ success: true, data: { started: false } }));
+  await submitAnswer(view);
+  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
+  expect(callCount(view, "resumeStream")).toBe(1);
+  const retry = view.getByRole("button", { name: "Resume agent" });
+  view.setResume(async () => ({ success: true, data: { started: true } }));
+  await act(async () => fireEvent.click(retry));
+  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
+  expect(callCount(view, "resumeStream")).toBe(2);
+  expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
 });
 
 test("answer failure is retryable without resuming; resume failure survives tool completion and retries only resume", async () => {
