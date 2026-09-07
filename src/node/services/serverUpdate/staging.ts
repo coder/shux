@@ -147,23 +147,20 @@ export async function stageUpdate(
     throw new Error("Server launcher changed since startup");
   const parent = path.dirname(layout.workdir);
   const active = await fs.realpath(layout.workdir);
-  const dir = path.join(parent, `${SERVER_UPDATE_STAGING_PREFIX}${version}`);
   for (const entry of await fs.readdir(parent, { withFileTypes: true })) {
     if (!entry.isDirectory() || !entry.name.startsWith(SERVER_UPDATE_STAGING_PREFIX)) continue;
     const candidate = path.join(parent, entry.name);
     if ((await fs.realpath(candidate)) !== active && (await ownsStage(candidate, layout)))
       await fs.rm(candidate, { recursive: true });
   }
-  // The marker lands before the directory takes its final name, so a crash in between leaves a
-  // suffixed, marked directory the next attempt prunes rather than an unmarked one that would
-  // block this version. The rename refuses a pre-existing link or populated directory and never
-  // mutates the running installation.
-  const partial = await fs.mkdtemp(`${dir}.`);
+  // A fresh, uniquely named directory: a foreign directory sharing the version's name can neither
+  // block the stage nor be replaced by it (rename would replace an empty one), and the marker
+  // lands first so a crash at any later point leaves a directory the next attempt prunes.
+  const dir = await fs.mkdtemp(path.join(parent, `${SERVER_UPDATE_STAGING_PREFIX}${version}.`));
   await fs.writeFile(
-    path.join(partial, SERVER_UPDATE_STAGE_MARKER),
+    path.join(dir, SERVER_UPDATE_STAGE_MARKER),
     JSON.stringify({ launcher: layout.launcher })
   );
-  await fs.rename(partial, dir);
   await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ private: true }));
   // Package managers follow redirects, so the release itself is fetched and digest-checked here;
   // the dependency tree the manager resolves is anchored to the registry afterwards.

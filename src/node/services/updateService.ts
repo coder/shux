@@ -29,6 +29,7 @@ export class UpdateService {
   private currentChannel: UpdateChannel;
   private subscribers = new Set<(status: UpdateStatus) => void>();
   private readonly ready: Promise<void>;
+  private channelChange: Promise<void> = Promise.resolve();
 
   constructor(private readonly config: Config) {
     this.currentChannel = this.config.getUpdateChannel();
@@ -129,6 +130,14 @@ export class UpdateService {
   }
 
   async setChannel(channel: UpdateChannel): Promise<void> {
+    // Persist, switch, and roll back run as one transaction: a second change interleaving with
+    // them could leave the runtime on one channel and the config on another.
+    const change = this.channelChange.then(() => this.changeChannel(channel));
+    this.channelChange = change.catch(() => undefined);
+    await change;
+  }
+
+  private async changeChannel(channel: UpdateChannel): Promise<void> {
     await this.ready;
     if (this.impl && this.currentStatus.type === "unsupported") return;
     // The runtime switch discards a staged update, so persist first: a failed write then costs

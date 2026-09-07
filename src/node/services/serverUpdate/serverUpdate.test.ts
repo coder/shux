@@ -154,6 +154,13 @@ const fakeInstall =
     );
   };
 
+/** The stage directory a staged CLI entry lives in. */
+const stageOf = (entry: string) => entry.slice(0, entry.indexOf("/node_modules/"));
+
+/** Names of every directory staged for `version` under `parent`, including foreign ones. */
+const stagesIn = async (parent: string, version: string) =>
+  (await fs.readdir(parent)).filter((name) => name.startsWith(`xum-staging-${version}`)).sort();
+
 async function expectFailure(run: () => Promise<unknown>) {
   let failed = false;
   try {
@@ -277,12 +284,13 @@ describe("staging and activation", () => {
         await fakeInstall("2.0.0", { "zod@4.5.4": sriOf("zod") })(file, args, cwd);
       },
     });
-    const tarball = path.join(root, "xum-staging-2.0.0", "xum-2.0.0.tgz");
+    const stageDir = stageOf(bin);
+    expect(path.dirname(stageDir)).toBe(root);
+    expect(path.basename(stageDir)).toMatch(/^xum-staging-2\.0\.0\./);
+    const tarball = path.join(stageDir, "xum-2.0.0.tgz");
     expect(installed).toContain(tarball);
     expect(new Uint8Array(await fs.readFile(tarball))).toEqual(registry.bytes);
-    expect(bin).toBe(
-      path.join(root, "xum-staging-2.0.0/node_modules/@coder/xum/dist/cli/index.js")
-    );
+    expect(bin).toBe(path.join(stageDir, "node_modules/@coder/xum/dist/cli/index.js"));
     expect(registry.calls.map((call) => call.url)).toEqual([
       `${layout.registry}/@coder%2Fxum/2.0.0`,
       registry.tarball,
@@ -301,7 +309,8 @@ describe("staging and activation", () => {
       })
     );
     expect(installs).toBe(0);
-    expect((await fs.readdir(path.join(root, "xum-staging-3.0.0"))).sort()).toEqual([
+    const [aborted] = await stagesIn(root, "3.0.0");
+    expect((await fs.readdir(path.join(root, aborted))).sort()).toEqual([
       SERVER_UPDATE_STAGE_MARKER,
       "package.json",
     ]);
@@ -341,7 +350,7 @@ describe("staging and activation", () => {
     expect(remaining.sort()).toEqual([
       "xum-staging-0.7.0",
       "xum-staging-0.8.0",
-      "xum-staging-2.0.0",
+      path.basename(stageOf(bin)),
     ]);
     expect(await fs.readdir(path.join(root, "xum-staging-0.8.0"))).toEqual(["keep"]);
     activateUpdate(layout, bin);
@@ -362,16 +371,15 @@ describe("staging and activation", () => {
     );
     expect(await fs.realpath(layout.launcher)).toBe(await fs.realpath(bin));
     expect(await fs.readFile(layout.entry, "utf8")).toBe(oldEntry);
-    // A populated foreign directory under the target name fails the stage and is left intact.
+    // A foreign directory carrying the version's name, even an empty one that rename() would
+    // silently replace, is neither touched nor an obstacle.
     await fs.mkdir(path.join(root, "xum-staging-4.0.0"));
-    await fs.writeFile(path.join(root, "xum-staging-4.0.0/keep"), "");
-    await expectFailure(() =>
-      stageUpdate(result.layout, "4.0.0", {
-        ...fakeRegistry("4.0.0"),
-        install: fakeInstall("4.0.0"),
-      })
-    );
-    expect(await fs.readdir(path.join(root, "xum-staging-4.0.0"))).toEqual(["keep"]);
+    await stageUpdate(result.layout, "4.0.0", {
+      ...fakeRegistry("4.0.0"),
+      install: fakeInstall("4.0.0"),
+    });
+    expect(await fs.readdir(path.join(root, "xum-staging-4.0.0"))).toEqual([]);
+    expect(await stagesIn(root, "4.0.0")).toHaveLength(2);
   });
   test("verification rejects mismatched versions, missing entrypoints, and failing smoke runs", async () => {
     const { layout } = await fixture();

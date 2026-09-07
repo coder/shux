@@ -95,4 +95,44 @@ describe("UpdateService channel persistence", () => {
     expect(setUpdateChannel.mock.calls.map((call) => call[0])).toEqual(["nightly", "stable"]);
     expect(service.getChannel()).toBe("stable");
   });
+
+  it("serializes concurrent changes so a rollback cannot land after a later switch", async () => {
+    const { config, setUpdateChannel, getUpdateChannel } = createMockConfig("stable");
+    // Config writes complete in order but asynchronously, like the real FIFO editor.
+    let queue = Promise.resolve();
+    setUpdateChannel.mockImplementation((channel) => {
+      queue = queue.then(() => new Promise((resolve) => setTimeout(resolve, 1)));
+      return queue.then(() => {
+        getUpdateChannel.mockReturnValue(channel);
+      });
+    });
+    const service = new UpdateService(config);
+    const channels: UpdateChannel[] = [];
+    const internal = service as unknown as {
+      impl: { setChannel(channel: UpdateChannel): void; getChannel(): UpdateChannel };
+      currentStatus: { type: string };
+    };
+    let refusals = 1;
+    internal.impl = {
+      setChannel: (channel) => {
+        if (refusals-- > 0) throw new Error("An update operation is in progress");
+        channels.push(channel);
+      },
+      getChannel: () => channels.at(-1) ?? "stable",
+    };
+    internal.currentStatus = { type: "idle" };
+    const [first, second] = await Promise.allSettled([
+      service.setChannel("nightly"),
+      service.setChannel("nightly"),
+    ]);
+    expect(first.status).toBe("rejected");
+    expect(second.status).toBe("fulfilled");
+    expect(setUpdateChannel.mock.calls.map((call) => call[0])).toEqual([
+      "nightly",
+      "stable",
+      "nightly",
+    ]);
+    expect(getUpdateChannel()).toBe("nightly");
+    expect(service.getChannel()).toBe("nightly");
+  });
 });
