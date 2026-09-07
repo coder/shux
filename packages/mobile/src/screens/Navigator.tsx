@@ -58,8 +58,12 @@ export function Navigator(props: {
       name: config.displayName ?? path.split(/[\\/]/).filter(Boolean).at(-1) ?? path,
       workspaces: [],
     });
-  // Match desktop's root list before searching/counting; keep orphaned agents accessible.
-  for (const workspace of excludeSubAgentRows(props.workspaces)) {
+  const workspaceNames = new Map(
+    props.workspaces.map((workspace) => [workspace.id, workspace.title ?? workspace.name])
+  );
+  // Keep the default root list clean without making delegated chats unreachable.
+  const candidates = query.trim() ? props.workspaces : excludeSubAgentRows(props.workspaces);
+  for (const workspace of candidates) {
     const key = workspace.kind === "scratch" ? "scratch" : workspace.projectPath;
     const group = groups.get(key) ?? {
       name: workspace.kind === "scratch" ? "Scratch chats" : workspace.projectName,
@@ -221,7 +225,11 @@ export function Navigator(props: {
                               {workspace.title ?? workspace.name}
                             </Text>
                             <Text numberOfLines={1} style={[layout.muted, typography.footnote]}>
-                              {workspace.kind === "scratch" ? "Scratch chat" : workspace.name}
+                              {workspace.parentWorkspaceId
+                                ? `Subagent of ${workspaceNames.get(workspace.parentWorkspaceId) ?? workspace.parentWorkspaceId}`
+                                : workspace.kind === "scratch"
+                                  ? "Scratch chat"
+                                  : workspace.name}
                             </Text>
                           </View>
                         </Pressable>

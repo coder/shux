@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { Brain, ChevronDown, ChevronRight, File, Pause, Wrench } from "lucide-react-native";
+import { Brain, Check, ChevronDown, ChevronRight, File, Pause, Wrench } from "lucide-react-native";
 import type { MuxMessage, MuxToolPart } from "../../../../src/common/types/message";
+import type { AskUserQuestionQuestion } from "../../../../src/common/types/tools";
+import { AskUserQuestionToolArgsSchema } from "../../../../src/common/utils/tools/toolDefinitions";
 import { Button, Field, Notice, Sheet } from "./Controls";
 import { Markdown } from "./Markdown";
 import { mergeAdjacentParts } from "../../../../src/common/utils/messages/mergeAdjacentParts";
@@ -165,7 +167,7 @@ function Tool(props: {
   const [inspecting, setInspecting] = useState(false);
   const questions =
     props.part.toolName === "ask_user_question" && props.part.state === "input-available"
-      ? questionTexts(props.part.input)
+      ? (AskUserQuestionToolArgsSchema.safeParse(props.part.input).data?.questions ?? [])
       : [];
   const name = props.part.toolName
     .replaceAll("_", " ")
@@ -221,35 +223,39 @@ function Tool(props: {
   );
 }
 
-function questionTexts(input: unknown): string[] {
-  if (
-    !input ||
-    typeof input !== "object" ||
-    !("questions" in input) ||
-    !Array.isArray(input.questions)
-  )
-    return [];
-  return input.questions.flatMap((question: unknown) =>
-    question &&
-    typeof question === "object" &&
-    "question" in question &&
-    typeof question.question === "string"
-      ? [question.question]
-      : []
-  );
+interface QuestionDraft {
+  selected: Array<string | null>;
+  otherText: string;
 }
 
 function QuestionForm(props: {
-  questions: string[];
+  questions: AskUserQuestionQuestion[];
   disabled: boolean;
   onSubmit: (answers: Record<string, string>) => Promise<void>;
 }) {
-  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [drafts, setDrafts] = useState(() => new Map<string, QuestionDraft>());
+  // Match desktop answer serialization: selection order, comma-separated labels,
+  // and trimmed Other text. Null keeps the implicit choice distinct from tool labels.
+  const answers = Object.fromEntries(
+    props.questions.map((question) => {
+      const draft = drafts.get(question.question);
+      const complete =
+        draft &&
+        draft.selected.length > 0 &&
+        (!draft.selected.includes(null) || draft.otherText.trim().length > 0);
+      return [
+        question.question,
+        complete ? draft.selected.map((label) => label ?? draft.otherText.trim()).join(", ") : "",
+      ];
+    })
+  );
   const [busy, setBusy] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const disabled = props.disabled || busy || submitted;
+  const complete = props.questions.every((question) => Boolean(answers[question.question]));
   async function submit() {
-    if (busy || submitted) return;
+    if (disabled || !complete) return;
     setBusy(true);
     setError(null);
     try {
@@ -264,27 +270,73 @@ function QuestionForm(props: {
   return (
     <View style={styles.question}>
       <Text style={layout.label}>Your input is needed</Text>
-      {props.questions.map((question) => (
-        <Field
-          key={question}
-          label={question}
-          value={answers[question] ?? ""}
-          onChangeText={(answer) => setAnswers({ ...answers, [question]: answer })}
-          placeholder="Your answer…"
-          multiline
-          editable={!props.disabled && !busy && !submitted}
-        />
-      ))}
+      {props.questions.map((question) => {
+        const draft = drafts.get(question.question) ?? { selected: [], otherText: "" };
+        return (
+          <View
+            key={question.question}
+            role={question.multiSelect ? "group" : "radiogroup"}
+            accessibilityLabel={question.question}
+            style={{ gap: spacing.sm }}
+          >
+            <Text style={layout.label}>{question.header}</Text>
+            <Text style={layout.text}>{question.question}</Text>
+            {[...question.options, { label: null, description: "Provide a custom answer." }].map(
+              (option) => {
+                const checked = draft.selected.includes(option.label);
+                return (
+                  <Pressable
+                    key={option.label ?? "other"}
+                    accessibilityRole={question.multiSelect ? "checkbox" : "radio"}
+                    accessibilityLabel={option.label ?? "Other"}
+                    accessibilityState={{ checked, disabled }}
+                    aria-checked={checked}
+                    disabled={disabled}
+                    onPress={() =>
+                      setDrafts((current) =>
+                        new Map(current).set(question.question, {
+                          selected: checked
+                            ? draft.selected.filter((label) => label !== option.label)
+                            : question.multiSelect
+                              ? [...draft.selected, option.label]
+                              : [option.label],
+                          otherText:
+                            !question.multiSelect && option.label !== null ? "" : draft.otherText,
+                        })
+                      )
+                    }
+                    style={[styles.option, checked && { backgroundColor: colors.elevated }]}
+                  >
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={layout.text}>{option.label ?? "Other"}</Text>
+                      <Text style={styles.secondary}>{option.description}</Text>
+                    </View>
+                    <View style={{ width: 18 }}>
+                      {checked && <Check size={18} color={colors.selection} />}
+                    </View>
+                  </Pressable>
+                );
+              }
+            )}
+            {draft.selected.includes(null) && (
+              <Field
+                label={`Other: ${question.question}`}
+                value={draft.otherText}
+                onChangeText={(otherText) =>
+                  setDrafts((current) =>
+                    new Map(current).set(question.question, { ...draft, otherText })
+                  )
+                }
+                placeholder="Your answer…"
+                multiline
+                editable={!disabled}
+              />
+            )}
+          </View>
+        );
+      })}
       {error && <Notice>{error}</Notice>}
-      <Button
-        busy={busy}
-        disabled={
-          props.disabled ||
-          submitted ||
-          props.questions.some((question) => !answers[question]?.trim())
-        }
-        onPress={submit}
-      >
+      <Button busy={busy} disabled={disabled || !complete} onPress={submit}>
         {submitted ? "Answers sent" : "Send answers"}
       </Button>
     </View>
@@ -316,6 +368,16 @@ const styles = StyleSheet.create({
   toolHint: { color: colors.text },
   outputSurface: { backgroundColor: colors.panel, borderRadius: radii.control },
   output: { ...typography.footnote, color: colors.text, fontFamily: mono, lineHeight: 21 },
+  option: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    minHeight: 44,
+    padding: spacing.sm,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    borderRadius: radii.control,
+  },
   question: {
     gap: spacing.lg,
     borderRadius: radii.card,

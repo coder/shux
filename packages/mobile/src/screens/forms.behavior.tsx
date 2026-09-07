@@ -1,7 +1,7 @@
 import "./formTestPlatform";
 import { afterEach, expect, test } from "bun:test";
 import { createRef, useState } from "react";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { createORPCClient } from "@orpc/client";
 import { View } from "react-native";
 import type { TextInput } from "react-native";
@@ -97,7 +97,8 @@ test("context meter exposes measured progress without inventing an unknown perce
   expect(view.getByRole("progressbar").getAttribute("aria-valuetext")).toBeTruthy();
 });
 
-test("navigator counts and searches roots, not their agents, and preserves orphan access", () => {
+test("navigator keeps roots by default but opens matching agents through search", () => {
+  const selected: string[] = [];
   const child: FrontendWorkspaceMetadata = {
     ...workspace,
     id: "child",
@@ -111,7 +112,7 @@ test("navigator counts and searches roots, not their agents, and preserves orpha
     loading: false,
     error: null,
     onRetry: () => {},
-    onSelect: () => {},
+    onSelect: (value: FrontendWorkspaceMetadata) => selected.push(value.id),
     onCreate: () => {},
     onSettings: () => {},
   };
@@ -120,8 +121,12 @@ test("navigator counts and searches roots, not their agents, and preserves orpha
   expect(view.queryByRole("button", { name: child.title })).toBeNull();
   const search = view.getByRole("textbox", { name: "Search workspaces" });
   fireEvent.change(search, { target: { value: "Scout" } });
-  expect(view.getByText("No matching workspaces")).toBeDefined();
-  fireEvent.change(search, { target: { value: "" } });
+  fireEvent.click(view.getByRole("button", { name: child.title }));
+  expect(selected).toEqual([child.id]);
+  expect(view.getByText("Subagent of feature")).toBeDefined();
+  expect(view.queryByRole("button", { name: workspace.name })).toBeNull();
+  fireEvent.change(search, { target: { value: "  " } });
+  expect(view.queryByRole("button", { name: child.title })).toBeNull();
 
   // A live metadata update must not promote a running child into a peer row.
   view.rerender(
@@ -746,7 +751,28 @@ test("question answers remain inline and require complete input before submissio
     toolCallId: "question",
     toolName: "ask_user_question",
     state: "input-available",
-    input: { questions: [{ question: "Which branch?" }, { question: "What should change?" }] },
+    input: {
+      questions: [
+        {
+          question: "Which branch?",
+          header: "Branch",
+          options: [
+            { label: "main", description: "Stable branch" },
+            { label: "next", description: "Upcoming release" },
+          ],
+          multiSelect: false,
+        },
+        {
+          question: "What should change?",
+          header: "Scope",
+          options: [
+            { label: "API", description: "Change the interface" },
+            { label: "UI", description: "Change the presentation" },
+          ],
+          multiSelect: false,
+        },
+      ],
+    },
   };
   const view = render(
     <Message
@@ -760,10 +786,21 @@ test("question answers remain inline and require complete input before submissio
   );
   fireEvent.click(view.getByRole("button", { name: "Send answers" }));
   expect(answers).toHaveLength(0);
-  fireEvent.change(view.getByLabelText("Which branch?"), { target: { value: "main" } });
+  const branch = within(view.getByRole("radiogroup", { name: "Which branch?" }));
+  expect(branch.getByText("Upcoming release")).toBeDefined();
+  fireEvent.click(branch.getByRole("radio", { name: "next" }));
+  fireEvent.click(branch.getByRole("radio", { name: "main" }));
+  expect(branch.getByRole("radio", { name: "next" }).getAttribute("aria-checked")).toBe("false");
   fireEvent.click(view.getByRole("button", { name: "Send answers" }));
   expect(answers).toHaveLength(0);
-  fireEvent.change(view.getByLabelText("What should change?"), {
+  fireEvent.click(
+    within(view.getByRole("radiogroup", { name: "What should change?" })).getByRole("radio", {
+      name: "Other",
+    })
+  );
+  fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+  expect(answers).toHaveLength(0);
+  fireEvent.change(view.getByLabelText("Other: What should change?"), {
     target: { value: "Keep the API stable" },
   });
   await act(async () => {
@@ -772,6 +809,82 @@ test("question answers remain inline and require complete input before submissio
   expect(answers).toEqual([
     { "Which branch?": "main", "What should change?": "Keep the API stable" },
   ]);
+});
+
+test.each(["Which features?", "__proto__"])(
+  "multi-select question %s preserves selection order and custom text across a failed send",
+  async (question) => {
+    const answers: Array<Record<string, string>> = [];
+    const part: MuxToolPart = {
+      type: "dynamic-tool",
+      toolCallId: "features",
+      toolName: "ask_user_question",
+      state: "input-available",
+      input: {
+        questions: [
+          {
+            question,
+            header: "Features",
+            options: [
+              { label: "Search", description: "Find workspaces" },
+              { label: "Tabs", description: "Switch conversations" },
+            ],
+            multiSelect: true,
+          },
+        ],
+      },
+    };
+    const onAnswer = async (_id: string, value: Record<string, string>) => {
+      answers.push(value);
+      if (answers.length === 1) throw new Error("Connection lost");
+    };
+    const view = render(
+      <Message message={toolMessage(part)} canAnswer={false} onAnswer={onAnswer} />
+    );
+    const search = view.getByRole("checkbox", { name: "Search" });
+    fireEvent.click(search);
+    expect(search.getAttribute("aria-checked")).toBe("false");
+    view.rerender(<Message message={toolMessage(part)} canAnswer onAnswer={onAnswer} />);
+    fireEvent.click(view.getByRole("checkbox", { name: "Tabs" }));
+    fireEvent.click(search);
+    fireEvent.click(search);
+    expect(search.getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(view.getByRole("checkbox", { name: "Other" }));
+    fireEvent.change(view.getByLabelText(`Other: ${question}`), { target: { value: "   " } });
+    fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+    expect(answers).toHaveLength(0);
+    fireEvent.change(view.getByLabelText(`Other: ${question}`), {
+      target: { value: "  Offline, too  " },
+    });
+    fireEvent.click(search);
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+    });
+    expect(answers).toEqual([{ [question]: "Tabs, Offline, too, Search" }]);
+    expect(view.getByRole("alert").textContent).toContain("Connection lost");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+    });
+    expect(answers[1]).toEqual(answers[0]);
+    fireEvent.click(view.getByRole("checkbox", { name: "Tabs" }));
+    expect(view.getByRole("checkbox", { name: "Tabs" }).getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(view.getByRole("button", { name: "Answers sent" }));
+    expect(answers).toHaveLength(2);
+  }
+);
+
+test("malformed question payloads stay inspectable without presenting an incomplete answer form", () => {
+  const part: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "malformed",
+    toolName: "ask_user_question",
+    state: "input-available",
+    input: { questions: [{ question: "Missing choices?" }] },
+  };
+  const view = render(<Message message={toolMessage(part)} canAnswer onAnswer={async () => {}} />);
+  expect(view.queryByRole("button", { name: "Send answers" })).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Ask user question: No result" }));
+  expect(view.getByText(/Missing choices/)).toBeDefined();
 });
 
 test("reasoning stays an inline disclosure and historical errors are not replaced by an empty-response hint", () => {
