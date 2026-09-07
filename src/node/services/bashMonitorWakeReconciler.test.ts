@@ -374,6 +374,30 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(2);
   });
 
+  test("failed acceptance I/O is retried ahead of dispatch instead of redelivering the wake", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const wake = dispatches[0];
+
+    acknowledgeGate = Promise.withResolvers<void>();
+    acknowledgeGate.promise.catch(() => undefined);
+    acknowledgeGate.reject(new Error("transient acknowledgement failure"));
+    // The accepted row is durable, so acceptance resolves and only the consumption stays owed.
+    await wake.onAccepted();
+    await expect(reconciler.reconcile(OWNER)).rejects.toThrow("transient acknowledgement failure");
+    expect(dispatches).toHaveLength(1);
+
+    acknowledgeGate = undefined;
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+
+    live = [
+      liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
+    ];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+  });
+
   test("full history clear consumes signals present both before and during the clear", async () => {
     live = [liveSnapshot()];
     const token = await reconciler.beginFullHistoryClear(OWNER);

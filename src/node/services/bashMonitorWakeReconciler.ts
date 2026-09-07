@@ -11,6 +11,7 @@ import type {
   BashMonitorRegistryRecord,
   BashMonitorTerminalSummary,
 } from "@/node/services/bashMonitorRegistryStore";
+import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
 import { isErrnoWithCode } from "@/node/utils/fs";
@@ -161,6 +162,8 @@ interface ReconcileState {
   scheduled: boolean;
   promise?: Promise<void>;
   dispatch?: DispatchState;
+  /** Signals of an accepted wake whose consumption I/O has not succeeded; applied before any dispatch. */
+  owedAcceptance?: readonly DerivedSignal[];
   /** Frontier a committed stop still has to retire; applied before any dispatch. */
   owedRetirement?: readonly BashMonitorProcessSnapshot[];
 }
@@ -505,10 +508,13 @@ export class BashMonitorWakeReconciler {
 
   private async reconcileOnce(ownerWorkspaceId: string): Promise<void> {
     const dispatch = await this.locks.withLock(ownerWorkspaceId, async () => {
-      // A stop's retirement that failed on transient I/O is retried here first (a throw lands in
-      // the reconcile retry backoff), so dismissed attention never dispatches when the stop's own
-      // idle transition reconciles.
-      await this.retireOwed(ownerWorkspaceId, this.state(ownerWorkspaceId));
+      // Consumption that failed on transient I/O is retried here first (a throw lands in the
+      // reconcile retry backoff): an accepted wake's signals are never redelivered over the row
+      // the transcript already carries, and dismissed attention never dispatches when the stop's
+      // own idle transition reconciles.
+      const owed = this.state(ownerWorkspaceId);
+      await this.acceptOwed(ownerWorkspaceId, owed);
+      await this.retireOwed(ownerWorkspaceId, owed);
       const collected = await this.collect(ownerWorkspaceId, true);
       for (const readSettled of collected.deferredReads) {
         void readSettled.finally(() => this.scheduleReconcile(ownerWorkspaceId));
@@ -579,13 +585,31 @@ export class BashMonitorWakeReconciler {
     await this.locks.withLock(ownerWorkspaceId, async () => {
       if (dispatch.accepted || dispatch.controller.signal.aborted) return;
       dispatch.accepted = true;
-      const watermarks = await this.readWatermarks(ownerWorkspaceId);
-      await this.advanceWatermarks(ownerWorkspaceId, watermarks, dispatch.signals);
-      await this.cleanup(dispatch.signals);
       const state = this.state(ownerWorkspaceId);
-      if (state.dispatch === dispatch) state.dispatch = undefined;
+      // The accepted row is durable, so its consumption stays owed when this I/O fails: the next
+      // reconcile retries it ahead of any dispatch instead of failing the turn or redelivering.
+      state.owedAcceptance = [...(state.owedAcceptance ?? []), ...dispatch.signals];
+      try {
+        await this.acceptOwed(ownerWorkspaceId, state);
+      } catch (error) {
+        log.warn("Bash monitor wake acceptance I/O failed; retrying before the next dispatch", {
+          ownerWorkspaceId,
+          error,
+        });
+      } finally {
+        // Still registered during the I/O so a Stop landing then can withdraw the wake.
+        if (state.dispatch === dispatch) state.dispatch = undefined;
+      }
     });
     this.scheduleReconcile(ownerWorkspaceId);
+  }
+
+  private async acceptOwed(ownerWorkspaceId: string, state: ReconcileState): Promise<void> {
+    if (state.owedAcceptance == null) return;
+    const watermarks = await this.readWatermarks(ownerWorkspaceId);
+    await this.advanceWatermarks(ownerWorkspaceId, watermarks, state.owedAcceptance);
+    await this.cleanup(state.owedAcceptance);
+    state.owedAcceptance = undefined;
   }
 
   private abortDispatch(ownerWorkspaceId: string): void {
