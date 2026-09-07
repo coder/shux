@@ -819,10 +819,14 @@ interface SendMessageInternalOptions {
   admissionStale?: () => boolean;
 }
 
+interface PreparedRolloverRequest extends PreparedStreamMessage {
+  detachAdmissionCancellation(): void;
+}
+
 // Enqueueing creates no preparation attempt. Once dispatched, Promise success alone cannot
 // distinguish cancellation, a background transfer, and delivery to terminal policy.
 interface PreparationAttempt {
-  preparedRequest?: PreparedStreamMessage;
+  preparedRequest?: PreparedRolloverRequest;
   owner?: TurnId;
   expectedTurn: TurnId;
   editReservation?: ReturnType<TurnCoordinator["reserve"]>;
@@ -4368,6 +4372,7 @@ export class AgentSession {
     // wake finish acceptance rather than delete the row after goal state has already observed it.
     if (cancelSignal != null) {
       cancellationDisabled = true;
+      attempt.preparedRequest?.detachAdmissionCancellation();
     }
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
@@ -5219,7 +5224,7 @@ export class AgentSession {
     agentInitiated?: boolean,
     signal?: AbortSignal,
     manualIntervention?: { enqueuedAtMs?: number }
-  ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
+  ): Promise<Result<PreparedRolloverRequest, SendMessageError>> {
     if (!this.aiService.prepareStreamMessage)
       return Err({
         type: "context_budget_blocked",
@@ -5246,12 +5251,27 @@ export class AgentSession {
       ),
       providersConfig
     );
+    // A monitor may cancel admission only until its durable wake crosses the rollback horizon.
+    // Do not retain that signal in the accepted request; shutdown has its own permanent link.
+    const admissionController = new AbortController();
+    const cancelAdmission = () => admissionController.abort(signal?.reason);
+    const detachAdmissionCancellation = () => signal?.removeEventListener("abort", cancelAdmission);
+    if (signal?.aborted) cancelAdmission();
+    else signal?.addEventListener("abort", cancelAdmission, { once: true });
+    let retained = false;
+    using _admissionCancellation = {
+      [Symbol.dispose]: () => {
+        if (!retained) detachAdmissionCancellation();
+      },
+    };
     const optionsMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
     const prepared = await this.aiService.prepareStreamMessage({
       workspaceId: this.workspaceId,
       messages,
       modelString,
-      abortSignal: signal ? AbortSignal.any([this.closingSignal, signal]) : this.closingSignal,
+      abortSignal: signal
+        ? AbortSignal.any([this.closingSignal, admissionController.signal])
+        : this.closingSignal,
       thinkingLevel: options?.thinkingLevel
         ? enforceThinkingPolicy(
             modelString,
@@ -5304,12 +5324,17 @@ export class AgentSession {
             message: `The complete request does not fit in a fresh context window for ${prepared.error.model}. Shorten system instructions or tool schemas, or choose a larger model.`,
           })
         : prepared;
+    retained = true;
     return Ok({
+      detachAdmissionCancellation,
       start: (startOptions) => {
         this.memoryContextByModelString = cache;
         return prepared.data.start(startOptions);
       },
-      [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
+      [Symbol.asyncDispose]: () => {
+        detachAdmissionCancellation();
+        return prepared.data[Symbol.asyncDispose]();
+      },
     });
   }
 

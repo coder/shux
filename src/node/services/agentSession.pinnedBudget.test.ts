@@ -667,4 +667,120 @@ describe("pinned full-payload rollover admission", () => {
       await fixture.cleanup();
     }
   });
+  test.each(["goal-sync", "on-accepted", "streaming"] as const)(
+    "late admission cancellation during %s cannot revoke an accepted prepared wake",
+    async (phase) => {
+      const fixture = await setup("small");
+      const { h, goalService, start, historyService, applyReset, assembly } = fixture;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const controller = new AbortController();
+      const canceled = mock(() => undefined);
+      const accepted = mock(async () => {
+        if (phase === "on-accepted") {
+          entered.resolve();
+          await release.promise;
+        }
+      });
+      if (phase === "goal-sync") {
+        const sync = goalService.syncGoalModeWithChatTail.bind(goalService);
+        spyOn(goalService, "syncGoalModeWithChatTail").mockImplementationOnce(async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return sync(...args);
+        });
+      }
+      const sending = h.session.sendMessage(
+        "Durable prepared monitor wake",
+        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+          onCanceled: canceled,
+          onAccepted: accepted,
+        }
+      );
+      try {
+        if (phase === "streaming") expect((await sending).success).toBe(true);
+        else await entered.promise;
+        controller.abort("monitor removed after the rollback horizon");
+        release.resolve();
+        expect((await sending).success).toBe(true);
+        expect(accepted).toHaveBeenCalledTimes(1);
+        expect(canceled).not.toHaveBeenCalled();
+        expect(start).toHaveBeenCalledTimes(1);
+        expect(start.mock.calls[0][0].abortSignal?.aborted).toBe(false);
+        expect(applyReset).toHaveBeenCalledTimes(1);
+        expect(assembly).toHaveBeenCalledTimes(1);
+        const rows = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(
+          rows.success &&
+            rows.data.some(
+              (row) =>
+                row.role === "user" &&
+                row.parts.some(
+                  (part) => part.type === "text" && part.text === "Durable prepared monitor wake"
+                )
+            )
+        ).toBe(true);
+      } finally {
+        release.resolve();
+        await sending;
+        await fixture.cleanup();
+      }
+    }
+  );
+  test.each(["interrupt", "dispose"] as const)(
+    "accepted prepared startup still honors %s after admission cancellation detaches",
+    async (action) => {
+      const fixture = await setup("small");
+      const { h, start, applyReset } = fixture;
+      const entered = Promise.withResolvers<AbortSignal>();
+      const aborted = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      start.mockImplementation(async (options) => {
+        const signal = options.abortSignal;
+        if (!signal) throw new Error("Prepared startup must have an abort signal");
+        signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+        entered.resolve(signal);
+        await release.promise;
+        return Ok(createStartedTurnHandle(signal, options.messageId));
+      });
+      const controller = new AbortController();
+      const sending = h.session.sendMessage(
+        "Accepted prepared wake",
+        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+        }
+      );
+      let stopped: Promise<void> | undefined;
+      try {
+        const signal = await entered.promise;
+        controller.abort("admission-only cancellation");
+        expect(signal.aborted).toBe(false);
+        stopped =
+          action === "interrupt"
+            ? h.session.interruptStream().then((result) => {
+                expect(result.success).toBe(true);
+              })
+            : h.session.dispose();
+        await aborted.promise;
+        expect(signal.aborted).toBe(true);
+        release.resolve();
+        await sending;
+        await stopped;
+        expect(start).toHaveBeenCalledTimes(1);
+        expect(applyReset).toHaveBeenCalledTimes(1);
+      } finally {
+        release.resolve();
+        await sending;
+        await stopped;
+        await fixture.cleanup();
+      }
+    }
+  );
 });
