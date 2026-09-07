@@ -90,6 +90,23 @@ async function serverFixture(stallProbe = false) {
 }
 
 describe("mobile WebSocket connection", () => {
+  test("runtime signals check cancellation and preserve a propagated abort reason", () => {
+    const controller = new AbortController();
+    expect(() => controller.signal.throwIfAborted()).not.toThrow();
+    controller.abort();
+    expect(() => controller.signal.throwIfAborted()).toThrow();
+
+    const combined = AbortSignal.any([controller.signal]);
+    expect(combined.reason).toBeDefined();
+    let thrown: unknown;
+    try {
+      combined.throwIfAborted();
+    } catch (cause) {
+      thrown = cause;
+    }
+    expect(thrown).toBe(combined.reason);
+  });
+
   test("authenticates unary probe and streams actual oRPC events through a proxy prefix", async () => {
     await using server = await serverFixture();
     const connection = await connect(`${server.endpoint}/`, server.token);

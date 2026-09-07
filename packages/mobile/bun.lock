@@ -30,6 +30,7 @@
         "@types/http-proxy": "^1.17.16",
         "@types/react": "~19.2.2",
         "@types/react-dom": "19.2.3",
+        "abort-controller": "3.0.0",
         "happy-dom": "20.0.10",
         "http-proxy": "^1.18.1",
         "typescript": "~6.0.3",
