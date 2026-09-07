@@ -206,7 +206,8 @@ export function useConversation(client: MobileClient, workspaceId: string, signa
   return {
     transcript: owned ? transcript : createTranscriptState(),
     settings: owned && settings ? { ...settings, policy } : null,
-    error: owned ? (error ?? settingsError) : null,
+    error: owned ? error : null,
+    settingsError: owned ? settingsError : null,
     loadingOlder,
     historyError,
     loadOlder,

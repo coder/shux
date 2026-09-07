@@ -370,15 +370,17 @@ test.each(["config", "providers"] as const)(
     const subscription =
       source === "config" ? view.configSubscriptions[0] : view.providerSubscriptions[0];
     await act(async () => subscription.events.enqueue());
-    await waitFor(() => expect(view.result.current.error).not.toBeNull());
+    await waitFor(() => expect(view.result.current.settingsError).not.toBeNull());
+    expect(view.result.current.error).toBeNull();
     expect(view.result.current.settings).toBeNull();
     failed = false;
     await act(async () => subscription.events.enqueue());
     await waitFor(() => expect(view.result.current.settings).not.toBeNull());
-    expect(view.result.current.error).toBeNull();
+    expect(view.result.current.settingsError).toBeNull();
     await act(async () => subscription.fail(new Error("disconnected")));
     await waitFor(() => expect(view.result.current.settings).toBeNull());
-    expect(view.result.current.error).not.toBeNull();
+    expect(view.result.current.settingsError).not.toBeNull();
+    expect(view.result.current.error).toBeNull();
   }
 );
 

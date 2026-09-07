@@ -135,6 +135,7 @@ function fixture(
           return answer();
         case "workspace.resumeStream":
           return resume();
+        case "workspace.interruptStream":
         case "workspace.sendMessage":
           return { success: true };
         case "workspace.executeBash":
@@ -787,4 +788,51 @@ test("unavailable live settings prevent send and retain resume-only recovery aft
   expect(view.calls.find((call) => call.path === "workspace.resumeStream")?.input).toMatchObject({
     options: { providerOptions },
   });
+});
+
+test("live interruption remains available during pending and failed settings refreshes, but not a lost transport", async () => {
+  const view = fixture([
+    {
+      type: "stream-start",
+      workspaceId: "alpha",
+      messageId: "live",
+      historySequence: 1,
+      startTime: 1,
+      model,
+    },
+    {
+      type: "tool-call-start",
+      workspaceId: "alpha",
+      messageId: "live",
+      toolCallId: "live",
+      toolName: "ask_user_question",
+      tokens: 1,
+      args: questionInput("live"),
+      timestamp: 1,
+    },
+  ]);
+  await view.select("alpha");
+  const read = deferred<SettingsData["config"]>();
+  view.setConfigRead(() => read.promise);
+  await view.updateConfig({ agentAiDefaults: {} });
+  const interrupt = () => view.getByRole("button", { name: "Interrupt agent" });
+  expect(interrupt().getAttribute("aria-disabled")).not.toBe("true");
+  expect(view.getByRole("button", { name: "Send answers" }).getAttribute("aria-disabled")).toBe(
+    "true"
+  );
+  await act(async () => fireEvent.click(interrupt()));
+  expect(callCount(view, "interruptStream")).toBe(1);
+  await act(async () => read.reject(new Error("settings unavailable")));
+  expect(view.getByRole("alert")).toBeDefined();
+  expect(interrupt().getAttribute("aria-disabled")).not.toBe("true");
+  await act(async () => fireEvent.click(interrupt()));
+  expect(callCount(view, "interruptStream")).toBe(2);
+  expect(callCount(view, "sendMessage")).toBe(0);
+  expect(callCount(view, "answerAskUserQuestion")).toBe(0);
+  expect(callCount(view, "resumeStream")).toBe(0);
+  await act(async () => view.chats[0].end());
+  expect(view.queryByRole("button", { name: "Interrupt agent" })).toBeNull();
+  expect(view.getByRole("button", { name: "Send message" }).getAttribute("aria-disabled")).toBe(
+    "true"
+  );
 });

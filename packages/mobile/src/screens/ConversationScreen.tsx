@@ -52,11 +52,8 @@ export function ConversationScreen(props: {
   onChanges: () => void;
   onSettings: () => void;
 }) {
-  const { transcript, settings, error, loadOlder, loadingOlder, historyError } = useConversation(
-    props.client,
-    props.workspace.id,
-    props.signal
-  );
+  const { transcript, settings, error, settingsError, loadOlder, loadingOlder, historyError } =
+    useConversation(props.client, props.workspace.id, props.signal);
   const draft = props.draft;
   const setDraft = props.onDraftChange;
   const [inputFocused, setInputFocused] = useState(false);
@@ -100,11 +97,12 @@ export function ConversationScreen(props: {
     settings?.providers,
     transcript.streamingMessageId
   );
-  const ready =
-    props.connected && !props.signal.aborted && transcript.caughtUp && !error && settings !== null;
+  // Settings gate new AI work, not the ability to interrupt an existing live stream.
+  const ready = props.connected && !props.signal.aborted && transcript.caughtUp && !error;
+  const loadError = error ?? settingsError;
   const policyBlockReason =
     settings && options ? getPolicyBlockReason(settings, options.model) : null;
-  const canAct = ready && !policyBlockReason;
+  const canAct = ready && settings !== null && !settingsError && !policyBlockReason;
   const latestSettings = useRef({ options, policyBlockReason });
   useEffect(() => {
     latestSettings.current = { options, policyBlockReason };
@@ -238,7 +236,8 @@ export function ConversationScreen(props: {
 
   async function answer(toolCallId: string, answers: Record<string, string>) {
     if (!ready) throw new Error("Reconnect before answering.");
-    if (policyBlockReason) throw new Error(policyBlockReason);
+    if (!canAct)
+      throw new Error(policyBlockReason ?? settingsError ?? "Wait for settings before answering.");
     if (pending.current) throw new Error("Another action is in progress.");
     if (
       !answerMessage ||
@@ -350,9 +349,9 @@ export function ConversationScreen(props: {
           />
         )}
         ListEmptyComponent={
-          !ready && !error ? (
+          !ready && !loadError ? (
             <Loading label="Syncing conversation…" />
-          ) : error ? null : (
+          ) : loadError ? null : (
             <View style={styles.empty}>
               <Text style={styles.emptyTitle}>What’s on your mind?</Text>
               <Text style={[layout.muted, { textAlign: "center" }]}>
@@ -363,7 +362,7 @@ export function ConversationScreen(props: {
         }
         ListFooterComponent={
           <View style={{ gap: 12 }}>
-            {error && <Notice onRetry={props.onReconnect}>{error}</Notice>}
+            {loadError && <Notice onRetry={props.onReconnect}>{loadError}</Notice>}
             {transcript.error && <Notice>{transcript.error}</Notice>}
             {canResume && (
               <Button busy={busy} onPress={retryResume}>
