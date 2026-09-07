@@ -120,7 +120,147 @@ describe("mobile model settings", () => {
       agentId: "exec",
       model: "workspace:exec",
       thinkingLevel: "high",
-      reasoningMode: undefined,
+      reasoningMode: "standard",
+      providerOptions: undefined,
     });
+  });
+  test("unset effort is Off, including an explicit model with Default effort", () => {
+    const config = data();
+    expect(resolveSettings({}, config, "exec").thinkingLevel).toBe("off");
+    expect(
+      resolveSettings({}, config, "exec", { model: "openai:gpt-4o", agentId: "exec" }).thinkingLevel
+    ).toBe("off");
+  });
+  test("declared agent bases inherit each field without importing subagent defaults", () => {
+    const config = data();
+    const descriptor = (id: string, base?: string): SettingsData["agents"][number] => ({
+      id,
+      base,
+      name: id,
+      scope: "project",
+      uiSelectable: true,
+      subagentRunnable: true,
+    });
+    config.agents = [
+      { ...descriptor("custom", "base"), aiDefaults: { thinkingLevel: "high" } },
+      { ...descriptor("base", "exec"), aiDefaults: { model: "openai:gpt-5.6" } },
+      descriptor("exec"),
+    ];
+    config.config.agentAiDefaults = {
+      custom: { subagent: { modelString: "wrong:model", thinkingLevel: "max" } },
+      base: { reasoningMode: "pro" },
+      exec: { modelString: "wrong:exec", thinkingLevel: "low" },
+    };
+    expect(resolveSettings({}, config, "custom")).toMatchObject({
+      model: "openai:gpt-5.6",
+      thinkingLevel: "high",
+      reasoningMode: "pro",
+    });
+    config.config.agentAiDefaults.custom.modelString = "local:configured";
+    expect(resolveSettings({}, config, "custom").model).toBe("local:configured");
+    config.agents[0].aiDefaults = undefined;
+    expect(resolveSettings({}, config, "custom")).toMatchObject({
+      model: "local:configured",
+      thinkingLevel: "low",
+      reasoningMode: "pro",
+    });
+    config.agents[0].aiDefaults = { thinkingLevel: "high" };
+    expect(
+      resolveSettings(
+        {
+          aiSettingsByAgent: {
+            custom: {
+              model: "local:workspace",
+              thinkingLevel: "low",
+            },
+          },
+        },
+        config,
+        "custom"
+      )
+    ).toMatchObject({
+      model: "local:workspace",
+      thinkingLevel: "low",
+      reasoningMode: "standard",
+    });
+    // The visited-set traversal must terminate while retaining valid ancestor fields.
+    config.agents[1].base = "custom";
+    delete config.config.agentAiDefaults.custom.modelString;
+    expect(resolveSettings({}, config, "custom").model).toBe("openai:gpt-5.6");
+    config.agents[0].base = "custom";
+    expect(resolveSettings({}, config, "custom").thinkingLevel).toBe("high");
+    config.agents[0].base = "missing";
+    config.config.agentAiDefaults.missing = { modelString: "local:missing" };
+    expect(resolveSettings({}, config, "custom").model).toBe("local:missing");
+  });
+  test("invalid persisted model falls through while valid fields retain precedence", () => {
+    const config = data();
+    config.config.agentAiDefaults.exec = { modelString: "local:default", thinkingLevel: "low" };
+    expect(
+      resolveSettings(
+        { aiSettingsByAgent: { exec: { model: "", thinkingLevel: "high" } } },
+        config,
+        "exec"
+      )
+    ).toMatchObject({ model: "local:default", thinkingLevel: "high" });
+  });
+  test("synced privacy and provider options survive explicit model/agent preferences", () => {
+    const config = data();
+    const providerOptions = {
+      anthropic: {
+        disableBetaFeatures: true,
+        cacheTtl: "1h" as const,
+        use1MContextModels: ["anthropic:claude-sonnet-4-20250514"],
+      },
+      google: { cache: false, custom: { enabled: true } },
+    };
+    config.config.userPreferences = { ai: { providerOptions } };
+    const selected = resolveSettings({}, config, "exec");
+    expect(selected.providerOptions).toEqual(providerOptions);
+    const changed = resolveSettings({}, config, "plan", {
+      ...selected,
+      model: "google:gemini-2.5-pro",
+      agentId: "plan",
+      thinkingLevel: "low",
+    });
+    expect(changed).toMatchObject({
+      model: "google:gemini-2.5-pro",
+      thinkingLevel: "low",
+      providerOptions,
+    });
+    // Reconnected server preferences, not a stale local selection, own privacy settings.
+    config.config.userPreferences.ai!.providerOptions = {
+      anthropic: { disableBetaFeatures: false },
+    };
+    expect(resolveSettings({}, config, "plan", changed).providerOptions).toEqual({
+      anthropic: { disableBetaFeatures: false },
+    });
+  });
+  test.each(["coder", "openrouter"])("OpenAI auth gates follow the actual %s route", (gateway) => {
+    const config = data();
+    config.providers.openai = {
+      isConfigured: true,
+      isEnabled: true,
+      apiKeySet: false,
+      codexOauthSet: true,
+      models: ["gpt-4o", "gpt-5.3-codex-spark"],
+    };
+    config.providers[gateway] = {
+      isConfigured: true,
+      isEnabled: true,
+      apiKeySet: true,
+      models: ["openai/gpt-4o", "openai/gpt-5.3-codex-spark"],
+      discoveredModels: ["openai/gpt-4o", "openai/gpt-5.3-codex-spark"],
+    };
+    config.config.routePriority = [gateway, "direct"];
+    expect(modelChoices(config, "")).toContain("openai:gpt-4o");
+    config.providers.openai.apiKeySet = true;
+    config.providers.openai.codexOauthSet = false;
+    expect(modelChoices(config, "")).toContain("openai:gpt-5.3-codex-spark");
+    config.config.routeOverrides = { "openai:gpt-5.3-codex-spark": "direct" };
+    expect(modelChoices(config, "")).not.toContain("openai:gpt-5.3-codex-spark");
+    config.config.routeOverrides = {};
+    config.providers[gateway].isEnabled = false;
+    expect(modelChoices(config, "")).not.toContain("openai:gpt-5.3-codex-spark");
   });
 });

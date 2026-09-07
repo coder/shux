@@ -13,6 +13,10 @@ mock.module("lucide-react-native", () =>
   Object.fromEntries(
     [
       "AlertCircle",
+      "ArrowDown",
+      "ArrowUp",
+      "GitCompareArrows",
+      "Square",
       "ChevronLeft",
       "Info",
       "TriangleAlert",

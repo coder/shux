@@ -1,13 +1,12 @@
-import {
-  DEFAULT_MODEL,
-  KNOWN_MODELS,
-  MODEL_ABBREVIATIONS,
-} from "../../../src/common/constants/knownModels";
+import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "../../../src/common/constants/knownModels";
 import {
   isCodexOauthAllowedModel,
   isCodexOauthRequiredModel,
 } from "../../../src/common/constants/codexOAuth";
-import { isModelAvailable } from "../../../src/common/routing";
+import { isModelAvailable, resolveRoute } from "../../../src/common/routing";
+import { collectDeclaredAncestorLayers } from "../../../src/common/utils/ai/agentAncestorLayers";
+import { resolveAgentAiSettings } from "../../../src/common/utils/ai/resolveAgentAiSettings";
+import { targetWorkspaceBucketToLayer } from "../../../src/common/types/agentAiSettings";
 import { normalizeToCanonical } from "../../../src/common/utils/ai/models";
 import { formatModelDisplayName } from "../../../src/common/utils/ai/modelDisplay";
 import { isProviderModelAccessibleFromAuthoritativeCatalog } from "../../../src/common/utils/providers/gatewayModelCatalog";
@@ -19,40 +18,59 @@ import type { ThinkingLevel } from "../../../src/common/types/thinking";
 export type SettingsData = {
   config: Pick<
     Awaited<ReturnType<MobileClient["config"]["getConfig"]>>,
-    "agentAiDefaults" | "defaultModel" | "hiddenModels" | "routePriority" | "routeOverrides"
+    | "agentAiDefaults"
+    | "defaultModel"
+    | "hiddenModels"
+    | "routePriority"
+    | "routeOverrides"
+    | "userPreferences"
   >;
   providers: Awaited<ReturnType<MobileClient["providers"]["getConfig"]>>;
   agents: Awaited<ReturnType<MobileClient["agents"]["list"]>>;
 };
 export type ChatSettings = Pick<
   SendMessageOptions,
-  "model" | "agentId" | "thinkingLevel" | "reasoningMode"
+  "model" | "agentId" | "thinkingLevel" | "reasoningMode" | "providerOptions"
 >;
 export const thinkingLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
 
 export function resolveSettings(
   workspace: Pick<FrontendWorkspaceMetadata, "aiSettingsByAgent" | "agentId" | "aiSettings">,
   data: SettingsData,
-  agentId: string
+  agentId: string,
+  selection?: ChatSettings | null
 ): ChatSettings {
   const workspaceDefaults =
     workspace.aiSettingsByAgent?.[agentId] ??
     (workspace.agentId === agentId ? workspace.aiSettings : undefined);
-  const globalDefaults = data.config.agentAiDefaults[agentId];
-  const agentDefaults = data.agents.find((agent) => agent.id === agentId)?.aiDefaults;
+  const descriptors = new Map(
+    data.agents.map((agent) => [
+      agent.id,
+      {
+        base: agent.base,
+        definitionAiDefaults: agent.aiDefaults,
+      },
+    ])
+  );
+  // Reuse desktop/server field-wise inheritance, including Off and standard defaults.
+  const resolved = resolveAgentAiSettings({
+    targetAgentId: agentId,
+    profile: "interactive",
+    explicit: selection ?? undefined,
+    targetWorkspaceSettings: workspaceDefaults
+      ? targetWorkspaceBucketToLayer(workspaceDefaults)
+      : undefined,
+    agentAiDefaults: data.config.agentAiDefaults,
+    targetDefinitionAiDefaults: descriptors.get(agentId)?.definitionAiDefaults,
+    ancestors: collectDeclaredAncestorLayers(agentId, descriptors),
+    defaultModel: data.config.defaultModel,
+    providersConfig: data.providers,
+  });
   return {
+    ...resolved.selected,
     agentId,
-    model:
-      workspaceDefaults?.model ??
-      globalDefaults?.modelString ??
-      agentDefaults?.model ??
-      data.config.defaultModel ??
-      DEFAULT_MODEL,
-    thinkingLevel:
-      workspaceDefaults?.thinkingLevel ??
-      globalDefaults?.thinkingLevel ??
-      agentDefaults?.thinkingLevel,
-    reasoningMode: workspaceDefaults?.reasoningMode ?? globalDefaults?.reasoningMode,
+    // Server-synced preferences own privacy/cache settings, even after a local model switch.
+    providerOptions: data.config.userPreferences?.ai?.providerOptions,
   };
 }
 
@@ -97,7 +115,17 @@ export function modelChoices(data: SettingsData, currentModel: string): string[]
       )
     )
       return false;
-    if (!model.startsWith("openai:")) return true;
+    // Gate only the actual direct route; gateways supply their own credentials.
+    if (
+      resolveRoute(
+        model,
+        data.config.routePriority ?? ["direct"],
+        data.config.routeOverrides ?? {},
+        isConfigured,
+        isAccessible
+      ).routeProvider !== "openai"
+    )
+      return true;
     const openai = data.providers.openai;
     if (openai?.apiKeySet && openai.codexOauthSet) return true;
     if (!openai?.apiKeySet && openai?.codexOauthSet)

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { MuxMessage, WorkspaceChatMessage } from "./transcript";
 import { applyChatEvent, createTranscriptState } from "./transcript";
-import { getContextUsage } from "./contextUsage";
+import { getContextUsage, getContextMeterData } from "./contextUsage";
 import { calculateTokenMeterData } from "../../../src/common/utils/tokens/tokenMeterUtils";
 
 const usage = {
@@ -97,4 +97,51 @@ test("context does not resurrect pre-boundary or compacted usage, but keeps the 
       },
     ]).totalTokens
   ).toBe(120);
+});
+
+test("context capacity follows per-model 1M intent without bypassing privacy or capability gates", () => {
+  const model = "anthropic:claude-sonnet-4-20250514";
+  const anthropic = { use1MContextModels: [model] };
+  const options = { model, agentId: "exec", providerOptions: { anthropic } };
+  // Pin the non-beta limit rather than depending on changing upstream model metadata.
+  const providers = {
+    anthropic: {
+      isConfigured: true,
+      isEnabled: true,
+      apiKeySet: true,
+      models: [{ id: "claude-sonnet-4-20250514", contextWindowTokens: 200_000 }],
+    },
+  };
+  const capacity = (settings: Parameters<typeof getContextMeterData>[1]) =>
+    getContextMeterData([row], settings, providers).maxTokens;
+  expect(capacity(options)).toBe(1_000_000);
+  expect(
+    capacity({
+      ...options,
+      providerOptions: {
+        anthropic: { ...anthropic, disableBetaFeatures: true },
+      },
+    })
+  ).toBe(200_000);
+  expect(
+    capacity({
+      ...options,
+      providerOptions: {
+        anthropic: { use1MContextModels: ["anthropic:another-model"] },
+      },
+    })
+  ).toBe(200_000);
+  expect(
+    capacity({
+      ...options,
+      providerOptions: {
+        anthropic: { use1MContext: true },
+      },
+    })
+  ).toBe(1_000_000);
+  expect(capacity({ ...options, model: "openai:gpt-4o" })).toBe(128_000);
+  // Canonical preferences still match a gateway-scoped model selection.
+  expect(capacity({ ...options, model: "openrouter:anthropic/claude-sonnet-4-20250514" })).toBe(
+    1_000_000
+  );
 });

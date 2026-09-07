@@ -15,6 +15,8 @@ import { Markdown } from "../components/Markdown";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { ChangesScreen } from "./ChangesScreen";
 import { ModelSettings } from "./ModelSettings";
+import { ConversationScreen } from "./ConversationScreen";
+import type { WorkspaceChatMessage } from "../transcript";
 import { Navigator } from "./Navigator";
 import { SettingsScreen } from "./SettingsScreen";
 import type { ChatSettings, SettingsData } from "../settings";
@@ -303,7 +305,19 @@ test("workspace creation cannot be dismissed or submitted twice while the server
   expect(selected).toBe(workspace);
 });
 
-const pickerValue: ChatSettings = { agentId: "exec", model: "local:one", thinkingLevel: "high" };
+const pickerValue: ChatSettings = {
+  agentId: "exec",
+  model: "local:one",
+  thinkingLevel: "high",
+  providerOptions: {
+    anthropic: {
+      disableBetaFeatures: true,
+      cacheTtl: "1h",
+      use1MContextModels: ["anthropic:claude-sonnet-4-20250514"],
+    },
+    google: { cache: false },
+  },
+};
 const pickerData: SettingsData = {
   config: { agentAiDefaults: {}, defaultModel: "local:one", hiddenModels: ["other:hidden"] },
   providers: {
@@ -354,6 +368,118 @@ function PickerHarness(props: {
     />
   );
 }
+
+test.each([
+  { selected: false, disableBetaFeatures: true },
+  { selected: true, disableBetaFeatures: true },
+  { selected: true, disableBetaFeatures: false },
+])(
+  "conversation sends resolved effort and synced options matching its context meter: %j",
+  async (scenario) => {
+    const model = "anthropic:claude-sonnet-4-20250514";
+    const providerOptions = {
+      anthropic: {
+        disableBetaFeatures: scenario.disableBetaFeatures,
+        cacheTtl: "1h" as const,
+        use1MContextModels: [model],
+      },
+      google: { cache: false },
+    };
+    const requests: Array<Parameters<MobileClient["workspace"]["sendMessage"]>[0]> = [];
+    let eventsController!: ReadableStreamDefaultController<WorkspaceChatMessage>;
+    const events = new ReadableStream<WorkspaceChatMessage>({
+      start(controller) {
+        eventsController = controller;
+      },
+    });
+    const client = createORPCClient<MobileClient>({
+      call: async (path, input, request) => {
+        switch (path.join(".")) {
+          case "config.getConfig":
+            return {
+              agentAiDefaults: {},
+              defaultModel: model,
+              userPreferences: { ai: { providerOptions } },
+            };
+          case "providers.getConfig":
+            return {
+              anthropic: {
+                isConfigured: true,
+                isEnabled: true,
+                apiKeySet: true,
+                models: [{ id: "claude-sonnet-4-20250514", contextWindowTokens: 200_000 }],
+              },
+            };
+          case "agents.list":
+            return pickerData.agents;
+          case "workspace.onChat":
+            request.signal?.addEventListener("abort", () => eventsController.close(), {
+              once: true,
+            });
+            return events.values();
+          case "workspace.sendMessage":
+            requests.push(input as Parameters<MobileClient["workspace"]["sendMessage"]>[0]);
+            return { success: true };
+          default:
+            throw new Error(`Unexpected settings call: ${path.join(".")}`);
+        }
+      },
+    });
+    const lifetime = new AbortController();
+    const view = render(
+      <ConversationScreen
+        client={client}
+        workspace={workspace}
+        serverLabel="Test"
+        signal={lifetime.signal}
+        connected
+        onReconnect={async () => {}}
+        onBack={() => {}}
+        selection={scenario.selected ? { model, agentId: "plan" } : null}
+        onSelectionChange={() => {}}
+        draft="Keep preferences"
+        onDraftChange={() => {}}
+        onChanges={() => {}}
+        onSettings={() => {}}
+      />
+    );
+    await act(async () => {
+      eventsController.enqueue({
+        type: "message",
+        id: "usage",
+        role: "assistant",
+        parts: [],
+        metadata: {
+          model,
+          historySequence: 1,
+          contextUsage: {
+            inputTokens: 100_000,
+            outputTokens: 0,
+            totalTokens: 100_000,
+            cachedInputTokens: 0,
+            reasoningTokens: 0,
+          },
+        },
+      });
+      eventsController.enqueue({ type: "caught-up", hasOlderHistory: false });
+    });
+    const send = view.getByRole("button", { name: "Send message" });
+    await waitFor(() => expect(send.getAttribute("aria-disabled")).not.toBe("true"));
+    expect(view.getByRole("progressbar").getAttribute("aria-valuenow")).toBe(
+      scenario.disableBetaFeatures ? "50" : "10"
+    );
+    fireEvent.click(send);
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0].options).toMatchObject({
+      model,
+      agentId: scenario.selected ? "plan" : "exec",
+      thinkingLevel: "off",
+      providerOptions,
+    });
+    expect(view.getByText(requests[0].options.thinkingLevel!.toUpperCase())).toBeDefined();
+    view.unmount();
+  }
+);
 
 test("model picks apply directly while keeping mode and effort", () => {
   const changes: ChatSettings[] = [];

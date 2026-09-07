@@ -18,15 +18,14 @@ import { Button, IconButton, Loading, Notice } from "../components/Controls";
 import { KeyboardAvoidingView } from "../components/Keyboard";
 import { Message } from "../components/Message";
 import { ContextUsage } from "../components/ContextUsage";
-import { getContextUsage } from "../contextUsage";
-import { calculateTokenMeterData } from "../../../../src/common/utils/tokens/tokenMeterUtils";
+import { getContextMeterData } from "../contextUsage";
 import { useConversation } from "../useConversation";
 import { linkedAbortController } from "../useConnection";
 import { modelName, resolveSettings } from "../settings";
 import type { ChatSettings } from "../settings";
 import { ModelSettings } from "./ModelSettings";
 import { colors, fontFamily, layout, radii, spacing, typography } from "../theme";
-import { DEFAULT_THINKING_LEVEL } from "../../../../src/common/types/thinking";
+import { THINKING_LEVEL_OFF } from "../../../../src/common/types/thinking";
 
 // RN Web reports scrollHeight, which cannot shrink a fixed-height textarea and
 // can expand hidden stack screens. Let the browser size content; native uses its intrinsic measurement.
@@ -80,15 +79,15 @@ export function ConversationScreen(props: {
     return () => abort.abort();
   }, [props.signal]);
   const agentId = props.workspace.agentId ?? "exec";
-  const options =
-    props.selection ?? (settings ? resolveSettings(props.workspace, settings, agentId) : null);
-  const context = calculateTokenMeterData(
-    getContextUsage(transcript.messages, options?.model ?? "unknown"),
-    options?.model ?? "unknown",
-    false,
-    false,
-    settings?.providers
-  );
+  const options = settings
+    ? resolveSettings(
+        props.workspace,
+        settings,
+        props.selection?.agentId ?? agentId,
+        props.selection
+      )
+    : null;
+  const context = getContextMeterData(transcript.messages, options, settings?.providers);
   const ready =
     props.connected && !props.signal.aborted && transcript.caughtUp && !error && settings !== null;
   const running = ready && transcript.streaming;
@@ -106,8 +105,7 @@ export function ConversationScreen(props: {
         {
           workspaceId: props.workspace.id,
           message,
-          // Persist the effective default alongside the model, like the desktop composer.
-          options: { ...options, thinkingLevel: options.thinkingLevel ?? DEFAULT_THINKING_LEVEL },
+          options,
         },
         { signal }
       );
@@ -322,7 +320,7 @@ export function ConversationScreen(props: {
               </Text>
               {options && (
                 <Text style={styles.effortLabel}>
-                  {(options.thinkingLevel ?? DEFAULT_THINKING_LEVEL).toUpperCase()}
+                  {(options.thinkingLevel ?? THINKING_LEVEL_OFF).toUpperCase()}
                 </Text>
               )}
               <ChevronDown size={12} color={colors.muted} />
