@@ -184,7 +184,9 @@ export function transition(
     commands.push({ type: "decision", decision: value });
   };
   const current = state.turn.operation;
-  if (state.lifetime === "disposed")
+  // A retained Stop cleanup may finish while destructive disposal drains its lease.
+  // Only its exact release remains legal; disposal never admits new work.
+  if (state.lifetime === "disposed" && event.type !== "compaction-follow-up-finish")
     return {
       state,
       commands,
@@ -441,7 +443,8 @@ export function transition(
     case "compaction-follow-up":
     case "compaction-follow-up-cleanup":
       if (
-        state.lifetime === "open" &&
+        (state.lifetime === "open" ||
+          (state.lifetime === "shutting-down" && event.type === "compaction-follow-up-cleanup")) &&
         state.compaction.status ===
           (event.type === "compaction-follow-up" ? "ready" : "abandoned") &&
         !state.compaction.followUp &&
@@ -694,7 +697,12 @@ export class TurnCoordinator {
   }
 
   canClearCompactionFollowUp(token: CompactionToken): boolean {
-    return !this.closing && this.state.compaction.followUp?.id === token.id;
+    // Closing forbids dispatch, but cannot revoke Stop cleanup already joined
+    // by a physical lease. Replacement still retires the exact token.
+    return (
+      this.state.compaction.followUp?.id === token.id &&
+      (!this.closing || this.state.compaction.status === "abandoned")
+    );
   }
 
   recordCompactionSummary(summaryId: string | null): void {

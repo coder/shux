@@ -98,6 +98,46 @@ describe("TurnCoordinator", () => {
     expect(coordinator.claimCompactionFollowUp()).toBeDefined();
   });
 
+  test.each([false, true])(
+    "shutdown retains only exact abandoned cleanup (claimed=%s)",
+    (claimed) => {
+      const { coordinator } = setup();
+      const ready = claimed ? coordinator.claimCompactionFollowUp() : undefined;
+      coordinator.invalidateCompaction(true);
+      coordinator.beginShutdown();
+      const cleanup = ready ?? coordinator.claimCompactionFollowUpCleanup();
+      if (!cleanup) throw new Error("Expected cleanup through shutdown");
+      expect(coordinator.canClearCompactionFollowUp(cleanup)).toBe(true);
+      expect(coordinator.isCurrentCompaction(cleanup)).toBe(false);
+      expect(coordinator.claimCompactionFollowUp()).toBeUndefined();
+      expect(
+        coordinator.prepare({
+          kind: "fresh",
+          intent: "direct",
+          expectedTurnId: coordinator.turnId,
+          compactionHandoff: cleanup,
+        }).status
+      ).toBe("rejected");
+      coordinator.dispose();
+      expect(coordinator.canClearCompactionFollowUp(cleanup)).toBe(true);
+      coordinator.finishCompactionFollowUp(cleanup);
+      expect(coordinator.canClearCompactionFollowUp(cleanup)).toBe(false);
+      expect(coordinator.claimCompactionFollowUpCleanup()).toBeUndefined();
+    }
+  );
+
+  test("shutdown preserves ready recovery intent without granting cleanup", () => {
+    const { coordinator } = setup();
+    const ready = coordinator.claimCompactionFollowUp();
+    if (!ready) throw new Error("Expected follow-up");
+    coordinator.beginShutdown();
+    expect(coordinator.canClearCompactionFollowUp(ready)).toBe(false);
+    expect(coordinator.isCurrentCompaction(ready)).toBe(false);
+    coordinator.finishCompactionFollowUp(ready);
+    expect(coordinator.claimCompactionFollowUp()).toBeUndefined();
+    expect(coordinator.claimCompactionFollowUpCleanup()).toBeUndefined();
+  });
+
   test("a compaction handoff survives its own admission, but stale completion cannot release its replacement", () => {
     const { coordinator } = setup();
     const token = coordinator.beginCompactionObservation("continuous");

@@ -679,6 +679,11 @@ interface CachedMemoryContext {
   includesHotMemories: boolean;
 }
 
+interface CompactionFollowUpDispatch {
+  summary?: MuxMessage;
+  accepted: boolean;
+}
+
 interface SendMessageInternalOptions {
   compactionHandoff?: CompactionToken;
   preparation?: PreparationAttempt;
@@ -691,6 +696,8 @@ interface SendMessageInternalOptions {
   /** Goal identity persisted alongside goalKind so chat-tail reconciliation can scope the row. */
   goalId?: string;
   startStreamInBackground?: boolean;
+  /** Synchronous receipt at the rollback frontier, before goal sync or event observers. */
+  onRowsDurable?: () => void;
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
   onCanceled?: (reason: string) => Promise<void> | void;
@@ -3326,18 +3333,26 @@ export class AgentSession {
     const markRowsDurable = (): void => {
       if (attempt.durability !== "rollback-eligible") return;
       attempt.durability = "durable";
+      internal?.onRowsDurable?.();
       if ((internal?.preTurnMessages?.length ?? 0) > 0) internal?.onPreTurnRowsPersisted?.();
     };
     const accept = async (): Promise<void> => {
       await internal?.onAccepted?.();
       attempt.durability = "accepted";
     };
+    // Capture known admission refusal where it occurs; later token changes cannot
+    // turn a genuine goal/provider failure into a successful historical handoff.
+    const refuseAdmission = (error: SendMessageError): AgentSessionResult<void> => ({
+      success: false,
+      error,
+      ...(attempt.durability !== "rollback-eligible" ? { superseded: true as const } : {}),
+    });
     const refuseBeforeAcceptance = async (
       error: SendMessageError
     ): Promise<AgentSessionResult<void>> => {
       if (attempt.durability === "rollback-eligible" && !(await rollbackPersistedTurnRows()))
         markRowsDurable();
-      return Err(error);
+      return refuseAdmission(error);
     };
     let cancellationHandled = false;
     let cancellationDisabled = false;
@@ -4154,7 +4169,7 @@ export class AgentSession {
         // refunds keep the charge — refunding here would leave provider-visible rows uncharged.
         markRowsDurable();
       }
-      return Err(
+      return refuseAdmission(
         createUnknownSendMessageError(
           "Send refused: the caller's admission became stale before the turn was accepted."
         )
@@ -4205,7 +4220,7 @@ export class AgentSession {
     // creation) lands in the holder the stream's prepareStep will read.
     const turnThinkingOverride: ActiveTurnThinkingOverride = {};
     if (isAdmissionStale())
-      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+      return refuseAdmission(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
     this.coordinator.acceptThinkingOverride(
       turnThinkingOverride,
       attempt.owner ?? attempt.expectedTurn
@@ -4255,10 +4270,14 @@ export class AgentSession {
       // A fresh accepted user send supersedes any persisted startup-abandon
       // classification from previous turns.
       if (isAdmissionStale())
-        return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+        return refuseAdmission(
+          createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+        );
       await this.clearStartupAutoRetryAbandon();
       if (isAdmissionStale())
-        return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+        return refuseAdmission(
+          createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+        );
       this.retryManager.cancel();
       this.retryManager.setEnabled(true);
       await this.persistAutoRetryEnabledPreference(true);
@@ -4267,7 +4286,7 @@ export class AgentSession {
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
     if (isAdmissionStale())
-      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+      return refuseAdmission(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
     this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
     try {
       await accept();
@@ -6664,6 +6683,8 @@ export class AgentSession {
     let emittedStreamEnd = false;
     const completedCompactionRequest = this.activeCompactionRequest;
     let continuedAfterCompaction = false;
+    let handledCompaction = false;
+    let followUpDispatchStarted = false;
 
     try {
       this.activeCompactionRequest = undefined;
@@ -6683,6 +6704,7 @@ export class AgentSession {
         streamEndPayload,
         completedCompactionRequest?.id
       );
+      handledCompaction = handled;
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return;
 
@@ -6761,6 +6783,7 @@ export class AgentSession {
         // not the last row, so target it by ID (stashed in onCompactionComplete).
         const rlmSummaryId = this.pendingCompactionFollowUpSummaryId;
         this.coordinator.recordCompactionSummary(null);
+        followUpDispatchStarted = true;
         continuedAfterCompaction = await this.dispatchPendingFollowUp(rlmSummaryId ?? undefined);
         if (
           !this.coordinator.isCurrentTurn(turn) ||
@@ -6835,6 +6858,27 @@ export class AgentSession {
           this.emitChatEvent(payload);
         } catch {
           // Best-effort; don't mask the original error.
+        }
+      }
+
+      // Goal/accounting or boundary-publication failures can bypass dispatch
+      // after the boundary commits. History revalidation also makes an uncommitted
+      // compaction request a no-op here.
+      // Stop still owns that cleanup; the terminal lease joins it before shutdown ends.
+      // Once dispatch began, its own receipt protects any irrevocable continuation row.
+      if (
+        (handledCompaction || completedCompactionRequest != null) &&
+        !followUpDispatchStarted &&
+        this.coordinator.isCurrentOperation(operation) &&
+        this.coordinator.compactionIntent.status === "abandoned"
+      ) {
+        try {
+          await this.dispatchPendingFollowUp(this.pendingCompactionFollowUpSummaryId ?? undefined);
+        } catch (cleanupError) {
+          log.warn("Abandoned compaction follow-up cleanup failed", {
+            workspaceId: this.workspaceId,
+            error: getErrorMessage(cleanupError),
+          });
         }
       }
     } finally {
@@ -7914,9 +7958,14 @@ export class AgentSession {
     summaryMessageId?: string,
     cancelResume?: () => boolean
   ): Promise<boolean> {
-    if (this.coordinator.disposed || this.coordinator.closing) {
+    if (
+      this.coordinator.disposed ||
+      (this.coordinator.closing && this.coordinator.compactionIntent.status !== "abandoned")
+    ) {
       return false;
     }
+    // A leased terminal producer can reach its abandoned boundary only after
+    // shutdown begins. Join its cleanup while continuing to forbid new sends.
     using _execution = this.coordinator.enterExecution();
     // Claim before history I/O: a send admitted and completed during that read
     // must not make an obsolete summary look like a fresh idle continuation.
@@ -7924,8 +7973,34 @@ export class AgentSession {
       this.coordinator.claimCompactionFollowUp() ??
       this.coordinator.claimCompactionFollowUpCleanup();
     if (!token) return false;
+    const dispatch: CompactionFollowUpDispatch = { accepted: false };
     try {
-      return await this.dispatchOwnedCompactionFollowUp(token, summaryMessageId, cancelResume);
+      return await this.dispatchOwnedCompactionFollowUp(
+        token,
+        dispatch,
+        summaryMessageId,
+        cancelResume
+      );
+    } catch (error) {
+      // Rejections must settle the same abandoned obligation as normal refusals.
+      // Keep the captured payload guard and durable receipt: a replacement summary
+      // or already-persisted Continue must never lose its recovery marker here.
+      if (
+        !dispatch.accepted &&
+        dispatch.summary &&
+        this.coordinator.compactionIntent.status === "abandoned" &&
+        this.coordinator.canClearCompactionFollowUp(token)
+      ) {
+        try {
+          await this.clearPendingFollowUpFromSummary(dispatch.summary, token);
+        } catch (cleanupError) {
+          log.warn("Abandoned compaction follow-up cleanup failed", {
+            workspaceId: this.workspaceId,
+            error: getErrorMessage(cleanupError),
+          });
+        }
+      }
+      throw error;
     } finally {
       this.coordinator.finishCompactionFollowUp(token);
     }
@@ -7933,6 +8008,7 @@ export class AgentSession {
 
   private async dispatchOwnedCompactionFollowUp(
     token: CompactionToken,
+    dispatch: CompactionFollowUpDispatch,
     summaryMessageId?: string,
     cancelResume?: () => boolean
   ): Promise<boolean> {
@@ -8013,6 +8089,7 @@ export class AgentSession {
     if (!isCompactionSummaryMetadata(muxMeta) || !muxMeta.pendingFollowUp) {
       return false;
     }
+    dispatch.summary = lastMessage;
 
     if (!this.coordinator.isCurrentCompaction(token)) {
       // Stop cancels dispatch while retaining ownership of its durable cleanup.
@@ -8137,6 +8214,12 @@ export class AgentSession {
       goalAdmissionStale = admission.admissionStale;
     }
 
+    if (!this.coordinator.isCurrentCompaction(token)) {
+      if (this.coordinator.canClearCompactionFollowUp(token))
+        await this.clearPendingFollowUpFromSummary(lastMessage, token);
+      return false;
+    }
+
     // Codex P1 (PRRT_kwDOPxxmWM6cQt3j): the queue/busy sample above ages
     // across the awaited goal read and the send's own preflight. Re-evaluate
     // the idle rule through the send-admission gates — all of them run before
@@ -8256,12 +8339,16 @@ export class AgentSession {
     // before sendQueuedMessages() runs, preventing race conditions.
     // Mark as synthetic so recovery/background dispatches do not implicitly
     // re-enable auto-retry after a user explicitly opted out.
-    let accepted = false;
     const sendResult = await this.sendMessage(finalText, options, {
       synthetic: true,
       compactionHandoff: token,
+      // Goal sync and synchronous message observers run after rollback becomes
+      // forbidden but before onAccepted. Stop cannot erase that durable handoff.
+      onRowsDurable: () => {
+        dispatch.accepted = true;
+      },
       onAccepted: () => {
-        accepted = true;
+        dispatch.accepted = true;
       },
       agentInitiated: followUp.agentInitiated,
       goalKind: persistedGoalKind,
@@ -8274,15 +8361,15 @@ export class AgentSession {
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
       admissionStale: followUpAdmissionStale,
     });
-    if (!sendResult.success && !(accepted && sendResult.superseded)) {
-      if (!accepted && cancelResume?.()) {
+    if (!sendResult.success && !(dispatch.accepted && sendResult.superseded)) {
+      if (!dispatch.accepted && cancelResume?.()) {
         await this.clearPendingFollowUpFromSummary(lastMessage, token);
         return false;
       }
       // A stale-admission refusal is the idle rule (or a goal transition)
       // working as intended, not a recovery failure: route it through the
       // same skip path as the pre-send check instead of throwing.
-      if (!accepted && followUpAdmissionStale?.() === true) {
+      if (!dispatch.accepted && followUpAdmissionStale?.() === true) {
         log.info("Pending follow-up refused at send admission; skipping it", {
           workspaceId: this.workspaceId,
           summaryMessageId: lastMessage.id,
@@ -8302,7 +8389,7 @@ export class AgentSession {
     // Success can be a pre-acceptance no-op. Conversely, an accepted send may
     // return a captured supersession error before startup; that cannot undo its
     // durable handoff. Genuine startup errors still follow the failure path above.
-    if (!accepted) return false;
+    if (!dispatch.accepted) return false;
 
     // Codex P2 (PRRT_kwDOPxxmWM6cRJEE): if the original wrap-up dispatcher
     // crashed between send acceptance and its tryMarkBudgetLimitInjected
