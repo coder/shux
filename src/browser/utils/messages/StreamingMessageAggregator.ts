@@ -16,6 +16,7 @@ import {
 
 import {
   copyStreamLifecycleSnapshot,
+  copyStreamMetadataSnapshot,
   type StreamStartEvent,
   type StreamMetadataEvent,
   type StreamDeltaEvent,
@@ -2185,7 +2186,7 @@ export class StreamingMessageAggregator {
       (this.workspaceId !== undefined && this.workspaceId !== data.workspaceId)
     )
       return;
-    const metadata = { ...data.metadata, routeProvider: data.metadata.routeProvider ?? undefined };
+    const metadata = copyStreamMetadataSnapshot(data.metadata);
     context.model = metadata.model;
     context.metadataModel = metadata.metadataModel;
     context.thinkingLevel = metadata.thinkingLevel;

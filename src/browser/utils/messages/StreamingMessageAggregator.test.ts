@@ -4744,6 +4744,17 @@ test("fallback metadata refreshes desktop model identity without dropping stream
       routeProvider: null,
     },
   };
+  applyWorkspaceChatEventToAggregator(aggregator, {
+    ...event,
+    metadata: {
+      ...event.metadata,
+      model: TEST_MODEL,
+      thinkingLevel: "high",
+      routedThroughGateway: true,
+      routeProvider: "coder",
+      modelFallback: { requestedModel: TEST_MODEL, refusedModels: [TEST_MODEL] },
+    },
+  });
   applyWorkspaceChatEventToAggregator(aggregator, { ...event, workspaceId: "different" });
   applyWorkspaceChatEventToAggregator(aggregator, { ...event, messageId: "different" });
   expect(aggregator.getCurrentModel()).toBe(TEST_MODEL);
@@ -4752,6 +4763,10 @@ test("fallback metadata refreshes desktop model identity without dropping stream
   expect(aggregator.getActiveStreamMetadataModel()).toBe("openai:gpt-4o");
   expect(aggregator.getAllMessages()[0].parts).toBe(original.parts);
   expect(aggregator.getAllMessages()[0].metadata?.contextWindowTokens).toBe(400_000);
+  expect(aggregator.getAllMessages()[0].metadata?.thinkingLevel).toBeUndefined();
+  expect(aggregator.getAllMessages()[0].metadata?.routeProvider).toBeUndefined();
+  expect(aggregator.getAllMessages()[0].metadata?.modelFallback).toBeUndefined();
+
   expect(aggregator.getActiveStreamUsage("msg1")).toBe(usage);
   expect(aggregator.hasInterruptibleActiveStream()).toBe(true);
   applyWorkspaceChatEventToAggregator(aggregator, {

@@ -275,6 +275,18 @@ test("live fallback metadata updates capacity without resetting parts, usage, or
       },
     },
   };
+  state = applyChatEvent(state, {
+    ...metadataEvent,
+    metadata: {
+      ...metadataEvent.metadata,
+      model: before.metadata!.model!,
+      metadataModel: before.metadata!.model!,
+      contextWindowTokens: 1_000_000,
+      routeProvider: "coder",
+      routedThroughGateway: true,
+      thinkingLevel: "high",
+    },
+  });
   expect(applyChatEvent(state, { ...metadataEvent, messageId: "old" })).toBe(state);
   expect(applyChatEvent(state, { ...metadataEvent, workspaceId: "other" })).toBe(state);
   state = applyChatEvent(state, metadataEvent);
@@ -284,12 +296,26 @@ test("live fallback metadata updates capacity without resetting parts, usage, or
   expect(state.messages.find((message) => message.id === "b")?.metadata?.contextUsage).toBe(
     before.metadata?.contextUsage
   );
+  const metadata = state.messages.find((message) => message.id === "b")?.metadata;
+  expect(metadata?.thinkingLevel).toBeUndefined();
+  expect(metadata?.routeProvider).toBeUndefined();
+  expect(metadata?.routedThroughGateway).toBe(false);
+  expect(metadata?.modelFallback).toEqual(metadataEvent.metadata.modelFallback);
   expect(current().totalPercentage).toBe(25);
   state = applyChatEvent(state, {
     ...metadataEvent,
-    metadata: { ...metadataEvent.metadata, contextWindowTokens: null },
+    metadata: {
+      model: "local:unknown",
+      metadataModel: "local:unknown",
+      contextWindowTokens: null,
+      routedThroughGateway: false,
+      routeProvider: null,
+    },
   });
   expect(current().maxTokens).toBeUndefined();
+  expect(
+    state.messages.find((message) => message.id === "b")?.metadata?.modelFallback
+  ).toBeUndefined();
   // Next-hop usage must still use unknown, not a configured model's familiar capacity.
   state = applyChatEvent(state, delta);
   expect(current().maxTokens).toBeUndefined();

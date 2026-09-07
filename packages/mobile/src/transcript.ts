@@ -1,3 +1,4 @@
+import { copyStreamMetadataSnapshot } from "../../../src/common/types/stream";
 import type { WorkspaceChatMessage } from "../../../src/common/orpc/types";
 import type { MuxMessage, MuxToolPart } from "../../../src/common/types/message";
 
@@ -179,8 +180,7 @@ export function applyChatEvent(
         ...message,
         metadata: {
           ...message.metadata,
-          ...event.metadata,
-          routeProvider: event.metadata.routeProvider ?? undefined,
+          ...copyStreamMetadataSnapshot(event.metadata),
         },
       }));
     case "stream-delta":

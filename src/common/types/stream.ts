@@ -42,6 +42,19 @@ export type CompletedMessagePart = MuxReasoningPart | MuxTextPart | MuxToolPart;
 
 export type StreamStartEvent = z.infer<typeof StreamStartEventSchema>;
 export type StreamMetadataEvent = z.infer<typeof StreamMetadataEventSchema>;
+/** Explicit keys make omitted optional fields clear the previous attempt instead of lingering. */
+export function copyStreamMetadataSnapshot(metadata: StreamMetadataEvent["metadata"]) {
+  return {
+    model: metadata.model,
+    metadataModel: metadata.metadataModel,
+    contextWindowTokens: metadata.contextWindowTokens,
+    thinkingLevel: metadata.thinkingLevel,
+    routedThroughGateway: metadata.routedThroughGateway,
+    routeProvider: metadata.routeProvider ?? undefined,
+    modelFallback: metadata.modelFallback,
+  };
+}
+
 export type StreamDeltaEvent = z.infer<typeof StreamDeltaEventSchema>;
 export type StreamEndEvent = z.infer<typeof StreamEndEventSchema>;
 export type StreamAbortReason = z.infer<typeof StreamAbortReasonSchema>;
