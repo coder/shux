@@ -70,10 +70,13 @@ export class ServerUpdater {
   }
 
   setChannel(channel: UpdateChannel): void {
-    if (!this.layout || channel === this.channel) return;
+    if (channel === this.channel) return;
     if (this.installing || this.status.type === "checking" || this.status.type === "downloading")
       throw new Error("An update operation is in progress");
+    // An unsupported layout still records the preference so it applies once the operator has
+    // met the reported requirement and restarted.
     this.channel = channel;
+    if (!this.layout) return;
     this.availableVersion = null;
     this.staged = null;
     this.setStatus({ type: "idle" });

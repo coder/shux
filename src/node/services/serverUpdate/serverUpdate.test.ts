@@ -637,7 +637,7 @@ describe("staging and activation", () => {
 });
 
 describe("server updater", () => {
-  test("unsupported actions have no effects", async () => {
+  test("unsupported actions have no effects beyond recording the channel preference", async () => {
     const effect = () => {
       throw new Error("must not run");
     };
@@ -653,7 +653,7 @@ describe("server updater", () => {
     await updater.installUpdate();
     updater.setChannel("nightly");
     expect(updater.getStatus().type).toBe("unsupported");
-    expect(updater.getChannel()).toBe("stable");
+    expect(updater.getChannel()).toBe("nightly");
   });
   test("selects dist-tags by effective channel, including downgrades, and resets staged updates", async () => {
     const { layout } = await fixture("bun", "2.0.0-next.1");

@@ -96,6 +96,24 @@ describe("UpdateService channel persistence", () => {
     expect(service.getChannel()).toBe("stable");
   });
 
+  it("persists the channel while the updater reports an unsupported layout", async () => {
+    const { config, setUpdateChannel } = createMockConfig("stable");
+    const service = new UpdateService(config);
+    const channels: UpdateChannel[] = [];
+    const internal = service as unknown as {
+      impl: { setChannel(channel: UpdateChannel): void; getChannel(): UpdateChannel };
+      currentStatus: { type: string };
+    };
+    internal.impl = {
+      setChannel: (channel) => channels.push(channel),
+      getChannel: () => channels.at(-1) ?? "stable",
+    };
+    internal.currentStatus = { type: "unsupported" };
+    await service.setChannel("nightly");
+    expect(setUpdateChannel).toHaveBeenLastCalledWith("nightly");
+    expect(service.getChannel()).toBe("nightly");
+  });
+
   it("serializes concurrent changes so a rollback cannot land after a later switch", async () => {
     const { config, setUpdateChannel, getUpdateChannel } = createMockConfig("stable");
     // Config writes complete in order but asynchronously, like the real FIFO editor.

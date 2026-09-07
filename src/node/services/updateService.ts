@@ -139,7 +139,6 @@ export class UpdateService {
 
   private async changeChannel(channel: UpdateChannel): Promise<void> {
     await this.ready;
-    if (this.impl && this.currentStatus.type === "unsupported") return;
     // The runtime switch discards a staged update, so persist first: a failed write then costs
     // nothing, and a runtime refusal (operation in progress) reverts the write so the two never
     // disagree.
