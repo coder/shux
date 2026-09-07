@@ -1,11 +1,7 @@
 import type { TurnCompletion } from "./streamManager";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
-import {
-  WorkspaceService,
-  generateForkBranchName,
-  generateForkTitle,
-  STOP_UNRECORDED_MESSAGE,
-} from "./workspaceService";
+import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
+import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";

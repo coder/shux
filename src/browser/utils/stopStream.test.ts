@@ -1,21 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { installDom } from "../../../tests/ui/dom";
+import { describe, expect, test } from "bun:test";
 import type { APIClient } from "@/browser/contexts/API";
-import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { takeChatErrors } from "./chatErrorToasts";
 import { stopStream } from "./stopStream";
 
 describe("stopStream", () => {
-  let cleanupDom: (() => void) | null = null;
-
-  beforeEach(() => {
-    cleanupDom = installDom();
-  });
-
-  afterEach(() => {
-    cleanupDom?.();
-    cleanupDom = null;
-  });
-
   function apiReturning(
     result: { success: true; data: undefined } | { success: false; error: string }
   ): { api: APIClient; calls: unknown[] } {
@@ -31,35 +19,27 @@ describe("stopStream", () => {
     return { api, calls };
   }
 
-  function collectToasts(): unknown[] {
-    const toasts: unknown[] = [];
-    window.addEventListener(CUSTOM_EVENTS.CHAT_ERROR_TOAST, (event) => {
-      toasts.push((event as CustomEvent).detail);
-    });
-    return toasts;
-  }
-
-  test("a Stop the backend could not record is shown as a chat error toast", async () => {
+  test("a Stop the backend could not record is retained as the workspace's chat error", async () => {
     const { api } = apiReturning({ success: false, error: "disk full" });
-    const toasts = collectToasts();
 
-    await stopStream(api, "ws-1");
+    // No chat input is subscribed (the user may have switched workspaces mid-Stop): the error
+    // must wait for the workspace's input rather than be dropped with a one-shot event.
+    await stopStream(api, "ws-unrecorded");
 
-    expect(toasts).toEqual([{ workspaceId: "ws-1", message: "disk full" }]);
+    expect(takeChatErrors("ws-unrecorded")).toEqual(["disk full"]);
   });
 
-  test("a recorded Stop retires owed monitor output without a toast", async () => {
+  test("a recorded Stop retires owed monitor output without a chat error", async () => {
     const { api, calls } = apiReturning({ success: true, data: undefined });
-    const toasts = collectToasts();
 
-    await stopStream(api, "ws-1", { abandonPartial: true });
+    await stopStream(api, "ws-recorded", { abandonPartial: true });
 
     expect(calls).toEqual([
       {
-        workspaceId: "ws-1",
+        workspaceId: "ws-recorded",
         options: { abandonPartial: true, retireBashMonitorAttention: true },
       },
     ]);
-    expect(toasts).toEqual([]);
+    expect(takeChatErrors("ws-recorded")).toEqual([]);
   });
 });

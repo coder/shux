@@ -123,13 +123,6 @@ export const CUSTOM_EVENTS = {
    */
   OPEN_GOAL_TAB: "mux:openGoalTab",
 
-  /**
-   * Event to show an error toast in a workspace's chat input (child goal budget exhaustion,
-   * a Stop the backend could not record, ...).
-   * Detail: { workspaceId: string, message: string }
-   */
-  CHAT_ERROR_TOAST: "mux:chatErrorToast",
-
   REVEAL_TIMELINE_ANCHOR: "mux:revealTimelineAnchor",
 
   /**
@@ -201,10 +194,6 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_GOAL_TAB]: {
     workspaceId: string;
     openCompleteInput?: boolean;
-  };
-  [CUSTOM_EVENTS.CHAT_ERROR_TOAST]: {
-    workspaceId: string;
-    message: string;
   };
   [CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR]: {
     workspaceId: string;

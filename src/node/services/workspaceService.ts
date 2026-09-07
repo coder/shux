@@ -26,6 +26,7 @@ import {
   reassignPinnedTimestamps,
 } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
@@ -698,13 +699,6 @@ const WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE =
 // idle-compaction loop must not count it toward suppression.
 const IDLE_ONLY_BUSY_SKIP_MESSAGE = "Workspace is busy; idle-only send was skipped.";
 const BASH_MONITOR_PERSIST_RETRY_DELAYS_MS = [50, 200] as const;
-
-/**
- * Returned by a user Stop whose startup abandon marker or monitor-attention retirement could not
- * be written (see interruptStream).
- */
-export const STOP_UNRECORDED_MESSAGE =
-  "Stop could not be recorded on disk, so the stopped work may resume on restart.";
 
 /** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
 const SEND_ADMISSION_STALE_MESSAGE =

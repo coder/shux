@@ -1,4 +1,5 @@
 import { AgentSideConnection, PROTOCOL_VERSION, ndJsonStream } from "@agentclientprotocol/sdk";
+import { STOP_UNRECORDED_MESSAGE } from "../../src/common/constants/workspace";
 import type { OnChatMode, WorkspaceChatMessage } from "../../src/common/orpc/types";
 import { MuxAgent } from "../../src/node/acp/agent";
 import type { ORPCClient, ServerConnection } from "../../src/node/acp/serverConnection";
@@ -888,6 +889,25 @@ describe("ACP prompt stream correlation", () => {
         options: { retireBashMonitorAttention: true },
       },
     ]);
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+
+  it("settles pending prompts as cancelled when the Stop stopped the stream but was not recorded", async () => {
+    const harness = createHarness({
+      interruptStream: async () => ({ success: false, error: STOP_UNRECORDED_MESSAGE }),
+    });
+    const { newSessionResponse, promptPromise } = await createDefaultPromptTurn(harness);
+
+    await expect(harness.agent.cancel({ sessionId: newSessionResponse.sessionId })).rejects.toThrow(
+      STOP_UNRECORDED_MESSAGE
+    );
+
+    await expect(promptPromise).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: undefined,
+    });
 
     harness.closeConnection();
     await harness.connectionClosed;

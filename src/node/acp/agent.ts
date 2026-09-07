@@ -29,6 +29,7 @@ import type {
 import { RequestError } from "@agentclientprotocol/sdk";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
+import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import {
   DEFAULT_COMPACTION_WORD_TARGET,
   WORDS_TO_TOKENS_RATIO,
@@ -620,18 +621,21 @@ export class MuxAgent implements Agent {
       options: { retireBashMonitorAttention: true },
     });
 
-    if (!interruptResult.success) {
-      throw new Error(`cancel: workspace.interruptStream failed: ${interruptResult.error}`);
-    }
-
     // Resolve any pending prompt immediately after a successful interrupt request.
     // Backend abort events can be dropped or synthesized without a messageId when no
     // active stream exists; waiting exclusively for terminal chat events can leave
-    // ACP prompt requests hanging indefinitely.
-    this.resolveTurn(sessionId, {
-      stopReason: "cancelled",
-      usage: this.latestUsageBySessionId.get(sessionId),
-    });
+    // ACP prompt requests hanging indefinitely. STOP_UNRECORDED_MESSAGE reports a stream
+    // that did stop (only its durable Stop records failed), so the prompt settles as
+    // cancelled before that failure is reported below.
+    if (interruptResult.success || interruptResult.error === STOP_UNRECORDED_MESSAGE) {
+      this.resolveTurn(sessionId, {
+        stopReason: "cancelled",
+        usage: this.latestUsageBySessionId.get(sessionId),
+      });
+    }
+    if (!interruptResult.success) {
+      throw new Error(`cancel: workspace.interruptStream failed: ${interruptResult.error}`);
+    }
   }
 
   async setSessionConfigOption(

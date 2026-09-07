@@ -1,5 +1,5 @@
 import type { APIClient } from "@/browser/contexts/API";
-import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import { publishChatError } from "@/browser/utils/chatErrorToasts";
 
 /**
  * User Stop: interrupts the stream and dismisses owed background monitor output instead of letting
@@ -16,8 +16,6 @@ export async function stopStream(
     options: { ...options, retireBashMonitorAttention: true },
   });
   if (!result.success) {
-    window.dispatchEvent(
-      createCustomEvent(CUSTOM_EVENTS.CHAT_ERROR_TOAST, { workspaceId, message: result.error })
-    );
+    publishChatError(workspaceId, result.error);
   }
 }

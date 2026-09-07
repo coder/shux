@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { takeChatErrors } from "@/browser/utils/chatErrorToasts";
 import type { DeleteMessage, StreamErrorMessage, WorkspaceChatMessage } from "@/common/orpc/types";
 import type {
   ReasoningDeltaEvent,
@@ -94,40 +94,6 @@ class StubAggregator implements WorkspaceChatEventAggregator {
 }
 
 describe("applyWorkspaceChatEventToAggregator", () => {
-  function withDispatchSpy<T>(run: (dispatched: Event[]) => T): T {
-    const originalWindow = globalThis.window;
-    const originalCustomEvent = globalThis.CustomEvent;
-    const dispatched: Event[] = [];
-
-    // CI bun environment may lack CustomEvent (it was previously provided by happy-dom).
-    // createCustomEvent() in src/common/constants/events.ts uses `new CustomEvent(...)`.
-    if (typeof globalThis.CustomEvent === "undefined") {
-      // Minimal polyfill: only needs to carry .type and .detail for our assertions.
-      globalThis.CustomEvent = class CustomEvent extends Event {
-        detail: unknown;
-
-        constructor(type: string, init?: CustomEventInit) {
-          super(type, init);
-          this.detail = init?.detail;
-        }
-      } as typeof globalThis.CustomEvent;
-    }
-
-    globalThis.window = {
-      dispatchEvent: (event: Event) => {
-        dispatched.push(event);
-        return true;
-      },
-    } as unknown as Window & typeof globalThis;
-
-    try {
-      return run(dispatched);
-    } finally {
-      globalThis.window = originalWindow;
-      globalThis.CustomEvent = originalCustomEvent;
-    }
-  }
-
   test("stream-start routes to handleStreamStart", () => {
     const aggregator = new StubAggregator();
 
@@ -197,29 +163,24 @@ describe("applyWorkspaceChatEventToAggregator", () => {
     expect(hint).toBe("immediate");
     expect(aggregator.calls).toEqual(["handleRuntimeStatus:starting:ssh"]);
   });
-  test("goal-budget-limited child events dispatch a toast without mutating messages", () => {
-    withDispatchSpy((dispatched) => {
-      const aggregator = new StubAggregator();
-      const event: WorkspaceChatMessage = {
-        type: "goal-budget-limited",
-        workspaceId: "parent-1",
-        goalId: "goal-1",
-        causedByChild: true,
-        childWorkspaceId: "child-1",
-        message: "Child workspace exceeded the parent's goal budget.",
-      };
+  test("goal-budget-limited child events publish a chat error without mutating messages", () => {
+    const aggregator = new StubAggregator();
+    const event: WorkspaceChatMessage = {
+      type: "goal-budget-limited",
+      workspaceId: "parent-1",
+      goalId: "goal-1",
+      causedByChild: true,
+      childWorkspaceId: "child-1",
+      message: "Child workspace exceeded the parent's goal budget.",
+    };
 
-      const hint = applyWorkspaceChatEventToAggregator(aggregator, event);
+    const hint = applyWorkspaceChatEventToAggregator(aggregator, event);
 
-      expect(hint).toBe("ignored");
-      expect(aggregator.calls).toEqual([]);
-      expect(dispatched).toHaveLength(1);
-      expect(dispatched[0]?.type).toBe(CUSTOM_EVENTS.CHAT_ERROR_TOAST);
-      expect((dispatched[0] as CustomEvent).detail).toEqual({
-        workspaceId: "parent-1",
-        message: "Child workspace exceeded the parent's goal budget.",
-      });
-    });
+    expect(hint).toBe("ignored");
+    expect(aggregator.calls).toEqual([]);
+    expect(takeChatErrors("parent-1")).toEqual([
+      "Child workspace exceeded the parent's goal budget.",
+    ]);
   });
 
   test("stream-abort clears token state before calling handleStreamAbort", () => {

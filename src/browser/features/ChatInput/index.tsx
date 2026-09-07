@@ -78,6 +78,7 @@ import {
 } from "@/browser/utils/workflowRunMessages";
 import { Button } from "@/browser/components/Button/Button";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { useChatErrorToasts } from "@/browser/utils/chatErrorToasts";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { extractInlineSkillReferenceCandidates } from "@/browser/utils/agentSkills/inlineSkillReferences";
 import {
@@ -1472,23 +1473,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       window.removeEventListener(CUSTOM_EVENTS.THINKING_LEVEL_TOAST, handler as EventListener);
   }, [variant, props, pushToast]);
 
-  // Error toasts addressed to this workspace (child-budget warnings, unrecorded Stops).
-  useEffect(() => {
-    if (variant !== "workspace") return;
-
-    const handler = (event: Event) => {
-      const detail = (event as CustomEvent<{ workspaceId: string; message: string }>).detail;
-      if (detail?.workspaceId !== workspaceId || !detail.message) {
-        return;
-      }
-
-      pushToast({ type: "error", message: detail.message });
-    };
-
-    window.addEventListener(CUSTOM_EVENTS.CHAT_ERROR_TOAST, handler as EventListener);
-    return () =>
-      window.removeEventListener(CUSTOM_EVENTS.CHAT_ERROR_TOAST, handler as EventListener);
-  }, [variant, workspaceId, pushToast]);
+  useChatErrorToasts(workspaceId, pushToast);
 
   // Show toast feedback for analytics rebuild command palette action.
   useEffect(() => {
