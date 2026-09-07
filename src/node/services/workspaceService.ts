@@ -2675,6 +2675,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           agentInitiated: true,
           requireIdle: true,
           cancelSignal: dispatch.cancelSignal,
+          withdrawAcceptedOnCancel: true,
           onAccepted: async () => {
             accepted = true;
             await dispatch.onAccepted();
@@ -11037,6 +11038,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             goalId: internal?.goalId,
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
+            withdrawAcceptedOnCancel: internal?.withdrawAcceptedOnCancel,
             onCanceled: internal?.onCanceled,
             onAccepted: internal?.onAccepted,
             onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
@@ -11338,6 +11340,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         startStreamInBackground: internal?.startStreamInBackground,
         cancelState: internal?.cancelState,
         cancelSignal: internal?.cancelSignal,
+        withdrawAcceptedOnCancel: internal?.withdrawAcceptedOnCancel,
         // Same authoring-time race as the queued path: the goal-creating
         // stream can end during the preflight awaits above, making a fresh
         // goal visible after the user hit enter but before this dispatch.

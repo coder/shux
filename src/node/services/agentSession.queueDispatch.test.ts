@@ -572,7 +572,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.queueMessage(
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
-        { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+        }
       );
       expect(session.hasQueuedMessages("tool-end")).toBe(true);
 
@@ -616,7 +620,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
         session.queueMessage(
           "Background monitor wake",
           { model: TEST_MODEL, agentId: "exec", queueDispatchMode: withdrawnMode },
-          { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
+          {
+            synthetic: true,
+            agentInitiated: true,
+            cancelSignal: controller.signal,
+          }
         );
         controller.abort("monitor withdrawn");
 
@@ -1008,6 +1016,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -1092,6 +1101,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -1177,6 +1187,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -1271,6 +1282,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           synthetic: true,
           agentInitiated: true,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           admissionStale: () => manualSendInPreflight,
           onAccepted: () => {
             accepted = true;
@@ -1358,7 +1370,12 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const sendPromise = session.sendMessage(
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec" },
-        { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
+        }
       );
       await syncStarted;
       // A Stop withdraws the wake past the point of no return.
@@ -1418,6 +1435,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onAccepted: () => {
             accepted = true;
           },
@@ -1476,6 +1494,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },

@@ -761,6 +761,13 @@ interface SendMessageInternalOptions {
   cancelState?: { canceledBeforeAcceptance: boolean };
   cancelSignal?: AbortSignal;
   /**
+   * Withdraw the send when `cancelSignal` aborts after its rows are durable but before PREPARING:
+   * resolve Ok without a stream and record the startup abandon marker for the row. By default a
+   * late abort cannot revoke an accepted send (r54). Bash-monitor wakes set this so a Stop that
+   * lands during acceptance or goal sync is not followed by the wake's stream.
+   */
+  withdrawAcceptedOnCancel?: boolean;
+  /**
    * For queue-dispatched sends: when the user last added to the queued
    * entry. Goal safety compares it against the goal's explicit
    * user-activation consent stamp — a message the user visibly left
@@ -4435,15 +4442,17 @@ export class AgentSession {
     if (cancelSignal != null) {
       cancellationDisabled = true;
     }
-    // A cancelable send withdrawn past the point of no return (a hard Stop retiring owed attention
-    // during goal sync or acceptance) keeps its durable, accepted rows but never streams: the Stop
-    // saw no turn to abort. The trailing UI-visible row would read as an interrupted turn to
-    // startup recovery, so every exit below that skips PREPARING records the same abandon marker a
-    // user-aborted stream leaves, before the send resolves (Stop joins the send for this). The
-    // withdrawal can land during any await on the way out, including acceptance I/O, so each exit
-    // runs this check after its last other await.
+    // A send that opted into withdrawal and is withdrawn past the point of no return (a hard Stop
+    // retiring owed attention during goal sync or acceptance) keeps its durable, accepted rows but
+    // never streams: the Stop saw no turn to abort. The trailing UI-visible row would read as an
+    // interrupted turn to startup recovery, so every exit below that skips PREPARING records the
+    // same abandon marker a user-aborted stream leaves, before the send resolves (Stop joins the
+    // send for this). The withdrawal can land during any await on the way out, including
+    // acceptance I/O, so each exit runs this check after its last other await.
+    const withdrawn = () =>
+      internal?.withdrawAcceptedOnCancel === true && cancelSignal?.aborted === true;
     const abandonWithdrawnSend = async (): Promise<void> => {
-      if (cancelSignal?.aborted === true) {
+      if (withdrawn()) {
         // Startup recovery matches the marker against the trailing durable row, which under on-send
         // compaction is the compaction request, not the never-persisted user message.
         await this.updateStartupAutoRetryAbandonFromAbort(
@@ -4606,7 +4615,7 @@ export class AgentSession {
     }
     // A withdrawn send must not claim PREPARING (see abandonWithdrawnSend); it resolves Ok without
     // a stream, like cancelBeforeAcceptance and the disposed path above.
-    if (cancelSignal?.aborted === true) {
+    if (withdrawn()) {
       if (this.coordinator.thinkingOverride === turnThinkingOverride) {
         this.coordinator.releaseThinkingOverride(turnThinkingOverride);
       }
