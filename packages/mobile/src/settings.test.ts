@@ -115,6 +115,34 @@ describe("server policy", () => {
 });
 
 describe("model action availability", () => {
+  test.each(["config", "file", "env"] as const)(
+    "effective %s API key plus OAuth permits non-OAuth models",
+    (source) => {
+      const settings = data();
+      const model = "openai:gpt-4o";
+      settings.providers.openai = {
+        isEnabled: true,
+        isConfigured: true,
+        apiKeySet: false,
+        apiKeySource: source,
+        codexOauthSet: true,
+        models: ["gpt-4o", "gpt-5.3-codex-spark"],
+      };
+      expect(getModelBlockReason(settings, model)).toBeNull();
+      expect(modelChoices(settings, "")).toContain(model);
+      settings.providers.openai.codexOauthSet = false;
+      expect(getModelBlockReason(settings, "openai:gpt-5.3-codex-spark")).not.toBeNull();
+      settings.providers.openai.codexOauthSet = true;
+      settings.providers.openai.apiKeySource = undefined;
+      expect(getModelBlockReason(settings, model)).not.toBeNull();
+      settings.providers.openai.apiKeySource = "keyless";
+      expect(getModelBlockReason(settings, model)).not.toBeNull();
+      settings.providers.openrouter = { isEnabled: true, isConfigured: true, apiKeySet: true };
+      settings.config.routePriority = ["openrouter", "direct"];
+      expect(getModelBlockReason(settings, model)).toBeNull();
+    }
+  );
+
   test.each(["disabled", "unconfigured", "removed"])(
     "retains the current model but blocks a %s only route without policy",
     (state) => {

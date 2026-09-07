@@ -129,10 +129,16 @@ function getModelRouteBlockReason(data: SettingsData, model: string): string | n
   // Gate only the actual direct route; gateways supply their own credentials.
   if (route.routeProvider !== "openai") return null;
   const openai = data.providers.openai;
+  // apiKeySet omits env/file credentials; keyless is not API-key authentication.
+  const hasApiKey =
+    openai?.apiKeySet === true ||
+    openai?.apiKeySource === "config" ||
+    openai?.apiKeySource === "file" ||
+    openai?.apiKeySource === "env";
   const supported =
-    openai?.apiKeySet && openai.codexOauthSet
+    hasApiKey && openai?.codexOauthSet
       ? true
-      : !openai?.apiKeySet && openai?.codexOauthSet
+      : !hasApiKey && openai?.codexOauthSet
         ? isCodexOauthAllowedModel(model, data.providers)
         : !isCodexOauthRequiredModel(model, data.providers);
   return supported
