@@ -35,6 +35,7 @@ import {
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { CommandIds } from "@/browser/utils/commandIds";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
+import { stopStream } from "@/browser/utils/stopStream";
 import { publishPluginsSectionIntent } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
 import { isTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
@@ -1218,8 +1219,10 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           if (p.selectedWorkspaceState?.awaitingUserQuestion) {
             return;
           }
-          await p.api?.workspace.setAutoRetryEnabled?.({ workspaceId: id, enabled: false });
-          await p.api?.workspace.interruptStream({ workspaceId: id });
+          if (!p.api) {
+            return;
+          }
+          await stopStream(p.api, id, { disableAutoRetry: true });
         },
       });
       list.push({

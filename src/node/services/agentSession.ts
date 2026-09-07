@@ -239,6 +239,7 @@ import {
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
 import type { MemorySessionContext } from "@/node/services/memoryService";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
@@ -781,6 +782,13 @@ interface SendMessageInternalOptions {
   cancelState?: { canceledBeforeAcceptance: boolean };
   cancelSignal?: AbortSignal;
   /**
+   * Withdraw the send when `cancelSignal` aborts after its rows are durable but before PREPARING:
+   * resolve Ok without a stream and record the startup abandon marker for the row. By default a
+   * late abort cannot revoke an accepted send (r54). Bash-monitor wakes set this so a Stop that
+   * lands during acceptance or goal sync is not followed by the wake's stream.
+   */
+  withdrawAcceptedOnCancel?: boolean;
+  /**
    * For queue-dispatched sends: when the user last added to the queued
    * entry. Goal safety compares it against the goal's explicit
    * user-activation consent stamp — a message the user visibly left
@@ -972,6 +980,10 @@ export class AgentSession {
   private autoRetryEnabledPreference: boolean | null = null;
   private legacyAutoRetryEnabledHint: boolean | null = null;
   private startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null = null;
+  // The preference file may not reflect memory after a failed write (see persistAutoRetryState).
+  private autoRetryStateUnrecorded = false;
+  private autoRetryStateVersion = 0;
+  private autoRetryStateLoad: Promise<void> | null = null;
 
   /** Latest context-usage snapshot used for on-send compaction checks. */
   private lastUsageState?: AutoCompactionUsageState;
@@ -988,8 +1000,7 @@ export class AgentSession {
   /** Prevent duplicate mid-stream compaction interrupts while we are already transitioning. */
   private readonly compactionObservations = new Map<symbol, Promise<void>>();
   private get midStreamCompactionPending(): boolean {
-    const stage = this.coordinator.compactionIntent.observation?.stage;
-    return stage === "stopping" || stage === "stopped" || stage === "dispatching";
+    return this.coordinator.midStreamCompactionPending;
   }
   private get continuousCompactionAbandoned(): boolean {
     return this.coordinator.compactionIntent.status === "abandoned";
@@ -1855,15 +1866,27 @@ export class AgentSession {
     };
   }
 
-  private async loadAutoRetryEnabledPreference(isCurrent = () => true): Promise<boolean> {
-    if (this.autoRetryEnabledPreference !== null) {
-      return this.autoRetryEnabledPreference;
-    }
+  /**
+   * The preference file is read once per session, and every reader and writer of the in-memory
+   * auto-retry state waits for that read: a load that lands late cannot overwrite a newer change,
+   * and a write never rebuilds the file from unloaded defaults.
+   */
+  private loadAutoRetryState(): Promise<void> {
+    this.autoRetryStateLoad ??= this.readAutoRetryState();
+    return this.autoRetryStateLoad;
+  }
 
+  private async loadAutoRetryEnabledPreference(isCurrent = () => true): Promise<boolean> {
+    await this.loadAutoRetryState();
+    if (this.coordinator.closing || !isCurrent()) return false;
+    return this.autoRetryEnabledPreference !== false;
+  }
+
+  private async readAutoRetryState(): Promise<void> {
     const preferencePath = this.getAutoRetryPreferencePath();
     try {
       const raw = await readFile(preferencePath, "utf-8");
-      if (this.coordinator.closing || !isCurrent()) return false;
+      if (this.coordinator.closing) return;
       const parsed = JSON.parse(raw) as {
         enabled?: unknown;
         startupAutoRetryAbandon?: unknown;
@@ -1875,9 +1898,8 @@ export class AgentSession {
         parsed.startupAutoRetryAbandon
       );
       this.retryManager.setEnabled(enabled);
-      return enabled;
     } catch (error) {
-      if (this.coordinator.closing || !isCurrent()) return false;
+      if (this.coordinator.closing) return;
       // Missing preference file is the default path. Use any legacy frontend hint
       // (captured at onChat subscribe time) before falling back to enabled.
       const errno =
@@ -1894,7 +1916,8 @@ export class AgentSession {
 
       if (errno === "ENOENT" && defaultEnabled === false) {
         // Persist migrated legacy opt-out so restart behavior no longer depends
-        // on renderer localStorage keys.
+        // on renderer localStorage keys. This write runs inside the load, so
+        // persistAutoRetryState must not wait for loadAutoRetryState.
         await this.persistAutoRetryState();
       } else if (errno !== "ENOENT") {
         log.warn("Failed to load auto-retry preference; defaulting to enabled", {
@@ -1902,15 +1925,18 @@ export class AgentSession {
           error: getErrorMessage(error),
         });
       }
-
-      return defaultEnabled;
     }
   }
 
   private autoRetryPersistence: Promise<void> = Promise.resolve();
 
-  private persistAutoRetryState(isCurrent = () => true): Promise<void> {
-    if (!isCurrent()) return Promise.resolve();
+  // Best-effort: a failed write only sets autoRetryStateUnrecorded, which the one caller that must
+  // not acknowledge an unrecorded write (a user Stop) checks via recordPendingAutoRetryState. Only
+  // the latest state change's write marks it recorded. Callers change the state only after
+  // loadAutoRetryState settled, so the file is never rebuilt from unloaded defaults.
+  private persistAutoRetryState(): Promise<void> {
+    const version = ++this.autoRetryStateVersion;
+    this.autoRetryStateUnrecorded = true;
     const preferencePath = this.getAutoRetryPreferencePath();
     const enabled = this.autoRetryEnabledPreference !== false;
     const abandon = this.startupAutoRetryAbandon;
@@ -1919,6 +1945,7 @@ export class AgentSession {
     // must settle before a newer preference commits, or it can erase the user's opt-out.
     // Once memory reflects this admitted snapshot it must commit even if its generation
     // retires while queued; a later clear may already see null and have nothing to enqueue.
+    // Callers admit against the retry generation synchronously, before the load await.
     const payload =
       enabled && !abandon
         ? undefined
@@ -1937,26 +1964,45 @@ export class AgentSession {
             await writeFile(preferencePath, payload, "utf-8");
           }
         } catch (error) {
-          if (
-            payload === undefined &&
-            typeof error === "object" &&
-            error !== null &&
-            "code" in error &&
-            error.code === "ENOENT"
-          )
+          if (payload !== undefined || !isErrnoWithCode(error, "ENOENT")) {
+            log.warn("Failed to persist auto-retry preference", {
+              workspaceId: this.workspaceId,
+              error: getErrorMessage(error),
+            });
             return;
-          log.warn("Failed to persist auto-retry preference", {
-            workspaceId: this.workspaceId,
-            error: getErrorMessage(error),
-          });
+          }
         }
+        this.markAutoRetryStateRecorded(version);
       })
       .finally(() => execution[Symbol.dispose]());
     this.autoRetryPersistence = persisted;
     return persisted;
   }
 
+  private markAutoRetryStateRecorded(version: number): void {
+    // A state change made while this write ran has its own queued write; disk still lags memory.
+    if (version === this.autoRetryStateVersion) this.autoRetryStateUnrecorded = false;
+  }
+
+  /**
+   * A user Stop is acknowledged only once the auto-retry state its stopped turn relies on is on
+   * disk: the startup abandon marker, or the opt-out a RetryBarrier Stop records while no stream is
+   * active. Otherwise the trailing row stays eligible for startup replay. A write that failed earlier
+   * (a withdrawn monitor wake, an aborted stream, that opt-out) is retried here, so the obligation
+   * survives the Stop that first reported it. The default state owes disk nothing: a file that
+   * outlived a failed unlink can only disable retries or suppress a replay.
+   */
+  async recordPendingAutoRetryState(): Promise<boolean> {
+    await this.loadAutoRetryState();
+    if (this.autoRetryEnabledPreference !== false && this.startupAutoRetryAbandon === null) {
+      return true;
+    }
+    if (this.autoRetryStateUnrecorded) await this.persistAutoRetryState();
+    return !this.autoRetryStateUnrecorded;
+  }
+
   private async persistAutoRetryEnabledPreference(enabled: boolean): Promise<void> {
+    await this.loadAutoRetryState();
     this.autoRetryEnabledPreference = enabled;
     await this.persistAutoRetryState();
   }
@@ -1967,21 +2013,23 @@ export class AgentSession {
     isCurrent = () => true
   ): Promise<void> {
     if (!isCurrent()) return;
+    await this.loadAutoRetryState();
     this.startupAutoRetryAbandon = {
       reason,
       ...(userMessageId ? { userMessageId } : {}),
     };
-    await this.persistAutoRetryState(isCurrent);
+    await this.persistAutoRetryState();
   }
 
   private async clearStartupAutoRetryAbandon(isCurrent = () => true): Promise<void> {
     if (!isCurrent()) return;
+    await this.loadAutoRetryState();
     if (this.startupAutoRetryAbandon === null) {
       return;
     }
 
     this.startupAutoRetryAbandon = null;
-    await this.persistAutoRetryState(isCurrent);
+    await this.persistAutoRetryState();
   }
 
   async handleProviderConfigChanged(): Promise<void> {
@@ -3591,6 +3639,7 @@ export class AgentSession {
       if ((internal?.preTurnMessages?.length ?? 0) > 0) internal?.onPreTurnRowsPersisted?.();
     };
     const accept = async (): Promise<void> => {
+      if (attempt.durability === "accepted") return;
       await internal?.onAccepted?.();
       attempt.durability = "accepted";
     };
@@ -4642,10 +4691,48 @@ export class AgentSession {
     if (cancelSignal != null) {
       cancellationDisabled = true;
     }
+    // A send that opted into withdrawal and is withdrawn past the point of no return (a hard Stop
+    // retiring owed attention during goal sync or acceptance) keeps its durable, accepted rows but
+    // never streams: the Stop saw no turn to abort. The trailing UI-visible row would read as an
+    // interrupted turn to startup recovery, so every exit below that skips PREPARING records the
+    // same abandon marker a user-aborted stream leaves, before the send resolves (Stop joins the
+    // send for this). The withdrawal can land during any await on the way out, including
+    // acceptance I/O, so each exit runs this check after its last other await.
+    const withdrawn = () =>
+      internal?.withdrawAcceptedOnCancel === true && cancelSignal?.aborted === true;
+    const abandonWithdrawnSend = async (): Promise<void> => {
+      if (withdrawn()) {
+        // Startup recovery matches the marker against the trailing durable row, which under on-send
+        // compaction is the compaction request, not the never-persisted user message.
+        await this.updateStartupAutoRetryAbandonFromAbort(
+          "user",
+          (autoCompactionMessage ?? userMessage).id
+        );
+      }
+    };
+    // A stale refusal past this point keeps the durable, already accepted row, which the manual
+    // turn that made the admission stale consumes as context.
+    const refuseStaleDurableSend = async (): Promise<AgentSessionResult<void>> => {
+      await abandonWithdrawnSend();
+      return refuseAdmission(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    };
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
     // acceptance leaves the payload + trigger rows durable in the transcript.
     markRowsDurable();
+    // A cancelable wake is accepted the moment its row is durable, before goal sync: its
+    // dispatcher treats the transcript row as proof of acceptance (a restart consumes a signal
+    // whose row is already there), so no later await may leave a durable, unaccepted row behind
+    // a crash. Startup recovery resumes the row without redelivering it, unless a Stop withdrew
+    // the wake.
+    if (cancelSignal != null) {
+      try {
+        await accept();
+      } catch (error) {
+        await abandonWithdrawnSend();
+        return Err(createUnknownSendMessageError(getErrorMessage(error)));
+      }
+    }
     // The committed row witnesses replacement even if ancillary unlink fails.
     // Continue acceptance so a visible, durable user send is never reported lost.
     if (compactionCancellationNonce)
@@ -4653,11 +4740,7 @@ export class AgentSession {
     try {
       await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
     } catch (error) {
-      if (cancelSignal != null) {
-        // The durable row crossed the point of no return, so every later goal-sync failure must still
-        // finalize this monitor wake. Startup recovery can resume the row without redelivering it.
-        await accept();
-      }
+      await abandonWithdrawnSend();
       throw error;
     }
 
@@ -4669,12 +4752,9 @@ export class AgentSession {
     }
 
     // Workspace may be tearing down while we await filesystem IO.
-    // If so, skip event emission + streaming to avoid races with dispose(). A cancelable monitor
-    // wake past the point of no return is already durable, so finalize it before leaving.
+    // If so, skip event emission + streaming to avoid races with dispose().
     if (this.coordinator.disposed) {
-      if (cancelSignal != null && cancellationDisabled) {
-        await accept();
-      }
+      await abandonWithdrawnSend();
       return Ok(undefined);
     }
 
@@ -4683,8 +4763,7 @@ export class AgentSession {
     // await, so a slider change during PREPARING (runtime warmup, model
     // creation) lands in the holder the stream's prepareStep will read.
     const turnThinkingOverride: ActiveTurnThinkingOverride = {};
-    if (isAdmissionStale())
-      return refuseAdmission(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    if (isAdmissionStale()) return refuseStaleDurableSend();
     this.coordinator.acceptThinkingOverride(
       turnThinkingOverride,
       attempt.owner ?? attempt.expectedTurn
@@ -4735,15 +4814,9 @@ export class AgentSession {
     if (isManualUserMessage) {
       // A fresh accepted user send supersedes any persisted startup-abandon
       // classification from previous turns.
-      if (isAdmissionStale())
-        return refuseAdmission(
-          createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
-        );
+      if (isAdmissionStale()) return refuseStaleDurableSend();
       await this.clearStartupAutoRetryAbandon();
-      if (isAdmissionStale())
-        return refuseAdmission(
-          createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
-        );
+      if (isAdmissionStale()) return refuseStaleDurableSend();
       this.retryManager.cancel();
       this.retryManager.setEnabled(true);
       await this.persistAutoRetryEnabledPreference(true);
@@ -4751,8 +4824,7 @@ export class AgentSession {
 
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
-    if (isAdmissionStale())
-      return refuseAdmission(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    if (isAdmissionStale()) return refuseStaleDurableSend();
     this.setAutoRetryResumeState(
       optionsForStream,
       agentInitiated,
@@ -4768,6 +4840,7 @@ export class AgentSession {
       if (this.coordinator.thinkingOverride === turnThinkingOverride) {
         this.coordinator.releaseThinkingOverride(turnThinkingOverride);
       }
+      await abandonWithdrawnSend();
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
 
@@ -4790,7 +4863,17 @@ export class AgentSession {
       // callback to revert it — returning without notifying would strand
       // that bookkeeping (r41).
       await this.settlePreparationFailure(attempt, error);
+      await abandonWithdrawnSend();
       return { success: false, error, superseded: true };
+    }
+    // A withdrawn send must not claim PREPARING (see abandonWithdrawnSend); it resolves Ok without
+    // a stream, like cancelBeforeAcceptance and the disposed path above.
+    if (withdrawn()) {
+      if (this.coordinator.thinkingOverride === turnThinkingOverride) {
+        this.coordinator.releaseThinkingOverride(turnThinkingOverride);
+      }
+      await abandonWithdrawnSend();
+      return Ok(undefined);
     }
 
     const preparedTurnAbortController = new AbortController();
@@ -8088,7 +8171,8 @@ export class AgentSession {
     const hadAnyOutput = this.activeStreamHadAnyDelta;
     let emittedAbort = false;
     try {
-      const activeModelForAbort = this.activeStreamContext?.modelString;
+      // A configured fallback can bill a different model than the requested one.
+      const activeModelForAbort = payload.metadata?.model ?? this.activeStreamContext?.modelString;
       const activeOptionsForAbort = this.activeStreamContext?.options;
       this.lastSystemMessageTokens = systemMessageTokens ?? this.lastSystemMessageTokens;
       if (activeModelForAbort) {
@@ -8127,6 +8211,7 @@ export class AgentSession {
           model: activeModelForAbort,
           usage: payload.metadata?.usage,
           providerMetadata: payload.metadata?.providerMetadata,
+          metadataModel: payload.metadata?.metadataModel,
           goalKind: this.activeStreamContext?.goalKind,
           agentInitiated: this.activeStreamContext?.agentInitiated,
           isCompaction: hadCompactionRequest,
@@ -8848,6 +8933,15 @@ export class AgentSession {
    */
   hasActiveOrPendingTurnWork(): boolean {
     return this.isBusy() || this.midStreamCompactionPending;
+  }
+
+  /**
+   * Resolves once no mid-stream compaction request is pending. The window closes with no
+   * chat event when the compaction request never becomes a turn, so idle waiters need this
+   * signal rather than the stream lifecycle.
+   */
+  waitForMidStreamCompactionSettled(): Promise<void> {
+    return this.coordinator.waitForMidStreamCompactionSettled();
   }
 
   /**

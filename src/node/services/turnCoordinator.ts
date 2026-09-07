@@ -652,6 +652,7 @@ export class TurnCoordinator {
   private idleWaiters = new Set<() => void>();
   private unbusyWaiters = new Set<() => void>();
   private admissionWaiters = new Set<() => void>();
+  private compactionWaiters = new Set<() => void>();
   private prepared?: { id: TurnId; controller: AbortController };
   private thinking: { holder: ActiveTurnThinkingOverride; resource?: Disposable } | null = null;
   private readonly execution = new TurnExecution(defaultEffectRunner);
@@ -671,6 +672,17 @@ export class TurnCoordinator {
 
   get compactionIntent(): CompactionIntent {
     return this.state.compaction;
+  }
+
+  get midStreamCompactionPending(): boolean {
+    const stage = this.state.compaction.observation?.stage;
+    return stage === "stopping" || stage === "stopped" || stage === "dispatching";
+  }
+
+  /** Semantic turn work can retire while an old physical observation still drains. */
+  waitForMidStreamCompactionSettled(): Promise<void> {
+    if (!this.midStreamCompactionPending || this.closing) return Promise.resolve();
+    return new Promise((resolve) => this.compactionWaiters.add(resolve));
   }
 
   beginCompactionObservation(kind: CompactionObservation["kind"]): CompactionToken | undefined {
@@ -811,7 +823,21 @@ export class TurnCoordinator {
     const previousCompactionEpoch = this.state.compaction.epoch;
     const result = transition(this.state, event);
     this.state = result.state;
-    if (result.admission?.status === "admitted") install?.();
+    // Detach before admission/phase callbacks can install a replacement observation
+    // and waiter. Finishing A must never release B or join A's physical I/O.
+    const compactionWaiters =
+      !this.midStreamCompactionPending || this.closing ? this.compactionWaiters : undefined;
+    if (compactionWaiters) this.compactionWaiters = new Set();
+    if (result.admission?.status === "admitted") {
+      try {
+        install?.();
+      } catch (error) {
+        // Admission installation precedes phase publication. Its failure still
+        // releases the detached old batch, never a reentrant replacement's waiters.
+        for (const resolve of compactionWaiters ?? []) resolve();
+        throw error;
+      }
+    }
     // Detach before *any* callback. An idle observer may synchronously admit a new turn and waiter.
     const idle = result.commands.some(
       (command) => command.type === "phase" && command.next.phase === "idle"
@@ -901,6 +927,7 @@ export class TurnCoordinator {
         }
       }
     }
+    for (const resolve of compactionWaiters ?? []) resolve();
     for (const resolve of admissionWaiters ?? []) resolve();
     for (const resolve of waiters ?? []) resolve();
     for (const resolve of unbusyWaiters ?? []) resolve();

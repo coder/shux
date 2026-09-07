@@ -764,6 +764,7 @@ describe("AgentSession continuous compaction wiring", () => {
     async (eventType) => {
       const h = await setup();
       const resumed = deferred<void>();
+      const settled = deferred<void>();
       const order: string[] = [];
       let starts = 0;
       spyOn(h.aiService, "streamMessage").mockImplementation(() => {
@@ -820,6 +821,11 @@ describe("AgentSession continuous compaction wiring", () => {
                 dispatchOptions: { source: "internal-resume" },
               });
               order.push("apply");
+              // Idle waiters (monitor wakes) must stay parked until the continuation is sent.
+              void h.session.waitForMidStreamCompactionSettled().then(() => {
+                order.push("settled");
+                settled.resolve();
+              });
               await appendBoundary(h, followUp);
               return true;
             }
@@ -863,7 +869,8 @@ describe("AgentSession continuous compaction wiring", () => {
         observationFinished.resolve();
       }
       await resumed.promise;
-      expect(order).toEqual(["stop", "apply", "latch-released", "resume"]);
+      await settled.promise;
+      expect(order).toEqual(["stop", "apply", "latch-released", "resume", "settled"]);
       const history = await rows(h);
       expect(history.some((row) => row.metadata?.muxMetadata?.type === "compaction-request")).toBe(
         false

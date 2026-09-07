@@ -1,6 +1,6 @@
 import type { ReactNode, RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, renderHook } from "@testing-library/react";
+import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import { copyFile, readFile, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -90,7 +90,7 @@ describe("useAIViewKeybinds", () => {
     isolatedModulePaths = [];
   });
 
-  test("Escape interrupts an active stream in normal mode", () => {
+  test("Escape interrupts an active stream in normal mode", async () => {
     const interruptStream = mock(() =>
       Promise.resolve({ success: true as const, data: undefined })
     );
@@ -124,7 +124,7 @@ describe("useAIViewKeybinds", () => {
       })
     );
 
-    expect(interruptStream.mock.calls.length).toBe(1);
+    await waitFor(() => expect(interruptStream.mock.calls.length).toBe(1));
   });
 
   test("Escape does not interrupt when the event target is an <input>", () => {
@@ -168,7 +168,7 @@ describe("useAIViewKeybinds", () => {
     expect(interruptStream.mock.calls.length).toBe(0);
   });
 
-  test("Escape interrupts when an editable element opts in", () => {
+  test("Escape interrupts when an editable element opts in", async () => {
     const interruptStream = mock(() =>
       Promise.resolve({ success: true as const, data: undefined })
     );
@@ -207,10 +207,10 @@ describe("useAIViewKeybinds", () => {
       })
     );
 
-    expect(interruptStream.mock.calls.length).toBe(1);
+    await waitFor(() => expect(interruptStream.mock.calls.length).toBe(1));
   });
 
-  test("Ctrl+C interrupts in vim mode even when an <input> is focused", () => {
+  test("Ctrl+C interrupts in vim mode even when an <input> is focused", async () => {
     const interruptStream = mock(() =>
       Promise.resolve({ success: true as const, data: undefined })
     );
@@ -249,7 +249,56 @@ describe("useAIViewKeybinds", () => {
       })
     );
 
-    expect(interruptStream.mock.calls.length).toBe(1);
+    await waitFor(() => expect(interruptStream.mock.calls.length).toBe(1));
+  });
+
+  test("Escape on the retry barrier opts out of auto-retry inside the Stop itself", async () => {
+    const interruptStream = mock(() =>
+      Promise.resolve({ success: true as const, data: undefined })
+    );
+    const setAutoRetryEnabled = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        data: { previousEnabled: true, enabled: false },
+      })
+    );
+    currentClientMock = {
+      workspace: {
+        interruptStream,
+        setAutoRetryEnabled,
+      },
+    };
+
+    const chatInputAPI: RefObject<ChatInputAPI | null> = { current: null };
+
+    renderUseAIViewKeybinds({
+      workspaceId: "ws",
+      canInterrupt: false,
+      showRetryBarrier: true,
+      chatInputAPI,
+      jumpToBottom: () => undefined,
+      loadOlderHistory: null,
+      handleOpenTerminal: () => undefined,
+      handleOpenInEditor: () => undefined,
+      aggregator: undefined,
+      setEditingMessage: () => undefined,
+      vimEnabled: false,
+    });
+
+    document.body.dispatchEvent(
+      new window.KeyboardEvent("keydown", {
+        key: "Escape",
+        bubbles: true,
+        cancelable: true,
+      })
+    );
+
+    await waitFor(() => expect(interruptStream.mock.calls.length).toBe(1));
+    expect(interruptStream).toHaveBeenCalledWith({
+      workspaceId: "ws",
+      options: { disableAutoRetry: true, retireBashMonitorAttention: true },
+    });
+    expect(setAutoRetryEnabled).not.toHaveBeenCalled();
   });
 
   test.each([

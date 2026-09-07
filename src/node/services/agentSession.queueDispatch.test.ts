@@ -1,12 +1,18 @@
 import type { StreamAbortEvent } from "@/common/types/stream";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, mock, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import * as fsPromises from "node:fs/promises";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 
 import type { MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
+import type { CompactionMonitor } from "./compactionMonitor";
+import type { TurnCompletion } from "./streamManager";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
 const WORKSPACE_TURN_CORRELATION = {
@@ -160,6 +166,76 @@ describe("AgentSession queued message tool-call dispatch", () => {
       } finally {
         releaseFailure.resolve();
         append.mockRestore();
+        await session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
+  test.each([
+    { effectiveModel: undefined, metadataModel: undefined },
+    { effectiveModel: "anthropic:claude-opus-4-1", metadataModel: undefined },
+    // A Coder runtime ID has no catalog price; the request-pinned identity must price it.
+    { effectiveModel: "coder:acme/opus", metadataModel: "anthropic:claude-opus-4-1" },
+  ])(
+    "accounts aborted usage against the effective model $effectiveModel priced as $metadataModel",
+    async ({ effectiveModel, metadataModel }) => {
+      const workspaceId = "abort-effective-model";
+      const aiEmitter = new EventEmitter();
+      const accounting = Promise.withResolvers<number>();
+      const completion = Promise.withResolvers<TurnCompletion>();
+      const workspaceGoalService = {
+        assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+        recordStreamAccounting: mock((input: { costUsd: number }) => {
+          accounting.resolve(input.costUsd);
+          return Promise.resolve();
+        }),
+        applyPendingAfterStreamEnd: mock(() => Promise.resolve()),
+        requestContinuationAfterStreamEnd: mock(() => Promise.resolve()),
+        recordStreamStarted: mock(() => Promise.resolve()),
+        syncGoalModeWithChatTail: mock(() => Promise.resolve(null)),
+      } as unknown as WorkspaceGoalService;
+      const { session, cleanup } = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter,
+        workspaceGoalService,
+        aiServiceOverrides: {
+          streamMessage: mock(() => {
+            aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+            return Promise.resolve(
+              Ok({ messageId: "assistant-1", completion: completion.promise })
+            );
+          }),
+        },
+      });
+      try {
+        expect(
+          (
+            await session.sendMessage(
+              "start",
+              { model: TEST_MODEL, agentId: "exec" },
+              { synthetic: true, agentInitiated: true }
+            )
+          ).success
+        ).toBe(true);
+        const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
+        completion.resolve({
+          status: "aborted",
+          abortReason: "system",
+          streamAbort: {
+            type: "stream-abort",
+            workspaceId,
+            metadata: { duration: 1, usage, model: effectiveModel, metadataModel },
+          },
+        });
+        const expectedCost =
+          getTotalCost(
+            createDisplayUsage(usage, effectiveModel ?? TEST_MODEL, undefined, metadataModel)
+          ) ?? 0;
+        expect(expectedCost).toBeGreaterThan(0);
+        expect(await accounting.promise).toBe(expectedCost);
+        await session.waitForIdle();
+      } finally {
         await session.dispose();
         await cleanup();
       }
@@ -496,7 +572,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.queueMessage(
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
-        { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+        }
       );
       expect(session.hasQueuedMessages("tool-end")).toBe(true);
 
@@ -540,7 +620,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
         session.queueMessage(
           "Background monitor wake",
           { model: TEST_MODEL, agentId: "exec", queueDispatchMode: withdrawnMode },
-          { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
+          {
+            synthetic: true,
+            agentInitiated: true,
+            cancelSignal: controller.signal,
+          }
         );
         controller.abort("monitor withdrawn");
 
@@ -892,7 +976,13 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
   test("rollback failure preserves the wake and continues acceptance", async () => {
     const workspaceId = "queue-dispatch-cancel-rollback-failure";
-    const { session, cleanup, historyService } = await createAgentSessionHarness({ workspaceId });
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: { streamMessage },
+    });
     const originalAppend = historyService.appendToHistory.bind(historyService);
     let markAppendStarted: () => void = () => undefined;
     const appendStarted = new Promise<void>((resolve) => {
@@ -926,6 +1016,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -945,6 +1036,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(canceledReasons).toEqual([]);
       expect(cancelState.canceledBeforeAcceptance).toBe(false);
       expect(accepted).toBe(true);
+      // Accepted but withdrawn: the row stays durable and no turn starts.
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(session.isBusy()).toBe(false);
 
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
@@ -1007,6 +1101,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -1070,9 +1165,13 @@ describe("AgentSession queued message tool-call dispatch", () => {
       assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
       syncGoalModeWithChatTail,
     } as unknown as WorkspaceGoalService;
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId,
       workspaceGoalService,
+      aiServiceOverrides: { streamMessage },
     });
 
     try {
@@ -1088,6 +1187,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -1107,6 +1207,102 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(canceledReasons).toEqual([]);
       expect(cancelState.canceledBeforeAcceptance).toBe(false);
       expect(accepted).toBe(true);
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(session.isBusy()).toBe(false);
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      const wakeRow = history.success
+        ? history.data.find((message) =>
+            message.parts.some(
+              (part) => part.type === "text" && part.text === "Background monitor wake"
+            )
+          )
+        : undefined;
+      expect(wakeRow).toBeDefined();
+
+      // The accepted row has no assistant follow-up, so startup recovery would otherwise treat
+      // it as an interrupted turn and replay the withdrawn wake.
+      const preferencePath = (
+        session as unknown as { getAutoRetryPreferencePath: () => string }
+      ).getAutoRetryPreferencePath();
+      const persisted = (await Bun.file(preferencePath).json()) as {
+        startupAutoRetryAbandon?: unknown;
+      };
+      expect(persisted.startupAutoRetryAbandon).toEqual({
+        reason: "aborted",
+        userMessageId: wakeRow?.id,
+      });
+    } finally {
+      releaseInitialSync();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a wake whose admission goes stale during goal sync is finalized, not left owed", async () => {
+    const workspaceId = "queue-dispatch-stale-after-goal-sync";
+    let markSyncStarted: () => void = () => undefined;
+    const syncStarted = new Promise<void>((resolve) => {
+      markSyncStarted = resolve;
+    });
+    let releaseSync: () => void = () => undefined;
+    const syncRelease = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    const syncGoalModeWithChatTail = mock(async () => {
+      markSyncStarted();
+      await syncRelease;
+      return null;
+    });
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+      syncGoalModeWithChatTail,
+    } as unknown as WorkspaceGoalService;
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      workspaceGoalService,
+      aiServiceOverrides: { streamMessage },
+    });
+
+    try {
+      const controller = new AbortController();
+      // Stands in for the requireIdle preflight probe: a manual send enters preflight while the
+      // wake's durable row is already past the rollback horizon.
+      let manualSendInPreflight = false;
+      let accepted = false;
+      let preStreamFailures = 0;
+      const sendPromise = session.sendMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
+          admissionStale: () => manualSendInPreflight,
+          onAccepted: () => {
+            accepted = true;
+          },
+          onAcceptedPreStreamFailure: () => {
+            preStreamFailures += 1;
+          },
+        }
+      );
+
+      await syncStarted;
+      manualSendInPreflight = true;
+      releaseSync();
+      const result = await sendPromise;
+
+      expect(result.success).toBe(false);
+      expect(accepted).toBe(true);
+      expect(preStreamFailures).toBe(1);
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(session.isBusy()).toBe(false);
 
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
@@ -1120,7 +1316,84 @@ describe("AgentSession queued message tool-call dispatch", () => {
         ).toBe(true);
       }
     } finally {
-      releaseInitialSync();
+      releaseSync();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a wake withdrawn under on-send compaction records the persisted compaction row as abandoned", async () => {
+    const workspaceId = "queue-dispatch-withdrawn-compaction-row";
+    let markSyncStarted: () => void = () => undefined;
+    const syncStarted = new Promise<void>((resolve) => {
+      markSyncStarted = resolve;
+    });
+    let releaseSync: () => void = () => undefined;
+    const syncRelease = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+      syncGoalModeWithChatTail: mock(async () => {
+        markSyncStarted();
+        await syncRelease;
+        return null;
+      }),
+    } as unknown as WorkspaceGoalService;
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      workspaceGoalService,
+      aiServiceOverrides: { streamMessage },
+    });
+    const internals = session as unknown as {
+      compactionMonitor: CompactionMonitor;
+      getAutoRetryPreferencePath(): string;
+    };
+    internals.compactionMonitor = {
+      checkBeforeSend: () => ({
+        shouldShowWarning: true,
+        shouldForceCompact: true,
+        usagePercentage: 99,
+        thresholdPercentage: 85,
+      }),
+      checkMidStream: () => false,
+      resetForNewStream: () => undefined,
+      setThreshold: () => undefined,
+      getThreshold: () => 0.85,
+    } as unknown as CompactionMonitor;
+
+    try {
+      const controller = new AbortController();
+      const sendPromise = session.sendMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
+        }
+      );
+      await syncStarted;
+      // A Stop withdraws the wake past the point of no return.
+      controller.abort();
+      releaseSync();
+      expect((await sendPromise).success).toBe(true);
+      expect(streamMessage).not.toHaveBeenCalled();
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const trailing = history.data.at(-1);
+      expect(trailing?.metadata?.muxMetadata?.type).toBe("compaction-request");
+      const persisted = JSON.parse(
+        await fsPromises.readFile(internals.getAutoRetryPreferencePath(), "utf-8")
+      ) as { startupAutoRetryAbandon?: { userMessageId?: string } };
+      expect(persisted.startupAutoRetryAbandon?.userMessageId).toBe(trailing?.id);
+    } finally {
+      releaseSync();
       await session.dispose();
       await cleanup();
     }
@@ -1162,6 +1435,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onAccepted: () => {
             accepted = true;
           },
@@ -1220,6 +1494,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -1230,6 +1505,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       );
 
       await syncStarted;
+      // Accepted before goal sync began: a crash anywhere past the durable row leaves an accepted
+      // row, never one the reconciler's transcript lookup would misread as delivered.
+      expect(accepted).toBe(true);
       releaseSync();
       let syncError: unknown;
       try {
@@ -1240,7 +1518,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(syncError).toBeInstanceOf(Error);
       expect((syncError as Error).message).toContain("injected goal sync failure");
 
-      expect(accepted).toBe(true);
       expect(canceledReasons).toEqual([]);
       expect(cancelState.canceledBeforeAcceptance).toBe(false);
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);

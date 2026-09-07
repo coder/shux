@@ -182,6 +182,152 @@ describe("TurnCoordinator", () => {
     expect(coordinator.compactionIntent.observation?.stage).toBe("stopping");
   });
 
+  test("pending compaction wait retires independently of held physical work", async () => {
+    const { coordinator } = setup();
+    const execution = coordinator.enterExecution();
+    const a = coordinator.beginCompactionObservation("continuous");
+    if (!a) throw new Error("Expected A");
+    coordinator.setCompactionStage(a, "stopped");
+    let settled = false;
+    const waiting = coordinator.waitForMidStreamCompactionSettled().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    coordinator.invalidateCompaction(false);
+    await waiting;
+    expect(settled).toBe(true);
+    let drained = false;
+    const draining = coordinator.drain().then(() => {
+      drained = true;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    execution[Symbol.dispose]();
+    await draining;
+  });
+
+  test("old completion cannot release a replacement's reentrantly registered waiter", async () => {
+    let replacement: ReturnType<TurnCoordinator["beginCompactionObservation"]>;
+    let bWaiting: Promise<void> | undefined;
+    let bSettled = false;
+    const { coordinator } = setup({
+      phaseChanged: (phase) => {
+        if (phase !== "preparing") return;
+        replacement = coordinator.beginCompactionObservation("continuous");
+        if (!replacement) throw new Error("Expected B");
+        coordinator.setCompactionStage(replacement, "stopping");
+        bWaiting = coordinator.waitForMidStreamCompactionSettled().then(() => {
+          bSettled = true;
+        });
+      },
+    });
+    const a = coordinator.beginCompactionObservation("continuous");
+    if (!a) throw new Error("Expected A");
+    coordinator.setCompactionStage(a, "stopped");
+    const aWaiting = coordinator.waitForMidStreamCompactionSettled();
+    prepare(coordinator);
+    await aWaiting;
+    expect(bSettled).toBe(false);
+    coordinator.finishCompactionObservation(a);
+    await Promise.resolve();
+    expect(bSettled).toBe(false);
+    if (!replacement) throw new Error("Expected B");
+    coordinator.finishCompactionObservation(replacement);
+    await bWaiting;
+    expect(bSettled).toBe(true);
+  });
+
+  test.each(["install", "phase"] as const)(
+    "throwing %s callback settles retired waiters without releasing reentrant replacement",
+    async (source) => {
+      let b: ReturnType<TurnCoordinator["beginCompactionObservation"]>;
+      let bWaiting: Promise<void> | undefined;
+      let bSettled = false;
+      const fail = () => {
+        b = coordinator.beginCompactionObservation("continuous");
+        if (!b) throw new Error("Expected B");
+        coordinator.setCompactionStage(b, "stopping");
+        bWaiting = coordinator.waitForMidStreamCompactionSettled().then(() => {
+          bSettled = true;
+        });
+        throw new Error("admission callback failed");
+      };
+      const { coordinator } = setup({
+        phaseChanged: (phase) => {
+          if (source === "phase" && phase === "preparing") fail();
+        },
+      });
+      const a = coordinator.beginCompactionObservation("continuous");
+      if (!a) throw new Error("Expected A");
+      coordinator.setCompactionStage(a, "stopped");
+      let aSettled = false;
+      const aWaiting = coordinator.waitForMidStreamCompactionSettled().then(() => {
+        aSettled = true;
+      });
+      try {
+        expect(() =>
+          coordinator.prepare(
+            { kind: "fresh", intent: "direct", expectedTurnId: coordinator.turnId },
+            undefined,
+            source === "install" ? fail : () => undefined
+          )
+        ).toThrow("admission callback failed");
+        await Promise.resolve();
+        expect(aSettled).toBe(true);
+        expect(bSettled).toBe(false);
+        coordinator.finishCompactionObservation(a);
+        await Promise.resolve();
+        expect(bSettled).toBe(false);
+        if (!b) throw new Error("Expected B");
+        coordinator.finishCompactionObservation(b);
+        await Promise.all([aWaiting, bWaiting]);
+      } finally {
+        if (b) coordinator.finishCompactionObservation(b);
+      }
+    }
+  );
+
+  test("compaction wait preserves dispatch until its own handoff has claimed preparation", async () => {
+    const { coordinator } = setup();
+    const token = coordinator.beginCompactionObservation("continuous");
+    if (!token) throw new Error("Expected observation");
+    coordinator.setCompactionStage(token, "stopping");
+    let settled = false;
+    const waiting = coordinator.waitForMidStreamCompactionSettled().then(() => {
+      settled = true;
+    });
+    coordinator.setCompactionStage(token, "stopped");
+    coordinator.setCompactionStage(token, "dispatching");
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(
+      coordinator.prepare({
+        kind: "fresh",
+        intent: "direct",
+        expectedTurnId: coordinator.turnId,
+        compactionHandoff: token,
+      }).status
+    ).toBe("admitted");
+    expect(coordinator.phase).toBe("preparing");
+    coordinator.finishCompactionObservation(token);
+    await waiting;
+    expect(settled).toBe(true);
+  });
+
+  test("shutdown releases pending compaction wait without manufacturing idle", async () => {
+    const { coordinator } = setup();
+    prepare(coordinator);
+    const token = coordinator.beginCompactionObservation("continuous");
+    if (!token) throw new Error("Expected observation");
+    coordinator.setCompactionStage(token, "stopped");
+    const waiting = coordinator.waitForMidStreamCompactionSettled();
+    coordinator.beginShutdown();
+    await waiting;
+    expect(coordinator.phase).toBe("preparing");
+    expect(coordinator.compactionIntent.observation?.id).toBe(token.id);
+  });
+
   test("observed terminal publishes before idle/drain and cannot retire a reentrant replacement", () => {
     const order: string[] = [];
     const { coordinator, callbacks } = setup({

@@ -8,6 +8,7 @@ import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
 import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
+import { stopStream } from "@/browser/utils/stopStream";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -233,10 +234,11 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     }
   };
 
-  const handleStopAutoRetry = () => {
+  const handleStopAutoRetry = async () => {
     setCountdown(0);
     setManualRetryError(null);
-    void api?.workspace.setAutoRetryEnabled?.({ workspaceId: props.workspaceId, enabled: false });
+    if (!api) return;
+    await stopStream(api, props.workspaceId, { disableAutoRetry: true });
   };
 
   const lastMessage = getLastMainRetryCandidateMessage(workspaceState.messages);
@@ -301,7 +303,9 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     actionButton = (
       <button
         className="border-warning font-primary text-warning hover:bg-warning-overlay cursor-pointer rounded border bg-transparent px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
-        onClick={handleStopAutoRetry}
+        onClick={() => {
+          void handleStopAutoRetry();
+        }}
       >
         Stop <span className="mobile-hide-shortcut-hints">({stopKeybind})</span>
       </button>

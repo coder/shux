@@ -2,6 +2,7 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { BashMonitorWakeDisplayRecord } from "@/common/types/message";
 import { classifyMachineTurnPromptKind } from "@/common/utils/machineTurnPrompts";
 import type {
   BashMonitorRegistryRecord,
@@ -12,6 +13,7 @@ import {
   type BashMonitorProcessSnapshot,
   type BashMonitorWakeDeliveryState,
   type BashMonitorWakeDispatch,
+  type BashMonitorWakeDispatchOutcome,
 } from "@/node/services/bashMonitorWakeReconciler";
 
 const OWNER = "owner";
@@ -60,6 +62,8 @@ describe("BashMonitorWakeReconciler", () => {
   let removedOwners: string[];
   let dropped: string[];
   let droppedGenerations: Array<string | undefined>;
+  let acknowledgeGate: ReturnType<typeof Promise.withResolvers<void>> | undefined;
+  let transcript: BashMonitorWakeDisplayRecord[];
   let reconciler: BashMonitorWakeReconciler;
 
   beforeEach(async () => {
@@ -74,6 +78,8 @@ describe("BashMonitorWakeReconciler", () => {
     removedOwners = [];
     dropped = [];
     droppedGenerations = [];
+    acknowledgeGate = undefined;
+    transcript = [];
     reconciler = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: {
@@ -84,6 +90,7 @@ describe("BashMonitorWakeReconciler", () => {
             processId,
             ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
           });
+          return acknowledgeGate?.promise;
         },
         dropRetiredMonitor: (processId, createdAt) => {
           droppedGenerations.push(createdAt);
@@ -107,6 +114,7 @@ describe("BashMonitorWakeReconciler", () => {
         },
         recordTerminal: () => undefined,
       },
+      deliveredWakes: () => Promise.resolve(transcript),
       onWake: (dispatch) => {
         dispatches.push(dispatch);
         return dispatchOutcome;
@@ -143,10 +151,107 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(2);
   });
 
-  test("superseding a queued wake uses a distinct queue key", async () => {
-    const queuedKeys = new Set<string>();
-    const queuedDispatches: BashMonitorWakeDispatch[] = [];
-    const queueing = new BashMonitorWakeReconciler({
+  test("a newer match withdraws the in-flight wake and dispatches again", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    live = [
+      liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[0].cancelSignal.aborted).toBe(true);
+    expect(dispatches[1].cancelSignal.aborted).toBe(false);
+  });
+
+  test("consumeCurrent withdraws an in-flight wake without waiting behind acceptance I/O", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const wake = dispatches[0];
+
+    // Acceptance holds the owner lock while acknowledging the process; a Stop must still
+    // withdraw the wake immediately so the admission can bail before claiming a turn.
+    acknowledgeGate = Promise.withResolvers<void>();
+    const accepted = wake.onAccepted();
+    while (acknowledged.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const consumed = reconciler.consumeCurrent(OWNER);
+    try {
+      expect(wake.cancelSignal.aborted).toBe(true);
+    } finally {
+      acknowledgeGate.resolve();
+    }
+    await accepted;
+    await consumed;
+    expect(acknowledged).toHaveLength(1);
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+  });
+
+  test("an accepted wake stays withdrawable until its send settles", async () => {
+    live = [liveSnapshot()];
+    const send = Promise.withResolvers<BashMonitorWakeDispatchOutcome>();
+    const inFlight: BashMonitorWakeDispatch[] = [];
+    const held = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: (processId, _generation, matchedThroughOffset) => {
+          acknowledged.push({
+            processId,
+            ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
+          });
+        },
+        dropRetiredMonitor: () => undefined,
+      },
+      registry: {
+        listAll: () => Promise.resolve(rows),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
+      },
+      deliveredWakes: () => Promise.resolve(transcript),
+      onWake: (dispatch) => {
+        inFlight.push(dispatch);
+        return send.promise;
+      },
+    });
+    const reconciling = held.reconcile(OWNER);
+    while (inFlight.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    // The row is durable, so the wake is accepted while its send is still in preflight.
+    await inFlight[0].onAccepted();
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+    // A Stop landing before the stream starts still withdraws it.
+    await held.consumeCurrent(OWNER);
+    expect(inFlight[0].cancelSignal.aborted).toBe(true);
+    send.resolve("in-flight");
+    await reconciling;
+
+    live = [
+      liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
+    ];
+    await held.reconcile(OWNER);
+    expect(inFlight).toHaveLength(2);
+    expect(inFlight[1].cancelSignal.aborted).toBe(false);
+    await held.dispose(OWNER);
+  });
+
+  test("a discarded process withdraws an unaccepted wake but leaves an accepted one to stream", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const unaccepted = dispatches[0];
+    await reconciler.discardProcess(OWNER, "proc", CREATED_AT);
+    expect(unaccepted.cancelSignal.aborted).toBe(true);
+
+    // The accepted wake's send is still in flight (row durable, stream not yet started).
+    const send = Promise.withResolvers<BashMonitorWakeDispatchOutcome>();
+    const inFlight: BashMonitorWakeDispatch[] = [];
+    const held = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: {
         pullMonitorWakeSignals: () => live,
@@ -155,28 +260,153 @@ describe("BashMonitorWakeReconciler", () => {
         dropRetiredMonitor: () => undefined,
       },
       registry: {
-        listAll: () => Promise.resolve([]),
+        listAll: () => Promise.resolve(rows),
         remove: () => undefined,
         recordTerminal: () => undefined,
       },
+      deliveredWakes: () => Promise.resolve(transcript),
       onWake: (dispatch) => {
-        if (queuedKeys.has(dispatch.dedupeKey)) return "deferred";
-        queuedKeys.add(dispatch.dedupeKey);
-        queuedDispatches.push(dispatch);
-        return "in-flight";
+        inFlight.push(dispatch);
+        return send.promise;
       },
     });
+    const reconciling = held.reconcile(OWNER);
+    while (inFlight.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    await inFlight[0].onAccepted();
+    await held.discardProcess(OWNER, "proc", CREATED_AT);
+    expect(inFlight[0].cancelSignal.aborted).toBe(false);
+    send.resolve("in-flight");
+    await reconciling;
+    await held.dispose(OWNER);
+  });
+
+  test("consumeCurrent withdraws the wake but keeps signals owed when the commit is refused", async () => {
     live = [liveSnapshot()];
-    await queueing.reconcile(OWNER);
+    await reconciler.reconcile(OWNER);
+    const wake = dispatches[0];
+
+    await reconciler.consumeCurrent(OWNER, () => Promise.resolve(false));
+
+    expect(wake.cancelSignal.aborted).toBe(true);
+    expect(acknowledged).toEqual([]);
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].cancelSignal.aborted).toBe(false);
+  });
+
+  test("consumeCurrent retires only the attention owed when the stop was requested", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const stop = Promise.withResolvers<boolean>();
+    const stopRequested = Promise.withResolvers<void>();
+    const consuming = reconciler.consumeCurrent(OWNER, () => {
+      stopRequested.resolve();
+      return stop.promise;
+    });
+    await stopRequested.promise;
     live = [
-      liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
+      liveSnapshot({ match: { throughOffset: 30, lines: ["READY", "READY"], totalMatches: 2 } }),
     ];
+    stop.resolve(true);
+    await consuming;
 
-    await queueing.reconcile(OWNER);
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].cancelSignal.aborted).toBe(false);
+  });
 
-    expect(queuedDispatches).toHaveLength(2);
-    expect(queuedKeys.size).toBe(2);
-    expect(queuedDispatches[0].cancelSignal.aborted).toBe(true);
+  test("consumeCurrent leaves a settlement recorded after the stop request owed", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const stop = Promise.withResolvers<boolean>();
+    const stopRequested = Promise.withResolvers<void>();
+    const consuming = reconciler.consumeCurrent(OWNER, () => {
+      stopRequested.resolve();
+      return stop.promise;
+    });
+    await stopRequested.promise;
+    const terminal: BashMonitorTerminalSummary = {
+      status: "exited",
+      exitCode: 0,
+      settledAt: "2026-08-31T12:00:05.000Z",
+      wakeOnExit: true,
+      terminalStatusShown: false,
+    };
+    live = [liveSnapshot({ terminal })];
+    rows = [{ ...registryRecord(terminal), processId: "proc", taskId: "bash:proc" }];
+    stop.resolve(true);
+    await consuming;
+
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].muxMetadata.records[0]).toMatchObject({
+      processId: "proc",
+      wakeUpdatedAt: terminal.settledAt,
+      terminal: { status: "exited", exitCode: 0 },
+    });
+  });
+
+  test("consumeCurrent leaves a monitor failure recorded after the stop request owed", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const stop = Promise.withResolvers<boolean>();
+    const stopRequested = Promise.withResolvers<void>();
+    const consuming = reconciler.consumeCurrent(OWNER, () => {
+      stopRequested.resolve();
+      return stop.promise;
+    });
+    await stopRequested.promise;
+    live = [liveSnapshot({ retired: true })];
+    rows = [
+      {
+        ...registryRecord(),
+        processId: "proc",
+        taskId: "bash:proc",
+        lost: { reason: "runtime-failure", failedAt: "2026-08-31T12:00:05.000Z" },
+      },
+    ];
+    stop.resolve(true);
+    await consuming;
+
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].muxMetadata.records[0]).toMatchObject({
+      processId: "proc",
+      kind: "monitor-lost",
+    });
+  });
+
+  test("consumeCurrent keeps the registry row of a monitor armed after the stop request", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const stop = Promise.withResolvers<boolean>();
+    const stopRequested = Promise.withResolvers<void>();
+    const consuming = reconciler.consumeCurrent(OWNER, () => {
+      stopRequested.resolve();
+      return stop.promise;
+    });
+    await stopRequested.promise;
+    const later = liveSnapshot({
+      processId: "later",
+      taskId: "bash:later",
+      createdAt: "2026-08-31T12:00:05.000Z",
+    });
+    live = [liveSnapshot(), later];
+    rows = [
+      { ...registryRecord(), processId: "later", taskId: "bash:later", createdAt: later.createdAt },
+    ];
+    stop.resolve(true);
+    await consuming;
+
+    expect(removed).toEqual([]);
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].muxMetadata.records).toEqual([
+      expect.objectContaining({ processId: "later", kind: "match" }),
+    ]);
   });
 
   test("keeps dead registry evidence until the queued wake is accepted", async () => {
@@ -238,6 +468,143 @@ describe("BashMonitorWakeReconciler", () => {
     ];
     await reconciler.reconcile(OWNER);
     expect(dispatches).toHaveLength(2);
+  });
+
+  test("failed acceptance I/O is retried ahead of dispatch instead of redelivering the wake", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const wake = dispatches[0];
+
+    acknowledgeGate = Promise.withResolvers<void>();
+    acknowledgeGate.promise.catch(() => undefined);
+    acknowledgeGate.reject(new Error("transient acknowledgement failure"));
+    // The accepted row is durable, so acceptance resolves and only the consumption stays owed.
+    await wake.onAccepted();
+    await expect(reconciler.reconcile(OWNER)).rejects.toThrow("transient acknowledgement failure");
+    expect(dispatches).toHaveLength(1);
+
+    acknowledgeGate = undefined;
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+
+    live = [
+      liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
+    ];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+  });
+
+  test("a process created in this instance never triggers a transcript scan", async () => {
+    let transcriptReads = 0;
+    const fresh = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: () => undefined,
+        dropRetiredMonitor: () => undefined,
+      },
+      registry: {
+        listAll: () => Promise.resolve(rows),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
+      },
+      deliveredWakes: () => {
+        transcriptReads++;
+        return Promise.resolve(transcript);
+      },
+      onWake: (dispatch) => {
+        dispatches.push(dispatch);
+        return "in-flight";
+      },
+    });
+    // A failed acceptance from this instance stays owed in memory, so only processes older than
+    // the instance can have a delivered row the reconciler does not remember.
+    live = [liveSnapshot({ createdAt: new Date(Date.now() + 1_000).toISOString() })];
+    await fresh.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    expect(transcriptReads).toBe(0);
+    await fresh.dispose(OWNER);
+  });
+
+  test.each(["9", "not-a-date"])(
+    "a recovered process with the noncanonical age %j is still checked against the transcript",
+    async (createdAt) => {
+      // The registry accepts any createdAt string, and both sort after an ISO instance stamp: a string
+      // comparison would take the process for a live one and redeliver the wake its row already holds.
+      live = [liveSnapshot({ createdAt })];
+      transcript.push({
+        processId: "proc",
+        wakeUpdatedAt: createdAt + ":12",
+        kind: "match",
+        displayName: "CI watcher",
+        filter: "READY",
+        filterExclude: false,
+      });
+      await reconciler.reconcile(OWNER);
+      expect(dispatches).toEqual([]);
+      expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+    }
+  );
+
+  test("a wake the transcript already carries is consumed after restart, not redelivered", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    // The row landed but its consumption I/O never succeeded before the app exited.
+    transcript.push(...dispatches[0].muxMetadata.records);
+    await reconciler.dispose(OWNER);
+
+    let transcriptReads = 0;
+    let transcriptReadFails = true;
+    const afterRestart: BashMonitorWakeDispatch[] = [];
+    const restarted = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: (processId, _generation, matchedThroughOffset) => {
+          acknowledged.push({
+            processId,
+            ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
+          });
+        },
+        dropRetiredMonitor: () => undefined,
+      },
+      registry: {
+        listAll: () => Promise.resolve(rows),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
+      },
+      deliveredWakes: () => {
+        transcriptReads++;
+        return transcriptReadFails
+          ? Promise.reject(new Error("transient transcript read"))
+          : Promise.resolve(transcript);
+      },
+      onWake: (dispatch) => {
+        afterRestart.push(dispatch);
+        return "in-flight";
+      },
+    });
+
+    await expect(restarted.reconcile(OWNER)).rejects.toThrow("transient transcript read");
+    expect(afterRestart).toEqual([]);
+
+    transcriptReadFails = false;
+    await restarted.reconcile(OWNER);
+    expect(afterRestart).toEqual([]);
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+
+    live = [
+      liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
+    ];
+    await restarted.reconcile(OWNER);
+    await restarted.reconcile(OWNER);
+    expect(afterRestart).toHaveLength(1);
+    expect(afterRestart[0].prompt).toContain("READY again");
+    // One lookup per new outstanding key; an unchanged frontier reconciles without another read.
+    expect(transcriptReads).toBe(3);
+    await restarted.dispose(OWNER);
   });
 
   test("full history clear consumes signals present both before and during the clear", async () => {
@@ -315,6 +682,7 @@ describe("BashMonitorWakeReconciler", () => {
         },
         recordTerminal: () => undefined,
       },
+      deliveredWakes: () => Promise.resolve(transcript),
       onWake: (dispatch) => {
         restartedDispatches.push(dispatch);
         return "in-flight";
@@ -397,6 +765,7 @@ describe("BashMonitorWakeReconciler", () => {
         remove: () => undefined,
         recordTerminal: () => undefined,
       },
+      deliveredWakes: () => Promise.resolve(transcript),
       onWake: (dispatch) => {
         afterRestart.push(dispatch);
         return "in-flight";
@@ -663,6 +1032,7 @@ describe("BashMonitorWakeReconciler", () => {
         },
         recordTerminal: () => undefined,
       },
+      deliveredWakes: () => Promise.resolve(transcript),
       onWake: (dispatch) => {
         afterRestart.push(dispatch);
         return "in-flight";
@@ -802,6 +1172,7 @@ describe("BashMonitorWakeReconciler", () => {
         remove: () => undefined,
         recordTerminal: () => undefined,
       },
+      deliveredWakes: () => Promise.resolve(transcript),
       onWake: (dispatch) => {
         retryDispatches.push(dispatch);
         return "in-flight";

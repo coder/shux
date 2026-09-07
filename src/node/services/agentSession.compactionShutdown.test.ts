@@ -2234,3 +2234,76 @@ test.each(["empty", "raw reset", "journal only"])(
     }
   }
 );
+
+test("failed legacy compaction preflight releases idle waiters without a stream terminal", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, createMuxMessage("original", "user", "Work"));
+  const direct = h.session as unknown as {
+    activeStreamContext: { modelString: string; options: typeof options; providersConfig: null };
+    interruptForCompaction(): Promise<void>;
+  };
+  direct.activeStreamContext = { modelString: options.model, options, providersConfig: null };
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  spyOn(h.goalService, "assertPricedModelForBudgetedGoal").mockImplementationOnce(async () => {
+    entered.resolve();
+    await release.promise;
+    throw new Error("legacy preparation unavailable");
+  });
+  const stream = spyOn(h.aiService, "streamMessage");
+  const pending = direct.interruptForCompaction().catch((error: unknown) => error);
+  try {
+    await entered.promise;
+    let settled = false;
+    const waiting = h.session.waitForMidStreamCompactionSettled().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release.resolve();
+    await pending;
+    await waiting;
+    expect(settled).toBe(true);
+    expect(stream).not.toHaveBeenCalled();
+    expect(h.session.hasActiveOrPendingTurnWork()).toBe(false);
+  } finally {
+    release.resolve();
+    await pending;
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test("cancelable acceptance precedes blocked cancellation retirement and runs once", async () => {
+  const h = await setup();
+  await h.session.interruptStream({ abandonPartial: true });
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const write = h.historyService.writeCompactionCancellation.bind(h.historyService);
+  spyOn(h.historyService, "writeCompactionCancellation").mockImplementation(async (...args) => {
+    if (args[1] === null) {
+      entered.resolve();
+      await release.promise;
+    }
+    return write(...args);
+  });
+  const accepted = mock(() => undefined);
+  const controller = new AbortController();
+  const pending = h.session.sendMessage("Explicit replacement", options, {
+    cancelSignal: controller.signal,
+    onAccepted: accepted,
+  });
+  try {
+    await entered.promise;
+    expect(accepted).toHaveBeenCalledTimes(1);
+    release.resolve();
+    expect((await pending).success).toBe(true);
+    expect(accepted).toHaveBeenCalledTimes(1);
+    expect(await h.historyService.readCompactionCancellation(workspaceId)).toBeNull();
+  } finally {
+    release.resolve();
+    await pending;
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
