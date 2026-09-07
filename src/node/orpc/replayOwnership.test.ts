@@ -7,9 +7,15 @@ import type { ORPCContext } from "./context";
 import { createMuxMessage } from "@/common/types/message";
 import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
+import type { TurnCoordinator, OperationId } from "../services/turnCoordinator";
 import { Ok } from "@/common/types/result";
 
-async function setup(onReplayResumed?: () => void) {
+async function setup(
+  onReplayResumed?: () => void,
+  beforeReplayStart?: () => Promise<void>,
+  initiallyActive = true
+) {
+  let active = initiallyActive;
   const workspaceId = "observed-engine";
   const emitter = new EventEmitter();
   const info = {
@@ -33,11 +39,12 @@ async function setup(onReplayResumed?: () => void) {
     workspaceId,
     aiEmitter: emitter,
     aiServiceOverrides: {
-      isStreaming: () => true,
-      getStreamInfo: () => info,
+      isStreaming: () => active,
+      getStreamInfo: () => (active ? { ...info } : undefined),
       replayStream: async (_workspaceId, options) => {
         replayOffsets.push(options?.afterTimestamp);
         const index = invocation++;
+        await beforeReplayStart?.();
         emitter.emit("stream-start", start);
         const gate = gates[index];
         gate?.entered.resolve();
@@ -68,6 +75,7 @@ async function setup(onReplayResumed?: () => void) {
     const caught = Promise.withResolvers<void>();
     const queued = Promise.withResolvers<void>();
     const live = Promise.withResolvers<void>();
+    const terminal = Promise.withResolvers<void>();
     const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
     const events: WorkspaceChatMessage[] = [];
     const done = (async () => {
@@ -83,6 +91,7 @@ async function setup(onReplayResumed?: () => void) {
           if (event.hasQueuedMessages) queued.resolve();
         }
         if (event.type === "caught-up") caught.resolve();
+        if (event.type === "stream-end") terminal.resolve();
         if (event.type === "stream-delta" && event.delta === "live") live.resolve();
       }
     })();
@@ -95,6 +104,7 @@ async function setup(onReplayResumed?: () => void) {
       caught: caught.promise,
       queued: queued.promise,
       live: live.promise,
+      terminal: terminal.promise,
       events,
       aggregator,
       stop,
@@ -106,6 +116,14 @@ async function setup(onReplayResumed?: () => void) {
     emitter,
     gates,
     replayOffsets,
+    startReplacement: () => {
+      active = true;
+      info.messageId = "engine-B";
+      emitter.emit("stream-start", { ...info, workspaceId, type: "stream-start" });
+    },
+    setActive: (value: boolean) => {
+      active = value;
+    },
     subscribe,
     close: async () => {
       for (const gate of gates) gate?.release.resolve();
@@ -258,5 +276,142 @@ test("disposing a held replay releases its async context without affecting a sib
     await held?.stop();
     await h.cleanup();
     await sibling.close();
+  }
+});
+
+test.each([
+  ["history", "full"],
+  ["history", "since"],
+  ["before-start", "full"],
+  ["before-start", "since"],
+  ["before-start", "live"],
+])("replay owns the active engine before %s awaits in %s mode", async (boundary, modeName) => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const hold = async () => {
+    entered.resolve();
+    await release.promise;
+  };
+  const h = await setup(undefined, boundary === "before-start" ? hold : undefined, false);
+  h.setActive(true);
+  if (boundary === "history") {
+    const read = h.historyService.readPartial.bind(h.historyService);
+    spyOn(h.historyService, "readPartial").mockImplementationOnce(async (...args) => {
+      await hold();
+      return read(...args);
+    });
+  }
+  const coordinator = (h.session as unknown as { coordinator: TurnCoordinator }).coordinator;
+  let replacementOperation: OperationId | undefined;
+  const send = spyOn(h.session, "sendMessage").mockImplementation(() => {
+    // Queue dispatch has already claimed B's real preparation owner. Only its
+    // provider boundary is controlled here; start and replay use session ingress.
+    replacementOperation = coordinator.registerOperation(coordinator.turnId);
+    h.startReplacement();
+    return Promise.resolve(Ok(undefined));
+  });
+  try {
+    const mode: OnChatMode | undefined =
+      modeName === "live"
+        ? { type: "live" }
+        : modeName === "since"
+          ? {
+              type: "since",
+              cursor: {
+                history: { messageId: "seed", historySequence: 0 },
+                stream: { messageId: "engine-A", lastTimestamp: 10 },
+              },
+            }
+          : undefined;
+    const client = h.subscribe(mode);
+    await entered.promise;
+    expect(h.session.isBusy()).toBe(true);
+    h.session.queueMessage("manual during replay");
+    h.session.drainQueuedMessagesIfIdle();
+    expect(send).not.toHaveBeenCalled();
+    h.emitter.emit("stream-end", {
+      type: "stream-end",
+      workspaceId: h.workspaceId,
+      messageId: "stale",
+      parts: [],
+      metadata: {},
+    });
+    expect(h.session.isBusy()).toBe(true);
+    h.setActive(false);
+    expect(h.session.isBusy()).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+    h.emitter.emit("stream-end", {
+      type: "stream-end",
+      workspaceId: h.workspaceId,
+      messageId: "engine-A",
+      parts: [],
+      metadata: {},
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+    const replacementTurn = coordinator.turnId;
+    expect(coordinator.phase).toBe("streaming");
+    release.resolve();
+    await client.caught;
+    await client.terminal;
+    expect(client.events.filter((event) => event.type === "stream-end")).toHaveLength(1);
+    expect(
+      client.events.some((event) => event.type === "stream-start" && event.messageId === "engine-A")
+    ).toBe(false);
+    expect(coordinator.turnId).toBe(replacementTurn);
+    expect(coordinator.phase).toBe("streaming");
+    expect(client.events.find((event) => event.type === "caught-up")).toMatchObject({
+      cursor: { stream: { messageId: "engine-B" } },
+    });
+  } finally {
+    release.resolve();
+    if (replacementOperation) coordinator.finishStartup(replacementOperation);
+    await h.close();
+  }
+});
+
+test("a constructed session reserves an existing engine before a lazy subscription is pulled", async () => {
+  const h = await setup();
+  const send = spyOn(h.session, "sendMessage").mockResolvedValue(Ok(undefined));
+  try {
+    const context = {
+      workspaceService: { getOrCreateSession: () => h.session },
+    } as unknown as ORPCContext;
+    const subscription = subscribeWorkspaceChat(context, { workspaceId: h.workspaceId });
+    expect(h.session.isBusy()).toBe(true);
+    h.session.queueMessage("manual before first pull");
+    h.session.drainQueuedMessagesIfIdle();
+    expect(send).not.toHaveBeenCalled();
+    h.setActive(false);
+    h.emitter.emit("stream-end", {
+      type: "stream-end",
+      workspaceId: h.workspaceId,
+      messageId: "engine-A",
+      parts: [],
+      metadata: {},
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+    await subscription.return(undefined);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a later observed engine is reserved before replay lifecycle listeners can submit input", async () => {
+  const h = await setup(undefined, undefined, false);
+  const send = spyOn(h.session, "sendMessage").mockResolvedValue(Ok(undefined));
+  try {
+    h.setActive(true);
+    let busyAtFirstPublication: boolean | undefined;
+    await h.session.replayHistory(({ message }) => {
+      if (message.type === "stream-lifecycle" && busyAtFirstPublication === undefined) {
+        busyAtFirstPublication = h.session.isBusy();
+        h.session.queueMessage("reentrant manual");
+        h.session.drainQueuedMessagesIfIdle();
+      }
+    });
+    expect(busyAtFirstPublication).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+  } finally {
+    await h.close();
   }
 });

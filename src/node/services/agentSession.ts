@@ -1181,6 +1181,10 @@ export class AgentSession {
 
     this.attachAiListeners();
     this.attachInitListeners();
+    // A subscription is lazy: protect an existing engine before any caller can
+    // send through this new session, even before replay is first pulled.
+    const existingStream = this.streamManager.getStreamInfo(this.workspaceId);
+    if (existingStream) this.coordinator.observeStreamReplay(existingStream.messageId);
     eventSpine.emit("session.start", { workspaceId: this.workspaceId });
   }
 
@@ -2741,6 +2745,10 @@ export class AgentSession {
     // try/catch/finally guarantees caught-up is always sent, even if replay fails.
     // Without caught-up, the frontend stays in "Loading workspace..." forever.
     try {
+      // Reserve the observed engine before history/tokenization awaits or the first
+      // lifecycle publication can reenter a manual send. The envelope arrives later.
+      const initialStreamInfo = this.streamManager.getStreamInfo(this.workspaceId);
+      if (initialStreamInfo) this.coordinator.observeStreamReplay(initialStreamInfo.messageId);
       if (shouldReplayTerminalState) {
         // Rehydrate the current terminal/preparing state immediately so reconnect clients do not
         // regress to transcript heuristics while the rest of replay is still streaming in.
@@ -2753,7 +2761,7 @@ export class AgentSession {
         // Live mode still needs stream context when a response is currently active.
         // Replay only stream-start (no historical deltas/tool updates) so clients can
         // attach future live events to the correct message.
-        const liveStreamInfo = this.streamManager.getStreamInfo(this.workspaceId);
+        const liveStreamInfo = initialStreamInfo;
         if (liveStreamInfo) {
           const streamLastTimestamp = this.getStreamLastTimestamp(liveStreamInfo);
           await this.streamManager.replayStream(this.workspaceId, {
@@ -2782,7 +2790,7 @@ export class AgentSession {
 
       // Read partial BEFORE iterating history so we can skip the corresponding
       // placeholder message (which has empty parts). The partial has the real content.
-      const streamInfo = this.streamManager.getStreamInfo(this.workspaceId);
+      const streamInfo = initialStreamInfo;
       const partial = await this.historyService.readPartial(this.workspaceId);
       const partialHistorySequence = partial?.metadata?.historySequence;
 
