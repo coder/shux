@@ -1308,6 +1308,60 @@ describe("AgentSession startup auto-retry recovery", () => {
     }
   });
 
+  test("a marker recorded while the preference file is still loading survives the load and keeps the file's opt-out", async () => {
+    const workspaceId = "startup-retry-marker-during-preference-load";
+    const { session, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+
+    const privateSession = session as unknown as {
+      persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
+      loadAutoRetryEnabledPreference: () => Promise<boolean>;
+      getAutoRetryPreferencePath: () => string;
+      startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
+    };
+    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    await fsPromises.mkdir(path.dirname(preferencePath), { recursive: true });
+    await fsPromises.writeFile(preferencePath, JSON.stringify({ enabled: false }) + "\n", "utf-8");
+
+    // The first preference read is held open, as in a fresh session whose startup check is still
+    // reading the file when a Stop withdraws an accepted wake.
+    const readEntered = Promise.withResolvers<void>();
+    const releaseRead = Promise.withResolvers<void>();
+    const readFile = fsPromises.readFile.bind(fsPromises);
+    const readSpy = spyOn(fsPromises, "readFile").mockImplementation((async (
+      ...args: Parameters<typeof fsPromises.readFile>
+    ) => {
+      const raw = await readFile(...args);
+      if (args[0] !== preferencePath) return raw;
+      readEntered.resolve();
+      await releaseRead.promise;
+      return raw;
+    }) as typeof fsPromises.readFile);
+    try {
+      const loading = privateSession.loadAutoRetryEnabledPreference();
+      await readEntered.promise;
+      const recording = privateSession.persistStartupAutoRetryAbandon("aborted", "user-2");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // Nothing is written from unloaded state while the read is pending.
+      expect(JSON.parse(await Bun.file(preferencePath).text())).toEqual({ enabled: false });
+      releaseRead.resolve();
+      expect(await loading).toBe(false);
+      await recording;
+
+      expect(privateSession.startupAutoRetryAbandon).toEqual({
+        reason: "aborted",
+        userMessageId: "user-2",
+      });
+      expect(JSON.parse(await Bun.file(preferencePath).text())).toEqual({
+        enabled: false,
+        startupAutoRetryAbandon: { reason: "aborted", userMessageId: "user-2" },
+      });
+      expect(await session.recordPendingStartupAutoRetryAbandon()).toBe(true);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
   test("provider config changes preserve non-fixable abandon state without starting a stream", async () => {
     const workspaceId = "startup-retry-keep-abandon-on-provider-config";
     const { session, aiService, events, cleanup } = await createSessionBundle(workspaceId);

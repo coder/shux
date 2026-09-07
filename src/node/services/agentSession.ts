@@ -756,6 +756,7 @@ export class AgentSession {
   private autoRetryStateUnrecorded = false;
   private autoRetryStateVersion = 0;
   private autoRetryStateWrites: Promise<void> = Promise.resolve();
+  private autoRetryStateLoad: Promise<void> | null = null;
 
   /** Latest context-usage snapshot used for on-send compaction checks. */
   private lastUsageState?: AutoCompactionUsageState;
@@ -1446,11 +1447,22 @@ export class AgentSession {
     };
   }
 
-  private async loadAutoRetryEnabledPreference(): Promise<boolean> {
-    if (this.autoRetryEnabledPreference !== null) {
-      return this.autoRetryEnabledPreference;
-    }
+  /**
+   * The preference file is read once per session, and every reader and writer of the in-memory
+   * auto-retry state waits for that read: a load that lands late cannot overwrite a newer change,
+   * and a write never rebuilds the file from unloaded defaults.
+   */
+  private loadAutoRetryState(): Promise<void> {
+    this.autoRetryStateLoad ??= this.readAutoRetryState();
+    return this.autoRetryStateLoad;
+  }
 
+  private async loadAutoRetryEnabledPreference(): Promise<boolean> {
+    await this.loadAutoRetryState();
+    return this.autoRetryEnabledPreference !== false;
+  }
+
+  private async readAutoRetryState(): Promise<void> {
     const preferencePath = this.getAutoRetryPreferencePath();
     try {
       const raw = await readFile(preferencePath, "utf-8");
@@ -1465,7 +1477,6 @@ export class AgentSession {
         parsed.startupAutoRetryAbandon
       );
       this.retryManager.setEnabled(enabled);
-      return enabled;
     } catch (error) {
       // Missing preference file is the default path. Use any legacy frontend hint
       // (captured at onChat subscribe time) before falling back to enabled.
@@ -1483,7 +1494,8 @@ export class AgentSession {
 
       if (errno === "ENOENT" && defaultEnabled === false) {
         // Persist migrated legacy opt-out so restart behavior no longer depends
-        // on renderer localStorage keys.
+        // on renderer localStorage keys. This write runs inside the load, so
+        // writeAutoRetryState must not wait for loadAutoRetryState.
         await this.persistAutoRetryState();
       } else if (errno !== "ENOENT") {
         log.warn("Failed to load auto-retry preference; defaulting to enabled", {
@@ -1491,15 +1503,14 @@ export class AgentSession {
           error: getErrorMessage(error),
         });
       }
-
-      return defaultEnabled;
     }
   }
 
   // Best-effort: a failed write only sets autoRetryStateUnrecorded, which the one caller that must
   // not acknowledge an unrecorded write (a user Stop) checks via recordPendingStartupAutoRetryAbandon.
   // Writes are serialized and only the latest state change's write marks it recorded, so an older
-  // unlink cannot land after a newer marker write with the flag already cleared.
+  // unlink cannot land after a newer marker write with the flag already cleared. Callers change the
+  // state only after loadAutoRetryState settled, so the file is never rebuilt from unloaded defaults.
   private persistAutoRetryState(): Promise<void> {
     const version = ++this.autoRetryStateVersion;
     this.autoRetryStateUnrecorded = true;
@@ -1572,12 +1583,14 @@ export class AgentSession {
    * the Stop that first reported it.
    */
   async recordPendingStartupAutoRetryAbandon(): Promise<boolean> {
+    await this.loadAutoRetryState();
     if (this.startupAutoRetryAbandon === null) return true;
     if (this.autoRetryStateUnrecorded) await this.persistAutoRetryState();
     return !this.autoRetryStateUnrecorded;
   }
 
   private async persistAutoRetryEnabledPreference(enabled: boolean): Promise<void> {
+    await this.loadAutoRetryState();
     this.autoRetryEnabledPreference = enabled;
     await this.persistAutoRetryState();
   }
@@ -1586,6 +1599,7 @@ export class AgentSession {
     reason: string,
     userMessageId?: string
   ): Promise<void> {
+    await this.loadAutoRetryState();
     this.startupAutoRetryAbandon = {
       reason,
       ...(userMessageId ? { userMessageId } : {}),
@@ -1594,6 +1608,7 @@ export class AgentSession {
   }
 
   private async clearStartupAutoRetryAbandon(): Promise<void> {
+    await this.loadAutoRetryState();
     if (this.startupAutoRetryAbandon === null) {
       return;
     }
