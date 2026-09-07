@@ -819,14 +819,10 @@ interface SendMessageInternalOptions {
   admissionStale?: () => boolean;
 }
 
-interface PreparedRolloverRequest extends PreparedStreamMessage {
-  detachAdmissionCancellation(): void;
-}
-
 // Enqueueing creates no preparation attempt. Once dispatched, Promise success alone cannot
 // distinguish cancellation, a background transfer, and delivery to terminal policy.
 interface PreparationAttempt {
-  preparedRequest?: PreparedRolloverRequest;
+  preparedRequest?: PreparedStreamMessage;
   owner?: TurnId;
   expectedTurn: TurnId;
   editReservation?: ReturnType<TurnCoordinator["reserve"]>;
@@ -4372,7 +4368,6 @@ export class AgentSession {
     // wake finish acceptance rather than delete the row after goal state has already observed it.
     if (cancelSignal != null) {
       cancellationDisabled = true;
-      attempt.preparedRequest?.detachAdmissionCancellation();
     }
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
@@ -5224,7 +5219,7 @@ export class AgentSession {
     agentInitiated?: boolean,
     signal?: AbortSignal,
     manualIntervention?: { enqueuedAtMs?: number }
-  ): Promise<Result<PreparedRolloverRequest, SendMessageError>> {
+  ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
     if (!this.aiService.prepareStreamMessage)
       return Err({
         type: "context_budget_blocked",
@@ -5251,72 +5246,77 @@ export class AgentSession {
       ),
       providersConfig
     );
-    // A monitor may cancel admission only until its durable wake crosses the rollback horizon.
-    // Do not retain that signal in the accepted request; shutdown has its own permanent link.
+    // Abort unfinished assembly, not a ready request: failed rollback can force its delivery.
+    // Ready candidates use explicit cancellation guards/disposal; shutdown remains permanent.
     const admissionController = new AbortController();
     const cancelAdmission = () => admissionController.abort(signal?.reason);
     const detachAdmissionCancellation = () => signal?.removeEventListener("abort", cancelAdmission);
     if (signal?.aborted) cancelAdmission();
     else signal?.addEventListener("abort", cancelAdmission, { once: true });
-    let retained = false;
-    using _admissionCancellation = {
-      [Symbol.dispose]: () => {
-        if (!retained) detachAdmissionCancellation();
-      },
-    };
     const optionsMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
-    const prepared = await this.aiService.prepareStreamMessage({
-      workspaceId: this.workspaceId,
-      messages,
-      modelString,
-      abortSignal: signal
-        ? AbortSignal.any([this.closingSignal, admissionController.signal])
-        : this.closingSignal,
-      thinkingLevel: options?.thinkingLevel
-        ? enforceThinkingPolicy(
-            modelString,
-            options.thinkingLevel,
-            minThinkingLevel,
-            providersConfig
-          )
-        : undefined,
-      minThinkingLevel,
-      reasoningMode: options?.reasoningMode,
-      toolPolicy: options?.toolPolicy,
-      additionalSystemContext: options?.additionalSystemContext,
-      additionalSystemInstructions: options?.additionalSystemInstructions,
-      maxOutputTokens: options?.maxOutputTokens,
-      muxProviderOptions: options?.providerOptions,
-      agentInitiated,
-      agentId: options?.agentId,
-      acpPromptId:
-        normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(optionsMuxMetadata),
-      delegatedToolNames:
-        normalizeDelegatedToolNames(options?.delegatedToolNames) ??
-        extractAcpDelegatedTools(optionsMuxMetadata),
-      muxMetadata: resolveStreamMuxMetadata(
-        optionsMuxMetadata,
-        this.findLastRetryUserMessage(messages)?.metadata?.muxMetadata,
-        messages
-      ),
-      recordFileState: this.fileChangeTracker.record.bind(this.fileChangeTracker),
-      postCompactionAttachments: null,
-      resolveMemoryContext: (model, memoryOptions) =>
-        this.resolveMemoryContext(
-          model,
-          { ...memoryOptions, tokenBudgetActive: this.isTokenBudgetActive(options) },
-          cache
+    let prepared: Result<PreparedStreamMessage, SendMessageError>;
+    try {
+      prepared = await this.aiService.prepareStreamMessage({
+        workspaceId: this.workspaceId,
+        messages,
+        modelString,
+        abortSignal: signal
+          ? AbortSignal.any([this.closingSignal, admissionController.signal])
+          : this.closingSignal,
+        thinkingLevel: options?.thinkingLevel
+          ? enforceThinkingPolicy(
+              modelString,
+              options.thinkingLevel,
+              minThinkingLevel,
+              providersConfig
+            )
+          : undefined,
+        minThinkingLevel,
+        reasoningMode: options?.reasoningMode,
+        toolPolicy: options?.toolPolicy,
+        additionalSystemContext: options?.additionalSystemContext,
+        additionalSystemInstructions: options?.additionalSystemInstructions,
+        maxOutputTokens: options?.maxOutputTokens,
+        muxProviderOptions: options?.providerOptions,
+        agentInitiated,
+        agentId: options?.agentId,
+        acpPromptId:
+          normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(optionsMuxMetadata),
+        delegatedToolNames:
+          normalizeDelegatedToolNames(options?.delegatedToolNames) ??
+          extractAcpDelegatedTools(optionsMuxMetadata),
+        muxMetadata: resolveStreamMuxMetadata(
+          optionsMuxMetadata,
+          this.findLastRetryUserMessage(messages)?.metadata?.muxMetadata,
+          messages
         ),
-      workspaceGoalService: this.workspaceGoalService,
-      prospectiveGoalStatusForToolAvailability,
-      allowAgentSetGoal: options?.allowAgentSetGoal === true,
-      experiments: options?.experiments,
-      disableWorkspaceAgents: options?.disableWorkspaceAgents,
-      strictAgentResolution: options?.strictAgentResolution,
-      hasQueuedMessages: this.hasQueuedMessages.bind(this),
-      onStepSettled: (step) => this.onContextBudgetStepSettled(step),
-      requestAssemblySnapshot: snapshot,
-    });
+        recordFileState: this.fileChangeTracker.record.bind(this.fileChangeTracker),
+        postCompactionAttachments: null,
+        resolveMemoryContext: (model, memoryOptions) =>
+          this.resolveMemoryContext(
+            model,
+            { ...memoryOptions, tokenBudgetActive: this.isTokenBudgetActive(options) },
+            cache
+          ),
+        workspaceGoalService: this.workspaceGoalService,
+        prospectiveGoalStatusForToolAvailability,
+        allowAgentSetGoal: options?.allowAgentSetGoal === true,
+        experiments: options?.experiments,
+        disableWorkspaceAgents: options?.disableWorkspaceAgents,
+        strictAgentResolution: options?.strictAgentResolution,
+        hasQueuedMessages: this.hasQueuedMessages.bind(this),
+        onStepSettled: (step) => this.onContextBudgetStepSettled(step),
+        requestAssemblySnapshot: snapshot,
+      });
+    } finally {
+      detachAdmissionCancellation();
+    }
+    if (prepared.success && admissionController.signal.aborted) {
+      await prepared.data[Symbol.asyncDispose]();
+      return Err(
+        createUnknownSendMessageError("Request preparation was canceled before admission.")
+      );
+    }
     if (!prepared.success)
       return prepared.error.type === "context_budget_exceeded"
         ? Err({
@@ -5324,17 +5324,12 @@ export class AgentSession {
             message: `The complete request does not fit in a fresh context window for ${prepared.error.model}. Shorten system instructions or tool schemas, or choose a larger model.`,
           })
         : prepared;
-    retained = true;
     return Ok({
-      detachAdmissionCancellation,
       start: (startOptions) => {
         this.memoryContextByModelString = cache;
         return prepared.data.start(startOptions);
       },
-      [Symbol.asyncDispose]: () => {
-        detachAdmissionCancellation();
-        return prepared.data[Symbol.asyncDispose]();
-      },
+      [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
     });
   }
 

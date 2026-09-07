@@ -783,4 +783,69 @@ describe("pinned full-payload rollover admission", () => {
       }
     }
   );
+  test.each([false, true])(
+    "cancellation during rollover append follows the durable rollback outcome (rollback fails=%s)",
+    async (rollbackFails) => {
+      const fixture = await setup("small");
+      const { h, historyService, before, start, assembly, modelCleanup } = fixture;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const append = historyService.appendManyToHistory.bind(historyService);
+      spyOn(historyService, "appendManyToHistory").mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return append(...args);
+      });
+      const rollback = spyOn(historyService, "deleteMessages");
+      if (rollbackFails) rollback.mockResolvedValueOnce(Err("injected durable rollback failure"));
+      const controller = new AbortController();
+      const accepted = mock(() => undefined);
+      const canceled = mock(() => undefined);
+      const cancelState = { canceledBeforeAcceptance: false };
+      const sending = h.session.sendMessage(
+        "Wake retained when rollback fails",
+        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+          cancelState,
+          onAccepted: accepted,
+          onCanceled: canceled,
+        }
+      );
+      try {
+        await entered.promise;
+        controller.abort("monitor canceled during rollover publication");
+        release.resolve();
+        expect((await sending).success).toBe(true);
+        expect(rollback).toHaveBeenCalledTimes(1);
+        expect(accepted).toHaveBeenCalledTimes(rollbackFails ? 1 : 0);
+        expect(canceled).toHaveBeenCalledTimes(rollbackFails ? 0 : 1);
+        expect(cancelState.canceledBeforeAcceptance).toBe(!rollbackFails);
+        expect(assembly).toHaveBeenCalledTimes(1);
+        expect(start).toHaveBeenCalledTimes(rollbackFails ? 1 : 0);
+        if (rollbackFails) {
+          expect(start.mock.calls[0][0].abortSignal?.aborted).toBe(false);
+          const rows = await historyService.getHistoryFromLatestBoundary(workspaceId);
+          expect(
+            rows.success &&
+              rows.data.some((row) =>
+                row.parts.some(
+                  (part) =>
+                    part.type === "text" && part.text === "Wake retained when rollback fails"
+                )
+              )
+          ).toBe(true);
+        } else {
+          expect(modelCleanup).toHaveBeenCalledTimes(1);
+          expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(before);
+        }
+      } finally {
+        release.resolve();
+        await sending;
+        await fixture.cleanup();
+      }
+    }
+  );
 });
