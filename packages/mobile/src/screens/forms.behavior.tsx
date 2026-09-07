@@ -486,7 +486,7 @@ test.each([
         onBack={() => {}}
         selection={scenario.selected ? { model, agentId: "plan" } : null}
         onSelectionChange={() => {}}
-        draft="Keep preferences"
+        draft={{ text: "Keep preferences", fileParts: [], reviews: [] }}
         onDraftChange={() => {}}
         onChanges={() => {}}
         onSettings={() => {}}

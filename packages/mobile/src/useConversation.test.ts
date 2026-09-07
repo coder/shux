@@ -5,6 +5,7 @@ import { createORPCClient } from "@orpc/client";
 import type { MobileClient } from "./api";
 import type { WorkspaceChatMessage } from "./transcript";
 import { useConversation } from "./useConversation";
+import type { RestoredInput } from "./draft";
 import type { SettingsData } from "./settings";
 
 afterEach(cleanup);
@@ -69,6 +70,8 @@ function fixture(
       yield* events.values();
     })();
   }
+  const restored: RestoredInput[] = [];
+  const chatRequests: AbortSignal[] = [];
   const requests: Array<{ input: unknown; signal?: AbortSignal }> = [];
   const client = createORPCClient<MobileClient>({
     call: async (path, input, options) => {
@@ -108,6 +111,7 @@ function fixture(
         case "agents.list":
           return [];
         case "workspace.onChat":
+          chatRequests.push(options.signal!);
           return new ReadableStream<WorkspaceChatMessage>({
             start(controller) {
               eventController = controller;
@@ -123,14 +127,29 @@ function fixture(
     },
   });
   const lifetime = new AbortController();
-  const view = renderHook(
-    ({ workspaceId, signal }) => useConversation(client, workspaceId, signal),
-    { initialProps: { workspaceId: "workspace", signal: lifetime.signal } }
+  const view = renderHook<
+    ReturnType<typeof useConversation>,
+    {
+      workspaceId: string;
+      signal: AbortSignal;
+      onRestore?: (event: RestoredInput) => void;
+    }
+  >(
+    ({ workspaceId, signal, onRestore }) => useConversation(client, workspaceId, signal, onRestore),
+    {
+      initialProps: {
+        workspaceId: "workspace",
+        signal: lifetime.signal,
+        onRestore: (event) => restored.push(event),
+      },
+    }
   );
   return {
     ...view,
     complete,
     requests,
+    restored,
+    chatRequests,
     policyRequests,
     policySubscriptions,
     configSubscriptions,
@@ -146,11 +165,55 @@ function fixture(
       });
       await waitFor(() => expect(view.result.current.transcript.caughtUp).toBe(true));
     },
-    async emit(event: WorkspaceChatMessage) {
-      await act(async () => eventController.enqueue(event));
+    async emit(event: WorkspaceChatMessage, afterEnqueue?: () => void) {
+      await act(async () => {
+        eventController.enqueue(event);
+        afterEnqueue?.();
+      });
     },
   };
 }
+
+test("restore events use the latest workspace callback once without resubscribing or replaying queue snapshots", async () => {
+  const view = fixture();
+  await view.ready();
+  const event: RestoredInput = {
+    type: "restore-to-input",
+    workspaceId: "workspace",
+    text: "Follow up",
+    fileParts: [
+      { url: "data:text/plain;base64,dGV4dA==", mediaType: "text/plain", filename: "draft.txt" },
+    ],
+    reviews: [{ filePath: "draft.ts", lineRange: "1", selectedCode: "draft", userNote: "Keep it" }],
+  };
+  await view.emit({ ...event, workspaceId: "other" });
+  await view.emit({
+    type: "queued-message-changed",
+    workspaceId: "workspace",
+    queuedMessages: [event.text],
+    displayText: event.text,
+    fileParts: event.fileParts,
+    reviews: event.reviews,
+  });
+  expect(view.restored).toHaveLength(0);
+  const transcript = view.result.current.transcript;
+  await view.emit(event);
+  expect(view.restored).toEqual([event]);
+  expect(view.result.current.transcript).toBe(transcript);
+  const replacement: RestoredInput[] = [];
+  view.rerender({
+    workspaceId: "workspace",
+    signal: view.lifetime.signal,
+    onRestore: (value) => replacement.push(value),
+  });
+  expect(replacement).toHaveLength(0);
+  await view.emit(event);
+  expect(view.restored).toHaveLength(1);
+  expect(replacement).toEqual([event]);
+  expect(view.chatRequests).toHaveLength(1);
+  await view.emit(event, () => view.lifetime.abort());
+  expect(replacement).toHaveLength(1);
+});
 
 test("older history is inserted without replacing newer copies and uses the oldest visible row", async () => {
   const view = fixture();

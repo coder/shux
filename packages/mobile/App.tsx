@@ -19,6 +19,8 @@ import { KeyboardProvider } from "./src/components/Keyboard";
 import { useProjects } from "./src/useProjects";
 import { useConnection } from "./src/useConnection";
 import { colors, layout, WIDE_LAYOUT_MIN_WIDTH } from "./src/theme";
+import { EMPTY_DRAFT } from "./src/draft";
+import type { ChatDraft } from "./src/draft";
 import type { ChatSettings } from "./src/settings";
 
 export type MobileRoutes = {
@@ -32,10 +34,10 @@ const Stack = createNativeStackNavigator<MobileRoutes>();
 type SessionContext = {
   session: ReturnType<typeof useConnection>;
   data: ReturnType<typeof useProjects>;
-  drafts: Record<string, string>;
+  drafts: Record<string, ChatDraft>;
   selections: Record<string, ChatSettings>;
   setSelection: (id: string, value: ChatSettings) => void;
-  setDraft: (id: string, update: SetStateAction<string>) => void;
+  setDraft: (id: string, update: SetStateAction<ChatDraft>) => void;
   create: (onCreated: (workspace: FrontendWorkspaceMetadata) => void) => void;
   disconnect: () => Promise<void>;
   disconnectError: string | null;
@@ -69,8 +71,8 @@ export default function App() {
 export function ConnectedApp(props: { connection: Connection; onDisconnect: () => void }) {
   const session = useConnection(props.connection);
   const data = useProjects(session.connection.client, session.signal);
-  // Draft text and unsent model choices survive native back/pop and reconnection.
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  // Full drafts and unsent model choices survive native back/pop and reconnection.
+  const [drafts, setDrafts] = useState<Record<string, ChatDraft>>({});
   const [selections, setSelections] = useState<Record<string, ChatSettings>>({});
   const [onCreated, setOnCreated] = useState<
     ((workspace: FrontendWorkspaceMetadata) => void) | null
@@ -108,7 +110,7 @@ export function ConnectedApp(props: { connection: Connection; onDisconnect: () =
     disconnecting,
     setDraft(id, update) {
       setDrafts((current) => {
-        const next = typeof update === "function" ? update(current[id] ?? "") : update;
+        const next = typeof update === "function" ? update(current[id] ?? EMPTY_DRAFT) : update;
         return current[id] === next ? current : { ...current, [id]: next };
       });
     },
@@ -267,7 +269,7 @@ function ConversationRoute(props: NativeStackScreenProps<MobileRoutes, "Conversa
           onSettings={() => props.navigation.navigate("Settings")}
           selection={selections[workspaceId] ?? null}
           onSelectionChange={(value) => setSelection(workspaceId, value)}
-          draft={drafts[workspaceId] ?? ""}
+          draft={drafts[workspaceId] ?? EMPTY_DRAFT}
           onDraftChange={(update) => setDraft(workspaceId, update)}
         />
       ) : (

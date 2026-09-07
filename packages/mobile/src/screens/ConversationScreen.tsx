@@ -13,9 +13,13 @@ import {
 } from "lucide-react-native";
 import type { MobileClient } from "../api";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
+import { prepareUserMessageForSend } from "../../../../src/common/types/message";
 import type { MuxMessage } from "../../../../src/common/types/message";
 import { Button, IconButton, Loading, Notice } from "../components/Controls";
 import { KeyboardAvoidingView } from "../components/Keyboard";
+import { DraftExtras } from "../components/DraftExtras";
+import { EMPTY_DRAFT } from "../draft";
+import type { ChatDraft } from "../draft";
 import { Message } from "../components/Message";
 import { ContextUsage } from "../components/ContextUsage";
 import { getContextMeterData } from "../contextUsage";
@@ -47,14 +51,21 @@ export function ConversationScreen(props: {
   onBack: () => void;
   selection: ChatSettings | null;
   onSelectionChange: (value: ChatSettings) => void;
-  draft: string;
-  onDraftChange: (value: SetStateAction<string>) => void;
+  draft: ChatDraft;
+  onDraftChange: (value: SetStateAction<ChatDraft>) => void;
   onChanges: () => void;
   onSettings: () => void;
 }) {
   const { transcript, settings, error, settingsError, loadOlder, loadingOlder, historyError } =
-    useConversation(props.client, props.workspace.id, props.signal);
+    useConversation(props.client, props.workspace.id, props.signal, (restored) => {
+      props.onDraftChange((current) => ({
+        text: [current.text, restored.text].filter(Boolean).join("\n\n"),
+        fileParts: [...current.fileParts, ...(restored.fileParts ?? [])],
+        reviews: [...current.reviews, ...(restored.reviews ?? [])],
+      }));
+    });
   const draft = props.draft;
+  const hasDraft = Boolean(draft.text.trim() || draft.fileParts.length || draft.reviews.length);
   const setDraft = props.onDraftChange;
   const [inputFocused, setInputFocused] = useState(false);
   const [inputHeight, setInputHeight] = useState(44);
@@ -111,7 +122,7 @@ export function ConversationScreen(props: {
     latestSettings.current = { options, policyBlockReason };
   }, [options, policyBlockReason]);
   const running = ready && transcript.streaming;
-  const expanded = inputFocused || draft.length > 0 || running || showSettings !== null;
+  const expanded = inputFocused || hasDraft || running || showSettings !== null;
 
   const lastMessage = transcript.messages.at(-1);
   // Only the active stream or the latest persisted partial can still need input.
@@ -139,18 +150,25 @@ export function ConversationScreen(props: {
     canAct && !running && resumeTargetId !== null && resumeTargetId !== startedResumeMessageId;
 
   async function send() {
-    if (!canAct || !options?.model || !draft.trim() || pending.current || running) return;
+    if (!canAct || !options?.model || !hasDraft || pending.current || running) return;
     pending.current = true;
     setBusy(true);
     setActionError(null);
-    const message = draft;
+    // All draft updates are immutable: only clear this sent version, never newer
+    // typing or another queue restoration that arrives while the request is pending.
+    const sent = draft;
+    const { finalText, metadata } = prepareUserMessageForSend(sent);
     const signal = controller.current.signal;
     try {
       const result = await props.client.workspace.sendMessage(
         {
           workspaceId: props.workspace.id,
-          message,
-          options,
+          message: finalText,
+          options: {
+            ...options,
+            ...(sent.fileParts.length ? { fileParts: sent.fileParts } : {}),
+            ...(metadata ? { muxMetadata: metadata } : {}),
+          },
         },
         { signal }
       );
@@ -159,7 +177,7 @@ export function ConversationScreen(props: {
         throw new Error(
           typeof result.error === "string" ? result.error : JSON.stringify(result.error)
         );
-      setDraft((current) => (current === message ? "" : current));
+      setDraft((current) => (current === sent ? EMPTY_DRAFT : current));
       setInputHeight(44);
       list.current?.scrollToEnd({ animated: true });
     } catch (cause) {
@@ -424,6 +442,7 @@ export function ConversationScreen(props: {
             {actionError}
           </Notice>
         )}
+        <DraftExtras draft={draft} onChange={setDraft} />
         {/* Keep the input bottommost. Pointer presses retain browser focus until click opens the picker, avoiding blur-driven movement. */}
         <View style={styles.composerToolbar}>
           <View style={styles.pickers}>
@@ -485,12 +504,11 @@ export function ConversationScreen(props: {
               !ready ? "Reconnecting…" : running ? "Write your next message…" : "Message Xum…"
             }
             placeholderTextColor={colors.muted}
-            value={draft}
-            onChangeText={setDraft}
+            value={draft.text}
+            onChangeText={(text) => setDraft((current) => ({ ...current, text }))}
             multiline
             onFocus={() => setInputFocused(true)}
             onBlur={() => setInputFocused(false)}
-            editable={!busy}
             onContentSizeChange={
               Platform.OS === "web"
                 ? undefined
@@ -512,7 +530,7 @@ export function ConversationScreen(props: {
             style={[
               styles.send,
               (canAct || running) &&
-                (running || Boolean(draft.trim())) && {
+                (running || hasDraft) && {
                   backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent,
                 },
             ]}
@@ -520,14 +538,8 @@ export function ConversationScreen(props: {
             <IconButton
               label={running ? "Interrupt agent" : "Send message"}
               icon={running ? Square : ArrowUp}
-              color={
-                (canAct || running) && (running || Boolean(draft.trim()))
-                  ? colors.bright
-                  : colors.muted
-              }
-              disabled={
-                !ready || busy || (!running && (!canAct || !draft.trim() || !options?.model))
-              }
+              color={(canAct || running) && (running || hasDraft) ? colors.bright : colors.muted}
+              disabled={!ready || busy || (!running && (!canAct || !hasDraft || !options?.model))}
               onPress={running ? interrupt : send}
             />
           </View>

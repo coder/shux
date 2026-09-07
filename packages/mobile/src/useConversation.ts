@@ -2,9 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import type { MobileClient } from "./api";
 import { applyChatEvent, createTranscriptState } from "./transcript";
 import type { SettingsData } from "./settings";
+import type { RestoredInput } from "./draft";
 import { linkedAbortController } from "./useConnection";
 
-export function useConversation(client: MobileClient, workspaceId: string, signal: AbortSignal) {
+export function useConversation(
+  client: MobileClient,
+  workspaceId: string,
+  signal: AbortSignal,
+  onRestore?: (event: RestoredInput) => void
+) {
+  const restore = useRef(onRestore);
+  useEffect(() => {
+    restore.current = onRestore;
+  }, [onRestore]);
   const [transcript, setTranscript] = useState(createTranscriptState);
   const [settings, setSettings] = useState<Omit<SettingsData, "policy"> | null>(null);
   const [policy, setPolicy] = useState<SettingsData["policy"]>(null);
@@ -113,6 +123,12 @@ export function useConversation(client: MobileClient, workspaceId: string, signa
       );
       for await (const event of events) {
         if (controller.signal.aborted) return;
+        // This is a one-shot queue handoff, not replayable transcript state. Consume
+        // it here so React rerenders cannot restore it twice or restart the socket.
+        if (event.type === "restore-to-input") {
+          if (event.workspaceId === workspaceId) restore.current?.(event);
+          continue;
+        }
         if (event.type === "delete") {
           // A page read before a truncate must not resurrect deleted history.
           historyRequest.current?.abort();

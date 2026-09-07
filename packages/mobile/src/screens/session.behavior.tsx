@@ -64,6 +64,8 @@ function fixture(
   let closed = 0;
   let reconnected = 0;
   let disconnected = 0;
+  let send = async (): Promise<unknown> => ({ success: true });
+  let interrupt = async (): Promise<unknown> => ({ success: true });
   let answer = async (): Promise<unknown> => ({ success: true });
   let resume = async (): Promise<unknown> => ({ success: true, data: { started: true } });
   function events<T>(
@@ -136,8 +138,9 @@ function fixture(
         case "workspace.resumeStream":
           return resume();
         case "workspace.interruptStream":
+          return interrupt();
         case "workspace.sendMessage":
-          return { success: true };
+          return send();
         case "workspace.executeBash":
           return { success: true, data: { success: true, output: "" } };
         default:
@@ -177,6 +180,12 @@ function fixture(
     },
     get disconnected() {
       return disconnected;
+    },
+    setSend(value: typeof send) {
+      send = value;
+    },
+    setInterrupt(value: typeof interrupt) {
+      interrupt = value;
     },
     setAnswer(value: typeof answer) {
       answer = value;
@@ -898,6 +907,174 @@ test("unavailable live settings prevent send and retain resume-only recovery aft
     options: { providerOptions },
   });
 });
+
+function restoredInput(): Extract<WorkspaceChatMessage, { type: "restore-to-input" }> {
+  return {
+    type: "restore-to-input",
+    workspaceId: "alpha",
+    text: "Queued follow-up",
+    fileParts: [
+      { filename: "queue.txt", mediaType: "text/plain", url: "data:text/plain;base64,cXVldWU=" },
+    ],
+    reviews: [
+      {
+        filePath: "src/queue.ts",
+        lineRange: "10-11",
+        selectedCode: "const next = 1;",
+        selectedDiff: "+const next = 1;",
+        oldStart: 10,
+        newStart: 10,
+        userNote: "Preserve the queued input",
+      },
+    ],
+  };
+}
+
+test("interrupt restores the full queue into the existing draft once and keeps it across navigation/reconnect", async () => {
+  const restored = restoredInput();
+  const replay: WorkspaceChatMessage[] = [
+    {
+      type: "stream-start",
+      workspaceId: "alpha",
+      messageId: "live",
+      historySequence: 1,
+      startTime: 1,
+      model,
+    },
+    {
+      type: "queued-message-changed",
+      workspaceId: "alpha",
+      queuedMessages: [restored.text],
+      displayText: restored.text,
+      fileParts: restored.fileParts,
+      reviews: restored.reviews,
+    },
+  ];
+  const view = fixture(replay);
+  await view.select("alpha");
+  expect(view.getByLabelText("Message")).toHaveProperty("value", "");
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Existing draft" } });
+  view.setInterrupt(async () => {
+    view.chats[0].events.enqueue(restored);
+    const idle = {
+      type: "stream-lifecycle",
+      workspaceId: "alpha",
+      phase: "idle",
+      hadAnyOutput: true,
+    } as const;
+    view.chats[0].events.enqueue(idle);
+    replay.splice(0, replay.length, idle);
+    return { success: true };
+  });
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Interrupt agent" })));
+  expect(view.calls.find((call) => call.path === "workspace.interruptStream")?.input).toEqual({
+    workspaceId: "alpha",
+  });
+  expect(view.getByLabelText("Message")).toHaveProperty(
+    "value",
+    "Existing draft\n\nQueued follow-up"
+  );
+  expect(view.getByText("queue.txt")).toBeDefined();
+  expect(view.getByText("1 review note")).toBeDefined();
+  await view.emit({ ...restored, workspaceId: "beta", text: "Wrong workspace" });
+  expect(callCount(view, "onChat")).toBe(1);
+  expect(view.getByLabelText("Message")).toHaveProperty(
+    "value",
+    "Existing draft\n\nQueued follow-up"
+  );
+  fireEvent.click(view.getByRole("button", { name: "Back to workspaces" }));
+  await view.select("alpha");
+  await act(async () => view.chats.at(-1)!.end());
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Retry" })));
+  await waitFor(() => expect(view.chats).toHaveLength(3));
+  expect(view.getByLabelText("Message")).toHaveProperty(
+    "value",
+    "Existing draft\n\nQueued follow-up"
+  );
+  expect(view.getAllByText("queue.txt")).toHaveLength(1);
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
+  const request = view.calls.find((call) => call.path === "workspace.sendMessage")?.input;
+  expect(request).toMatchObject({
+    options: { fileParts: restored.fileParts, muxMetadata: { reviews: restored.reviews } },
+  });
+  expect(request).toHaveProperty(
+    "message",
+    expect.stringContaining("Existing draft\n\nQueued follow-up")
+  );
+  expect(request).toHaveProperty("message", expect.stringContaining(restored.reviews![0].userNote));
+  expect(request).toHaveProperty(
+    "message",
+    expect.stringContaining(restored.reviews![0].selectedCode)
+  );
+  expect(view.getByLabelText("Message")).toHaveProperty("value", "");
+  expect(view.queryByText("queue.txt")).toBeNull();
+  expect(view.queryByText("1 review note")).toBeNull();
+});
+
+test("failed sends preserve full restored drafts and successful sends cannot erase newer text or extras", async () => {
+  const restored = restoredInput();
+  const view = fixture();
+  await view.select("alpha");
+  await view.emit(restored);
+  view.setSend(async () => ({ success: false, error: "send unavailable" }));
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
+  expect(view.getByRole("alert").textContent).toContain("send unavailable");
+  expect(view.getByLabelText("Message")).toHaveProperty("value", restored.text);
+  expect(view.getByText("queue.txt")).toBeDefined();
+  expect(view.getByText("1 review note")).toBeDefined();
+  const send = deferred<unknown>();
+  view.setSend(() => send.promise);
+  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+  expect(callCount(view, "sendMessage")).toBe(2);
+  expect(view.getByLabelText("Message").getAttribute("readonly")).toBeNull();
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "New draft" } });
+  await view.emit({
+    ...restored,
+    text: "Another restore",
+    fileParts: [{ ...restored.fileParts![0], filename: "new.txt" }],
+  });
+  expect(view.getByText("queue.txt")).toBeDefined();
+  fireEvent.click(view.getByRole("button", { name: "Remove attachment queue.txt" }));
+  await act(async () => send.resolve({ success: true }));
+  expect(view.getByLabelText("Message")).toHaveProperty("value", "New draft\n\nAnother restore");
+  expect(view.queryByText("queue.txt")).toBeNull();
+  expect(view.getByText("new.txt")).toBeDefined();
+  expect(view.getByText("2 review notes")).toBeDefined();
+  expect(callCount(view, "onChat")).toBe(1);
+  expect(view.calls.filter((call) => call.path === "workspace.sendMessage")[1].input).toMatchObject(
+    {
+      options: { fileParts: restored.fileParts, muxMetadata: { reviews: restored.reviews } },
+    }
+  );
+  fireEvent.click(view.getByRole("button", { name: "Remove review notes" }));
+  expect(view.queryByText("2 review notes")).toBeNull();
+});
+
+for (const extra of ["attachment", "review"] as const) {
+  test(`${extra}-only restored drafts send without text`, async () => {
+    const restored = restoredInput();
+    const view = fixture();
+    await view.select("alpha");
+    await view.emit({
+      ...restored,
+      text: "",
+      fileParts: extra === "attachment" ? restored.fileParts : [],
+      reviews: extra === "review" ? restored.reviews : [],
+    });
+    expect(view.getByLabelText("Message")).toHaveProperty("value", "");
+    await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
+    expect(callCount(view, "sendMessage")).toBe(1);
+    expect(view.calls.find((call) => call.path === "workspace.sendMessage")?.input).toMatchObject(
+      extra === "attachment"
+        ? { message: "", options: { fileParts: restored.fileParts } }
+        : { options: { muxMetadata: { reviews: restored.reviews } } }
+    );
+    expect(view.getByRole("button", { name: "Send message" }).getAttribute("aria-disabled")).toBe(
+      "true"
+    );
+  });
+}
 
 test("live interruption remains available during pending and failed settings refreshes, but not a lost transport", async () => {
   const view = fixture([
