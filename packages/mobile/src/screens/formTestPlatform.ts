@@ -8,6 +8,7 @@ import * as NativeWeb from "react-native-web";
 mock.module("react-native", () => NativeWeb);
 mock.module("react-native-safe-area-context", () => ({ SafeAreaView: NativeWeb.View }));
 const icon = () => null;
+mock.module("react-native-svg", () => ({ default: NativeWeb.View, Circle: icon }));
 mock.module("lucide-react-native", () =>
   Object.fromEntries(
     [

@@ -10,6 +10,7 @@ import type { MobileClient } from "../api";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 import { Button, Field, Sheet } from "../components/Controls";
 import { Message } from "../components/Message";
+import { ContextUsage } from "../components/ContextUsage";
 import { Markdown } from "../components/Markdown";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { ModelSettings } from "./ModelSettings";
@@ -27,6 +28,17 @@ const workspace: FrontendWorkspaceMetadata = {
   namedWorkspacePath: "/project/feature",
   runtimeConfig: { type: "local" },
 };
+
+test("context meter exposes measured progress without inventing an unknown percentage", () => {
+  const data = { segments: [], totalTokens: 200_000, maxTokens: 1_000_000, totalPercentage: 20 };
+  const view = render(<ContextUsage data={data} />);
+  expect(view.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("20");
+  view.rerender(<ContextUsage data={{ ...data, totalPercentage: 120 }} />);
+  expect(view.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("100");
+  view.rerender(<ContextUsage data={{ ...data, maxTokens: undefined }} />);
+  expect(view.getByRole("progressbar").getAttribute("aria-valuenow")).toBeNull();
+  expect(view.getByRole("progressbar").getAttribute("aria-valuetext")).toBeTruthy();
+});
 
 test("navigator counts and searches roots, not their agents, and preserves orphan access", () => {
   const child: FrontendWorkspaceMetadata = {

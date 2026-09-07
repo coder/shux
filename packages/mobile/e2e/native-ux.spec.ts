@@ -130,10 +130,10 @@ test("native stack preserves drafts and sheets keep their actions reachable", as
     await page.getByRole("radio", { name: "High", exact: true }).click();
     await expect(page.getByRole("button", { name: /^Effort/ })).toContainText("High");
     await page.getByRole("button", { name: "Close", exact: true }).click();
-    const modelBeforeModeChange = await chooseModel.innerText();
+    const modelBeforeModeChange = await chooseModel.textContent();
     await page.getByRole("button", { name: "Choose mode", exact: true }).click();
     await page.getByRole("radio", { name: /^Plan/ }).click();
-    await expect(chooseModel).toHaveText(modelBeforeModeChange);
+    await expect.poll(() => chooseModel.textContent()).toBe(modelBeforeModeChange);
     await expect(page.getByRole("textbox", { name: "Message", exact: true })).toHaveValue(draft);
     await expect(page.getByRole("button", { name: "Choose mode", exact: true })).toContainText(
       "Plan"

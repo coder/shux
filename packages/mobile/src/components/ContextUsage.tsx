@@ -20,9 +20,10 @@ export function ContextUsage(props: { data: TokenMeterData }) {
       accessible
       accessibilityRole="progressbar"
       accessibilityLabel="Context usage"
-      accessibilityValue={
-        known ? { min: 0, max: 100, now: percentage, text: detail } : { text: detail }
-      }
+      aria-valuemin={known ? 0 : undefined}
+      aria-valuemax={known ? 100 : undefined}
+      aria-valuenow={known ? percentage : undefined}
+      aria-valuetext={detail}
       style={styles.meter}
     >
       <Svg width={34} height={34} viewBox="0 0 34 34" accessible={false}>
