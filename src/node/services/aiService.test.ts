@@ -69,6 +69,7 @@ import * as toolAssembly from "./toolAssembly";
 import type { ToolModelUsageEvent } from "@/common/utils/tools/tools";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as systemMessageModule from "./systemMessage";
 
@@ -2577,6 +2578,67 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(created.optionsMuxProviderOptions?.openai?.wireFormat).toBe(testCase.wireFormat);
     }
   });
+
+  it.each(["gpt-6-astra", "team-astra"])(
+    "preserves the actual Coder instance and scoped alias for advisor Pro: %s",
+    async (modelId) => {
+      using xumHome = new DisposableTempDir("ai-service-advisor-coder-pro");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workspace-advisor-coder-pro";
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath)
+      );
+      const model = `coder:prod-openai/${modelId}`;
+      await writeProvidersConfig(xumHome.path, {
+        coder: {
+          coderOauth: {
+            type: "oauth",
+            sessionId: "test",
+            deploymentUrl: "https://coder.example.com",
+            access: "test-access",
+            refresh: "test-refresh",
+            expires: Date.now() + 3_600_000,
+            clientId: "test",
+            clientSecret: "test",
+          },
+          discoveredProviders: [
+            { name: "prod-openai", type: "openai" },
+            { name: "openai", type: "openai-compat" },
+          ],
+          models: [{ id: "prod-openai/team-astra", mappedToModel: "openai:gpt-6-astra" }],
+        },
+      });
+      await enableAdvisorForHarness(harness, model);
+      await startAdvisorStream(harness, workspaceId);
+      // Avoid an OAuth exchange; the real option/route adapter below must retain
+      // the selected instance instead of re-resolving the unrelated "openai" instance.
+      spyOn(harness.service, "createModel").mockImplementation((_model, options) => {
+        if (!options) throw new Error("Expected the adapter's provider-options target");
+        options.openai = { wireFormat: "responses" };
+        return Promise.resolve({ success: true, data: Object.create(null) as LanguageModel });
+      });
+      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
+      if (!runtime) throw new Error("Expected advisor runtime");
+      const created = await runtime.createModel(model);
+      expect(created.optionsRouteProvider).toBe("coder");
+      const options = buildProviderOptions(
+        created.optionsModelString,
+        "high",
+        undefined,
+        undefined,
+        created.optionsMuxProviderOptions,
+        undefined,
+        undefined,
+        created.optionsProvidersConfig,
+        created.optionsRouteProvider,
+        undefined,
+        "pro"
+      );
+      expect(options).toMatchObject({ openai: { reasoningMode: "pro" } });
+    }
+  );
 
   it("freezes advisor tool-call snapshots at the tool-call boundary", async () => {
     using xumHome = new DisposableTempDir("ai-service-advisor-step-snapshot-boundary");

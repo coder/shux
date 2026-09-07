@@ -1302,6 +1302,49 @@ describe("buildProviderOptions - OpenAI", () => {
       ).toBe(false);
     });
 
+    test.each([
+      { scoped: "openai:gpt-6-astra", upstream: "openai:gpt-5.2", type: "openai", pro: true },
+      { scoped: "openai:gpt-5.2", upstream: "openai:gpt-6-astra", type: "openai", pro: false },
+      {
+        scoped: "openai:gpt-6-astra",
+        upstream: "openai:gpt-6-astra",
+        type: "openai-compat",
+        pro: false,
+      },
+    ])("scoped aliases control capabilities, not Coder's wire: %j", (testCase) => {
+      const model = "coder:prod-openai/team-astra";
+      const config: ProvidersConfigMap = {
+        openai: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          models: [{ id: "team-astra", mappedToModel: testCase.upstream }],
+        },
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          discoveredProviders: [{ name: "prod-openai", type: testCase.type }],
+          models: [{ id: "prod-openai/team-astra", mappedToModel: testCase.scoped }],
+        },
+      };
+      expect(openaiProModeAvailable(model, { providersConfig: config })).toBe(testCase.pro);
+      const options = buildProviderOptions(
+        model,
+        "high",
+        undefined,
+        undefined,
+        { openai: { wireFormat: "responses" } },
+        undefined,
+        undefined,
+        config,
+        "coder",
+        undefined,
+        "pro"
+      );
+      expect(getOpenAIOptions(options)?.reasoningMode).toBe(testCase.pro ? "pro" : undefined);
+    });
+
     const fallbackAvailability: Array<Partial<NonNullable<ProvidersConfigMap["coder"]>>> = [
       { isEnabled: false, isConfigured: true },
       { isEnabled: true, isConfigured: false },

@@ -2091,36 +2091,16 @@ export class TurnRequestBuilder {
         toolOnCoderRoute ? toolModelString : normalizeToCanonical(toolEffectiveModelString),
         toolProvidersConfig
       );
-      // Wire-resolved identity for option construction, same
-      // snapshot: a raw coder: string carries no wire info, so
-      // buildProviderOptions would emit the wrong (or no)
-      // namespace for custom-named/cross-typed instances. Mirrors
-      // resolveOptionsCanonicalModel's shadow + wire rules.
-      const toolOptionsModelString = (() => {
-        // Custom providers keep their RAW identity: with the
-        // pinned snapshot below, buildProviderOptions remaps the
-        // wire namespace itself while still resolving
-        // mappedToModel alias metadata from the custom entry.
-        if (!toolModelString.startsWith("coder:")) {
-          return toolModelString;
-        }
-        const coderSection = toolProvidersConfig.coder;
-        if (isCustomProviderConfig(coderSection)) {
-          return toolModelString;
-        }
-        if (!toolOnCoderRoute) {
-          // Fallback-away: options must target the route that
-          // actually serves the request, not the instance's wire.
-          return normalizeToCanonical(toolEffectiveModelString);
-        }
-        const wire = resolveCoderWireCanonicalModel(
-          toolModelString.slice("coder:".length),
-          coderSection as
-            | { discoveredProviders?: unknown; additionalProviders?: unknown }
-            | undefined
-        );
-        return wire ? `${wire.origin}:${wire.modelId}` : toolModelString;
-      })();
+      // Keep the raw Coder instance and scoped aliases for option construction;
+      // the builder resolves the wire itself. A normalized openai: identity would
+      // make Pro inspect the unrelated default-named instance. Only fallback-away
+      // requests must switch to the identity of the provider actually serving them.
+      const toolOptionsModelString =
+        toolModelString.startsWith("coder:") &&
+        !isCustomProviderConfig(toolProvidersConfig.coder) &&
+        !toolOnCoderRoute
+          ? normalizeToCanonical(toolEffectiveModelString)
+          : toolModelString;
       return {
         model: toolModel.data.model,
         metadataModel,

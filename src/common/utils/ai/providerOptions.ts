@@ -481,14 +481,16 @@ export function buildProviderOptions(
     const routeIsDirect = routeProvider == null || routeProvider === origin;
     const shouldUseProMode =
       isResponses &&
-      (routeIsDirect ||
-        (routeProvider === "coder" &&
+      reasoningMode === "pro" &&
+      (routeIsDirect
+        ? openaiSupportsProMode(capabilityModel)
+        : routeProvider === "coder" &&
+          // The route-aware gate preserves scoped aliases without treating an
+          // alias's capability identity as the Coder instance's wire type.
           openaiProModeAvailable(modelString, {
             providersConfig,
             resolvedRouteProvider: routeProvider,
-          }))) &&
-      reasoningMode === "pro" &&
-      openaiSupportsProMode(capabilityModel);
+          }));
     const truncationMode = openaiTruncationMode ?? "disabled";
     const shouldSendReasoningSummary = supportsOpenAIReasoningSummary(capModelName);
 
