@@ -992,6 +992,154 @@ test.each(["Which features?", "__proto__"])(
   }
 );
 
+function prefilledQuestionPart(
+  answers: unknown,
+  multiSelect = false,
+  toolCallId = "prefilled"
+): MuxToolPart {
+  return {
+    type: "dynamic-tool",
+    toolCallId,
+    toolName: "ask_user_question",
+    state: "input-available",
+    input: {
+      questions: [
+        {
+          question: "Which branch?",
+          header: "Branch",
+          options: [
+            { label: "main", description: "Stable branch" },
+            { label: "next", description: "Upcoming release" },
+          ],
+          multiSelect,
+        },
+      ],
+      answers,
+    },
+  };
+}
+
+test.each([
+  { multi: false, answer: "main", choices: ["main"], other: null },
+  { multi: false, answer: "feature, urgent", choices: ["Other"], other: "feature, urgent" },
+  { multi: true, answer: "next, main", choices: ["next", "main"], other: null },
+  {
+    multi: true,
+    answer: "next, main, custom one, custom two",
+    choices: ["next", "main", "Other"],
+    other: "custom one, custom two",
+  },
+])(
+  "prefilled question displays and submits without edits: %j",
+  async ({ multi, answer, choices, other }) => {
+    const submitted: Array<Record<string, string>> = [];
+    const part = prefilledQuestionPart(
+      { "Which branch?": `  ${answer}  `, unrelated: "Ignore this" },
+      multi
+    );
+    const view = render(
+      <Message
+        message={toolMessage(part)}
+        canAnswer
+        onAnswer={async (_id, value) => {
+          submitted.push(value);
+        }}
+      />
+    );
+    for (const label of ["main", "next", "Other"]) {
+      expect(
+        view.getByRole(multi ? "checkbox" : "radio", { name: label }).getAttribute("aria-checked")
+      ).toBe(String(choices.some((choice) => choice === label)));
+    }
+    if (other !== null)
+      expect(view.getByDisplayValue(other)).toBe(view.getByLabelText("Other: Which branch?"));
+    else expect(view.queryByLabelText("Other: Which branch?")).toBeNull();
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+    });
+    expect(submitted).toEqual([{ "Which branch?": answer }]);
+  }
+);
+
+test("prefilled drafts preserve user edits across deltas but reset for a different tool call", async () => {
+  const submitted: Array<{ id: string; value: Record<string, string> }> = [];
+  const onAnswer = async (id: string, value: Record<string, string>) => {
+    submitted.push({ id, value });
+  };
+  const view = render(
+    <Message
+      message={toolMessage(prefilledQuestionPart({ "Which branch?": "main" }))}
+      canAnswer
+      onAnswer={onAnswer}
+    />
+  );
+  fireEvent.click(view.getByRole("radio", { name: "Other" }));
+  fireEvent.change(view.getByLabelText("Other: Which branch?"), {
+    target: { value: "My edited branch" },
+  });
+  view.rerender(
+    <Message
+      message={toolMessage(prefilledQuestionPart({ "Which branch?": "next" }))}
+      streaming
+      canAnswer
+      onAnswer={onAnswer}
+    />
+  );
+  expect(view.getByDisplayValue("My edited branch")).toBe(
+    view.getByLabelText("Other: Which branch?")
+  );
+  await act(async () => {
+    fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+  });
+  expect(submitted).toEqual([{ id: "prefilled", value: { "Which branch?": "My edited branch" } }]);
+  view.rerender(
+    <Message
+      message={toolMessage(
+        prefilledQuestionPart({ "Which branch?": "next" }, false, "another-call")
+      )}
+      canAnswer
+      onAnswer={onAnswer}
+    />
+  );
+  expect(view.queryByLabelText("Other: Which branch?")).toBeNull();
+  expect(view.getByRole("radio", { name: "next" }).getAttribute("aria-checked")).toBe("true");
+  await act(async () => {
+    fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+  });
+  expect(submitted[1]).toEqual({ id: "another-call", value: { "Which branch?": "next" } });
+});
+
+test.each([undefined, null, {}, { "Which branch?": "   " }])(
+  "missing or blank prefilled answers remain unanswered: %j",
+  (answers) => {
+    const view = render(
+      <Message
+        message={toolMessage(prefilledQuestionPart(answers))}
+        canAnswer
+        onAnswer={async () => {}}
+      />
+    );
+    expect(view.getByRole("button", { name: "Send answers" }).getAttribute("aria-disabled")).toBe(
+      "true"
+    );
+    expect(view.getByRole("radio", { name: "Other" }).getAttribute("aria-checked")).toBe("false");
+    expect(view.queryByLabelText("Other: Which branch?")).toBeNull();
+  }
+);
+
+test("invalid prefilled answer types are rejected by the canonical schema without crashing the message", () => {
+  const view = render(
+    <Message
+      message={toolMessage(prefilledQuestionPart({ "Which branch?": 42 }))}
+      canAnswer
+      onAnswer={async () => {}}
+    />
+  );
+  expect(view.queryByRole("button", { name: "Send answers" })).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Ask user question: No result" }));
+  expect(view.getByText(/42/)).toBeDefined();
+});
+
 test("malformed question payloads stay inspectable without presenting an incomplete answer form", () => {
   const part: MuxToolPart = {
     type: "dynamic-tool",

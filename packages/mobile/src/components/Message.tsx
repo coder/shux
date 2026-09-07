@@ -2,8 +2,12 @@ import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Brain, Check, ChevronDown, ChevronRight, File, Pause } from "lucide-react-native";
 import type { MuxMessage, MuxToolPart } from "../../../../src/common/types/message";
-import type { AskUserQuestionQuestion } from "../../../../src/common/types/tools";
+import type {
+  AskUserQuestionQuestion,
+  AskUserQuestionToolArgs,
+} from "../../../../src/common/types/tools";
 import { AskUserQuestionToolArgsSchema } from "../../../../src/common/utils/tools/toolDefinitions";
+import { parseAskUserQuestionAnswer } from "../../../../src/common/utils/tools/parseAskUserQuestionAnswer";
 import { Button, Field, Notice, Sheet } from "./Controls";
 import { Markdown } from "./Markdown";
 import { ToolIcon } from "./ToolIcon";
@@ -166,10 +170,10 @@ function Tool(props: {
   onAnswer: (toolCallId: string, answers: Record<string, string>) => Promise<void>;
 }) {
   const [inspecting, setInspecting] = useState(false);
-  const questions =
+  const questionInput =
     props.part.toolName === "ask_user_question" && props.part.state === "input-available"
-      ? (AskUserQuestionToolArgsSchema.safeParse(props.part.input).data?.questions ?? [])
-      : [];
+      ? AskUserQuestionToolArgsSchema.safeParse(props.part.input).data
+      : undefined;
   const name = props.part.toolName
     .replaceAll("_", " ")
     .replace(/^./, (letter) => letter.toUpperCase());
@@ -213,9 +217,9 @@ function Tool(props: {
           )}
         </Sheet>
       )}
-      {questions.length > 0 && (
+      {questionInput && (
         <QuestionForm
-          questions={questions}
+          {...questionInput}
           disabled={!props.canAnswer}
           onSubmit={(answers) => props.onAnswer(props.part.toolCallId, answers)}
         />
@@ -229,12 +233,30 @@ interface QuestionDraft {
   otherText: string;
 }
 
-function QuestionForm(props: {
-  questions: AskUserQuestionQuestion[];
-  disabled: boolean;
-  onSubmit: (answers: Record<string, string>) => Promise<void>;
-}) {
-  const [drafts, setDrafts] = useState(() => new Map<string, QuestionDraft>());
+function parsePrefilledAnswer(question: AskUserQuestionQuestion, answer: string): QuestionDraft {
+  const { optionLabels, customText } = parseAskUserQuestionAnswer(question, answer);
+  return {
+    selected: customText ? [...optionLabels, null] : optionLabels,
+    otherText: customText,
+  };
+}
+
+function QuestionForm(
+  props: Pick<AskUserQuestionToolArgs, "questions" | "answers"> & {
+    disabled: boolean;
+    onSubmit: (answers: Record<string, string>) => Promise<void>;
+  }
+) {
+  // Tool is keyed by toolCallId: seed once so streaming rerenders preserve user edits.
+  const [drafts, setDrafts] = useState(() => {
+    const prefilled = new Map(Object.entries(props.answers ?? {}));
+    return new Map(
+      props.questions.map((question) => [
+        question.question,
+        parsePrefilledAnswer(question, prefilled.get(question.question) ?? ""),
+      ])
+    );
+  });
   // Match desktop answer serialization: selection order, comma-separated labels,
   // and trimmed Other text. Null keeps the implicit choice distinct from tool labels.
   const answers = Object.fromEntries(
