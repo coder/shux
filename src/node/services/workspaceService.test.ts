@@ -7259,6 +7259,66 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  test.each(["reset", "clear", "replace"] as const)(
+    "committed %s still publishes invalidation and hygiene when cancellation retirement fails",
+    async (operation) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "cancel-retirement-hygiene";
+      await config.addWorkspace("/tmp/cancel-retirement-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "cancel-retirement-project",
+        projectPath: "/tmp/cancel-retirement-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user", "user", "old context")
+      );
+      const session = workspaceService.getOrCreateSession(workspaceId);
+      await session.interruptStream({ abandonPartial: true });
+      await session.retryPendingCompactionCleanup();
+      const clearState = spyOn(session, "clearFileState");
+      const clearCarryover = spyOn(session, "clearPostCompactionState");
+      const discard = spyOn(sandboxHostService, "discardScope");
+      const write = historyService.writeCompactionCancellation.bind(historyService);
+      const failedRetire = spyOn(historyService, "writeCompactionCancellation").mockImplementation(
+        async (...args) => {
+          if (args[1] === null) throw new Error("cancel unlink unavailable");
+          return write(...args);
+        }
+      );
+      const epochs = (workspaceService as unknown as { contextMutationEpochs: Map<string, number> })
+        .contextMutationEpochs;
+      const before = epochs.get(workspaceId) ?? 0;
+      try {
+        const result =
+          operation === "reset"
+            ? await workspaceService.resetContext(workspaceId)
+            : operation === "clear"
+              ? await workspaceService.truncateHistory(workspaceId)
+              : await workspaceService.replaceHistory(
+                  workspaceId,
+                  createMuxMessage("replacement", "assistant", "new context")
+                );
+        expect(result.success).toBe(false);
+        expect(!result.success && result.error).toContain("cancel unlink unavailable");
+        expect(epochs.get(workspaceId)).toBe(before + 1);
+        if (operation !== "replace") expect(clearState).toHaveBeenCalled();
+        expect(clearCarryover).toHaveBeenCalled();
+        expect(discard).toHaveBeenCalled();
+        failedRetire.mockRestore();
+        if (operation === "reset") {
+          expect(await workspaceService.resetContext(workspaceId)).toEqual(Ok("noop"));
+          expect(await historyService.readCompactionCancellation(workspaceId)).toBeNull();
+        }
+      } finally {
+        failedRetire.mockRestore();
+        await cleanup();
+      }
+    }
+  );
+
   test.each([
     "temporary",
     "busy",

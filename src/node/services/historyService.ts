@@ -2,6 +2,11 @@ import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
 import { renameSync } from "node:fs";
 import * as fs from "fs/promises";
+import { COMPACTION_CANCELLATION_FILE } from "@/common/constants/compactionCancellation";
+import {
+  CompactionCancellationSchema,
+  type CompactionCancellationRecord,
+} from "./compactionCancellation";
 import { ContinuousCompactionJournalStore } from "./continuousCompactionJournal";
 import writeFileAtomic from "write-file-atomic";
 import assert from "node:assert";
@@ -239,6 +244,61 @@ export class HistoryService {
       this.continuousJournals.set(workspaceId, journal);
     }
     return journal;
+  }
+
+  async readCompactionCancellation(
+    workspaceId: string
+  ): Promise<CompactionCancellationRecord | null> {
+    try {
+      return CompactionCancellationSchema.parse(
+        JSON.parse(
+          await fs.readFile(
+            path.join(this.getSessionDir(workspaceId), COMPACTION_CANCELLATION_FILE),
+            "utf8"
+          )
+        )
+      );
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return null;
+      // An unreadable cancellation record must never authorize automatic recovery.
+      throw error;
+    }
+  }
+
+  async writeCompactionCancellation(
+    workspaceId: string,
+    record: CompactionCancellationRecord | null,
+    isCurrent: () => boolean,
+    retiredNonce?: string
+  ): Promise<void> {
+    // This file must remain writable when transcript reads/recovery are failing.
+    await this.withHistoryWriteFileLock(workspaceId, async () => {
+      if (!isCurrent()) return;
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
+        throw new Error(`workspace ${workspaceId} was removed; refusing cancellation mutation`);
+      const cancellationPath = path.join(
+        this.getSessionDir(workspaceId),
+        COMPACTION_CANCELLATION_FILE
+      );
+      if (record === null) {
+        const current = await this.readCompactionCancellation(workspaceId);
+        if (isCurrent() && current?.nonce === retiredNonce)
+          await fs.rm(cancellationPath, { force: true });
+        return;
+      }
+      if (record.scope.kind === "summary") {
+        const current = await this.readCompactionCancellation(workspaceId);
+        if (current?.nonce !== record.nonce) return;
+      }
+      await ensurePrivateDir(this.getSessionDir(workspaceId));
+      const stagedPath = `${cancellationPath}.${randomUUID()}`;
+      try {
+        await writeFileAtomic(stagedPath, JSON.stringify(record), { mode: 0o600 });
+        if (isCurrent()) renameSync(stagedPath, cancellationPath);
+      } finally {
+        await fs.rm(stagedPath, { force: true });
+      }
+    });
   }
 
   private getSessionDir(workspaceId: string): string {
@@ -2540,10 +2600,18 @@ export class HistoryService {
     workspaceId: string,
     message: MuxMessage,
     shouldUpdate?: (current: MuxMessage) => boolean,
-    updateFromCurrent?: (current: MuxMessage) => MuxMessage
+    updateFromCurrent?: (current: MuxMessage) => MuxMessage,
+    onCommitted?: () => void
   ): Promise<Result<void>> {
+    assert(!onCommitted || shouldUpdate, "Update commit observers require a conditional mutation");
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to update history", () =>
-      this.updateHistoryUnderWriteLock(workspaceId, message, shouldUpdate, updateFromCurrent)
+      this.updateHistoryUnderWriteLock(
+        workspaceId,
+        message,
+        shouldUpdate,
+        updateFromCurrent,
+        onCommitted
+      )
     );
   }
 
@@ -2551,7 +2619,8 @@ export class HistoryService {
     workspaceId: string,
     message: MuxMessage,
     shouldUpdate?: (current: MuxMessage) => boolean,
-    updateFromCurrent?: (current: MuxMessage) => MuxMessage
+    updateFromCurrent?: (current: MuxMessage) => MuxMessage,
+    onCommitted?: () => void
   ): Promise<Result<void>> {
     try {
       const historyPath = this.getChatHistoryPath(workspaceId);
@@ -2622,7 +2691,12 @@ export class HistoryService {
       if (shouldUpdate && sourceMessage) {
         const source = sourceMessage;
         if (
-          !(await this.writeGuardedHistory(historyPath, historyEntries, () => shouldUpdate(source)))
+          !(await this.writeGuardedHistory(
+            historyPath,
+            historyEntries,
+            () => shouldUpdate(source),
+            onCommitted
+          ))
         )
           return Ok(undefined);
       } else await writeFileAtomic(historyPath, historyEntries);

@@ -5,6 +5,7 @@ import * as path from "path";
 import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
 import { Effect, Fiber } from "effect";
+import { CompactionCancellation } from "./compactionCancellation";
 import { StartupRecovery, type StartupRecoveryOutcome } from "./startupRecovery";
 import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
@@ -233,7 +234,13 @@ type SessionCompactionContext = ContinuousCompactionContext & {
  */
 type AgentSessionResult<T> =
   | { success: true; data: T }
-  | { success: false; error: SendMessageError; failureHandled?: true; superseded?: true };
+  | {
+      success: false;
+      error: SendMessageError;
+      failureHandled?: true;
+      superseded?: true;
+      admissionDeferred?: true;
+    };
 
 /**
  * Tracked file state for detecting external edits.
@@ -776,6 +783,7 @@ interface PreparationAttempt {
   failureAttempts?: number;
   failure?: SendMessageError;
   onFailure?: (error: SendMessageError) => Promise<void> | void;
+  resumeCancellation?: { nonce: string; epoch: number };
 }
 
 export class AgentSession {
@@ -786,6 +794,7 @@ export class AgentSession {
   private readonly workspaceId: string;
   private readonly config: Config;
   private readonly historyService: HistoryService;
+  private readonly compactionCancellation: CompactionCancellation;
   private readonly aiService: AgentSessionAIService;
   private readonly streamManager: AgentSessionStreamManager;
   private readonly mcpServerManager?: MCPServerManager;
@@ -865,10 +874,16 @@ export class AgentSession {
     // Persisted compaction follow-ups precede goal continuation recovery. Each successful
     // step is checkpointed, so retrying a later read cannot replay an earlier side effect.
     steps: [
+      () => this.runStartupRecoveryStep(() => this.reconcileCompactionCancellation()),
       () =>
         this.runStartupRecoveryStep(() => this.requireGoalAcknowledgmentForCrashRecoveredPartial()),
-      () => this.runStartupRecoveryStep(() => this.continuousCompactor.recover()),
-      () => this.runStartupRecoveryStep(() => this.dispatchPendingFollowUp()),
+      () =>
+        this.runStartupRecoveryStep(async () => {
+          // An unresolved Stop also excludes a journal that has not published its summary yet.
+          if ((await this.compactionCancellation.read())?.scope.kind !== "unresolved")
+            await this.continuousCompactor.recover();
+        }),
+      () => this.dispatchPendingFollowUp(),
       () =>
         this.runStartupRecoveryStep(() =>
           this.workspaceGoalService?.recoverPendingDispatchAfterRestart(this.workspaceId)
@@ -1071,6 +1086,7 @@ export class AgentSession {
     this.workspaceId = trimmedWorkspaceId;
     this.config = config;
     this.historyService = historyService;
+    this.compactionCancellation = new CompactionCancellation(historyService, trimmedWorkspaceId);
     this.aiService = aiService;
     const streamManagerCandidate = streamManager ?? aiService;
     assert(
@@ -1265,6 +1281,7 @@ export class AgentSession {
 
   get hasPendingCompactionCleanup(): boolean {
     return (
+      this.compactionCancellation.needsPersistence ||
       this.compactionCleanupRetry != null ||
       (this.deferredCompactionCleanup != null &&
         this.coordinator.canClearCompactionFollowUp(this.deferredCompactionCleanup.token))
@@ -1273,6 +1290,8 @@ export class AgentSession {
 
   retryPendingCompactionCleanup(): Promise<void> {
     if (this.compactionCleanupRetry) return this.compactionCleanupRetry;
+    if (this.compactionCancellation.needsPersistence)
+      return this.compactionCancellation.retry().then(() => this.retryPendingCompactionCleanup());
     const deferred = this.deferredCompactionCleanup;
     if (!deferred) return Promise.resolve();
     if (!this.coordinator.canClearCompactionFollowUp(deferred.token)) {
@@ -1363,6 +1382,7 @@ export class AgentSession {
         // A failed producer may defer cleanup while drain is running. Retry only
         // after its lease settles; retaining its token must never self-join drain.
         try {
+          await this.compactionCancellation.retry();
           await this.retryPendingCompactionCleanup();
         } catch (error) {
           unresolvedCompactionCleanup =
@@ -1646,6 +1666,7 @@ export class AgentSession {
       goalKind: request.goalKind,
       goalId: request.goalId,
       retrySignal: signal,
+      automatic: true,
     });
     // Interrupting the scheduling fiber cannot cancel resumeStream's original Promise.
     // Its late settlement must not mutate a replacement retry or accepted manual turn.
@@ -2545,6 +2566,24 @@ export class AgentSession {
     return retryRequest?.model ?? null;
   }
 
+  private async reconcileCompactionCancellation(): Promise<void> {
+    const cancellation = await this.compactionCancellation.read();
+    if (!cancellation) return;
+    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!history.success) throw new Error(history.error);
+    // A replacement witness is part of the row's atomic commit. The sidecar can
+    // safely retire even if the previous process died before its unlink completed.
+    if (
+      history.data.length === 0 ||
+      history.data.some((row) => row.metadata?.compactionCancellationNonce === cancellation.nonce)
+    )
+      await this.compactionCancellation.retire(cancellation.nonce);
+  }
+
+  getCompactionCancellationNonce(): Promise<string | undefined> {
+    return this.compactionCancellation.readForReplacement().then((record) => record?.nonce);
+  }
+
   private async runStartupRecoveryStep(step: () => unknown): Promise<void> {
     if (this.coordinator.closing) return;
     using _execution = this.coordinator.enterExecution();
@@ -3429,6 +3468,26 @@ export class AgentSession {
         markRowsDurable();
       return refuseAdmission(error);
     };
+    const refuseContextMutation = (): Promise<AgentSessionResult<void>> => {
+      // Only an intact, pre-persistence handoff can wait and retry. Capture the
+      // refusal here; later state or error text cannot reclassify real failures.
+      if (
+        this.coordinator.admissionBlocked &&
+        !isAdmissionStale() &&
+        internal?.compactionHandoff != null &&
+        this.coordinator.isCurrentCompaction(internal.compactionHandoff) &&
+        attempt.durability === "rollback-eligible" &&
+        persistedCancelableMessageIds.length === 0
+      )
+        return Promise.resolve({
+          success: false,
+          error: createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE),
+          admissionDeferred: true,
+        });
+      return refuseBeforeAcceptance(
+        createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+      );
+    };
     let cancellationHandled = false;
     let cancellationDisabled = false;
     const cancelBeforeAcceptance = async (): Promise<boolean> => {
@@ -3740,9 +3799,7 @@ export class AgentSession {
       // other. The epoch probe (r41) also refuses edits whose target rows a
       // completed mutation already discarded.
       if (this.coordinator.admissionBlocked || isAdmissionStale()) {
-        return refuseBeforeAcceptance(
-          createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
-        );
+        return refuseContextMutation();
       }
       if (this.coordinator.closing) {
         return refuseBeforeAcceptance(
@@ -3852,6 +3909,9 @@ export class AgentSession {
         ? await this.withKeepRecentTailStamp(typedMuxMetadata, optionsForStream)
         : typedMuxMetadata;
 
+    const compactionCancellationNonce = isManualUserMessage
+      ? await this.getCompactionCancellationNonce()
+      : undefined;
     const userMessage = createMuxMessage(
       messageId,
       "user",
@@ -3862,6 +3922,7 @@ export class AgentSession {
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         retrySendOptions: pickStartupRetrySendOptions(optionsForStream, agentInitiated, goalKind),
         muxMetadata: stampedMuxMetadata, // Pass through frontend metadata as black-box
+        ...(compactionCancellationNonce ? { compactionCancellationNonce } : {}),
         ...(acpPromptId != null ? { acpPromptId } : {}),
         ...(goalKind != null ? { kind: goalKind } : {}),
         // Scope goal-loop rows to their goal so a replaced goal's continuation
@@ -4033,15 +4094,13 @@ export class AgentSession {
               autoCompactionRequest.agentInitiated
             ),
             muxMetadata: autoCompactionRequest.metadata,
+            ...(compactionCancellationNonce ? { compactionCancellationNonce } : {}),
             synthetic: true,
             uiVisible: true,
           }
         );
 
-        if (this.coordinator.admissionBlocked || isAdmissionStale())
-          return refuseBeforeAcceptance(
-            createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
-          );
+        if (this.coordinator.admissionBlocked || isAdmissionStale()) return refuseContextMutation();
         if (this.coordinator.closing)
           return refuseBeforeAcceptance(
             createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE)
@@ -4085,9 +4144,7 @@ export class AgentSession {
     // after a mutation commits; this check and the PREPARING gate remain
     // backstops for entry-accounting bypasses.
     if (this.coordinator.admissionBlocked || isAdmissionStale()) {
-      return refuseBeforeAcceptance(
-        createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
-      );
+      return refuseContextMutation();
     }
     // Still pre-persist: a row appended now would read as a dispatched turn on the next startup
     // while streamWithHistory's own latch check keeps its stream from ever running.
@@ -4261,6 +4318,9 @@ export class AgentSession {
     // is never invoked past this point, so even a failure in goal sync or
     // acceptance leaves the payload + trigger rows durable in the transcript.
     markRowsDurable();
+    // No replacement provider/compaction may produce B before A's fence retires.
+    if (compactionCancellationNonce)
+      await this.compactionCancellation.retire(compactionCancellationNonce);
     try {
       await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
     } catch (error) {
@@ -4509,6 +4569,7 @@ export class AgentSession {
       goalKind?: GoalSyntheticMessageKind;
       goalId?: string;
       retrySignal?: AbortSignal;
+      automatic?: boolean;
     }
   ): Promise<AgentSessionResult<{ started: boolean }>> {
     this.assertNotDisposed("resumeStream");
@@ -4583,6 +4644,17 @@ export class AgentSession {
       );
       if (admission.status !== "admitted") return Ok({ started: false });
       const preparedTurn = admission.turnId;
+      if (!internal?.automatic && internal?.agentInitiated !== true) {
+        const epoch = this.coordinator.compactionIntent.epoch;
+        const nonce = await this.getCompactionCancellationNonce();
+        if (
+          !this.coordinator.isCurrentTurn(preparedTurn) ||
+          this.coordinator.compactionIntent.epoch !== epoch ||
+          this.coordinator.closing
+        )
+          return Ok({ started: false });
+        if (nonce) attempt.resumeCancellation = { nonce, epoch };
+      }
       this.setAutoRetryResumeState(
         optionsForStream,
         internal?.agentInitiated,
@@ -5551,6 +5623,18 @@ export class AgentSession {
     const interruptedPolicy = this.coordinator.captureInterruptSettlement(options?.soft);
     if (options?.abandonPartial || this.midStreamCompactionPending) {
       this.coordinator.invalidateCompaction(true);
+      // Register durable cancellation before any Stop await. Its independent nonce
+      // survives a later manual preparation that fails before committing its row.
+      const execution = this.coordinator.enterExecution();
+      this.compactionCancellation
+        .cancel()
+        .finally(() => execution[Symbol.dispose]())
+        .catch((error: unknown) =>
+          log.warn("Failed to persist compaction cancellation", {
+            workspaceId: this.workspaceId,
+            error,
+          })
+        );
       this.continuousCompactor.reset("user-interrupt");
     }
 
@@ -5888,6 +5972,47 @@ export class AgentSession {
       // collect them so the Err path resolves each exactly once.
       const preStartErrors: StreamErrorPayload[] = [];
       this.coordinator.configureOperation(operation, this.activeCompactionRequest != null);
+      const resumedCancellation = preparation?.resumeCancellation;
+      if (resumedCancellation) {
+        const resumedUser =
+          lastUserMessage ?? requestMessages.findLast((row) => row.role === "user");
+        if (!resumedUser)
+          return await fail(
+            createUnknownSendMessageError("Cannot accept resume without a user row")
+          );
+        let committed = false;
+        // Retry is explicit user intent but reuses its existing row. Persist that
+        // acceptance before engine entry; failed preflight or a guarded no-op keeps Stop.
+        const witnessed = await this.historyService.updateHistory(
+          this.workspaceId,
+          resumedUser,
+          (current) =>
+            !isStreamStartAborted() &&
+            this.coordinator.compactionIntent.epoch === resumedCancellation.epoch &&
+            current.id === resumedUser.id &&
+            current.role === "user" &&
+            current.metadata?.historySequence === resumedUser.metadata?.historySequence,
+          (current) => ({
+            ...current,
+            metadata: {
+              ...current.metadata,
+              compactionCancellationNonce: resumedCancellation.nonce,
+            },
+          }),
+          () => {
+            committed = true;
+          }
+        );
+        if (committed) await this.compactionCancellation.retire(resumedCancellation.nonce);
+        if (!witnessed.success) return await fail(createUnknownSendMessageError(witnessed.error));
+        if (
+          !committed ||
+          isStreamStartAborted() ||
+          this.coordinator.compactionIntent.epoch !== resumedCancellation.epoch
+        )
+          return Ok(undefined);
+      }
+
       const streamResult = await this.aiService.streamMessage({
         messages: requestMessages,
         workspaceId: this.workspaceId,
@@ -7415,9 +7540,15 @@ export class AgentSession {
     return this.coordinator.reserve("admission");
   }
 
-  contextMutationCommitted(): void {
+  async contextMutationCommitted(): Promise<void> {
     this.coordinator.invalidateCompaction(false);
     this.continuousCompactor.reset("context-mutation");
+    await this.retireCompactionCancellation();
+  }
+
+  async retireCompactionCancellation(): Promise<void> {
+    const cancellation = await this.compactionCancellation.readForReplacement();
+    if (cancellation) await this.compactionCancellation.retire(cancellation.nonce);
   }
 
   /**
@@ -8067,6 +8198,23 @@ export class AgentSession {
     summaryMessageId?: string,
     cancelResume?: () => boolean
   ): Promise<boolean> {
+    const epoch = this.coordinator.compactionIntent.epoch;
+    for (;;) {
+      // Keep the recovery checkpoint pending while a temporary hold excludes sends.
+      // Wait outside the I/O lease so shutdown can cancel it without joining itself.
+      while (this.coordinator.admissionBlocked && !this.coordinator.closing) {
+        await this.coordinator.waitForAdmissionRelease();
+        if (this.coordinator.compactionIntent.epoch !== epoch) return false;
+      }
+      const result = await this.tryDispatchPendingFollowUp(summaryMessageId, cancelResume);
+      if (result !== "deferred") return result;
+    }
+  }
+
+  private async tryDispatchPendingFollowUp(
+    summaryMessageId?: string,
+    cancelResume?: () => boolean
+  ): Promise<boolean | "deferred"> {
     if (
       this.deferredCompactionCleanup &&
       !this.coordinator.canClearCompactionFollowUp(this.deferredCompactionCleanup.token)
@@ -8080,9 +8228,6 @@ export class AgentSession {
     ) {
       return false;
     }
-    // A temporary admission hold is not a replacement. Keep deferred work for
-    // its next lifecycle opportunity rather than competing with context writes.
-    if (deferred && this.coordinator.admissionBlocked && !this.coordinator.closing) return false;
     this.deferredCompactionCleanup = undefined;
     const targetSummaryId = deferred ? deferred.summaryMessageId : summaryMessageId;
     // A leased terminal producer can reach its abandoned boundary only after
@@ -8097,6 +8242,7 @@ export class AgentSession {
     if (!token) return false;
     const dispatch: CompactionFollowUpDispatch = deferred?.dispatch ?? { accepted: false };
     try {
+      await this.compactionCancellation.flush();
       if (deferred && dispatch.summary) {
         await this.clearPendingFollowUpFromSummary(dispatch.summary, token);
         return false;
@@ -8145,7 +8291,7 @@ export class AgentSession {
     dispatch: CompactionFollowUpDispatch,
     summaryMessageId?: string,
     cancelResume?: () => boolean
-  ): Promise<boolean> {
+  ): Promise<boolean | "deferred"> {
     let summaryMessage: MuxMessage | undefined;
     if (summaryMessageId) {
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(
@@ -8230,6 +8376,17 @@ export class AgentSession {
       // A replacement/edit drops that ownership, so it cannot erase the new intent.
       if (this.coordinator.canClearCompactionFollowUp(token))
         await this.clearPendingFollowUpFromSummary(lastMessage, token);
+      return false;
+    }
+
+    const cancellation = await this.compactionCancellation.read();
+    if (!this.coordinator.isCurrentCompaction(token)) {
+      if (this.coordinator.canClearCompactionFollowUp(token))
+        await this.clearPendingFollowUpFromSummary(lastMessage, token);
+      return false;
+    }
+    if (cancellation && this.compactionCancellation.matches(cancellation, lastMessage)) {
+      await this.clearPendingFollowUpFromSummary(lastMessage, token);
       return false;
     }
 
@@ -8468,6 +8625,10 @@ export class AgentSession {
       persistedGoalId
     );
 
+    // A hold may arrive during history/goal reads. Release this claim and wait
+    // at the outer checkpoint rather than turning temporary exclusion into failure.
+    if (this.coordinator.admissionBlocked) return "deferred";
+
     // Await sendMessage to ensure the follow-up is persisted before returning.
     // This guarantees ordering: the follow-up message is written to history
     // before sendQueuedMessages() runs, preventing race conditions.
@@ -8495,6 +8656,7 @@ export class AgentSession {
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
       admissionStale: followUpAdmissionStale,
     });
+    if (!sendResult.success && sendResult.admissionDeferred) return "deferred";
     if (!sendResult.success && !(dispatch.accepted && sendResult.superseded)) {
       if (!dispatch.accepted && cancelResume?.()) {
         await this.clearPendingFollowUpFromSummary(lastMessage, token);
@@ -8602,6 +8764,14 @@ export class AgentSession {
       return;
     }
 
+    if (!this.coordinator.canClearCompactionFollowUp(token)) return;
+    const cancellation = await this.compactionCancellation.read();
+    if (!this.coordinator.canClearCompactionFollowUp(token)) return;
+    const canceled =
+      cancellation != null && this.compactionCancellation.matches(cancellation, summaryMessage);
+    if (canceled) await this.compactionCancellation.narrow(cancellation.nonce, summaryMessage);
+    if (!this.coordinator.canClearCompactionFollowUp(token)) return;
+
     const updateResult = await this.historyService.updateHistory(
       this.workspaceId,
       summaryMessage,
@@ -8631,6 +8801,8 @@ export class AgentSession {
     if (!updateResult.success) {
       throw new Error(`Failed to clear skipped pending follow-up: ${updateResult.error}`);
     }
+    if (canceled && this.coordinator.canClearCompactionFollowUp(token))
+      await this.compactionCancellation.retire(cancellation.nonce);
   }
 
   /**

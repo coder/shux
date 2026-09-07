@@ -152,6 +152,7 @@ export const MuxMessageSchema = z.object({
   metadata: z
     .object({
       historySequence: z.number().optional(),
+      compactionCancellationNonce: z.string().optional().catch(undefined),
       // Step cuts are an optimization; malformed legacy metadata must not block chat replay.
       stepStartPartIndices: z.array(z.number()).optional().catch(undefined),
       timestamp: z.number().optional(),

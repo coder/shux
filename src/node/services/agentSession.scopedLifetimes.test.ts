@@ -48,7 +48,7 @@ describe("AgentSession scoped turn lifetimes", () => {
       await entered.promise;
       {
         using _mutation = h.session.holdTurnAdmission();
-        h.session.contextMutationCommitted();
+        await h.session.contextMutationCommitted();
       }
       expect(h.session.isBusy()).toBe(false);
       await compactor.observe(75, context);

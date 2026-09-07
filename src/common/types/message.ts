@@ -889,6 +889,8 @@ export interface ModelFallbackRecord {
 
 // Our custom metadata type
 export interface MuxMetadata {
+  /** Durable explicit replacement of a stopped compaction intent, safe across sidecar retirement crashes. */
+  compactionCancellationNonce?: string;
   /** Highest persisted history sequence included in the provider request that produced this assistant. */
   requestHistorySequence?: number;
   historySequence?: number; // Assigned by backend for global message ordering (required when writing to history)

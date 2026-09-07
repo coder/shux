@@ -1,10 +1,13 @@
+import { writeFile } from "node:fs/promises";
+import { COMPACTION_CANCELLATION_FILE } from "@/common/constants/compactionCancellation";
+import type { ContinuousCompactor } from "./continuousCompactor";
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
 import type { CompactionHandler } from "./compactionHandler";
-import type { HistoryService } from "./historyService";
+import { HistoryService } from "./historyService";
 import { log } from "./log";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -421,7 +424,7 @@ test.each([
             },
           },
         });
-        h.session.contextMutationCommitted();
+        await h.session.contextMutationCommitted();
       }
       closing = h.session.finishShutdown();
       release.resolve();
@@ -569,7 +572,7 @@ test("context replacement after Stop dispatches B while A's held cleanup is reti
           },
         },
       });
-      h.session.contextMutationCommitted();
+      await h.session.contextMutationCommitted();
     }
     expect(await h.internals.dispatchPendingFollowUp()).toBe(true);
     release.resolve();
@@ -689,7 +692,7 @@ test("retrying retired cleanup never dispatches the replacement handoff", async 
           },
         },
       });
-      h.session.contextMutationCommitted();
+      await h.session.contextMutationCommitted();
     }
     await h.session.retryPendingCompactionCleanup();
     expect(stream).not.toHaveBeenCalled();
@@ -700,3 +703,518 @@ test("retrying retired cleanup never dispatches the replacement handoff", async 
     await h.cleanup();
   }
 });
+
+test("stopped follow-up stays canceled after failed cleanup and a fresh process session", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  await h.session.interruptStream({ abandonPartial: true });
+  const read = spyOn(h.historyService, "getLastMessages").mockRejectedValue(
+    new Error("history unavailable")
+  );
+  try {
+    await h.internals.dispatchPendingFollowUp().catch(() => undefined);
+    await h.session.finishShutdown().catch(() => undefined);
+    read.mockRestore();
+    const freshHistory = new HistoryService(h.config);
+    const restarted = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: freshHistory,
+    });
+    const stream = spyOn(restarted.aiService, "streamMessage");
+    try {
+      await restarted.session.runStartupRecovery();
+      expect(stream).not.toHaveBeenCalled();
+    } finally {
+      await restarted.session.dispose();
+    }
+  } finally {
+    read.mockRestore();
+    await h.session.dispose().catch(() => undefined);
+    await h.cleanup();
+  }
+});
+
+test("an initial follow-up waits for admission release without consuming recovery", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  const hold = h.session.holdTurnAdmission();
+  const stream = spyOn(h.aiService, "streamMessage");
+  try {
+    const pending = h.internals.dispatchPendingFollowUp();
+    await Promise.resolve();
+    expect(h.internals.coordinator.compactionIntent.followUp).toBeUndefined();
+    expect(stream).not.toHaveBeenCalled();
+    hold[Symbol.dispose]();
+    expect(await pending).toBe(true);
+    expect(stream).toHaveBeenCalledTimes(1);
+  } finally {
+    hold[Symbol.dispose]();
+    await h.session.dispose();
+    await h.cleanup();
+  }
+}, 1000);
+
+test.each([
+  "release",
+  "nested release",
+  "Stop",
+  "replacement",
+  "shutdown",
+  "hold during read",
+  "hold during prepare",
+] as const)(
+  "startup follow-up admission wait handles %s without another recovery trigger",
+  async (action) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(workspaceId, summary());
+    let hold =
+      action === "hold during read" || action === "hold during prepare"
+        ? undefined
+        : h.session.holdTurnAdmission();
+    const second = action === "nested release" ? h.session.holdTurnAdmission() : undefined;
+    const waiting = Promise.withResolvers<void>();
+    const wait = h.internals.coordinator.waitForAdmissionRelease.bind(h.internals.coordinator);
+    spyOn(h.internals.coordinator, "waitForAdmissionRelease").mockImplementation(() => {
+      waiting.resolve();
+      return wait();
+    });
+    if (action === "hold during read") {
+      const read = h.historyService.getLastMessages.bind(h.historyService);
+      spyOn(h.historyService, "getLastMessages").mockImplementationOnce(async (...args) => {
+        const result = await read(...args);
+        hold = h.session.holdTurnAdmission();
+        return result;
+      });
+    }
+    if (action === "hold during prepare") {
+      const pricing = h.goalService.assertPricedModelForBudgetedGoal.bind(h.goalService);
+      spyOn(h.goalService, "assertPricedModelForBudgetedGoal").mockImplementationOnce(
+        async (...args) => {
+          const result = await pricing(...args);
+          hold = h.session.holdTurnAdmission();
+          return result;
+        }
+      );
+    }
+    const stream = spyOn(h.aiService, "streamMessage");
+    const recovery = h.session.runStartupRecovery();
+    try {
+      await waiting.promise;
+      // No physical lease is waiting for a policy hold: shutdown can drain it.
+      await h.internals.coordinator.drain();
+      expect(stream).not.toHaveBeenCalled();
+      if (action === "Stop") await h.session.interruptStream({ abandonPartial: true });
+      if (action === "replacement") {
+        await h.historyService.clearHistory(workspaceId);
+        await h.session.contextMutationCommitted();
+      }
+      if (action === "shutdown") await h.session.finishShutdown();
+      hold?.[Symbol.dispose]();
+      if (second) {
+        await Promise.resolve();
+        expect(stream).not.toHaveBeenCalled();
+        second[Symbol.dispose]();
+      }
+      await recovery;
+      expect(stream).toHaveBeenCalledTimes(
+        action === "release" ||
+          action === "nested release" ||
+          action === "hold during read" ||
+          action === "hold during prepare"
+          ? 1
+          : 0
+      );
+    } finally {
+      hold?.[Symbol.dispose]();
+      second?.[Symbol.dispose]();
+      await recovery;
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  },
+  2000
+);
+
+test("a delayed cancellation write survives failed manual preparation", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const write = h.historyService.writeCompactionCancellation.bind(h.historyService);
+  spyOn(h.historyService, "writeCompactionCancellation").mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return write(...args);
+  });
+  try {
+    await h.session.interruptStream({ abandonPartial: true });
+    await entered.promise;
+    spyOn(h.historyService, "appendToHistory").mockResolvedValueOnce(
+      Err("replacement append failed")
+    );
+    expect((await h.session.sendMessage("replacement", options)).success).toBe(false);
+    release.resolve();
+    await h.session.dispose();
+    const freshHistory = new HistoryService(h.config);
+    expect(await freshHistory.readCompactionCancellation(workspaceId)).not.toBeNull();
+    await expectNoRecovery(h.config, freshHistory);
+  } finally {
+    release.resolve();
+    await h.session.dispose().catch(() => undefined);
+    await h.cleanup();
+  }
+});
+
+test("a durable replacement witness survives a crash before cancellation retirement", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  await h.session.interruptStream({ abandonPartial: true });
+  const nonce = await h.session.getCompactionCancellationNonce();
+  const write = h.historyService.writeCompactionCancellation.bind(h.historyService);
+  const writes = spyOn(h.historyService, "writeCompactionCancellation").mockImplementation(
+    async (...args) => {
+      if (args[1] === null) throw new Error("cancellation unlink failed");
+      return write(...args);
+    }
+  );
+  const stream = spyOn(h.aiService, "streamMessage");
+  try {
+    const result = await h.session
+      .sendMessage("replacement", options)
+      .catch((error: unknown) => error);
+    expect(result).toHaveProperty("message", "cancellation unlink failed");
+    expect(stream).not.toHaveBeenCalled();
+    const freshHistory = new HistoryService(h.config);
+    const rows = await freshHistory.getHistoryFromLatestBoundary(workspaceId);
+    expect(
+      rows.success &&
+        rows.data.find((row) => row.role === "user")?.metadata?.compactionCancellationNonce
+    ).toBe(nonce);
+    expect(await freshHistory.readCompactionCancellation(workspaceId)).not.toBeNull();
+    const restarted = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: freshHistory,
+    });
+    try {
+      await restarted.session.runStartupRecovery();
+      expect(await freshHistory.readCompactionCancellation(workspaceId)).toBeNull();
+      const after = await freshHistory.getHistoryFromLatestBoundary(workspaceId);
+      expect(
+        after.success && after.data.filter((row) => row.role === "user").map((row) => row.parts)
+      ).toMatchObject([[{ type: "text", text: "replacement" }]]);
+    } finally {
+      await restarted.session.dispose();
+    }
+  } finally {
+    writes.mockRestore();
+    await h.session.dispose().catch(() => undefined);
+    await h.cleanup();
+  }
+});
+
+test("cancellation persistence failures fail teardown until an explicit durable retry", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  const write = spyOn(h.historyService, "writeCompactionCancellation").mockRejectedValue(
+    new Error("cancellation disk unavailable")
+  );
+  try {
+    await h.session.interruptStream({ abandonPartial: true });
+    const failure = await h.session.dispose().catch((error: unknown) => error);
+    expect(failure).toHaveProperty("message", "cancellation disk unavailable");
+    expect(h.session.hasPendingCompactionCleanup).toBe(true);
+    expect(h.aiEmitter.listenerCount("stream-start")).toBe(0);
+    write.mockRestore();
+    await h.session.retryPendingCompactionCleanup();
+    expect(h.session.hasPendingCompactionCleanup).toBe(false);
+    await expectNoRecovery(h.config, new HistoryService(h.config));
+  } finally {
+    write.mockRestore();
+    await h.session.dispose().catch(() => undefined);
+    await h.cleanup();
+  }
+});
+
+test("an exact cancellation survives failed summary writes across a fresh service", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  await h.session.interruptStream({ abandonPartial: true });
+  const update = spyOn(h.historyService, "updateHistory").mockResolvedValue(
+    Err("history rewrite unavailable")
+  );
+  try {
+    await h.internals.dispatchPendingFollowUp().catch(() => undefined);
+    await h.session.finishShutdown().catch(() => undefined);
+    const freshHistory = new HistoryService(h.config);
+    expect((await freshHistory.readCompactionCancellation(workspaceId))?.scope.kind).toBe(
+      "summary"
+    );
+    const rows = await freshHistory.getLastMessages(workspaceId, 1);
+    expect(rows.success && rows.data[0].metadata?.muxMetadata).toHaveProperty("pendingFollowUp");
+    await expectNoRecovery(h.config, freshHistory);
+  } finally {
+    update.mockRestore();
+    await h.session.dispose().catch(() => undefined);
+    await h.cleanup();
+  }
+});
+
+test("an unreadable cancellation blocks journal and follow-up startup recovery", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  await writeFile(`${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`, "{");
+  const compactor = (h.session as unknown as { continuousCompactor: ContinuousCompactor })
+    .continuousCompactor;
+  const recover = spyOn(compactor, "recover");
+  const stream = spyOn(h.aiService, "streamMessage");
+  try {
+    await h.session.runStartupRecovery();
+    expect(recover).not.toHaveBeenCalled();
+    expect(stream).not.toHaveBeenCalled();
+    const failure = await h.internals.dispatchPendingFollowUp().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(stream).not.toHaveBeenCalled();
+  } finally {
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test("ordinary manual sends do not write cancellation state or attach a witness", async () => {
+  const h = await setup();
+  const write = spyOn(h.historyService, "writeCompactionCancellation");
+  try {
+    expect((await h.session.sendMessage("ordinary user", options)).success).toBe(true);
+    const rows = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(
+      rows.success && rows.data.find((row) => row.role === "user")?.metadata
+    ).not.toHaveProperty("compactionCancellationNonce");
+    expect(write).not.toHaveBeenCalled();
+  } finally {
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test("Stop during cancellation loading retains exact summary cleanup", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const read = h.historyService.readCompactionCancellation.bind(h.historyService);
+  spyOn(h.historyService, "readCompactionCancellation").mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return read(...args);
+  });
+  const pending = h.internals.dispatchPendingFollowUp();
+  try {
+    await entered.promise;
+    await h.session.interruptStream({ abandonPartial: true });
+    release.resolve();
+    expect(await pending).toBe(false);
+    const rows = await h.historyService.getLastMessages(workspaceId, 1);
+    expect(rows.success && rows.data[0].metadata?.muxMetadata).not.toHaveProperty(
+      "pendingFollowUp"
+    );
+    expect(await new HistoryService(h.config).readCompactionCancellation(workspaceId)).toBeNull();
+  } finally {
+    release.resolve();
+    await pending;
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test.each(["manual", "context replacement"] as const)(
+  "explicit %s repairs a corrupt cancellation without permitting old automatic recovery",
+  async (action) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(workspaceId, summary());
+    await writeFile(`${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`, "{");
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      await h.session.runStartupRecovery();
+      expect(stream).not.toHaveBeenCalled();
+      if (action === "manual") {
+        expect((await h.session.sendMessage("explicit repair", options)).success).toBe(true);
+      } else {
+        using _hold = h.session.holdTurnAdmission();
+        await h.historyService.clearHistory(workspaceId);
+        await h.session.contextMutationCommitted();
+      }
+      expect(await new HistoryService(h.config).readCompactionCancellation(workspaceId)).toBeNull();
+      const rows = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(rows.success && rows.data.filter((row) => row.role === "user").length).toBe(
+        action === "manual" ? 1 : 0
+      );
+      expect(stream).toHaveBeenCalledTimes(action === "manual" ? 1 : 0);
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test("explicit resume durably supersedes an earlier Stop without appending another user row", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(
+    workspaceId,
+    createMuxMessage("original-user", "user", "original request")
+  );
+  await h.session.interruptStream({ abandonPartial: true });
+  await h.session.retryPendingCompactionCleanup();
+  expect(await new HistoryService(h.config).readCompactionCancellation(workspaceId)).not.toBeNull();
+  try {
+    expect((await h.session.resumeStream(options)).success).toBe(true);
+    expect(await new HistoryService(h.config).readCompactionCancellation(workspaceId)).toBeNull();
+    const rows = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(rows.success && rows.data.filter((row) => row.role === "user").length).toBe(1);
+  } finally {
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test("a second Stop after the resume witness commits cannot be retired by the first nonce", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, createMuxMessage("user", "user", "request"));
+  await h.session.interruptStream({ abandonPartial: true });
+  await h.session.retryPendingCompactionCleanup();
+  const firstNonce = await h.session.getCompactionCancellationNonce();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const history = h.historyService as unknown as {
+    writeGuardedHistory(
+      path: string,
+      serialized: string,
+      guard: () => boolean,
+      committed?: () => void
+    ): Promise<boolean>;
+  };
+  const write = history.writeGuardedHistory.bind(history);
+  spyOn(history, "writeGuardedHistory").mockImplementationOnce(async (...args) => {
+    const committed = await write(...args);
+    entered.resolve();
+    await release.promise;
+    return committed;
+  });
+  const stream = spyOn(h.aiService, "streamMessage");
+  const resume = h.session.resumeStream(options);
+  try {
+    await entered.promise;
+    await h.session.interruptStream({ abandonPartial: true });
+    const secondNonce = await h.session.getCompactionCancellationNonce();
+    expect(secondNonce).not.toBe(firstNonce);
+    release.resolve();
+    expect(await resume).toEqual(Ok({ started: false }));
+    await h.session.retryPendingCompactionCleanup();
+    expect(stream).not.toHaveBeenCalled();
+    expect(
+      (await new HistoryService(h.config).readCompactionCancellation(workspaceId))?.nonce
+    ).toBe(secondNonce);
+  } finally {
+    release.resolve();
+    await resume;
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test.each(["history failure", "witness no-op", "automatic"] as const)(
+  "resume keeps cancellation before explicit durable acceptance (%s)",
+  async (outcome) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user", "user", "request")
+    );
+    await h.session.interruptStream({ abandonPartial: true });
+    await h.session.retryPendingCompactionCleanup();
+    const nonce = await h.session.getCompactionCancellationNonce();
+    if (outcome === "history failure")
+      spyOn(h.historyService, "getHistoryFromLatestBoundary").mockResolvedValueOnce(
+        Err("resume history unavailable")
+      );
+    if (outcome === "witness no-op")
+      spyOn(h.historyService, "updateHistory").mockResolvedValueOnce(Ok(undefined));
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      await h.session.resumeStream(options, { automatic: outcome === "automatic" });
+      expect(
+        (await new HistoryService(h.config).readCompactionCancellation(workspaceId))?.nonce
+      ).toBe(nonce);
+      expect(stream).toHaveBeenCalledTimes(outcome === "automatic" ? 1 : 0);
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(["user row", "summary only", "failed unlink"] as const)(
+  "accepted explicit resume allows B's follow-up across restart (%s)",
+  async (shape) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(
+      workspaceId,
+      shape === "summary only" ? summary() : createMuxMessage("user", "user", "request")
+    );
+    await h.session.interruptStream({ abandonPartial: true });
+    await h.session.retryPendingCompactionCleanup();
+    const write = h.historyService.writeCompactionCancellation.bind(h.historyService);
+    const writes = spyOn(h.historyService, "writeCompactionCancellation").mockImplementation(
+      async (...args) => {
+        if (shape === "failed unlink" && args[1] === null) throw new Error("resume unlink failed");
+        return write(...args);
+      }
+    );
+    try {
+      await h.session.resumeStream(options).catch(() => undefined);
+      // A new process first reconciles an already-durable Retry receipt if unlink failed.
+      const freshHistory = new HistoryService(h.config);
+      const restarted = await createAgentSessionHarness({
+        workspaceId,
+        config: h.config,
+        historyService: freshHistory,
+      });
+      try {
+        await restarted.session.runStartupRecovery();
+        expect(await freshHistory.readCompactionCancellation(workspaceId)).toBeNull();
+      } finally {
+        await restarted.session.dispose();
+      }
+      await freshHistory.appendToHistory(
+        workspaceId,
+        createMuxMessage("summary-b", "assistant", "B compacted", {
+          muxMetadata: {
+            type: "compaction-summary",
+            pendingFollowUp: { text: "Continue B", ...options },
+          },
+        })
+      );
+      const next = await createAgentSessionHarness({
+        workspaceId,
+        config: h.config,
+        historyService: new HistoryService(h.config),
+      });
+      const stream = spyOn(next.aiService, "streamMessage");
+      try {
+        await next.session.runStartupRecovery();
+        expect(stream).toHaveBeenCalledTimes(1);
+        const rows = await freshHistory.getLastMessages(workspaceId, 1);
+        expect(rows.success && rows.data[0].parts).toMatchObject([
+          { type: "text", text: "Continue B" },
+        ]);
+      } finally {
+        await next.session.dispose();
+      }
+    } finally {
+      writes.mockRestore();
+      await h.session.dispose().catch(() => undefined);
+      await h.cleanup();
+    }
+  }
+);

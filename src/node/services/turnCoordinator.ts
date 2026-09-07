@@ -651,6 +651,7 @@ export class TurnCoordinator {
   >();
   private idleWaiters = new Set<() => void>();
   private unbusyWaiters = new Set<() => void>();
+  private admissionWaiters = new Set<() => void>();
   private prepared?: { id: TurnId; controller: AbortController };
   private thinking: { holder: ActiveTurnThinkingOverride; resource?: Disposable } | null = null;
   private readonly execution = new TurnExecution(defaultEffectRunner);
@@ -807,6 +808,7 @@ export class TurnCoordinator {
   ): Promise<void> | PreparationAdmission | undefined {
     let launchedPolicy: Promise<void> | undefined;
     let publicationError: { error: unknown } | undefined;
+    const previousCompactionEpoch = this.state.compaction.epoch;
     const result = transition(this.state, event);
     this.state = result.state;
     if (result.admission?.status === "admitted") install?.();
@@ -815,6 +817,13 @@ export class TurnCoordinator {
       (command) => command.type === "phase" && command.next.phase === "idle"
     );
     const waiters = idle ? this.idleWaiters : undefined;
+    const admissionWaiters =
+      !this.admissionBlocked ||
+      this.closing ||
+      previousCompactionEpoch !== this.state.compaction.epoch
+        ? this.admissionWaiters
+        : undefined;
+    if (admissionWaiters) this.admissionWaiters = new Set();
     const unbusyWaiters = !this.isBusy() ? this.unbusyWaiters : undefined;
     if (unbusyWaiters) this.unbusyWaiters = new Set();
     const retiredThinking = idle ? this.thinking : undefined;
@@ -892,6 +901,7 @@ export class TurnCoordinator {
         }
       }
     }
+    for (const resolve of admissionWaiters ?? []) resolve();
     for (const resolve of waiters ?? []) resolve();
     for (const resolve of unbusyWaiters ?? []) resolve();
     retiredThinking?.resource?.[Symbol.dispose]();
@@ -1009,6 +1019,12 @@ export class TurnCoordinator {
     };
     signal?.addEventListener("abort", release, { once: true });
     return release;
+  }
+
+  /** Admission holds are policy waits, not physical work joined by shutdown. */
+  waitForAdmissionRelease(): Promise<void> {
+    if (!this.admissionBlocked || this.closing) return Promise.resolve();
+    return new Promise((resolve) => this.admissionWaiters.add(resolve));
   }
 
   waitForIdle(signal?: AbortSignal): Promise<void> {
