@@ -319,11 +319,4 @@ export class PTYService {
     log.info(`Closing all ${sessionIds.length} terminal session(s)`);
     sessionIds.forEach((id) => this.closeSession(id));
   }
-
-  /**
-   * Get all sessions for debugging
-   */
-  getSessions(): Map<string, SessionData> {
-    return this.sessions;
-  }
 }

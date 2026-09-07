@@ -355,26 +355,10 @@ export class AIService extends EventEmitter {
 
     if (event.type === "stream-abort") {
       this.clearTrackedPendingDevToolsRunMetadata(event.messageId);
-      return (async () => {
-        try {
-          if (event.abandonPartial) {
-            await this.historyService.deletePartial(event.workspaceId);
-          } else {
-            const partial = await this.historyService.readPartial(event.workspaceId);
-            if (partial) {
-              await this.historyService.commitPartial(event.workspaceId);
-              await this.historyService.deletePartial(event.workspaceId);
-            }
-          }
-        } catch (error) {
-          log.error("Failed partial cleanup during stream-abort", {
-            workspaceId: event.workspaceId,
-            error: getErrorMessage(error),
-          });
-        } finally {
-          this.emit("stream-abort", event);
-        }
-      })();
+      // Persistence belongs to the captured engine attempt. Synthetic/empty startup
+      // terminals have no authority to mutate whichever partial occupies this workspace.
+      this.emit("stream-abort", event);
+      return;
     }
 
     this.emit(event.type, event);
@@ -493,10 +477,6 @@ export class AIService extends EventEmitter {
    */
   private durableEventJournalFor(workspaceId: string): DurableEventJournal {
     return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId));
-  }
-
-  isMockModeEnabled(): boolean {
-    return this.mockModeEnabled;
   }
 
   releaseMockStreamStartGate(workspaceId: string): void {

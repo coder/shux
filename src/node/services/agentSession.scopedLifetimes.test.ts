@@ -38,7 +38,7 @@ describe("AgentSession scoped turn lifetimes", () => {
       await closing;
     } finally {
       release.resolve();
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -74,7 +74,7 @@ describe("AgentSession scoped turn lifetimes", () => {
     } finally {
       release.resolve();
       await recovering;
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -123,7 +123,7 @@ describe("AgentSession scoped turn lifetimes", () => {
         expect(spyOn(h.aiService, "streamMessage")).not.toHaveBeenCalled();
       } finally {
         release.resolve();
-        h.session.dispose();
+        await h.session.dispose();
         await h.cleanup();
       }
     }
@@ -162,7 +162,7 @@ describe("AgentSession scoped turn lifetimes", () => {
     } finally {
       release.resolve();
       await send;
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -208,7 +208,7 @@ describe("AgentSession scoped turn lifetimes", () => {
     } finally {
       releaseStartup.resolve();
       releaseFailure.resolve();
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -231,7 +231,7 @@ describe("AgentSession scoped turn lifetimes", () => {
         await runner.runPromise(Scope.close(appFiberScope, Exit.void));
         expect(spyOn(h.aiService, "streamMessage")).not.toHaveBeenCalled();
       } finally {
-        h.session.dispose();
+        await h.session.dispose();
         await h.cleanup();
       }
     }
@@ -251,7 +251,7 @@ describe("AgentSession scoped turn lifetimes", () => {
       expect(append).not.toHaveBeenCalled();
       expect(spyOn(h.aiService, "streamMessage")).not.toHaveBeenCalled();
     } finally {
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });
@@ -269,7 +269,7 @@ describe("AgentSession scoped turn lifetimes", () => {
     });
     try {
       await entered.promise;
-      h.session.dispose();
+      h.session.beginDispose();
       let closed = false;
       const closing = runner.runPromise(Scope.close(appFiberScope, Exit.void)).then(() => {
         closed = true;
@@ -282,7 +282,7 @@ describe("AgentSession scoped turn lifetimes", () => {
     } finally {
       release.resolve();
       await send;
-      h.session.dispose();
+      await h.session.dispose();
       await h.cleanup();
     }
   });

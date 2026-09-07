@@ -33,7 +33,7 @@ describe("AgentSession.drainQueuedMessagesIfIdle", () => {
   let session: AgentSession | undefined;
 
   afterEach(async () => {
-    session?.dispose();
+    await session?.dispose();
     session = undefined;
     await cleanup?.();
     cleanup = undefined;

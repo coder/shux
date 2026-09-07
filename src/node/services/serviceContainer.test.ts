@@ -444,7 +444,6 @@ describe("ServiceContainer", () => {
     await housekeeping;
     await disposed;
 
-    expect(disposeRecoverySessions).toHaveBeenCalledTimes(1);
     expect(beginShutdown).toHaveBeenCalledTimes(1);
     expect(heartbeatStart).not.toHaveBeenCalled();
     expect(idleCompactionStart).not.toHaveBeenCalled();
@@ -902,6 +901,82 @@ describe("ServiceContainer", () => {
             part.type === "text" && part.text === "hello from a stream shutdown must not lose"
         )
       ).toBe(true);
+    }
+  );
+
+  it("joins cleanup enqueued by a closing session callback before dependency teardown", async () => {
+    services = new ServiceContainer(stores);
+    const session = services.workspaceService.getOrCreateSession("late-cleanup-owner");
+    const { coordinator } = session as unknown as { coordinator: TurnCoordinator };
+    const lease = coordinator.enterExecution();
+    const cleanupEntered = Promise.withResolvers<void>();
+    const cleanupRelease = Promise.withResolvers<void>();
+    const backgroundEntered = Promise.withResolvers<void>();
+    const backgroundRelease = Promise.withResolvers<void>();
+    spyOn(services.backgroundProcessManager, "cleanup").mockImplementationOnce(async () => {
+      backgroundEntered.resolve();
+      await backgroundRelease.promise;
+    });
+    const bridge = spyOn(services.desktopBridgeServer, "stop").mockResolvedValue(undefined);
+    const disposed = services.dispose();
+    try {
+      // The still-leased producer registers cleanup after the shutdown snapshot.
+      services.workspaceService.deferWorkspaceCleanup(async () => {
+        cleanupEntered.resolve();
+        await cleanupRelease.promise;
+      });
+      lease[Symbol.dispose]();
+      await Promise.all([cleanupEntered.promise, backgroundEntered.promise]);
+      expect(bridge).not.toHaveBeenCalled();
+      backgroundRelease.resolve();
+      await session.dispose();
+      expect(bridge).not.toHaveBeenCalled();
+      cleanupRelease.resolve();
+      await disposed;
+      expect(bridge).toHaveBeenCalledTimes(1);
+    } finally {
+      lease[Symbol.dispose]();
+      backgroundRelease.resolve();
+      cleanupRelease.resolve();
+      await disposed;
+    }
+  });
+
+  it.each(["stop", "drain"] as const)(
+    "a rejected session %s cannot skip held background or deferred cleanup",
+    async (failure) => {
+      services = new ServiceContainer(stores);
+      const session = services.workspaceService.getOrCreateSession(`shutdown-${failure}-failure`);
+      const { coordinator } = session as unknown as { coordinator: TurnCoordinator };
+      if (failure === "stop")
+        spyOn(services.streamManager, "stopStream").mockRejectedValueOnce(
+          new Error("adapter stop failure")
+        );
+      else spyOn(coordinator, "drain").mockRejectedValueOnce(new Error("scope drain failure"));
+      const backgroundEntered = Promise.withResolvers<void>();
+      const backgroundRelease = Promise.withResolvers<void>();
+      const cleanupRelease = Promise.withResolvers<void>();
+      spyOn(services.backgroundProcessManager, "cleanup").mockImplementationOnce(async () => {
+        backgroundEntered.resolve();
+        await backgroundRelease.promise;
+      });
+      services.workspaceService.deferWorkspaceCleanup(() => cleanupRelease.promise);
+      const bridge = spyOn(services.desktopBridgeServer, "stop").mockResolvedValue(undefined);
+      const disposed = services.dispose();
+      try {
+        await backgroundEntered.promise;
+        expect(bridge).not.toHaveBeenCalled();
+        backgroundRelease.resolve();
+        await session.dispose();
+        expect(bridge).not.toHaveBeenCalled();
+        cleanupRelease.resolve();
+        await disposed;
+        expect(bridge).toHaveBeenCalledTimes(1);
+      } finally {
+        backgroundRelease.resolve();
+        cleanupRelease.resolve();
+        await disposed;
+      }
     }
   );
 

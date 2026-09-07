@@ -9,8 +9,6 @@ import { log } from "./log";
  * applies to every consumer (Coder-agents-review nit DEREM-30).
  */
 export const MAX_CONCURRENT_IDLE_DISPATCHES = 1;
-/** @deprecated Use MAX_CONCURRENT_IDLE_DISPATCHES — kept as alias to avoid churn for any out-of-tree imports. */
-export const MAX_CONCURRENT_GOAL_DISPATCHES = MAX_CONCURRENT_IDLE_DISPATCHES;
 
 export interface IdleDispatchPayload {
   dispatch(): Promise<void>;

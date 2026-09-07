@@ -150,7 +150,6 @@ export function extractEditedFilePaths(messages: MuxMessage[]): string[] {
       const output = part.output as { success?: boolean } | undefined;
       if (!output?.success) continue;
 
-      // Extract file path from input
       const filePath = extractToolFilePath(part.input);
       if (filePath && !seen.has(filePath)) {
         seen.add(filePath);

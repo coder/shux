@@ -159,7 +159,6 @@ function AppLoaderInner() {
   const apiState = useAPI();
   const api = apiState.api;
 
-  // Get store instances
   const workspaceStoreInstance = useWorkspaceStoreRaw();
   const gitStatusStore = useGitStatusStoreRaw();
   const runtimeStatusStore = useRuntimeStatusStoreRaw();

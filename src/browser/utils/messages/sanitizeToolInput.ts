@@ -22,7 +22,6 @@ export function sanitizeToolInputs(messages: MuxMessage[]): MuxMessage[] {
       return msg;
     }
 
-    // Check if any parts need sanitization
     const needsSanitization = msg.parts.some(
       (part) =>
         part.type === "dynamic-tool" &&

@@ -265,7 +265,6 @@ function detectUnavailableGlobals(code: string, sourceFile?: ts.SourceFile): Ana
       }
     }
 
-    // Only check identifier nodes
     if (!ts.isIdentifier(node)) {
       ts.forEachChild(node, visit);
       return;

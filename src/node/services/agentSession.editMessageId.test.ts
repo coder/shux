@@ -1,6 +1,6 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
 import { EventEmitter } from "events";
-import type { AIService } from "@/node/services/aiService";
+import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { Config } from "@/node/config";
@@ -37,7 +37,8 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
 
   async function createSessionHarness(
     workspaceId: string,
-    streamHandler: StreamMessageHandler = () => Promise.resolve(Ok(createStartedTurnHandle()))
+    streamHandler: StreamMessageHandler = (opts: StreamMessageOptions) =>
+      Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
   ) {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
@@ -286,7 +287,7 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     const streamResolves: Array<() => void> = [];
     const streamHandler: StreamMessageHandler = (opts) => {
       return new Promise<Awaited<ReturnType<StreamMessageHandler>>>((resolve) => {
-        const resolveOk = () => resolve(Ok(createStartedTurnHandle()));
+        const resolveOk = () => resolve(Ok(createStartedTurnHandle(opts.abortSignal!)));
         if (opts.abortSignal?.aborted === true) {
           resolveOk();
           return;
@@ -354,10 +355,11 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
       }
       await firstSendPromise;
     } finally {
-      session.dispose();
+      session.beginDispose();
       for (const resolve of streamResolves) {
         resolve();
       }
+      await session.dispose();
     }
   });
 

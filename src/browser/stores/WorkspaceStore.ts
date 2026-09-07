@@ -2701,15 +2701,6 @@ export class WorkspaceStore {
   }
 
   /**
-   * Get current TODO list for a workspace.
-   * Returns empty array if workspace doesn't exist or has no TODOs.
-   */
-  getTodos(workspaceId: string): TodoItem[] {
-    const aggregator = this.aggregators.get(workspaceId);
-    return aggregator ? aggregator.getCurrentTodos() : [];
-  }
-
-  /**
    * Get current Assisted Review hunks (agent-flagged) for a workspace.
    * Updated when `review_pane_update` tool succeeds; consumed by the
    * Review pane and ReviewControls to power the Assisted toggle.

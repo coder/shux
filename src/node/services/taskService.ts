@@ -12655,7 +12655,6 @@ export class TaskService implements AgentTaskIntegration {
       reportArgs
     );
 
-    // Resolve foreground waiters.
     const hadForegroundWaiters = this.resolveWaiters(childWorkspaceId, {
       ...reportArgs,
       model: latestChildEntry?.workspace.taskModelString,

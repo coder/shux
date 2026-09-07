@@ -154,6 +154,53 @@ describe("RetryManager", () => {
     expect(onRetry).not.toHaveBeenCalled();
   });
 
+  it("scheduled observers can cancel before the retry fiber is installed", async () => {
+    const onRetry = vi.fn(() => Promise.resolve());
+    const manager = new RetryManager(
+      "workspace-1",
+      onRetry,
+      (event) => {
+        if (event.type === "auto-retry-scheduled") manager.cancel();
+      },
+      clock.runner
+    );
+
+    manager.handleStreamFailure({ type: "unknown" });
+    expect(manager.isRetryPending).toBe(false);
+    expect(manager.getScheduledStatusSnapshot()).toBeNull();
+    await adjustPastAnyBackoff();
+    expect(onRetry).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it("a reentrant replacement owns its fiber and status through the retired wake time", async () => {
+    const onRetry = vi.fn(() => Promise.resolve());
+    const events: RetryStatusEvent[] = [];
+    const manager = new RetryManager(
+      "workspace-1",
+      onRetry,
+      (event) => {
+        events.push(event);
+        if (event.type === "auto-retry-scheduled" && event.attempt === 1) {
+          manager.handleStreamFailure({ type: "unknown", message: "replacement" });
+        }
+      },
+      clock.runner
+    );
+
+    manager.handleStreamFailure({ type: "unknown", message: "retired" });
+    const replacement = manager.getScheduledStatusSnapshot();
+    await clock.adjust(Duration.millis(calculateBackoffDelay(1)));
+    expect(onRetry).not.toHaveBeenCalled();
+    expect(manager.isRetryPending).toBe(true);
+    expect(manager.getScheduledStatusSnapshot()).toEqual(replacement);
+    manager.cancel();
+    await adjustPastAnyBackoff();
+    expect(events.filter((event) => event.type === "auto-retry-starting")).toHaveLength(0);
+    expect(onRetry).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
   it("setEnabled(false) prevents scheduling", async () => {
     const { manager, onRetry, onStatusChange } = createRetryManager();
 
@@ -225,6 +272,101 @@ describe("RetryManager", () => {
       reason: "disabled_by_user",
     });
   });
+
+  it("starting publication owns exactly one claim even when its observer cancels synchronously", async () => {
+    let owned = false;
+    const released = vi.fn(() => {
+      owned = false;
+    });
+    const onRetry = vi.fn(() => Promise.resolve());
+    const begin = vi.fn(() => {
+      owned = true;
+      return { [Symbol.dispose]: released };
+    });
+    const manager = new RetryManager(
+      "workspace-1",
+      onRetry,
+      (event) => {
+        if (event.type !== "auto-retry-starting") return;
+        expect(owned).toBe(true);
+        manager.cancel();
+        expect(owned).toBe(false);
+      },
+      clock.runner,
+      begin
+    );
+    manager.handleStreamFailure({ type: "unknown" });
+    await clock.adjust(calculateBackoffDelay(1));
+    expect(begin).toHaveBeenCalledTimes(1);
+    expect(released).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it("an observer throwing after rescheduling cannot retire its replacement", async () => {
+    const onRetry = vi.fn(() => Promise.resolve());
+    const manager = new RetryManager(
+      "workspace-1",
+      onRetry,
+      (event) => {
+        if (event.type === "auto-retry-scheduled" && event.attempt === 1) {
+          manager.handleStreamFailure({ type: "unknown" });
+          throw new Error("observer failed after replacement");
+        }
+      },
+      clock.runner
+    );
+    expect(() => manager.handleStreamFailure({ type: "unknown" })).toThrow();
+    expect(manager.getScheduledStatusSnapshot()?.attempt).toBe(2);
+    await clock.adjust(calculateBackoffDelay(2));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    manager.dispose();
+  });
+
+  it.each([false, true])(
+    "a throwing starting observer releases only its own claim (replacement=%s)",
+    async (replace) => {
+      let owned = 0;
+      const onRetry = vi.fn(() => Promise.resolve());
+      const events: RetryStatusEvent[] = [];
+      const manager = new RetryManager(
+        "workspace-1",
+        onRetry,
+        (event) => {
+          events.push(event);
+          if (event.type === "auto-retry-starting" && event.attempt === 1) {
+            if (replace) manager.handleStreamFailure({ type: "unknown" });
+            throw new Error("starting observer failed");
+          }
+        },
+        clock.runner,
+        () => {
+          owned += 1;
+          return {
+            [Symbol.dispose]: () => {
+              owned -= 1;
+            },
+          };
+        }
+      );
+      manager.handleStreamFailure({ type: "unknown" });
+      await clock.adjust(calculateBackoffDelay(1));
+      expect(owned).toBe(0);
+      expect(onRetry).not.toHaveBeenCalled();
+      if (replace) {
+        expect(manager.getScheduledStatusSnapshot()?.attempt).toBe(2);
+        await clock.adjust(calculateBackoffDelay(2));
+        expect(onRetry).toHaveBeenCalledTimes(1);
+      } else {
+        expect(events).toContainEqual({
+          type: "auto-retry-abandoned",
+          reason: "starting observer failed",
+        });
+      }
+      manager.dispose();
+      expect(owned).toBe(0);
+    }
+  );
 
   it("ignores stale onRetry rejection after disable", async () => {
     let rejectRetry: ((reason?: unknown) => void) | undefined;

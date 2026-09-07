@@ -52,7 +52,6 @@ export const createFileReadTool: ToolFactory = (config: ToolConfiguration) => {
           };
         }
 
-        // Validate file size
         const sizeValidation = validateFileSize(fileStat);
         if (sizeValidation) {
           return {

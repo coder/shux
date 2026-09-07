@@ -142,7 +142,7 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
     let streamedMuxMetadata: StreamMessageOptions["muxMetadata"];
     const streamMessage = mock((opts: StreamMessageOptions) => {
       streamedMuxMetadata = opts.muxMetadata;
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId: "workspace-turn-inheritance",
@@ -167,7 +167,7 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
       expect(streamMessage.mock.calls).toHaveLength(1);
       return streamedMuxMetadata;
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   }
@@ -215,7 +215,7 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
         muxMetadata: correlation,
       });
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -268,7 +268,7 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
       expect(requestMeta.parsed.followUpContent?.agentInitiated).toBe(true);
       expect(requestMeta.parsed.followUpContent?.workspaceTurnMetadata).toEqual(correlation);
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });

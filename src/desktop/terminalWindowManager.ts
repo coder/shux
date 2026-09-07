@@ -173,20 +173,4 @@ export class TerminalWindowManager {
       this.windows.delete(workspaceId);
     }
   }
-
-  /**
-   * Get all windows for a workspace
-   */
-  getWindows(workspaceId: string): BrowserWindow[] {
-    const windowSet = this.windows.get(workspaceId);
-    if (!windowSet) return [];
-    return Array.from(windowSet).filter((w) => !w.isDestroyed());
-  }
-
-  /**
-   * Get count of open terminal windows for a workspace
-   */
-  getWindowCount(workspaceId: string): number {
-    return this.getWindows(workspaceId).length;
-  }
 }

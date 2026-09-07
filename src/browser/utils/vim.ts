@@ -1238,7 +1238,6 @@ function handleNormalModeKey(state: VimState, key: string, modifiers: KeyModifie
 
   const count = nextState.count ?? 1;
 
-  // Handle navigation
   const navResult = tryHandleNavigation(nextState, key, count);
   if (navResult) return navResult;
 

@@ -275,14 +275,6 @@ export class TerminalSessionRouter {
     this.sessions.clear();
   }
 
-  /**
-   * Check if a session has any subscribers.
-   */
-  hasSubscribers(sessionId: string): boolean {
-    const session = this.sessions.get(sessionId);
-    return session ? session.subscribers.size > 0 : false;
-  }
-
   // ============================================================================
   // Private methods
   // ============================================================================

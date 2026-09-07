@@ -812,20 +812,6 @@ export class TerminalService {
   }
 
   /**
-   * Open a native terminal and run a command.
-   * Used for opening $EDITOR in a terminal when editing files.
-   * @param command The command to run
-   * @param workspacePath Optional directory to run the command in (defaults to cwd)
-   */
-  async openNativeWithCommand(command: string, workspacePath?: string): Promise<void> {
-    await this.openNativeTerminal({
-      type: "local",
-      workspacePath: workspacePath ?? process.cwd(),
-      command,
-    });
-  }
-
-  /**
    * Open a native terminal (local or SSH) with platform-specific handling.
    * This spawns the user's native terminal emulator, not a web-based terminal.
    */

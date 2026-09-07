@@ -1594,7 +1594,6 @@ export async function createOrpcServer({
     });
   }
 
-  // Create HTTP server
   const httpServer = http.createServer(app);
 
   // Avoid process crashes from unhandled socket/server errors.

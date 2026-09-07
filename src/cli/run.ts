@@ -1595,7 +1595,9 @@ async function main(): Promise<number> {
         // Interrupt + await the runtime's supervised fibers while their
         // dependencies are still alive (same slot as ServiceContainer.dispose).
         { name: "appFiberScope.close", run: () => closeScopeBounded(appFiberScope) },
-        { name: "session.dispose", run: () => session.dispose() },
+        // The service guardian joins disposal inside closeScopeBounded. After a timeout,
+        // only initiate cleanup here: a second unbounded join would prevent CLI exit.
+        { name: "session.dispose", run: () => session.beginDispose() },
         { name: "mcpServerManager.dispose", run: () => mcpServerManager.dispose() },
         { name: "codexOauthService.dispose", run: () => codexOauthService.dispose() },
         { name: "coderOauthService.dispose", run: () => coderOauthService.dispose() },

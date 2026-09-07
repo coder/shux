@@ -77,7 +77,6 @@ export async function cancelCompaction(
   aggregator: StreamingMessageAggregator,
   startEditingMessage: (editing: EditingMessageState) => void
 ): Promise<boolean> {
-  // Find the compaction request message
   const compactionRequestMsg = findCompactionRequestMessage(aggregator);
   if (!compactionRequestMsg) {
     return false;

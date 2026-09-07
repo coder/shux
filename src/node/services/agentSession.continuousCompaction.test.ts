@@ -76,7 +76,7 @@ function deferred<T>() {
 describe("AgentSession continuous compaction wiring", () => {
   let harness: AgentSessionHarness | undefined;
   afterEach(async () => {
-    harness?.session.dispose();
+    await harness?.session.dispose();
     await harness?.cleanup();
     harness = undefined;
     mock.restore();
@@ -473,7 +473,7 @@ describe("AgentSession continuous compaction wiring", () => {
       starts++;
       startStream(h);
       if (starts === 2) queuedStarted.resolve();
-      return Promise.resolve(Ok(createStartedTurnHandle()));
+      return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
     });
     spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
       async (_percent, context) => {
@@ -625,7 +625,7 @@ describe("AgentSession continuous compaction wiring", () => {
       spyOn(h.aiService, "streamMessage").mockImplementation(() => {
         streaming = true;
         startStream(h);
-        return Promise.resolve(Ok(createStartedTurnHandle()));
+        return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
       });
       const stop = spyOn(h.aiService, "stopStream").mockImplementation(async () => {
         streaming = false;
@@ -728,7 +728,7 @@ describe("AgentSession continuous compaction wiring", () => {
           order.push("resume");
           resumed.resolve();
         }
-        return Promise.resolve(Ok(createStartedTurnHandle()));
+        return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
       });
       spyOn(h.aiService, "stopStream").mockImplementation(async (_id, options) => {
         if (eventType === "prefix-swap-invalidated")
@@ -848,7 +848,7 @@ describe("AgentSession continuous compaction wiring", () => {
       spyOn(h.aiService, "streamMessage").mockImplementation(() => {
         starts++;
         startStream(h);
-        return Promise.resolve(Ok(createStartedTurnHandle()));
+        return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
       });
       spyOn(h.aiService, "stopStream").mockImplementation(() => {
         void runSessionTerminalPolicy(h.session, h.aiEmitter, {
@@ -1158,7 +1158,7 @@ describe("AgentSession continuous compaction wiring", () => {
     h.session.beginShutdown();
     expect(reset).toHaveBeenCalled();
     reset.mockClear();
-    h.session.dispose();
+    h.session.beginDispose();
     expect(reset).toHaveBeenCalled();
     reset.mockClear();
   });

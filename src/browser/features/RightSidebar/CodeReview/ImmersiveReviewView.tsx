@@ -1810,7 +1810,6 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         return;
       }
 
-      // Toggle hunk read
       if (matchesKeybind(e, KEYBINDS.TOGGLE_HUNK_READ)) {
         e.preventDefault();
         if (selectedHunkId) handleToggleReadWithUndo(selectedHunkId);

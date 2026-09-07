@@ -747,6 +747,7 @@ interface WorkspaceStreamInfo {
   // when registration fails. Optional: whitebox test fixtures register stream
   // infos without a resource scope.
   resourceScope?: Scope.Closeable;
+  resourceCleanup?: Promise<void>;
   // Cumulative usage across all steps (for live cost display during streaming)
   cumulativeUsage: LanguageModelV2Usage;
   // Cumulative provider metadata across all steps (for live cost display with cache tokens)
@@ -789,9 +790,17 @@ interface PendingStreamStartHandle {
   finish(): void;
 }
 
+export interface StopStreamOptions {
+  soft?: boolean;
+  abandonPartial?: boolean;
+  abortReason?: StreamAbortReason;
+  /** Teardown of an already-settled attempt must not manufacture a second raw terminal. */
+  emitIfMissing?: boolean;
+}
+
 interface MockStreamLifecycle {
   isStreaming(workspaceId: string): boolean;
-  stop(workspaceId: string): Promise<void>;
+  stop(workspaceId: string, options?: StopStreamOptions): Promise<void>;
   replayStream(workspaceId: string): Promise<void>;
 }
 
@@ -803,6 +812,7 @@ export class StreamManager {
       abortController: AbortController;
       startTime: number;
       syntheticMessageId: string;
+      abortDelivery?: Promise<void>;
       acpPromptId?: string;
     }
   >();
@@ -1901,6 +1911,38 @@ export class StreamManager {
     }
   }
 
+  private closeStreamResources(streamInfo: WorkspaceStreamInfo): Promise<void> {
+    if (streamInfo.resourceCleanup) return streamInfo.resourceCleanup;
+    const closed = Promise.withResolvers<void>();
+    streamInfo.resourceCleanup = closed.promise;
+    (async () => {
+      // Retire scheduled writes before joining their original Promise I/O. Scope close
+      // interrupts debounce fibers; remote temp-directory removal remains best effort
+      // (its registered finalizer only initiates removal, never awaits SSH).
+      streamInfo.partialRetired = true;
+      try {
+        if (streamInfo.resourceScope) {
+          await this.effectRunner.runPromise(Scope.close(streamInfo.resourceScope, Exit.void));
+        }
+      } catch (error) {
+        log.error("Stream resource cleanup failed", { error });
+      }
+      try {
+        this.interruptPartialWriteFiber(streamInfo);
+        await this.awaitPendingPartialWrite(streamInfo);
+      } catch (error) {
+        // A cleanup defect must not orphan a completed/failed handle or skip raw teardown.
+        log.error("Pending partial write cleanup failed", { error });
+      }
+
+      runLanguageModelCleanup(streamInfo.request?.model);
+
+      streamInfo.unlinkAbortSignal?.();
+      streamInfo.unlinkAbortSignal = undefined;
+    })().then(closed.resolve, closed.reject);
+    return closed.promise;
+  }
+
   private async cleanupAbortedStream(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
@@ -1927,6 +1969,12 @@ export class StreamManager {
     if (streamInfo.terminalCompletion !== undefined) {
       return;
     }
+
+    // Also covers registered STARTING attempts: their envelope callback may itself await
+    // stopStream, so join owned resources here without joining that callback back into itself.
+    // The envelope only journals; its original callback/mutex lifetime stays independently
+    // leased. Canceled engine model/temp/debounce resources retire before raw terminal delivery.
+    await this.closeStreamResources(streamInfo);
 
     // For aborts, use our tracked cumulativeUsage directly instead of AI SDK's totalUsage.
     // cumulativeUsage is updated on each finish-step event (before tool execution),
@@ -1984,8 +2032,8 @@ export class StreamManager {
         streamInfo
       );
 
-      // Stamp the aborted turn's usage onto the partial message BEFORE emitting
-      // stream-abort (whose handler commits the partial to chat.jsonl). Analytics
+      // Stamp the aborted turn's usage onto the partial message BEFORE committing
+      // it and delivering stream-abort. Analytics
       // prices history rows from metadata.usage, so without this every
       // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
       // would ingest as $0 even though the provider billed all completed steps.
@@ -2044,28 +2092,43 @@ export class StreamManager {
     } catch (error) {
       log.error("Failed abort bookkeeping; delivering preserved terminal metadata", { error });
     } finally {
-      // Emit abort asynchronously as before; completion settles only after the facade's
-      // partial cleanup and external stream-abort emission have finished.
-      const abortDelivery = (async () => this.eventSink(streamAbort))();
-
-      // Clean up immediately
-      if (this.workspaceStreams.get(workspaceId) === streamInfo) {
-        this.workspaceStreams.delete(workspaceId);
-      }
-      void abortDelivery
-        .catch((error) => {
-          // Contain sink rejections: .finally alone would re-propagate them as
-          // an unhandled rejection after completion settles.
-          log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
-        })
-        .finally(() => {
-          streamInfo.completionController?.settle({
-            status: "aborted",
-            abortReason,
-            streamAbort,
-            systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
+      try {
+        // Cancellation owns this attempt through disk cleanup and raw delivery. Keeping
+        // the registration until then makes replacement startup join the same fence.
+        const result = abandonPartial
+          ? await this.historyService.deletePartialIfMessageIdMatches(
+              workspaceId,
+              streamInfo.messageId
+            )
+          : await this.historyService.commitPartial(workspaceId, streamInfo.messageId);
+        // commitPartial already deletes on success. On failure retain recovery data;
+        // an unconditional delete here would silently discard an uncommitted answer.
+        if (!result.success)
+          log.error("Failed partial cleanup during stream-abort", {
+            workspaceId,
+            error: result.error,
           });
-        });
+      } catch (error) {
+        log.error("Failed partial cleanup during stream-abort", { workspaceId, error });
+      }
+      try {
+        await this.eventSink(streamAbort);
+      } catch (error) {
+        log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
+      } finally {
+        if (this.workspaceStreams.get(workspaceId) === streamInfo) {
+          this.workspaceStreams.delete(workspaceId);
+        }
+        streamInfo.terminalCompletion = {
+          status: "aborted",
+          abortReason,
+          streamAbort,
+          systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
+        };
+        // Session policy consumes this promise separately. It may start a replacement,
+        // so neither this fence nor the raw sink may join that policy.
+        streamInfo.completionController?.settle(streamInfo.terminalCompletion);
+      }
     }
   }
 
@@ -3028,7 +3091,7 @@ export class StreamManager {
     }
   }
 
-  private emitStreamAbort(
+  private async emitStreamAbort(
     workspaceId: WorkspaceId,
     messageId: string,
     metadata: Record<string, unknown>,
@@ -4393,25 +4456,16 @@ export class StreamManager {
     } finally {
       this.mcpServerManager?.releaseLease(workspaceId as string);
 
-      // Guaranteed cleanup in all code paths: close the stream's resource
-      // scope. Finalizers run in reverse acquisition order — the scope-tied
-      // debounce fiber is interrupted first (replaces manual clearTimeout
-      // bookkeeping; a pending partial flush must not fire after the stream
-      // ends and resurrect partial.json), then the temp-dir release runs (the
-      // fire-and-forget rm registered by acquireRelease in startStream; don't
-      // block stream completion on directory deletion — especially on SSH
-      // where rm -rf can take 500ms-2s). Scope.close is idempotent, so the
-      // never-registered path in startStream can never double-release.
-      if (streamInfo.resourceScope) {
-        Effect.runFork(Scope.close(streamInfo.resourceScope, Exit.void));
+      await this.closeStreamResources(streamInfo);
+
+      // Aborts keep their registration until cleanupAbortedStream completes its disk
+      // transaction and raw delivery. A stale finally must never remove a replacement.
+      if (
+        streamInfo.terminalCompletion != null &&
+        this.workspaceStreams.get(workspaceId) === streamInfo
+      ) {
+        this.workspaceStreams.delete(workspaceId);
       }
-
-      runLanguageModelCleanup(streamInfo.request?.model);
-
-      streamInfo.unlinkAbortSignal?.();
-      streamInfo.unlinkAbortSignal = undefined;
-
-      this.workspaceStreams.delete(workspaceId);
 
       // Lifecycle spine event: emitted from the guaranteed-cleanup path so
       // EVERY terminal outcome (completion, abort/Escape, provider failure)
@@ -4880,15 +4934,6 @@ export class StreamManager {
       };
     }
 
-    // TODO: Add more specific error types as needed
-    // if (APICallError.isInstance(error)) {
-    //   if (error.statusCode === 401) return { type: "authentication", ... };
-    //   if (error.statusCode === 429) return { type: "rate_limit", ... };
-    // }
-    // if (RetryError.isInstance(error)) {
-    //   return { type: "retry_failed", ... };
-    // }
-
     // Fallback for unknown errors
     const message = getErrorMessage(error);
     return { type: "unknown", raw: message };
@@ -5111,6 +5156,7 @@ export class StreamManager {
     }
     const mutex = this.streamLocks.get(typedWorkspaceId)!;
 
+    let registeredStream: WorkspaceStreamInfo | undefined;
     try {
       // Acquire lock - guarantees only one startStream per workspace
       // Lock is automatically released when scope exits via Symbol.asyncDispose
@@ -5128,7 +5174,17 @@ export class StreamManager {
       // fiber). Ownership transfers to processStreamWithCleanup once the
       // stream registers; otherwise the finally below closes it.
       const resourceScope = Scope.makeUnsafe();
-      let streamRegistered = false;
+      let processingStarted = false;
+      const cleanupStartup = async (): Promise<void> => {
+        if (registeredStream) return this.closeStreamResources(registeredStream);
+        runLanguageModelCleanup(model);
+        unlinkAbortSignal();
+        try {
+          await this.effectRunner.runPromise(Scope.close(resourceScope, Exit.void));
+        } catch (error) {
+          log.error("Startup resource cleanup failed", { error });
+        }
+      };
 
       try {
         // Step 1: Cancel any existing stream before proceeding
@@ -5141,6 +5197,7 @@ export class StreamManager {
         // If the stream was interrupted while we were waiting on async setup (mutex,
         // temp dir creation, etc), avoid starting the stream entirely.
         if (streamAbortController.signal.aborted) {
+          await cleanupStartup();
           return settleStartupAbort();
         }
 
@@ -5177,6 +5234,7 @@ export class StreamManager {
         );
 
         if (streamAbortController.signal.aborted) {
+          await cleanupStartup();
           return settleStartupAbort();
         }
 
@@ -5189,18 +5247,21 @@ export class StreamManager {
           completionController,
         });
 
+        registeredStream = streamInfo;
+        streamInfo.unlinkAbortSignal = unlinkAbortSignal;
+
         // Guard against a narrow race:
         // - stopStream() may abort while we're between the last aborted-check and stream registration.
         // - If we start processStreamWithCleanup anyway, it would emit stream-start, but no one would
         //   subsequently call stopStream() again (it already ran), so we'd never emit stream-abort/end.
         // In that case, immediately drop the registered stream and rely on the caller to handle UI.
         if (streamAbortController.signal.aborted) {
-          this.workspaceStreams.delete(typedWorkspaceId);
+          if (this.workspaceStreams.get(typedWorkspaceId) === streamInfo)
+            this.workspaceStreams.delete(typedWorkspaceId);
+          await cleanupStartup();
           return settleStartupAbort();
         }
 
-        streamInfo.unlinkAbortSignal = unlinkAbortSignal;
-        streamRegistered = true;
         // Supervise from registration on: a shutdown landing during the envelope
         // write below must find this STARTING stream and cancel it inside the
         // scope close (the hard-interrupt path documented after the await),
@@ -5222,15 +5283,18 @@ export class StreamManager {
           streamAbortController.signal.aborted ||
           this.workspaceStreams.get(typedWorkspaceId) !== streamInfo
         ) {
-          if (this.workspaceStreams.get(typedWorkspaceId) === streamInfo) {
+          // The envelope may return while abort persistence/raw delivery is still held.
+          // Joining its existing fence preserves the first reason and attempt registration.
+          await streamInfo.cancelPromise;
+          await cleanupStartup();
+          if (this.workspaceStreams.get(typedWorkspaceId) === streamInfo)
             this.workspaceStreams.delete(typedWorkspaceId);
-          }
-          streamRegistered = false;
           return settleStartupAbort();
         }
 
         // Step 5: Track the processing promise for guaranteed cleanup
         // This allows cancelStreamSafely to wait for full exit
+        processingStarted = true;
         streamInfo.processingPromise = this.processStreamWithCleanup(
           typedWorkspaceId,
           streamInfo,
@@ -5241,18 +5305,15 @@ export class StreamManager {
 
         return Ok(handle);
       } finally {
-        if (!streamRegistered) {
-          runLanguageModelCleanup(model);
-          unlinkAbortSignal();
-          // Releases the temp dir if it was acquired (no-op otherwise). The
-          // finalizer is synchronous and runFork executes it before returning
-          // control, mirroring the previous direct cleanup call.
-          Effect.runFork(Scope.close(resourceScope, Exit.void));
-        }
+        if (!processingStarted) await cleanupStartup();
       }
     } catch (error) {
-      // Guaranteed cleanup on any failure
-      this.workspaceStreams.delete(typedWorkspaceId);
+      // An envelope failure may arrive after an old stop and replacement registration.
+      // Preserve both the captured cancellation fence and the replacement's map entry.
+      await registeredStream?.cancelPromise;
+      if (registeredStream && this.workspaceStreams.get(typedWorkspaceId) === registeredStream) {
+        this.workspaceStreams.delete(typedWorkspaceId);
+      }
       // No handle is handed out on this path, so the completion is observed only
       // by a supervisor forked at registration: settle it so that fiber exits
       // instead of cancelling this never-started stream at shutdown.
@@ -5272,8 +5333,8 @@ export class StreamManager {
    * during shutdown, cancels the stream through the user-stop path
    * (`cancelStreamSafely`, abort reason `"system"`) and waits for the turn to
    * settle — i.e. for the partial to be flushed with usage, `stream-abort`
-   * delivered (AIService commits the partial into chat.jsonl and deletes
-   * partial.json) and `completion` resolved. `closeScopeBounded` awaits that
+   * delivered after attempt-owned partial persistence, and `completion` resolved.
+   * `closeScopeBounded` awaits that
    * finalizer, so dispose() proceeds to tear down bridges and sessions only once
    * every in-flight stream is durably settled. Supervision starts at
    * registration (before the awaited turn-envelope write), so a STARTING stream
@@ -5307,9 +5368,7 @@ export class StreamManager {
           Effect.promise(async () => {
             const startedAt = performance.now();
             await this.cancelStreamSafely(workspaceId, streamInfo, "system");
-            // Abort delivery (partial commit, downstream stream-abort listeners)
-            // settles the completion asynchronously after cancelStreamSafely
-            // returns; shutdown must not proceed until it has.
+            // The engine fence includes persistence and raw delivery, never session policy.
             await streamInfo.completionController.promise;
             // Per-stream cost inside the AppFiberScope close (shutdownStep style).
             log.debug("[shutdown] streamManager.abortStream", {
@@ -5475,73 +5534,73 @@ export class StreamManager {
    * Stops an active stream for a workspace
    * If soft is true, performs a soft interrupt (cancels at next block boundary)
    */
-  async stopStream(
-    workspaceId: string,
-    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
-  ): Promise<Result<void>> {
+  async stopStream(workspaceId: string, options?: StopStreamOptions): Promise<Result<void>> {
     const typedWorkspaceId = workspaceId as WorkspaceId;
+    // Capture every target before abort callbacks or raw startup delivery can reenter and
+    // register a replacement. Never look up a new engine after an asynchronous stop step.
     const pending = this.pendingStreamStarts.get(workspaceId);
-    const isActuallyStreaming = this.mockStreamLifecycle
-      ? this.mockStreamLifecycle.isStreaming(workspaceId)
+    const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
+    const mockLifecycle = this.mockStreamLifecycle;
+    const isActuallyStreaming = mockLifecycle
+      ? mockLifecycle.isStreaming(workspaceId)
       : this.isStreaming(workspaceId);
 
-    if (pending) {
-      pending.abortController.abort(options?.abortReason ?? "startup");
-      if (!isActuallyStreaming) {
-        await this.emitStreamAbort(
-          typedWorkspaceId,
-          pending.syntheticMessageId,
-          { duration: Date.now() - pending.startTime },
-          options?.abortReason ?? "startup",
-          options?.abandonPartial,
-          pending.acpPromptId
-        );
-      }
-    }
-
-    if (this.mockStreamLifecycle) {
-      await this.mockStreamLifecycle.stop(workspaceId);
-      return Ok(undefined);
-    }
-
     try {
-      const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
-      if (!streamInfo) {
-        if (!pending) {
-          void this.emitStreamAbort(
+      // Invoke against the captured mock before pending abort can synchronously start another.
+      const mockStop = mockLifecycle?.stop(workspaceId, options);
+      let engineStop: Promise<void> | undefined;
+      if (!mockLifecycle && streamInfo) {
+        const abortReason = options?.abortReason ?? "system";
+        if (options?.soft) {
+          streamInfo.softInterrupt = {
+            pending: true,
+            abandonPartial: options.abandonPartial ?? false,
+            abortReason,
+          };
+        } else {
+          engineStop = this.cancelStreamSafely(
             typedWorkspaceId,
-            "",
-            {},
-            options?.abortReason ?? "startup",
+            streamInfo,
+            abortReason,
             options?.abandonPartial
-          ).catch((error) => {
-            log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
-          });
+          );
         }
-        return Ok(undefined);
+      }
+      let startupDelivery: Promise<void> | undefined;
+      if (pending) {
+        if (!isActuallyStreaming && !streamInfo && !pending.abortDelivery) {
+          const delivery = Promise.withResolvers<void>();
+          pending.abortDelivery = delivery.promise;
+          pending.abortController.abort(options?.abortReason ?? "startup");
+          this.emitStreamAbort(
+            typedWorkspaceId,
+            pending.syntheticMessageId,
+            { duration: Date.now() - pending.startTime },
+            this.getStartupAbortReason(pending.abortController.signal),
+            options?.abandonPartial,
+            pending.acpPromptId
+          ).then(delivery.resolve, delivery.reject);
+        } else {
+          pending.abortController.abort(options?.abortReason ?? "startup");
+        }
+        startupDelivery = pending.abortDelivery;
       }
 
-      const abortReason = options?.abortReason ?? "system";
-      const soft = options?.soft ?? false;
-
-      if (soft) {
-        streamInfo.softInterrupt = {
-          pending: true,
-          abandonPartial: options?.abandonPartial ?? false,
-          abortReason,
-        };
-      } else {
-        await this.cancelStreamSafely(
+      if (!mockLifecycle && !streamInfo && !pending && options?.emitIfMissing !== false) {
+        startupDelivery = this.emitStreamAbort(
           typedWorkspaceId,
-          streamInfo,
-          abortReason,
+          "",
+          {},
+          options?.abortReason ?? "startup",
           options?.abandonPartial
         );
       }
+      const outcomes = await Promise.allSettled([startupDelivery, engineStop, mockStop]);
+      const failure = outcomes.find((outcome) => outcome.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
       return Ok(undefined);
     } catch (error) {
-      const message = getErrorMessage(error);
-      return Err("Failed to stop stream: " + message);
+      return Err("Failed to stop stream: " + getErrorMessage(error));
     }
   }
 
@@ -5577,7 +5636,10 @@ export class StreamManager {
    * Returns undefined if no active stream exists
    * Used to re-establish streaming context on frontend reconnection
    */
-  getStreamInfo(workspaceId: string):
+  getStreamInfo(
+    workspaceId: string,
+    includeFinalizing = false
+  ):
     | {
         messageId: string;
         model: string;
@@ -5597,7 +5659,9 @@ export class StreamManager {
     // Only return info if stream is actively running
     if (
       streamInfo &&
-      (streamInfo.state === StreamState.STARTING || streamInfo.state === StreamState.STREAMING)
+      (includeFinalizing ||
+        streamInfo.state === StreamState.STARTING ||
+        streamInfo.state === StreamState.STREAMING)
     ) {
       return {
         messageId: streamInfo.messageId,

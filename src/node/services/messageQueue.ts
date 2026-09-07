@@ -814,11 +814,6 @@ export class MessageQueue {
     return this.getFilePartsForEntries(this.getVisibleEntries());
   }
 
-  /** Get reviews across all entries' metadata. */
-  getReviews(): ReviewNoteData[] | undefined {
-    return this.getReviewsForEntries(this.entries);
-  }
-
   /** Get reviews across user-visible entries' metadata only. */
   getVisibleReviews(): ReviewNoteData[] | undefined {
     return this.getReviewsForEntries(this.getVisibleEntries());

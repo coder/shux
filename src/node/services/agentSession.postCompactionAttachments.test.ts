@@ -267,7 +267,7 @@ describe("AgentSession post-compaction attachments", () => {
         );
       expect(stateExists).toBe(false);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -318,7 +318,7 @@ describe("AgentSession post-compaction attachments", () => {
       const attachments = await generatePeriodicPostCompactionAttachments(session);
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/recent-epoch-2.ts"]);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -355,7 +355,7 @@ describe("AgentSession post-compaction attachments", () => {
       const attachments = await generatePeriodicPostCompactionAttachments(session);
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/recent.ts", "/tmp/stale.ts"]);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -403,7 +403,7 @@ describe("AgentSession post-compaction attachments", () => {
       );
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/post-compaction.ts"]);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -447,7 +447,7 @@ describe("AgentSession post-compaction attachments", () => {
       );
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/recent-periodic.ts"]);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -493,7 +493,7 @@ describe("AgentSession post-compaction attachments", () => {
       expect(getLoadedSkillNames(attachments)).toEqual([]);
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/excluded-skills.ts"]);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 });

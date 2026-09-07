@@ -193,7 +193,6 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
     );
   };
 
-  // Render tooltip content
   const renderTooltipContent = () => {
     if (isLoading) {
       return "Loading...";

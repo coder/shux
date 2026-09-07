@@ -123,13 +123,11 @@ export function parseDiff(diffOutput: string): FileDiff[] {
       continue;
     }
 
-    // New file mode
     if (line.startsWith("new file mode ")) {
       currentFile.changeType = "added";
       continue;
     }
 
-    // Deleted file mode
     if (line.startsWith("deleted file mode ")) {
       currentFile.changeType = "deleted";
       continue;
@@ -167,7 +165,6 @@ export function parseDiff(diffOutput: string): FileDiff[] {
     }
   }
 
-  // Finish last file
   finishFile();
 
   return files;

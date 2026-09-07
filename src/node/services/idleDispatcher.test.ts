@@ -4,7 +4,7 @@ import { describe, expect, mock, test } from "bun:test";
 import { drainPendingDispatches, waitForCondition } from "./testDispatchHelpers";
 import {
   IdleDispatcher,
-  MAX_CONCURRENT_GOAL_DISPATCHES,
+  MAX_CONCURRENT_IDLE_DISPATCHES,
   type IdleConsumer,
   type IdleDispatchPayload,
 } from "./idleDispatcher";
@@ -118,7 +118,7 @@ describe("IdleDispatcher", () => {
   });
 
   test("enforces the global firing-rate cap", async () => {
-    expect(MAX_CONCURRENT_GOAL_DISPATCHES).toBe(1);
+    expect(MAX_CONCURRENT_IDLE_DISPATCHES).toBe(1);
     const dispatcher = new IdleDispatcher();
     const events: string[] = [];
     let releaseFirstDispatch: (() => void) | undefined;
@@ -161,7 +161,7 @@ describe("IdleDispatcher", () => {
   });
 
   test("serializes simultaneous cross-workspace goal continuations in FIFO order", async () => {
-    expect(MAX_CONCURRENT_GOAL_DISPATCHES).toBe(1);
+    expect(MAX_CONCURRENT_IDLE_DISPATCHES).toBe(1);
     const dispatcher = new IdleDispatcher();
     const workspaceIds = ["workspace-1", "workspace-2", "workspace-3", "workspace-4"];
     const events: string[] = [];

@@ -59,7 +59,6 @@ export function sanitizeImageData(mediaType: string, data: string): string | nul
     return null;
   }
 
-  // Validate base64 data
   if (!isValidBase64AttachmentData(data)) {
     return null;
   }

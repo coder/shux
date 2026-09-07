@@ -131,7 +131,6 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
     return { success: false, error: result.error ?? "Failed to fork workspace" };
   }
 
-  // Copy UI state to the new workspace
   copyWorkspaceStorage(options.sourceWorkspaceId, result.metadata.id);
 
   // Get workspace info for switching
@@ -1537,7 +1536,6 @@ export function prepareCompactionMessage(options: CompactionOptions): {
     followUpContent: fc,
   };
 
-  // Apply compaction overrides
   const sendOptions = applyCompactionOverrides(options.sendMessageOptions, compactData);
 
   const metadata: MuxMessageMetadata = {

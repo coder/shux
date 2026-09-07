@@ -124,7 +124,6 @@
               "reference/benchmarking",
               "adr/0003-context-boundaries-for-compaction-and-reset",
               "adr/0004-cli-goal-runs-are-not-strict-goal-aliases",
-              "research/claude-code-cross-session-messaging-comparison",
               "AGENTS"
             ]
           }

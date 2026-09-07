@@ -782,19 +782,4 @@ export class SessionUsageService {
       await this.rebuildFromMessagesInternal(workspaceId, messages);
     });
   }
-
-  /**
-   * Delete session usage file (when workspace is deleted).
-   */
-  async deleteSessionUsage(workspaceId: string): Promise<void> {
-    return this.fileLocks.withLock(workspaceId, async () => {
-      try {
-        await fs.unlink(this.getFilePath(workspaceId));
-      } catch (error) {
-        if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
-          throw error;
-        }
-      }
-    });
-  }
 }
