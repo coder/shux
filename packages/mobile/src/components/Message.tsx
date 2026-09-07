@@ -286,7 +286,7 @@ function QuestionForm(props: {
                 const checked = draft.selected.includes(option.label);
                 return (
                   <Pressable
-                    key={option.label ?? "other"}
+                    key={option.label === null ? "other" : `option:${option.label}`}
                     accessibilityRole={question.multiSelect ? "checkbox" : "radio"}
                     accessibilityLabel={option.label ?? "Other"}
                     accessibilityState={{ checked, disabled }}
