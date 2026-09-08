@@ -33,7 +33,10 @@ import * as path from "path";
 import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
 import { Effect, Fiber } from "effect";
-import { CompactionCancellation } from "./compactionCancellation";
+import {
+  CompactionCancellation,
+  type CompactionCancellationRecord,
+} from "./compactionCancellation";
 import { StartupRecovery, type StartupRecoveryOutcome } from "./startupRecovery";
 import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
@@ -2718,20 +2721,23 @@ export class AgentSession {
     return retryRequest?.model ?? null;
   }
 
-  private async reconcileCompactionCancellation(): Promise<void> {
-    const cancellation = await this.compactionCancellation.read();
-    if (!cancellation) return;
-    // Empty history is only a snapshot: a foreign producer can still publish
-    // canceled work later. Only explicit replacement evidence retires Stop.
-    // A replacement witness is part of the row's atomic commit. The sidecar can
-    // safely retire even if the previous process died before its unlink completed.
-    if (
-      await this.historyService.hasCompactionReplacementWitness(
+  private async reconcileCompactionCancellation(): Promise<CompactionCancellationRecord | null> {
+    let cancellation = await this.compactionCancellation.read();
+    // Empty history cannot retire Stop: only an exact active/archive row witness can.
+    // Live dispatch uses the same reconciliation as startup because another backend
+    // can commit a replacement while its ancillary sidecar unlink keeps failing.
+    while (
+      cancellation &&
+      (await this.historyService.hasCompactionReplacementWitness(
         this.workspaceId,
         cancellation.nonce
-      )
-    )
+      ))
+    ) {
       await this.retireWitnessedCompactionCancellation(cancellation.nonce);
+      // Re-read shared identity after every await; retiring witnessed A cannot hide B.
+      cancellation = await this.compactionCancellation.read();
+    }
+    return cancellation;
   }
 
   private async retireWitnessedCompactionCancellation(nonce: string): Promise<void> {
@@ -3569,18 +3575,6 @@ export class AgentSession {
     const cancelSignal = internal?.cancelSignal;
     const persistedCancelableMessageIds: string[] = [];
     let compactionAppendSkipped = false;
-    const compactionAppendCondition = internal?.compactionHandoff
-      ? {
-          summary: internal.compactionHandoffSource?.summary,
-          allowedTailMessageIds: persistedCancelableMessageIds,
-          isCurrent: () =>
-            !isAdmissionStale() && !this.coordinator.closing && cancelSignal?.aborted !== true,
-          onSkipped: () => {
-            compactionAppendSkipped = true;
-            internal.compactionHandoffSource?.onSkipped();
-          },
-        }
-      : undefined;
     // Roll back synthetic snapshots if the invoking user row fails to persist, or
     // later provider requests could consume orphaned context.
     /**
@@ -3629,7 +3623,11 @@ export class AgentSession {
           "Failed to roll back preparation rows after compaction follow-up became stale"
         );
       return Err(
-        createUnknownSendMessageError("Compaction follow-up source became stale before append")
+        createUnknownSendMessageError(
+          isManualUserMessage
+            ? "Send superseded by a newer Stop before append"
+            : "Compaction follow-up source became stale before append"
+        )
       );
     };
     const markRowsDurable = (): void => {
@@ -4102,6 +4100,22 @@ export class AgentSession {
     const compactionCancellationNonce = isManualUserMessage
       ? await this.getCompactionCancellationNonce()
       : undefined;
+    const compactionAppendCondition =
+      isManualUserMessage || internal?.compactionHandoff
+        ? {
+            ...(isManualUserMessage
+              ? { replacementNonce: compactionCancellationNonce ?? null }
+              : {}),
+            summary: internal?.compactionHandoffSource?.summary,
+            allowedTailMessageIds: persistedCancelableMessageIds,
+            isCurrent: () =>
+              !isAdmissionStale() && !this.coordinator.closing && cancelSignal?.aborted !== true,
+            onSkipped: () => {
+              compactionAppendSkipped = true;
+              internal?.compactionHandoffSource?.onSkipped();
+            },
+          }
+        : undefined;
     const userMessage = createMuxMessage(
       messageId,
       "user",
@@ -4344,7 +4358,7 @@ export class AgentSession {
           compactionAppendCondition
         );
         if (!appendCompactionResult.success) {
-          if (compactionAppendCondition) throw new Error(appendCompactionResult.error);
+          if (internal?.compactionHandoff) throw new Error(appendCompactionResult.error);
           return Err(createUnknownSendMessageError(appendCompactionResult.error));
         }
         if (compactionAppendSkipped) return refuseSkippedCompactionAppend();
@@ -4391,6 +4405,9 @@ export class AgentSession {
     // Persist snapshots only when this turn will be sent immediately.
     // On on-send compaction paths, snapshots are deferred with the follow-up turn.
     const shouldPersistTurnSnapshots = autoCompactionMessage === null;
+    // A handoff snapshot without its trigger strands pendingFollowUp after a crash.
+    // Commit their exact materialized rows together, including with token budgets disabled.
+    const batchTurnSnapshots = tokenBudgetActive || internal?.compactionHandoff != null;
 
     let skillSnapshotMessages: MuxMessage[] = [];
     let mcpPromptSnapshotMessages: MuxMessage[] = [];
@@ -4414,7 +4431,7 @@ export class AgentSession {
       }
     }
 
-    if (shouldPersistTurnSnapshots && !tokenBudgetActive && snapshotResult?.snapshotMessage) {
+    if (shouldPersistTurnSnapshots && !batchTurnSnapshots && snapshotResult?.snapshotMessage) {
       const snapshotAppendResult = await this.historyService.appendToHistory(
         this.workspaceId,
         snapshotResult.snapshotMessage
@@ -4428,7 +4445,7 @@ export class AgentSession {
       }
     }
 
-    if (shouldPersistTurnSnapshots && !tokenBudgetActive && skillSnapshotMessages.length > 0) {
+    if (shouldPersistTurnSnapshots && !batchTurnSnapshots && skillSnapshotMessages.length > 0) {
       for (const snapshotMessage of skillSnapshotMessages) {
         const skillSnapshotAppendResult = await this.historyService.appendToHistory(
           this.workspaceId,
@@ -4445,7 +4462,7 @@ export class AgentSession {
       }
     }
 
-    if (shouldPersistTurnSnapshots && !tokenBudgetActive && mcpPromptSnapshotMessages.length > 0) {
+    if (shouldPersistTurnSnapshots && !batchTurnSnapshots && mcpPromptSnapshotMessages.length > 0) {
       for (const snapshotMessage of mcpPromptSnapshotMessages) {
         const appendResult = await this.historyService.appendToHistory(
           this.workspaceId,
@@ -4478,7 +4495,7 @@ export class AgentSession {
         "sendMessage: preTurnMessages must be synthetic assistant rows"
       );
     }
-    if (tokenBudgetActive) {
+    if (batchTurnSnapshots && !autoCompactionMessage) {
       const requestPrelude = [
         ...(snapshotResult?.snapshotMessage ? [snapshotResult.snapshotMessage] : []),
         ...skillSnapshotMessages,
@@ -4489,17 +4506,19 @@ export class AgentSession {
       // before clearing context state or publishing a reset. Reuse these rows below:
       // skill directives and MCP prompt expansion must not execute a second time.
       if (requestPrelude.length > 0) {
-        const freshBudget = await this.checkFreshContextBudget(
-          userMessage,
-          optionsForStream.model,
-          optionsForStream,
-          [...contextBudgetPrefix, ...requestPrelude]
-        );
-        if (await cancelBeforeAcceptance()) return Ok(undefined);
-        if (isAdmissionStale() || this.coordinator.admissionBlocked || this.coordinator.closing) {
-          return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+        if (tokenBudgetActive) {
+          const freshBudget = await this.checkFreshContextBudget(
+            userMessage,
+            optionsForStream.model,
+            optionsForStream,
+            [...contextBudgetPrefix, ...requestPrelude]
+          );
+          if (await cancelBeforeAcceptance()) return Ok(undefined);
+          if (isAdmissionStale() || this.coordinator.admissionBlocked || this.coordinator.closing) {
+            return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+          }
+          if (!freshBudget.success) return await rejectBudgetSend(freshBudget.error);
         }
-        if (!freshBudget.success) return await rejectBudgetSend(freshBudget.error);
         userMessage.metadata = {
           ...userMessage.metadata,
           requestPreludeMessageIds: requestPrelude.map((row) => row.id),
@@ -4559,11 +4578,11 @@ export class AgentSession {
                 compactionAppendCondition
               );
         if (!appended.success) {
-          if (compactionAppendCondition) throw new Error(appended.error);
+          if (internal?.compactionHandoff) throw new Error(appended.error);
           return Err(createUnknownSendMessageError(appended.error));
         }
       } catch (error) {
-        if (compactionAppendCondition) throw error;
+        if (internal?.compactionHandoff) throw error;
         return Err(createUnknownSendMessageError(getErrorMessage(error)));
       }
       if (compactionAppendSkipped) return refuseSkippedCompactionAppend();
@@ -4583,14 +4602,16 @@ export class AgentSession {
       }
       if (await cancelBeforeAcceptance()) return Ok(undefined);
     } else if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
-      const batchAppendResult = await this.historyService.appendManyToHistory(this.workspaceId, [
-        ...internal.preTurnMessages,
-        userMessage,
-      ]);
+      const batchAppendResult = await this.historyService.appendManyToHistory(
+        this.workspaceId,
+        [...internal.preTurnMessages, userMessage],
+        compactionAppendCondition
+      );
       if (!batchAppendResult.success) {
         await rollbackPersistedTurnRows();
         return Err(createUnknownSendMessageError(batchAppendResult.error));
       }
+      if (compactionAppendSkipped) return refuseSkippedCompactionAppend();
       persistedCancelableMessageIds.push(
         ...internal.preTurnMessages.map((message) => message.id),
         userMessage.id
@@ -4611,7 +4632,7 @@ export class AgentSession {
         await rollbackPersistedTurnRows();
         // Rollback can retire the local token; that must not disguise a real
         // locked-read/write failure as an ordinary stale-source skip.
-        if (compactionAppendCondition) throw new Error(appendResult.error);
+        if (internal?.compactionHandoff) throw new Error(appendResult.error);
         return Err(createUnknownSendMessageError(appendResult.error));
       }
       if (compactionAppendSkipped) return refuseSkippedCompactionAppend();
@@ -9841,7 +9862,7 @@ export class AgentSession {
       return false;
     }
 
-    const cancellation = await this.compactionCancellation.read();
+    const cancellation = await this.reconcileCompactionCancellation();
     if (!this.coordinator.isCurrentCompaction(token)) {
       if (this.coordinator.canClearCompactionFollowUp(token))
         await this.clearPendingFollowUpFromSummary(lastMessage, token);
@@ -9851,7 +9872,7 @@ export class AgentSession {
     // Its now-absent fence cannot authorize the stale request we read before repair.
     if (repairRevision !== this.compactionCancellation.repairRevision) return false;
     if (cancellation && this.compactionCancellation.matches(cancellation, lastMessage)) {
-      await this.clearPendingFollowUpFromSummary(lastMessage, token);
+      await this.clearPendingFollowUpFromSummary(lastMessage, token, cancellation.nonce);
       return false;
     }
 
@@ -10221,7 +10242,8 @@ export class AgentSession {
 
   private async clearPendingFollowUpFromSummary(
     summaryMessage: MuxMessage,
-    token: CompactionToken
+    token: CompactionToken,
+    cancellationNonce?: string
   ): Promise<void> {
     assert(
       summaryMessage.role === "assistant",
@@ -10239,10 +10261,12 @@ export class AgentSession {
     }
 
     if (!this.coordinator.canClearCompactionFollowUp(token)) return;
-    const cancellation = await this.compactionCancellation.read();
+    const cancellation = await this.reconcileCompactionCancellation();
     if (!this.coordinator.canClearCompactionFollowUp(token)) return;
     const canceled =
       cancellation != null && this.compactionCancellation.matches(cancellation, summaryMessage);
+    if (cancellationNonce !== undefined && (!canceled || cancellation?.nonce !== cancellationNonce))
+      return;
     let matched = false;
     let committed = false;
     const updateResult = await this.historyService.updateHistory(
@@ -10273,7 +10297,8 @@ export class AgentSession {
       },
       () => {
         committed = true;
-      }
+      },
+      cancellationNonce
     );
     if (!updateResult.success) {
       // Only a target verified under the write lock may narrow an unresolved Stop.

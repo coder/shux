@@ -1238,11 +1238,13 @@ test.each(["clean", "cleanup failure", "guard I/O failure"] as const)(
       materializeFileAtMentionsSnapshot(text: string): Promise<{
         snapshotMessage: ReturnType<typeof createMuxMessage>;
         materializedTokens: string[];
+        fileStates: [];
       } | null>;
     };
     spyOn(materializer, "materializeFileAtMentionsSnapshot").mockResolvedValue({
       snapshotMessage: ownSnapshot,
       materializedTokens: [],
+      fileStates: [],
     });
     const foreignHistory = new HistoryService(h.config);
     const foreign = await createAgentSessionHarness({
@@ -1250,9 +1252,8 @@ test.each(["clean", "cleanup failure", "guard I/O failure"] as const)(
       config: h.config,
       historyService: foreignHistory,
     });
-    const append = h.historyService.appendToHistory.bind(h.historyService);
-    spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
-      const result = await append(...args);
+    const append = h.historyService.appendManyToHistory.bind(h.historyService);
+    spyOn(h.historyService, "appendManyToHistory").mockImplementationOnce(async (...args) => {
       if (failureMode === "guard I/O failure") {
         spyOn(h.historyService, "readCompactionCancellation").mockRejectedValueOnce(
           new Error("guard storage unavailable")
@@ -1264,7 +1265,7 @@ test.each(["clean", "cleanup failure", "guard I/O failure"] as const)(
         );
         await foreign.session.runStartupRecovery();
       }
-      return result;
+      return append(...args);
     });
     if (cleanupFails)
       spyOn(h.historyService, "deleteMessages").mockResolvedValueOnce(
@@ -1287,19 +1288,14 @@ test.each(["clean", "cleanup failure", "guard I/O failure"] as const)(
       if (failureMode === "guard I/O failure")
         expect(result).toHaveProperty(
           "message",
-          "Failed to append history: guard storage unavailable"
-        );
-      else if (cleanupFails)
-        expect(result).toHaveProperty(
-          "message",
-          "Failed to roll back preparation rows after compaction follow-up became stale"
+          "Failed to append to history: guard storage unavailable"
         );
       else expect(result).toBe(false);
       expect(durableReceipts).toBe(0);
       expect(stream).not.toHaveBeenCalled();
       const rows = await foreignHistory.getHistoryFromLatestBoundary(workspaceId);
       expect(rows.success && rows.data.some((row) => row.role === "user")).toBe(false);
-      expect(rows.success && rows.data.some((row) => row.id === ownSnapshot.id)).toBe(cleanupFails);
+      expect(rows.success && rows.data.some((row) => row.id === ownSnapshot.id)).toBe(false);
     } finally {
       await foreign.session.dispose();
       await h.session.dispose();
@@ -2124,16 +2120,23 @@ test.each([
   }
 });
 
-test.each(["accepted", "foreign Stop", "raw reset", "append failure"] as const)(
-  "token-budget handoff batch preserves locked admission (%s)",
-  async (action) => {
+test.each(
+  [false, true].flatMap((tokenBudget) =>
+    ["accepted", "foreign Stop", "raw reset", "append failure"].map((action) => ({
+      tokenBudget,
+      action,
+    }))
+  )
+)(
+  "handoff batch preserves locked admission ($action, tokenBudget=$tokenBudget)",
+  async ({ action, tokenBudget }) => {
     const h = await setup();
     const source = summary();
     source.metadata = {
       ...source.metadata,
       muxMetadata: {
         type: "compaction-summary",
-        pendingFollowUp: { text: "Continue", ...options, experiments: { tokenBudget: true } },
+        pendingFollowUp: { text: "Continue", ...options, experiments: { tokenBudget } },
       },
     };
     await h.historyService.appendToHistory(workspaceId, source);
@@ -2307,3 +2310,429 @@ test("cancelable acceptance precedes blocked cancellation retirement and runs on
     await h.cleanup();
   }
 });
+
+test.each(
+  [false, true].flatMap((initialStop) =>
+    [
+      "single",
+      "token-budget single",
+      "token-budget batch",
+      "pre-turn batch",
+      "on-send compaction",
+    ].map((branch) => ({ initialStop, branch }))
+  )
+)(
+  "manual $branch rejects a foreign Stop after capture (initial Stop=$initialStop)",
+  async ({ initialStop, branch }) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("original", "user", "Earlier work")
+    );
+    if (initialStop) await h.session.interruptStream({ abandonPartial: true });
+    if (branch === "on-send compaction") {
+      const monitor = (h.session as unknown as { compactionMonitor: CompactionMonitor })
+        .compactionMonitor;
+      spyOn(monitor, "checkBeforeSend").mockReturnValue({
+        shouldShowWarning: true,
+        shouldForceCompact: true,
+        usagePercentage: 99,
+        thresholdPercentage: 85,
+        contextTokens: 99_000,
+        maxTokens: 100_000,
+      });
+    }
+    if (branch === "token-budget batch") {
+      const materializer = h.session as unknown as {
+        materializeFileAtMentionsSnapshot(text: string): Promise<{
+          snapshotMessage: ReturnType<typeof createMuxMessage>;
+          materializedTokens: string[];
+          fileStates: [];
+        } | null>;
+      };
+      spyOn(materializer, "materializeFileAtMentionsSnapshot").mockResolvedValue({
+        snapshotMessage: createMuxMessage("snapshot", "assistant", "Context", { synthetic: true }),
+        materializedTokens: [],
+        fileStates: [],
+      });
+    }
+    const capture = h.session.getCompactionCancellationNonce.bind(h.session);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spyOn(h.session, "getCompactionCancellationNonce").mockImplementationOnce(async () => {
+      const nonce = await capture();
+      entered.resolve();
+      await release.promise;
+      return nonce;
+    });
+    const stream = spyOn(h.aiService, "streamMessage");
+    const durable = mock(() => undefined);
+    const pending = h.session.sendMessage(
+      "Manual replacement",
+      {
+        ...options,
+        ...(branch.startsWith("token-budget") ? { experiments: { tokenBudget: true } } : {}),
+      },
+      {
+        onRowsDurable: durable,
+        ...(branch === "pre-turn batch"
+          ? {
+              preTurnMessages: [
+                createMuxMessage("payload", "assistant", "Payload", { synthetic: true }),
+              ],
+            }
+          : {}),
+      }
+    );
+    try {
+      await entered.promise;
+      const foreign = new CompactionCancellation(new HistoryService(h.config), workspaceId);
+      await foreign.cancel();
+      const stopped = await foreign.read();
+      release.resolve();
+      expect((await pending).success).toBe(false);
+      expect(stream).not.toHaveBeenCalled();
+      expect(durable).not.toHaveBeenCalled();
+      const rows = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(rows.success && rows.data.map((row) => row.id)).toEqual(["original"]);
+      expect(await new HistoryService(h.config).readCompactionCancellation(workspaceId)).toEqual(
+        stopped
+      );
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each([false, true])(
+  "live dispatch reconciles a foreign replacement witness (archived=%s)",
+  async (archived) => {
+    const h = await setup();
+    const foreign = new HistoryService(h.config);
+    const stop = new CompactionCancellation(foreign, workspaceId);
+    await stop.cancel();
+    const record = await stop.read();
+    if (!record) throw new Error("Expected Stop");
+    await foreign.appendToHistory(
+      workspaceId,
+      createMuxMessage("replacement", "user", "Fresh work", {
+        compactionCancellationNonce: record.nonce,
+      })
+    );
+    spyOn(foreign, "writeCompactionCancellation").mockRejectedValueOnce(
+      new Error("unlink unavailable")
+    );
+    expect(
+      await stop.retireReplacement(record.nonce).catch((error: unknown) => error)
+    ).toHaveProperty("message", "unlink unavailable");
+    expect(await foreign.readCompactionCancellation(workspaceId)).toEqual(record);
+    const boundary = summary();
+    if (archived)
+      boundary.metadata = {
+        ...boundary.metadata,
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      };
+    await foreign.appendToHistory(workspaceId, boundary);
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      expect(await h.internals.dispatchPendingFollowUp()).toBe(true);
+      expect(stream).toHaveBeenCalledTimes(1);
+      const rows = await foreign.getLastMessages(workspaceId, 1);
+      expect(rows.success && rows.data[0].role).toBe("user");
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test("interrupted handoff snapshot persistence leaves a fresh service able to recover", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  const snapshot = createMuxMessage("interrupted-snapshot", "user", "Expanded context", {
+    synthetic: true,
+  });
+  const materializer = h.session as unknown as {
+    materializeAgentSkillSnapshots(): Promise<Array<ReturnType<typeof createMuxMessage>>>;
+    materializeMcpPromptSnapshots(): Promise<Array<ReturnType<typeof createMuxMessage>>>;
+    materializeFileAtMentionsSnapshot(text: string): Promise<{
+      snapshotMessage: ReturnType<typeof createMuxMessage>;
+      materializedTokens: string[];
+      fileStates: [];
+    } | null>;
+  };
+  spyOn(materializer, "materializeFileAtMentionsSnapshot").mockResolvedValue({
+    snapshotMessage: snapshot,
+    materializedTokens: [],
+    fileStates: [],
+  });
+  spyOn(materializer, "materializeAgentSkillSnapshots").mockResolvedValue([
+    createMuxMessage("skill-prelude", "user", "Skill context", { synthetic: true }),
+  ]);
+  spyOn(materializer, "materializeMcpPromptSnapshots").mockResolvedValue([
+    createMuxMessage("mcp-prelude", "user", "MCP context", { synthetic: true }),
+  ]);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const append = h.historyService.appendToHistory.bind(h.historyService);
+  spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
+    const result = await append(...args);
+    entered.resolve();
+    await release.promise;
+    return result;
+  });
+  const batch = h.historyService.appendManyToHistory.bind(h.historyService);
+  spyOn(h.historyService, "appendManyToHistory").mockImplementationOnce(async (...args) => {
+    // Simulate process loss before publication by observing disk from an independent service.
+    entered.resolve();
+    await release.promise;
+    return batch(...args);
+  });
+  const pending = h.internals.dispatchPendingFollowUp();
+  let fresh: Awaited<ReturnType<typeof createAgentSessionHarness>> | undefined;
+  try {
+    await entered.promise;
+    fresh = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: new HistoryService(h.config),
+    });
+    const recoveredStream = spyOn(fresh.aiService, "streamMessage");
+    await fresh.session.runStartupRecovery();
+    expect(recoveredStream).toHaveBeenCalledTimes(1);
+    const recovered = await fresh.historyService.getLastMessages(workspaceId, 1);
+    expect(recovered.success && recovered.data[0].parts).toMatchObject([
+      { type: "text", text: "Continue" },
+    ]);
+  } finally {
+    release.resolve();
+    await pending.catch(() => undefined);
+    await fresh?.session.dispose();
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test("Stop survives failed rollback of a committed handoff snapshot batch across restart", async () => {
+  const h = await setup();
+  await h.historyService.appendToHistory(workspaceId, summary());
+  const snapshot = createMuxMessage("retained-snapshot", "user", "Expanded context", {
+    synthetic: true,
+  });
+  const materializer = h.session as unknown as {
+    materializeFileAtMentionsSnapshot(text: string): Promise<{
+      snapshotMessage: ReturnType<typeof createMuxMessage>;
+      materializedTokens: string[];
+      fileStates: [];
+    } | null>;
+  };
+  spyOn(materializer, "materializeFileAtMentionsSnapshot").mockResolvedValue({
+    snapshotMessage: snapshot,
+    materializedTokens: [],
+    fileStates: [],
+  });
+  const append = h.historyService.appendManyToHistory.bind(h.historyService);
+  spyOn(h.historyService, "appendManyToHistory").mockImplementationOnce(async (...args) => {
+    const result = await append(...args);
+    await h.session.interruptStream({ abandonPartial: true });
+    return result;
+  });
+  spyOn(h.historyService, "deleteMessages").mockResolvedValue(Err("rollback unavailable"));
+  const stream = spyOn(h.aiService, "streamMessage");
+  try {
+    await h.internals.dispatchPendingFollowUp();
+    expect(stream).not.toHaveBeenCalled();
+    const foreign = new HistoryService(h.config);
+    expect(await foreign.readCompactionCancellation(workspaceId)).not.toBeNull();
+    const rows = await foreign.getHistoryFromLatestBoundary(workspaceId);
+    expect(rows.success && rows.data.filter((row) => row.role === "user")).toHaveLength(2);
+    const fresh = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: foreign,
+    });
+    try {
+      const recovered = spyOn(fresh.aiService, "streamMessage");
+      await fresh.session.runStartupRecovery();
+      expect(recovered).not.toHaveBeenCalled();
+      expect(await foreign.readCompactionCancellation(workspaceId)).not.toBeNull();
+    } finally {
+      await fresh.session.dispose();
+    }
+  } finally {
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test.each(["witness read", "retirement"] as const)(
+  "live witness reconciliation preserves newer Stop during %s",
+  async (stage) => {
+    const h = await setup();
+    const foreign = new HistoryService(h.config);
+    const cancellation = new CompactionCancellation(foreign, workspaceId);
+    await cancellation.cancel();
+    const record = await cancellation.read();
+    if (!record) throw new Error("Expected Stop");
+    await foreign.appendToHistory(
+      workspaceId,
+      createMuxMessage("replacement", "user", "Work", { compactionCancellationNonce: record.nonce })
+    );
+    await foreign.appendToHistory(workspaceId, summary());
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    if (stage === "witness read") {
+      const read = h.historyService.hasCompactionReplacementWitness.bind(h.historyService);
+      spyOn(h.historyService, "hasCompactionReplacementWitness").mockImplementationOnce(
+        async (...args) => {
+          const result = await read(...args);
+          entered.resolve();
+          await release.promise;
+          return result;
+        }
+      );
+    } else {
+      const write = h.historyService.writeCompactionCancellation.bind(h.historyService);
+      spyOn(h.historyService, "writeCompactionCancellation").mockImplementationOnce(
+        async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return write(...args);
+        }
+      );
+    }
+    const stream = spyOn(h.aiService, "streamMessage");
+    const pending = h.internals.dispatchPendingFollowUp();
+    try {
+      await entered.promise;
+      await cancellation.cancel();
+      const newer = await cancellation.read();
+      // Keep the newer cancellation observable through a failed durable cleanup.
+      const writes = h.historyService as unknown as {
+        writeGuardedHistory(
+          path: string,
+          serialized: string | Buffer,
+          guard: () => boolean
+        ): Promise<boolean>;
+      };
+      spyOn(writes, "writeGuardedHistory").mockRejectedValueOnce(new Error("cleanup unavailable"));
+      release.resolve();
+      expect(await pending.catch((error: unknown) => error)).toHaveProperty(
+        "message",
+        "Failed to clear skipped pending follow-up: Failed to update history: cleanup unavailable"
+      );
+      expect(stream).not.toHaveBeenCalled();
+      expect((await foreign.readCompactionCancellation(workspaceId))?.nonce).toBe(newer?.nonce);
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test("cancellation cleanup rechecks a replacement witness under the summary write lock", async () => {
+  const h = await setup();
+  const foreign = new HistoryService(h.config);
+  const user = createMuxMessage("replacement", "user", "Work");
+  await foreign.appendToHistory(workspaceId, user);
+  const boundary = summary();
+  await foreign.appendToHistory(workspaceId, boundary);
+  const cancellation = new CompactionCancellation(foreign, workspaceId);
+  await cancellation.cancel();
+  const record = await cancellation.read();
+  if (!record) throw new Error("Expected Stop");
+  const update = h.historyService.updateHistory.bind(h.historyService);
+  spyOn(h.historyService, "updateHistory").mockImplementationOnce(async (...args) => {
+    await foreign.updateHistory(workspaceId, {
+      ...user,
+      metadata: { ...user.metadata, compactionCancellationNonce: record.nonce },
+    });
+    return update(...args);
+  });
+  try {
+    expect(await h.internals.dispatchPendingFollowUp()).toBe(false);
+    const rows = await foreign.getLastMessages(workspaceId, 1);
+    expect(rows.success && rows.data[0].metadata?.muxMetadata).toHaveProperty("pendingFollowUp");
+  } finally {
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test.each(["absence", "witnessed debt", "Stop after commit"] as const)(
+  "manual locked acceptance handles %s",
+  async (state) => {
+    const h = await setup();
+    const cancellation = (
+      h.session as unknown as { compactionCancellation: CompactionCancellation }
+    ).compactionCancellation;
+    let captured: string | undefined;
+    let newer: string | undefined;
+    let restoreWrite: (() => void) | undefined;
+    if (state !== "absence") {
+      await h.session.interruptStream({ abandonPartial: true });
+      captured = await h.session.getCompactionCancellationNonce();
+      if (!captured) throw new Error("Expected Stop");
+      if (state === "witnessed debt") {
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("accepted-earlier", "user", "Work", {
+            compactionCancellationNonce: captured,
+          })
+        );
+        const write = h.historyService.writeCompactionCancellation.bind(h.historyService);
+        const spy = spyOn(h.historyService, "writeCompactionCancellation").mockImplementation(
+          (...args) =>
+            args[1] === null ? Promise.reject(new Error("unlink unavailable")) : write(...args)
+        );
+        restoreWrite = () => spy.mockRestore();
+        await cancellation.retireReplacement(captured).catch(() => undefined);
+        expect(await h.session.getCompactionCancellationNonce()).toBeUndefined();
+      } else {
+        const append = h.historyService.appendToHistory.bind(h.historyService);
+        spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
+          const result = await append(...args);
+          const foreign = new CompactionCancellation(new HistoryService(h.config), workspaceId);
+          await foreign.cancel();
+          newer = (await foreign.read())?.nonce;
+          return result;
+        });
+      }
+    }
+    const durable = mock(() => undefined);
+    const accepted = mock(() => undefined);
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      expect(
+        (
+          await h.session.sendMessage("Accepted work", options, {
+            onRowsDurable: durable,
+            onAccepted: accepted,
+          })
+        ).success
+      ).toBe(true);
+      expect(durable).toHaveBeenCalledTimes(1);
+      expect(accepted).toHaveBeenCalledTimes(1);
+      expect(stream).toHaveBeenCalledTimes(1);
+      const foreign = new HistoryService(h.config);
+      const rows = await foreign.getLastMessages(workspaceId, 1);
+      expect(rows.success && rows.data[0].metadata?.compactionCancellationNonce).toBe(
+        state === "Stop after commit" ? captured : undefined
+      );
+      if (state === "Stop after commit")
+        expect((await foreign.readCompactionCancellation(workspaceId))?.nonce).toBe(newer);
+      if (state === "witnessed debt") expect(cancellation.blocksRecovery).toBe(false);
+    } finally {
+      restoreWrite?.();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);

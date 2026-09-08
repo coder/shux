@@ -89,6 +89,8 @@ import {
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
 
 interface CompactionFollowUpAppendCondition {
+  /** Presence selects manual replacement admission; null captures semantic absence. */
+  replacementNonce?: string | null;
   summary?: MuxMessage;
   allowedTailMessageIds: readonly string[];
   isCurrent: () => boolean;
@@ -2876,6 +2878,14 @@ export class HistoryService {
     workspaceId: string,
     condition: CompactionFollowUpAppendCondition
   ): Promise<boolean> {
+    if (condition.replacementNonce !== undefined) {
+      return (
+        (await this.matchesReplacementCancellationUnlocked(
+          workspaceId,
+          condition.replacementNonce
+        )) && condition.isCurrent()
+      );
+    }
     // Another backend can consume/repair this summary while send preparation
     // awaits. Validate its exact intent under the same lock as the new row.
     const rows = await this.readChatHistory(workspaceId);
@@ -3078,17 +3088,47 @@ export class HistoryService {
     message: MuxMessage,
     shouldUpdate?: (current: MuxMessage) => boolean,
     updateFromCurrent?: (current: MuxMessage) => MuxMessage,
-    onCommitted?: () => void
+    onCommitted?: () => void,
+    cancellationNonce?: string
   ): Promise<Result<void>> {
     assert(!onCommitted || shouldUpdate, "Update commit observers require a conditional mutation");
-    return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to update history", () =>
-      this.updateHistoryUnderWriteLock(
-        workspaceId,
-        message,
-        shouldUpdate,
-        updateFromCurrent,
-        onCommitted
-      )
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to update history",
+      async () => {
+        // A live cancellation read can age across another backend's accepted replacement.
+        // Only the exact still-unwitnessed Stop may erase its captured pending summary.
+        if (cancellationNonce !== undefined) {
+          const cancellation = await this.readCompactionCancellation(workspaceId);
+          if (
+            cancellation?.nonce !== cancellationNonce ||
+            !matchesCompactionCancellation(cancellation, message) ||
+            (await this.hasCompactionReplacementWitnessUnlocked(workspaceId, cancellationNonce))
+          )
+            return Ok(undefined);
+        }
+        return this.updateHistoryUnderWriteLock(
+          workspaceId,
+          message,
+          shouldUpdate,
+          updateFromCurrent,
+          onCommitted
+        );
+      }
+    );
+  }
+
+  private async matchesReplacementCancellationUnlocked(
+    workspaceId: string,
+    expectedNonce: string | null
+  ): Promise<boolean> {
+    const current = await this.readCompactionCancellation(workspaceId);
+    // Semantic absence can retain a physical file when witnessed unlink failed.
+    return (
+      (current?.nonce ?? null) === expectedNonce ||
+      (expectedNonce === null &&
+        current != null &&
+        (await this.hasCompactionReplacementWitnessUnlocked(workspaceId, current.nonce)))
     );
   }
 
@@ -3105,16 +3145,7 @@ export class HistoryService {
       async () => {
         // Retry must not stamp an obsolete receipt over a foreign Stop that arrived
         // during preparation. Compare shared identity and commit under one lock.
-        const current = await this.readCompactionCancellation(workspaceId);
-        // Semantic absence can retain a physical file when witnessed unlink failed.
-        if (
-          (current?.nonce ?? null) !== expectedNonce &&
-          !(
-            expectedNonce === null &&
-            current &&
-            (await this.hasCompactionReplacementWitnessUnlocked(workspaceId, current.nonce))
-          )
-        )
+        if (!(await this.matchesReplacementCancellationUnlocked(workspaceId, expectedNonce)))
           return Ok(undefined);
         return this.updateHistoryUnderWriteLock(
           workspaceId,
