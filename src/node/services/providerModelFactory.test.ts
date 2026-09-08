@@ -1189,8 +1189,12 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         expect(headers.get("content-type")).toBe("application/json");
         expect(headers.get("session-id")).toBeNull();
 
-        for (const sessionId of [undefined, "explicit-session"]) {
-          const promptCacheKey = "mux-v1-project-scope";
+        for (const [promptCacheKey, sessionId, expectedSessionId] of [
+          ["mux-v1-project-scope", undefined, "mux-v1-project-scope"],
+          ["mux-v1-日本語-scope", undefined, "mux-v1-%E6%97%A5%E6%9C%AC%E8%AA%9E-scope"],
+          ["mux-v1-project\nscope", undefined, "mux-v1-project%0Ascope"],
+          ["mux-v1-project-scope", "explicit-session", "explicit-session"],
+        ] as const) {
           const cacheHeaders = new Headers(request.headers);
           if (sessionId) cacheHeaders.set("session-id", sessionId);
           for (let turn = 0; turn < 2; turn++) {
@@ -1205,9 +1209,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
             });
             const outgoing = requests.at(-1);
             expect(outgoing?.input).toBe(CODEX_ENDPOINT);
-            expect(new Headers(outgoing?.init?.headers).get("session-id")).toBe(
-              sessionId ?? promptCacheKey
-            );
+            expect(new Headers(outgoing?.init?.headers).get("session-id")).toBe(expectedSessionId);
           }
         }
       } finally {

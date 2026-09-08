@@ -1738,7 +1738,8 @@ export class ProviderModelFactory {
                       typeof promptCacheKey === "string" &&
                       promptCacheKey.length > 0
                     ) {
-                      headers.set("session-id", promptCacheKey);
+                      // Project names may contain Unicode or control characters invalid in headers.
+                      headers.set("session-id", encodeURIComponent(promptCacheKey));
                     }
                     nextInit = {
                       ...init,
