@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import type { MobileClient } from "./api";
-import { applyChatEvent, createTranscriptState } from "./transcript";
+import { applyChatEvent, createTranscriptState, type WorkspaceChatMessage } from "./transcript";
+import {
+  MOBILE_STREAM_DISPLAY_BATCH_MS,
+  MOBILE_STREAM_MAX_PENDING_DELTAS,
+} from "../../../src/constants/streaming";
 import type { SettingsData } from "./settings";
 import type { RestoredInput } from "./draft";
 import { linkedAbortController } from "./useConnection";
@@ -23,6 +27,7 @@ export function useConversation(
   const [owner, setOwner] = useState(() => ({ client, workspaceId, signal }));
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
+  const displayBatch = useRef<{ take: () => WorkspaceChatMessage[] } | null>(null);
   const historyRequest = useRef<AbortController | null>(null);
   type HistoryCursor = NonNullable<
     Parameters<MobileClient["workspace"]["history"]["loadMore"]>[0]["cursor"]
@@ -40,6 +45,32 @@ export function useConversation(
     setHistoryError(null);
     historyCursor.current = null;
     if (signal.aborted) return;
+    let pendingDeltas: WorkspaceChatMessage[] = [];
+    let displayTimer: ReturnType<typeof setTimeout> | null = null;
+    const take = () => {
+      if (displayTimer !== null) clearTimeout(displayTimer);
+      displayTimer = null;
+      const events = pendingDeltas;
+      pendingDeltas = [];
+      return events;
+    };
+    const batch = { take };
+    displayBatch.current = batch;
+    const flush = (event?: WorkspaceChatMessage) => {
+      const events = take();
+      if (event) events.push(event);
+      if (!controller.signal.aborted && events.length > 0)
+        setTranscript((current) => events.reduce(applyChatEvent, current));
+    };
+    controller.signal.addEventListener(
+      "abort",
+      () => {
+        take();
+        if (displayBatch.current === batch) displayBatch.current = null;
+      },
+      { once: true }
+    );
+
     async function subscribePolicy() {
       // Subscribe before the initial read so changes during that read are not lost.
       const events = await client.policy.onChanged(undefined, { signal: controller.signal });
@@ -123,9 +154,19 @@ export function useConversation(
       );
       for await (const event of events) {
         if (controller.signal.aborted) return;
+        // This timer throttles display work only. Retain original ordered events;
+        // every control/tool boundary flushes immediately, not at the next frame.
+        if (event.type === "stream-delta" || event.type === "reasoning-delta") {
+          pendingDeltas.push(event);
+          if (pendingDeltas.length >= MOBILE_STREAM_MAX_PENDING_DELTAS) flush();
+          else if (displayTimer === null)
+            displayTimer = setTimeout(() => flush(), MOBILE_STREAM_DISPLAY_BATCH_MS);
+          continue;
+        }
         // This is a one-shot queue handoff, not replayable transcript state. Consume
         // it here so React rerenders cannot restore it twice or restart the socket.
         if (event.type === "restore-to-input") {
+          flush();
           if (event.workspaceId === workspaceId) restore.current?.(event);
           continue;
         }
@@ -136,7 +177,7 @@ export function useConversation(
           historyCursor.current = null;
           setLoadingOlder(false);
         }
-        setTranscript((current) => applyChatEvent(current, event));
+        flush(event);
       }
       if (!controller.signal.aborted)
         throw new Error(
@@ -144,6 +185,7 @@ export function useConversation(
         );
     }
     subscribe().catch((cause: unknown) => {
+      flush();
       if (!controller.signal.aborted)
         setError(
           cause instanceof Error
@@ -193,10 +235,11 @@ export function useConversation(
       );
       if (controller.signal.aborted) return;
       historyCursor.current = page.nextCursor;
+      const queuedDeltas = displayBatch.current?.take() ?? [];
       setTranscript((current) => {
         // Pages are historical snapshots; never replay old stream lifecycle events
         // over the current live turn or replace a newer copy of an existing row.
-        let next = current;
+        let next = queuedDeltas.reduce(applyChatEvent, current);
         for (const event of page.messages) {
           if (
             event.type === "message" &&

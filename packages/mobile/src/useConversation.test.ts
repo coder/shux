@@ -2,6 +2,7 @@ import "./testDom";
 import { afterEach, expect, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { createORPCClient } from "@orpc/client";
+import { createDisplayTestClock } from "./displayTestClock";
 import type { MobileClient } from "./api";
 import { getVisibleMessages } from "./transcript";
 import type { WorkspaceChatMessage } from "./transcript";
@@ -11,7 +12,10 @@ import type { SettingsData } from "./settings";
 
 afterEach(cleanup);
 
-function message(sequence: number, text = `message ${sequence}`): WorkspaceChatMessage {
+function message(
+  sequence: number,
+  text = `message ${sequence}`
+): Extract<WorkspaceChatMessage, { type: "message" }> {
   return {
     type: "message",
     id: String(sequence),
@@ -119,7 +123,19 @@ function fixture(
           return new ReadableStream<WorkspaceChatMessage>({
             start(controller) {
               eventController = controller;
-              options.signal?.addEventListener("abort", () => controller.close(), { once: true });
+              options.signal?.addEventListener(
+                "abort",
+                () => {
+                  if (controller.desiredSize !== null) {
+                    try {
+                      controller.close();
+                    } catch {
+                      /* The test may have closed the stream first. */
+                    }
+                  }
+                },
+                { once: true }
+              );
             },
           }).values();
         case "workspace.history.loadMore":
@@ -169,6 +185,9 @@ function fixture(
       });
       await waitFor(() => expect(view.result.current.transcript.caughtUp).toBe(true));
     },
+    async disconnect() {
+      await act(async () => eventController.close());
+    },
     async emit(event: WorkspaceChatMessage, afterEnqueue?: () => void) {
       await act(async () => {
         eventController.enqueue(event);
@@ -177,6 +196,225 @@ function fixture(
     },
   };
 }
+
+const displayStart: WorkspaceChatMessage = {
+  type: "stream-start",
+  workspaceId: "workspace",
+  messageId: "live",
+  model: "test:model",
+  historySequence: 11,
+  startTime: 1,
+};
+function displayDelta(
+  delta: string,
+  type: "stream-delta" | "reasoning-delta" = "stream-delta",
+  messageId = "live"
+): WorkspaceChatMessage {
+  return { type, workspaceId: "workspace", messageId, delta, tokens: 1, timestamp: 2 };
+}
+
+test("display batching retains mixed IDs and text/reasoning order across immediate tool boundaries", async () => {
+  using clock = createDisplayTestClock();
+  const view = fixture();
+  await view.ready();
+  await view.emit(displayStart);
+  const before = view.result.current.transcript;
+  await view.emit(displayDelta("Think ", "reasoning-delta"));
+  await view.emit(displayDelta("ignored", "stream-delta", "stale"));
+  await view.emit(displayDelta("first", "reasoning-delta"));
+  await view.emit(displayDelta("Answer"));
+  expect(view.result.current.transcript).toBe(before);
+  expect(clock.pending).toBe(1);
+  await view.emit({
+    type: "tool-call-start",
+    workspaceId: "workspace",
+    messageId: "live",
+    toolCallId: "question",
+    toolName: "ask_user_question",
+    args: {},
+    timestamp: 3,
+    tokens: 1,
+  });
+  expect(view.result.current.transcript.messages.at(-1)?.parts).toMatchObject([
+    { type: "reasoning", text: "Think first" },
+    { type: "text", text: "Answer" },
+    { type: "dynamic-tool", toolCallId: "question" },
+  ]);
+  expect(clock.pending).toBe(0);
+  await view.emit(displayDelta("After"));
+  act(() => clock.flush());
+  expect(view.result.current.transcript.messages.at(-1)?.parts.at(-1)).toMatchObject({
+    type: "text",
+    text: "After",
+  });
+});
+
+test("new stream identity and immediate policy updates are not delayed by the display throttle", async () => {
+  using clock = createDisplayTestClock();
+  let policy = disabledPolicy;
+  const view = fixture(() => Promise.resolve(policy));
+  await view.ready();
+  await view.emit(displayStart);
+  await view.emit(displayDelta("old tail"));
+  await view.emit({ ...displayStart, messageId: "next", historySequence: 12 });
+  expect(clock.pending).toBe(0);
+  expect(view.result.current.transcript.streamingMessageId).toBe("next");
+  expect(
+    view.result.current.transcript.messages.find((message) => message.id === "live")?.parts[0]
+  ).toMatchObject({ text: "old tail" });
+  await view.emit(displayDelta("new tail", "stream-delta", "next"));
+  policy = { source: "env", status: { state: "blocked", reason: "Policy changed" }, policy: null };
+  await act(async () => view.policySubscriptions[0].events.enqueue());
+  await waitFor(() => expect(view.result.current.settings?.policy?.status.state).toBe("blocked"));
+  expect(clock.pending).toBe(1);
+  act(() => clock.flush());
+  expect(view.result.current.transcript.messages.at(-1)?.parts[0]).toMatchObject({
+    text: "new tail",
+  });
+});
+
+test("restore and disconnect flush pending text immediately; deleting history cannot be undone by a timer or page", async () => {
+  using clock = createDisplayTestClock();
+  const view = fixture();
+  await view.ready();
+  await view.emit(displayStart);
+  await view.emit(displayDelta("Before restore"));
+  await view.emit({ type: "restore-to-input", workspaceId: "workspace", text: "draft" });
+  expect(view.restored).toHaveLength(1);
+  expect(view.result.current.transcript.messages.at(-1)?.parts[0]).toMatchObject({
+    text: "Before restore",
+  });
+  let page!: Promise<void>;
+  act(() => {
+    page = view.result.current.loadOlder();
+  });
+  await view.emit(displayDelta(" pending"));
+  await view.emit({ type: "delete", historySequences: [11] });
+  expect(clock.pending).toBe(0);
+  await act(async () => {
+    view.complete({
+      messages: [{ ...message(11), id: "live" }],
+      hasOlder: false,
+      nextCursor: null,
+    });
+    await page;
+  });
+  act(() => clock.flush());
+  expect(view.result.current.transcript.messages.some((row) => row.id === "live")).toBe(false);
+  await view.emit(displayStart);
+  await view.emit(displayDelta("Keep on disconnect"));
+  await view.disconnect();
+  expect(view.result.current.error).not.toBeNull();
+  expect(view.result.current.transcript.messages.at(-1)?.parts[0]).toMatchObject({
+    text: "Keep on disconnect",
+  });
+  expect(clock.pending).toBe(0);
+});
+
+test.each(["stream-abort", "stream-end", "stream-metadata"] as const)(
+  "%s flushes queued deltas synchronously",
+  async (type) => {
+    using clock = createDisplayTestClock();
+    const view = fixture();
+    await view.ready();
+    await view.emit(displayStart);
+    await view.emit(displayDelta("tail"));
+    if (type === "stream-end")
+      await view.emit({
+        type,
+        workspaceId: "workspace",
+        messageId: "live",
+        metadata: { model: "test:model" },
+        parts: [{ type: "text", text: "final" }],
+      });
+    else if (type === "stream-abort")
+      await view.emit({ type, workspaceId: "workspace", messageId: "live", abortReason: "user" });
+    else
+      await view.emit({
+        type,
+        workspaceId: "workspace",
+        messageId: "live",
+        metadata: {
+          model: "test:fallback",
+          metadataModel: "test:fallback",
+          contextWindowTokens: null,
+          routedThroughGateway: false,
+          routeProvider: null,
+        },
+      });
+    expect(clock.pending).toBe(0);
+    expect(view.result.current.transcript.messages.at(-1)?.parts[0]).toMatchObject({
+      text: type === "stream-end" ? "final" : "tail",
+    });
+  }
+);
+
+test.each(["workspace", "connection", "abort", "unmount"] as const)(
+  "%s discards queued display deltas and its timer",
+  async (change) => {
+    using clock = createDisplayTestClock();
+    const view = fixture();
+    await view.ready();
+    await view.emit(displayStart);
+    await view.emit(displayDelta("stale"));
+    expect(clock.pending).toBe(1);
+    if (change === "unmount") view.unmount();
+    else if (change === "abort") act(() => view.lifetime.abort());
+    else
+      view.rerender({
+        workspaceId: change === "workspace" ? "new" : "workspace",
+        signal: change === "connection" ? new AbortController().signal : view.lifetime.signal,
+      });
+    expect(clock.pending).toBe(0);
+    act(() => clock.flush());
+    if (change !== "unmount")
+      expect(
+        view.result.current.transcript.messages.some((message) =>
+          message.parts.some((part) => part.type === "text" && part.text === "stale")
+        )
+      ).toBe(false);
+  }
+);
+
+test("a paused display timer cannot accumulate an unbounded delta queue", async () => {
+  using clock = createDisplayTestClock();
+  const view = fixture();
+  await view.ready();
+  await view.emit(displayStart);
+  for (let index = 0; index < 1100; index++) await view.emit(displayDelta("x"));
+  const displayed = view.result.current.transcript.messages.at(-1)?.parts[0];
+  expect(displayed?.type === "text" ? displayed.text.length : 0).toBeGreaterThan(0);
+  expect(clock.pending).toBeLessThanOrEqual(1);
+  act(() => clock.flush());
+  expect(view.result.current.transcript.messages.at(-1)?.parts[0]).toMatchObject({
+    text: "x".repeat(1100),
+  });
+});
+
+test("history pagination incorporates pending live deltas before merging older rows", async () => {
+  using clock = createDisplayTestClock();
+  const view = fixture();
+  await view.ready();
+  await view.emit(displayStart);
+  let page!: Promise<void>;
+  act(() => {
+    page = view.result.current.loadOlder();
+  });
+  await view.emit(displayDelta("live text"));
+  await act(async () => {
+    view.complete({ messages: [message(1)], hasOlder: false, nextCursor: null });
+    await page;
+  });
+  expect(clock.pending).toBe(0);
+  expect(view.result.current.transcript.messages.map((message) => message.id)).toEqual([
+    "1",
+    "10",
+    "live",
+  ]);
+  expect(view.result.current.transcript.messages.at(-1)?.parts[0]).toMatchObject({
+    text: "live text",
+  });
+});
 
 test("restore events use the latest workspace callback once without resubscribing or replaying queue snapshots", async () => {
   const view = fixture();
@@ -437,7 +675,7 @@ test("settings subscriptions precede reads and refresh privacy, routes and provi
 test("agent catalogs refresh with config/providers and stale catalog success or failure cannot win", async () => {
   type Catalog = SettingsData["agents"];
   const enabled: Catalog = [
-    { id: "plan", name: "Plan", uiSelectable: true, subagentRunnable: false, scope: "built-in" },
+    { id: "scout", name: "Scout", uiSelectable: true, subagentRunnable: false, scope: "global" },
   ];
   let complete!: (value: Catalog) => void;
   let fail!: (error: Error) => void;

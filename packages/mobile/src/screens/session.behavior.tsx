@@ -67,6 +67,7 @@ function fixture(
     { id: "exec", name: "Exec", uiSelectable: true },
     { id: "explore", name: "Explore", uiSelectable: false },
     { id: "custom-worker", name: "custom-worker", uiSelectable: false },
+    { id: "scout", name: "Scout", uiSelectable: true },
     { id: "plan", name: "Plan", uiSelectable: true },
   ].map((agent) => ({ ...agent, scope: "built-in", subagentRunnable: true }));
   const configEvents: ReadableStreamDefaultController<void>[] = [];
@@ -470,10 +471,10 @@ test("live agent catalog removal updates the picker and blocks a remembered mode
   await view.select("alpha");
   const enabled = view.agents;
   fireEvent.click(view.getByRole("button", { name: "Choose mode" }));
-  fireEvent.click(view.getByRole("radio", { name: "Plan" }));
+  fireEvent.click(view.getByRole("radio", { name: "Scout" }));
   fireEvent.change(view.getByLabelText("Message"), { target: { value: "Keep this draft" } });
-  await view.updateAgents(enabled.filter((agent) => agent.id !== "plan"));
-  expect(view.getByRole("button", { name: "Choose mode" }).textContent).toContain("plan");
+  await view.updateAgents(enabled.filter((agent) => agent.id !== "scout"));
+  expect(view.getByRole("button", { name: "Choose mode" }).textContent).toContain("scout");
   expect(view.getByRole("button", { name: "Send message" }).getAttribute("aria-disabled")).toBe(
     "true"
   );
@@ -482,14 +483,14 @@ test("live agent catalog removal updates the picker and blocks a remembered mode
   expect(callCount(view, "sendMessage")).toBe(0);
   expect(view.getByRole("alert")).toBeDefined();
   fireEvent.click(view.getByRole("button", { name: "Choose mode" }));
-  expect(view.queryByRole("radio", { name: "Plan" })).toBeNull();
+  expect(view.queryByRole("radio", { name: "Scout" })).toBeNull();
   fireEvent.click(view.getByRole("button", { name: "Close" }));
   await view.updateAgents(enabled);
   expect(view.getByLabelText("Message")).toHaveProperty("value", "Keep this draft");
   expect(view.queryByRole("alert")).toBeNull();
   await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
   expect(view.calls.find((call) => call.path === "workspace.sendMessage")?.input).toMatchObject({
-    options: { agentId: "plan" },
+    options: { agentId: "scout" },
   });
 });
 
@@ -513,7 +514,9 @@ test("a removed next-turn agent does not strand a live answer or Stop", async ()
     },
   ]);
   await view.select("alpha");
-  await view.updateAgents(view.agents.filter((agent) => agent.id !== "exec"));
+  fireEvent.click(view.getByRole("button", { name: "Choose mode" }));
+  fireEvent.click(view.getByRole("radio", { name: "Scout" }));
+  await view.updateAgents(view.agents.filter((agent) => agent.id !== "scout"));
   await submitAnswer(view);
   expect(callCount(view, "answerAskUserQuestion")).toBe(1);
   expect(callCount(view, "resumeStream")).toBe(0);
