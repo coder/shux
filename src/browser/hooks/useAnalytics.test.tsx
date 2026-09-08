@@ -142,14 +142,11 @@ let currentApiClient: RouterClient<AppRouter> | null = null;
 let analyticsServiceCalls: AnalyticsServiceCalls | null = null;
 
 function importCreateOrpcServer(): typeof OrpcServerModule.createOrpcServer {
-  void mock.module("@/version", () => ({
-    VERSION: "test-version",
-  }));
-
+  // Bun module mocks survive mock.restore(); use the real VERSION so later reconnect
+  // tests receive valid build metadata instead of a leaked analytics-only fixture.
   const { createOrpcServer } = requireTestModule<{
     createOrpcServer: typeof OrpcServerModule.createOrpcServer;
   }>("@/node/orpc/server");
-  mock.restore();
   return createOrpcServer;
 }
 
