@@ -155,7 +155,7 @@ export class ContinuousCompactionJournalStore {
 
   /** Caller already holds the history lock; never re-enter the journal queue here. */
   async advanceGenerationUnderHistoryLock(
-    onCommitted?: (generation: string) => void
+    onCommitted?: (generation: string) => undefined
   ): Promise<void> {
     const generation = randomUUID();
     await publishCompactionFile(

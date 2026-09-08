@@ -16,7 +16,25 @@ import {
   MalformedCompactionCancellationError,
   type CompactionCancellationMutation,
   type CompactionCancellationRecord,
+  type CompactionCancellationStorage,
 } from "./compactionCancellation";
+
+type RejectsAsync<Observer> = (() => Promise<void>) extends Observer ? false : true;
+type RequireTrue<T extends true> = T;
+// Type-only contracts: widening any commit observer to void would admit async state installation.
+export type SynchronousCancellationObservers = [
+  RequireTrue<RejectsAsync<Parameters<CompactionCancellationStorage["repair"]>[1]>>,
+  RequireTrue<RejectsAsync<Parameters<FileCompactionCancellationStorage["repair"]>[1]>>,
+  RequireTrue<
+    RejectsAsync<
+      Parameters<
+        ReturnType<
+          HistoryService["getContinuousCompactionJournal"]
+        >["advanceGenerationUnderHistoryLock"]
+      >[0]
+    >
+  >,
+];
 
 const workspaceId = "cancellation-storage";
 const followUp = (text = "Continue") => ({ text, model: "test:model", agentId: "exec" });

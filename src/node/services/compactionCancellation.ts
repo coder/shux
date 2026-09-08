@@ -74,10 +74,11 @@ export interface CompactionCancellationStorage {
    * Re-read under the lock; preserve newer valid records. Neutralize obsolete recovery
    * before removing malformed bytes, preserve privacy floors, and call onCommitted
    * synchronously when repair commits. Never repair an ordinary read/I/O failure.
+   * Returning undefined excludes async observers that could publish state too late.
    */
   repair(
     isCurrent: () => boolean,
-    onCommitted: () => void
+    onCommitted: () => undefined
   ): Promise<CompactionCancellationRecord | null>;
 }
 
@@ -208,7 +209,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
 
   repair(
     isCurrent: () => boolean,
-    onCommitted: () => void
+    onCommitted: () => undefined
   ): Promise<CompactionCancellationRecord | null> {
     return this.history.withCompactionStorageLock(this.workspaceId, async () => {
       if (!isCurrent()) return null;

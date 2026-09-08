@@ -44,7 +44,7 @@ function harness() {
     repair: mock(
       (
         _isCurrent: () => boolean,
-        _onCommitted: () => void
+        _onCommitted: () => undefined
       ): Promise<CompactionCancellationRecord | null> => {
         return Promise.reject(new Error("Unexpected repair"));
       }
