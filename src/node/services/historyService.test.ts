@@ -1,6 +1,8 @@
 import * as path from "path";
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
+import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createTestHistoryService } from "./testHistoryService";
@@ -11,7 +13,9 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
+import * as atomicWrite from "write-file-atomic";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
+import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import {
   historyWriteLockPath,
   workspaceRemovalTombstonePath,
@@ -1075,7 +1079,337 @@ describe("HistoryService", () => {
       return { store, receipt };
     }
 
+    async function deleteErroredPlaceholder(messageId: string) {
+      const history = await service.getHistoryFromLatestBoundary(ws);
+      assert(history.success);
+      const message = history.data.find((entry) => entry.id === messageId);
+      assert(message);
+      assert(
+        (
+          await service.writePartial(ws, {
+            ...message,
+            parts: [],
+            metadata: { ...message.metadata, error: "stream failed" },
+          })
+        ).success
+      );
+      return service.commitPartial(ws, messageId);
+    }
+
+    async function seedDeletionHistory(archive: MuxMessage[], chat: MuxMessage[]) {
+      assert((await service.appendManyToHistory(ws, [...archive, ...chat])).success);
+      // Complete lazy rotation, then model legacy layouts where the archive
+      // still contributes provider context, or chat retains sealed duplicates.
+      assert((await service.getHistoryFromLatestBoundary(ws)).success);
+      const chatPath = path.join(config.sessionsDir, ws, "chat.jsonl");
+      const archivePath = path.join(config.sessionsDir, ws, "chat-archive.jsonl");
+      const bytes = (messages: MuxMessage[]) =>
+        Buffer.from(messages.map((message) => messageLine(ws, message) + "\n").join(""));
+      await fs.writeFile(chatPath, bytes(chat));
+      await fs.writeFile(archivePath, bytes(archive));
+      return { chatPath, archivePath, bytes };
+    }
+
+    it.each(
+      [
+        {
+          name: "empty placeholder",
+          archive: [],
+          chat: [createMuxMessage("target", "assistant", "")],
+          changed: false,
+        },
+        {
+          name: "display-only row",
+          archive: [],
+          chat: [{ ...display(), id: "target" }],
+          changed: false,
+        },
+        {
+          name: "sealed active row",
+          archive: [],
+          chat: [row("target"), boundary()],
+          changed: false,
+        },
+        {
+          name: "sealed active boundary",
+          archive: [],
+          chat: [{ ...reset(), id: "target" }, boundary()],
+          changed: false,
+        },
+        {
+          name: "sealed archive row",
+          archive: [row("target")],
+          chat: [boundary()],
+          changed: false,
+        },
+        {
+          name: "sealed archive boundary",
+          archive: [{ ...boundary(), id: "target" }],
+          chat: [reset()],
+          changed: false,
+        },
+        {
+          name: "active-first duplicate",
+          archive: [row("target")],
+          chat: [createMuxMessage("target", "assistant", ""), row("later")],
+          changed: false,
+        },
+        {
+          name: "duplicate active occurrences",
+          archive: [],
+          chat: [row("target"), boundary(), row("target"), row("later")],
+          changed: true,
+        },
+        {
+          name: "duplicate archive context",
+          archive: [row("target"), row("target")],
+          chat: [row("later")],
+          changed: true,
+        },
+        {
+          name: "archive duplicate sealed content",
+          archive: [row("target"), boundary(), createMuxMessage("target", "assistant", "")],
+          chat: [row("later")],
+          changed: false,
+        },
+        ...[reset(), reset(true), { ...boundary(), parts: [] }].map((message, index) => ({
+          name: `archive boundary ${index}`,
+          archive: [row("old"), { ...message, id: "target" }],
+          chat: [row("later")],
+          changed: true,
+        })),
+        {
+          name: "oversized reset evidence",
+          archive: [],
+          chat: [
+            row("old"),
+            { ...reset(), id: "target", padding: " ".repeat(SESSION_HISTORY_MAX_LINE_BYTES) },
+          ],
+          changed: false,
+          refused: true,
+        },
+      ].flatMap((testCase) =>
+        ["single", "batch"].map((method) => ({ refused: false, ...testCase, method }))
+      )
+    )(
+      "$method deletion classifies $name by removed occurrences",
+      async ({ archive, chat, changed, method, refused }) => {
+        const { chatPath, archivePath } = await seedDeletionHistory(
+          structuredClone(archive),
+          structuredClone(chat)
+        );
+        const beforeChat = await fs.readFile(chatPath);
+        const beforeArchive = await fs.readFile(archivePath);
+        const { store, receipt } = await capturePublication();
+        const inChat = chat.some((message) => message.id === "target");
+        const admitted = !refused && (method === "single" || inChat);
+        const advance = spyOn(store, "advanceGenerationUnderHistoryLock");
+        try {
+          const result =
+            method === "single"
+              ? await service.deleteMessage(ws, "target")
+              : await service.deleteMessages(ws, ["target"]);
+          expect(result).toMatchObject({ success: admitted });
+          expect(advance).toHaveBeenCalledTimes(admitted && changed ? 1 : 0);
+          if (!admitted) {
+            expect(await fs.readFile(chatPath)).toEqual(beforeChat);
+            expect(await fs.readFile(archivePath)).toEqual(beforeArchive);
+          } else {
+            // Active-first deletion must retain archive duplicates verbatim.
+            expect(await fs.readFile(inChat ? archivePath : chatPath)).toEqual(
+              inChat ? beforeArchive : beforeChat
+            );
+            const retained = await collectFullHistory(service, ws);
+            expect(retained.filter((message) => message.id === "target")).toHaveLength(
+              inChat ? archive.filter((message) => message.id === "target").length : 0
+            );
+          }
+          if (admitted && changed) {
+            expect(await store.captureGeneration()).not.toBe(receipt.publicationGeneration);
+            expect(await store.read()).toBeNull();
+          } else {
+            expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+            expect(
+              await store.recordFallbackPrefix(
+                receipt,
+                { modelString: "anthropic:next", prefix },
+                () => true
+              )
+            ).not.toBeNull();
+          }
+        } finally {
+          advance.mockRestore();
+        }
+      }
+    );
+
+    it.each([
+      "single missing",
+      "batch missing",
+      "batch refused",
+      "duplicate batch IDs",
+      "partial placeholder",
+    ])("%s deletion leaves generation and unrelated history unchanged", async (method) => {
+      const { chatPath, archivePath } = await seedDeletionHistory(
+        [],
+        [row("target"), createMuxMessage("empty", "assistant", "")]
+      );
+      const before = await fs.readFile(chatPath);
+      const { store, receipt } = await capturePublication();
+      if (method === "duplicate batch IDs") {
+        expect(
+          await service.deleteMessages(ws, ["target", "target"]).catch((error: unknown) => error)
+        ).toBeInstanceOf(Error);
+      } else {
+        const result =
+          method === "partial placeholder"
+            ? await deleteErroredPlaceholder("empty")
+            : method === "single missing"
+              ? await service.deleteMessage(ws, "missing")
+              : await service.deleteMessages(
+                  ws,
+                  method === "batch refused" ? ["target", "missing"] : ["missing"]
+                );
+        expect(result.success).toBe(method === "partial placeholder");
+      }
+      if (method !== "partial placeholder") expect(await fs.readFile(chatPath)).toEqual(before);
+      expect(await fs.readFile(archivePath)).toEqual(Buffer.alloc(0));
+      expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+      expect(await store.read()).toEqual(receipt);
+    });
+
+    it.each(
+      ["chat", "archive"].flatMap((artifact) =>
+        ["single", "batch"].flatMap((method) =>
+          [false, true].map((active) => ({ artifact, method, active }))
+        )
+      )
+    )(
+      "$method deletion preserves raw floors in $artifact (active cut: $active)",
+      async ({ artifact, method, active }) => {
+        const old = row("target");
+        const fresh = row(active ? "target" : "fresh");
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(
+          artifact === "archive" ? [old, fresh] : [],
+          artifact === "chat" ? [old, fresh] : [row("tail")]
+        );
+        const raw = Buffer.concat([
+          Buffer.from(' {\n"contextBoundaryKind"\n:\n"reset"\n'),
+          Buffer.from([0xff]),
+          Buffer.from("\n}\n"),
+        ]);
+        const targetPath = artifact === "chat" ? chatPath : archivePath;
+        await fs.writeFile(targetPath, Buffer.concat([bytes([old]), raw, bytes([fresh])]));
+        const { store, receipt } = await capturePublication();
+        const result =
+          method === "single"
+            ? await service.deleteMessage(ws, "target")
+            : await service.deleteMessages(ws, ["target"]);
+        const admitted = method === "single" || artifact === "chat";
+        expect(result.success).toBe(admitted);
+        expect(await fs.readFile(targetPath)).toEqual(
+          Buffer.concat([
+            ...(admitted ? [] : [bytes([old])]),
+            raw,
+            ...(admitted && active ? [] : [bytes([fresh])]),
+          ])
+        );
+        expect((await store.captureGeneration()) !== receipt.publicationGeneration).toBe(
+          admitted && active
+        );
+        const provider = await service.getHistoryFromLatestBoundary(ws);
+        assert(provider.success);
+        expect(provider.data.map((message) => message.id)).toEqual([
+          ...(admitted && active ? [] : [fresh.id]),
+          ...(artifact === "archive" ? ["tail"] : []),
+        ]);
+      }
+    );
+
+    it.each(
+      ["single", "batch", "archive", "partial"].flatMap((method) =>
+        ["generation", "history"].map((stage) => ({ method, stage }))
+      )
+    )(
+      "$method deletion handles a $stage write failure without changing history or counters",
+      async ({ method, stage }) => {
+        const target = method === "partial" ? reset() : row("target");
+        const { chatPath, archivePath } = await seedDeletionHistory(
+          method === "archive" ? [target] : [],
+          method === "archive" ? [] : [target]
+        );
+        const beforeChat = await fs.readFile(chatPath);
+        const beforeArchive = await fs.readFile(archivePath);
+        const { store, receipt } = await capturePublication();
+        const counters = service as unknown as { sequenceCounters: Map<string, number> };
+        const counter = counters.sequenceCounters.get(ws);
+        const failedPath =
+          stage === "generation"
+            ? path.join(config.sessionsDir, ws, CONTINUOUS_COMPACTION_GENERATION_FILE)
+            : method === "archive"
+              ? archivePath
+              : chatPath;
+        const atomic = atomicWrite.default;
+        const failure = spyOn(atomicWrite, "default").mockImplementation(
+          new Proxy(atomic, {
+            apply(target, _thisArg, args: Parameters<typeof atomic>) {
+              if (args[0] === failedPath) return Promise.reject(new Error("disk unavailable"));
+              return target(...args);
+            },
+          })
+        );
+        try {
+          const result =
+            method === "partial"
+              ? await deleteErroredPlaceholder(target.id)
+              : method === "batch"
+                ? await service.deleteMessages(ws, [target.id])
+                : await service.deleteMessage(ws, target.id);
+          expect(result.success).toBe(false);
+          expect(await fs.readFile(chatPath)).toEqual(beforeChat);
+          expect(await fs.readFile(archivePath)).toEqual(beforeArchive);
+          expect(counters.sequenceCounters.get(ws)).toBe(counter);
+          expect((await store.captureGeneration()) !== receipt.publicationGeneration).toBe(
+            stage === "history"
+          );
+          expect(await store.read()).toEqual(stage === "history" ? null : receipt);
+          if (method === "partial") expect(await service.readPartial(ws)).not.toBeNull();
+        } finally {
+          failure.mockRestore();
+        }
+      }
+    );
+
     const destructiveCases = [
+      {
+        name: "single provider-row deletion",
+        rows: [row("old"), row("tail")],
+        mutate: () => service.deleteMessage(ws, "old"),
+        expected: ["tail"],
+      },
+      {
+        name: "batch provider-row deletion",
+        rows: [row("old"), row("tail"), row("later")],
+        mutate: () => service.deleteMessages(ws, ["old", "tail"]),
+        expected: ["later"],
+      },
+      ...[
+        { name: "reset", message: reset() },
+        { name: "rollover", message: reset(true) },
+        { name: "empty compaction", message: { ...boundary(), parts: [] } },
+      ].flatMap(({ name, message }) =>
+        ["single", "batch", "partial"].map((method) => ({
+          name: `${method} deletion of ${name} boundary`,
+          rows: [row("old"), message],
+          mutate: () =>
+            method === "partial"
+              ? deleteErroredPlaceholder(message.id)
+              : method === "batch"
+                ? service.deleteMessages(ws, [message.id])
+                : service.deleteMessage(ws, message.id),
+          expected: ["old"],
+        }))
+      ),
       ...[false, true].flatMap((rollover) =>
         [false, true].map((batch) => ({
           name: `${rollover ? "rollover" : "reset"} ${batch ? "batch" : "single"}`,
@@ -1257,14 +1591,23 @@ describe("HistoryService", () => {
       }
     );
 
-    it("holds the history file lock from generation advancement through deletion", async () => {
-      assert((await service.appendToHistory(ws, row("old"))).success);
+    it.each(
+      ["clear", "single", "batch", "partial", "archive"].flatMap((method) =>
+        ["initial", "fallback", "boundary"].map((publication) => ({ method, publication }))
+      )
+    )("$method deletion fences foreign $publication", async (testCase) => {
+      const { method, publication } = testCase;
+      const target = method === "partial" ? reset() : row("old");
+      const { chatPath, archivePath } = await seedDeletionHistory(
+        method === "archive" ? [target] : [],
+        method === "archive" ? [] : [target]
+      );
       const store = service.getContinuousCompactionJournal(ws);
       // Exercise an existing durable generation too, rather than only legacy absence.
       await store.advanceGeneration();
       const { receipt } = await capturePublication();
-      await store.clear(receipt);
-      const historyPath = path.join(config.sessionsDir, ws, "chat.jsonl");
+      if (publication === "initial") await store.clear(receipt);
+      const historyPath = method === "archive" ? archivePath : chatPath;
       const before = await fs.readFile(historyPath, "utf8");
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
@@ -1277,36 +1620,82 @@ describe("HistoryService", () => {
           await release.promise;
         }
       );
-      const clearing = service.clearHistory(ws);
-      const foreign = new HistoryService(config).getContinuousCompactionJournal(ws);
+      const deleting =
+        method === "clear"
+          ? service.clearHistory(ws)
+          : method === "partial"
+            ? deleteErroredPlaceholder(target.id)
+            : method === "batch"
+              ? service.deleteMessages(ws, [target.id])
+              : service.deleteMessage(ws, target.id);
+      const foreignHistory = new HistoryService(config);
+      const foreign = foreignHistory.getContinuousCompactionJournal(ws);
+      const publish = async (candidate: ContinuousCompactionJournal) => {
+        if (publication === "boundary")
+          return (
+            await foreignHistory.persistBoundaryWithTailCopies(
+              ws,
+              structuredClone(candidate.boundary),
+              [],
+              false,
+              () => true,
+              {
+                publication: { generation: candidate.publicationGeneration, journal: candidate },
+                onCommitted: () => undefined,
+              }
+            )
+          ).success;
+        return (
+          (publication === "fallback"
+            ? await foreign.recordFallbackPrefix(
+                candidate,
+                { modelString: "anthropic:next", prefix },
+                () => true
+              )
+            : await foreign.write(candidate, prefix, () => true)) !== null
+        );
+      };
       const capture = spyOn(foreign, "captureGenerationUnderHistoryLock");
       const acquire = fileLock.acquireProcessFileLock;
       const attempted = Promise.withResolvers<void>();
       let acquiring:
         | ReturnType<typeof spyOn<typeof fileLock, "acquireProcessFileLock">>
         | undefined;
-      let writing: ReturnType<typeof foreign.write> | undefined;
+      let writing: Promise<boolean> | undefined;
+      const queued = spyOn(workspaceFileLocks, "withLock");
       try {
         await entered.promise;
         acquiring = spyOn(fileLock, "acquireProcessFileLock").mockImplementation((options) => {
           attempted.resolve();
           return acquire(options);
         });
-        writing = foreign.write(receipt, prefix, () => true);
-        await attempted.promise;
+        writing = publish(receipt);
+        // Boundary writes first queue on the shared in-process mutex; journal
+        // publications go straight to the same cross-process history lock.
+        if (publication === "boundary") expect(queued).toHaveBeenCalled();
+        else await attempted.promise;
         expect(capture).not.toHaveBeenCalled();
         expect(await fs.readFile(historyPath, "utf8")).toBe(before);
         release.resolve();
-        expect((await clearing).success).toBe(true);
-        expect(await writing).toBeNull();
+        expect((await deleting).success).toBe(true);
+        expect(await writing).toBe(false);
         expect(await foreign.captureGeneration()).not.toBe(receipt.publicationGeneration);
         expect(await collectFullHistory(new HistoryService(config), ws)).toEqual([]);
+        expect(await foreign.read()).toBeNull();
+        const fresh = await foreign.write(
+          { ...receipt, publicationGeneration: await foreign.captureGeneration() },
+          prefix,
+          () => true
+        );
+        assert(fresh);
+        if (publication !== "initial") expect(await publish(fresh)).toBe(true);
       } finally {
         release.resolve();
-        await Promise.all([clearing, writing]);
+        await Promise.all([deleting, writing]);
         acquiring?.mockRestore();
         capture.mockRestore();
         advancing.mockRestore();
+        queued.mockRestore();
       }
     });
 

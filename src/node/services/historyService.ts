@@ -3381,10 +3381,11 @@ export class HistoryService {
           }
 
           const filteredMessages = messages.filter((message) => !ids.has(message.id));
-          await writeFileAtomic(
-            this.getChatHistoryPath(workspaceId),
-            this.serializeHistoryRewrite(rows, workspaceId, (row) => (ids.has(row.id) ? null : row))
+          const historyEntries = this.serializeHistoryRewrite(rows, workspaceId, (row) =>
+            ids.has(row.id) ? null : row
           );
+          await this.fenceDeletedMessagesUnderHistoryLock(workspaceId, messages, ids);
+          await writeFileAtomic(this.getChatHistoryPath(workspaceId), historyEntries);
 
           const maxSeq = filteredMessages.reduce((max, message) => {
             const sequence = message.metadata?.historySequence;
@@ -3433,6 +3434,35 @@ export class HistoryService {
     );
   }
 
+  private async fenceDeletedMessagesUnderHistoryLock(
+    workspaceId: string,
+    messages: MuxMessage[],
+    deletedIds: ReadonlySet<string>,
+    newerMessageCount = 0
+  ): Promise<void> {
+    // Cleanup must retire foreign compactors only when the actual removed
+    // occurrences affect today's provider view, including an empty boundary.
+    // Use the raw-aware suffix so retained unreadable resets still seal old rows.
+    const providerMessages = await readProviderHistoryFromLatestBoundary(
+      {
+        chat: this.getChatHistoryPath(workspaceId),
+        archive: this.getChatArchivePath(workspaceId),
+      },
+      0
+    );
+    // Archive fallback excludes all newer chat rows. Matching IDs across files
+    // would conflate retained duplicates with occurrences this write removes.
+    const activeCount = Math.max(0, providerMessages.length - newerMessageCount);
+    const removed = messages
+      .slice(Math.max(0, messages.length - activeCount))
+      .filter((message) => deletedIds.has(message.id));
+    if (tailCutChangesProviderContext(removed)) {
+      // Call only after serialization admits the rewrite, immediately before
+      // its write. A later disk failure must not restore the old generation.
+      await this.getContinuousCompactionJournal(workspaceId).advanceGenerationUnderHistoryLock();
+    }
+  }
+
   private async deleteMessageUnderWriteLock(
     workspaceId: string,
     messageId: string
@@ -3458,12 +3488,16 @@ export class HistoryService {
 
         // Archived rows are strictly older than active rows, so deleting one
         // can never affect the sequence counter.
-        await writeFileAtomic(
-          this.getChatArchivePath(workspaceId),
-          this.serializeHistoryRewrite(archiveRows, workspaceId, (row) =>
-            row.id === messageId ? null : row
-          )
+        const archiveEntries = this.serializeHistoryRewrite(archiveRows, workspaceId, (row) =>
+          row.id === messageId ? null : row
         );
+        await this.fenceDeletedMessagesUnderHistoryLock(
+          workspaceId,
+          archiveMessages,
+          new Set([messageId]),
+          messages.length
+        );
+        await writeFileAtomic(this.getChatArchivePath(workspaceId), archiveEntries);
         return Ok(undefined);
       }
 
@@ -3472,6 +3506,7 @@ export class HistoryService {
         row.id === messageId ? null : row
       );
 
+      await this.fenceDeletedMessagesUnderHistoryLock(workspaceId, messages, new Set([messageId]));
       // Atomic write prevents corruption if app crashes mid-write
       await writeFileAtomic(historyPath, historyEntries);
 
