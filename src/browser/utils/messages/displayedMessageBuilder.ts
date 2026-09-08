@@ -1,3 +1,4 @@
+import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import type {
   BashMonitorWakeDisplayRecord,
   CompactionRequestData,
@@ -9,6 +10,7 @@ import type {
 } from "@/common/types/message";
 import {
   getCompactionFollowUpContent,
+  isRolloverBoundary,
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
 } from "@/common/types/message";
@@ -169,6 +171,7 @@ function createCompactionBoundaryRow(
     historySequence,
     boundaryKind: getContextBoundaryKind(message) ?? CONTEXT_BOUNDARY_KINDS.COMPACTION,
     position: "start",
+    contextWindowRollover: isRolloverBoundary(message) ? true : undefined,
     compactionEpoch,
     ...(message.metadata?.muxMetadata?.type === "compaction-summary" &&
     message.metadata.muxMetadata.strategy === "continuous"
@@ -379,6 +382,7 @@ function buildUserDisplayedMessages(options: {
       historySequence,
       isSynthetic: message.metadata?.synthetic === true ? true : undefined,
       isUiVisible: message.metadata?.uiVisible === true ? true : undefined,
+      contextBudgetRejected: message.metadata?.contextBudgetRejected === true ? true : undefined,
       isGoalContinuation: message.metadata?.kind === GOAL_CONTINUATION_KIND ? true : undefined,
       isBudgetLimitWrapup: message.metadata?.kind === GOAL_BUDGET_LIMIT_KIND ? true : undefined,
       timestamp: baseTimestamp,
@@ -389,6 +393,16 @@ function buildUserDisplayedMessages(options: {
       compactionRequest,
       reviews: muxMeta?.reviews,
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
+      // Only genuine machine rows get collapsed; corrupted metadata must not hide human input.
+      contextBudgetWarning:
+        message.metadata?.synthetic === true &&
+        muxMeta?.type === "context-budget-warning" &&
+        Number.isFinite(muxMeta.contextTokens) &&
+        muxMeta.contextTokens >= 0 &&
+        Number.isFinite(muxMeta.maxTokens) &&
+        muxMeta.maxTokens > 0
+          ? { contextTokens: muxMeta.contextTokens, maxTokens: muxMeta.maxTokens }
+          : undefined,
       // The peer-message wake trigger is a synthetic machine row: mark it so prompt
       // navigation skips it (the envelope payload itself is a separate assistant row). When the
       // recipient is executing a delegated workspace turn, the trigger carries that turn's
@@ -800,7 +814,8 @@ function buildAssistantDisplayedMessages(options: {
 export function buildDisplayedMessagesForMessage(
   options: BuildDisplayedMessagesForMessageOptions
 ): DisplayedMessage[] {
-  const { message, agentSkillSnapshot, inlineSkillSnapshots, hasActiveStream } = options;
+  const { agentSkillSnapshot, inlineSkillSnapshots, hasActiveStream } = options;
+  const message = restoreContextBudgetRejectedMessageForDisplay(options.message);
   const baseTimestamp = message.metadata?.timestamp;
   const historySequence = message.metadata?.historySequence ?? 0;
   const planRows = buildPlanDisplayMessages(message, historySequence);

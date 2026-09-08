@@ -63,6 +63,7 @@ Use this index to find a page's:
       - Compaction (`/workspaces/compaction`) → `references/docs/workspaces/compaction/index.mdx`: Managing conversation context size with compaction
       - Manual Compaction (`/workspaces/compaction/manual`) → `references/docs/workspaces/compaction/manual.mdx`: Commands for manually managing conversation context
       - Automatic Compaction (`/workspaces/compaction/automatic`) → `references/docs/workspaces/compaction/automatic.mdx`: Let Xum automatically compact your conversations based on usage or idle time
+      - Token-Budget Context Windows (`/workspaces/compaction/token-budget`) → `references/docs/workspaces/compaction/token-budget.md`: Start fresh context windows without automatic summaries and retrieve earlier work on demand
       - Customization (`/workspaces/compaction/customization`) → `references/docs/workspaces/compaction/customization.mdx`: Customize the compaction system prompt
     - **Runtimes**
       - Runtimes (`/runtime`) → `references/docs/runtime/index.mdx`: Configure where and how Xum executes agent workspaces

@@ -30,6 +30,7 @@ import {
   reassignPinnedTimestamps,
 } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
@@ -118,6 +119,7 @@ import {
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { createContextResetBoundaryMessageId } from "@/node/services/utils/messageIds";
 import { fileExists } from "@/node/utils/runtime/fileExists";
@@ -320,6 +322,7 @@ import {
   type BashMonitorWakeDispatch,
   type BashMonitorWakeDispatchOutcome,
   type BashMonitorWakeReconcilerSnapshot,
+  type DeliveredWakeRecord,
 } from "@/node/services/bashMonitorWakeReconciler";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
 import {
@@ -1857,6 +1860,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly bashMonitorWakeReconciler: BashMonitorWakeReconciler;
   private readonly constructedAtMs = Date.now();
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
+  /** The wake send in flight per owner (at most one: dispatch runs under the history lock). */
+  private readonly inFlightBashMonitorWakeSendsByOwner = new Map<string, Promise<unknown>>();
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
   private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
@@ -2379,7 +2384,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         pullMonitorWakeSignals: (ownerWorkspaceId) =>
           typeof monitorManager.pullMonitorWakeSignals === "function"
             ? monitorManager.pullMonitorWakeSignals(ownerWorkspaceId)
-            : Promise.resolve([]),
+            : [],
         getMonitorWakeDeliveryState: (processId, originNotAfterMs) =>
           typeof monitorManager.getMonitorWakeDeliveryState === "function"
             ? monitorManager.getMonitorWakeDeliveryState(processId, originNotAfterMs)
@@ -2399,6 +2404,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             : undefined,
       },
       registry: this.bashMonitorRegistryStore,
+      deliveredWakes: (ownerWorkspaceId, sinceMs) =>
+        this.listDeliveredBashMonitorWakes(ownerWorkspaceId, sinceMs),
       onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
     });
     if (typeof this.backgroundProcessManager.on === "function") {
@@ -2548,13 +2555,67 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           error,
         });
       })
-      .then(() => this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId))
-      .finally(() => {
+      .then(() => {
+        // Release the slot before scheduling: the reconcile may find a new turn already running
+        // and must be able to install the next idle wait.
         if (this.pendingBashMonitorWakeIdleWaitsByOwner.get(ownerWorkspaceId) === promise) {
           this.pendingBashMonitorWakeIdleWaitsByOwner.delete(ownerWorkspaceId);
         }
+        this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
       });
     this.pendingBashMonitorWakeIdleWaitsByOwner.set(ownerWorkspaceId, promise);
+  }
+
+  /**
+   * Wake records in transcript rows written since `sinceMs`, scanning newest-first across the
+   * compaction archive too because a delivered row stays proof of delivery after it leaves the
+   * window the model sees. A failed read rejects so the reconciler holds dispatch in its retry
+   * backoff instead of risking a duplicate row.
+   */
+  private async listDeliveredBashMonitorWakes(
+    ownerWorkspaceId: string,
+    sinceMs: number
+  ): Promise<readonly DeliveredWakeRecord[]> {
+    const records: DeliveredWakeRecord[] = [];
+    const result = await this.historyService.iterateFullHistory(
+      ownerWorkspaceId,
+      "backward",
+      (messages) => {
+        // A wake row is appended after its process was created, so once a whole chunk predates
+        // every process being checked the rest of history cannot carry one.
+        let predatesAll = messages.length > 0;
+        for (const message of messages) {
+          const muxMetadata = message.metadata?.muxMetadata;
+          // A wake that triggered on-send compaction persists only the compaction request, with
+          // the wake's metadata nested as its follow-up.
+          const wake =
+            muxMetadata?.type === "bash-monitor-wake"
+              ? muxMetadata
+              : getCompactionFollowUpContent(muxMetadata)?.muxMetadata;
+          if (message.role === "user" && wake?.type === "bash-monitor-wake") {
+            // Persisted metadata is unvalidated: a malformed row must degrade to "not delivered"
+            // rather than fail the scan, which would hold every wake of this owner.
+            const rows: unknown = wake.records;
+            if (Array.isArray(rows)) {
+              for (const row of rows) {
+                if (
+                  isPlainObject(row) &&
+                  typeof row.processId === "string" &&
+                  typeof row.wakeUpdatedAt === "string"
+                ) {
+                  records.push({ processId: row.processId, wakeUpdatedAt: row.wakeUpdatedAt });
+                }
+              }
+            }
+          }
+          const timestamp = message.metadata?.timestamp;
+          if (!(typeof timestamp === "number" && timestamp < sinceMs)) predatesAll = false;
+        }
+        return !predatesAll;
+      }
+    );
+    if (!result.success) throw new Error(result.error);
+    return records;
   }
 
   private async dispatchBashMonitorWake(
@@ -2568,14 +2629,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
         return "in-flight";
       }
+      // sendMessage refuses archived workspaces and no session exists to wait on, so an after-idle
+      // retry would spin; the wake stays owed and unarchive reconciles it.
+      if (
+        this.archivingWorkspaces.has(ownerWorkspaceId) ||
+        isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+      ) {
+        return "deferred";
+      }
       const hasPendingTurn = this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
-      const hasSessionBackedBusyState = this.isBusyForMessage(ownerWorkspaceId);
+      // Pending mid-stream compaction counts as turn work: the session reads idle between the
+      // stopped stream and its compaction request, which the session sends directly.
+      const hasSessionBackedBusyState =
+        this.sessions.get(ownerWorkspaceId)?.hasActiveOrPendingTurnWork() === true;
       const hasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
-      if (hasPendingTurn || (hasSessionBackedBusyState && !hasAiServiceStream)) {
+      // Cancelable attention must not cut a turn that can consume it in its current tool call.
+      // Keep it outside the queue so later manual tool-end input cannot be held behind it.
+      if (hasPendingTurn || hasSessionBackedBusyState) {
         this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
         return "deferred";
       }
-      if (hasAiServiceStream && !hasSessionBackedBusyState) {
+      if (hasAiServiceStream) {
         return "deferred";
       }
       const sendOptions =
@@ -2586,43 +2660,24 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return "deferred";
       }
 
-      // Withdrawn while awaiting send options above: the abort listener below would never
-      // fire, and send preflight (which persists AI settings) has nothing left to admit.
+      // Withdrawal during send-option resolution must not enter preflight or persist settings.
       if (dispatch.cancelSignal.aborted) return "deferred";
 
       let accepted = false;
-      // A queued wake can be superseded after dequeue. Share cancellation state so
-      // AgentSession can release PREPARING when cancellation wins before acceptance.
-      const cancelState = { canceledBeforeAcceptance: false };
-      // Withdrawal (output already shown, process discarded, history cleared) must
-      // free the queue slot now, not at stream end: a lingering entry keeps the
-      // workspace reported busy and its dedupe key held. The key is unique per
-      // dispatch, so this cannot drop a newer wake's entry.
-      dispatch.cancelSignal.addEventListener(
-        "abort",
-        () => {
-          this.removeQueuedMessagesByDedupeKeyPrefix(ownerWorkspaceId, dispatch.dedupeKey, {
-            cancelReason: "Bash monitor wake withdrawn before dispatch.",
-          });
-        },
-        { once: true }
-      );
-      const sendResult = await this.sendMessage(
+      const send = this.sendMessage(
         ownerWorkspaceId,
         dispatch.prompt,
         {
           ...sendOptions,
-          queueDispatchMode: "tool-end",
           muxMetadata: dispatch.muxMetadata,
         },
         {
           skipAutoResumeReset: true,
           synthetic: true,
           agentInitiated: true,
-          cancelState,
+          requireIdle: true,
           cancelSignal: dispatch.cancelSignal,
-          queueDedupeKey: dispatch.dedupeKey,
-          removableQueueDedupeKey: true,
+          withdrawAcceptedOnCancel: true,
           onAccepted: async () => {
             accepted = true;
             await dispatch.onAccepted();
@@ -2639,6 +2694,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           },
         }
       );
+      // Published so a hard Stop that withdraws this wake can join it (see interruptStream).
+      this.inFlightBashMonitorWakeSendsByOwner.set(ownerWorkspaceId, send);
+      let sendResult: Awaited<typeof send>;
+      try {
+        sendResult = await send;
+      } finally {
+        if (this.inFlightBashMonitorWakeSendsByOwner.get(ownerWorkspaceId) === send) {
+          this.inFlightBashMonitorWakeSendsByOwner.delete(ownerWorkspaceId);
+        }
+      }
       if (!sendResult.success && !accepted) {
         this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
         return "deferred";
@@ -4197,6 +4262,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           args.workspacePath,
           args.runtimeConfig
         ),
+      onContextWindowRollover: () => this.advanceContextMutationEpoch(workspaceId),
       onCompactionComplete: (metadata) => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
         // Compaction marks a long session with accumulated learnings: harvest
@@ -9059,26 +9125,34 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
       }
 
-      // Lifecycle hooks run *after* we persist unarchivedAt.
-      //
-      // Why best-effort: Unarchive is a quick UI action and should not fail permanently due to a
-      // start error (e.g., Coder workspace start).
-      if (this.workspaceLifecycleHooks && hookMetadata) {
-        await this.workspaceLifecycleHooks.runAfterUnarchive({
-          workspaceId,
-          workspaceMetadata: hookMetadata,
+      // Restoration succeeded, so the unarchive is final from here: monitor attention held while
+      // archived (see dispatchBashMonitorWake) wakes after lifecycle startup below, and still
+      // wakes when a follow-up step throws, since a retried unarchive would take the
+      // !didUnarchive exit and never reach this point again.
+      try {
+        // Lifecycle hooks run *after* we persist unarchivedAt.
+        //
+        // Why best-effort: Unarchive is a quick UI action and should not fail permanently due to a
+        // start error (e.g., Coder workspace start).
+        if (this.workspaceLifecycleHooks && hookMetadata) {
+          await this.workspaceLifecycleHooks.runAfterUnarchive({
+            workspaceId,
+            workspaceMetadata: hookMetadata,
+          });
+        }
+
+        if (this.workspaceLifecycleHooks || this.worktreeArchiveSnapshotService) {
+          await this.emitCurrentWorkspaceMetadata(workspaceId);
+        }
+
+        await this.syncCodeWorkspaceFiles({
+          projectPath,
+          projects: hookMetadata?.projects,
+          subProjectPath: hookMetadata?.subProjectPath,
         });
+      } finally {
+        this.scheduleBashMonitorWakeReconcile(workspaceId);
       }
-
-      if (this.workspaceLifecycleHooks || this.worktreeArchiveSnapshotService) {
-        await this.emitCurrentWorkspaceMetadata(workspaceId);
-      }
-
-      await this.syncCodeWorkspaceFiles({
-        projectPath,
-        projects: hookMetadata?.projects,
-        subProjectPath: hookMetadata?.subProjectPath,
-      });
 
       // Archived owners park workflow terminal wakes unsettled; reconcile so an idle
       // workspace does not stay silent until the interval sweep. Only AFTER snapshot
@@ -9583,14 +9657,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     );
   }
 
-  /**
-   * Best-effort persist AI settings from send/resume options.
-   * Skips requests explicitly marked to avoid persistence.
-   */
   private async maybePersistAISettingsFromOptions(
     workspaceId: string,
-    options: SendMessageOptions | undefined,
-    context: "send" | "resume"
+    options: SendMessageOptions | undefined
   ): Promise<void> {
     if (options?.skipAiSettingsPersistence) {
       // One-shot/compaction sends shouldn't overwrite workspace defaults.
@@ -9606,14 +9675,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       agentId,
       extractedSettings,
       {
-        // Normal sends/resumes also persist the selected agent so future backend heartbeat
-        // dispatches can reuse the same workspace default after reloads and reconnects.
+        // Save the selected agent so heartbeats can reuse it after reloads and reconnects.
         persistSelectedAgentId: true,
         ...(options?.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
       }
     );
     if (!persistResult.success) {
-      log.debug(`Failed to persist workspace AI settings from ${context} options`, {
+      log.debug("Failed to persist workspace AI settings from user message", {
         workspaceId,
         error: persistResult.error,
       });
@@ -10843,7 +10911,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // reset/clear/replace that completes while this send is still doing
       // pre-admission work refuses the send instead of letting it append and
       // stream stale content into the fresh context.
-      const admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+      let admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
       const admissionEpochStale = () =>
         (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
       // r41: count this send as in-preflight until it settles so refine
@@ -11010,6 +11078,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             goalId: internal?.goalId,
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
+            withdrawAcceptedOnCancel: internal?.withdrawAcceptedOnCancel,
             onCanceled: internal?.onCanceled,
             onAccepted: internal?.onAccepted,
             onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
@@ -11026,8 +11095,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err(pricingGate.error);
       }
 
-      // Persist last-used model + thinking level for cross-device consistency.
-      await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "send");
+      // Synthetic turns must not replace the user's remembered model and mode.
+      if (internal?.synthetic !== true) {
+        await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions);
+      }
 
       // Decide queue-or-direct in arrival order: a later send whose awaits above finished
       // first would otherwise enqueue ahead of an earlier one. The decision below runs
@@ -11299,6 +11370,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
+        onContextWindowRollover: () => {
+          this.advanceContextMutationEpoch(workspaceId);
+          admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+        },
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
         goalKind: internal?.goalKind,
@@ -11307,6 +11382,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         startStreamInBackground: internal?.startStreamInBackground,
         cancelState: internal?.cancelState,
         cancelSignal: internal?.cancelSignal,
+        withdrawAcceptedOnCancel: internal?.withdrawAcceptedOnCancel,
         // Same authoring-time race as the queued path: the goal-creating
         // stream can end during the preflight awaits above, making a fresh
         // goal visible after the user hit enter but before this dispatch.
@@ -11544,9 +11620,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err(pricingGate.error);
       }
 
-      // Persist last-used model + thinking level for cross-device consistency.
-      await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "resume");
-
       // Non-destructive interrupt cascades preserve descendant task workspaces with
       // taskStatus=interrupted. Transition before stream start so task orchestration stream-end
       // handling does not early-return on interrupted status.
@@ -11692,7 +11765,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   async interruptStream(
     workspaceId: string,
-    options?: { soft?: boolean; abandonPartial?: boolean; sendQueuedImmediately?: boolean }
+    options?: {
+      soft?: boolean;
+      abandonPartial?: boolean;
+      sendQueuedImmediately?: boolean;
+      retireBashMonitorAttention?: boolean;
+      disableAutoRetry?: boolean;
+    }
   ): Promise<Result<void>> {
     let releaseHardStopLatch: (() => void) | undefined;
     try {
@@ -11712,7 +11791,68 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       const session = this.getOrCreateSession(workspaceId);
-      const stopResult = await session.interruptStream(options);
+      // Only a user Stop dismisses owed attention; internal interrupts (goal promotion, archive,
+      // ACP disconnect, send-now) must not lose monitor output. Start retiring before the abort:
+      // consumeCurrent withdraws an in-flight dispatch synchronously and reserves the reconciler
+      // lock ahead of the reconcile this abort's idle transition triggers, so the abort itself
+      // never waits behind acceptance I/O. The durable consumption commits only once the stop
+      // succeeded: a failed stop leaves the agent running, so its output stays owed. Monitors stay
+      // armed for new output. Retirement I/O that fails keeps the frontier owed in memory (the
+      // reconciler retries it before any dispatch, as does the next Stop) but fails this Stop
+      // below: that obligation is not durable, so a restart before the retry could wake the agent
+      // on the dismissed output. Never behind the history lock (a wake admission holds it across
+      // stream construction).
+      const retiring = options?.retireBashMonitorAttention === true;
+      const withdrawnWakeSend = retiring
+        ? this.inFlightBashMonitorWakeSendsByOwner.get(workspaceId)
+        : undefined;
+      let settleStop!: (stopped: boolean) => void;
+      const stopSettled = new Promise<boolean>((resolve) => {
+        settleStop = resolve;
+      });
+      let retirementRecorded = true;
+      const retirement = retiring
+        ? this.bashMonitorWakeReconciler
+            .consumeCurrent(workspaceId, () => stopSettled)
+            .catch((error: unknown) => {
+              retirementRecorded = false;
+              log.warn("Failed to retire bash monitor attention before Stop", {
+                workspaceId,
+                error,
+              });
+            })
+        : undefined;
+      // The opt-out starts only after retirement reserved the reconciler lock above: disabling
+      // retry releases the idle gate a pending wake may be waiting behind, and that wake must
+      // find its attention withdrawn, not a window to start a turn after the user's Stop. The
+      // interrupt does not wait for the opt-out's disk write (a stuck write must not keep the
+      // stream running); the write is joined and verified below, and a failure fails the Stop.
+      const disabling = options?.disableAutoRetry === true;
+      const optOut = disabling
+        ? session.setAutoRetryEnabled(false).catch((error: unknown) => {
+            log.warn("Failed to disable auto-retry during Stop", { workspaceId, error });
+          })
+        : undefined;
+      let stopResult: Result<void> | undefined;
+      try {
+        stopResult = await session.interruptStream(options);
+      } finally {
+        settleStop(stopResult?.success === true);
+      }
+      await retirement;
+      await optOut;
+      // A wake withdrawn past its point of no return (durable row, not yet PREPARING, so the
+      // session interrupt above saw idle) records the startup abandon marker for that row on every
+      // exit before it resolves, including a failed goal sync or acceptance (see
+      // abandonWithdrawnSend in AgentSession.sendMessage). Stop is acknowledged after it settles: a
+      // forced exit right after Stop must not leave the row eligible for startup replay. The send's
+      // own result is the dispatch's to report; a marker (or a RetryBarrier Stop's opt-out) still
+      // unrecorded after the session retried the write fails the Stop below, on this and every later
+      // Stop, so the obligation is not lost with the joined send.
+      await withdrawnWakeSend?.catch(() => undefined);
+      const stopRecorded =
+        !(retiring || disabling) ||
+        ((await session.recordPendingAutoRetryState()) && retirementRecorded);
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
@@ -11762,6 +11902,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         session.restoreQueueToInput();
       }
 
+      if (!stopRecorded) {
+        log.error("Stop left stopped work eligible to resume on restart", { workspaceId });
+        return Err(STOP_UNRECORDED_MESSAGE);
+      }
       return Ok(undefined);
     } catch (error) {
       if (!options?.soft) {
@@ -12086,10 +12230,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
 
     if (session.closingSignal.aborted) throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
-    while (session.isBusy() || session.hasQueuedMessages() || session.hasPendingAutoRetry()) {
+    // Pending mid-stream compaction is turn work the coordinator cannot see: the session reads
+    // idle until the compaction request claims PREPARING.
+    const hasTurnWork = () =>
+      session.hasActiveOrPendingTurnWork() ||
+      session.hasQueuedMessages() ||
+      session.hasPendingAutoRetry();
+    while (hasTurnWork()) {
       if (session.closingSignal.aborted) throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
       if (session.isBusy()) {
         await session.waitForIdle();
+        continue;
+      }
+      if (session.hasActiveOrPendingTurnWork()) {
+        await session.waitForMidStreamCompactionSettled();
         continue;
       }
 
@@ -12112,17 +12266,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             eventType === "stream-lifecycle";
           const queuedOrRetryCleared =
             (eventType === "queued-message-changed" || eventType === "auto-retry-abandoned") &&
-            !session.hasQueuedMessages() &&
-            !session.hasPendingAutoRetry();
+            !hasTurnWork();
           if (retryStartedOrTurnPhaseChanged || queuedOrRetryCleared) {
             finish();
           }
         });
         session.closingSignal.addEventListener("abort", finish, { once: true });
-        if (
-          session.closingSignal.aborted ||
-          (!session.hasQueuedMessages() && !session.hasPendingAutoRetry())
-        ) {
+        if (session.closingSignal.aborted || !hasTurnWork()) {
           finish();
         }
       });
@@ -12673,50 +12823,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // discarded even when no session exists yet (e.g. reset right after
       // an app restart).
       try {
-        await this.getOrCreateSession(workspaceId).clearPostCompactionState();
+        await this.getOrCreateSession(workspaceId).applyContextResetSideEffects();
       } catch (error) {
-        // Same partial-failure posture as the sandbox invalidation below:
-        // the chat-side reset applied, but the stale persisted carryover
-        // would re-inject pre-reset context after a restart, so success must
-        // not be reported while the discard is not durable.
-        log.error(
-          `Failed to durably discard post-compaction carryover for ${workspaceId} after context reset`,
-          error
-        );
+        // The boundary is durable, but success must wait for both persisted
+        // carryover and sandbox invalidation. Preserve the failing stage's diagnosis.
+        log.error(`Failed to durably discard context state for ${workspaceId}`, error);
         return Err(
-          `Context was reset, but the persisted post-compaction carryover could not be durably ` +
-            `discarded (${getErrorMessage(error)}). Pre-reset read/skill context may be ` +
-            `re-injected after a restart; retry once the session storage is writable.`
-        );
-      }
-
-      // Persistent sandbox mounts are scoped to the workspace session; a
-      // context reset ends that session, so sandbox state is DISCARDED (not
-      // snapshotted) — vars must not survive a reset the way they survive
-      // archive/un-archive.
-      try {
-        await sandboxHostService.discardScope(
-          workspaceId,
-          path.join(this.config.sessionsDir, workspaceId)
-        );
-      } catch (error) {
-        // The chat-side reset already applied, but the sandbox invalidation
-        // is NOT durable: the empty-snapshot tombstone failed to publish, and
-        // the only remaining record is the in-memory reset-pending guard,
-        // which blocks mounts and retries for THIS process only. A crash
-        // before a retry lands would let the next process restore — resurrect
-        // — the pre-reset snapshot the user explicitly cleared. Invalidation
-        // must be durable before success is reported, so surface the partial
-        // failure to the caller instead of returning Ok.
-        log.error(
-          `Failed to durably invalidate sandbox state for ${workspaceId} after context reset; ` +
-            `the sandbox kernel stays unavailable until invalidation succeeds`,
-          error
-        );
-        return Err(
-          `Context was reset, but the sandbox kernel state could not be durably invalidated ` +
-            `(${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables ` +
-            `may reappear after a restart; retry once the session storage is writable.`
+          `Context was reset, but ${getErrorMessage(error)} Retry once the session storage is writable.`
         );
       }
 
@@ -14782,11 +14895,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Send options for continuing a STILL-OPEN delegated workspace turn (bash-monitor
-   * wakes cut turns at tool boundaries). The delegated prompt's persisted
-   * retrySendOptions carry the turn's own settings — including per-turn overrides
-   * (agentId, model, strictAgentResolution) that are deliberately NOT in the
-   * workspace's persisted defaults when the launch used skipAiSettingsPersistence —
+   * Send options for continuing a STILL-OPEN delegated workspace turn. The delegated
+   * prompt's persisted retrySendOptions carry the turn's own settings — including
+   * per-turn overrides (agentId, model, strictAgentResolution) that are deliberately NOT
+   * in the workspace's persisted defaults when the launch used skipAiSettingsPersistence —
    * so resolving from workspace defaults would continue the turn under the wrong
    * agent. Openness is decided by the same rule as workspace-turn correlation
    * (inheritOpenWorkspaceTurnMetadata): only a correlated assistant cut with

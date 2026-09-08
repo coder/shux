@@ -1,3 +1,6 @@
+import { createAssistantMessageId } from "@/node/services/utils/messageIds";
+import { eventSpine, type RequestAssemblySnapshot } from "./events/eventSpine";
+import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
@@ -17,6 +20,9 @@ import {
   resolveMuxProjectRootForHostFs,
   resolveXumToolScope,
   type StreamMessageOptions,
+  type PreparedStreamMessage,
+  type PreparedTurnRequest,
+  type TurnRequestBuildContext,
 } from "./turnRequestBuilder";
 export { replaceOrAppendMessageById } from "./turnRequestBuilder";
 export type { StreamMessageOptions } from "./turnRequestBuilder";
@@ -217,8 +223,6 @@ export class AIService extends EventEmitter {
       durableEventJournalFor: (workspaceId) => this.durableEventJournalFor(workspaceId),
       shouldAllowLegacyInvalidWorkflowAgentOutputSchema: (metadata) =>
         this.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata),
-      createModel: (modelString, providerOptions, options) =>
-        this.createModel(modelString, providerOptions, options),
       isStreaming: (workspaceId) => this.streamManager.isStreaming(workspaceId),
       trackPendingDevToolsRunMetadata: (messageId, workspaceId, metadataId) =>
         this.trackPendingDevToolsRunMetadata(messageId, workspaceId, metadataId),
@@ -258,7 +262,7 @@ export class AIService extends EventEmitter {
   async buildMemorySessionContext(
     workspaceId: string,
     modelString: string,
-    options?: { includeHotMemories?: boolean }
+    options?: { includeHotMemories?: boolean; tokenBudgetActive?: boolean }
   ): Promise<MemorySessionContext | null> {
     if (!this.turnRequestBuilderBindings.memoryService) return null;
     if (this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) !== true) {
@@ -294,6 +298,7 @@ export class AIService extends EventEmitter {
           const tokenizer = await getTokenizerForModel(modelString, metadataModel);
           const items = await this.turnRequestBuilderBindings.memoryService.listHotMemories(ctx, {
             countTokens: (text) => tokenizer.countTokens(text),
+            tokenBudgetActive: options?.tokenBudgetActive === true,
           });
           hotMemoriesBlock = items.length === 0 ? null : formatHotMemoriesBlock(items);
         } catch (error) {
@@ -479,6 +484,24 @@ export class AIService extends EventEmitter {
     return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId));
   }
 
+  /** Reconcile lazy workspace hooks before pinning a rollover's request-assembly contract. */
+  async captureRequestAssemblySnapshot(
+    workspaceId: string
+  ): Promise<Result<RequestAssemblySnapshot, SendMessageError>> {
+    const metadata = await this.getWorkspaceMetadata(workspaceId);
+    if (!metadata.success) return Err({ type: "unknown", raw: metadata.error });
+    const runtimeContext = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+    if (!runtimeContext.success) return runtimeContext;
+    await prepareWorkspaceRequestHooks({
+      config: this.config,
+      metadata: metadata.data,
+      hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
+      enabled: this.isAgentPluginsEnabled(),
+      journal: this.durableEventJournalFor(workspaceId),
+    });
+    return Ok(eventSpine.captureRequestAssembly(workspaceId));
+  }
+
   releaseMockStreamStartGate(workspaceId: string): void {
     this.mockAiStreamPlayer?.releaseStreamStartGate(workspaceId);
   }
@@ -568,6 +591,13 @@ export class AIService extends EventEmitter {
       model: result.data,
       metadataModel: resolveModelForMetadata(metadataSeed, providersConfig),
     });
+  }
+
+  createModelWithPinnedOptions(
+    modelString: string,
+    opts?: Parameters<ProviderModelFactory["createModelWithPinnedOptions"]>[1]
+  ): ReturnType<ProviderModelFactory["createModelWithPinnedOptions"]> {
+    return this.providerModelFactory.createModelWithPinnedOptions(modelString, opts);
   }
 
   private wrapToolsForDelegation(
@@ -813,9 +843,59 @@ export class AIService extends EventEmitter {
     return resolveXumToolScope(this.config, metadata, workspacePath, projectCheckoutRoot);
   }
 
+  /** Build a candidate without publishing stream ownership or touching accepted history. */
+  async prepareStreamMessage(
+    opts: StreamMessageOptions
+  ): Promise<Result<PreparedStreamMessage, SendMessageError>> {
+    if (this.mockModeEnabled)
+      return Ok({
+        start: (options) => this.streamMessage(options),
+        [Symbol.asyncDispose]: () => Promise.resolve(),
+      });
+    const controller = new AbortController();
+    const startupPhaseTimingsMs: Record<string, number> = {};
+    const context: TurnRequestBuildContext = {
+      abortSignal: opts.abortSignal
+        ? AbortSignal.any([opts.abortSignal, controller.signal])
+        : controller.signal,
+      syntheticMessageId: createAssistantMessageId(),
+      startTime: Date.now(),
+      startupPhaseTimingsMs,
+      startupState: { pendingRunMetadataId: null },
+      recordStartupPhaseTiming: (phase, started) => {
+        startupPhaseTimingsMs[phase] = Date.now() - started;
+      },
+      admissionOnly: true,
+    };
+    try {
+      const result = await this.turnRequestBuilder.prepare(opts, context);
+      if (result.type === "finished")
+        return result.result.success
+          ? Err({ type: "unknown", raw: "Request preparation was canceled." })
+          : result.result;
+      return Ok({
+        start: (options) => {
+          assert(
+            options.workspaceId === opts.workspaceId && options.modelString === opts.modelString,
+            "Prepared request must retain its admitted workspace and model"
+          );
+          return this.streamMessage(options, { request: result.request, controller, context });
+        },
+        [Symbol.asyncDispose]: () => result.request[Symbol.asyncDispose](),
+      });
+    } catch (error) {
+      return Err({ type: "unknown", raw: "Failed to prepare request: " + getErrorMessage(error) });
+    }
+  }
+
   /** Stream a message conversation to the AI model. */
   async streamMessage(
-    opts: StreamMessageOptions
+    opts: StreamMessageOptions,
+    prepared?: {
+      request: PreparedTurnRequest;
+      controller: AbortController;
+      context: TurnRequestBuildContext;
+    }
   ): Promise<Result<TurnStreamHandle, SendMessageError>> {
     const { messages, workspaceId, modelString, thinkingLevel, abortSignal, agentId, muxMetadata } =
       opts;
@@ -825,15 +905,19 @@ export class AIService extends EventEmitter {
       abortSignal,
       acpPromptId: opts.acpPromptId,
     });
-    const startTime = Date.now();
+    const startTime = prepared?.context.startTime ?? Date.now();
     const syntheticMessageId = pendingStart.syntheticMessageId;
     opts.onStreamStarting?.(syntheticMessageId);
     const combinedAbortSignal = pendingStart.abortSignal;
-    const startupPhaseTimingsMs: Record<string, number> = {};
+    const startupPhaseTimingsMs: Record<string, number> =
+      prepared?.context.startupPhaseTimingsMs ?? {};
+    const forwardCancellation = () => prepared?.controller.abort(combinedAbortSignal.reason);
+    if (combinedAbortSignal.aborted) forwardCancellation();
+    else combinedAbortSignal.addEventListener("abort", forwardCancellation, { once: true });
     const recordStartupPhaseTiming = (phase: string, phaseStartedAt: number): void => {
       startupPhaseTimingsMs[phase] = Date.now() - phaseStartedAt;
     };
-    const startupState = {
+    const startupState = prepared?.context.startupState ?? {
       pendingRunMetadataId: null as string | null,
       logSlowStreamStartup: undefined as ((details: Record<string, unknown>) => void) | undefined,
     };
@@ -873,15 +957,24 @@ export class AIService extends EventEmitter {
       await this.historyService.commitPartial(workspaceId);
       recordStartupPhaseTiming("commitPartialMs", commitPartialStartedAt);
 
-      const buildOutcome = await this.turnRequestBuilder.build(opts, {
-        abortSignal: combinedAbortSignal,
-        syntheticMessageId,
-        startTime,
-        startupPhaseTimingsMs,
-        startupState,
-        recordStartupPhaseTiming,
-      });
+      const buildOutcome = prepared
+        ? await prepared.request.start(opts.activeTurnThinkingOverride)
+        : await this.turnRequestBuilder.build(opts, {
+            abortSignal: combinedAbortSignal,
+            syntheticMessageId,
+            startTime,
+            startupPhaseTimingsMs,
+            startupState,
+            recordStartupPhaseTiming,
+          });
       if (buildOutcome.type === "finished") {
+        if (startupState.pendingRunMetadataId != null) {
+          this.clearTrackedPendingDevToolsRunMetadataById(
+            workspaceId,
+            startupState.pendingRunMetadataId
+          );
+          startupState.pendingRunMetadataId = null;
+        }
         return buildOutcome.result;
       }
 
@@ -921,6 +1014,7 @@ export class AIService extends EventEmitter {
       log.error("Stream message error:", error);
       return Err({ type: "unknown", raw: "Failed to stream message: " + errorMessage });
     } finally {
+      combinedAbortSignal.removeEventListener("abort", forwardCancellation);
       pendingStart.finish();
     }
   }

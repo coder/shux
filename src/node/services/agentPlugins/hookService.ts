@@ -32,7 +32,7 @@ import type { DurableEventJournal } from "@/node/utils/journal/durableEventJourn
 import {
   eventSpine,
   type EventSpine,
-  type RequestAssembleContext,
+  type RequestContextOnly,
   type ToolExecuteContext,
 } from "@/node/services/events/eventSpine";
 import { log } from "@/node/services/log";
@@ -421,9 +421,9 @@ export class AgentPluginHookService {
           this.runToolExecuteAfter(ctx, state, args.workspaceId)
         );
       case "request.assemble":
-        return this.spine.useBefore("request.assemble", (ctx) =>
-          this.runRequestAssemble(ctx, state, args)
-        );
+        return this.spine.useRequestContext((ctx) => this.runRequestAssemble(ctx, state, args), {
+          workspaceId: args.workspaceId,
+        });
     }
   }
 
@@ -514,7 +514,7 @@ export class AgentPluginHookService {
   }
 
   private async runRequestAssemble(
-    ctx: RequestAssembleContext,
+    ctx: RequestContextOnly,
     state: LoadedPluginHookState,
     args: EnsureWorkspaceHooksArgs
   ): Promise<void> {

@@ -1,3 +1,4 @@
+import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import assert from "@/common/utils/assert";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
@@ -114,6 +115,8 @@ export type QueueCutCutter =
   | { stage: "queued"; muxMetadata: unknown; dispatchMode: QueueDispatchMode };
 
 interface QueuedMessageInternalOptions {
+  goalKind?: GoalSyntheticMessageKind;
+  goalId?: string;
   synthetic?: boolean;
   agentInitiated?: boolean;
   /**
@@ -175,6 +178,8 @@ type QueueClearCallbacks = Pick<
  * exactly one dispatch.
  */
 interface QueueEntry {
+  goalKind?: GoalSyntheticMessageKind;
+  goalId?: string;
   messages: string[];
   /** First muxMetadata added to this entry (never overwritten by later batched adds). */
   muxMetadata?: unknown;
@@ -278,43 +283,39 @@ export class MessageQueue {
     return entries.some((entry) => entry.dispatchMode === "tool-end") ? "tool-end" : "turn-end";
   }
 
-  /** Dispatch boundary for the FIFO head entry — the only entry the next drain can send. */
-  getNextQueueDispatchMode(): QueueDispatchMode {
-    return this.entries[0]?.dispatchMode ?? "tool-end";
-  }
-
   /**
-   * Dispatch mode of the first entry whose cancel signal has not fired, or undefined
-   * when none remains. Aborted entries still drain FIFO (as no-ops that fire
-   * onCanceled), but they are not pending work and must not arm a tool-end stop.
+   * The first entry whose cancel signal has not fired. Aborted entries still drain FIFO (as no-ops that fire
+   * onCanceled), but they are not pending work or continuations of a turn.
    */
+  private nextDispatchableEntry(): QueueEntry | undefined {
+    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true);
+  }
+
   getNextDispatchableMode(): QueueDispatchMode | undefined {
-    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true)?.dispatchMode;
+    return this.nextDispatchableEntry()?.dispatchMode;
   }
 
   /**
-   * Whether every queued entry continues the exact workspace turn correlation.
+   * Whether every pending queued entry continues the exact workspace turn correlation.
    *
    * The caller uses this for a new continuation that has not entered the queue.
-   * An unrelated entry anywhere ahead of it supersedes the correlation.
+   * An unrelated pending entry anywhere ahead of it supersedes the correlation.
    */
   hasAllWorkspaceTurnContinuations(
     taskHandleId: string,
     ownerWorkspaceId: string,
     turnId: string
   ): boolean {
-    return (
-      this.entries.length > 0 &&
-      this.entries.every((entry) => {
-        const metadata = entry.muxMetadata;
-        return (
-          isWorkspaceTurnMetadata(metadata) &&
-          metadata.taskHandleId === taskHandleId &&
-          metadata.ownerWorkspaceId === ownerWorkspaceId &&
-          metadata.turnId === turnId
-        );
-      })
-    );
+    return this.entries.every((entry) => {
+      if (entry.cancelSignal?.aborted === true) return true;
+      const metadata = entry.muxMetadata;
+      return (
+        isWorkspaceTurnMetadata(metadata) &&
+        metadata.taskHandleId === taskHandleId &&
+        metadata.ownerWorkspaceId === ownerWorkspaceId &&
+        metadata.turnId === turnId
+      );
+    });
   }
 
   /**
@@ -331,6 +332,7 @@ export class MessageQueue {
     turnId: string
   ): boolean {
     return this.entries.slice(0, this.trailingHiddenTurnEndRunStart()).every((entry) => {
+      if (entry.cancelSignal?.aborted === true) return true;
       const metadata = entry.muxMetadata;
       return (
         isWorkspaceTurnMetadata(metadata) &&
@@ -359,14 +361,14 @@ export class MessageQueue {
   }
 
   /**
-   * Whether the next entry continues the exact workspace turn correlation.
+   * Whether the next dispatchable entry continues the exact workspace turn correlation.
    */
   hasNextWorkspaceTurnContinuation(
     taskHandleId: string,
     ownerWorkspaceId: string,
     turnId: string
   ): boolean {
-    const metadata = this.entries[0]?.muxMetadata;
+    const metadata = this.nextDispatchableEntry()?.muxMetadata;
     return (
       isWorkspaceTurnMetadata(metadata) &&
       metadata.taskHandleId === taskHandleId &&
@@ -376,7 +378,7 @@ export class MessageQueue {
   }
 
   /**
-   * FIFO head entry's cut-attribution view: its first muxMetadata plus dispatch mode.
+   * Next dispatchable entry's cut-attribution view: its first muxMetadata plus dispatch mode.
    *
    * Soundness of metadata-based cut attribution rests on the sealing invariant
    * (see class docblock): workspace-turn entries are sealed at add time and
@@ -387,7 +389,7 @@ export class MessageQueue {
   getNextQueueCutCandidate():
     | { muxMetadata: unknown; dispatchMode: QueueDispatchMode }
     | undefined {
-    const head = this.entries[0];
+    const head = this.nextDispatchableEntry();
     if (head == null) {
       return undefined;
     }
@@ -395,13 +397,10 @@ export class MessageQueue {
   }
 
   /**
-   * Whether the next entry to dispatch is a bash-monitor wake. Wake sends are
-   * the only queued input that continues an open delegated workspace turn
-   * (see AgentSession.inheritOpenWorkspaceTurnMetadata); any other head entry
-   * supersedes the turn when it dispatches.
+   * Bash-monitor wakes inherit an open delegated turn's correlation at dispatch.
    */
   isNextEntryBashMonitorWake(): boolean {
-    const muxMetadata = this.entries[0]?.muxMetadata;
+    const muxMetadata = this.nextDispatchableEntry()?.muxMetadata;
     if (typeof muxMetadata !== "object" || muxMetadata === null) return false;
     return (muxMetadata as Record<string, unknown>).type === "bash-monitor-wake";
   }
@@ -418,9 +417,13 @@ export class MessageQueue {
   /**
    * Dispatch mode for user-visible entries only. Backend-initiated maintenance/wake
    * messages should not change the queue badge shown beside the user's own follow-up.
+   * Derived from the entry the next drain actually sends, so a withdrawn head cannot show a
+   * boundary the live message will not dispatch at.
    */
   getVisibleQueueDispatchMode(): QueueDispatchMode {
-    return this.getVisibleEntries().length > 0 ? this.getNextQueueDispatchMode() : "tool-end";
+    return this.getVisibleEntries().length > 0
+      ? (this.getNextDispatchableMode() ?? "tool-end")
+      : "tool-end";
   }
 
   /**
@@ -435,6 +438,9 @@ export class MessageQueue {
     let priorCorrelation: WorkspaceTurnMetadata | undefined;
 
     for (const entry of this.entries) {
+      // Withdrawn entries drain as no-ops: neither predecessors nor correlation holders, as in
+      // hasAllWorkspaceTurnContinuations.
+      if (entry.cancelSignal?.aborted === true) continue;
       const metadata = isWorkspaceTurnMetadata(entry.muxMetadata) ? entry.muxMetadata : undefined;
       const matchesPriorCorrelation =
         metadata != null &&
@@ -586,6 +592,7 @@ export class MessageQueue {
       // A staleness probe gates exactly one dispatch; batching would let one
       // sender's stop-refusal veto unrelated queued messages.
       internal?.admissionStale != null ||
+      internal?.goalKind != null ||
       incomingHasAcceptedCallbacks;
     // Compaction starts its own entry (its metadata must not adopt earlier batched
     // texts), but stays open so a follow-up typed behind a pending /compact batches
@@ -616,6 +623,8 @@ export class MessageQueue {
         sealed: incomingIsSealed,
         userAuthored: incomingIsUserAuthored,
         workspaceTurnContinuation: internal?.workspaceTurnContinuation === true,
+        goalKind: internal?.goalKind,
+        goalId: internal?.goalId,
         addCount: 0,
         syntheticCount: 0,
         agentInitiatedCount: 0,
@@ -988,6 +997,7 @@ export class MessageQueue {
       ? {
           ...(allAddsAreSynthetic ? { synthetic: true } : {}),
           ...(allAddsAreAgentInitiated ? { agentInitiated: true } : {}),
+          ...(entry.goalKind != null ? { goalKind: entry.goalKind, goalId: entry.goalId } : {}),
           ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
           ...(entry.cancelState != null ? { cancelState: entry.cancelState } : {}),
           ...(entry.cancelSignal != null ? { cancelSignal: entry.cancelSignal } : {}),

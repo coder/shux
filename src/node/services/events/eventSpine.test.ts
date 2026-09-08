@@ -162,6 +162,84 @@ describe("EventSpine waterfall", () => {
   });
 });
 
+describe("request assembly snapshots", () => {
+  function context(workspaceId = "one") {
+    return { workspaceId, modelString: "model", systemMessage: "base", tools: {} };
+  }
+
+  test("scopes generic registrations in both live dispatch and certification", async () => {
+    const spine = new EventSpine();
+    spine.useBefore(
+      "request.assemble",
+      (ctx) => {
+        ctx.systemMessage += " other";
+      },
+      { workspaceId: "two" }
+    );
+    expect(spine.captureRequestAssembly("one").preservesToolset).toBe(true);
+    expect(spine.captureRequestAssembly("two").preservesToolset).toBe(false);
+    const ctx = context();
+    await spine.run("request.assemble", ctx);
+    expect(ctx.systemMessage).toBe("base");
+    spine.useAfter("request.assemble", () => undefined);
+    expect(spine.captureRequestAssembly("one").preservesToolset).toBe(false);
+  });
+
+  test("context-only callbacks cannot see or replace tools", async () => {
+    const spine = new EventSpine();
+    spine.useRequestContext((ctx) => {
+      expect("tools" in ctx).toBe(false);
+      Reflect.set(ctx, "tools", { injected: {} });
+      ctx.systemMessage += " context";
+    });
+    const snapshot = spine.captureRequestAssembly("one");
+    const ctx = context();
+    const tools = ctx.tools;
+    expect(snapshot.preservesToolset).toBe(true);
+    await snapshot.run(ctx);
+    expect(ctx.tools).toBe(tools);
+    expect(ctx.tools).toEqual({});
+    expect(ctx.systemMessage).toBe("base context");
+  });
+
+  test("pins ordered registrations through unregister/register and awaited execution", async () => {
+    const spine = new EventSpine();
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spine.useRequestContext(
+      async (ctx) => {
+        started.resolve();
+        await release.promise;
+        ctx.systemMessage += " first";
+      },
+      { order: -1 }
+    );
+    const unregister = spine.useRequestContext((ctx) => {
+      ctx.systemMessage += " admitted";
+    });
+    const snapshot = spine.captureRequestAssembly("one");
+    const ctx = context();
+    const running = snapshot.run(ctx);
+    await started.promise;
+    unregister();
+    spine.useRequestContext((next) => {
+      next.systemMessage += " next";
+    });
+    release.resolve();
+    await running;
+    expect(ctx.systemMessage).toBe("base first admitted");
+    const later = context();
+    await spine.captureRequestAssembly("one").run(later);
+    expect(later.systemMessage).toBe("base first next");
+  });
+
+  test("a snapshot rejects dispatch for a different workspace", async () => {
+    const snapshot = new EventSpine().captureRequestAssembly("one");
+    const error = await snapshot.run(context("two")).catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(Error);
+  });
+});
+
 describe("EventSpine observers", () => {
   test("fan-out delivers payloads and unsubscribe stops delivery", () => {
     const spine = new EventSpine();

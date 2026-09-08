@@ -14,6 +14,7 @@ import {
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useAPI } from "@/browser/contexts/API";
+import { stopStream } from "@/browser/utils/stopStream";
 
 type StreamingPhase =
   | "starting" // Message sent, waiting for stream-start
@@ -264,8 +265,6 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
       return;
     }
 
-    void api.workspace.setAutoRetryEnabled?.({ workspaceId, enabled: false });
-
     if (phase === "compacting") {
       // Reuse the established compaction-cancel flow from keyboard shortcuts so we keep
       // edit restoration + follow-up content behavior consistent across input methods.
@@ -274,10 +273,7 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
         return;
       }
 
-      void api.workspace.interruptStream({
-        workspaceId,
-        options: { abandonPartial: true },
-      });
+      void stopStream(api, workspaceId, { abandonPartial: true, disableAutoRetry: true });
       return;
     }
 
@@ -285,7 +281,7 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
       storeRaw.setInterrupting(workspaceId);
     }
 
-    void api.workspace.interruptStream({ workspaceId });
+    void stopStream(api, workspaceId, { disableAutoRetry: true });
   };
 
   // Show settings hint during compaction if no custom compaction model is configured

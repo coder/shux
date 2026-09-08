@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
+import * as ActualMinThinkingLevelsModule from "@/browser/hooks/useMinThinkingLevels";
+import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -38,6 +40,10 @@ interface MockAPIClient {
     saveConfig: (input: SaveConfigInput) => Promise<void>;
   };
 }
+
+// Capture before installing module mocks; mock.restore() does not undo them.
+const actualMinThinkingLevelsModule = { ...ActualMinThinkingLevelsModule };
+const actualRoutingModule = { ...ActualRoutingModule };
 
 let mockApi: MockAPIClient;
 let providersConfig: ProvidersConfigMap | null = null;
@@ -105,7 +111,10 @@ void mock.module("@/browser/hooks/useProvidersConfig", () => ({
   useProvidersConfig: () => ({ config: providersConfig }),
 }));
 void mock.module("@/browser/hooks/useRouting", () => ({
-  useRouting: () => ({ resolveRoute: () => ({ route: "direct" }) }),
+  useRouting: () => ({
+    resolveRoute: () => ({ route: "direct" }),
+    resolveEffectiveRoute: () => "direct",
+  }),
 }));
 
 import { ExperimentsSection } from "./ExperimentsSection";
@@ -157,6 +166,11 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
 
 describe("ExperimentsSection advisor config", () => {
   let cleanupDom: (() => void) | null = null;
+
+  afterAll(async () => {
+    await mock.module("@/browser/hooks/useMinThinkingLevels", () => actualMinThinkingLevelsModule);
+    await mock.module("@/browser/hooks/useRouting", () => actualRoutingModule);
+  });
 
   beforeEach(() => {
     cleanupDom = installDom();

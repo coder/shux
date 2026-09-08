@@ -4,6 +4,7 @@ import { TokenMeter } from "@/browser/features/RightSidebar/TokenMeter";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "../Dialog/Dialog";
 import {
   HorizontalThresholdSlider,
+  getAutoCompactionLabel,
   type AutoCompactionConfig,
 } from "@/browser/features/RightSidebar/ThresholdSlider";
 import { Switch } from "../Switch/Switch";
@@ -112,8 +113,10 @@ const AutoCompactSettings: React.FC<{
           </span>
         </div>
         {showUsageSlider && (
-          <div className="text-muted mt-1 text-[10px]">
-            Drag blue slider to adjust usage-based auto-compaction
+          <div className="text-muted counter-nums mt-1 text-[10px]">
+            {usageConfig?.rolloverEnabled
+              ? `${getAutoCompactionLabel(usageConfig)} · Drag blue slider to adjust`
+              : "Drag blue slider to adjust usage-based auto-compaction"}
           </div>
         )}
       </div>

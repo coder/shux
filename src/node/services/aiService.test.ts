@@ -1,4 +1,4 @@
-import { eventSpine } from "./events/eventSpine";
+import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
 // Bun test file - doesn't support Jest mocking, so we skip this test for now
 // These tests would need to be rewritten to work with Bun's test runner
 // For now, the commandProcessor tests demonstrate our testing approach
@@ -69,6 +69,7 @@ import * as toolAssembly from "./toolAssembly";
 import type { ToolModelUsageEvent } from "@/common/utils/tools/tools";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
 import * as systemMessageModule from "./systemMessage";
 
@@ -1270,6 +1271,58 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     mock.restore();
   });
 
+  it.each(["request-row", "idle-row", "agent", "send-metadata", "ordinary", "historical"] as const)(
+    "keeps oversized compaction recovery outside token-budget preflight: %s",
+    async (identity) => {
+      using xumHome = new DisposableTempDir("ai-service-compaction-budget");
+      const metadata = createLocalWorkspaceMetadata("compaction-budget", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata);
+      const compactionMetadata = {
+        type: "compaction-request" as const,
+        rawCommand: "/compact",
+        parsed: {},
+        ...(identity === "idle-row" ? { source: "idle-compaction" as const } : {}),
+      };
+      if (identity === "agent") {
+        const resolved = resolvedAgentResultFor(metadata);
+        if (!resolved.success) throw new Error("Expected resolved agent");
+        resolved.data.effectiveAgentId = "compact";
+        resolved.data.effectiveMode = "compact";
+        spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(resolved);
+      }
+      const currentRowIsCompaction = identity === "request-row" || identity === "idle-row";
+      const messages = [
+        createMuxMessage("large-history", "user", "x".repeat(2_000_000)),
+        ...(identity === "historical"
+          ? [
+              createMuxMessage("previous-compact", "user", "summarize", {
+                muxMetadata: compactionMetadata,
+              }),
+            ]
+          : []),
+        createMuxMessage("latest-user", "user", "continue", {
+          ...(currentRowIsCompaction ? { muxMetadata: compactionMetadata } : {}),
+          ...(identity === "send-metadata" ? { synthetic: true } : {}),
+        }),
+      ];
+      const result = await harness.service.streamMessage({
+        workspaceId: metadata.id,
+        messages,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        experiments: { tokenBudget: true },
+        ...(identity === "send-metadata" ? { muxMetadata: compactionMetadata } : {}),
+      });
+      const shouldBypass = identity !== "ordinary" && identity !== "historical";
+      expect(result.success).toBe(shouldBypass);
+      expect(harness.startStreamCalls).toHaveLength(shouldBypass ? 1 : 0);
+      expect(harness.preparedPayloadMessageIds[0]).toContain("large-history");
+      if (!shouldBypass && !result.success) {
+        expect(result.error.type).toBe("context_budget_exceeded");
+      }
+    }
+  );
+
   it("keeps set_goal disabled for one-shot streams that do not opt into agent-created goals", async () => {
     using xumHome = new DisposableTempDir("ai-service-set-goal-disabled");
     const projectPath = path.join(xumHome.path, "project");
@@ -1425,6 +1478,74 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(harness.streamSystemContextHotMemoriesBlocks).toContain(
       `<hot_memories>${fallbackModel}</hot_memories>`
     );
+  });
+
+  it.each([false, true])("pins assembly across attempts (budget=%s)", async (tokenBudget) => {
+    using xumHome = new DisposableTempDir("ai-pinned-request-assembly");
+    const sourceModel = KNOWN_MODELS.SONNET.id;
+    const fallbackModel = KNOWN_MODELS.GPT.id;
+    await writeMainConfig(xumHome.path, {
+      modelFallbacks: { [sourceModel]: { models: [fallbackModel] } },
+    });
+    const metadata = createLocalWorkspaceMetadata("pinned-request", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, {
+      allTools: { session_history: { inputSchema: jsonSchema({ type: "object" }) } },
+      useRequestedModelString: true,
+    });
+    const seenModels: string[] = [];
+    const unregister = eventSpine.useRequestContext(
+      (ctx) => {
+        seenModels.push(ctx.modelString);
+        ctx.systemMessage += "\npinned-context";
+      },
+      { workspaceId: metadata.id }
+    );
+    let removeLive: (() => void) | undefined;
+    try {
+      const captured = await harness.service.captureRequestAssemblySnapshot(metadata.id);
+      expect(captured.success).toBe(true);
+      if (!captured.success) throw new Error("Expected assembly snapshot");
+      expect(harness.getToolsForModelSpy).not.toHaveBeenCalled();
+      unregister();
+      const live = mock((ctx: RequestAssembleContext) => {
+        delete ctx.tools.session_history;
+      });
+      removeLive = eventSpine.useBefore("request.assemble", live, { workspaceId: metadata.id });
+      const request = {
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: sourceModel,
+        thinkingLevel: "off" as const,
+        experiments: { tokenBudget },
+      };
+      expect(
+        (
+          await harness.service.streamMessage({
+            ...request,
+            requestAssemblySnapshot: captured.data,
+          })
+        ).success
+      ).toBe(true);
+      const primary = harness.startStreamCalls[0];
+      expect(primary.tools?.session_history).toBeDefined();
+      expect(primary.contextBudgetLimit != null).toBe(tokenBudget);
+      const rebuilt = await primary.rebuildFirstStepForThinkingLevel!("low", {});
+      expect(JSON.stringify(rebuilt)).toContain("pinned-context");
+      const fallback = await primary.modelFallback!.prepare(fallbackModel);
+      expect(fallback.success).toBe(true);
+      if (fallback.success) {
+        expect(fallback.data.tools?.session_history).toBeDefined();
+        expect(fallback.data.contextBudgetLimit != null).toBe(tokenBudget);
+      }
+      expect(seenModels).toEqual([sourceModel, fallbackModel]);
+      expect(live).not.toHaveBeenCalled();
+      expect((await harness.service.streamMessage(request)).success).toBe(true);
+      expect(live).toHaveBeenCalledTimes(1);
+      expect(harness.startStreamCalls[1].tools?.session_history).toBeUndefined();
+    } finally {
+      unregister();
+      removeLive?.();
+    }
   });
 
   it("emits startup breadcrumbs as runtime-status events before stream start", async () => {
@@ -2092,6 +2213,54 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(withHotSet?.hotMemoriesBlock).toContain("root fact");
   });
 
+  it("adds context notes only for an active request with Memory and HotSet allowed", async () => {
+    using root = new DisposableTempDir("ai-service-additive-context-notes");
+    let memoryEnabled = true;
+    let hotSetEnabled = true;
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(root.path),
+      xumHome: root.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) =>
+        (id === EXPERIMENT_IDS.MEMORY && memoryEnabled) ||
+        (id === EXPERIMENT_IDS.MEMORY_HOT_SET && hotSetEnabled)
+    );
+    const { config, service } = createBasicAIService(root.path, { experimentsService });
+    const metaService = new MemoryMetaService(root.path);
+    const memoryService = new MemoryService(config, metaService);
+    service.turnRequestBuilderBindings.memoryService = memoryService;
+    const workspaceId = "additive-context-notes";
+    spyOn(service, "getWorkspaceMetadata").mockResolvedValue({
+      success: true,
+      data: {
+        ...createLocalWorkspaceMetadata(workspaceId, root.path),
+        runtimeConfig: { type: "local" },
+      },
+    });
+    const directory = path.join(config.sessionsDir, workspaceId, "memory");
+    await fs.mkdir(directory, { recursive: true });
+    const file = path.join(directory, "context-notes.md");
+    await fs.writeFile(file, "Unused but important handoff facts");
+    const before = await metaService.getEntries();
+    const build = (options?: Parameters<AIService["buildMemorySessionContext"]>[2]) =>
+      service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2", options);
+    expect((await build())?.hotMemoriesBlock).toBeNull();
+    expect((await build({ tokenBudgetActive: true }))?.hotMemoriesBlock).toContain(
+      "Unused but important handoff facts"
+    );
+    expect((await build({ tokenBudgetActive: false }))?.hotMemoriesBlock).toBeNull();
+    expect(
+      (await build({ tokenBudgetActive: true, includeHotMemories: false }))?.hotMemoriesBlock
+    ).toBeNull();
+    hotSetEnabled = false;
+    expect((await build({ tokenBudgetActive: true }))?.hotMemoriesBlock).toBeNull();
+    memoryEnabled = false;
+    expect(await build({ tokenBudgetActive: true })).toBeNull();
+    expect(await metaService.getEntries()).toEqual(before);
+    expect(await fs.readFile(file, "utf8")).toBe("Unused but important handoff facts");
+  });
+
   it("preserves the memory index when hot-memory selection fails", async () => {
     using xumHome = new DisposableTempDir("ai-service-memory-hot-failure");
     const projectPath = path.join(xumHome.path, "project");
@@ -2398,6 +2567,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     await startAdvisorStream(harness, workspaceId);
     const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
     if (!runtime) throw new Error("Expected advisor runtime");
+    const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+    spyOn(factory, "resolveAndCreateModel").mockImplementation(
+      ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
+    );
     const created = await runtime.createModel(testCase.model);
     providersStore.saveProvidersConfig({
       openai: { apiKey: "changed-key", wireFormat: "responses" },
@@ -2409,6 +2582,110 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(created.optionsMuxProviderOptions?.openai?.wireFormat).toBe(testCase.wireFormat);
     }
   });
+
+  it.each([
+    { modelId: "gpt-6-astra", refresh: "none" },
+    { modelId: "team-astra", refresh: "none" },
+    { modelId: "team-astra", refresh: "retyped" },
+    { modelId: "team-astra", refresh: "removed" },
+  ])(
+    "preserves the actual Coder instance and scoped alias for advisor Pro: %j",
+    async (testCase) => {
+      using xumHome = new DisposableTempDir("ai-service-advisor-coder-pro");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workspace-advisor-coder-pro";
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath)
+      );
+      const model = `coder:prod-openai/${testCase.modelId}`;
+      await writeProvidersConfig(xumHome.path, {
+        coder: {
+          coderOauth: {
+            type: "oauth",
+            sessionId: "test",
+            deploymentUrl: "https://coder.example.com",
+            access: "test-access",
+            refresh: "test-refresh",
+            expires: Date.now() + 3_600_000,
+            clientId: "test",
+            clientSecret: "test",
+          },
+          discoveredProviders: [
+            { name: "prod-openai", type: "openai" },
+            { name: "openai", type: "openai-compat" },
+          ],
+          models: [{ id: "prod-openai/team-astra", mappedToModel: "openai:gpt-6-astra" }],
+        },
+      });
+      await enableAdvisorForHarness(harness, model);
+      await startAdvisorStream(harness, workspaceId);
+      // Avoid an OAuth exchange; the real option/route adapter below must retain
+      // the selected instance instead of re-resolving the unrelated "openai" instance.
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      spyOn(factory, "resolveAndCreateModel").mockImplementation(
+        (_model, _thinking, options, creation) => {
+          expect(creation?.providersConfig?.coder).toMatchObject({
+            discoveredProviders: [
+              { name: "prod-openai", type: "openai" },
+              { name: "openai", type: "openai-compat" },
+            ],
+          });
+          if (!options) throw new Error("Expected the adapter's provider-options target");
+          options.openai = { wireFormat: "responses" };
+          return Promise.resolve({
+            success: true,
+            data: {
+              model: Object.create(null) as LanguageModel,
+              effectiveModelString: model,
+              canonicalModelString: "openai:gpt-6-astra",
+              canonicalProviderName: "openai",
+              canonicalModelId: "gpt-6-astra",
+              wireProviderName: "openai",
+              routeProvider: "coder",
+              routedThroughGateway: false,
+            },
+          });
+        }
+      );
+      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
+      if (!runtime) throw new Error("Expected advisor runtime");
+      if (testCase.refresh !== "none") {
+        const snapshot = new ProvidersConfigStore(harness.config.rootDir).loadProvidersConfig();
+        if (!snapshot) throw new Error("Expected the initial Coder configuration");
+        // Model creation gets the first read; an independent options-view read
+        // would see a catalog refresh with incompatible or missing metadata.
+        spyOn(ProvidersConfigStore.prototype, "loadProvidersConfig")
+          .mockReturnValue({
+            ...snapshot,
+            coder: {
+              ...snapshot.coder,
+              discoveredProviders:
+                testCase.refresh === "retyped" ? [{ name: "prod-openai", type: "anthropic" }] : [],
+              models: [],
+            },
+          })
+          .mockReturnValueOnce(snapshot);
+      }
+      const created = await runtime.createModel(model);
+      expect(created.optionsRouteProvider).toBe("coder");
+      const options = buildProviderOptions(
+        created.optionsModelString,
+        "high",
+        undefined,
+        undefined,
+        created.optionsMuxProviderOptions,
+        undefined,
+        undefined,
+        created.optionsProvidersConfig,
+        created.optionsRouteProvider,
+        undefined,
+        "pro"
+      );
+      expect(options).toMatchObject({ openai: { reasoningMode: "pro" } });
+    }
+  );
 
   it("freezes advisor tool-call snapshots at the tool-call boundary", async () => {
     using xumHome = new DisposableTempDir("ai-service-advisor-step-snapshot-boundary");
@@ -2837,12 +3114,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const resolveModel = spyOn(factory, "resolveAndCreateModel").mockImplementation(
         ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
       );
-      const createModel = spyOn(harness.service, "createModel");
       const created = await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
-      const creationOptions =
-        toolName === "advisor"
-          ? createModel.mock.calls.at(-1)?.[2]
-          : resolveModel.mock.calls.at(-1)?.[3];
+      const creationOptions = resolveModel.mock.calls.at(-1)?.[3];
       expect(creationOptions).toMatchObject({
         agentInitiated: true,
         workspaceId,

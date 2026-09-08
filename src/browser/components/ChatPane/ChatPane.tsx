@@ -7,7 +7,7 @@ import React, {
   useDeferredValue,
   useMemo,
 } from "react";
-import { Lightbulb } from "lucide-react";
+import { Lightbulb, Loader2 } from "lucide-react";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
 import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
@@ -383,7 +383,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // after the transcript is visible.
   const chatViewDataReady = useChatViewDataReady(workspaceId);
 
-  const { threshold: autoCompactionThreshold } = useAutoCompactionSettings(
+  const { threshold: autoCompactionThreshold, rolloverEnabled } = useAutoCompactionSettings(
     workspaceId,
     pendingModel
   );
@@ -763,12 +763,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const userMessageNavigationByHistoryId = useMemo(() => {
     const userHistoryIds: string[] = [];
     for (const message of deferredMessages) {
-      // Monitor wakes and peer-message wake triggers are synthetic machine rows and should not
-      // interrupt navigation between human prompts (payloads themselves are assistant rows).
+      // Machine wakes and budget warnings should not interrupt navigation between human prompts.
       if (
         message.type === "user" &&
         message.bashMonitorWake == null &&
-        message.agentPeerMessageTrigger == null
+        message.agentPeerMessageTrigger == null &&
+        message.contextBudgetWarning == null
       ) {
         userHistoryIds.push(message.historyId);
       }
@@ -1689,6 +1689,19 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       </span>
                     </button>
                   )}
+                  {/* Read-only transcripts need replay feedback without an editable composer. */}
+                  {isHydratingTranscript && !shouldMountStreamingBarrier && (
+                    <ChatDockSurface>
+                      <div
+                        role={showTranscriptHydrationPlaceholder ? undefined : "status"}
+                        data-testid="transcript-loading-status"
+                        className="text-muted flex items-center gap-2 px-3 py-1 text-xs"
+                      >
+                        <Loader2 aria-hidden="true" className="size-3 shrink-0 animate-spin" />
+                        <span>Loading messages...</span>
+                      </div>
+                    </ChatDockSurface>
+                  )}
                   {transcriptOnly ? (
                     // Transcript-only workspaces keep their historical transcript, but the whole
                     // composer surface is replaced with a single read-only notice.
@@ -1714,6 +1727,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       canInterrupt={canInterrupt}
                       autoCompactionResult={autoCompactionResult}
                       shouldShowCompactionWarning={shouldShowCompactionWarning}
+                      rolloverEnabled={rolloverEnabled}
                       contextSwitchWarning={contextSwitchWarning}
                       onContextSwitchCompact={handleContextSwitchCompact}
                       onContextSwitchDismiss={handleContextSwitchDismiss}
@@ -1773,8 +1787,8 @@ interface ChatInputPaneProps {
   workspaceName: string;
   /**
    * False until the chat view's one-commit reveal (transcript + decorations
-   * together). The decoration lane stays empty before that so a decoration
-   * can never mount after paint and shift the transcript.
+   * together). Async decorations stay hidden before that so they cannot
+   * mount after paint and shift the transcript.
    */
   revealDecorations: boolean;
   runtimeConfig?: RuntimeConfig;
@@ -1789,6 +1803,7 @@ interface ChatInputPaneProps {
   canInterrupt: boolean;
   autoCompactionResult: ReturnType<typeof checkAutoCompaction>;
   shouldShowCompactionWarning: boolean;
+  rolloverEnabled: boolean;
   contextSwitchWarning: ContextSwitchWarning | null;
   onContextSwitchCompact: () => void;
   onContextSwitchDismiss: () => void;
@@ -1855,6 +1870,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
             usagePercentage={props.autoCompactionResult.usagePercentage}
             thresholdPercentage={props.autoCompactionResult.thresholdPercentage}
             isStreaming={props.canInterrupt}
+            rolloverEnabled={props.rolloverEnabled}
           />
         </ChatDockSurface>
       ),
@@ -1934,13 +1950,8 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       ),
     });
   }
-  // The decoration lane lives inside the in-flow sticky composer dock, so a
-  // decoration mounting/unmounting reflows the transcript clearance in the same
-  // layout pass; the bottom stays pinned via native anchoring plus the
-  // scrollport-children ResizeObserver in useAutoScroll. Until the one-commit
-  // reveal the lane renders empty: readiness is monotonic per mounted
-  // workspace, so this only ever delays the initial mount — it never unmounts
-  // visible decorations.
+  // Keep decorations in the in-flow composer dock so height changes reserve
+  // transcript clearance in the same layout pass.
 
   return (
     <>

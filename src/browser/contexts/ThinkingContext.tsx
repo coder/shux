@@ -28,11 +28,7 @@ import { useMinThinkingLevels } from "@/browser/hooks/useMinThinkingLevels";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
-import {
-  clearPendingWorkspaceAiSettings,
-  getWorkspaceAiSettingsFromMetadata,
-  markPendingWorkspaceAiSettings,
-} from "@/browser/utils/workspaceAiSettingsSync";
+import { getWorkspaceAiSettingsFromMetadata } from "@/browser/utils/workspaceAiSettingsSync";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -133,17 +129,13 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
     updatePersistedState(thinkingKey, legacy);
   }, [defaultModel, scopeId, thinkingKey]);
 
-  // Shared persistence for both setters: caches the full per-agent settings and
-  // pushes them to the backend. updateAgentAISettings replaces the agent's
-  // settings wholesale, so every payload must carry BOTH thinkingLevel and
-  // reasoningMode or the omitted one gets wiped on the next sync.
+  // Keep picker choices local until a user message sends the full settings.
   const persistAgentAiSettings = useCallback(
     (settings: {
       model: string;
       thinkingLevel: ThinkingLevel;
       reasoningMode: OpenAIReasoningMode;
     }) => {
-      // Workspace variant: persist to backend so settings follow the workspace across devices.
       if (!props.workspaceId) {
         return;
       }
@@ -174,38 +166,12 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
         },
         {}
       );
-
-      if (!api) {
-        return;
-      }
-
-      // Avoid stale backend metadata clobbering newer local preferences when users
-      // click through levels quickly (tests reproduce this by cycling to xhigh).
-      markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, settings);
-
-      api.workspace
-        .updateAgentAISettings({
-          workspaceId,
-          agentId: normalizedAgentId,
-          aiSettings: settings,
-        })
-        .then((result) => {
-          if (!result.success) {
-            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-          }
-        })
-        .catch(() => {
-          clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-          // Best-effort only. If offline or backend is old, the next sendMessage will persist.
-        });
     },
-    [api, props.workspaceId, scopeId]
+    [props.workspaceId, scopeId]
   );
 
   // Read the sibling setting at call time (not from the render closure) so
   // rapid interleaved updates cannot persist a stale counterpart value.
-  // Coerced like the render path: a corrupt persisted value must not ride a
-  // thinking-level change into updateAgentAISettings and fail backend sync.
   const getCurrentReasoningMode = useCallback(
     (): OpenAIReasoningMode =>
       coerceOpenAIReasoningMode(

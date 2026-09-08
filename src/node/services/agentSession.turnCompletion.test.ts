@@ -458,6 +458,89 @@ describe("AgentSession turn completion", () => {
     }
   );
 
+  test("budget recovery paused in history cannot reset or reject a replacement turn", async () => {
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const emitter = new EventEmitter();
+    let calls = 0;
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          const messageId = `assistant-${++calls}`;
+          start(emitter, messageId);
+          return Promise.resolve(
+            Ok({
+              messageId,
+              completion:
+                calls === 1
+                  ? completion.promise
+                  : createStartedTurnHandle(h.session.closingSignal).completion,
+            })
+          );
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    const reset = spyOn(
+      h.session as unknown as { applyContextResetSideEffects(): Promise<void> },
+      "applyContextResetSideEffects"
+    );
+    const historyEntered = Promise.withResolvers<void>();
+    const releaseHistory = Promise.withResolvers<void>();
+    let oldPolicy: Promise<void> | undefined;
+    try {
+      await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("prior", "assistant", "Earlier completed work")
+      );
+      const options = { ...sendOptions, experiments: { tokenBudget: true } };
+      expect((await h.session.sendMessage("original request", options)).success).toBe(true);
+      oldPolicy = policyPromise(consumer);
+      const read = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);
+      spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(async (id) => {
+        historyEntered.resolve();
+        await releaseHistory.promise;
+        return read(id);
+      });
+      completion.resolve({
+        status: "failed",
+        streamError: {
+          messageId: "assistant-1",
+          error: "context overflow",
+          errorType: "context_exceeded",
+        },
+      });
+      await historyEntered.promise;
+      const coordinator = internal(h.session).coordinator;
+      const originalOperation = coordinator.operationId;
+      coordinator.finishTurn(coordinator.turnId);
+      expect((await h.session.sendMessage("replacement request", options)).success).toBe(true);
+      const replacementOperation = coordinator.operationId;
+      expect(replacementOperation).toBeDefined();
+      expect(replacementOperation).not.toBe(originalOperation);
+      releaseHistory.resolve();
+      await oldPolicy;
+      expect(calls).toBe(2);
+      expect(reset).not.toHaveBeenCalled();
+      expect(coordinator.operationId).toBe(replacementOperation);
+      expect(coordinator.phase).toBe("streaming");
+      const rows = await read(workspaceId);
+      expect(rows.success).toBe(true);
+      if (!rows.success) throw new Error(rows.error);
+      expect(rows.data.some((row) => row.metadata?.contextBudgetRejected)).toBe(false);
+      expect(
+        rows.data.some((row) => row.metadata?.muxMetadata?.type === "context-window-rollover")
+      ).toBe(false);
+    } finally {
+      releaseHistory.resolve();
+      await h.session.dispose();
+      await oldPolicy;
+      await h.cleanup();
+    }
+  });
+
   test.each(["completed", "aborted", "failed"] as const)(
     "late %s completion cannot change a replacement paused in history preparation",
     async (status) => {

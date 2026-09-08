@@ -29,6 +29,7 @@ import type {
 import { RequestError } from "@agentclientprotocol/sdk";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
+import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import {
   DEFAULT_COMPACTION_WORD_TARGET,
   WORDS_TO_TOKENS_RATIO,
@@ -49,7 +50,7 @@ import {
 } from "@/common/utils/subProjects";
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { negotiateCapabilities, type NegotiatedCapabilities } from "./capabilities";
-import { AGENT_MODE_CONFIG_ID, buildConfigOptions, handleSetConfigOption } from "./configOptions";
+import { buildConfigOptions, handleSetConfigOption } from "./configOptions";
 import { forkSessionFromWorkspace } from "./experimental/sessionFork";
 import {
   canonicalizePathForWorkspaceMatch,
@@ -372,7 +373,6 @@ export class MuxAgent implements Agent {
 
       const agentId = meta.agentId ?? workspace.agentId ?? DEFAULT_AGENT_ID;
       const aiSettings = await resolveAgentAiSettings(this.server.client, agentId, workspaceId);
-      await this.persistAiSettings(workspaceId, agentId, aiSettings);
 
       this.sessionStateById.set(sessionId, {
         workspaceId,
@@ -388,6 +388,7 @@ export class MuxAgent implements Agent {
         sessionId,
         configOptions: await buildConfigOptions(this.server.client, workspaceId, {
           activeAgentId: agentId,
+          aiSettings,
         }),
       };
 
@@ -406,16 +407,14 @@ export class MuxAgent implements Agent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     this.assertInitialized("loadSession");
 
-    // Pass any prior in-memory agent selection so mode switches survive
-    // reconnect/reload (agent mode set via set_config_option is only stored
-    // in ACP session state, not persisted as the workspace's active agent).
+    // Preserve unsent picker choices when reloading this adapter's active session.
     const existingState = this.sessionStateById.get(params.sessionId);
     const resumed = await loadSessionFromWorkspace(params, {
       server: this.server,
       sessionManager: this.sessionManager,
       negotiatedCapabilities: this.negotiatedCapabilities,
       defaultAgentId: DEFAULT_AGENT_ID,
-      existingSessionAgentId: existingState?.agentId,
+      existingSessionState: existingState,
     });
 
     this.sessionStateById.set(resumed.sessionId, {
@@ -498,7 +497,7 @@ export class MuxAgent implements Agent {
         sessionManager: this.sessionManager,
         negotiatedCapabilities: this.negotiatedCapabilities,
         defaultAgentId: DEFAULT_AGENT_ID,
-        existingSessionAgentId: existingState?.agentId,
+        existingSessionState: existingState,
       }
     );
 
@@ -551,8 +550,6 @@ export class MuxAgent implements Agent {
       meta.forkName
     );
 
-    await this.persistAiSettings(forked.workspaceId, forked.agentId, forked.aiSettings);
-
     this.sessionStateById.set(forked.sessionId, {
       workspaceId: forked.workspaceId,
       runtimeMode: forked.runtimeMode,
@@ -598,8 +595,7 @@ export class MuxAgent implements Agent {
       options: {
         model: sessionState.aiSettings.model,
         thinkingLevel: sessionState.aiSettings.thinkingLevel,
-        // Per-workspace pro mode from workspace metadata; the send path
-        // re-gates per model/route so this is inert for unsupported models.
+        // The send path re-gates pro mode for the selected model and route.
         reasoningMode: sessionState.aiSettings.reasoningMode,
         agentId: sessionState.agentId,
       },
@@ -615,20 +611,26 @@ export class MuxAgent implements Agent {
 
     this.touchSession(sessionId);
     const workspaceId = this.sessionManager.getWorkspaceId(sessionId);
-    const interruptResult = await this.server.client.workspace.interruptStream({ workspaceId });
-
-    if (!interruptResult.success) {
-      throw new Error(`cancel: workspace.interruptStream failed: ${interruptResult.error}`);
-    }
+    const interruptResult = await this.server.client.workspace.interruptStream({
+      workspaceId,
+      options: { retireBashMonitorAttention: true },
+    });
 
     // Resolve any pending prompt immediately after a successful interrupt request.
     // Backend abort events can be dropped or synthesized without a messageId when no
     // active stream exists; waiting exclusively for terminal chat events can leave
-    // ACP prompt requests hanging indefinitely.
-    this.resolveTurn(sessionId, {
-      stopReason: "cancelled",
-      usage: this.latestUsageBySessionId.get(sessionId),
-    });
+    // ACP prompt requests hanging indefinitely. STOP_UNRECORDED_MESSAGE reports a stream
+    // that did stop (only its durable Stop records failed), so the prompt settles as
+    // cancelled before that failure is reported below.
+    if (interruptResult.success || interruptResult.error === STOP_UNRECORDED_MESSAGE) {
+      this.resolveTurn(sessionId, {
+        stopReason: "cancelled",
+        usage: this.latestUsageBySessionId.get(sessionId),
+      });
+    }
+    if (!interruptResult.success) {
+      throw new Error(`cancel: workspace.interruptStream failed: ${interruptResult.error}`);
+    }
   }
 
   async setSessionConfigOption(
@@ -655,23 +657,20 @@ export class MuxAgent implements Agent {
       );
     }
 
-    const activeAgentId = this.sessionStateById.get(sessionId)?.agentId;
+    const sessionState = this.sessionStateById.get(sessionId);
     const configOptions = await handleSetConfigOption(
       this.server.client,
       workspaceId,
       params.configId,
       params.value,
       {
-        activeAgentId,
+        activeAgentId: sessionState?.agentId,
+        aiSettings: sessionState?.aiSettings,
         onAgentModeChanged: (agentId, aiSettings) => {
           this.updateSessionAgentState(sessionId, agentId, aiSettings);
         },
       }
     );
-
-    if (trimmedConfigId !== AGENT_MODE_CONFIG_ID) {
-      await this.refreshSessionState(sessionId);
-    }
 
     return { configOptions };
   }
@@ -2143,7 +2142,9 @@ export class MuxAgent implements Agent {
     // selection lives in sessionStateById and must not be reverted by a
     // workspace.agentId value from the backend.
     const agentId = existing?.agentId ?? workspace.agentId ?? DEFAULT_AGENT_ID;
+    // Picker choices remain session-local until the next user message sends them.
     const aiSettings =
+      existing?.aiSettings ??
       workspace.aiSettingsByAgent?.[agentId] ??
       workspace.aiSettings ??
       (await resolveAgentAiSettings(this.server.client, agentId, workspaceId));
@@ -2157,36 +2158,6 @@ export class MuxAgent implements Agent {
 
     this.sessionStateById.set(sessionId, nextState);
     return nextState;
-  }
-
-  private async persistAiSettings(
-    workspaceId: string,
-    agentId: string,
-    aiSettings: ResolvedAiSettings
-  ): Promise<void> {
-    if (agentId === "plan" || agentId === "exec") {
-      const updateModeResult = await this.server.client.workspace.updateModeAISettings({
-        workspaceId,
-        mode: agentId,
-        aiSettings,
-      });
-
-      if (!updateModeResult.success) {
-        throw new Error(`workspace.updateModeAISettings failed: ${updateModeResult.error}`);
-      }
-
-      return;
-    }
-
-    const updateAgentResult = await this.server.client.workspace.updateAgentAISettings({
-      workspaceId,
-      agentId,
-      aiSettings,
-    });
-
-    if (!updateAgentResult.success) {
-      throw new Error(`workspace.updateAgentAISettings failed: ${updateAgentResult.error}`);
-    }
   }
 
   async waitForDisconnectCleanup(): Promise<void> {

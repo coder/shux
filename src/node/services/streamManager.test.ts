@@ -5,7 +5,11 @@ import * as path from "node:path";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { StreamEndEventSchema, ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
+import {
+  StreamAbortEventSchema,
+  StreamEndEventSchema,
+  ToolCallStartEventSchema,
+} from "@/common/orpc/schemas/stream";
 import type {
   CompletedMessagePart,
   ToolCallEndEvent,
@@ -1844,10 +1848,14 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
 });
 
 describe("StreamManager - stopWhen configuration", () => {
-  type StopWhenCondition = (options: { steps: unknown[] }) => boolean;
+  type StopWhenCondition = (options: { steps: unknown[] }) => boolean | Promise<boolean>;
   type BuildStopWhenCondition = (request: {
     hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
     toolPolicy?: ToolPolicy;
+    onStepSettled?: TurnExecutionOptions["onStepSettled"];
+    modelString?: string;
+    tools?: Record<string, Tool>;
+    contextBudgetMemoryWritable?: boolean;
   }) => StopWhenCondition[];
 
   function buildStopWhenForTests(streamManager = new StreamManager(historyService)) {
@@ -1869,7 +1877,7 @@ describe("StreamManager - stopWhen configuration", () => {
     return { steps: [{ toolResults: [{ toolName, output }] }] };
   }
 
-  test("returns step-cap and queued-message conditions with no policy", () => {
+  test("returns step-cap and queued-message conditions with no policy", async () => {
     let queued = false;
     const stopWhen = buildStopWhenForTests()({ hasQueuedMessages: () => queued });
     expect(stopWhen).toHaveLength(3);
@@ -1878,12 +1886,78 @@ describe("StreamManager - stopWhen configuration", () => {
     expect(maxStepCondition({ steps: new Array(99999) })).toBe(false);
     expect(maxStepCondition({ steps: new Array(100000) })).toBe(true);
 
-    expect(queuedMessageCondition({ steps: [] })).toBe(false);
+    expect(await queuedMessageCondition({ steps: [] })).toBe(false);
     queued = true;
-    expect(queuedMessageCondition({ steps: [] })).toBe(true);
+    expect(await queuedMessageCondition({ steps: [] })).toBe(true);
     expect(requiredToolCondition(stepsWithToolResult("agent_report", { success: true }))).toBe(
       false
     );
+  });
+
+  test.each(["warn", "rollover"] as const)(
+    "budget %s stops with only turn-end input queued and evaluates settled fallback usage",
+    async (decision) => {
+      const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
+        Promise.resolve(decision)
+      );
+      const sessionHistory = tool({ inputSchema: z.object({}) });
+      const [, stop] = buildStopWhenForTests()({
+        // The ordinary queue condition must be false; the budget decision itself stops the SDK.
+        hasQueuedMessages: (mode) => mode === "turn-end",
+        onStepSettled,
+        modelString: "anthropic:claude-sonnet-4-5",
+        tools: { session_history: sessionHistory },
+        contextBudgetMemoryWritable: true,
+      });
+      const providerMetadata = { anthropic: { cacheCreationInputTokens: 20 } };
+      expect(
+        await stop({
+          steps: [
+            {
+              usage: {
+                inputTokens: 90,
+                outputTokens: 10,
+                totalTokens: 100,
+                inputTokenDetails: { cacheReadTokens: 40 },
+                outputTokenDetails: { reasoningTokens: 3 },
+              },
+              providerMetadata,
+              toolResults: [
+                { toolName: "bash", output: "first sibling" },
+                { toolName: "file_read", output: "x".repeat(40_000) },
+              ],
+            },
+          ],
+        })
+      ).toBe(true);
+      expect(onStepSettled).toHaveBeenCalledTimes(1);
+      const settled = onStepSettled.mock.calls[0][0];
+      expect(settled).toMatchObject({
+        model: "anthropic:claude-sonnet-4-5",
+        usage: { inputTokens: 90, outputTokens: 10, cachedInputTokens: 40, reasoningTokens: 3 },
+        providerMetadata,
+        sessionHistoryAvailable: true,
+        memoryWritable: true,
+      });
+      expect(settled.toolResultChars).toBeGreaterThan(40_000);
+    }
+  );
+
+  test("successful required completion wins over rollover while a failed tool still evaluates budget", async () => {
+    const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
+      Promise.resolve("rollover")
+    );
+    const [, stop, required] = buildStopWhenForTests()({
+      onStepSettled,
+      modelString: TEST_STREAM_MODEL_ID,
+      toolPolicy: [{ regex_match: "agent_report", action: "require" }],
+    });
+    const success = stepsWithToolResult("agent_report", { success: true });
+    expect(await stop(success)).toBe(false);
+    expect(await required(success)).toBe(true);
+    expect(onStepSettled).not.toHaveBeenCalled();
+    expect(await stop(stepsWithToolResult("agent_report", { success: false }))).toBe(true);
+    expect(onStepSettled).toHaveBeenCalledTimes(1);
   });
 
   const requiredToolCases: Array<{
@@ -6742,6 +6816,32 @@ describe("StreamManager - aborted stream usage persistence", () => {
       outputTokens: 30,
       totalTokens: 150,
     });
+  });
+
+  test("emits the effective fallback model and its pinned pricing identity with aborted usage", async () => {
+    const streamManager = new StreamManager(historyService);
+    const effectiveModel = "coder:acme/opus";
+    const pinnedMetadataModel = "anthropic:claude-opus-4-1";
+    const abort = Promise.withResolvers<unknown>();
+    onTurnEngineEvent(streamManager, "stream-abort", (event) => abort.resolve(event));
+    const cleanupAborted = getPrivateMethodForTests<CleanupAbortedStreamForTests>(
+      streamManager,
+      "cleanupAbortedStream"
+    );
+    await cleanupAborted.call(
+      streamManager,
+      "fallback-abort",
+      {
+        ...createAbortStreamInfo("fallback-message"),
+        model: effectiveModel,
+        metadataModel: pinnedMetadataModel,
+      },
+      "system"
+    );
+    const event = StreamAbortEventSchema.parse(await abort.promise);
+    expect(event.metadata?.model).toBe(effectiveModel);
+    expect(event.metadata?.metadataModel).toBe(pinnedMetadataModel);
+    expect(event.metadata?.usage?.inputTokens).toBe(120);
   });
 
   test.each(["commit-err", "commit-throw", "delete-err", "delete-throw"] as const)(

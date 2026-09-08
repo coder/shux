@@ -203,9 +203,11 @@ export function loadTokenizerModules(
 
 export async function getTokenizerForModel(
   modelString: string,
-  metadataModelOverride?: string
+  metadataModelOverride?: string,
+  // Bypass only the performance approximation; provider-family fallback encodings still apply.
+  options?: { requireRealEncoding?: boolean }
 ): Promise<Tokenizer> {
-  if (shouldUseApproxTokenizer()) {
+  if (!options?.requireRealEncoding && shouldUseApproxTokenizer()) {
     return getApproxTokenizer();
   }
 

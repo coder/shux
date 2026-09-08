@@ -50,6 +50,7 @@ const NON_RETRYABLE_STREAM_ERRORS = [
   ...PROVIDER_CONFIG_FIXABLE_STREAM_ERRORS,
   "model_not_found", // Invalid model - user must select different model
   "context_exceeded", // Message too long - user must reduce context
+  "context_budget_blocked", // Local preflight failed; retrying unchanged cannot fit
   "aborted", // User cancelled - should not auto-retry
   "runtime_not_ready", // Container/runtime unavailable - permanent failure
   "model_refusal", // Provider declined to answer - retrying the same request will refuse again
@@ -86,6 +87,8 @@ export function isNonRetryableSendError(error: { type: string }): boolean {
     case "incompatible_workspace": // Workspace from newer mux version - user must upgrade
     case "runtime_not_ready": // Container doesn't exist - user must recreate workspace
     case "policy_denied": // Policy blocks won't resolve automatically
+    case "context_budget_exceeded": // Parent may roll over explicitly; never retry the oversized request
+    case "context_budget_blocked":
       return true;
     case "runtime_start_failed": // Runtime is starting - transient, worth retrying
     case "unknown":
@@ -127,7 +130,9 @@ export function isPreTokenInterruptedUserTurn(
   tail: DisplayedMessage | undefined,
   lastAbortReason: StreamAbortReasonSnapshot | null | undefined
 ): boolean {
-  return tail?.type === "user" && shouldSuppressAutoRetry(lastAbortReason);
+  return (
+    tail?.type === "user" && !tail.contextBudgetRejected && shouldSuppressAutoRetry(lastAbortReason)
+  );
 }
 
 function isDecorativeTranscriptMessage(message: DisplayedMessage): boolean {
@@ -154,6 +159,7 @@ export function getLastNonDecorativeMessage(
 function isDisplayOnlyCompletedSubagentReport(message: DisplayedMessage): boolean {
   return (
     message.type === "user" &&
+    !message.contextBudgetRejected &&
     message.isSynthetic === true &&
     message.isUiVisible === true &&
     isCompletedSubagentReportEnvelope(message.content)
@@ -208,6 +214,7 @@ function computeHasInterruptedStream(
 
   const lastMessage = getLastMainRetryCandidateMessage(messages);
   if (!lastMessage) return false;
+  if (lastMessage.type === "user" && lastMessage.contextBudgetRejected) return false;
 
   // Don't show retry barrier if workspace init is still running AND no error has occurred yet.
   // The backend waits for init to complete before starting the stream.
@@ -245,9 +252,12 @@ function computeHasInterruptedStream(
     return false;
   }
 
-  // Don't show retry barrier for runtime_not_ready - requires workspace recreation.
-  // StreamErrorMessage already shows a distinct "Runtime Unavailable" UI for this case.
-  if (lastMessage.type === "stream-error" && lastMessage.errorType === "runtime_not_ready") {
+  // These terminal failures require a new request or workspace, not replaying the same turn.
+  if (
+    lastMessage.type === "stream-error" &&
+    (lastMessage.errorType === "runtime_not_ready" ||
+      lastMessage.errorType === "context_budget_blocked")
+  ) {
     return false;
   }
 

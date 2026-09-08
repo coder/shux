@@ -2,6 +2,8 @@ import type { TurnCoordinator } from "./turnCoordinator";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
+import * as fsPromises from "fs/promises";
+import path from "path";
 import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
@@ -889,6 +891,140 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
   });
 
+  test("a marker recorded while an older clear is still unlinking is written after it and acknowledged once written", async () => {
+    const workspaceId = "startup-retry-serialized-abandon-writes";
+    const { session, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+
+    const privateSession = session as unknown as {
+      persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
+      clearStartupAutoRetryAbandon: () => Promise<void>;
+      getAutoRetryPreferencePath: () => string;
+    };
+    const preferencePath = privateSession.getAutoRetryPreferencePath();
+
+    // An in-memory preference file whose unlink and marker write the test holds open, so the clear's
+    // unlink and the Stop's marker write can be ordered exactly (real I/O would race them).
+    let fileContent: string | null = null;
+    let markerWrites = 0;
+    let holdMarkerWrites = false;
+    const unlinkEntered = Promise.withResolvers<void>();
+    const releaseUnlink = Promise.withResolvers<void>();
+    const releaseWrite = Promise.withResolvers<void>();
+    const macrotask = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const { unlink, mkdir, writeFile } = fsPromises;
+    const spies = [
+      spyOn(fsPromises, "unlink").mockImplementation(async (target) => {
+        if (target !== preferencePath) return unlink(target);
+        unlinkEntered.resolve();
+        await releaseUnlink.promise;
+        fileContent = null;
+      }),
+      spyOn(fsPromises, "mkdir").mockImplementation(async (target, options) => {
+        if (target !== path.dirname(preferencePath)) await mkdir(target, options);
+      }),
+      spyOn(fsPromises, "writeFile").mockImplementation(async (target, data, options) => {
+        if (target !== preferencePath || typeof data !== "string") {
+          return writeFile(target, data, options);
+        }
+        if (holdMarkerWrites) {
+          markerWrites += 1;
+          await releaseWrite.promise;
+        }
+        fileContent = data;
+      }),
+    ];
+    try {
+      await privateSession.persistStartupAutoRetryAbandon("authentication", "user-1");
+      holdMarkerWrites = true;
+      const clearing = privateSession.clearStartupAutoRetryAbandon();
+      await unlinkEntered.promise;
+      const recording = privateSession.persistStartupAutoRetryAbandon("aborted", "user-2");
+      // A macrotask drains every microtask-resolved fake step the recording could have taken: the
+      // marker write waits for the clear's unlink instead of racing it.
+      await macrotask();
+      expect(markerWrites).toBe(0);
+      releaseUnlink.resolve();
+      await clearing;
+
+      // The clear's completion does not acknowledge the marker that is still being written.
+      let acknowledged: boolean | undefined;
+      const ack = session.recordPendingAutoRetryState().then((recorded) => {
+        acknowledged = recorded;
+        return recorded;
+      });
+      await macrotask();
+      expect(acknowledged).toBeUndefined();
+      releaseWrite.resolve();
+      expect(await ack).toBe(true);
+      await recording;
+      expect(fileContent).not.toBeNull();
+      const persisted = JSON.parse(fileContent!) as {
+        startupAutoRetryAbandon?: { reason: string; userMessageId?: string };
+      };
+      expect(persisted.startupAutoRetryAbandon).toEqual({
+        reason: "aborted",
+        userMessageId: "user-2",
+      });
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  });
+
+  test("a marker recorded while the preference file is still loading survives the load and keeps the file's opt-out", async () => {
+    const workspaceId = "startup-retry-marker-during-preference-load";
+    const { session, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+
+    const privateSession = session as unknown as {
+      persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
+      loadAutoRetryEnabledPreference: () => Promise<boolean>;
+      getAutoRetryPreferencePath: () => string;
+      startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
+    };
+    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    await fsPromises.mkdir(path.dirname(preferencePath), { recursive: true });
+    await fsPromises.writeFile(preferencePath, JSON.stringify({ enabled: false }) + "\n", "utf-8");
+
+    // The first preference read is held open, as in a fresh session whose startup check is still
+    // reading the file when a Stop withdraws an accepted wake.
+    const readEntered = Promise.withResolvers<void>();
+    const releaseRead = Promise.withResolvers<void>();
+    const readFile = fsPromises.readFile.bind(fsPromises);
+    const readSpy = spyOn(fsPromises, "readFile").mockImplementation((async (
+      ...args: Parameters<typeof fsPromises.readFile>
+    ) => {
+      const raw = await readFile(...args);
+      if (args[0] !== preferencePath) return raw;
+      readEntered.resolve();
+      await releaseRead.promise;
+      return raw;
+    }) as typeof fsPromises.readFile);
+    try {
+      const loading = privateSession.loadAutoRetryEnabledPreference();
+      await readEntered.promise;
+      const recording = privateSession.persistStartupAutoRetryAbandon("aborted", "user-2");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // Nothing is written from unloaded state while the read is pending.
+      expect(JSON.parse(await Bun.file(preferencePath).text())).toEqual({ enabled: false });
+      releaseRead.resolve();
+      expect(await loading).toBe(false);
+      await recording;
+
+      expect(privateSession.startupAutoRetryAbandon).toEqual({
+        reason: "aborted",
+        userMessageId: "user-2",
+      });
+      expect(JSON.parse(await Bun.file(preferencePath).text())).toEqual({
+        enabled: false,
+        startupAutoRetryAbandon: { reason: "aborted", userMessageId: "user-2" },
+      });
+      expect(await session.recordPendingAutoRetryState()).toBe(true);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
   test("provider config changes preserve non-fixable abandon state without starting a stream", async () => {
     const workspaceId = "startup-retry-keep-abandon-on-provider-config";
     const { session, aiService, events, cleanup } = await createSessionBundle(workspaceId);
@@ -951,6 +1087,36 @@ describe("AgentSession startup auto-retry recovery", () => {
     await privateSession.persistStartupAutoRetryAbandon("authentication", "user-1");
     await clearProviderConfigFixableAbandonMarkers(config.sessionsDir, new Set([workspaceId]));
     expect(await Bun.file(preferencePath).exists()).toBe(true);
+  });
+
+  test("an auto-retry opt-out whose write failed is not acknowledged as recorded until it is written", async () => {
+    const workspaceId = "startup-retry-unrecorded-opt-out";
+    const { session, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    const preferencePath = (
+      session as unknown as { getAutoRetryPreferencePath: () => string }
+    ).getAutoRetryPreferencePath();
+
+    let failWrites = true;
+    const { writeFile } = fsPromises;
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(
+      async (target, data, options) => {
+        if (target === preferencePath && failWrites) throw new Error("EIO");
+        return writeFile(target, data, options);
+      }
+    );
+    try {
+      // A RetryBarrier Stop with no active stream: the opt-out is the only state it relies on.
+      await session.setAutoRetryEnabled(false);
+      expect(await Bun.file(preferencePath).exists()).toBe(false);
+      expect(await session.recordPendingAutoRetryState()).toBe(false);
+
+      failWrites = false;
+      expect(await session.recordPendingAutoRetryState()).toBe(true);
+      expect(JSON.parse(await Bun.file(preferencePath).text())).toEqual({ enabled: false });
+    } finally {
+      writeSpy.mockRestore();
+    }
   });
 
   test("provider config sweep keeps a persisted auto-retry opt-out while clearing the marker", async () => {

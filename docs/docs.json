@@ -54,6 +54,7 @@
                   "workspaces/compaction",
                   "workspaces/compaction/manual",
                   "workspaces/compaction/automatic",
+                  "workspaces/compaction/token-budget",
                   "workspaces/compaction/customization"
                 ]
               },

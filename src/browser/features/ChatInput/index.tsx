@@ -48,10 +48,6 @@ import {
 } from "@/browser/utils/additionalSystemContextStore";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
-import {
-  clearPendingWorkspaceAiSettings,
-  markPendingWorkspaceAiSettings,
-} from "@/browser/utils/workspaceAiSettingsSync";
 import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
 import {
   getModelKey,
@@ -78,6 +74,7 @@ import {
 } from "@/browser/utils/workflowRunMessages";
 import { Button } from "@/browser/components/Button/Button";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { useChatErrorToasts } from "@/browser/utils/chatErrorToasts";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { extractInlineSkillReferenceCandidates } from "@/browser/utils/agentSkills/inlineSkillReferences";
 import {
@@ -612,12 +609,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? calculateTokenMeterData(lastUsage, contextDisplayModel, use1M, false, providersConfig)
       : { segments: [], totalTokens: 0, totalPercentage: 0 };
   }, [lastUsage, contextDisplayModel, use1M, providersConfig]);
-  const { threshold: autoCompactThreshold, setThreshold: setAutoCompactThreshold } =
-    useAutoCompactionSettings(workspaceIdForUsage, contextDisplayModel);
-  const autoCompactionProps = useMemo(
-    () => ({ threshold: autoCompactThreshold, setThreshold: setAutoCompactThreshold }),
-    [autoCompactThreshold, setAutoCompactThreshold]
-  );
+  const autoCompactionProps = useAutoCompactionSettings(workspaceIdForUsage, contextDisplayModel);
 
   // Idle compaction settings (per-project, persisted to backend for idleCompactionService)
   const { hours: idleCompactionHours, setHours: setIdleCompactionHours } = useIdleCompactionHours({
@@ -681,43 +673,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             prev && typeof prev === "object" ? prev : {};
           return {
             ...record,
-            // Include reasoningMode so a model change cannot wipe the persisted
-            // pro-mode choice (backend replaces the agent's settings wholesale).
             [normalizedAgentId]: { model: selectedModel, thinkingLevel, reasoningMode },
           };
         },
         {}
       );
-
-      // Workspace variant: persist to backend for cross-device consistency.
-      if (!api) {
-        return;
-      }
-
-      markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
-        model: selectedModel,
-        thinkingLevel,
-        reasoningMode,
-      });
-
-      api.workspace
-        .updateAgentAISettings({
-          workspaceId,
-          agentId: normalizedAgentId,
-          aiSettings: { model: selectedModel, thinkingLevel, reasoningMode },
-        })
-        .then((result) => {
-          if (!result.success) {
-            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-          }
-        })
-        .catch(() => {
-          clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-          // Best-effort only. If offline or backend is old, sendMessage will persist.
-        });
     },
     [
-      api,
       agentId,
       creationParentProjectPath,
       ensureModelInSettings,
@@ -1472,23 +1434,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       window.removeEventListener(CUSTOM_EVENTS.THINKING_LEVEL_TOAST, handler as EventListener);
   }, [variant, props, pushToast]);
 
-  // Show the backend's one-shot child-budget warning on the matching parent workspace.
-  useEffect(() => {
-    if (variant !== "workspace") return;
-
-    const handler = (event: Event) => {
-      const detail = (event as CustomEvent<{ workspaceId: string; message: string }>).detail;
-      if (detail?.workspaceId !== workspaceId || !detail.message) {
-        return;
-      }
-
-      pushToast({ type: "error", message: detail.message });
-    };
-
-    window.addEventListener(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, handler as EventListener);
-    return () =>
-      window.removeEventListener(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, handler as EventListener);
-  }, [variant, workspaceId, pushToast]);
+  useChatErrorToasts(workspaceId, toast?.message ?? null, pushToast);
 
   // Show toast feedback for analytics rebuild command palette action.
   useEffect(() => {

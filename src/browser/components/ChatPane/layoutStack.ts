@@ -16,8 +16,8 @@ export interface LayoutStackItem<
 export type TranscriptTailStackItem = LayoutStackItem<"transcript-tail">;
 export type ChatInputDecorationStackItem = LayoutStackItem<"composer-decoration"> & {
   /**
-   * Render even before async decoration data is ready. Reserve this for synchronous,
-   * user-authored state that must stay visible while an active stream bypasses hydration.
+   * Render even before async decoration data is ready, for synchronous chat state
+   * that must stay visible during hydration.
    */
   readonly revealBeforeReady?: boolean;
 };

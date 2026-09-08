@@ -1,3 +1,4 @@
+import { eventSpine } from "./events/eventSpine";
 import { mock } from "bun:test";
 import { EventEmitter } from "events";
 
@@ -123,11 +124,28 @@ function createMockAiService(args: {
         Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
       )
     ),
+    createModelWithPinnedOptions: mock(() =>
+      Promise.resolve(
+        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+      )
+    ),
     getWorkspaceMetadata: mock(() =>
       Promise.resolve(Err("Test AI service has no workspace metadata"))
     ),
     getProvidersConfig: mock(() => null),
     isExperimentEnabled: mock((_experimentId) => false),
+    prepareStreamMessage: mock(() =>
+      Promise.resolve(
+        Ok({
+          start: (options: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
+            aiService.streamMessage(options),
+          [Symbol.asyncDispose]: () => Promise.resolve(),
+        })
+      )
+    ),
+    captureRequestAssemblySnapshot: mock((workspaceId: string) =>
+      Promise.resolve(Ok(eventSpine.captureRequestAssembly(workspaceId)))
+    ),
     ...createStreamLifecycleMocks(),
     streamMessage: mock(() =>
       Promise.resolve(

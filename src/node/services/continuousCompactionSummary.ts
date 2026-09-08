@@ -11,7 +11,6 @@ import assert from "@/common/utils/assert";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { MuxMessage } from "@/common/types/message";
 import { coerceThinkingLevel } from "@/common/types/thinking";
-import { getExplicitGatewayPrefix } from "@/common/utils/ai/models";
 import {
   buildProviderOptions,
   buildRequestHeaders,
@@ -67,7 +66,7 @@ export async function summarizeContinuousCompaction(args: {
     if (headTokens > args.context.contextWindowTokens * SUMMARIZER_INPUT_FRACTION) return null;
   }
   const modelString = options.model;
-  const thinkingLevel = enforceThinkingPolicy(
+  const initialThinkingLevel = enforceThinkingPolicy(
     modelString,
     coerceThinkingLevel(options.thinkingLevel) ?? "off",
     undefined,
@@ -115,16 +114,24 @@ export async function summarizeContinuousCompaction(args: {
     }
   );
   args.signal.throwIfAborted();
-  const created = await args.aiService.createModelWithPinnedMetadata(modelString, {
+  const created = await args.aiService.createModelWithPinnedOptions(modelString, {
     workspaceId: args.workspaceId,
     agentInitiated: true,
+    thinkingLevel: initialThinkingLevel,
+    providerOptions: options.providerOptions,
   });
   if (!created.success) throw new Error(`Cannot create compact model: ${created.error.type}`);
   try {
     args.signal.throwIfAborted();
+    const thinkingLevel = enforceThinkingPolicy(
+      created.data.optionsModelString,
+      coerceThinkingLevel(options.thinkingLevel) ?? "off",
+      undefined,
+      created.data.optionsProvidersConfig
+    );
     const prepared = prepareProviderRequestMessages(
       args.head,
-      created.data.metadataModel.split(":", 1)[0],
+      created.data.wireProviderName,
       thinkingLevel
     );
     const messages = await prepareMessagesForProvider({
@@ -132,10 +139,10 @@ export async function summarizeContinuousCompaction(args: {
       effectiveAgentId: "compact",
       toolNamesForSentinel: [],
       postCompactionAttachments: null,
-      providerForMessages: created.data.metadataModel.split(":", 1)[0],
+      providerForMessages: created.data.wireProviderName,
       effectiveThinkingLevel: thinkingLevel,
-      modelString,
-      providersConfig,
+      modelString: created.data.optionsModelString,
+      providersConfig: created.data.optionsProvidersConfig,
       workspaceId: args.workspaceId,
     });
     messages.push({
@@ -178,24 +185,24 @@ export async function summarizeContinuousCompaction(args: {
       messages,
       abortSignal: args.signal,
       providerOptions: buildProviderOptions(
-        modelString,
+        created.data.optionsModelString,
         thinkingLevel,
         args.head,
         undefined,
-        options.providerOptions,
+        created.data.optionsMuxProviderOptions,
         args.workspaceId,
         undefined,
-        providersConfig,
-        getExplicitGatewayPrefix(modelString),
+        created.data.optionsProvidersConfig,
+        created.data.optionsRouteProvider,
         undefined,
         options.reasoningMode
       ) as NonNullable<Parameters<typeof streamText>[0]["providerOptions"]>,
       headers: buildRequestHeaders(
-        modelString,
-        options.providerOptions,
+        created.data.optionsModelString,
+        created.data.optionsMuxProviderOptions,
         args.workspaceId,
-        providersConfig,
-        getExplicitGatewayPrefix(modelString)
+        created.data.optionsProvidersConfig,
+        created.data.optionsRouteProvider
       ),
     });
     const text = (await stream.text).trim();

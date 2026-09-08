@@ -1,3 +1,5 @@
+import type { HistoryService } from "@/node/services/historyService";
+import { createSessionHistoryTool } from "@/node/services/tools/session_history";
 import { xai } from "@ai-sdk/xai";
 import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
@@ -200,6 +202,7 @@ export interface ToolConfiguration {
   /** Pre-resolved mux-managed resource scope (global ~/.xum vs project root). */
   xumScope?: XumToolScope;
   /** Memory service for the memory tool (present only when the memory experiment is enabled). */
+  historyService?: HistoryService;
   memoryService?: MemoryService;
   timelineService?: TimelineService;
   /** Per-scope memory write policy for the current agent (defaults to read-only). */
@@ -298,6 +301,7 @@ export interface ToolConfiguration {
     rlm?: boolean;
     advisorTool?: boolean;
     dynamicWorkflows?: boolean;
+    tokenBudget?: boolean;
     memory?: boolean;
     timeline?: boolean;
     workspaceHeartbeats?: boolean;
@@ -352,13 +356,9 @@ export interface ToolConfiguration {
     /** Returns the frozen same-step capture snapshot for a specific advisor tool call, if available. */
     takeToolCallSnapshot: (toolCallId: string) => AdvisorToolCallSnapshot | undefined;
     /**
-     * Creates a LanguageModel from a model string (delegates to
-     * providerModelFactory). Also returns the wire-resolved identity for
-     * provider option construction, derived from the SAME config snapshot
-     * that created the model: a raw coder:<instance>/<model> string carries
-     * no wire information on its own, so building options from it would emit
-     * the wrong (or no) provider namespace for custom-named or cross-typed
-     * instances.
+     * Creates a model and pins its request identity, route, and config together.
+     * Coder identities retain their actual instance and scoped aliases; option
+     * construction resolves their wire from this snapshot, never live config.
      */
     createModel: (modelString: string) => Promise<{
       model: LanguageModel;
@@ -371,7 +371,7 @@ export interface ToolConfiguration {
        * alias metadata from the raw custom identity.
        */
       optionsProvidersConfig: ProvidersConfigMap | null;
-      /** Pinned wire/route options keep Pro restricted to supported direct Responses requests. */
+      /** Pinned wire/route options keep Pro restricted to supported Responses routes. */
       optionsMuxProviderOptions?: MuxProviderOptions;
       optionsRouteProvider?: ProviderName;
     }>;
@@ -822,6 +822,9 @@ export async function getToolsForModel(
     bash_background_terminate: wrap(createBashBackgroundTerminateTool(config)),
 
     web_fetch: wrap(createWebFetchTool(config)),
+    ...(config.experiments?.tokenBudget
+      ? { session_history: wrap(createSessionHistoryTool(config)) }
+      : {}),
 
     // Agent memory (experiment-gated; off => no tool, no context cost)
     ...(config.memoryService && config.experiments?.memory
@@ -1026,6 +1029,7 @@ export async function getToolsForModel(
       ),
       enableAdvisor: Boolean(config.advisorRuntime),
       enableIntuition: Boolean(config.intuitionRuntime),
+      enableSessionHistory: config.experiments?.tokenBudget === true,
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
       enableTimelineEvent: Boolean(config.timelineService && config.experiments?.timeline),
       enableToolSearch: Boolean(config.toolSearchRuntime),

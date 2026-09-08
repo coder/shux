@@ -1,4 +1,5 @@
 import { AgentSideConnection, PROTOCOL_VERSION, ndJsonStream } from "@agentclientprotocol/sdk";
+import { STOP_UNRECORDED_MESSAGE } from "../../src/common/constants/workspace";
 import type { OnChatMode, WorkspaceChatMessage } from "../../src/common/orpc/types";
 import { MuxAgent } from "../../src/node/acp/agent";
 import type { ORPCClient, ServerConnection } from "../../src/node/acp/serverConnection";
@@ -565,6 +566,54 @@ function streamEnd(
 }
 
 describe("ACP prompt stream correlation", () => {
+  it.each(["unchanged", "loadSession", "resumeSession"] as const)(
+    "sends session-local picker settings after %s despite unchanged workspace metadata",
+    async (method) => {
+      const harness = createHarness();
+      await initializeDefaultAgent(harness);
+      const { sessionId } = await createDefaultSession(harness);
+      for (const [configId, value] of [
+        ["agentMode", "plan"],
+        ["model", "openai:gpt-5.2"],
+        ["thinkingLevel", "high"],
+        ["agentMode", "plan"],
+      ]) {
+        await harness.agent.setSessionConfigOption({ sessionId, configId, value });
+      }
+      expect(harness.sendMessageCalls).toHaveLength(0);
+      const restored =
+        method === "unchanged"
+          ? undefined
+          : await harness.agent[method]({
+              sessionId,
+              cwd: "/repo/acp-go-sdk",
+              mcpServers: [],
+            });
+
+      const { promptPromise, promptCorrelationId } = await startPromptTurn(harness, sessionId);
+      harness.pushChatEvent(
+        streamStart(sessionId, "assistant-local", { acpPromptId: promptCorrelationId })
+      );
+      harness.pushChatEvent(streamEnd(sessionId, "assistant-local"));
+      await expect(promptPromise).resolves.toMatchObject({ stopReason: "end_turn" });
+      harness.closeConnection();
+      await harness.connectionClosed;
+      expect(harness.sendMessageCalls[0]?.options).toMatchObject({
+        agentId: "plan",
+        model: "openai:gpt-5.2",
+        thinkingLevel: "high",
+      });
+      if (restored) {
+        expect(restored.configOptions).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ id: "model", currentValue: "openai:gpt-5.2" }),
+            expect.objectContaining({ id: "thinkingLevel", currentValue: "high" }),
+          ])
+        );
+      }
+    }
+  );
+
   it("ignores unrelated stream-start/end pairs while waiting for this prompt turn", async () => {
     const harness = createHarness();
     const { newSessionResponse, promptPromise, promptCorrelationId } =
@@ -885,8 +934,28 @@ describe("ACP prompt stream correlation", () => {
     expect(harness.interruptCalls).toEqual([
       {
         workspaceId: newSessionResponse.sessionId,
+        options: { retireBashMonitorAttention: true },
       },
     ]);
+
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
+
+  it("settles pending prompts as cancelled when the Stop stopped the stream but was not recorded", async () => {
+    const harness = createHarness({
+      interruptStream: async () => ({ success: false, error: STOP_UNRECORDED_MESSAGE }),
+    });
+    const { newSessionResponse, promptPromise } = await createDefaultPromptTurn(harness);
+
+    await expect(harness.agent.cancel({ sessionId: newSessionResponse.sessionId })).rejects.toThrow(
+      STOP_UNRECORDED_MESSAGE
+    );
+
+    await expect(promptPromise).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: undefined,
+    });
 
     harness.closeConnection();
     await harness.connectionClosed;

@@ -718,6 +718,7 @@ describe("AgentSession continuous compaction wiring", () => {
     async (eventType) => {
       const h = await setup();
       const resumed = deferred<void>();
+      const settled = deferred<void>();
       const order: string[] = [];
       let starts = 0;
       spyOn(h.aiService, "streamMessage").mockImplementation(() => {
@@ -774,6 +775,11 @@ describe("AgentSession continuous compaction wiring", () => {
                 dispatchOptions: { source: "internal-resume" },
               });
               order.push("apply");
+              // Idle waiters (monitor wakes) must stay parked until the continuation is sent.
+              void h.session.waitForMidStreamCompactionSettled().then(() => {
+                order.push("settled");
+                settled.resolve();
+              });
               await appendBoundary(h, followUp);
               return true;
             }
@@ -819,7 +825,8 @@ describe("AgentSession continuous compaction wiring", () => {
         observationFinished.resolve();
       }
       await resumed.promise;
-      expect(order).toEqual(["stop", "apply", "latch-released", "resume"]);
+      await settled.promise;
+      expect(order).toEqual(["stop", "apply", "latch-released", "resume", "settled"]);
       const history = await rows(h);
       expect(history.some((row) => row.metadata?.muxMetadata?.type === "compaction-request")).toBe(
         false
@@ -981,6 +988,19 @@ describe("AgentSession continuous compaction wiring", () => {
     };
   }
 
+  function pinnedSummaryModel(sdkModel: MockLanguageModelV3, metadataModel: string) {
+    return {
+      model: sdkModel,
+      metadataModel,
+      effectiveModelString: metadataModel,
+      wireProviderName: "openai",
+      optionsModelString: metadataModel,
+      optionsProvidersConfig: {},
+      optionsMuxProviderOptions: {},
+      optionsRouteProvider: "openai" as const,
+    };
+  }
+
   function modelChunks(): LanguageModelV3StreamPart[] {
     return [
       { type: "text-start", id: "summary" },
@@ -1024,8 +1044,8 @@ describe("AgentSession continuous compaction wiring", () => {
         return Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) });
       },
     });
-    const create = spyOn(h.aiService, "createModelWithPinnedMetadata").mockResolvedValue(
-      Ok({ model: sdkModel, metadataModel: "openai:gpt-4.1" })
+    const create = spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok(pinnedSummaryModel(sdkModel, "openai:gpt-4.1"))
     );
     const record = mock<SessionUsageService["recordHeadlessUsage"]>(() =>
       Promise.resolve(undefined)
@@ -1064,6 +1084,62 @@ describe("AgentSession continuous compaction wiring", () => {
     expect(await rows(h)).toHaveLength(0);
   });
 
+  test.each([
+    { route: "coder", alias: true, wire: "responses", pro: true },
+    { route: "mux-gateway", alias: false, wire: "responses", pro: false },
+    { route: "openai", alias: false, wire: "responses", pro: true },
+    { route: "openai", alias: false, wire: "chatCompletions", pro: false },
+  ] as const)(
+    "summary consumes the pinned route/wire rather than raw Coder intent: %j",
+    async (testCase) => {
+      const { h, args } = await summarySetup();
+      const rawModel = `coder:prod-openai/${testCase.alias ? "team-astra" : "gpt-6-astra"}`;
+      const requests: LanguageModelV3CallOptions[] = [];
+      const sdkModel = new MockLanguageModelV3({
+        doStream: (request) => {
+          requests.push(request);
+          return Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) });
+        },
+      });
+      spyOn(h.aiService, "getProvidersConfig").mockReturnValue({
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          discoveredProviders: [{ name: "prod-openai", type: "anthropic" }],
+        },
+      });
+      spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+        Ok({
+          ...pinnedSummaryModel(sdkModel, "openai:gpt-6-astra"),
+          effectiveModelString:
+            testCase.route === "coder" ? rawModel : `${testCase.route}:gpt-6-astra`,
+          optionsModelString: testCase.route === "coder" ? rawModel : "openai:gpt-6-astra",
+          optionsRouteProvider: testCase.route,
+          optionsMuxProviderOptions: { openai: { wireFormat: testCase.wire } },
+          optionsProvidersConfig: {
+            coder: {
+              apiKeySet: false,
+              isEnabled: true,
+              isConfigured: true,
+              discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+              models: [{ id: "prod-openai/team-astra", mappedToModel: "openai:gpt-6-astra" }],
+            },
+          },
+        })
+      );
+      await summarizeContinuousCompaction({
+        ...args,
+        compactOptions: { ...args.compactOptions, model: rawModel, reasoningMode: "pro" },
+        baseOptions: { ...args.baseOptions, model: rawModel, reasoningMode: "pro" },
+      });
+      expect(requests[0].providerOptions?.openai?.reasoningMode).toBe(
+        testCase.pro ? "pro" : undefined
+      );
+      expect(requests[0].providerOptions?.anthropic).toBeUndefined();
+    }
+  );
+
   test("a compact model too small for the head falls back to the configured parent route without truncating", async () => {
     const { h, args } = await summarySetup();
     spyOn(h.aiService, "getProvidersConfig").mockReturnValue({
@@ -1078,8 +1154,8 @@ describe("AgentSession continuous compaction wiring", () => {
       doStream: () =>
         Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) }),
     });
-    const create = spyOn(h.aiService, "createModelWithPinnedMetadata").mockResolvedValue(
-      Ok({ model: sdkModel, metadataModel: model })
+    const create = spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok(pinnedSummaryModel(sdkModel, model))
     );
     const result = await summarizeContinuousCompaction({
       ...args,
@@ -1099,7 +1175,7 @@ describe("AgentSession continuous compaction wiring", () => {
         models: [{ id: "gpt-4.1-mini", contextWindowTokens: 100 }],
       },
     });
-    const create = spyOn(h.aiService, "createModelWithPinnedMetadata");
+    const create = spyOn(h.aiService, "createModelWithPinnedOptions");
     const result = await summarizeContinuousCompaction({
       ...args,
       context: { ...args.context, contextWindowTokens: 100 },
@@ -1126,8 +1202,8 @@ describe("AgentSession continuous compaction wiring", () => {
         });
       },
     });
-    spyOn(h.aiService, "createModelWithPinnedMetadata").mockResolvedValue(
-      Ok({ model: sdkModel, metadataModel: model })
+    spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok(pinnedSummaryModel(sdkModel, model))
     );
     const result = summarizeContinuousCompaction({ ...args, signal: controller.signal }).catch(
       (error: unknown) => error

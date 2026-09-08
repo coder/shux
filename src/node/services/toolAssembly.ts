@@ -95,6 +95,7 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   effectiveToolPolicy: ToolPolicy | undefined;
   /** PTC experiment flags. */
   experiments?: {
+    tokenBudget?: boolean;
     programmaticToolCalling?: boolean;
     /**
      * RLM mode: graduate code_execution onto the persistent per-workspace
@@ -148,6 +149,7 @@ export function resolveBackendGatedPtcExperiments(
       experiments?.programmaticToolCalling ??
       isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
     rlm: experiments?.rlm ?? isExperimentEnabled(EXPERIMENT_IDS.RLM),
+    tokenBudget: experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET),
   };
 }
 

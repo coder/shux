@@ -1,3 +1,8 @@
+import { MuxMessageSchema } from "@/common/orpc/schemas/message";
+import {
+  createContextBudgetRejectedMessage,
+  restoreContextBudgetRejectedMessageForDisplay,
+} from "./contextBudgetRejection";
 import { describe, expect, it } from "bun:test";
 import type { MuxMessage } from "@/common/types/message";
 import { buildChatJsonlForSharing } from "./transcriptShare";
@@ -7,6 +12,62 @@ function splitJsonlLines(jsonl: string): string[] {
 }
 
 describe("buildChatJsonlForSharing", () => {
+  it("keeps rejection capsules inert while redacting their original tool output for sharing", () => {
+    const original: MuxMessage = {
+      id: "rejected-payload",
+      role: "assistant",
+      metadata: { historySequence: 4, synthetic: true, uiVisible: true, partial: true },
+      parts: [
+        { type: "text", text: "Visible original response" },
+        {
+          type: "dynamic-tool",
+          toolCallId: "call",
+          toolName: "bash",
+          state: "output-available",
+          input: {},
+          output: "private-result",
+        },
+      ],
+    };
+    const capsule = createContextBudgetRejectedMessage(original);
+    const jsonl = buildChatJsonlForSharing([capsule], { includeToolOutput: false });
+    expect(jsonl).not.toContain("private-result");
+    const exported = MuxMessageSchema.parse(JSON.parse(jsonl));
+    expect(exported).toMatchObject({
+      role: "assistant",
+      parts: [],
+      metadata: { contextBudgetRejected: true },
+    });
+    expect(exported.metadata?.partial).toBeUndefined();
+    expect(restoreContextBudgetRejectedMessageForDisplay(exported).parts).toEqual([
+      original.parts[0],
+      {
+        type: "dynamic-tool",
+        toolCallId: "call",
+        toolName: "bash",
+        state: "output-redacted",
+        input: {},
+      },
+    ]);
+    expect(buildChatJsonlForSharing([capsule], { includeToolOutput: true })).toContain(
+      "private-result"
+    );
+    const damaged = MuxMessageSchema.parse({
+      ...capsule,
+      metadata: {
+        ...capsule.metadata,
+        contextBudgetRejectedMessage: {
+          ...capsule.metadata?.contextBudgetRejectedMessage,
+          metadata: { timestamp: "invalid" },
+        },
+      },
+    });
+    expect(buildChatJsonlForSharing([damaged], { includeToolOutput: false })).not.toContain(
+      "private-result"
+    );
+    expect(capsule.metadata?.contextBudgetRejectedMessage?.parts).toEqual(original.parts);
+  });
+
   it("strips tool output and sets state to output-redacted when includeToolOutput=false", () => {
     const messages: MuxMessage[] = [
       {

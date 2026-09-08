@@ -25,6 +25,41 @@ describe("MessageRenderer goal continuation rows", () => {
     globalThis.localStorage = undefined as unknown as Storage;
   });
 
+  test("budget warnings collapse machine text without hiding ordinary user input", () => {
+    const content = "Record the current objective and next steps in the workspace notes.";
+    const message: DisplayedMessage = {
+      type: "user",
+      id: "warning",
+      historyId: "warning",
+      historySequence: 1,
+      content,
+      isSynthetic: true,
+      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000 },
+    };
+    const view = render(
+      <TooltipProvider>
+        <MessageRenderer message={message} />
+      </TooltipProvider>
+    );
+    const toggle = view.container.querySelector("[data-context-budget-warning] button");
+    expect(toggle).not.toBeNull();
+    expect(view.queryByText(content)).toBeNull();
+    fireEvent.click(toggle!);
+    expect(view.getByText(content)).toBeDefined();
+    fireEvent.click(toggle!);
+    expect(view.queryByText(content)).toBeNull();
+
+    view.rerender(
+      <TooltipProvider>
+        <MessageRenderer
+          message={{ ...message, isSynthetic: undefined, contextBudgetWarning: undefined }}
+        />
+      </TooltipProvider>
+    );
+    expect(view.container.querySelector("[data-context-budget-warning]")).toBeNull();
+    expect(view.getByText(content)).toBeDefined();
+  });
+
   test("labels synthetic active-goal continuation user messages without exposing model-only prompt details", () => {
     const message: DisplayedMessage = {
       type: "user",
@@ -796,6 +831,17 @@ describe("MessageRenderer compaction boundary rows", () => {
 
     rerender(<MessageRenderer message={{ ...message, boundaryKind: "reset" }} />);
     expect(getByRole("separator").getAttribute("aria-label")).toBe("Context reset");
+
+    rerender(
+      <MessageRenderer
+        message={{ ...message, boundaryKind: "reset", contextWindowRollover: true }}
+      />
+    );
+    expect(getByRole("separator").getAttribute("aria-label")).toBe("Context window rollover");
+
+    // Rollover presentation cannot turn a compaction summary into a reset.
+    rerender(<MessageRenderer message={{ ...message, contextWindowRollover: true }} />);
+    expect(getByRole("separator").getAttribute("aria-label")).toBe("Continuous compaction #4");
 
     rerender(<MessageRenderer message={{ ...message, strategy: undefined }} />);
     expect(getByRole("separator").getAttribute("aria-label")).toBe("Compaction boundary #4");

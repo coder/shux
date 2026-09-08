@@ -1,3 +1,21 @@
+import {
+  HistoryAppendProvenance,
+  HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
+  invalidateHistoryAppendProvenance,
+} from "./historyAppendProvenance";
+import { SESSION_HISTORY_MAX_SCAN_BYTES } from "@/common/constants/contextBudget";
+import {
+  hasRawResetMarker,
+  hasAmbiguousResetKeys,
+  isReadableHistoryMessage,
+  scanHistoryFilesBounded,
+  readProviderHistoryFromLatestBoundary,
+  readHistoryControlEvidenceFromLatestBoundary,
+  type HistoryControlRow,
+  type BoundedHistoryScanOptions,
+} from "./historyScanner";
+import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
+import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
 import { renameSync } from "node:fs";
@@ -10,6 +28,7 @@ import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import {
   isCompactionSummaryMetadata,
+  isSyntheticSnapshotUserMessage,
   type MuxMessage,
   type MuxMetadata,
 } from "@/common/types/message";
@@ -56,6 +75,31 @@ import {
  * workspace removal can hold it across its tombstone+delete critical section.
  */
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
+
+interface HistoryTruncateHashes {
+  finalArchiveHash: string | null;
+  finalChatHash: string | null;
+}
+
+interface HistoryTruncateTransaction extends HistoryTruncateHashes {
+  rawHashes?: HistoryTruncateHashes & { version: 1 };
+}
+
+interface HistoryRewriteRow {
+  raw: Buffer;
+  message: MuxMessage | undefined;
+}
+
+function splitHistoryLines(raw: Buffer): Buffer[] {
+  const lines: Buffer[] = [];
+  for (let start = 0; start < raw.length; ) {
+    const newline = raw.indexOf(10, start);
+    const end = newline < 0 ? raw.length : newline + 1;
+    lines.push(raw.subarray(start, end));
+    start = end;
+  }
+  return lines;
+}
 
 function hasDurableCompactionBoundary(metadata: MuxMetadata | undefined): boolean {
   if (metadata?.compactionBoundary !== true) {
@@ -209,6 +253,53 @@ interface SubagentTranscriptDependencies {
 }
 
 export class HistoryService {
+  private getAppendProvenance(workspaceId: string): HistoryAppendProvenance {
+    return new HistoryAppendProvenance(this.getSessionDir(workspaceId));
+  }
+
+  /** One bounded page under both history locks; never performs mutation recovery. */
+  scanHistoryBounded(workspaceId: string, options: BoundedHistoryScanOptions) {
+    assert(workspaceId.trim().length > 0, "history scan requires workspaceId");
+    return this.fileLocks.withLock(workspaceId, () =>
+      this.withHistoryWriteFileLock(workspaceId, async () => {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
+          throw new Error("stale_cursor");
+        // Recovery rewrites history and takes the write lock. This read-only tool
+        // must instead fail closed while a truncate transaction is unresolved.
+        const assertNoTruncate = async () => {
+          for (const marker of [
+            this.getTruncateTransactionPath(workspaceId),
+            `${this.getChatArchivePath(workspaceId)}.truncate`,
+          ]) {
+            const exists = await fs.stat(marker).then(
+              () => true,
+              (error: NodeJS.ErrnoException) => {
+                if (error.code !== "ENOENT") throw error;
+                return false;
+              }
+            );
+            if (exists) throw new Error("stale_cursor");
+          }
+        };
+        await assertNoTruncate();
+        const provenance = this.getAppendProvenance(workspaceId);
+        const { receipt, bytesRead } = await provenance.forScan(options.cursor?.provenanceEpoch);
+        const result = await scanHistoryFilesBounded(
+          {
+            chat: this.getChatHistoryPath(workspaceId),
+            archive: this.getChatArchivePath(workspaceId),
+          },
+          options,
+          receipt.epoch,
+          SESSION_HISTORY_MAX_SCAN_BYTES - 2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES
+        );
+        result.bytesRead += bytesRead + (await provenance.validatePage(receipt));
+        await assertNoTruncate();
+        return result;
+      })
+    );
+  }
+
   private readonly CHAT_FILE = CHAT_FILE_NAME;
   private readonly CHAT_ARCHIVE_FILE = CHAT_ARCHIVE_FILE_NAME;
   private readonly PARTIAL_FILE = "partial.json";
@@ -520,8 +611,12 @@ export class HistoryService {
   }
 
   private async readExistingFile(filePath: string): Promise<string | null> {
+    return (await this.readExistingFileBytes(filePath))?.toString("utf8") ?? null;
+  }
+
+  private async readExistingFileBytes(filePath: string): Promise<Buffer | null> {
     try {
-      return await fs.readFile(filePath, "utf-8");
+      return await fs.readFile(filePath);
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return null;
@@ -530,14 +625,11 @@ export class HistoryService {
     }
   }
 
-  private historyContentsHash(contents: string): string {
+  private historyContentsHash(contents: string | Buffer): string {
     return createHash("sha256").update(contents).digest("hex");
   }
 
-  private parseTruncateTransaction(contents: string): {
-    finalArchiveHash: string | null;
-    finalChatHash: string | null;
-  } | null {
+  private parseTruncateTransaction(contents: string): HistoryTruncateTransaction | null {
     try {
       const parsed: unknown = JSON.parse(contents);
       if (parsed === null || typeof parsed !== "object") {
@@ -546,22 +638,48 @@ export class HistoryService {
       const marker = parsed as Record<string, unknown>;
       const finalArchiveHash = marker.finalArchiveHash;
       const finalChatHash = marker.finalChatHash;
-      if (
-        (finalArchiveHash !== null && typeof finalArchiveHash !== "string") ||
-        (finalChatHash !== null && typeof finalChatHash !== "string")
-      ) {
-        return null;
+      const isHash = (value: unknown): value is string | null =>
+        value === null || (typeof value === "string" && /^[a-f0-9]{64}$/.test(value));
+      if (!isHash(finalArchiveHash) || !isHash(finalChatHash)) return null;
+      const result: HistoryTruncateTransaction = { finalArchiveHash, finalChatHash };
+      if ("rawHashes" in marker) {
+        const raw = marker.rawHashes;
+        // An invalid extension is not a legacy marker: never downgrade its
+        // verification to decoded hashes, which can hide changed invalid bytes.
+        if (
+          !raw ||
+          typeof raw !== "object" ||
+          !("version" in raw) ||
+          raw.version !== 1 ||
+          !("finalArchiveHash" in raw) ||
+          !isHash(raw.finalArchiveHash) ||
+          !("finalChatHash" in raw) ||
+          !isHash(raw.finalChatHash)
+        )
+          return null;
+        result.rawHashes = {
+          version: 1,
+          finalArchiveHash: raw.finalArchiveHash,
+          finalChatHash: raw.finalChatHash,
+        };
       }
-      return { finalArchiveHash, finalChatHash };
+      return result;
     } catch {
       return null;
     }
   }
 
-  private historyContentsMatch(contents: string | null, hash: string | null): boolean {
-    return hash === null
-      ? contents === null
-      : contents !== null && this.historyContentsHash(contents) === hash;
+  private historyContentsMatch(
+    contents: Buffer | null,
+    hash: string | null,
+    rawHash?: string | null
+  ): boolean {
+    if (hash === null) return contents === null && (rawHash === undefined || rawHash === null);
+    return (
+      contents !== null &&
+      this.historyContentsHash(contents.toString("utf8")) === hash &&
+      (rawHash === undefined || this.historyContentsHash(contents) === rawHash)
+    );
   }
 
   private async recoverTruncateTransactionUnlocked(workspaceId: string): Promise<boolean> {
@@ -582,7 +700,7 @@ export class HistoryService {
       if (!tombstoneExists) {
         return false;
       }
-      const archiveExists = (await this.readExistingFile(archivePath)) !== null;
+      const archiveExists = (await this.readExistingFileBytes(archivePath)) !== null;
       if (archiveExists) {
         await fs.rm(archiveTombstonePath);
       } else {
@@ -597,20 +715,36 @@ export class HistoryService {
       if (marker === null) {
         return false;
       }
-      const archiveContents = await this.readExistingFile(archivePath);
-      const chatContents = await this.readExistingFile(this.getChatHistoryPath(workspaceId));
+      const archiveContents = await this.readExistingFileBytes(archivePath);
+      const chatContents = await this.readExistingFileBytes(this.getChatHistoryPath(workspaceId));
       return (
-        this.historyContentsMatch(archiveContents, marker.finalArchiveHash) &&
-        this.historyContentsMatch(chatContents, marker.finalChatHash)
+        this.historyContentsMatch(
+          archiveContents,
+          marker.finalArchiveHash,
+          marker.rawHashes?.finalArchiveHash
+        ) &&
+        this.historyContentsMatch(
+          chatContents,
+          marker.finalChatHash,
+          marker.rawHashes?.finalChatHash
+        )
       );
     }
 
     if (marker !== null) {
-      const archiveContents = await this.readExistingFile(archivePath);
-      const chatContents = await this.readExistingFile(this.getChatHistoryPath(workspaceId));
+      const archiveContents = await this.readExistingFileBytes(archivePath);
+      const chatContents = await this.readExistingFileBytes(this.getChatHistoryPath(workspaceId));
       const committed =
-        this.historyContentsMatch(archiveContents, marker.finalArchiveHash) &&
-        this.historyContentsMatch(chatContents, marker.finalChatHash);
+        this.historyContentsMatch(
+          archiveContents,
+          marker.finalArchiveHash,
+          marker.rawHashes?.finalArchiveHash
+        ) &&
+        this.historyContentsMatch(
+          chatContents,
+          marker.finalChatHash,
+          marker.rawHashes?.finalChatHash
+        );
       if (committed) {
         await fs.rm(archiveTombstonePath);
         await fs.rm(markerPath, { force: true });
@@ -670,7 +804,10 @@ export class HistoryService {
       if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
         return;
       }
-      await this.recoverTruncateTransactionUnlocked(workspaceId);
+      await this.getAppendProvenance(workspaceId).runMutation(async () => {
+        invalidateHistoryAppendProvenance();
+        await this.recoverTruncateTransactionUnlocked(workspaceId);
+      });
     });
   }
 
@@ -698,9 +835,10 @@ export class HistoryService {
 
   private async rewriteHistoryFilesUnlocked(
     workspaceId: string,
-    finalArchiveContents: string | null,
-    finalChatContents: string | null
+    finalArchiveContents: Buffer | null,
+    finalChatContents: Buffer | null
   ): Promise<void> {
+    invalidateHistoryAppendProvenance();
     const archivePath = this.getChatArchivePath(workspaceId);
     const archiveTombstonePath = `${archivePath}.truncate`;
     const markerPath = this.getTruncateTransactionPath(workspaceId);
@@ -726,10 +864,23 @@ export class HistoryService {
     await writeFileAtomic(
       markerPath,
       JSON.stringify({
+        // Older builds hash decoded UTF-8. Keep these fields compatible so a
+        // downgrade cannot roll back a committed byte-preserving truncation.
         finalArchiveHash:
-          finalArchiveContents === null ? null : this.historyContentsHash(finalArchiveContents),
+          finalArchiveContents === null
+            ? null
+            : this.historyContentsHash(finalArchiveContents.toString("utf8")),
         finalChatHash:
-          finalChatContents === null ? null : this.historyContentsHash(finalChatContents),
+          finalChatContents === null
+            ? null
+            : this.historyContentsHash(finalChatContents.toString("utf8")),
+        rawHashes: {
+          version: 1,
+          finalArchiveHash:
+            finalArchiveContents === null ? null : this.historyContentsHash(finalArchiveContents),
+          finalChatHash:
+            finalChatContents === null ? null : this.historyContentsHash(finalChatContents),
+        },
       })
     );
     try {
@@ -1069,7 +1220,7 @@ export class HistoryService {
 
   /**
    * Read a history file from start to end in chunks, calling visitor with each
-   * batch of parsed messages. Uses raw byte scanning for \n to handle
+   * batch of parsed messages and the original trimmed lines. Uses raw byte scanning for \n to handle
    * multi-byte UTF-8 safely at chunk boundaries.
    *
    * Returns false when the visitor stopped iteration early, true otherwise —
@@ -1077,7 +1228,11 @@ export class HistoryService {
    */
   private async iterateForward(
     filePath: string,
-    visitor: (messages: MuxMessage[]) => boolean | void | Promise<boolean | void>
+    visitor: (
+      messages: MuxMessage[],
+      rawLines: readonly string[],
+      rawBytes: Buffer
+    ) => boolean | void | Promise<boolean | void>
   ): Promise<boolean> {
     let fileSize: number;
     try {
@@ -1129,9 +1284,11 @@ export class HistoryService {
         carryoverBytes = Buffer.from(buffer.subarray(lastNewline + 1));
 
         const messages: MuxMessage[] = [];
-        for (const line of completeText.split("\n")) {
-          const trimmed = line.trim();
-          if (trimmed.length === 0) continue;
+        const rawLines = completeText
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean);
+        for (const trimmed of rawLines) {
           try {
             messages.push(normalizeLegacyMuxMetadata(JSON.parse(trimmed) as MuxMessage));
           } catch {
@@ -1140,7 +1297,11 @@ export class HistoryService {
         }
 
         if (messages.length > 0) {
-          const shouldContinue = await visitor(messages);
+          const shouldContinue = await visitor(
+            messages,
+            rawLines,
+            buffer.subarray(0, lastNewline + 1)
+          );
           if (shouldContinue === false) return false;
         }
       }
@@ -1151,7 +1312,7 @@ export class HistoryService {
         if (line.length > 0) {
           try {
             const msg = normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage);
-            const shouldContinue = await visitor([msg]);
+            const shouldContinue = await visitor([msg], [line], carryoverBytes);
             if (shouldContinue === false) return false;
           } catch {
             // Skip malformed line
@@ -1310,7 +1471,7 @@ export class HistoryService {
       sourceWorkspaceId !== targetWorkspaceId,
       "history snapshot target must be a new workspace"
     );
-    const snapshot = await this.withRecoveredHistoryResultLock(
+    const snapshot = await this.withRecoveredHistoryWriteResultLock(
       sourceWorkspaceId,
       "Failed to read history snapshot",
       async () =>
@@ -1323,22 +1484,24 @@ export class HistoryService {
       return snapshot;
     }
 
-    try {
-      await ensurePrivateDir(this.getSessionDir(targetWorkspaceId));
-      for (const [targetPath, contents] of [
-        [this.getChatArchivePath(targetWorkspaceId), snapshot.data.archive],
-        [this.getChatHistoryPath(targetWorkspaceId), snapshot.data.chat],
-      ] as const) {
-        if (contents === null) {
-          await fs.rm(targetPath, { force: true });
-        } else {
-          await writeFileAtomic(targetPath, contents);
+    return this.withRecoveredHistoryWriteResultLock(
+      targetWorkspaceId,
+      "Failed to copy history snapshot",
+      async () => {
+        invalidateHistoryAppendProvenance();
+        for (const [targetPath, contents] of [
+          [this.getChatArchivePath(targetWorkspaceId), snapshot.data.archive],
+          [this.getChatHistoryPath(targetWorkspaceId), snapshot.data.chat],
+        ] as const) {
+          if (contents === null) {
+            await fs.rm(targetPath, { force: true });
+          } else {
+            await writeFileAtomic(targetPath, contents);
+          }
         }
+        return Ok(undefined);
       }
-      return Ok(undefined);
-    } catch (error) {
-      return Err(`Failed to copy history snapshot: ${getErrorMessage(error)}`);
-    }
+    );
   }
 
   private async iterateFullHistoryUnlocked(
@@ -1642,6 +1805,7 @@ export class HistoryService {
   /**
    * Read messages from a compaction boundary onward.
    * Falls back to full history if no boundary exists (new/uncompacted workspace).
+   * Unreadable reset evidence is a provider privacy floor that skip/fallback cannot cross.
    *
    * @param skip How many boundaries to skip (counting from the latest, across
    *             chat.jsonl and the sealed archive). 0 = read from the latest
@@ -1663,6 +1827,28 @@ export class HistoryService {
     }
   }
 
+  /** Lifecycle decisions retain malformed IDs/parts without bypassing the raw privacy floor. */
+  async getControlEvidenceFromLatestBoundary(
+    workspaceId: string
+  ): Promise<Result<HistoryControlRow[]>> {
+    return this.withRecoveredHistoryResultLock(
+      workspaceId,
+      "Failed to read history control evidence",
+      async () => {
+        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        return Ok(
+          await readHistoryControlEvidenceFromLatestBoundary(
+            {
+              chat: this.getChatHistoryPath(workspaceId),
+              archive: this.getChatArchivePath(workspaceId),
+            },
+            0
+          )
+        );
+      }
+    );
+  }
+
   private async getHistoryFromLatestBoundaryUnlocked(
     workspaceId: string,
     skip: number
@@ -1671,45 +1857,17 @@ export class HistoryService {
     // by older builds so this read (and every later one) stays O(active epoch).
     await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
 
-    const chatPath = this.getChatHistoryPath(workspaceId);
-    const archivePath = this.getChatArchivePath(workspaceId);
-
-    // Try the requested boundary in chat.jsonl, falling back to less-skipped boundaries.
-    let chatBoundaryCount = 0;
-    let chatFallbackOffset: number | null = null;
-    for (let s = skip; s >= 0; s--) {
-      const offset = await this.findLastBoundaryByteOffset(chatPath, s);
-      if (offset !== null) {
-        if (s === skip) {
-          return Ok(await this.readHistoryFromOffset(chatPath, offset));
-        }
-        // chat.jsonl has fewer boundaries than requested; remember its oldest
-        // boundary as a fallback and keep counting into the archive.
-        chatBoundaryCount = s + 1;
-        chatFallbackOffset = offset;
-        break;
-      }
-    }
-
-    // Boundaries older than chat.jsonl live in the sealed archive. A window that
-    // starts at an archive boundary spans the archive tail plus all of chat.jsonl.
-    for (let s = skip - chatBoundaryCount; s >= 0; s--) {
-      const offset = await this.findLastBoundaryByteOffset(archivePath, s);
-      if (offset !== null) {
-        const archived = await this.readHistoryFromOffset(archivePath, offset);
-        const active = await this.readChatHistory(workspaceId);
-        return Ok([...archived, ...active]);
-      }
-    }
-
-    if (chatFallbackOffset !== null) {
-      return Ok(await this.readHistoryFromOffset(chatPath, chatFallbackOffset));
-    }
-
-    // No boundaries at all — workspace is uncompacted, full read is the only option
-    const archived = await this.readArchivedHistory(workspaceId);
-    const active = await this.readChatHistory(workspaceId);
-    return Ok([...archived, ...active]);
+    // Provider and control-evidence reads share raw privacy floors. UI browsing
+    // and archival rotation keep the durable-boundary locator and the full log.
+    return Ok(
+      await readProviderHistoryFromLatestBoundary(
+        {
+          chat: this.getChatHistoryPath(workspaceId),
+          archive: this.getChatArchivePath(workspaceId),
+        },
+        skip
+      )
+    );
   }
 
   // ── Sealed-history rotation ─────────────────────────────────────────────
@@ -1732,6 +1890,15 @@ export class HistoryService {
     }
 
     try {
+      const provenance = this.getAppendProvenance(workspaceId);
+      if (!provenance.inTransaction()) {
+        await this.withHistoryWriteFileLock(workspaceId, async () => {
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return;
+          await ensurePrivateDir(this.getSessionDir(workspaceId));
+          await provenance.runMutation(() => this.ensureSealedHistoryRotatedUnlocked(workspaceId));
+        });
+        return;
+      }
       const offset = await this.findLastBoundaryByteOffset(this.getChatHistoryPath(workspaceId));
       if (offset !== null && offset !== 0) {
         await this.rotateSealedHistoryUnlocked(workspaceId);
@@ -1754,8 +1921,8 @@ export class HistoryService {
    *
    * Crash safety: archived lines are fsynced before chat.jsonl is rewritten, so
    * a crash in between leaves duplicated rows in archive + chat.jsonl. The next
-   * rotation deduplicates by skipping prefix rows whose historySequence is
-   * already covered by the archive.
+   * rotation deduplicates sequence-covered prefix rows only after verifying
+   * that the archive contains the same complete row identity.
    */
   private async rotateSealedHistoryUnlocked(workspaceId: string): Promise<void> {
     const chatPath = this.getChatHistoryPath(workspaceId);
@@ -1766,37 +1933,61 @@ export class HistoryService {
       return; // Nothing sealed — boundary already starts the file (or no boundary).
     }
 
+    invalidateHistoryAppendProvenance();
     const fileBuffer = await fs.readFile(chatPath);
-    const sealedPrefix = fileBuffer.subarray(0, boundaryOffset).toString("utf-8");
+    const sealedPrefix = fileBuffer.subarray(0, boundaryOffset);
     const activeTail = fileBuffer.subarray(boundaryOffset);
 
-    // Crash-replay dedupe: find the newest sequence already archived.
+    // Sequence coverage only identifies possible crash-replay copies. A repaired
+    // row (especially a reset) may reuse an old sequence without being archived.
     const archivedMaxSequence = await this.getArchiveTailMaxSequence(workspaceId);
-
-    const linesToArchive: string[] = [];
-    for (const line of sealedPrefix.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed.length === 0) {
-        continue;
-      }
+    const candidates = new Set<string>();
+    // Parsed equality loses duplicate-key reset markers. Compare exact bytes,
+    // including whitespace and invalid UTF-8, before discarding a replayed row.
+    const fingerprint = (line: Buffer) => createHash("sha256").update(line).digest("hex");
+    const prefixRows = splitHistoryLines(sealedPrefix).map((line) => {
       try {
-        const message = JSON.parse(trimmed) as MuxMessage;
+        const message = JSON.parse(line.toString("utf8")) as MuxMessage;
         const sequence = message.metadata?.historySequence;
         if (isNonNegativeInteger(sequence) && sequence <= archivedMaxSequence) {
-          continue; // Already archived by a rotation that crashed before the chat rewrite.
+          const key = fingerprint(line);
+          candidates.add(key);
+          return { line, fingerprint: key };
         }
       } catch {
-        // Malformed line — preserve it in the archive (read paths skip it anyway).
+        // Malformed reset fragments must survive rotation byte-for-byte.
       }
-      linesToArchive.push(trimmed);
+      return { line, fingerprint: undefined };
+    });
+    const verifiedCopies = new Set<string>();
+    if (candidates.size > 0) {
+      await this.iterateForward(archivePath, (_messages, _rawLines, rawBytes) => {
+        for (const line of splitHistoryLines(rawBytes)) {
+          const key = fingerprint(line);
+          if (candidates.delete(key)) verifiedCopies.add(key);
+        }
+        return candidates.size > 0;
+      });
     }
+    const linesToArchive = prefixRows
+      .filter((row) => row.fingerprint === undefined || !verifiedCopies.has(row.fingerprint))
+      .map((row) => row.line);
 
     if (linesToArchive.length > 0) {
       // Append + fsync BEFORE rewriting chat.jsonl: a crash must never lose
       // sealed rows, only (at worst) duplicate them, which the dedupe above heals.
-      const fh = await fs.open(archivePath, "a");
+      const fh = await fs.open(archivePath, "a+");
       try {
-        await fh.writeFile(linesToArchive.join("\n") + "\n");
+        // A failed archive write can leave a torn tail while chat still contains
+        // the complete rows. Delimit that evidence before replaying those rows.
+        const { size } = await fh.stat();
+        if (size > 0) {
+          const tail = Buffer.alloc(1);
+          const read = await fh.read(tail, 0, 1, size - 1);
+          assert(read.bytesRead === 1, "archive tail must remain readable under the history lock");
+          if (tail[0] !== 10) await fh.writeFile("\n");
+        }
+        await fh.writeFile(Buffer.concat(linesToArchive));
         await fh.sync();
       } finally {
         await fh.close();
@@ -2187,7 +2378,6 @@ export class HistoryService {
     try {
       const workspaceDir = this.getSessionDir(workspaceId);
       await ensurePrivateDir(workspaceDir);
-      const historyPath = this.getChatHistoryPath(workspaceId);
 
       // DEBUG: Log message append with caller stack trace
       const stack = new Error().stack?.split("\n").slice(2, 6).join("\n") ?? "no stack";
@@ -2257,7 +2447,9 @@ export class HistoryService {
         `[HISTORY APPEND] Assigned historySequence=${message.metadata.historySequence ?? "unknown"} role=${message.role}`
       );
 
-      await fs.appendFile(historyPath, JSON.stringify(historyEntry) + "\n");
+      await this.getAppendProvenance(workspaceId).appendChat(
+        Buffer.from(JSON.stringify(historyEntry) + "\n")
+      );
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -2268,6 +2460,88 @@ export class HistoryService {
   /** Serialize messages as JSONL rows tagged with workspace context. */
   private serializeHistoryEntries(messages: readonly MuxMessage[], workspaceId: string): string {
     return messages.map((msg) => JSON.stringify({ ...msg, workspaceId }) + "\n").join("");
+  }
+
+  private async readHistoryForRewrite(filePath: string): Promise<{
+    rows: HistoryRewriteRow[];
+    messages: MuxMessage[];
+  }> {
+    const raw = (await this.readExistingFileBytes(filePath)) ?? Buffer.alloc(0);
+    const rows = splitHistoryLines(raw).map((line) => {
+      const text = line.toString("utf8");
+      return {
+        raw: line,
+        message: this.parseMessages(text, filePath, (value) =>
+          isReadableHistoryMessage(value) &&
+          !(hasRawResetMarker(text) && hasAmbiguousResetKeys(text))
+            ? normalizeLegacyMuxMetadata(value)
+            : null
+        )[0],
+      };
+    });
+    return { rows, messages: rows.flatMap((row) => (row.message ? [row.message] : [])) };
+  }
+
+  private serializeHistoryRewrite(
+    rows: readonly HistoryRewriteRow[],
+    workspaceId: string,
+    transform: (message: MuxMessage, raw: Buffer) => MuxMessage | null,
+    appended: readonly MuxMessage[] = []
+  ): Buffer {
+    // Automatic rewrites must not erase unreadable reset evidence, including
+    // invalid UTF-8, duplicate keys, and markers split across malformed rows.
+    const contents = rows.flatMap((row) => {
+      if (!row.message) return [row.raw];
+      const updated = transform(row.message, row.raw);
+      if (updated === row.message) return [row.raw];
+      if (updated === null) {
+        if (
+          hasRawResetMarker(row.raw.toString("utf8")) &&
+          (!isReadableHistoryMessage(row.message) ||
+            !hasRawResetMarker(JSON.stringify(row.message)))
+        ) {
+          throw new Error("History cleanup would erase unreadable reset evidence");
+        }
+        return [];
+      }
+      const serialized = this.serializeHistoryEntries([updated], workspaceId);
+      // Unreadable/ambiguous rows stay raw above. For readable rows, payload
+      // data cannot establish or stand in for a real top-level reset boundary.
+      if (
+        row.message.metadata?.contextBoundaryKind === CONTEXT_BOUNDARY_KINDS.RESET &&
+        updated.metadata?.contextBoundaryKind !== CONTEXT_BOUNDARY_KINDS.RESET
+      ) {
+        throw new Error("History update would erase reset evidence");
+      }
+      return [Buffer.from(serialized)];
+    });
+    // Future appends must start a new row even when a preserved corrupt tail
+    // lacked its final newline. Add only a delimiter; retain every original byte.
+    const last = contents.at(-1);
+    if (last && last.at(-1) !== 10) contents.push(Buffer.from("\n"));
+    if (appended.length > 0) {
+      contents.push(Buffer.from(this.serializeHistoryEntries(appended, workspaceId)));
+    }
+    return Buffer.concat(contents);
+  }
+
+  private serializeHistoryTruncation(
+    rows: readonly HistoryRewriteRow[],
+    workspaceId: string,
+    retainedMessages: readonly MuxMessage[],
+    sanitize: (message: MuxMessage) => MuxMessage = (message) => message
+  ): Buffer {
+    const retained = new Set(retainedMessages);
+    // Partial cuts are not full clears: unreadable fragments may jointly form a
+    // reset floor, even beyond the cut or in the other history file. Keep them
+    // byte-for-byte, including standalone JSON strings that parse as non-messages.
+    return this.serializeHistoryRewrite(rows, workspaceId, (message) =>
+      !isReadableHistoryMessage(message)
+        ? message
+        : retained.has(message)
+          ? sanitize(message)
+          : null
+    );
   }
 
   /**
@@ -2334,8 +2608,12 @@ export class HistoryService {
       // crashed transaction from another backend's live rewrite — rolling
       // back a live transaction mid-flight resurrects discarded history with
       // mismatched archive/chat state.
-      await this.recoverTruncateTransactionUnlocked(workspaceId);
-      return operation();
+      return this.getAppendProvenance(workspaceId).runMutation(async () => {
+        if (await this.truncateRecoveryArtifactsPresent(workspaceId))
+          invalidateHistoryAppendProvenance();
+        await this.recoverTruncateTransactionUnlocked(workspaceId);
+        return operation();
+      });
     });
   }
 
@@ -2390,7 +2668,11 @@ export class HistoryService {
     // recovery would redundantly acquire and release the same file lock.
     try {
       return await this.fileLocks.withLock(workspaceId, () =>
-        this.withCrossProcessWriteLock(workspaceId, operation)
+        this.withCrossProcessWriteLock(workspaceId, async () => {
+          const result = await operation();
+          if (!result.success) invalidateHistoryAppendProvenance();
+          return result;
+        })
       );
     } catch (error) {
       return Err(`${errorPrefix}: ${getErrorMessage(error)}`);
@@ -2436,7 +2718,6 @@ export class HistoryService {
           await this.refreshSequenceCounterUnderWriteLock(workspaceId);
           const workspaceDir = this.getSessionDir(workspaceId);
           await ensurePrivateDir(workspaceDir);
-          const historyPath = this.getChatHistoryPath(workspaceId);
           for (const message of messages) {
             assert(
               message.metadata?.historySequence === undefined,
@@ -2459,24 +2740,14 @@ export class HistoryService {
           // temp-and-rename helper the other history mutations use, under the
           // cross-process append lock (r50) so a foreign backend's row cannot
           // land between this read and the replace and be silently deleted.
-          const existing = await fs.readFile(historyPath, "utf-8").catch((error: unknown) => {
-            if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "";
-            throw error;
-          });
-          // Terminate a torn tail before concatenating (r50): a crash can
-          // leave chat.jsonl ending in an unterminated JSON line. Gluing the
-          // first payload row directly onto those bytes would make the
-          // self-healing reader drop payload+corruption as ONE malformed line
-          // while KEEPING the following trigger row — a durable trigger
-          // referencing an absent payload, breaking the batch's
-          // all-or-nothing contract. With the newline, only the pre-existing
-          // corrupt line is dropped and every batch row survives intact.
-          const healedExisting =
-            existing.length > 0 && !existing.endsWith("\n") ? existing + "\n" : existing;
-          await writeFileAtomic(
-            historyPath,
-            healedExisting + this.serializeHistoryEntries(messages, workspaceId)
+          await this.getAppendProvenance(workspaceId).appendChat(
+            Buffer.from(this.serializeHistoryEntries(messages, workspaceId)),
+            true
           );
+          // Publish the entire batch before sealing its previous epoch. Rotation
+          // is best-effort: a storage failure must not invite a duplicate batch.
+          const boundary = messages.findLast(isDurableContextBoundaryMarker);
+          if (boundary) await this.rotateAfterBoundaryWriteUnlocked(workspaceId, boundary);
           return Ok(undefined);
         } catch (error) {
           return Err(`Failed to append to history: ${getErrorMessage(error)}`);
@@ -2539,15 +2810,72 @@ export class HistoryService {
     );
   }
 
+  /** Reject a request and its owned preludes in one commit, never leaving replayable orphan payloads. */
+  async rejectContextBudgetRequest(
+    workspaceId: string,
+    trigger: MuxMessage
+  ): Promise<Result<MuxMessage[]>> {
+    assert(
+      trigger.role === "user" || trigger.metadata?.contextBudgetRejected === true,
+      "context-budget rejection requires a user trigger or rejected capsule"
+    );
+    assert(
+      isNonNegativeInteger(trigger.metadata?.historySequence),
+      "rejected trigger must be persisted"
+    );
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to reject context-budget request",
+      async () => {
+        invalidateHistoryAppendProvenance();
+        const historyPath = this.getChatHistoryPath(workspaceId);
+        const { rows, messages } = await this.readHistoryForRewrite(historyPath);
+        // Match request assembly's newest identity when repaired history reuses an id/sequence.
+        const triggerIndex = messages.findLastIndex(
+          (row) =>
+            row?.id === trigger.id &&
+            row.metadata?.historySequence === trigger.metadata?.historySequence
+        );
+        const persisted = messages[triggerIndex];
+        if (!persisted || (persisted.role !== "user" && !persisted.metadata?.contextBudgetRejected))
+          return Err("Rejected request no longer exists");
+        const preludeIds = new Set(
+          getRequestPreludeMessageIds(
+            persisted.metadata?.contextBudgetRejectedMessage?.metadata?.requestPreludeMessageIds ??
+              persisted.metadata?.requestPreludeMessageIds
+          )
+        );
+        const rejected: MuxMessage[] = [];
+        const earlier = new Set(messages.slice(0, triggerIndex));
+        const updated = this.serializeHistoryRewrite(rows, workspaceId, (row) => {
+          const ownedPrelude =
+            earlier.has(row) &&
+            preludeIds.has(row.id) &&
+            !isDurableContextBoundaryMarker(row) &&
+            (isSyntheticSnapshotUserMessage(row) ||
+              (row.role === "assistant" && row.metadata?.synthetic === true));
+          if (row !== persisted && !ownedPrelude) return row;
+          const marked = createContextBudgetRejectedMessage(row);
+          rejected.push(marked);
+          return marked;
+        });
+        await writeFileAtomic(historyPath, updated);
+        return Ok(rejected);
+      }
+    );
+  }
+
   private async updateHistoryUnderWriteLock(
     workspaceId: string,
     message: MuxMessage
   ): Promise<Result<void>> {
+    invalidateHistoryAppendProvenance();
     try {
       const historyPath = this.getChatHistoryPath(workspaceId);
 
       // Read the active epoch — structural rewrite requires full file content
-      const messages = await this.readChatHistory(workspaceId);
+      const { rows, messages } = await this.readHistoryForRewrite(historyPath);
+      const updates = new Map<MuxMessage, MuxMessage>();
       const targetSequence = message.metadata?.historySequence;
 
       if (targetSequence === undefined) {
@@ -2586,6 +2914,7 @@ export class HistoryService {
             },
           };
           persistedMessage = messages[i];
+          updates.set(existingMessage, persistedMessage);
           found = true;
           break;
         }
@@ -2596,7 +2925,11 @@ export class HistoryService {
       }
 
       // Rewrite entire file
-      const historyEntries = this.serializeHistoryEntries(messages, workspaceId);
+      const historyEntries = this.serializeHistoryRewrite(
+        rows,
+        workspaceId,
+        (row) => updates.get(row) ?? row
+      );
 
       // Atomic write prevents corruption if app crashes mid-write
       await writeFileAtomic(historyPath, historyEntries);
@@ -2643,6 +2976,7 @@ export class HistoryService {
       workspaceId,
       "Failed to persist compaction boundary with tail copies",
       async () => {
+        invalidateHistoryAppendProvenance();
         try {
           // r52: this path assigns fresh sequences (appended summary + every
           // preserved tail copy) from the cached counter, so it needs the
@@ -2652,7 +2986,8 @@ export class HistoryService {
           await this.refreshSequenceCounterUnderWriteLock(workspaceId);
           await ensurePrivateDir(this.getSessionDir(workspaceId));
           const historyPath = this.getChatHistoryPath(workspaceId);
-          const messages = await this.readChatHistory(workspaceId);
+          const { rows, messages } = await this.readHistoryForRewrite(historyPath);
+          const updates = new Map<MuxMessage, MuxMessage>();
 
           // Rolling summaries are prepared outside this lock. Edits, resets, and
           // newly appended rows must win over a stale prepared boundary.
@@ -2688,6 +3023,7 @@ export class HistoryService {
                 },
               };
               persistedSummary = messages[i];
+              updates.set(sourceMessages[i], persistedSummary);
               break;
             }
             if (persistedSummary === undefined) {
@@ -2721,7 +3057,12 @@ export class HistoryService {
             messages.push(copy);
           }
 
-          const serialized = this.serializeHistoryEntries(messages, workspaceId);
+          const serialized = this.serializeHistoryRewrite(
+            rows,
+            workspaceId,
+            (row) => updates.get(row) ?? row,
+            messages.slice(sourceMessages.length)
+          );
           if (shouldPersist) {
             const stagedPath = `${historyPath}.continuous-${randomUUID()}`;
             try {
@@ -2760,8 +3101,11 @@ export class HistoryService {
       workspaceId,
       "Failed to delete messages",
       async () => {
+        invalidateHistoryAppendProvenance();
         try {
-          const messages = await this.readChatHistory(workspaceId);
+          const { rows, messages } = await this.readHistoryForRewrite(
+            this.getChatHistoryPath(workspaceId)
+          );
           const foundIds = new Set(
             messages.filter((message) => ids.has(message.id)).map((message) => message.id)
           );
@@ -2773,7 +3117,7 @@ export class HistoryService {
           const filteredMessages = messages.filter((message) => !ids.has(message.id));
           await writeFileAtomic(
             this.getChatHistoryPath(workspaceId),
-            this.serializeHistoryEntries(filteredMessages, workspaceId)
+            this.serializeHistoryRewrite(rows, workspaceId, (row) => (ids.has(row.id) ? null : row))
           );
 
           const maxSeq = filteredMessages.reduce((max, message) => {
@@ -2827,15 +3171,20 @@ export class HistoryService {
     workspaceId: string,
     messageId: string
   ): Promise<Result<void>> {
+    invalidateHistoryAppendProvenance();
     try {
       // Structural rewrite requires full file content
-      const messages = await this.readChatHistory(workspaceId);
+      const { rows, messages } = await this.readHistoryForRewrite(
+        this.getChatHistoryPath(workspaceId)
+      );
       const filteredMessages = messages.filter((msg) => msg.id !== messageId);
 
       if (filteredMessages.length === messages.length) {
         // Not in the active epoch — the row may live in the sealed archive
         // (rare: cleanup paths almost always target recent rows).
-        const archiveMessages = await this.readArchivedHistory(workspaceId);
+        const { rows: archiveRows, messages: archiveMessages } = await this.readHistoryForRewrite(
+          this.getChatArchivePath(workspaceId)
+        );
         const filteredArchive = archiveMessages.filter((msg) => msg.id !== messageId);
         if (filteredArchive.length === archiveMessages.length) {
           return Err(`Message with ID ${messageId} not found in history`);
@@ -2845,13 +3194,17 @@ export class HistoryService {
         // can never affect the sequence counter.
         await writeFileAtomic(
           this.getChatArchivePath(workspaceId),
-          this.serializeHistoryEntries(filteredArchive, workspaceId)
+          this.serializeHistoryRewrite(archiveRows, workspaceId, (row) =>
+            row.id === messageId ? null : row
+          )
         );
         return Ok(undefined);
       }
 
       const historyPath = this.getChatHistoryPath(workspaceId);
-      const historyEntries = this.serializeHistoryEntries(filteredMessages, workspaceId);
+      const historyEntries = this.serializeHistoryRewrite(rows, workspaceId, (row) =>
+        row.id === messageId ? null : row
+      );
 
       // Atomic write prevents corruption if app crashes mid-write
       await writeFileAtomic(historyPath, historyEntries);
@@ -2919,9 +3272,12 @@ export class HistoryService {
       workspaceId,
       "Failed to truncate history",
       async () => {
+        invalidateHistoryAppendProvenance();
         try {
           // Structural rewrite requires full file content
-          const messages = await this.readChatHistory(workspaceId);
+          const { rows, messages } = await this.readHistoryForRewrite(
+            this.getChatHistoryPath(workspaceId)
+          );
           const messageIndex = messages.findIndex((msg) => msg.id === messageId);
 
           const keepTargetMessage = options?.keepTargetMessage === true;
@@ -2935,7 +3291,8 @@ export class HistoryService {
               workspaceId,
               messageId,
               keepTargetMessage,
-              messages
+              messages,
+              rows
             );
           }
 
@@ -2947,7 +3304,11 @@ export class HistoryService {
 
           // Rewrite the history file with truncated messages
           const historyPath = this.getChatHistoryPath(workspaceId);
-          const historyEntries = this.serializeHistoryEntries(truncatedMessages, workspaceId);
+          const historyEntries = this.serializeHistoryTruncation(
+            rows,
+            workspaceId,
+            truncatedMessages
+          );
 
           const archiveMaxSeq = await this.getArchiveTailMaxSequence(workspaceId);
 
@@ -3007,10 +3368,13 @@ export class HistoryService {
     messageId: string,
     keepTargetMessage: boolean,
     /** Active-epoch messages already read by the caller; all of them are discarded on this branch. */
-    activeEpochMessages: MuxMessage[]
+    activeEpochMessages: MuxMessage[],
+    activeEpochRows: HistoryRewriteRow[]
   ): Promise<Result<{ removedMessages: MuxMessage[] }>> {
     try {
-      const archiveMessages = await this.readArchivedHistory(workspaceId);
+      const { rows: archiveRows, messages: archiveMessages } = await this.readHistoryForRewrite(
+        this.getChatArchivePath(workspaceId)
+      );
       const messageIndex = archiveMessages.findIndex((msg) => msg.id === messageId);
 
       if (messageIndex === -1) {
@@ -3022,10 +3386,20 @@ export class HistoryService {
       // The removed tail spans the archive remainder plus the whole active epoch.
       const removedMessages = [...archiveMessages.slice(cutIndex), ...activeEpochMessages];
 
+      // The files were separate JSONL streams. Do not glue an unterminated kept
+      // archive row to a preserved active reset fragment when collapsing them.
+      const lastArchiveRow = archiveRows.at(-1);
+      if (lastArchiveRow && lastArchiveRow.raw.at(-1) !== 10 && activeEpochRows.length > 0) {
+        archiveRows.push({ raw: Buffer.from("\n"), message: undefined });
+      }
       await this.rewriteHistoryFilesUnlocked(
         workspaceId,
         null,
-        this.serializeHistoryEntries(truncatedMessages, workspaceId)
+        this.serializeHistoryTruncation(
+          [...archiveRows, ...activeEpochRows],
+          workspaceId,
+          truncatedMessages
+        )
       );
       // chat.jsonl may contain sealed epochs again — allow the lazy check to re-run.
       this.sealedRotationChecked.delete(workspaceId);
@@ -3142,9 +3516,13 @@ export class HistoryService {
       workspaceId,
       "Failed to truncate history",
       async () => {
+        invalidateHistoryAppendProvenance();
         try {
-          const archivedMessages = await this.readArchivedHistory(workspaceId);
-          const chatMessages = await this.readChatHistory(workspaceId);
+          const { rows: archiveRows, messages: archivedMessages } =
+            await this.readHistoryForRewrite(this.getChatArchivePath(workspaceId));
+          const { rows: chatRows, messages: chatMessages } = await this.readHistoryForRewrite(
+            this.getChatHistoryPath(workspaceId)
+          );
           const messages = [...archivedMessages, ...chatMessages];
           const allSequences = messages
             .map((msg) => msg.metadata?.historySequence)
@@ -3216,21 +3594,28 @@ export class HistoryService {
           const sanitize = activeContextChanged
             ? stripContextUsage
             : (message: MuxMessage) => message;
-          const remainingMessages = messages.slice(removeCount).map(sanitize);
+          const retainedMessages = messages.slice(removeCount);
+          const remainingMessages = retainedMessages.map(sanitize);
           const deletedMessages = messages.slice(0, removeCount);
           const deletedSequences = deletedMessages
             .map((msg) => msg.metadata?.historySequence)
             .filter((s): s is number => isNonNegativeInteger(s));
-          const remainingArchiveCount = Math.max(0, archivedMessages.length - removeCount);
-          const remainingArchive = remainingMessages.slice(0, remainingArchiveCount);
-          const remainingChat = remainingMessages.slice(remainingArchiveCount);
-
+          const remainingArchive = this.serializeHistoryTruncation(
+            archiveRows,
+            workspaceId,
+            retainedMessages,
+            sanitize
+          );
+          const remainingChat = this.serializeHistoryTruncation(
+            chatRows,
+            workspaceId,
+            retainedMessages,
+            sanitize
+          );
           await this.rewriteHistoryFilesUnlocked(
             workspaceId,
-            remainingArchive.length > 0
-              ? this.serializeHistoryEntries(remainingArchive, workspaceId)
-              : null,
-            this.serializeHistoryEntries(remainingChat, workspaceId)
+            remainingArchive.length > 0 ? remainingArchive : null,
+            remainingChat
           );
           this.sealedRotationChecked.delete(workspaceId);
 
@@ -3293,20 +3678,36 @@ export class HistoryService {
       newWorkspaceId,
       "Failed to migrate workspace history",
       async () => {
+        invalidateHistoryAppendProvenance();
         try {
           // Migrate the sealed archive first so a crash mid-migration never leaves
           // the active file pointing at a stale-ID archive.
-          const archiveMessages = await this.readArchivedHistory(newWorkspaceId);
+          const migrate = (message: MuxMessage, raw: Buffer): MuxMessage => {
+            // A duplicate-key reset can parse as an ordinary message. Preserve
+            // that damaged row rather than normalizing away its privacy floor.
+            if (
+              !isReadableHistoryMessage(message) ||
+              (hasRawResetMarker(raw.toString("utf8")) &&
+                !hasRawResetMarker(JSON.stringify(message)))
+            )
+              return message;
+            return { ...message };
+          };
+          const { rows: archiveRows, messages: archiveMessages } = await this.readHistoryForRewrite(
+            this.getChatArchivePath(newWorkspaceId)
+          );
           if (archiveMessages.length > 0) {
             await writeFileAtomic(
               this.getChatArchivePath(newWorkspaceId),
-              this.serializeHistoryEntries(archiveMessages, newWorkspaceId)
+              this.serializeHistoryRewrite(archiveRows, newWorkspaceId, migrate)
             );
           }
 
           // Read messages from the NEW workspace location (directory was already renamed).
           // Structural rewrite requires full file content.
-          const messages = await this.readChatHistory(newWorkspaceId);
+          const { rows, messages } = await this.readHistoryForRewrite(
+            this.getChatHistoryPath(newWorkspaceId)
+          );
           if (messages.length === 0) {
             // No active messages to migrate, just transfer the sequence counter.
             // Floor it with the archive max: an archive-only session (active file
@@ -3321,7 +3722,7 @@ export class HistoryService {
 
           // Rewrite all messages with new workspace ID
           const newHistoryPath = this.getChatHistoryPath(newWorkspaceId);
-          const historyEntries = this.serializeHistoryEntries(messages, newWorkspaceId);
+          const historyEntries = this.serializeHistoryRewrite(rows, newWorkspaceId, migrate);
 
           // Atomic write prevents corruption if app crashes mid-write
           await writeFileAtomic(newHistoryPath, historyEntries);

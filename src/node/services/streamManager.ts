@@ -1,3 +1,9 @@
+import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
+import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
+import {
+  checkAssembledRequestBudgetForModel,
+  estimateToolResultTokensForModel,
+} from "./contextBudgetCounting";
 import {
   applyCacheControl,
   getAnthropicCacheTtl,
@@ -248,6 +254,21 @@ export function createTurnCompletionController(): TurnCompletionController {
 
 // Request-construction options shared by the primary turn and model-fallback
 // hops (fallbacks rebuild these from the prepared fallback request).
+export interface SettledStepBudget {
+  model: string;
+  usage: LanguageModelV2Usage | undefined;
+  providerMetadata?: Record<string, unknown>;
+  toolResultChars: number;
+  imageParts: number;
+  toolResultTokens?: number;
+  sessionHistoryAvailable: boolean;
+  memoryWritable: boolean;
+}
+
+export type OnStepSettled = (
+  step: SettledStepBudget
+) => Promise<"continue" | "warn" | "rollover" | "block">;
+
 interface StreamRequestOptions {
   model: LanguageModel;
   modelString: string;
@@ -262,6 +283,9 @@ interface StreamRequestOptions {
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
+  onStepSettled?: OnStepSettled;
+  contextBudgetMemoryWritable?: boolean;
+  contextBudgetLimit?: number;
   toolSearchState?: ToolSearchStreamState;
   thinkingOverrideState?: ActiveTurnThinkingOverride;
   rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
@@ -299,7 +323,9 @@ interface StepMessageTracker {
 }
 interface StreamRequestConfig {
   cacheEnabled?: boolean;
+  budgetMetadataModel?: string;
   model: LanguageModel;
+  modelString: string;
   messages: ModelMessage[];
   /** Provider-ready system instructions from TurnContextAssembler. */
   system?: string | SystemModelMessage;
@@ -314,6 +340,9 @@ interface StreamRequestConfig {
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
   onStepMessages?: (messages: ModelMessage[]) => void;
+  onStepSettled?: OnStepSettled;
+  contextBudgetMemoryWritable?: boolean;
+  contextBudgetLimit?: number;
   toolPolicy?: ToolPolicy;
   /**
    * Tool-search deferral state (tool-search experiment). Owned and mutated by
@@ -350,6 +379,8 @@ interface StreamRequestConfig {
  * verbatim would leak provider-specific options/messages across providers).
  */
 interface PreparedModelFallback {
+  contextBudgetMemoryWritable?: boolean;
+  contextBudgetLimit?: number;
   model: LanguageModel;
   /** Canonical model string of the fallback attempt (drives metadata + tokenizer). */
   modelString: string;
@@ -426,7 +457,12 @@ export interface ModelFallbackOptions {
   prepare: (
     nextModelString: string,
     options?: ModelFallbackPrepareOptions
-  ) => Promise<Result<PreparedModelFallback, string>>;
+  ) => Promise<
+    Result<
+      PreparedModelFallback,
+      string | Extract<SendMessageError, { type: "context_budget_exceeded" }>
+    >
+  >;
 }
 
 function isKnownProviderName(provider: string): provider is keyof typeof PROVIDER_DEFINITIONS {
@@ -1999,7 +2035,15 @@ export class StreamManager {
       type: "stream-abort",
       workspaceId,
       messageId: streamInfo.messageId,
-      metadata: { usage, contextUsage, duration, providerMetadata, contextProviderMetadata },
+      metadata: {
+        usage,
+        contextUsage,
+        duration,
+        providerMetadata,
+        contextProviderMetadata,
+        model: streamInfo.model,
+        metadataModel: streamInfo.metadataModel,
+      },
       abortReason,
       abandonPartial,
       acpPromptId: streamInfo.initialMetadata?.acpPromptId,
@@ -2246,6 +2290,9 @@ export class StreamManager {
       headers,
       onChunk,
       onStepMessages,
+      onStepSettled,
+      contextBudgetMemoryWritable,
+      contextBudgetLimit,
       toolSearchState,
       onToolExecutionStart,
       thinkingOverrideState,
@@ -2282,9 +2329,11 @@ export class StreamManager {
 
     return {
       model,
+      modelString,
       messages,
       system,
       cacheEnabled: supportsAnthropicCache(modelString, requestProvidersConfig),
+      budgetMetadataModel: resolveModelForMetadata(modelString, requestProvidersConfig),
       // Keep provider-level parallel tool planning enabled, but serialize sibling
       // execute() handlers inside this stream so shared mutable state cannot race.
       tools: withSequentialExecution(tools, onToolExecutionStart),
@@ -2296,6 +2345,9 @@ export class StreamManager {
       hasQueuedMessages,
       onChunk,
       onStepMessages,
+      onStepSettled,
+      contextBudgetMemoryWritable,
+      contextBudgetLimit,
       toolPolicy,
       toolSearchState,
       thinkingOverrideState,
@@ -2306,7 +2358,16 @@ export class StreamManager {
   }
 
   private createStopWhenCondition(
-    request: Pick<StreamRequestConfig, "hasQueuedMessages" | "toolPolicy">
+    request: Pick<
+      StreamRequestConfig,
+      | "hasQueuedMessages"
+      | "toolPolicy"
+      | "onStepSettled"
+      | "modelString"
+      | "tools"
+      | "contextBudgetMemoryWritable"
+      | "budgetMetadataModel"
+    >
   ): Array<ReturnType<typeof stepCountIs>> {
     // Completion-tool stop check: completion/routing tools use explicit
     // success/ok markers (agent_report, propose_plan).
@@ -2352,7 +2413,34 @@ export class StreamManager {
       // The SDK evaluates stop conditions only after every sibling tool result in the
       // model's current step settles. Do not move this to individual tool-call-end events:
       // that would abort the remaining calls the model emitted in the same batch.
-      () => request.hasQueuedMessages?.("tool-end") ?? false,
+      async ({ steps }) => {
+        const step = steps.at(-1);
+        if (request.onStepSettled && step && !(await hasSuccessfulRequiredToolResult({ steps }))) {
+          const outputs = step.toolResults.map((result) => result.output);
+          const size = estimateToolResultSize(outputs);
+          const toolResultTokens = await estimateToolResultTokensForModel(outputs, {
+            model: request.modelString,
+            metadataModel: request.budgetMetadataModel,
+          });
+          const decision = await request.onStepSettled({
+            model: request.modelString,
+            usage: normalizeUsage(step.usage),
+            providerMetadata: step.providerMetadata,
+            ...size,
+            toolResultTokens,
+            sessionHistoryAvailable: request.tools?.session_history != null,
+            memoryWritable: request.contextBudgetMemoryWritable === true,
+          });
+          // All siblings have settled: stop before another provider step without discarding results.
+          if (decision === "block")
+            throw new ContextBudgetBlockedError(
+              "The settled tool results exceed the context budget. Use /compact or start a new context before continuing."
+            );
+          // Budget stops are authoritative even when only a turn-end message is queued.
+          if (decision !== "continue") return true;
+        }
+        return request.hasQueuedMessages?.("tool-end") ?? false;
+      },
       hasSuccessfulRequiredToolResult,
     ];
   }
@@ -2617,6 +2705,27 @@ export class StreamManager {
               error: getErrorMessage(error),
             });
           }
+        }
+        if (request.contextBudgetLimit != null) {
+          const exceeded = await checkAssembledRequestBudgetForModel(
+            {
+              system: request.system,
+              messages: rebuiltFirstStepMessages ?? effectiveMessages,
+              tools: request.tools,
+            },
+            {
+              model: request.modelString,
+              metadataModel: request.budgetMetadataModel,
+              modelContextLimit: request.contextBudgetLimit,
+              activeTools,
+            }
+          );
+          // Step zero can follow executed tools on a fallback. This late hard stop
+          // preserves settled results; it must not reset/replay the activated catalog.
+          if (exceeded)
+            throw new ContextBudgetBlockedError(
+              `The next request exceeds the safe context budget for ${exceeded.model} (${exceeded.estimate} > ${exceeded.hardCeiling}). Use /compact or reduce the active tool/context payload.`
+            );
         }
         if (
           effectiveMessages === stepMessages &&
@@ -3431,7 +3540,7 @@ export class StreamManager {
           }
         : undefined;
     streamInfo.stepTracker.pendingPrefixSwap = undefined;
-    let prepared: Result<PreparedModelFallback, string>;
+    let prepared: Awaited<ReturnType<ModelFallbackOptions["prepare"]>>;
     try {
       prepared = await fallbackState.options.prepare(nextModelString, prepareCallOptions);
     } catch (error) {
@@ -3444,6 +3553,7 @@ export class StreamManager {
       };
     }
     if (!prepared.success) {
+      if (typeof prepared.error !== "string") throw new ContextBudgetExceededError(prepared.error);
       return {
         kind: "terminal",
         terminalNote: `Configured fallback model ${nextModelString} could not be started: ${prepared.error}`,
@@ -3467,6 +3577,9 @@ export class StreamManager {
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
+      onStepSettled: streamInfo.request.onStepSettled,
+      contextBudgetMemoryWritable: prepared.data.contextBudgetMemoryWritable,
+      contextBudgetLimit: prepared.data.contextBudgetLimit,
       // Same state object: aiService's fallback prepare() rebuilt it in place
       // against the fallback toolset, so prepareStep keeps reading live state.
       toolSearchState: streamInfo.request.toolSearchState,
@@ -4539,6 +4652,24 @@ export class StreamManager {
       actualError = error.cause;
     }
 
+    if (actualError instanceof ContextBudgetBlockedError) {
+      return {
+        messageId: streamInfo.messageId,
+        error: actualError.message,
+        errorType: "context_budget_blocked",
+        acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+      };
+    }
+    if (actualError instanceof ContextBudgetExceededError) {
+      return {
+        messageId: streamInfo.messageId,
+        error: actualError.message,
+        errorType: "context_budget_blocked",
+        contextBudgetExceeded: actualError.details,
+        acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+      };
+    }
+
     let errorType = this.categorizeError(actualError);
 
     // Enhance previous-response and model-not-found error messages
@@ -4935,6 +5066,8 @@ export class StreamManager {
    * Categorizes errors for better error handling (used for event emission)
    */
   private categorizeError(error: unknown): StreamErrorType {
+    if (error instanceof ContextBudgetExceededError || error instanceof ContextBudgetBlockedError)
+      return "context_budget_blocked";
     if (error instanceof StreamTruncatedError) {
       return "stream_truncated";
     }

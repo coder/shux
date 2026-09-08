@@ -336,6 +336,8 @@ export const StreamAbortEventSchema = z.object({
       // Last step's provider metadata (for context window cache display)
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
       duration: z.number().optional(),
+      model: z.string().optional(),
+      metadataModel: z.string().optional(),
     })
     .optional()
     .meta({
@@ -819,6 +821,7 @@ export const ExperimentsSchema = z.preprocess(
     workspaceHeartbeats: z.boolean().optional(),
     toolSearch: z.boolean().optional(),
     continuousCompaction: z.boolean().optional(),
+    tokenBudget: z.boolean().optional(),
   })
 );
 

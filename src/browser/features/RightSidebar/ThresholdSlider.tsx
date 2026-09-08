@@ -2,6 +2,7 @@ import React, { useRef } from "react";
 import {
   AUTO_COMPACTION_THRESHOLD_MIN,
   AUTO_COMPACTION_THRESHOLD_MAX,
+  FORCE_COMPACTION_BUFFER_PERCENT,
 } from "@/common/constants/ui";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 
@@ -9,6 +10,7 @@ import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/To
 
 export interface AutoCompactionConfig {
   threshold: number;
+  rolloverEnabled?: boolean;
   setThreshold: (threshold: number) => void;
   /**
    * Warning if the compaction model context window is smaller than the
@@ -57,13 +59,18 @@ const applyThreshold = (pct: number, setThreshold: (v: number) => void): void =>
   setThreshold(pct >= DISABLE_THRESHOLD ? 100 : Math.min(pct, AUTO_COMPACTION_THRESHOLD_MAX));
 };
 
-/** Get tooltip text based on threshold */
-const getTooltipText = (threshold: number): string => {
-  const isEnabled = threshold < DISABLE_THRESHOLD;
-  return isEnabled
-    ? `Auto-compact at ${threshold}% · Drag to adjust (per-model)`
-    : `Auto-compact disabled · Drag left to enable (per-model)`;
-};
+/** Share the effective automatic policy label between the meter and its settings. */
+export function getAutoCompactionLabel(config: AutoCompactionConfig): string {
+  if (config.rolloverEnabled) {
+    // Match the evaluator's force threshold; "by" allows the hard ceiling to win earlier.
+    return config.threshold < DISABLE_THRESHOLD
+      ? `Rolls over by ${config.threshold + FORCE_COMPACTION_BUFFER_PERCENT}%`
+      : "Automatic rollover disabled";
+  }
+  return config.threshold < DISABLE_THRESHOLD
+    ? `Auto-compact at ${config.threshold}%`
+    : "Auto-compact disabled";
+}
 
 // ----- Main component -----
 
@@ -118,7 +125,7 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
 
   const isEnabled = config.threshold < DISABLE_THRESHOLD;
   const color = isEnabled ? "var(--color-plan-mode)" : "var(--color-muted)";
-  const tooltipText = getTooltipText(config.threshold);
+  const tooltipText = `${getAutoCompactionLabel(config)} · ${isEnabled ? "Drag to adjust" : "Drag left to enable"} (per-model)`;
 
   // Container styles - covers the full bar area for drag handling
   // Uses pointer-events: none by default, only the indicator handle has pointer-events: auto
