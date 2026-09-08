@@ -461,10 +461,78 @@ describe("WorkspaceMcpOverridesService", () => {
       [untouched.workspaceId, {}],
     ]);
     // The sweep cost must not scale with a full config parse per workspace:
-    // getAllWorkspaceMetadata itself loads config once, plus the batch's
-    // single legacy-config snapshot.
-    expect(metadataSpy).toHaveBeenCalledTimes(1);
-    expect(configSpy).toHaveBeenCalledTimes(2);
+    // one metadata load up front and one post-sweep re-resolution (each
+    // loading config once), plus the batch's single legacy-config snapshot.
+    expect(metadataSpy).toHaveBeenCalledTimes(2);
+    expect(configSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces prunes every checkout sharing a duplicated ID", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const first = await registerWorkspace("dup-a");
+    const second = await registerWorkspace("dup-b");
+    // Corrupted config: both entries carry the same workspace ID.
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        for (const workspace of project.workspaces) {
+          if (workspace.id === second.workspaceId) {
+            workspace.id = first.workspaceId;
+          }
+        }
+      }
+      return cfg;
+    });
+    for (const workspacePath of [first.workspacePath, second.workspacePath]) {
+      await fs.mkdir(path.join(workspacePath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(workspacePath, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo"] })
+      );
+    }
+
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [first.workspaceId, first.workspaceId],
+      "plugin:0123456789abcdef:"
+    );
+
+    expect(failures).toEqual([]);
+    for (const workspacePath of [first.workspacePath, second.workspacePath]) {
+      const after = jsoncParse(
+        await fs.readFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), "utf-8")
+      ) as Record<string, unknown>;
+      expect(after.enabledServers).toEqual([]);
+    }
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces fails a workspace renamed during the sweep", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const stable = await registerWorkspace("stable");
+    const moved = await registerWorkspace("moved");
+    await config.getAllWorkspaceMetadata();
+    const realGetAll = config.getAllWorkspaceMetadata.bind(config);
+    // Second load (the post-sweep re-resolution) sees the workspace under a
+    // new name — exactly what a concurrent rename leaves behind.
+    spyOn(config, "getAllWorkspaceMetadata")
+      .mockImplementationOnce(realGetAll)
+      .mockImplementationOnce(async () =>
+        (await realGetAll()).map((metadata) =>
+          metadata.id === moved.workspaceId
+            ? {
+                ...metadata,
+                name: "renamed",
+                namedWorkspacePath: path.join(path.dirname(moved.workspacePath), "renamed"),
+              }
+            : metadata
+        )
+      );
+
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [stable.workspaceId, moved.workspaceId],
+      "plugin:0123456789abcdef:"
+    );
+
+    expect(failures.map((failure) => failure.workspaceId)).toEqual([moved.workspaceId]);
+    expect(String(failures[0].error)).toMatch(/moved while/);
   });
 
   it("prunePluginOverrideKeys refuses symlinked override files", async () => {

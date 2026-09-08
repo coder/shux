@@ -665,29 +665,78 @@ export class WorkspaceMcpOverridesService {
     assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
 
     return this.runExclusive(async () => {
-      const allMetadata = await this.config.getAllWorkspaceMetadata();
-      const metadataById = new Map(allMetadata.map((metadata) => [metadata.id, metadata]));
+      // Group, don't index: a corrupted config can list one ID under several
+      // entries (different checkouts). Every checkout carrying the ID must be
+      // pruned, or retiring the tombstone would leave a stale enable behind
+      // in the entry a last-write-wins map dropped.
+      const groupMetadataById = (
+        all: FrontendWorkspaceMetadata[]
+      ): Map<string, FrontendWorkspaceMetadata[]> => {
+        const grouped = new Map<string, FrontendWorkspaceMetadata[]>();
+        for (const metadata of all) {
+          const entries = grouped.get(metadata.id);
+          if (entries) {
+            entries.push(metadata);
+          } else {
+            grouped.set(metadata.id, [metadata]);
+          }
+        }
+        return grouped;
+      };
+      const checkoutPaths = (entries: FrontendWorkspaceMetadata[] | undefined): string =>
+        (entries ?? [])
+          .map((metadata) => this.resolveWorkspace(metadata).workspacePath)
+          .sort()
+          .join("\0");
+
+      const metadataById = groupMetadataById(await this.config.getAllWorkspaceMetadata());
       const legacyConfig = this.config.loadConfigOrDefault();
       const failures: Array<{ workspaceId: string; error: unknown }> = [];
+      const swept: string[] = [];
       for (const workspaceId of workspaceIds) {
         try {
-          const metadata = metadataById.get(workspaceId.trim());
-          if (!metadata) {
+          const entries = metadataById.get(workspaceId.trim());
+          if (!entries) {
             throw new Error(`Workspace metadata not found for ${workspaceId.trim()}`);
           }
-          const resolved = this.resolveWorkspace(metadata);
-          await this.pruneResolvedWorkspace(resolved, keyPrefix);
+          for (const metadata of entries) {
+            await this.pruneResolvedWorkspace(this.resolveWorkspace(metadata), keyPrefix);
+          }
           if (options?.publish) {
             // Strict re-read: the prune above already threw on anything
             // unreadable, so a failure here is a real regression and must keep
-            // the caller's retry tombstone rather than publish a guess.
+            // the caller's retry tombstone rather than publish a guess. Reads
+            // the first entry, matching getWorkspaceMetadata's lookup.
             await options.publish(
               workspaceId,
-              await this.loadOverridesForResolved(resolved, "strict", legacyConfig)
+              await this.loadOverridesForResolved(
+                this.resolveWorkspace(entries[0]),
+                "strict",
+                legacyConfig
+              )
             );
           }
+          swept.push(workspaceId);
         } catch (error) {
           failures.push({ workspaceId, error });
+        }
+      }
+
+      // Workspace renames move the checkout and rewrite config WITHOUT taking
+      // this lock, so a rename racing the sweep leaves the snapshot pointing
+      // at the old (now empty) path and the prune above "succeeds" against
+      // nothing. Re-resolve once afterwards and fail any swept workspace whose
+      // checkout set changed: the caller keeps its tombstone and retries.
+      if (swept.length > 0) {
+        const afterById = groupMetadataById(await this.config.getAllWorkspaceMetadata());
+        for (const workspaceId of swept) {
+          const id = workspaceId.trim();
+          if (checkoutPaths(metadataById.get(id)) !== checkoutPaths(afterById.get(id))) {
+            failures.push({
+              workspaceId,
+              error: new Error(`Workspace ${id} moved while its MCP overrides were being pruned`),
+            });
+          }
         }
       }
       return failures;
