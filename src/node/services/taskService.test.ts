@@ -13161,7 +13161,15 @@ describe("TaskService", () => {
     expect((await removeScope([child])).success).toBe(false);
     expect((await removeScope([child, grandchild, "unrelated"])).success).toBe(false);
     expect(remove).not.toHaveBeenCalled();
-    expect(await removeScope([child, grandchild])).toEqual(Err("runtime failure"));
+    expect(
+      taskService.listWorkspaceRemovalDescendants(parent).map((entry) => entry.workspaceId)
+    ).toEqual([grandchild, child]);
+    const failure = await removeScope([child, grandchild]);
+    expect(failure.success).toBe(false);
+    if (!failure.success) {
+      expect(failure.error).toContain(child);
+      expect(failure.error).toContain("runtime failure");
+    }
     expect(
       taskService.listWorkspaceRemovalDescendants(parent).map((entry) => entry.workspaceId)
     ).toEqual([child]);

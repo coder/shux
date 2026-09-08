@@ -9260,7 +9260,13 @@ export class TaskService implements AgentTaskIntegration {
 
   listWorkspaceRemovalDescendants(workspaceId: string): WorkspaceRemovalDescendant[] {
     const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
-    return this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).map((taskId) => {
+    const taskIds = this.listDescendantAgentTaskIdsFromIndex(index, workspaceId);
+    taskIds.sort(
+      (a, b) =>
+        this.getTaskDepthFromParentById(index.parentById, b) -
+        this.getTaskDepthFromParentById(index.parentById, a)
+    );
+    return taskIds.map((taskId) => {
       const entry = index.byId.get(taskId)!;
       return {
         workspaceId: taskId,
@@ -9294,24 +9300,24 @@ export class TaskService implements AgentTaskIntegration {
     if (descendants.some((descendant) => descendant.active)) {
       return Err("Stop active descendant sub-agents before removing this workspace.");
     }
-    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
-    descendants.sort(
-      (a, b) =>
-        this.getTaskDepthFromParentById(index.parentById, b.workspaceId) -
-        this.getTaskDepthFromParentById(index.parentById, a.workspaceId)
-    );
     for (const descendant of descendants) {
-      const result = await this.removeInactiveDescendantAgentTaskWhileTaskTreeLocked(
-        workspaceId,
-        descendant.workspaceId
-      );
-      if (!result.success) return Err(result.error);
-      if (result.data.status !== "removed" && result.data.status !== "already_removed") {
-        return Err(
-          "error" in result.data
-            ? (result.data.error ?? "Descendant removal failed.")
-            : "Descendant removal failed."
+      const failure = (error: string) =>
+        Err(`Cannot remove ${descendant.title} (${descendant.workspaceId}): ${error}`);
+      try {
+        const result = await this.removeInactiveDescendantAgentTaskWhileTaskTreeLocked(
+          workspaceId,
+          descendant.workspaceId
         );
+        if (!result.success) return failure(result.error);
+        if (result.data.status !== "removed" && result.data.status !== "already_removed") {
+          return failure(
+            "error" in result.data
+              ? (result.data.error ?? "Descendant removal failed.")
+              : "Descendant removal failed."
+          );
+        }
+      } catch (error) {
+        return failure(getErrorMessage(error));
       }
     }
     return Ok(undefined);
