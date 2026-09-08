@@ -141,6 +141,17 @@ else:
                         cache=data if cached else None,
                     )
 
+    def test_auto_triggered_security_heading_does_not_hide_findings(self):
+        header = "### 🛡️ Codex Security Review · _Automatically triggered_\n\n"
+        clean = FIXTURES["security_no_findings"]["body"]
+        for body, expected in (
+            (clean, 0),
+            (clean + "\n\n[P1] A security issue still needs fixing.", 1),
+            ("Security review completed. Found a P1 credential disclosure.", 1),
+        ):
+            with self.subTest(body=body):
+                self.assert_gate(expected, snapshot([comment(header + body)]))
+
     def test_summary_completion_requires_metadata_and_every_review_row(self):
         completed = FIXTURES["summary"]["body"]
         completed_pr_opened = (
