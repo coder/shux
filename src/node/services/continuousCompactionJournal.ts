@@ -209,6 +209,7 @@ export class ContinuousCompactionJournalStore {
   }
 
   exists(): Promise<boolean> {
+    // Ordinary send recovery must not acquire a write lock just to discover no journal exists.
     return this.enqueue(async () => {
       try {
         await fs.access(this.path);
@@ -218,7 +219,7 @@ export class ContinuousCompactionJournalStore {
           log.warn("[continuous-compaction] journal unavailable", error);
         return false;
       }
-    });
+    }, "local");
   }
 
   read(

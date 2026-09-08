@@ -25,6 +25,8 @@ import {
 } from "./agentSession.testHarness";
 import type { ContinuousCompactor } from "./continuousCompactor";
 import type { CompactionToken, TurnCoordinator } from "./turnCoordinator";
+import * as fileLock from "@/node/utils/concurrency/fileLock";
+import { historyWriteLockPath } from "./workspaceRemoval";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
@@ -490,6 +492,41 @@ describe("AgentSession continuous compaction wiring", () => {
     expect(current.at(-1)?.parts).toMatchObject([
       { type: "text", text: "Current saved follow-up" },
     ]);
+  });
+
+  test("sends ordinary work when recovery finds no journal under a held history lock", async () => {
+    const h = await setup();
+    const stream = spyOn(h.aiService, "streamMessage");
+    const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
+    expect(await journal.exists()).toBe(false);
+    const compactor = internals(h.session).continuousCompactor;
+    const recover = compactor.recover.bind(compactor);
+    const recovering = spyOn(compactor, "recover").mockImplementation(async () => {
+      // Contend at the recovery probe, then release before the send's actual history writes.
+      await using held = await fileLock.acquireProcessFileLock({
+        lockPath: historyWriteLockPath(h.config.rootDir, workspaceId),
+        timeoutMs: 1000,
+        label: "foreign history writer",
+      });
+      const acquire = fileLock.acquireProcessFileLock;
+      // Exercise the real timeout path without a ten-second wait on the broken implementation.
+      const timeout = spyOn(fileLock, "acquireProcessFileLock").mockImplementation((options) =>
+        acquire({ ...options, timeoutMs: 1 })
+      );
+      try {
+        const recovered = await recover();
+        expect(recovered).toBe(false);
+        await held.assertStillOwned();
+        return recovered;
+      } finally {
+        timeout.mockRestore();
+      }
+    });
+    expect((await h.session.sendMessage("Ordinary work", sendOptions)).success).toBe(true);
+    expect(recovering).toHaveBeenCalled();
+    expect(stream).toHaveBeenCalled();
+    expect((await rows(h)).at(-1)?.parts).toMatchObject([{ type: "text", text: "Ordinary work" }]);
+    expect(await journal.exists()).toBe(false);
   });
 
   test("on-send apply preserves the new user turn without running a compact turn", async () => {
