@@ -616,15 +616,18 @@ export class MemoryService extends EventEmitter {
   /**
    * Memoized resolveWorkspaceMemoryOwnerId (see memoryWorkspaceOwner.ts). The
    * config is only loaded on a memo miss. Callers resolving many workspaces
-   * in one synchronous pass may supply a shared `snapshot`; results derived
-   * from a caller snapshot are NOT memoized, because the snapshot can predate
-   * the current file stamp (another backend rewriting config.json mid-pass)
-   * and would otherwise be cached under the newer stamp.
+   * in one synchronous pass (launch sweep, recovery, config-change diffing)
+   * supply a shared `snapshot`, which bypasses the memo entirely: neither the
+   * per-call config stat (O(n) synchronous statSync on the main process for
+   * n workspaces) nor memoization apply — the snapshot can predate the current
+   * file stamp (another backend rewriting config.json mid-pass) and would
+   * otherwise be cached under the newer stamp.
    */
   resolveWorkspaceMemoryOwnerId(
     workspaceId: string,
     snapshot?: () => ReturnType<Config["loadConfigOrDefault"]>
   ): string {
+    if (snapshot !== undefined) return resolveWorkspaceMemoryOwnerId(snapshot(), workspaceId);
     const stamp = this.config.configFileStamp();
     if (stamp !== this.workspaceMemoryOwnerConfigStamp) {
       this.workspaceMemoryOwnerConfigStamp = stamp;
@@ -632,7 +635,6 @@ export class MemoryService extends EventEmitter {
     }
     const cached = this.workspaceMemoryOwnerById.get(workspaceId);
     if (cached !== undefined) return cached;
-    if (snapshot !== undefined) return resolveWorkspaceMemoryOwnerId(snapshot(), workspaceId);
     const cfg = this.config.loadConfigOrDefault();
     const owner = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
     // Only positive (registered) results are memoized; the workspace may

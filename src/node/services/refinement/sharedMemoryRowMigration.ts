@@ -96,12 +96,18 @@ export async function migrateSharedMemoryRefinementRows(args: {
   };
   // Idempotent across retried removals (the child journal survives a
   // retryable removal failure or a crash before deletion): rows already
-  // copied are identified by their source identity on the owner side.
-  const alreadyMigrated = new Set(
-    (await listRefinements(args.ownerSessionDir))
-      .map((row) => row.data.migratedFrom)
-      .filter((id): id is string => id !== undefined)
-  );
+  // copied are identified by their source identity on the owner side. This
+  // unlocked read only pre-filters; the authoritative check re-runs inside
+  // the owner journal's publish lock per row (skipIf below), because two
+  // backends removing the same child concurrently can both pass this
+  // pre-filter before either append lands.
+  const migratedSourceIds = async () =>
+    new Set(
+      (await listRefinements(args.ownerSessionDir))
+        .map((row) => row.data.migratedFrom)
+        .filter((id): id is string => id !== undefined)
+    );
+  const alreadyMigrated = await migratedSourceIds();
   const childJournal = sharedDurableEventJournal(args.childSessionDir);
   let migrated = 0;
   for (const row of rows) {
@@ -145,7 +151,8 @@ export async function migrateSharedMemoryRefinementRows(args: {
     const evidence = RefinementEvidenceSchema.safeParse(row.data.evidence);
     const postState = RefinementPostStateSchema.safeParse(row.data.postState);
     // Throws: this is the only durable copy once the child's journal goes.
-    await appendRefinementEventOrThrow({
+    const appended = await appendRefinementEventOrThrow({
+      skipIf: async () => (await migratedSourceIds()).has(migratedFrom),
       sessionDir: args.ownerSessionDir,
       workspaceId: args.ownerWorkspaceId,
       kind: "memory",
@@ -165,7 +172,7 @@ export async function migrateSharedMemoryRefinementRows(args: {
       sourceTs: row.data.sourceTs ?? row.ts,
       ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),
     });
-    migrated++;
+    if (appended) migrated++;
   }
   return migrated;
 }

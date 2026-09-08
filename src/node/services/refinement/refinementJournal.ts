@@ -86,6 +86,14 @@ export interface RefinementEmitArgs {
    * which only applies inverses to the host filesystem.
    */
   runtime?: "remote";
+  /**
+   * Runs INSIDE the journal's blob lock before anything is stored; returning
+   * true skips the append (no blob, no row). Every publisher into a journal
+   * serializes on that cross-process lock, so a duplicate check performed
+   * here has no check→append window — two backends removing the same
+   * sub-agent concurrently cannot both copy one row into the owner's journal.
+   */
+  skipIf?: () => Promise<boolean>;
 }
 
 /** Shared by the rollback engine to compare current files against `postState`. */
@@ -274,8 +282,9 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
  * Same as appendRefinementEvent but propagates failures: for callers whose
  * row is the ONLY durable copy (shared-memory row migration before the
  * source journal is deleted) a swallowed failure would silently lose it.
+ * Returns false when `args.skipIf` declined the append.
  */
-export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Promise<void> {
+export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Promise<boolean> {
   {
     assert(args.sessionDir.length > 0, "refinement journal requires a session dir");
     assert(args.workspaceId.length > 0, "refinement journal requires a workspace id");
@@ -284,7 +293,8 @@ export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Pr
     // blob lock: a concurrent reclamation pass must never observe the
     // put→append window (see DurableEventJournal.withBlobLock).
     let publishedBlobs: BlobQuotaEntry[] = [];
-    await journal.withBlobLock(async () => {
+    const appended = await journal.withBlobLock(async () => {
+      if (args.skipIf !== undefined && (await args.skipIf())) return false;
       const resolved = await resolveRefinementInverse(journal.blobs, args.inverse);
       const inverse = resolved.inverse;
       publishedBlobs = resolved.publishedBlobs;
@@ -319,7 +329,9 @@ export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Pr
           ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
         },
       });
+      return true;
     });
+    if (!appended) return false;
     // Bound retained inverse payloads per session AFTER releasing the publish
     // lock (reclaim takes it itself; the mutex is non-reentrant). Best-effort:
     // failure must never fail the mutation this row describes.
@@ -330,6 +342,7 @@ export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Pr
     } catch (error) {
       log.debug("[refinement] inverse blob reclamation failed; continuing", { error });
     }
+    return true;
   }
 }
 

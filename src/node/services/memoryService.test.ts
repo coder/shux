@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, spyOn } from "bun:test";
 
 import { MEMORY_MAX_FILES_PER_SCOPE, MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
 
@@ -823,6 +823,24 @@ describe("MemoryService", () => {
       );
     });
 
+    it("resolves from a caller snapshot without touching the config file", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const cfg = fixture.config.loadConfigOrDefault();
+      const stamp = spyOn(fixture.config, "configFileStamp");
+      const load = spyOn(fixture.config, "loadConfigOrDefault");
+      // Bulk passes (launch sweep over every recorded workspace) must not pay
+      // one synchronous stat per workspace on the main process.
+      for (const id of ["ws-owner", "ws-child", "ws-grandchild", "ws-solo"]) {
+        fixture.service.resolveWorkspaceMemoryOwnerId(id, () => cfg);
+      }
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-grandchild", () => cfg)).toBe(
+        "ws-owner"
+      );
+      expect(stamp).not.toHaveBeenCalled();
+      expect(load).not.toHaveBeenCalled();
+    });
+
     it("keeps a grandchild on the root store via the pinned owner after its parent is removed", async () => {
       using fixture = await createFixture("ws-grandchild");
       await registerTaskTree(fixture);
@@ -1165,6 +1183,31 @@ describe("MemoryService", () => {
       });
       expect(undo.success).toBe(true);
       expect(await fsPromises.readFile(keep, "utf-8")).toBe("v1");
+    });
+
+    it("concurrent migrations of the same child copy each row exactly once", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/a.md", "a", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/b.md", "b", "agent");
+      const migrate = () =>
+        migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        });
+      // Two removals of one child racing (two backends): both unlocked
+      // pre-filters see an empty owner journal, so only the in-lock check can
+      // keep the second from appending duplicate rows.
+      const counts = await Promise.all([migrate(), migrate()]);
+      expect(counts[0] + counts[1]).toBe(2);
+      const ownerRows = await readRefinementEvents(ownerSessionDir);
+      expect(ownerRows.map((row) => row.data.migratedFrom).sort()).toEqual(
+        (await readRefinementEvents(childSessionDir)).map((row) => `ws-child:${row.id}`).sort()
+      );
     });
 
     it("migrated rows keep their real order relative to the owner's own later edits", async () => {
