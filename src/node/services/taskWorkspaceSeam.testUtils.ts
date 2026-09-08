@@ -37,6 +37,8 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
       terminalSessions: false,
       desktopSession: false,
     }),
+    getStoppablePreparingWorkspaceTurn: () => undefined,
+    waitForIdle: () => Promise.resolve(),
     hasRunningBackgroundBashProcesses: () => Promise.resolve(false),
     hasUntrackableExternalAppOpen: () => Promise.resolve(false),
     // Keep-style behavior makes archive eligibility independent of untracked files.

@@ -147,6 +147,7 @@ import {
   type MuxMessage,
   type ReviewNoteDataForDisplay,
   type StartupRetrySendOptions,
+  type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import { toValidGoalId } from "@/common/types/goal";
 import { selectKeepRecentTailStartIndex } from "@/common/utils/messages/keepRecentTail";
@@ -8960,6 +8961,30 @@ export class AgentSession {
     }
     const candidate = this.messageQueue.getNextQueueCutCandidate();
     return candidate != null ? { stage: "queued", ...candidate } : undefined;
+  }
+
+  /**
+   * Correlation of the delegated workspace turn whose PREPARING send has already handed its
+   * startup to the engine, the only PREPARING state stopStream() cancels: earlier PREPARING
+   * work (history acceptance, request preparation) has no pending stream start, so a stop
+   * there only notifies and the turn still streams. Undefined for user sends and every other
+   * phase. The interrupt_active archive gates use this to tell an interruptible delegated
+   * turn from user input that merely looks like a queued message.
+   */
+  getStoppablePreparingWorkspaceTurn(): WorkspaceTurnTaskCorrelation | undefined {
+    const preparing = this.preparingWorkspaceTurnMetadata;
+    if (
+      preparing == null ||
+      this.coordinator.phase !== "preparing" ||
+      !this.coordinator.startupRegistered
+    ) {
+      return undefined;
+    }
+    return {
+      taskHandleId: preparing.taskHandleId,
+      ownerWorkspaceId: preparing.ownerWorkspaceId,
+      turnId: preparing.turnId,
+    };
   }
 
   /** Whether a message queued with this dedupe key is still pending (see MessageQueue.addOnce). */

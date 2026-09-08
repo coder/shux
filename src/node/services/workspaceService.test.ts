@@ -15572,6 +15572,160 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(releases).toBe(2);
   });
 
+  test("acquirePreInterruptionArchiveHold exempts only a stoppable PREPARING delegated turn", () => {
+    const delegated = { taskHandleId: "wt-1", ownerWorkspaceId: "owner-1", turnId: "turn-1" };
+    const session = workspaceService.getOrCreateSession(workspaceId);
+    session.isPreparingTurn = () => true;
+    let stoppable: typeof delegated | undefined = delegated;
+    session.getStoppablePreparingWorkspaceTurn = () => stoppable;
+    let queued = 0;
+    session.queuedMessageEntryCount = () => queued;
+
+    // The collected turn itself is PREPARING with its startup registered: interruptWorkspaceTurn's
+    // stopStream cancels it, so the hold is granted.
+    const held = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(held.success).toBe(true);
+    if (held.success) held.data[Symbol.dispose]();
+
+    // A user entry queued behind the exempt delegated turn is still user work.
+    queued = 1;
+    const refusedQueued = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(refusedQueued.success).toBe(false);
+    if (!refusedQueued.success) {
+      expect(refusedQueued.error).toContain("queued messages beyond the delegated turns");
+      expect(refusedQueued.error).not.toContain("a message dispatching");
+    }
+    queued = 0;
+
+    // PREPARING for a different turn than the collected one (the collected turn ended and
+    // another delegated turn took the session) is not the work the caller is interrupting.
+    stoppable = { ...delegated, turnId: "turn-2" };
+    const refusedMismatch = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(refusedMismatch.success).toBe(false);
+    if (!refusedMismatch.success) {
+      expect(refusedMismatch.error).toContain("a message dispatching");
+    }
+
+    // PREPARING work that has not handed its startup to the engine (or a user send) reports no
+    // stoppable turn: a stop there would not cancel it, so the hold fails closed.
+    stoppable = undefined;
+    const refusedUnstoppable = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(refusedUnstoppable.success).toBe(false);
+    if (!refusedUnstoppable.success) {
+      expect(refusedUnstoppable.error).toContain("a message dispatching");
+    }
+  });
+
+  test("archive sink admits a PREPARING delegated turn once its interruption has settled", async () => {
+    // End to end through a real session: the delegated send is PREPARING with its startup
+    // registered, the hold exempts it, the engine-side stop cancels it, and the sink accepts
+    // only after the aborted turn has unwound (stopStream resolves before that happens).
+    const delegated = { taskHandleId: "wt-prep", ownerWorkspaceId: "owner-1", turnId: "turn-prep" };
+    const syntheticMessageId = "starting-prep";
+    const aiEmitter = new EventEmitter();
+    const entered = Promise.withResolvers<void>();
+    const abortController = new AbortController();
+    // StreamManager.stopStream for a pending start: abort it and deliver the startup abort.
+    const stopStream = mock(() => {
+      abortController.abort("system");
+      aiEmitter.emit("stream-abort", {
+        type: "stream-abort",
+        workspaceId,
+        messageId: syntheticMessageId,
+        abortReason: "system",
+        metadata: {},
+      });
+      return Promise.resolve(Ok(undefined));
+    });
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      historyService,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage: mock(async (request: Parameters<AIService["streamMessage"]>[0]) => {
+          // StreamManager registers the pending start before its first await.
+          request.onStreamStarting?.(syntheticMessageId);
+          entered.resolve();
+          await new Promise<void>((resolve) => {
+            abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          const completion: TurnCompletion = { status: "aborted", abortReason: "system" };
+          return Ok({ messageId: syntheticMessageId, completion: Promise.resolve(completion) });
+        }),
+        stopStream,
+      },
+    });
+    const internal = workspaceService as unknown as {
+      sessions: Map<string, AgentSession>;
+      aiService: typeof harness.aiService;
+    };
+    internal.sessions.set(workspaceId, harness.session);
+    internal.aiService = harness.aiService;
+    try {
+      const sent = harness.session.sendMessage(
+        "Summarize",
+        {
+          model: "anthropic:claude-sonnet-4-5",
+          agentId: "exec",
+          muxMetadata: { type: "workspace-turn-task", ...delegated },
+        },
+        { startStreamInBackground: true }
+      );
+      await entered.promise;
+      // The PREPARING send reads as a queued message to the coarse activity snapshot; the
+      // correlation is what tells it apart from user input.
+      expect(workspaceService.listLiveWorkspaceActivity(workspaceId).queuedMessages).toBe(true);
+      expect(workspaceService.getStoppablePreparingWorkspaceTurn(workspaceId)).toEqual(delegated);
+
+      const refused = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+        queuedDelegatedTurnCount: 0,
+        expectedDelegatedTurnCorrelations: [],
+      });
+      expect(refused.success).toBe(false);
+      if (!refused.success) {
+        expect(refused.error).toContain("a message dispatching");
+      }
+      expect(harness.session.isPreparingTurn()).toBe(true);
+
+      const hold = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+        queuedDelegatedTurnCount: 0,
+        expectedDelegatedTurnCorrelations: [delegated],
+      });
+      expect(hold.success).toBe(true);
+      if (!hold.success) return;
+      try {
+        // What interruptWorkspaceTurn does for a running handle. The engine has aborted when
+        // this resolves, but the session's aborted turn has not reached policy yet.
+        expect((await stopStream()).success).toBe(true);
+        expect(harness.session.isPreparingTurn()).toBe(true);
+
+        await workspaceService.waitForIdle(workspaceId);
+        expect((await sent).success).toBe(true);
+        expect(harness.session.hasActiveOrPendingTurnWork()).toBe(false);
+        expect(
+          await workspaceService.archive(workspaceId, undefined, { refuseLiveUserActivity: true })
+        ).toEqual(Ok({ kind: "archived" }));
+      } finally {
+        hold.data[Symbol.dispose]();
+      }
+    } finally {
+      internal.sessions.delete(workspaceId);
+      await harness.session.dispose();
+    }
+  });
+
   test("fork() refuses while the source workspace is being archived", async () => {
     // Source-fork admission pairs with the archive gates: a Coder-stop archive must not stop
     // the dedicated remote workspace mid-clone while a fork shares it.

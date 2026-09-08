@@ -461,6 +461,8 @@ export interface WorkspaceLifecycleHost {
     }
   ): Result<Disposable>;
   listLiveWorkspaceActivity(workspaceId: string): WorkspaceLiveActivity;
+  getStoppablePreparingWorkspaceTurn(workspaceId: string): WorkspaceTurnTaskCorrelation | undefined;
+  waitForIdle(workspaceId: string): Promise<void>;
   hasRunningBackgroundBashProcesses(workspaceId: string): Promise<boolean>;
   hasUntrackableExternalAppOpen(workspaceId: string): Promise<boolean>;
   isSnapshotArchiveEligibilityMutationSensitive(

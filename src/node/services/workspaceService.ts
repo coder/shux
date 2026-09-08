@@ -195,6 +195,7 @@ import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
   getCompactionFollowUpContent,
+  isSameWorkspaceTurnTaskCorrelation,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
   type CompactionFollowUpRequest,
@@ -8425,8 +8426,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * (active streams, the delegated queue entries themselves) is intentionally NOT checked:
    * the caller is about to interrupt those turns, and the sink's admission-hold recheck
    * re-validates queue emptiness after interruption. Queue entries beyond
-   * queuedDelegatedTurnCount — or any entry already dispatching (PREPARING) — fail closed
-   * here instead.
+   * queuedDelegatedTurnCount — or any dispatching (PREPARING) entry other than a collected
+   * delegated turn that stopStream can still cancel — fail closed here instead.
    *
    * The sink adds/removes the same Set entry around its own gate; both operations are
    * idempotent, and by the time the sink's finally removes it either archivedAt is
@@ -8484,11 +8485,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       );
       const streamIsExpectedDelegatedTurn =
         streamCorrelation != null &&
-        options.expectedDelegatedTurnCorrelations.some(
-          (expected) =>
-            expected.taskHandleId === streamCorrelation.taskHandleId &&
-            expected.ownerWorkspaceId === streamCorrelation.ownerWorkspaceId &&
-            expected.turnId === streamCorrelation.turnId
+        options.expectedDelegatedTurnCorrelations.some((expected) =>
+          isSameWorkspaceTurnTaskCorrelation(expected, streamCorrelation)
         );
       if (!streamIsExpectedDelegatedTurn) {
         activityLabels.push("an active stream not attributable to the delegated turns");
@@ -8533,11 +8531,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // queued delegated turn before the entry-count comparison below could attribute it.
     // (Queued entries cannot dispatch into PREPARING after this check: the turn-admission
     // hold above freezes queue dispatch for the hold's lifetime.)
-    if (session.isPreparingTurn() || session.hasPendingAutoRetry()) {
-      // A dispatching (PREPARING) entry has left the queue but not yet registered a
-      // stream, so the queue comparison below cannot attribute it — fail closed.
+    // A PREPARING send is exempt only when it IS one of the collected active delegated turns
+    // (exact correlation) and has handed its startup to the engine, so interruptWorkspaceTurn's
+    // stopStream cancels it. Any other PREPARING entry has left the queue without registering
+    // a stream, so the queue comparison below cannot attribute it — fail closed. The same
+    // correlation binding as the stream check above keeps a user send that replaced an ended
+    // delegated turn, or a delegated turn still holding a queued handle, out of the exemption.
+    const preparingTurn = session.getStoppablePreparingWorkspaceTurn();
+    const preparingIsExpectedDelegatedTurn =
+      preparingTurn != null &&
+      options.expectedDelegatedTurnCorrelations.some((expected) =>
+        isSameWorkspaceTurnTaskCorrelation(expected, preparingTurn)
+      );
+    if (
+      (session.isPreparingTurn() && !preparingIsExpectedDelegatedTurn) ||
+      session.hasPendingAutoRetry()
+    ) {
       activityLabels.push("a message dispatching");
-    } else if (session.queuedMessageEntryCount() > options.queuedDelegatedTurnCount) {
+    }
+    // Checked even while an exempt delegated turn is PREPARING: user entries queued behind it
+    // are still user work the archive would silently drop.
+    if (session.queuedMessageEntryCount() > options.queuedDelegatedTurnCount) {
       activityLabels.push("queued messages beyond the delegated turns");
     }
     if (activityLabels.length > 0) {
@@ -12349,6 +12363,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined {
     const session = this.sessions.get(workspaceId.trim());
     return session?.getQueueCutCutter();
+  }
+
+  /** See AgentSession.getStoppablePreparingWorkspaceTurn. */
+  getStoppablePreparingWorkspaceTurn(
+    workspaceId: string
+  ): WorkspaceTurnTaskCorrelation | undefined {
+    return this.sessions.get(workspaceId.trim())?.getStoppablePreparingWorkspaceTurn();
   }
 
   /**
