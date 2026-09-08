@@ -677,6 +677,24 @@ describe("DesktopSessionManager browser viewer releases", () => {
         replacement.controller.abort();
         await replacement.watcher.return(undefined);
 
+        // A pane that gives its registration up while a release is pending completes that
+        // release: the close resolves at once rather than waiting out the release timeout, and
+        // the detachment stays definitive (no grace).
+        const releasing = await registerViewer("isolated");
+        const closingIsolated = manager.close("isolated");
+        const pendingRelease: IteratorResult<DesktopViewerEvent> = await releasing.watcher.next();
+        expect(pendingRelease.value).toMatchObject({ type: "release" });
+        manager.detachViewer(releasing.viewerId);
+        expect(
+          await Promise.race([
+            closingIsolated.then(() => "closed"),
+            new Promise<string>((resolve) => setTimeout(() => resolve("timed out"), 1_000)),
+          ])
+        ).toBe("closed");
+        releasing.controller.abort();
+        await releasing.watcher.return(undefined);
+        expect(manager.hasAttachedViewers("isolated")).toBe(false);
+
         // A bridge bootstrapped under a viewer registration is that pane's too: the pane's
         // definitive detach (a clean unmount) retracts the bridge's grace whether the bridge
         // closed before or — its socket close travelling separately — after the detach, while

@@ -688,7 +688,10 @@ export function useDesktopConnection(
             // the reconnect backoff runs; the reconnect reuses it once ready. A drop before the
             // first connect is terminal (no retry follows), so the registration is given up.
             if (!hasEverConnectedRef.current) settleTerminal();
-            disconnectCurrentRfb({ keepViewerRegistration: hasEverConnectedRef.current });
+            disconnectCurrentRfb({
+              keepViewerRegistration: hasEverConnectedRef.current,
+              keepGrace: hasEverConnectedRef.current,
+            });
             if (hasEverConnectedRef.current) {
               setState("disconnected");
               setReason(null);
@@ -732,10 +735,13 @@ export function useDesktopConnection(
         // A first attempt that fails is terminal (flagged before the abort below so no
         // background re-registration can re-attach the pane); a failed attempt inside the
         // reconnect loop keeps a ready registration instead: the pane is still mounted and
-        // about to retry, so it must stay attached through the backoff.
+        // about to retry, so it must stay attached through the backoff — and when its
+        // registration failed too, the graces its earlier attachments left are all that keeps
+        // it attached until a retry succeeds, so they are not retracted either.
         if (!hasEverConnectedRef.current) settleTerminal();
         disconnectCurrentRfb({
           keepViewerRegistration: hasEverConnectedRef.current && viewerReadyRef.current,
+          keepGrace: hasEverConnectedRef.current,
         });
         if (hasEverConnectedRef.current) {
           // A prior successful session means this is part of the reconnect loop, so keep the

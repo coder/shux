@@ -167,7 +167,12 @@ export class DesktopSessionManager {
    * backend never infers "will not reconnect" from a bootstrap outcome.
    */
   detachViewer(viewerId: string): void {
+    const viewer = this.viewers.get(viewerId);
     this.viewers.delete(viewerId);
+    // A release this pane never acknowledged is complete now (the pane is gone for good):
+    // resolve it rather than making the close wait out the release timeout. The viewer is
+    // already deleted, so completing stamps no grace.
+    viewer?.acknowledge?.();
     // The registration may already be gone and have stamped a grace instead: a ready
     // registration that dropped while its bootstrap was pending is replaced immediately, and the
     // pane reports the terminal outcome for the superseded viewerId too. Only that registration's

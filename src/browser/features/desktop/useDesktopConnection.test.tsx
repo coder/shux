@@ -551,6 +551,28 @@ describe("useDesktopConnection control ownership", () => {
     expect(registration.signal.aborted).toBe(false);
   });
 
+  test("a failed reconnect attempt with no ready registration keeps the earlier graces", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    // The release stream drops after ready; its replacement is still awaiting ready...
+    autoReady = false;
+    registrations[0].queue.end();
+    await waitFor(() => expect(registrations).toHaveLength(2));
+    // ...when the bridge drops too. The reconnect reuses the pending replacement...
+    act(() => rfb.events.dispatchEvent(new Event("disconnect")));
+    await waitFor(() => expect(view.desktop.state).toBe("checking"), { timeout: 5_000 });
+    // ...which fails before ready, as does the fresh registration the attempt makes instead.
+    registrations[1].failure = new Error("replacement lost");
+    registrations[1].queue.end();
+    await waitFor(() => expect(registrations).toHaveLength(3));
+    registrations[2].failure = new Error("registration lost");
+    registrations[2].queue.end();
+    await waitFor(() => expect(view.desktop.state).toBe("disconnected"));
+    // A retry is scheduled, so the graces the earlier attachments left are all that keeps the
+    // pane attached through the backoff: nothing may retract them.
+    expect(detachViewer).not.toHaveBeenCalled();
+  });
+
   test("suspend keeps the ready registration and a later connect reuses it", async () => {
     const view = mountConnection();
     const rfb = await connect(view);
