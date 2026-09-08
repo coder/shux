@@ -133,7 +133,7 @@ export const Rollover: AppStory = {
     await expect(canvas.queryByText(WARNING)).not.toBeInTheDocument();
     const warning = await canvas.findByRole("button", { name: /Context budget warning/ });
     await userEvent.click(warning);
-    await expect(canvas.getByText(WARNING)).toBeVisible();
+    await waitFor(() => expect(canvas.getByText(WARNING)).toBeVisible());
     await userEvent.click(warning);
     const tool = await canvas.findByText("session_history", { exact: true });
     await userEvent.click(tool);
