@@ -4,12 +4,13 @@ import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createTestHistoryService } from "./testHistoryService";
+import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
 import { updateSubagentTranscriptArtifactsFile } from "./subagentTranscriptArtifacts";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import * as fileLock from "@/node/utils/concurrency/fileLock";
 import {
   historyWriteLockPath,
   workspaceRemovalTombstonePath,
@@ -388,7 +389,7 @@ describe("HistoryService", () => {
       // session-dir append lock: the batch's read+replace must wait, or its
       // replacement — built from contents read before the foreign append —
       // would silently delete the foreign row.
-      const foreign = await acquireProcessFileLock({
+      const foreign = await fileLock.acquireProcessFileLock({
         // r63: the history write lock lives outside the session directory so
         // removal can hold it across its tombstone+delete critical section.
         lockPath: historyWriteLockPath(config.rootDir, workspaceId),
@@ -461,7 +462,7 @@ describe("HistoryService", () => {
         JSON.stringify({ finalArchiveHash: "in-flight", finalChatHash: "in-flight" })
       );
 
-      const foreign = await acquireProcessFileLock({
+      const foreign = await fileLock.acquireProcessFileLock({
         lockPath: historyWriteLockPath(config.rootDir, workspaceId),
         timeoutMs: 5_000,
         label: "test foreign truncation",
@@ -988,6 +989,379 @@ describe("HistoryService", () => {
       expect(messages).toHaveLength(2);
       expect(messages[0].id).toBe("msg1");
       expect(messages[1].id).toBe("msg2");
+    });
+  });
+
+  describe("destructive context publication fencing", () => {
+    const ws = "context-publication";
+    const row = (id: string) => createMuxMessage(id, "user", `Context for ${id}`);
+    const display = () =>
+      createMuxMessage("display", "user", "Workflow display", {
+        muxMetadata: { type: "workflow-trigger-display", rawCommand: "/wf", runId: "run" },
+      });
+    const boundary = () =>
+      createMuxMessage("sealed", "assistant", "Compacted context", {
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      });
+    const reset = (rollover = false) =>
+      createMuxMessage("reset", "assistant", "", {
+        contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+        ...(rollover && {
+          muxMetadata: {
+            type: "context-window-rollover",
+            rolloverId: "rollover",
+            reason: "on-send",
+            previousWindowId: "w:0",
+            flushOpportunity: false,
+            contextTokens: 1000,
+            maxTokens: 1000,
+          } as const,
+        }),
+      });
+    const prefix = [{ role: "user" as const, content: "Discarded provider context" }];
+
+    async function capturePublication() {
+      const store = service.getContinuousCompactionJournal(ws);
+      const journal: ContinuousCompactionJournal = {
+        version: 1,
+        publicationGeneration: await store.captureGeneration(),
+        boundary: { ...boundary(), id: "compacted" },
+        staticCopies: [],
+        liveTailCopySpec: {
+          sourceMessageId: "live",
+          sourceHistorySequence: 0,
+          copyId: "copy",
+          partIndex: 0,
+          metadataTemplate: { synthetic: true, rlmPreservedTailCopy: true },
+        },
+        postCompactionAttachments: [],
+        prefixSourceRows: [row("old")],
+        systemPrefix: [],
+        cacheEnabled: false,
+        preparation: {
+          modelString: "anthropic:claude-sonnet-4-5",
+          providerForMessages: "anthropic",
+          effectiveThinkingLevel: "off",
+          effectiveAgentId: "exec",
+          toolNamesForSentinel: [],
+        },
+        providerFamily: "anthropic",
+        parentModel: "anthropic:claude-sonnet-4-5",
+        summaryModel: "anthropic:claude-sonnet-4-5",
+        headFingerprint: "head",
+        sourceFingerprint: "source",
+        headEnd: { id: "old", sequence: 0 },
+        epoch: 0,
+        streamMessageId: "live",
+        streamHistorySequence: 0,
+        stepNumber: 0,
+        firstTailToolCallId: "tool",
+      };
+      const receipt = await store.write(journal, prefix, () => true);
+      assert(receipt, "Expected a durable compaction publication");
+      return { store, receipt };
+    }
+
+    const destructiveCases = [
+      ...[false, true].flatMap((rollover) =>
+        [false, true].map((batch) => ({
+          name: `${rollover ? "rollover" : "reset"} ${batch ? "batch" : "single"}`,
+          rows: [row("old")],
+          mutate: () =>
+            batch
+              ? service.appendManyToHistory(ws, [reset(rollover), row("fresh")])
+              : service.appendToHistory(ws, reset(rollover)),
+          expected: batch ? ["old", "reset", "fresh"] : ["old", "reset"],
+        }))
+      ),
+      {
+        name: "matching-tail reset",
+        rows: [row("old")],
+        mutate: () => service.appendToHistoryIfTailMatches(ws, reset(), "old"),
+        expected: ["old", "reset"],
+      },
+      {
+        name: "full clear",
+        rows: [row("old"), row("tail")],
+        mutate: () => service.clearHistory(ws),
+        expected: [],
+      },
+      {
+        name: "display-only full clear",
+        rows: [display()],
+        mutate: () => service.clearHistory(ws),
+        expected: [],
+      },
+      {
+        name: "rounded full clear",
+        rows: [row("old"), row("tail")],
+        mutate: () => service.truncateHistory(ws, 0.99),
+        expected: [],
+      },
+      {
+        name: "active prefix",
+        rows: [row("old"), row("tail")],
+        mutate: () => service.truncateHistory(ws, 0.2),
+        expected: ["tail"],
+      },
+      {
+        name: "active edit",
+        rows: [row("old"), row("tail")],
+        mutate: () => service.truncateAfterMessage(ws, "tail"),
+        expected: ["old"],
+      },
+      {
+        name: "archived edit",
+        rows: [row("old"), boundary(), row("tail")],
+        mutate: () => service.truncateAfterMessage(ws, "old", { keepTargetMessage: true }),
+        expected: ["old"],
+      },
+    ];
+
+    it.each(destructiveCases)(
+      "$name prevents stale journal and history resurrection",
+      async (testCase) => {
+        for (const message of testCase.rows) {
+          assert((await service.appendToHistory(ws, structuredClone(message))).success);
+        }
+        const { store, receipt } = await capturePublication();
+        const foreign = new HistoryService(config);
+        assert((await testCase.mutate()).success);
+        const settled = await collectFullHistory(foreign, ws);
+        expect(settled.map((message) => message.id)).toEqual(testCase.expected);
+        expect(await store.captureGeneration()).not.toBe(receipt.publicationGeneration);
+
+        let committed = false;
+        const folded = await foreign.persistBoundaryWithTailCopies(
+          ws,
+          structuredClone(receipt.boundary),
+          [],
+          false,
+          () => true,
+          {
+            publication: { generation: receipt.publicationGeneration, journal: receipt },
+            onCommitted: () => {
+              committed = true;
+            },
+          }
+        );
+        expect(folded.success).toBe(false);
+        expect(committed).toBe(false);
+        const foreignStore = foreign.getContinuousCompactionJournal(ws);
+        expect(await foreignStore.read()).toBeNull();
+        // Rejection must survive cleanup of the old record, when the slot is empty.
+        expect(await foreignStore.write(receipt, prefix, () => true)).toBeNull();
+        expect(await collectFullHistory(foreign, ws)).toEqual(settled);
+        expect(
+          await foreignStore.write(
+            { ...receipt, publicationGeneration: await foreignStore.captureGeneration() },
+            prefix,
+            () => true
+          )
+        ).not.toBeNull();
+      }
+    );
+
+    it.each(destructiveCases)(
+      "$name leaves history intact if generation advancement fails",
+      async (testCase) => {
+        for (const message of testCase.rows) {
+          assert((await service.appendToHistory(ws, structuredClone(message))).success);
+        }
+        const { store, receipt } = await capturePublication();
+        const before = await collectFullHistory(service, ws);
+        const failure = spyOn(store, "advanceGenerationUnderHistoryLock").mockRejectedValueOnce(
+          new Error("generation unavailable")
+        );
+        try {
+          expect((await testCase.mutate()).success).toBe(false);
+          expect(await collectFullHistory(new HistoryService(config), ws)).toEqual(before);
+          expect(await store.read()).toEqual(receipt);
+        } finally {
+          failure.mockRestore();
+        }
+      }
+    );
+
+    it("holds the history file lock from generation advancement through deletion", async () => {
+      assert((await service.appendToHistory(ws, row("old"))).success);
+      const store = service.getContinuousCompactionJournal(ws);
+      // Exercise an existing durable generation too, rather than only legacy absence.
+      await store.advanceGeneration();
+      const { receipt } = await capturePublication();
+      await store.clear(receipt);
+      const historyPath = path.join(config.sessionsDir, ws, "chat.jsonl");
+      const before = await fs.readFile(historyPath, "utf8");
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const advance = store.advanceGenerationUnderHistoryLock.bind(store);
+      const advancing = spyOn(store, "advanceGenerationUnderHistoryLock").mockImplementationOnce(
+        async () => {
+          await fs.access(historyWriteLockPath(config.rootDir, ws));
+          await advance();
+          entered.resolve();
+          await release.promise;
+        }
+      );
+      const clearing = service.clearHistory(ws);
+      const foreign = new HistoryService(config).getContinuousCompactionJournal(ws);
+      const capture = spyOn(foreign, "captureGenerationUnderHistoryLock");
+      const acquire = fileLock.acquireProcessFileLock;
+      const attempted = Promise.withResolvers<void>();
+      let acquiring:
+        | ReturnType<typeof spyOn<typeof fileLock, "acquireProcessFileLock">>
+        | undefined;
+      let writing: ReturnType<typeof foreign.write> | undefined;
+      try {
+        await entered.promise;
+        acquiring = spyOn(fileLock, "acquireProcessFileLock").mockImplementation((options) => {
+          attempted.resolve();
+          return acquire(options);
+        });
+        writing = foreign.write(receipt, prefix, () => true);
+        await attempted.promise;
+        expect(capture).not.toHaveBeenCalled();
+        expect(await fs.readFile(historyPath, "utf8")).toBe(before);
+        release.resolve();
+        expect((await clearing).success).toBe(true);
+        expect(await writing).toBeNull();
+        expect(await foreign.captureGeneration()).not.toBe(receipt.publicationGeneration);
+        expect(await collectFullHistory(new HistoryService(config), ws)).toEqual([]);
+      } finally {
+        release.resolve();
+        await Promise.all([clearing, writing]);
+        acquiring?.mockRestore();
+        capture.mockRestore();
+        advancing.mockRestore();
+      }
+    });
+
+    it.each([
+      {
+        name: "zero prefix",
+        rows: [row("old")],
+        mutate: () => service.truncateHistory(ws, 0),
+        expected: ["old"],
+        success: true,
+      },
+      {
+        name: "rounded zero",
+        rows: [row("old")],
+        mutate: () => service.truncateHistory(ws, 0.0001),
+        expected: ["old"],
+        success: true,
+      },
+      {
+        name: "empty clear",
+        rows: [],
+        mutate: () => service.clearHistory(ws),
+        expected: [],
+        success: true,
+      },
+      {
+        name: "declined full",
+        rows: [row("old")],
+        mutate: () => service.truncateHistory(ws, 0.9, { refuseFullDelete: true }),
+        expected: ["old"],
+        success: false,
+      },
+      {
+        name: "declined removal",
+        rows: [row("old")],
+        mutate: () => service.truncateHistory(ws, 0.2, { refuseRowRemoval: true }),
+        expected: ["old"],
+        success: false,
+      },
+      {
+        name: "declined partial",
+        rows: [row("old"), row("tail")],
+        mutate: () => service.truncateHistory(ws, 0.2, { requireFullDelete: true }),
+        expected: ["old", "tail"],
+        success: false,
+      },
+      {
+        name: "missing edit",
+        rows: [row("old")],
+        mutate: () => service.truncateAfterMessage(ws, "missing"),
+        expected: ["old"],
+        success: false,
+      },
+      {
+        name: "retained tail",
+        rows: [row("old")],
+        mutate: () => service.truncateAfterMessage(ws, "old", { keepTargetMessage: true }),
+        expected: ["old"],
+        success: true,
+      },
+      {
+        name: "display edit",
+        rows: [row("old"), display()],
+        mutate: () => service.truncateAfterMessage(ws, "display"),
+        expected: ["old"],
+        success: true,
+      },
+      {
+        name: "display prefix",
+        rows: [display(), row("tail")],
+        mutate: () => service.truncateHistory(ws, 0.1),
+        expected: ["tail"],
+        success: true,
+      },
+      {
+        name: "sealed prefix",
+        rows: [row("old"), boundary(), row("tail")],
+        mutate: () => service.truncateHistory(ws, 0.1),
+        expected: ["sealed", "tail"],
+        success: true,
+      },
+      {
+        name: "mismatched reset",
+        rows: [row("old")],
+        mutate: () => service.appendToHistoryIfTailMatches(ws, reset(), "missing"),
+        expected: ["old"],
+        success: true,
+      },
+      {
+        name: "compaction boundary",
+        rows: [row("old")],
+        mutate: () => service.appendToHistory(ws, boundary()),
+        expected: ["old", "sealed"],
+        success: true,
+      },
+    ])("$name preserves a usable compaction publication", async (testCase) => {
+      for (const message of testCase.rows) {
+        assert((await service.appendToHistory(ws, message)).success);
+      }
+      const { store, receipt } = await capturePublication();
+      expect((await testCase.mutate()).success).toBe(testCase.success);
+      expect((await collectFullHistory(service, ws)).map((message) => message.id)).toEqual([
+        ...testCase.expected,
+      ]);
+      expect(await store.read()).toEqual(receipt);
+      expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+      let committed = false;
+      const foreign = new HistoryService(config);
+      const folded = await foreign.persistBoundaryWithTailCopies(
+        ws,
+        structuredClone(receipt.boundary),
+        [],
+        false,
+        () => true,
+        {
+          publication: { generation: receipt.publicationGeneration, journal: receipt },
+          onCommitted: () => {
+            committed = true;
+          },
+        }
+      );
+      expect(folded.success).toBe(true);
+      expect(committed).toBe(true);
+      const active = await foreign.getHistoryFromLatestBoundary(ws);
+      assert(active.success);
+      expect(active.data.map((message) => message.id)).toEqual([receipt.boundary.id]);
+      expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
     });
   });
 
