@@ -413,6 +413,98 @@ describe("AgentSession turn completion", () => {
     }
   );
 
+  test.each(["completed", "aborted"] as const)(
+    "edit reserves the next turn before interruption finishes (%s)",
+    async (status) => {
+      const completion = Promise.withResolvers<TurnCompletion>();
+      const stopEntered = Promise.withResolvers<void>();
+      const stopReleased = Promise.withResolvers<void>();
+      const replacementStarted = Promise.withResolvers<void>();
+      const emitter = new EventEmitter();
+      const streamMessage = mock(() => {
+        const messageId = `assistant-${streamMessage.mock.calls.length}`;
+        start(emitter, messageId);
+        if (streamMessage.mock.calls.length > 1) replacementStarted.resolve();
+        return Promise.resolve(
+          Ok({
+            messageId,
+            completion:
+              streamMessage.mock.calls.length === 1
+                ? completion.promise
+                : createStartedTurnHandle(h.session.closingSignal).completion,
+          })
+        );
+      });
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter: emitter,
+        captureEvents: true,
+        aiServiceOverrides: {
+          streamMessage,
+          stopStream: mock(async () => {
+            stopEntered.resolve();
+            await stopReleased.promise;
+            return Ok(undefined);
+          }),
+        },
+      });
+      const consumer = observePolicy(h.session);
+      const outcome: TurnCompletion =
+        status === "completed"
+          ? { status, streamEnd: end() }
+          : { status, abortReason: "user", streamAbort: abort() };
+      let edit: ReturnType<AgentSession["sendMessage"]> | undefined;
+      try {
+        await h.session.sendMessage("original", sendOptions);
+        const firstPolicy = policyPromise(consumer);
+        const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!history.success) throw new Error(history.error);
+        const userId = history.data.find((message) => message.role === "user")!.id;
+        h.session.queueMessage("queued follow-up", {
+          ...sendOptions,
+          queueDispatchMode: "turn-end",
+        });
+        edit = h.session.sendMessage("edited", { ...sendOptions, editMessageId: userId });
+        await stopEntered.promise;
+
+        // The engine can finish naturally while stopStream is still settling. Its policy
+        // must not hand the turn to queued work that the edit would then wait on.
+        emitter.emit(
+          status === "completed" ? "stream-end" : "stream-abort",
+          status === "completed" ? end() : abort()
+        );
+        completion.resolve(outcome);
+        await firstPolicy;
+        expect(streamMessage).toHaveBeenCalledTimes(1);
+        expect(internal(h.session).coordinator.phase).toBe("idle");
+        expect(h.session.isBusy()).toBe(true);
+
+        stopReleased.resolve();
+        expect((await edit).success).toBe(true);
+        await replacementStarted.promise;
+        expect(streamMessage).toHaveBeenCalledTimes(2);
+        expect(h.session.hasQueuedMessages()).toBe(false);
+        expect(h.events.filter((event) => event.type === "restore-to-input")).toMatchObject([
+          { text: "queued follow-up" },
+        ]);
+        const editedHistory = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!editedHistory.success) throw new Error(editedHistory.error);
+        expect(
+          editedHistory.data
+            .filter((message) => message.role === "user")
+            .map((message) => message.parts)
+        ).toMatchObject([[{ type: "text", text: "edited" }]]);
+      } finally {
+        h.session.beginDispose();
+        completion.resolve(outcome);
+        stopReleased.resolve();
+        await edit;
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
   test.each(["user", "system"] as const)(
     "startup %s cancellation handle does not duplicate its delayed notification",
     async (reason) => {

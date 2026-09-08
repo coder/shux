@@ -914,8 +914,6 @@ export class AgentSession {
         error: getErrorMessage(error),
       }),
   });
-  // When true, stream-end skips auto-flushing queued messages so an edit can truncate first.
-  private deferQueuedFlushUntilAfterEdit = false;
   // Provider-executed tools (for example native web_search/web_fetch) complete inside one
   // provider response, so the SDK's between-step stopWhen hook cannot preempt after them.
   // Track known siblings and reserve soft interruption for that native-only boundary.
@@ -3734,11 +3732,12 @@ export class AgentSession {
         return refuseBeforeAcceptance(
           createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
         );
+      // Reserve before interrupting: terminal policy can otherwise start queued work
+      // while stopStream settles, leaving this edit waiting on the wrong turn.
+      attempt.editReservation = this.coordinator.reserve("edit");
       this.continuousCompactor.reset("edit");
-      // Ensure no in-flight completion code can append after we truncate.
-      if (this.isBusy()) {
-        let preemptedPreparing = false;
-
+      // Ignore our own reservation when deciding whether a turn needs to settle.
+      if (this.coordinator.phase !== "idle") {
         // If a turn is still PREPARING/STREAMING, interrupt aggressively — history is about to be
         // truncated.
         //
@@ -3761,32 +3760,18 @@ export class AgentSession {
 
         // Editing owns history before its replacement reaches PREPARING. The coordinator
         // invalidates startup synchronously so late completion cannot write across truncation.
-        preemptedPreparing = this.coordinator.preemptPreparation();
+        if (!this.coordinator.preemptPreparation()) {
+          await this.waitForIdle();
+        }
 
-        // Tell stream-end to skip sendQueuedMessages() so the edit truncates first.
-        this.deferQueuedFlushUntilAfterEdit = true;
-        try {
-          if (!preemptedPreparing) {
-            await this.waitForIdle();
-          }
-
-          // Workspace teardown does not await in-flight async work; bail out if the session was
-          // disposed while waiting for completion cleanup.
-          if (this.coordinator.disposed) {
-            return Ok(undefined);
-          }
-        } finally {
-          this.deferQueuedFlushUntilAfterEdit = false;
+        // Teardown may have started while completion cleanup was settling.
+        if (this.coordinator.disposed) {
+          return Ok(undefined);
         }
       }
 
-      // r40: same admission gate as the acceptance path below — the edit is
-      // about to truncate and rewrite history while a context-discarding
-      // mutation may sit between its busy check and its mutation. Checked in
-      // the same synchronous block that arms the edit reservation (which
-      // claims busy-ness), so whichever side runs first is observed by the
-      // other. The epoch probe (r41) also refuses edits whose target rows a
-      // completed mutation already discarded.
+      // Recheck admission after settlement: a context mutation may have already
+      // claimed admission or discarded the target before we reserved the edit.
       if (this.coordinator.admissionBlocked || isAdmissionStale()) {
         return refuseBeforeAcceptance(
           createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
@@ -3798,11 +3783,7 @@ export class AgentSession {
         );
       }
 
-      // Idle (or preempted to idle) now: hold busy-ness from here until the
-      // turn phase takes over, so concurrent sends queue instead of racing the
-      // truncate + summary + append sequence below.
       attempt.expectedTurn = this.coordinator.turnId;
-      attempt.editReservation ??= this.coordinator.reserve("edit");
 
       // The edit is about to truncate and rewrite history. Any queued content from
       // the previous turn was written in the old context — return it to the input
@@ -5122,7 +5103,9 @@ export class AgentSession {
   /** Emergency retries reuse the accepted user row; never rerun a completed tool to recover context. */
   private async rolloverAfterBudgetFailure(
     model: string,
-    estimate?: number
+    estimate?: number,
+    // An edited startup may recover its own request without admitting competing turns.
+    editReservation?: PreparationAttempt["editReservation"]
   ): Promise<
     Result<
       { snapshot: RequestAssemblySnapshot; request: PreparedStreamMessage } | undefined,
@@ -5139,7 +5122,7 @@ export class AgentSession {
       context.contextBudgetRetried ||
       this.compactionMonitor.getThreshold() >= 1 ||
       this.coordinator.admissionBlocked ||
-      this.deferQueuedFlushUntilAfterEdit ||
+      this.coordinator.editBlocked(editReservation?.id) ||
       this.coordinator.disposed ||
       this.coordinator.closing
     )
@@ -5288,7 +5271,7 @@ export class AgentSession {
         this.activeStreamContext !== context ||
         this.contextBudgetGeneration !== generation ||
         this.coordinator.admissionBlocked ||
-        this.deferQueuedFlushUntilAfterEdit ||
+        this.coordinator.editBlocked(editReservation?.id) ||
         this.coordinator.disposed ||
         this.coordinator.closing
       )
@@ -6220,7 +6203,7 @@ export class AgentSession {
     if (
       this.midStreamCompactionPending ||
       this.continuousCompactor.isApplying() ||
-      this.deferQueuedFlushUntilAfterEdit
+      this.coordinator.editBlocked()
     )
       return;
     try {
@@ -7000,7 +6983,8 @@ export class AgentSession {
         ) {
           const rolled = await this.rolloverAfterBudgetFailure(
             streamResult.error.model,
-            streamResult.error.estimate
+            streamResult.error.estimate,
+            preparation?.editReservation
           );
           await using _rolloverRequest = rolled.success ? rolled.data?.request : undefined;
           if (
@@ -8084,7 +8068,7 @@ export class AgentSession {
       const hadQueuedMessages = this.hasPendingManualFollowUp();
       const continuousApplyPending =
         this.midStreamCompactionPending || this.continuousCompactor.isApplying();
-      if (this.deferQueuedFlushUntilAfterEdit || continuousApplyPending) {
+      if (this.coordinator.editBlocked() || continuousApplyPending) {
         this.queuedProviderToolEndAbortInFlight = false;
         // Clear the queued-message signal while the edit flow owns the next dispatch.
         this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
@@ -8096,7 +8080,7 @@ export class AgentSession {
 
       if (
         !handled &&
-        !this.deferQueuedFlushUntilAfterEdit &&
+        !this.coordinator.editBlocked() &&
         !continuousApplyPending &&
         !hadQueuedMessages
       ) {
@@ -9010,9 +8994,7 @@ export class AgentSession {
 
     // Physical check: withdrawn entries must still drain so their onCanceled fires.
     const shouldDispatch =
-      abortReason !== "user" &&
-      !this.deferQueuedFlushUntilAfterEdit &&
-      !this.messageQueue.isEmpty();
+      abortReason !== "user" && !this.coordinator.editBlocked() && !this.messageQueue.isEmpty();
     this.queuedProviderToolEndAbortInFlight = false;
 
     if (!shouldDispatch) {
@@ -9117,11 +9099,7 @@ export class AgentSession {
    * failed-startup drains elsewhere in this file.
    */
   drainQueuedMessagesIfIdle(): void {
-    if (
-      this.hasActiveOrPendingTurnWork() ||
-      this.deferQueuedFlushUntilAfterEdit ||
-      this.messageQueue.isEmpty()
-    ) {
+    if (this.hasActiveOrPendingTurnWork() || this.messageQueue.isEmpty()) {
       return;
     }
     this.sendQueuedMessages("idle");
@@ -9134,7 +9112,7 @@ export class AgentSession {
   sendQueuedMessages(trigger: QueueDrainTrigger = "terminal"): void {
     if (
       this.coordinator.closing ||
-      this.deferQueuedFlushUntilAfterEdit ||
+      this.coordinator.editBlocked() ||
       this.midStreamCompactionPending
     )
       return;

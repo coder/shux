@@ -644,21 +644,24 @@ describe("Queued messages during stream completion", () => {
       }
       expect(queuedEvent.queuedMessages).toEqual([queuedText]);
 
+      const editWaiting = createDeferred<void>();
+      const waitForIdle = session.waitForIdle.bind(session);
+      const waitForIdleSpy = jest.spyOn(session, "waitForIdle").mockImplementationOnce((signal) => {
+        editWaiting.resolve();
+        return waitForIdle(signal);
+      });
+
       const editedText = "Edited message";
       const editSendPromise = sendMessageWithModel(env, workspaceId, editedText, HAIKU_MODEL, {
         editMessageId: firstUserMessageId,
       });
 
-      // Ensure the edit armed the defer latch before allowing stream-end cleanup to continue.
-      // Without this, the test can race stream-end and release the completion gate too early.
-      const armedDeferLatch = await waitFor(() => {
-        return Boolean(
-          (session as unknown as { deferQueuedFlushUntilAfterEdit?: boolean })
-            .deferQueuedFlushUntilAfterEdit
-        );
-      }, 5000);
-      if (!armedDeferLatch) {
-        throw new Error("Edit never armed deferQueuedFlushUntilAfterEdit latch");
+      // Join the actual edit wait before releasing completion, rather than polling
+      // a private latch that duplicates the reservation owning this operation.
+      try {
+        await editWaiting.promise;
+      } finally {
+        waitForIdleSpy.mockRestore();
       }
 
       releaseCompletion.resolve();
