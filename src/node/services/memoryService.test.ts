@@ -937,6 +937,8 @@ describe("MemoryService", () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
       expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      const invalidated: string[][] = [];
+      fixture.service.on("ownersInvalidated", (ids: string[]) => invalidated.push(ids));
 
       // The owner is deregistered (removal with a live shared-checkout child);
       // the dangling chain must not keep pointing at the tombstoned owner.
@@ -945,6 +947,8 @@ describe("MemoryService", () => {
         project.workspaces = project.workspaces.filter((ws) => ws.id !== "ws-owner");
         return cfg;
       });
+      // Live sessions of formerly-shared children are told to drop their cache.
+      expect(invalidated).toEqual([["ws-child"]]);
       expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
       const created = await fixture.service.create(
         fixture.ctx,

@@ -1083,6 +1083,41 @@ describe("MemoryConsolidationService", () => {
     expect(fixture.modelCalls).toHaveLength(3);
   });
 
+  it("recovers a sub-agent's failed harvest through the owner's run", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [metadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: metadata.summaryMessageId,
+              compactionEpoch: metadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: metadata,
+            },
+          },
+        },
+      })
+    );
+
+    // The child's manual run redirects to the owner; the owner's recovery
+    // must still retry the CHILD's bucket (the launch sweep never visits it).
+    expect((await fixture.service.maybeRun("ws-sub", "manual")).success).toBe(true);
+    const status = await fixture.service.getStatus("ws-sub");
+    expect(status.latestHarvestRecord?.status).toBe("completed");
+    expect(status.latestHarvestRecord?.attemptCount).toBe(2);
+  });
+
   it("normalizes stale max-attempt pending harvest records to failed", async () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
     const metadata = await seedCompactionEpoch(fixture);

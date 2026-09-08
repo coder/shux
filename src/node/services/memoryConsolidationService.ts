@@ -498,10 +498,21 @@ export class MemoryConsolidationService extends EventEmitter {
     const self = this;
     return Effect.gen(function* () {
       const sidecar = yield* self.loadEffect();
-      const records = sidecar.harvestsByWorkspace[workspaceId];
-      if (records === undefined) return;
+      // Harvest buckets are keyed by the ACTING workspace, but a sub-agent's
+      // runs redirect to its owner (see maybeRun) and the launch sweep skips
+      // children, so an owner run must retry every tree member's bucket or a
+      // child's failed/stale harvest would never be recovered.
+      const cfg = self.config.loadConfigOrDefault();
+      const records = Object.entries(sidecar.harvestsByWorkspace)
+        .filter(
+          ([bucketId]) =>
+            bucketId === workspaceId ||
+            self.memoryService.resolveWorkspaceMemoryOwnerId(bucketId, () => cfg) === workspaceId
+        )
+        .flatMap(([, bucket]) => Object.values(bucket));
+      if (records.length === 0) return;
 
-      const retryable = Object.values(records)
+      const retryable = records
         .filter((record) => {
           if (record.completionMetadata === undefined) return false;
           if (record.attemptCount >= HARVEST_MAX_ATTEMPTS) return false;
@@ -686,6 +697,7 @@ export class MemoryConsolidationService extends EventEmitter {
           "sub-agent workspaces share their owner's workspace memory; the owner's archive pass promotes it"
         );
       }
+      // The owner run's recovery covers this child's harvest bucket too.
       return this.maybeRun(ownerWorkspaceId, trigger, options);
     }
     if (this.removalCancelled.has(workspaceId)) {

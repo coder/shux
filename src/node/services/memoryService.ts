@@ -593,7 +593,7 @@ export class MemoryService extends EventEmitter {
     // its own store) instead of writing into the tombstoned owner forever.
     // Local edits notify here; edits by ANOTHER backend (multi-instance) are
     // caught by the config-file stamp check in resolveWorkspaceMemoryOwnerId.
-    this.config.onConfigChanged(() => this.workspaceMemoryOwnerById.clear());
+    this.config.onConfigChanged(() => this.invalidateWorkspaceMemoryOwnerMemo());
   }
 
   // -------------------------------------------------------------------------
@@ -615,28 +615,47 @@ export class MemoryService extends EventEmitter {
 
   /**
    * Memoized resolveWorkspaceMemoryOwnerId (see memoryWorkspaceOwner.ts). The
-   * config is only loaded on a memo miss; callers resolving many workspaces
-   * in one synchronous pass supply a shared `loadConfig` so a cold pass parses
-   * the config once instead of once per workspace.
+   * config is only loaded on a memo miss. Callers resolving many workspaces
+   * in one synchronous pass may supply a shared `snapshot`; results derived
+   * from a caller snapshot are NOT memoized, because the snapshot can predate
+   * the current file stamp (another backend rewriting config.json mid-pass)
+   * and would otherwise be cached under the newer stamp.
    */
   resolveWorkspaceMemoryOwnerId(
     workspaceId: string,
-    loadConfig: () => ReturnType<Config["loadConfigOrDefault"]> = () =>
-      this.config.loadConfigOrDefault()
+    snapshot?: () => ReturnType<Config["loadConfigOrDefault"]>
   ): string {
     const stamp = this.config.configFileStamp();
     if (stamp !== this.workspaceMemoryOwnerConfigStamp) {
-      this.workspaceMemoryOwnerById.clear();
       this.workspaceMemoryOwnerConfigStamp = stamp;
+      this.invalidateWorkspaceMemoryOwnerMemo();
     }
     const cached = this.workspaceMemoryOwnerById.get(workspaceId);
     if (cached !== undefined) return cached;
-    const cfg = loadConfig();
+    if (snapshot !== undefined) return resolveWorkspaceMemoryOwnerId(snapshot(), workspaceId);
+    const cfg = this.config.loadConfigOrDefault();
     const owner = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
+    // Only positive (registered) results are memoized; the workspace may
+    // simply not be registered yet.
     if (findWorkspaceEntry(cfg, workspaceId) !== null) {
       this.workspaceMemoryOwnerById.set(workspaceId, owner);
     }
     return owner;
+  }
+
+  /**
+   * Drop the owner memo and tell listeners which workspaces were sharing a
+   * store: their live sessions hold a memory context built from an owner
+   * that may just have been removed, so core.ts invalidates those caches
+   * (there is no memory-change event for a removal to ride on). Idempotent
+   * and cheap when nothing was shared.
+   */
+  private invalidateWorkspaceMemoryOwnerMemo(): void {
+    const shared = [...this.workspaceMemoryOwnerById]
+      .filter(([workspaceId, owner]) => workspaceId !== owner)
+      .map(([workspaceId]) => workspaceId);
+    this.workspaceMemoryOwnerById.clear();
+    if (shared.length > 0) this.emit("ownersInvalidated", shared);
   }
 
   /** Owner of the workspace scope for this context ("" when there is no workspace). */
