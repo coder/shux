@@ -1018,6 +1018,26 @@ describe("MemoryService", () => {
       ).toBe(true);
     });
 
+    it("ignores config edits that leave the memory topology unchanged", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      const invalidated: string[][] = [];
+      fixture.service.on("ownersInvalidated", (ids: string[]) => invalidated.push(ids));
+
+      // Ordinary churn (a retitle) must not make every live child rebuild its
+      // memory context, and the unchanged mapping stays memoized.
+      await fixture.config.editConfig((cfg) => {
+        const project = cfg.projects.get(FIXTURE_PROJECT_PATH)!;
+        project.workspaces.find((ws) => ws.id === "ws-child")!.title = "renamed";
+        return cfg;
+      });
+      expect(invalidated).toEqual([]);
+      const load = spyOn(fixture.config, "loadConfigOrDefault");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      expect(load).not.toHaveBeenCalled();
+    });
+
     it("re-resolves the owner after an EXTERNAL config rewrite (another backend removed it)", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

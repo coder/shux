@@ -86,14 +86,6 @@ export interface RefinementEmitArgs {
    * which only applies inverses to the host filesystem.
    */
   runtime?: "remote";
-  /**
-   * Runs INSIDE the journal's blob lock before anything is stored; returning
-   * true skips the append (no blob, no row). Every publisher into a journal
-   * serializes on that cross-process lock, so a duplicate check performed
-   * here has no check→append window — two backends removing the same
-   * sub-agent concurrently cannot both copy one row into the owner's journal.
-   */
-  skipIf?: () => Promise<boolean>;
 }
 
 /** Shared by the rollback engine to compare current files against `postState`. */
@@ -282,67 +274,87 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
  * Same as appendRefinementEvent but propagates failures: for callers whose
  * row is the ONLY durable copy (shared-memory row migration before the
  * source journal is deleted) a swallowed failure would silently lose it.
- * Returns false when `args.skipIf` declined the append.
  */
-export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Promise<boolean> {
-  {
-    assert(args.sessionDir.length > 0, "refinement journal requires a session dir");
-    assert(args.workspaceId.length > 0, "refinement journal requires a workspace id");
-    const journal = sharedDurableEventJournal(args.sessionDir);
-    // Inverse blob puts and the append referencing them run under the journal
-    // blob lock: a concurrent reclamation pass must never observe the
-    // put→append window (see DurableEventJournal.withBlobLock).
-    let publishedBlobs: BlobQuotaEntry[] = [];
-    const appended = await journal.withBlobLock(async () => {
-      if (args.skipIf !== undefined && (await args.skipIf())) return false;
-      const resolved = await resolveRefinementInverse(journal.blobs, args.inverse);
-      const inverse = resolved.inverse;
-      publishedBlobs = resolved.publishedBlobs;
-      // Optional fields are spread conditionally: an explicit `undefined` value
-      // would fail the JsonValue schema validation on append and drop the row.
-      const evidence: RefinementEvidence = {
-        workspaceId: args.workspaceId,
-        toolName: args.evidence.toolName,
-        ...(args.evidence.toolCallId !== undefined ? { toolCallId: args.evidence.toolCallId } : {}),
-        ...(args.evidence.actor !== undefined ? { actor: args.evidence.actor } : {}),
-      };
-      const postState: RefinementPostState | undefined =
-        args.postFiles !== undefined
-          ? {
-              files: args.postFiles.map((file) => ({
-                path: file.path,
-                sha256: sha256Hex(file.content),
-              })),
-            }
-          : args.postState;
-      await journal.append({
-        workspaceId: args.workspaceId,
-        kind: "refinement",
-        data: {
-          kind: args.kind,
-          action: args.action,
-          inverse,
-          evidence,
-          ...(postState !== undefined ? { postState } : {}),
-          ...(args.migratedFrom !== undefined ? { migratedFrom: args.migratedFrom } : {}),
-          ...(args.sourceTs !== undefined ? { sourceTs: args.sourceTs } : {}),
-          ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
-        },
-      });
-      return true;
-    });
-    if (!appended) return false;
-    // Bound retained inverse payloads per session AFTER releasing the publish
-    // lock (reclaim takes it itself; the mutex is non-reentrant). Best-effort:
-    // failure must never fail the mutation this row describes.
-    try {
-      await reclaimExcessRefinementInverseBlobs(journal, publishedBlobs, {
-        resweep: args.sourceTs !== undefined,
-      });
-    } catch (error) {
-      log.debug("[refinement] inverse blob reclamation failed; continuing", { error });
-    }
-    return true;
+export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Promise<void> {
+  assert(args.sessionDir.length > 0, "refinement journal requires a session dir");
+  const journal = sharedDurableEventJournal(args.sessionDir);
+  // Inverse blob puts and the append referencing them run under the journal
+  // blob lock: a concurrent reclamation pass must never observe the
+  // put→append window (see DurableEventJournal.withBlobLock).
+  const publishedBlobs = await journal.withBlobLock(() =>
+    appendRefinementEventUnderBlobLock(journal, args)
+  );
+  await reclaimRefinementInverseBlobsBestEffort(journal, publishedBlobs, {
+    resweep: args.sourceTs !== undefined,
+  });
+}
+
+/**
+ * The locked leg of appendRefinementEventOrThrow, for callers that batch
+ * several appends (plus their own journal-state checks) under ONE
+ * `journal.withBlobLock` section — shared-memory row migration dedups
+ * against the owner journal and copies every row inside the same hold, so
+ * neither a concurrent duplicate migration nor a reclamation pass can
+ * interleave. The caller MUST hold `journal`'s blob lock (asserted) and MUST
+ * hand the returned payload entries to
+ * reclaimRefinementInverseBlobsBestEffort after releasing it.
+ */
+export async function appendRefinementEventUnderBlobLock(
+  journal: DurableEventJournal,
+  args: RefinementEmitArgs
+): Promise<BlobQuotaEntry[]> {
+  assert(args.workspaceId.length > 0, "refinement journal requires a workspace id");
+  await journal.assertBlobLockOwned();
+  const resolved = await resolveRefinementInverse(journal.blobs, args.inverse);
+  const inverse = resolved.inverse;
+  // Optional fields are spread conditionally: an explicit `undefined` value
+  // would fail the JsonValue schema validation on append and drop the row.
+  const evidence: RefinementEvidence = {
+    workspaceId: args.workspaceId,
+    toolName: args.evidence.toolName,
+    ...(args.evidence.toolCallId !== undefined ? { toolCallId: args.evidence.toolCallId } : {}),
+    ...(args.evidence.actor !== undefined ? { actor: args.evidence.actor } : {}),
+  };
+  const postState: RefinementPostState | undefined =
+    args.postFiles !== undefined
+      ? {
+          files: args.postFiles.map((file) => ({
+            path: file.path,
+            sha256: sha256Hex(file.content),
+          })),
+        }
+      : args.postState;
+  await journal.append({
+    workspaceId: args.workspaceId,
+    kind: "refinement",
+    data: {
+      kind: args.kind,
+      action: args.action,
+      inverse,
+      evidence,
+      ...(postState !== undefined ? { postState } : {}),
+      ...(args.migratedFrom !== undefined ? { migratedFrom: args.migratedFrom } : {}),
+      ...(args.sourceTs !== undefined ? { sourceTs: args.sourceTs } : {}),
+      ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
+    },
+  });
+  return resolved.publishedBlobs;
+}
+
+/**
+ * Bound retained inverse payloads per session AFTER the publish lock is
+ * released (reclaim takes it itself; the mutex is non-reentrant). Best-effort:
+ * failure must never fail the mutation the row(s) describe.
+ */
+export async function reclaimRefinementInverseBlobsBestEffort(
+  journal: DurableEventJournal,
+  publishedBlobs: BlobQuotaEntry[],
+  options: { resweep: boolean }
+): Promise<void> {
+  try {
+    await reclaimExcessRefinementInverseBlobs(journal, publishedBlobs, options);
+  } catch (error) {
+    log.debug("[refinement] inverse blob reclamation failed; continuing", { error });
   }
 }
 

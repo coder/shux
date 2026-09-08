@@ -8,8 +8,13 @@ import {
   type RefinementInverse,
 } from "@/common/types/refinement";
 import { log } from "@/node/services/log";
+import type { BlobQuotaEntry } from "@/node/utils/journal/blobReclamation";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
-import { appendRefinementEventOrThrow, type RefinementInverseDraft } from "./refinementJournal";
+import {
+  appendRefinementEventUnderBlobLock,
+  reclaimRefinementInverseBlobsBestEffort,
+  type RefinementInverseDraft,
+} from "./refinementJournal";
 import { listRefinements } from "./refinementRollback";
 
 function inversePaths(inverse: RefinementInverse): string[] {
@@ -94,85 +99,93 @@ export async function migrateSharedMemoryRefinementRows(args: {
     }
     return depth % 2 === 0;
   };
-  // Idempotent across retried removals (the child journal survives a
-  // retryable removal failure or a crash before deletion): rows already
-  // copied are identified by their source identity on the owner side. This
-  // unlocked read only pre-filters; the authoritative check re-runs inside
-  // the owner journal's publish lock per row (skipIf below), because two
-  // backends removing the same child concurrently can both pass this
-  // pre-filter before either append lands.
-  const migratedSourceIds = async () =>
-    new Set(
+  const childJournal = sharedDurableEventJournal(args.childSessionDir);
+  const ownerJournal = sharedDurableEventJournal(args.ownerSessionDir);
+  let migrated = 0;
+  const publishedBlobs: BlobQuotaEntry[] = [];
+  // One hold of the owner journal's publish lock for the whole batch: the
+  // dedup read and every append happen inside it, so a second backend
+  // removing the same child concurrently (or a retried removal — the child
+  // journal survives a retryable failure or a crash before deletion) sees the
+  // copied rows before it decides, and the owner journal is read once rather
+  // than once per row. Rows already copied are identified by their source
+  // identity on the owner side.
+  await ownerJournal.withBlobLock(async () => {
+    const alreadyMigrated = new Set(
       (await listRefinements(args.ownerSessionDir))
         .map((row) => row.data.migratedFrom)
         .filter((id): id is string => id !== undefined)
     );
-  const alreadyMigrated = await migratedSourceIds();
-  const childJournal = sharedDurableEventJournal(args.childSessionDir);
-  let migrated = 0;
-  for (const row of rows) {
-    if (row.data.kind !== "memory" || row.data.rollbackOf !== undefined) continue;
-    if (isLive(row.id) !== true) continue;
-    const migratedFrom = `${args.childWorkspaceId}:${row.id}`;
-    if (alreadyMigrated.has(migratedFrom)) continue;
-    const inverse = RefinementInverseSchema.safeParse(row.data.inverse);
-    const action = MemoryRefinementActionSchema.safeParse(row.data.action);
-    if (!inverse.success || !action.success) continue;
-    if (!inversePaths(inverse.data).every((p) => isInside(ownerMemoryRoot, p))) continue;
+    for (const row of rows) {
+      if (row.data.kind !== "memory" || row.data.rollbackOf !== undefined) continue;
+      if (isLive(row.id) !== true) continue;
+      const migratedFrom = `${args.childWorkspaceId}:${row.id}`;
+      if (alreadyMigrated.has(migratedFrom)) continue;
+      const inverse = RefinementInverseSchema.safeParse(row.data.inverse);
+      const action = MemoryRefinementActionSchema.safeParse(row.data.action);
+      if (!inverse.success || !action.success) continue;
+      if (!inversePaths(inverse.data).every((p) => isInside(ownerMemoryRoot, p))) continue;
 
-    let draft: RefinementInverseDraft;
-    if (inverse.data.op === "restore-files") {
-      const files: Array<{ path: string; content: string }> = [];
-      for (const file of inverse.data.files) {
-        // Contents are blob-offloaded at append (resolveRefinementInverse); older
-        // rows may carry them inline.
-        const content =
-          file.text ??
-          (file.blobRef === undefined ? null : await childJournal.blobs.getText(file.blobRef));
-        if (content === null) break;
-        files.push({ path: file.path, content });
+      let draft: RefinementInverseDraft;
+      if (inverse.data.op === "restore-files") {
+        const files: Array<{ path: string; content: string }> = [];
+        for (const file of inverse.data.files) {
+          // Contents are blob-offloaded at append (resolveRefinementInverse); older
+          // rows may carry them inline.
+          const content =
+            file.text ??
+            (file.blobRef === undefined ? null : await childJournal.blobs.getText(file.blobRef));
+          if (content === null) break;
+          files.push({ path: file.path, content });
+        }
+        if (files.length !== inverse.data.files.length) {
+          log.debug("[refinement] skipping shared-memory row migration: inverse payload missing", {
+            rowId: row.id,
+          });
+          continue;
+        }
+        draft = {
+          op: "restore-files",
+          files,
+          ...(inverse.data.deletePaths !== undefined
+            ? { deletePaths: inverse.data.deletePaths }
+            : {}),
+        };
+      } else {
+        draft = inverse.data;
       }
-      if (files.length !== inverse.data.files.length) {
-        log.debug("[refinement] skipping shared-memory row migration: inverse payload missing", {
-          rowId: row.id,
-        });
-        continue;
-      }
-      draft = {
-        op: "restore-files",
-        files,
-        ...(inverse.data.deletePaths !== undefined
-          ? { deletePaths: inverse.data.deletePaths }
-          : {}),
-      };
-    } else {
-      draft = inverse.data;
+      const evidence = RefinementEvidenceSchema.safeParse(row.data.evidence);
+      const postState = RefinementPostStateSchema.safeParse(row.data.postState);
+      // Throws: this is the only durable copy once the child's journal goes.
+      publishedBlobs.push(
+        ...(await appendRefinementEventUnderBlobLock(ownerJournal, {
+          sessionDir: args.ownerSessionDir,
+          workspaceId: args.ownerWorkspaceId,
+          kind: "memory",
+          action: action.data,
+          inverse: draft,
+          evidence: {
+            toolName: evidence.success ? evidence.data.toolName : "memory",
+            ...(evidence.success && evidence.data.toolCallId !== undefined
+              ? { toolCallId: evidence.data.toolCallId }
+              : {}),
+            ...(evidence.success && evidence.data.actor !== undefined
+              ? { actor: evidence.data.actor }
+              : {}),
+          },
+          ...(postState.success ? { postState: postState.data } : {}),
+          migratedFrom,
+          sourceTs: row.data.sourceTs ?? row.ts,
+          ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),
+        }))
+      );
+      migrated++;
     }
-    const evidence = RefinementEvidenceSchema.safeParse(row.data.evidence);
-    const postState = RefinementPostStateSchema.safeParse(row.data.postState);
-    // Throws: this is the only durable copy once the child's journal goes.
-    const appended = await appendRefinementEventOrThrow({
-      skipIf: async () => (await migratedSourceIds()).has(migratedFrom),
-      sessionDir: args.ownerSessionDir,
-      workspaceId: args.ownerWorkspaceId,
-      kind: "memory",
-      action: action.data,
-      inverse: draft,
-      evidence: {
-        toolName: evidence.success ? evidence.data.toolName : "memory",
-        ...(evidence.success && evidence.data.toolCallId !== undefined
-          ? { toolCallId: evidence.data.toolCallId }
-          : {}),
-        ...(evidence.success && evidence.data.actor !== undefined
-          ? { actor: evidence.data.actor }
-          : {}),
-      },
-      ...(postState.success ? { postState: postState.data } : {}),
-      migratedFrom,
-      sourceTs: row.data.sourceTs ?? row.ts,
-      ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),
-    });
-    if (appended) migrated++;
+  });
+  // Migrated rows carry sourceTs (appended out of chronological order), so
+  // the quota pass re-derives retention in source order.
+  if (publishedBlobs.length > 0) {
+    await reclaimRefinementInverseBlobsBestEffort(ownerJournal, publishedBlobs, { resweep: true });
   }
   return migrated;
 }
