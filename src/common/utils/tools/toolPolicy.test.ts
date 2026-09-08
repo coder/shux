@@ -2,6 +2,8 @@ import {
   applyToolPolicy,
   applyToolPolicyToNames,
   buildRequiredToolPatterns,
+  isSessionHistoryDisabled,
+  withContextBudgetFlushToolPolicy,
   type ToolPolicy,
 } from "./toolPolicy";
 import { tool } from "ai";
@@ -370,5 +372,30 @@ describe("buildRequiredToolPatterns", () => {
   test("returns empty for undefined or require-free policies", () => {
     expect(buildRequiredToolPatterns(undefined)).toEqual([]);
     expect(buildRequiredToolPatterns([{ regex_match: "bash", action: "disable" }])).toEqual([]);
+  });
+});
+
+describe("withContextBudgetFlushToolPolicy", () => {
+  const names = ["memory", "session_history", "bash", "file_edit_replace_string", "mcp__srv__op"];
+
+  it("keeps only memory and session_history regardless of enabling caller rules", () => {
+    expect(applyToolPolicyToNames(names, withContextBudgetFlushToolPolicy(undefined))).toEqual([
+      "memory",
+      "session_history",
+    ]);
+    expect(
+      applyToolPolicyToNames(
+        names,
+        withContextBudgetFlushToolPolicy([{ regex_match: "bash", action: "enable" }])
+      )
+    ).toEqual(["memory", "session_history"]);
+  });
+
+  it("preserves the inherited verdict for memory and session_history", () => {
+    const policy = withContextBudgetFlushToolPolicy([
+      { regex_match: "session_.*", action: "disable" },
+    ]);
+    expect(applyToolPolicyToNames(names, policy)).toEqual(["memory"]);
+    expect(isSessionHistoryDisabled(policy)).toBe(true);
   });
 });

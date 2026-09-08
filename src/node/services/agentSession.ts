@@ -9,10 +9,10 @@ import { createContextBudgetRejectedMessage } from "@/common/utils/messages/cont
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
-import { isSessionHistoryDisabled, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
-  CONTEXT_FLUSH_TOOL_POLICY_RULE,
+  CONTEXT_NOTES_MEMORY_PATH,
   CONTEXT_WARNING_DEDUPE_KEY,
   WARNING_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
@@ -37,7 +37,7 @@ import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
 import { Effect, Fiber } from "effect";
 import { StartupRecovery, type StartupRecoveryOutcome } from "./startupRecovery";
-import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
+import { access, mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PlatformPaths } from "@/common/utils/paths";
@@ -242,7 +242,7 @@ import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
-import type { MemorySessionContext } from "@/node/services/memoryService";
+import { workspaceMemoryStorePath, type MemorySessionContext } from "@/node/services/memoryService";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -367,24 +367,6 @@ function coerceGoalId(value: unknown): string | undefined {
 const PDF_MEDIA_TYPE = "application/pdf";
 const ACP_PROMPT_ID_METADATA_KEY = "acpPromptId";
 const ACP_DELEGATED_TOOLS_METADATA_KEY = "acpDelegatedTools";
-
-/**
- * Undo the memory-only restriction appended to a final-flush turn's tool policy so a
- * continuation derived from that turn runs with the inherited policy again. Tolerant of
- * persisted rows that never carried the rule (nothing to strip).
- */
-function withoutFlushToolPolicyRule(policy: ToolPolicy | undefined): ToolPolicy | undefined {
-  const last = policy?.at(-1);
-  if (
-    !policy ||
-    !last ||
-    last.regex_match !== CONTEXT_FLUSH_TOOL_POLICY_RULE.regex_match ||
-    last.action !== CONTEXT_FLUSH_TOOL_POLICY_RULE.action
-  )
-    return policy;
-  const rest = policy.slice(0, -1);
-  return rest.length > 0 ? rest : undefined;
-}
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
   if (!metadata) return [];
@@ -5153,13 +5135,7 @@ export class AgentSession {
     estimate?: number
   ): Promise<
     Result<
-      | {
-          snapshot: RequestAssemblySnapshot;
-          request: PreparedStreamMessage;
-          /** Send options for the retry (a flush turn's memory-only policy is undone). */
-          options: SendMessageOptions | undefined;
-        }
-      | undefined,
+      { snapshot: RequestAssemblySnapshot; request: PreparedStreamMessage } | undefined,
       SendMessageError
     >
   > {
@@ -5209,17 +5185,10 @@ export class AgentSession {
       );
       if (maxTokens == null || maxTokens <= 0) return Ok(undefined);
       // An admitted final-flush trigger that overflowed at assembly must not carry its
-      // internal text, flag, or memory-only tool policy into the fresh window; it continues
-      // as an ordinary turn with the pre-flush policy.
+      // internal text or flag into the fresh window; without the flag the request builder
+      // applies the ordinary toolset again, so it continues as a normal turn.
       const wasFlush = user.metadata?.muxMetadata?.contextBudgetFlush === true;
-      const retryOptions =
-        wasFlush && context.options
-          ? {
-              ...context.options,
-              toolPolicy: withoutFlushToolPolicyRule(context.options.toolPolicy),
-            }
-          : context.options;
-      const access = await this.checkContextBudgetHistoryAccess(retryOptions);
+      const access = await this.checkContextBudgetHistoryAccess(context.options);
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return Ok(undefined);
       if (!access.success) return access;
@@ -5246,7 +5215,6 @@ export class AgentSession {
         ...(wasFlush ? { parts: [{ type: "text", text: "Continue" }] } : {}),
         metadata: {
           ...metadata,
-          ...(wasFlush ? { toolPolicy: withoutFlushToolPolicyRule(metadata.toolPolicy) } : {}),
           timestamp: Date.now(),
           muxMetadata: { ...muxMetadata, rolloverId: rollover.rolloverId },
         },
@@ -5325,7 +5293,7 @@ export class AgentSession {
       const freshBudget = await this.checkFreshContextBudget(
         continuation,
         model,
-        retryOptions,
+        context.options,
         retryPrelude,
         context.providersConfig
       );
@@ -5345,7 +5313,7 @@ export class AgentSession {
       const candidate = await this.prepareRolloverRequest(
         rows,
         model,
-        retryOptions,
+        context.options,
         captured.data,
         context.agentInitiated
       );
@@ -5395,7 +5363,7 @@ export class AgentSession {
         return Ok(undefined);
       for (const row of rows) this.emitChatEvent({ ...row, type: "message" });
       transferred = true;
-      return Ok({ snapshot: captured.data, request: candidate.data, options: retryOptions });
+      return Ok({ snapshot: captured.data, request: candidate.data });
     } catch (error) {
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
@@ -5683,7 +5651,11 @@ export class AgentSession {
       ) {
         // Keep pendingRollover: the next dispatch seals this window regardless of usage.
         return Ok({
-          prefix: [createContextBudgetWarning(decision.projected, maxTokens, true, true, true)],
+          prefix: [
+            createContextBudgetWarning(decision.projected, maxTokens, true, true, {
+              notesExist: await this.workspaceContextNotesExist(),
+            }),
+          ],
         });
       }
       // Neither the trigger text nor the flush flag may leak into the fresh window.
@@ -5776,6 +5748,53 @@ export class AgentSession {
     return Ok({ prefix: [] });
   }
 
+  /**
+   * Authoritative on-disk check for the workspace context notes: the flush prompt must not
+   * guess from a possibly missing memory index whether to `create` or update.
+   */
+  private async workspaceContextNotesExist(): Promise<boolean> {
+    const relPath = CONTEXT_NOTES_MEMORY_PATH.replace(/^\/memories\/workspace\//, "");
+    assert(relPath !== CONTEXT_NOTES_MEMORY_PATH, "context notes must live in workspace memory");
+    try {
+      await access(
+        path.join(workspaceMemoryStorePath(this.config.sessionsDir, this.workspaceId), relPath)
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Sealed tool-end continuation shared by the mid-stream and resume-hydration paths. */
+  private enqueueContextBudgetContinuation(args: {
+    text: string;
+    dedupeKey: string;
+    options: SendMessageOptions;
+    model: string;
+    muxMetadata: MuxMessageMetadata;
+    goalKind?: GoalSyntheticMessageKind;
+    goalId?: string;
+  }): void {
+    this.messageQueue.addOnce(
+      args.text,
+      {
+        ...args.options,
+        model: args.model,
+        queueDispatchMode: "tool-end",
+        muxMetadata: args.muxMetadata,
+      },
+      args.dedupeKey,
+      {
+        synthetic: true,
+        agentInitiated: true,
+        sealed: true,
+        removableDedupeKey: true,
+        goalKind: args.goalKind,
+        goalId: args.goalId,
+      }
+    );
+  }
+
   private async onContextBudgetStepSettled(
     step: SettledStepBudget
   ): Promise<"continue" | "warn" | "rollover" | "block"> {
@@ -5842,39 +5861,23 @@ export class AgentSession {
     // itself is a separate durable prefix row when this entry dispatches.
     const streamOptions = context.options;
     // SECURITY: the flush turn is a hidden, automatically dispatched step running on a
-    // transcript that may already contain injected tool output. Prose asking for a single
-    // memory call is not a capability boundary, so its tool policy keeps only `memory` (the
-    // write it exists for) and read-only `session_history`; every other tool is disabled.
-    // Leaving those two names untouched keeps the inherited policy's session_history verdict
-    // intact for the rollover admission re-check at dispatch.
-    const flushToolPolicy: ToolPolicy = [
-      ...(streamOptions.toolPolicy ?? []),
-      CONTEXT_FLUSH_TOOL_POLICY_RULE,
-    ];
+    // transcript that may already contain injected tool output. The request builder derives
+    // its memory-only tool ceiling, pinned notes path, and disabled hooks/PTC from the
+    // `contextBudgetFlush` flag, independent of these send options.
     const enqueue = (text: string, dedupeKey: string, flush: boolean) =>
-      this.messageQueue.addOnce(
+      this.enqueueContextBudgetContinuation({
         text,
-        {
-          ...streamOptions,
-          model: step.model,
-          queueDispatchMode: "tool-end",
-          ...(flush ? { toolPolicy: flushToolPolicy } : {}),
-          muxMetadata: {
-            ...(context.workspaceTurnMetadata ?? { type: "normal" }),
-            contextBudgetContinuation: true,
-            ...(flush ? { contextBudgetFlush: true as const } : {}),
-          },
-        },
         dedupeKey,
-        {
-          synthetic: true,
-          agentInitiated: true,
-          sealed: true,
-          removableDedupeKey: true,
-          goalKind: context.goalKind,
-          goalId: context.goalId,
-        }
-      );
+        options: streamOptions,
+        model: step.model,
+        muxMetadata: {
+          ...(context.workspaceTurnMetadata ?? { type: "normal" }),
+          contextBudgetContinuation: true,
+          ...(flush ? { contextBudgetFlush: true as const } : {}),
+        },
+        goalKind: context.goalKind,
+        goalId: context.goalId,
+      });
     if (offerFlush) {
       assert(
         !this.messageQueue.hasDedupeKey(CONTEXT_WARNING_DEDUPE_KEY) &&
@@ -6943,6 +6946,46 @@ export class AgentSession {
             row.metadata?.muxMetadata?.type === "context-budget-warning" &&
             row.metadata.muxMetadata.final === true
         );
+        // Resuming a persisted flush turn must also restore its sealing intent: the durable
+        // final warning promised that the next message starts fresh, so re-queue the rollover
+        // continuation and keep the pending claim even if the resumed step no longer crosses
+        // the threshold (e.g. a larger model was selected).
+        const finalRow = historyResult.data.findLast(
+          (row) =>
+            row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+            row.metadata.muxMetadata.final === true
+        )?.metadata?.muxMetadata;
+        const flushMuxMetadata = lastUserMessage?.metadata?.muxMetadata;
+        if (
+          options &&
+          flushMuxMetadata?.contextBudgetFlush === true &&
+          finalRow?.type === "context-budget-warning" &&
+          this.pendingRollover == null &&
+          this.compactionMonitor.getThreshold() < 1
+        ) {
+          this.pendingRollover = {
+            type: "context-window-rollover",
+            rolloverId: randomUUID(),
+            reason: "mid-stream",
+            previousWindowId: currentContextWindowId(historyResult.data),
+            flushOpportunity: true,
+            contextTokens: finalRow.contextTokens,
+            maxTokens: finalRow.maxTokens,
+          };
+          if (this.messageQueue.isEmpty()) {
+            const { contextBudgetFlush: _flush, ...continuationMetadata } = flushMuxMetadata;
+            this.enqueueContextBudgetContinuation({
+              text: "Continue",
+              dedupeKey: CONTEXT_CONTINUE_DEDUPE_KEY,
+              options,
+              model: modelString,
+              muxMetadata: continuationMetadata,
+              goalKind,
+              goalId,
+            });
+            this.emitQueuedMessageChanged();
+          }
+        }
       }
 
       // A crash between snapshot and user-row appends can leave orphaned prompt
@@ -7093,7 +7136,13 @@ export class AgentSession {
         agentId: options?.agentId,
         acpPromptId,
         delegatedToolNames,
-        muxMetadata: streamMuxMetadata,
+        // A resumed final-flush turn must keep its flag so the request builder applies the
+        // memory-only ceiling regardless of the caller's current send options; the flag is
+        // request-local and never becomes the stream's workspace-turn correlation.
+        muxMetadata:
+          lastUserMessage?.metadata?.muxMetadata?.contextBudgetFlush === true
+            ? { ...(streamMuxMetadata ?? { type: "normal" }), contextBudgetFlush: true }
+            : streamMuxMetadata,
         recordFileState,
         postCompactionAttachments,
         // Invoked by AIService after runtime.ensureReady() (project-scope
@@ -7156,7 +7205,7 @@ export class AgentSession {
             return await this.streamWithHistory(
               turn,
               streamResult.error.model,
-              rolled.data.options ?? options,
+              options,
               openaiTruncationModeOverride,
               true,
               agentInitiated,
@@ -7820,7 +7869,7 @@ export class AgentSession {
           retry = await this.streamWithHistory(
             preparedTurn,
             model,
-            rolled.data.options ?? context.options,
+            context.options,
             context.openaiTruncationModeOverride,
             true,
             context.agentInitiated,

@@ -221,6 +221,11 @@ async function assertRenameDestinationOutsideDirSource(args: {
  * Parse + validate a virtual memory path. Throws MemoryCommandError with a
  * model-recoverable message on invalid input.
  */
+/** Host-local root of one workspace's memory scope (<sessionDir>/memory). */
+export function workspaceMemoryStorePath(sessionsDir: string, workspaceId: string): string {
+  return path.join(sessionsDir, workspaceId, "memory");
+}
+
 export function parseMemoryPath(virtualPath: string): ParsedMemoryPath {
   const trimmed = virtualPath.trim();
   if (!trimmed.startsWith(MEMORY_VIRTUAL_ROOT)) {
@@ -697,7 +702,9 @@ export class MemoryService extends EventEmitter {
             "Workspace memory is unavailable: no workspace is associated with this session"
           );
         }
-        return new LocalMemoryStore(path.join(this.config.sessionsDir, ctx.workspaceId, "memory"));
+        return new LocalMemoryStore(
+          workspaceMemoryStorePath(this.config.sessionsDir, ctx.workspaceId)
+        );
       }
     }
   }

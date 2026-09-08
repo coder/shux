@@ -28,7 +28,9 @@ describe("context window rollover recovery", () => {
     expect(hasRolloverEligibleMessages([old, boundary, leadIn])).toBe(false);
     const warning = createContextBudgetWarning(80_000, 128_000, true, true);
     expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning])).toBe(false);
-    const finalFlush = createContextBudgetWarning(110_000, 128_000, true, true, true);
+    const finalFlush = createContextBudgetWarning(110_000, 128_000, true, true, {
+      notesExist: false,
+    });
     expect(warning.metadata?.muxMetadata).not.toHaveProperty("final");
     expect(finalFlush.metadata?.muxMetadata).toMatchObject({
       type: "context-budget-warning",

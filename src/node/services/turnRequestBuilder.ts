@@ -238,7 +238,7 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { withContextBudgetFlushToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -1378,7 +1378,11 @@ export class TurnRequestBuilder {
       requestedAgentId: agentId,
       strictAgentResolution,
       disableWorkspaceAgents: disableWorkspaceAgents ?? false,
-      callerToolPolicy: toolPolicy,
+      // Flush turns get the memory-only ceiling here, independent of caller options, so a
+      // resumed or retried stream cannot widen the hidden turn's toolset.
+      callerToolPolicy: contextBudgetFlushTurn
+        ? withContextBudgetFlushToolPolicy(toolPolicy)
+        : toolPolicy,
       cfg,
       emitError: (event) => {
         if (!context.admissionOnly) this.dependencies.emit("error", event);

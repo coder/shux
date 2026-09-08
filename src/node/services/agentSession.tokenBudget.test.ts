@@ -16,7 +16,6 @@ import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
-import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
@@ -1348,19 +1347,8 @@ describe("AgentSession token-budget lifecycle", () => {
       uiVisible: false,
       muxMetadata: { ...correlation, contextBudgetContinuation: true, contextBudgetFlush: true },
     });
-    // The hidden flush turn keeps only the memory write it exists for (plus read-only history).
-    const toolNames = [
-      "memory",
-      "session_history",
-      "bash",
-      "file_edit_replace_string",
-      "mcp__x__y",
-    ];
-    expect(applyToolPolicyToNames(toolNames, h.requests[1].toolPolicy)).toEqual([
-      "memory",
-      "session_history",
-    ]);
-    // The request builder pins memory writes to the notes file from this flag.
+    // The request builder derives the memory-only toolset, pinned notes path, and disabled
+    // hooks/PTC for the hidden flush turn from this flag (see turnRequestBuilder).
     expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     // The flush turn's own settlement re-evaluates as rollover without queuing a second flush.
     expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
@@ -1382,8 +1370,7 @@ describe("AgentSession token-budget lifecycle", () => {
       muxMetadata: { ...correlation, contextBudgetContinuation: true },
     });
     expect(text(rows.at(-1)!)).toBe("Continue");
-    // The rollover continuation runs with the inherited (unrestricted) policy again.
-    expect(applyToolPolicyToNames(toolNames, h.requests[2].toolPolicy)).toEqual(toolNames);
+    expect(h.requests[2].muxMetadata).not.toHaveProperty("contextBudgetFlush");
     expect(
       sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages).some((row) =>
         text(row).startsWith("Flush context notes")
@@ -1563,10 +1550,8 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.requests[2].messages.some((row) => text(row).startsWith("Flush context notes"))).toBe(
       false
     );
-    // The retry continues the task with the inherited policy, not the memory-only flush policy.
-    const toolNames = ["memory", "session_history", "bash", "file_edit_replace_string"];
-    expect(applyToolPolicyToNames(toolNames, h.requests[2].toolPolicy)).toEqual(toolNames);
-    expect(applyToolPolicyToNames(toolNames, trigger.metadata?.toolPolicy)).toEqual(toolNames);
+    // Without the flag the request builder applies the ordinary toolset to the retry.
+    expect(h.requests[2].muxMetadata).not.toHaveProperty("contextBudgetFlush");
   });
 
   test("a resumed final-flush turn keeps the once-per-window flush claim", async () => {
@@ -1578,10 +1563,21 @@ describe("AgentSession token-budget lifecycle", () => {
     // Startup retry resumes the persisted flush turn through history, not a fresh send.
     const h = await setup({ previous: first });
     expect((await h.session.resumeStream(options)).success).toBe(true);
-    expect(await h.requests[0].onStepSettled?.(step(112_000))).toBe("rollover");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+    // The sealing intent is restored with the resumed turn: the rollover continuation is
+    // queued up front and survives a step that no longer crosses the threshold.
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    expect(warningRows(await allRows(h)).filter(isFinalFlushRow)).toHaveLength(1);
+    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    expect(await h.requests[0].onStepSettled?.(step(50_000))).toBe("continue");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+    h.settleStream(0);
+    await h.waitForRequest(2);
+    const rows = await allRows(h);
+    expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
+    expect(rolloverRows(rows)).toHaveLength(1);
+    expect(rolloverRows(rows)[0].metadata?.muxMetadata).toMatchObject({
+      reason: "mid-stream",
+      flushOpportunity: true,
+    });
   });
 
   test("the final flush is offered once per window, including after a restart", async () => {
