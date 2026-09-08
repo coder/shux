@@ -846,11 +846,19 @@ export class TurnRequestBuilder {
       minThinkingLevel: providedMinThinkingLevel,
     } = opts;
     let activeTurnThinkingOverride = opts.activeTurnThinkingOverride;
-    const experiments: StreamMessageOptions["experiments"] = resolveBackendGatedPtcExperiments(
+    // SECURITY: the context-budget final flush is a hidden automatic turn whose only job is
+    // writing the workspace context notes, on a transcript that may carry injected tool output.
+    // It must not gain synthesized code execution (PTC) or run repository tool hooks, and its
+    // memory writes are pinned to the notes file below.
+    const contextBudgetFlushTurn = muxMetadata?.contextBudgetFlush === true;
+    const gatedExperiments = resolveBackendGatedPtcExperiments(
       experimentsFromOptions,
       (experimentId) =>
         this.dependencies.experimentsService?.isExperimentEnabled(experimentId) === true
     );
+    const experiments: StreamMessageOptions["experiments"] = contextBudgetFlushTurn
+      ? { ...gatedExperiments, programmaticToolCalling: false }
+      : gatedExperiments;
     const combinedAbortSignal = context.abortSignal;
     const syntheticMessageId = context.syntheticMessageId;
     const startTime = context.startTime;
@@ -1419,10 +1427,8 @@ export class TurnRequestBuilder {
       planLike: agentIsPlanLike,
       editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
     });
-    // SECURITY: the context-budget final flush is a hidden automatic turn whose only job is
-    // writing the workspace context notes. Keep global/project stores read-only and pin
-    // mutations to that one file so injected transcript content cannot reach other memory.
-    const contextBudgetFlushTurn = muxMetadata?.contextBudgetFlush === true;
+    // Flush turns: keep global/project stores read-only and pin mutations to the notes file
+    // (memoryWritePath below) so injected transcript content cannot reach other memory.
     const memoryAccess: MemoryScopeAccess = contextBudgetFlushTurn
       ? { global: "read", project: "read", workspace: agentMemoryAccess.workspace }
       : agentMemoryAccess;
@@ -2274,7 +2280,8 @@ export class TurnRequestBuilder {
       // description (same disclosure mechanic as skills).
       memoryIndexEntries: memoryContext?.indexEntries,
       // Trust gating: only run hooks/scripts when the full shared workspace runtime is trusted.
-      trusted: sharedExecutionTrusted,
+      // Flush turns never run repository tool hooks around their pinned memory write.
+      trusted: sharedExecutionTrusted && !contextBudgetFlushTurn,
     };
     const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
       if (event.type === "tool-call-start" || event.type === "tool-call-end") {

@@ -74,7 +74,7 @@ export function buildBudgetWarningText(
       usage,
       "This is the last step in this context window: the next message starts a fresh provider context that does not carry this transcript.",
       `${CONTEXT_NOTES_MEMORY_PATH} stays available through the memory tool and, when memory hot-set loading is enabled, is preloaded there if present (bounded to 8 KiB); session_history can retrieve earlier messages.`,
-      "Write or update that file now in a single memory call, essential state first: goal, decisions, invariants, open tasks, blockers, and the exact paths/IDs needed to resume. If the file is already preloaded, use str_replace/insert; otherwise create.",
+      "Write or update that file now in a single memory call, essential state first: goal, decisions, invariants, open tasks, blockers, and the exact paths/IDs needed to resume. The memory index in the memory tool description tells you whether the file exists: if it is listed, use insert (insert_line 0 works without its contents) or str_replace on preloaded text; if it is not listed, use create.",
       "Do not continue the task or reply to the user in this step.",
     ].join(" ");
   }
