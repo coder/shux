@@ -127,12 +127,18 @@ export function ConversationScreen(props: {
   const loadError = error ?? settingsError;
   const modelBlockReason =
     settings && options ? getModelBlockReason(settings, options.model) : null;
+  // The catalog includes non-selectable delegated agents, but excludes disabled ones.
+  const agentBlockReason =
+    settings && options && !settings.agents.some((agent) => agent.id === options.agentId)
+      ? "This agent is no longer available. Choose another mode or enable it on desktop."
+      : null;
+  const requestBlockReason = modelBlockReason ?? agentBlockReason;
   const settingsReady = ready && settings !== null && !settingsError;
-  const canAct = settingsReady && !modelBlockReason && !transcriptOnly;
-  const latestSettings = useRef({ options, modelBlockReason, transcriptOnly });
+  const canAct = settingsReady && !requestBlockReason && !transcriptOnly;
+  const latestSettings = useRef({ options, requestBlockReason, transcriptOnly });
   useEffect(() => {
-    latestSettings.current = { options, modelBlockReason, transcriptOnly };
-  }, [options, modelBlockReason, transcriptOnly]);
+    latestSettings.current = { options, requestBlockReason, transcriptOnly };
+  }, [options, requestBlockReason, transcriptOnly]);
   const running = ready && transcript.streaming;
   const actionDisabled = !ready || busy || (!running && (!canAct || !hasDraft || !options?.model));
   // A live answer resolves the existing tool, not the next-turn model. Connection,
@@ -261,13 +267,13 @@ export function ConversationScreen(props: {
       !latest.metadata?.partial
     )
       return;
-    const { options, modelBlockReason, transcriptOnly } = latestSettings.current;
+    const { options, requestBlockReason, transcriptOnly } = latestSettings.current;
     // The answer is already durable and its form may disappear on tool-call-end.
     // Keep resume failures outside that form, and retry only resume, never the answer.
     setResumeMessageId(messageId);
     // Settings or policy can change while the answer is saved. Preserve recovery
     // while unavailable, but never resume with stale options or a prohibited route.
-    if (!options?.model || modelBlockReason || transcriptOnly) return;
+    if (!options?.model || requestBlockReason || transcriptOnly) return;
     try {
       const result = await props.client.workspace.resumeStream(
         { workspaceId: props.workspace.id, options },
@@ -311,7 +317,7 @@ export function ConversationScreen(props: {
   async function answer(toolCallId: string, answers: Record<string, string>) {
     if (!ready) throw new Error("Reconnect before answering.");
     if (!canAnswer)
-      throw new Error(modelBlockReason ?? settingsError ?? "Wait for settings before answering.");
+      throw new Error(requestBlockReason ?? settingsError ?? "Wait for settings before answering.");
     if (pending.current) throw new Error("Another action is in progress.");
     if (
       !answerMessage ||
@@ -479,9 +485,9 @@ export function ConversationScreen(props: {
           style={styles.composerWrap}
           onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
         >
-          {modelBlockReason && (
+          {requestBlockReason && (
             <Notice onRetry={!settings?.policy ? props.onReconnect : undefined}>
-              {modelBlockReason}
+              {requestBlockReason}
             </Notice>
           )}
           {actionError && (

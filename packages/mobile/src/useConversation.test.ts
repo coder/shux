@@ -28,6 +28,7 @@ function fixture(
   getPolicy: () => Promise<Policy> = async () => disabledPolicy,
   reads: {
     config?: () => Promise<SettingsData["config"]>;
+    agents?: () => Promise<SettingsData["agents"]>;
     providers?: () => Promise<SettingsData["providers"]>;
   } = {}
 ) {
@@ -110,7 +111,9 @@ function fixture(
           settingsRequests.push({ path: "providers", signal: options.signal! });
           return reads.providers ? reads.providers() : {};
         case "agents.list":
-          return [];
+          settingsOrder.push("agents.read");
+          settingsRequests.push({ path: "agents", signal: options.signal! });
+          return reads.agents ? reads.agents() : [];
         case "workspace.onChat":
           chatRequests.push(options.signal!);
           return new ReadableStream<WorkspaceChatMessage>({
@@ -431,6 +434,50 @@ test("settings subscriptions precede reads and refresh privacy, routes and provi
   expect(view.providerSubscriptions[0].signal.aborted).toBe(true);
 });
 
+test("agent catalogs refresh with config/providers and stale catalog success or failure cannot win", async () => {
+  type Catalog = SettingsData["agents"];
+  const enabled: Catalog = [
+    { id: "plan", name: "Plan", uiSelectable: true, subagentRunnable: false, scope: "built-in" },
+  ];
+  let complete!: (value: Catalog) => void;
+  let fail!: (error: Error) => void;
+  let initial = true;
+  let catalog = enabled;
+  const view = fixture(undefined, {
+    agents: () => {
+      if (initial) {
+        initial = false;
+        return new Promise<Catalog>((resolve, reject) => {
+          complete = resolve;
+          fail = reject;
+        });
+      }
+      return Promise.resolve(catalog);
+    },
+  });
+  await view.ready();
+  expect(view.result.current.settings).toBeNull();
+  const first = view.settingsRequests.find((request) => request.path === "agents")!;
+  await act(async () => view.configSubscriptions[0].events.enqueue());
+  await waitFor(() => expect(view.result.current.settings?.agents).toEqual(enabled));
+  expect(first.signal.aborted).toBe(true);
+  await act(async () => complete([]));
+  expect(view.result.current.settings?.agents).toEqual(enabled);
+  initial = true;
+  await act(async () => view.providerSubscriptions[0].events.enqueue());
+  const staleFailure = fail;
+  catalog = [];
+  await act(async () => view.configSubscriptions[0].events.enqueue());
+  await waitFor(() => expect(view.result.current.settings?.agents).toEqual([]));
+  await act(async () => staleFailure(new Error("old catalog failed")));
+  expect(view.result.current.settingsError).toBeNull();
+  expect(view.result.current.settings?.agents).toEqual([]);
+  catalog = enabled;
+  await act(async () => view.providerSubscriptions[0].events.enqueue());
+  await waitFor(() => expect(view.result.current.settings?.agents).toEqual(enabled));
+  expect(view.settingsRequests.filter((request) => request.path === "agents")).toHaveLength(5);
+});
+
 test("a newer config event cancels a stale initial read rather than exposing old privacy settings", async () => {
   let resolve!: (config: SettingsData["config"]) => void;
   let first = true;
@@ -458,7 +505,7 @@ test("a newer config event cancels a stale initial read rather than exposing old
   expect(view.result.current.settings?.config).toEqual(latest);
 });
 
-test.each(["config", "providers"] as const)(
+test.each(["config", "providers", "agents"] as const)(
   "a failed %s refresh blocks settings until a later notification recovers",
   async (source) => {
     let failed = false;
@@ -466,6 +513,10 @@ test.each(["config", "providers"] as const)(
       config: async () => {
         if (source === "config" && failed) throw new Error("unavailable");
         return { agentAiDefaults: {} };
+      },
+      agents: async () => {
+        if (source === "agents" && failed) throw new Error("unavailable");
+        return [];
       },
       providers: async () => {
         if (source === "providers" && failed) throw new Error("unavailable");
@@ -475,7 +526,7 @@ test.each(["config", "providers"] as const)(
     await view.ready();
     failed = true;
     const subscription =
-      source === "config" ? view.configSubscriptions[0] : view.providerSubscriptions[0];
+      source === "providers" ? view.providerSubscriptions[0] : view.configSubscriptions[0];
     await act(async () => subscription.events.enqueue());
     await waitFor(() => expect(view.result.current.settingsError).not.toBeNull());
     expect(view.result.current.error).toBeNull();

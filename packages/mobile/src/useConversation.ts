@@ -68,10 +68,9 @@ export function useConversation(
     let settingsRequest: AbortController | null = null;
     async function subscribeSettings() {
       // Both subscriptions must be registered before reading privacy/routing settings.
-      const [configEvents, providerEvents, agents] = await Promise.all([
+      const [configEvents, providerEvents] = await Promise.all([
         client.config.onConfigChanged(undefined, { signal: settingsController.signal }),
         client.providers.onConfigChanged(undefined, { signal: settingsController.signal }),
-        client.agents.list({ workspaceId }, { signal: settingsController.signal }),
       ]);
       if (settingsController.signal.aborted) return;
       function refresh() {
@@ -84,10 +83,11 @@ export function useConversation(
         setSettingsError(null);
         Promise.all([
           client.config.getConfig(undefined, { signal: request.signal }),
+          client.agents.list({ workspaceId }, { signal: request.signal }),
           client.providers.getConfig(undefined, { signal: request.signal }),
         ])
           .then(
-            ([config, providers]) => {
+            ([config, agents, providers]) => {
               if (!request.signal.aborted) setSettings({ config, providers, agents });
             },
             () => {

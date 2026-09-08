@@ -63,6 +63,12 @@ function fixture(
   let providers: SettingsData["providers"] = {
     anthropic: { isConfigured: true, isEnabled: true, apiKeySet: true, models: ["allowed"] },
   };
+  let agents: SettingsData["agents"] = [
+    { id: "exec", name: "Exec", uiSelectable: true },
+    { id: "explore", name: "Explore", uiSelectable: false },
+    { id: "custom-worker", name: "custom-worker", uiSelectable: false },
+    { id: "plan", name: "Plan", uiSelectable: true },
+  ].map((agent) => ({ ...agent, scope: "built-in", subagentRunnable: true }));
   const configEvents: ReadableStreamDefaultController<void>[] = [];
   const providerEvents: ReadableStreamDefaultController<void>[] = [];
   let configRead = async () => config;
@@ -119,11 +125,7 @@ function fixture(
         case "providers.getConfig":
           return providers;
         case "agents.list":
-          return [
-            { id: "exec", name: "Exec", uiSelectable: true },
-            { id: "explore", name: "Explore", uiSelectable: false },
-            { id: "plan", name: "Plan", uiSelectable: true },
-          ];
+          return agents;
         case "workspace.onChat": {
           if (
             !options.signal ||
@@ -214,6 +216,13 @@ function fixture(
         workspace.id === metadata.id ? metadata : workspace
       );
       await act(async () => metadataEvents.at(-1)!.enqueue({ workspaceId: metadata.id, metadata }));
+    },
+    get agents() {
+      return agents;
+    },
+    async updateAgents(next: SettingsData["agents"]) {
+      agents = next;
+      await act(async () => configEvents.at(-1)!.enqueue());
     },
     setConfigRead(read: typeof configRead) {
       configRead = read;
@@ -454,6 +463,62 @@ test("transcript-only pending questions are read-only while live Stop remains av
     }
     view.unmount();
   }
+});
+
+test("live agent catalog removal updates the picker and blocks a remembered mode until re-enabled", async () => {
+  const view = fixture([answeredPartial()]);
+  await view.select("alpha");
+  const enabled = view.agents;
+  fireEvent.click(view.getByRole("button", { name: "Choose mode" }));
+  fireEvent.click(view.getByRole("radio", { name: "Plan" }));
+  fireEvent.change(view.getByLabelText("Message"), { target: { value: "Keep this draft" } });
+  await view.updateAgents(enabled.filter((agent) => agent.id !== "plan"));
+  expect(view.getByRole("button", { name: "Choose mode" }).textContent).toContain("plan");
+  expect(view.getByRole("button", { name: "Send message" }).getAttribute("aria-disabled")).toBe(
+    "true"
+  );
+  expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Send message" }));
+  expect(callCount(view, "sendMessage")).toBe(0);
+  expect(view.getByRole("alert")).toBeDefined();
+  fireEvent.click(view.getByRole("button", { name: "Choose mode" }));
+  expect(view.queryByRole("radio", { name: "Plan" })).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Close" }));
+  await view.updateAgents(enabled);
+  expect(view.getByLabelText("Message")).toHaveProperty("value", "Keep this draft");
+  expect(view.queryByRole("alert")).toBeNull();
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
+  expect(view.calls.find((call) => call.path === "workspace.sendMessage")?.input).toMatchObject({
+    options: { agentId: "plan" },
+  });
+});
+
+test("a removed next-turn agent does not strand a live answer or Stop", async () => {
+  const view = fixture([
+    {
+      type: "stream-start",
+      workspaceId: "alpha",
+      messageId: "question",
+      model,
+      historySequence: 1,
+      startTime: 1,
+    },
+    question(),
+    {
+      type: "tool-call-execution-start",
+      workspaceId: "alpha",
+      messageId: "question",
+      toolCallId: "question",
+      timestamp: 1,
+    },
+  ]);
+  await view.select("alpha");
+  await view.updateAgents(view.agents.filter((agent) => agent.id !== "exec"));
+  await submitAnswer(view);
+  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
+  expect(callCount(view, "resumeStream")).toBe(0);
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Interrupt agent" })));
+  expect(callCount(view, "interruptStream")).toBe(1);
 });
 
 test("failed credential clearing leaves the session usable and reconnectable before retrying disconnect", async () => {
@@ -1176,7 +1241,9 @@ test("live route and provider changes re-evaluate policy without replacing the s
   expect(view.calls.find((call) => call.path === "workspace.sendMessage")?.input).toMatchObject({
     options: { model: "anthropic:allowed" },
   });
-  expect(view.calls.filter((call) => call.path === "agents.list")).toHaveLength(1);
+  expect(view.calls.filter((call) => call.path === "agents.list")).toHaveLength(
+    view.calls.filter((call) => call.path === "config.getConfig").length
+  );
 });
 
 test("unavailable live settings prevent send and retain resume-only recovery after an answer is saved", async () => {
