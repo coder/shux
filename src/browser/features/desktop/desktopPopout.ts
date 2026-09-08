@@ -46,6 +46,9 @@ interface PopoutSnapshot {
   error: string | null;
 }
 
+const INLINE_LEASE_ERROR =
+  "Could not attach this pane before closing the detached desktop; it stays open. Try again.";
+
 // Lives outside the tab's mount lifetime so switching workspaces cannot reconnect an
 // inline viewer behind its popout. A persisted hint is recovery UI, never a control lease.
 export class DesktopPopout {
@@ -61,7 +64,7 @@ export class DesktopPopout {
   private closeTimer: number | undefined;
   private suspendInline: (() => void) | undefined;
   private resumeInline: (() => void) | undefined;
-  private registerInline: (() => Promise<void> | void) | undefined;
+  private registerInline: (() => Promise<boolean>) | undefined;
   private inlineSuspended = false;
   private childConfirmed = false;
   private readonly confirmationWaiters = new Set<(confirmed: boolean) => void>();
@@ -168,6 +171,29 @@ export class DesktopPopout {
     this.settleConfirmation(true);
   }
 
+  /**
+   * Bounded wait for the inline lease; false when it could not be established in time. With no
+   * inline pane attached there is no handoff — nothing takes the desktop over, so nothing needs
+   * protecting while the child closes — and the close proceeds.
+   */
+  private leaseInline(): Promise<boolean> {
+    const register = this.registerInline;
+    if (!register) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), DESKTOP_POPOUT_READY_TIMEOUT_MS);
+      register().then(
+        (leased) => {
+          clearTimeout(timer);
+          resolve(leased);
+        },
+        () => {
+          clearTimeout(timer);
+          resolve(false);
+        }
+      );
+    });
+  }
+
   private settleConfirmation(confirmed: boolean) {
     const waiters = Array.from(this.confirmationWaiters);
     this.confirmationWaiters.clear();
@@ -196,26 +222,6 @@ export class DesktopPopout {
   }
 
   /**
-   * Attach the inline pane and wait until the backend reports it ready, bounded. The child's
-   * close is definitive (it retracts its own attachment graces), so the inline lease must be
-   * live BEFORE the child is asked to close or an agent-driven archive could close the desktop
-   * in between. A lease that cannot be established (no API client, registration refused)
-   * leaves nothing to protect the pane with either way, so the handoff still proceeds.
-   */
-  private leaseInline(): Promise<void> {
-    return new Promise((resolve) => {
-      const timer = setTimeout(resolve, DESKTOP_POPOUT_READY_TIMEOUT_MS);
-      Promise.resolve()
-        .then(() => this.registerInline?.())
-        .catch(() => undefined)
-        .finally(() => {
-          clearTimeout(timer);
-          resolve();
-        });
-    });
-  }
-
-  /**
    * `suspended` marks an inline viewer that mounted while the desktop was already detached.
    * `register` attaches that suspended viewer without connecting; it is invoked only once a live
    * child is confirmed (Electron manager truth, or a bring-back in flight), never from a bare
@@ -225,7 +231,7 @@ export class DesktopPopout {
     suspend: () => void,
     resume?: () => void,
     suspended = false,
-    register?: () => Promise<void> | void
+    register?: () => Promise<boolean>
   ): () => void {
     this.suspendInline = suspend;
     this.resumeInline = resume;
@@ -320,38 +326,55 @@ export class DesktopPopout {
     }
   }
 
-  async bringBack(): Promise<void> {
+  /** Resolves true once the child has been asked to close; false when it must stay open. */
+  async bringBack(): Promise<boolean> {
     const instanceId = this.instanceId;
-    if (!instanceId) return;
+    if (!instanceId) return false;
     this.returning = true;
     this.grantPending = false;
     // Only a confirmed child is asked to close: an unconfirmed hint is pinged first, and a hint
     // nobody answers is stale and rolled back (a dead child would never release a lease).
     const confirmed = await this.awaitConfirmation();
-    if (this.instanceId !== instanceId) return;
+    if (this.instanceId !== instanceId) return false;
     if (!confirmed) {
       this.restore();
-      return;
+      return false;
     }
-    // Attach the inline pane and wait for its lease before the child disconnects so the desktop
-    // stays marked as in use through the handoff.
-    await this.leaseInline();
-    if (this.instanceId !== instanceId) return;
+    // The child's close is definitive (it retracts its own attachment graces), so the inline
+    // pane must hold a live lease BEFORE the child is asked to close or an agent-driven archive
+    // could close the desktop in between. Without a lease the child stays open.
+    const leased = await this.leaseInline();
+    if (this.instanceId !== instanceId) return false;
+    if (!leased) {
+      this.returning = false;
+      this.update("detached", INLINE_LEASE_ERROR);
+      return false;
+    }
     this.send("bring-back");
+    return true;
   }
 
-  private waitForRelease(instanceId: string): Promise<boolean> {
+  /**
+   * "released": the child acknowledged and inline was restored; "unresponsive": it was asked to
+   * close but never answered; "kept": it was never asked (no inline lease), so it must stay.
+   */
+  private waitForRelease(instanceId: string): Promise<"released" | "unresponsive" | "kept"> {
     return new Promise((resolve) => {
-      const finish = (released: boolean) => {
+      const finish = (outcome: "released" | "unresponsive" | "kept") => {
         clearTimeout(timer);
         unsubscribe();
-        resolve(released);
+        resolve(outcome);
       };
       const unsubscribe = this.subscribe(() => {
-        if (this.instanceId !== instanceId) finish(true);
+        if (this.instanceId !== instanceId) finish("released");
       });
-      const timer = setTimeout(() => finish(false), DESKTOP_POPOUT_READY_TIMEOUT_MS);
-      this.bringBack().catch(() => finish(false));
+      const timer = setTimeout(() => finish("unresponsive"), DESKTOP_POPOUT_READY_TIMEOUT_MS);
+      this.bringBack().then(
+        (requested) => {
+          if (!requested && this.instanceId === instanceId) finish("kept");
+        },
+        () => finish("kept")
+      );
     });
   }
 
@@ -384,8 +407,9 @@ export class DesktopPopout {
         this.instanceId = current.instanceId;
         this.listen();
         // A responsive renderer must release held inputs before native destruction.
-        // Force-close only when its cleanup acknowledgment misses the bounded wait.
-        if (await this.waitForRelease(current.instanceId)) return;
+        // Force-close only when its cleanup acknowledgment misses the bounded wait — never a
+        // child that was kept open because the inline pane holds no lease.
+        if ((await this.waitForRelease(current.instanceId)) !== "unresponsive") return;
         if (this.instanceId !== current.instanceId) return;
         await api.closeWindow({ workspaceId: this.workspaceId, instanceId: current.instanceId });
         if (this.instanceId === current.instanceId) this.restore();
@@ -399,8 +423,12 @@ export class DesktopPopout {
       if (!this.popup) throw new Error("Allow popups to reconnect the desktop here.");
       // Recovery closes the window whether or not the child answers, so lease the inline pane
       // first: a live child's close is definitive and must not leave the desktop unattached.
-      await this.leaseInline();
+      const leased = await this.leaseInline();
       if (this.instanceId !== instanceId) return;
+      if (!leased) {
+        this.returning = false;
+        throw new Error(INLINE_LEASE_ERROR);
+      }
       this.send("bring-back");
       const request: DesktopPopoutCloseRequest = { instanceId: instanceId ?? "", handled: false };
       try {

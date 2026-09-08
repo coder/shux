@@ -212,7 +212,7 @@ describe("DesktopPopout handoff", () => {
   test("an inline viewer mounted while detached registers only once a live child is confirmed", async () => {
     const popout = new DesktopPopout(workspaceId, false);
     const resume = mock(() => undefined);
-    const register = mock(() => undefined);
+    const register = mock(() => Promise.resolve(true));
     // A persisted browser hint alone must not become a backend attachment.
     popout.attach(() => undefined, resume, /* suspended */ true, register);
     expect(register).not.toHaveBeenCalled();
@@ -234,7 +234,7 @@ describe("DesktopPopout handoff", () => {
     updatePersistedState(`desktop-popout:${workspaceId}`, "hinted-instance");
     const popout = new DesktopPopout(workspaceId, false);
     expect(popout.getSnapshot().state).toBe("detached");
-    const register = mock(() => undefined);
+    const register = mock(() => Promise.resolve(true));
     popout.attach(() => undefined, undefined, /* suspended */ true, register);
     await popout.reconcile(api);
     expect(channel().sent).toEqual([{ type: "ping", instanceId: "hinted-instance" }]);
@@ -255,10 +255,47 @@ describe("DesktopPopout handoff", () => {
     expect(popout.getSnapshot().state).toBe("detached");
   });
 
+  test("bring-back keeps the child open when the inline pane cannot be leased", async () => {
+    const popout = new DesktopPopout(workspaceId, false);
+    const register = mock(() => Promise.resolve(false));
+    popout.attach(() => undefined, undefined, false, register);
+    await popout.open(api);
+    message("ready");
+    expect(await popout.bringBack()).toBe(false);
+    expect(register).toHaveBeenCalledTimes(2);
+    expect(
+      channel().sent.filter((sent) => (sent as { type: string }).type === "bring-back")
+    ).toEqual([]);
+    expect(popout.getSnapshot().state).toBe("detached");
+    expect(popout.getSnapshot().error).not.toBeNull();
+    // A later attempt with a lease completes the handoff.
+    register.mockImplementation(() => Promise.resolve(true));
+    expect(await popout.bringBack()).toBe(true);
+    expect(channel().sent.at(-1)).toEqual({ type: "bring-back", instanceId: instanceId() });
+  });
+
+  test("Electron recovery never force-closes a child kept open for want of an inline lease", async () => {
+    const popout = new DesktopPopout(workspaceId, true);
+    api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));
+    popout.attach(
+      () => undefined,
+      undefined,
+      false,
+      mock(() => Promise.resolve(false))
+    );
+    await popout.reconcile(api);
+    await popout.recover(api);
+    expect(api.closeWindow).not.toHaveBeenCalled();
+    expect(
+      channel().sent.filter((sent) => (sent as { type: string }).type === "bring-back")
+    ).toEqual([]);
+    expect(popout.getSnapshot().state).toBe("detached");
+  });
+
   test("a hint nobody answers is stale: bring-back rolls back inline without asking anything to close", async () => {
     updatePersistedState(`desktop-popout:${workspaceId}`, "hinted-instance");
     const popout = new DesktopPopout(workspaceId, false);
-    const register = mock(() => undefined);
+    const register = mock(() => Promise.resolve(true));
     const resume = mock(() => undefined);
     popout.attach(() => undefined, resume, /* suspended */ true, register);
     await popout.reconcile(api);

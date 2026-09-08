@@ -804,6 +804,43 @@ describe("DesktopSessionManager browser viewer releases", () => {
     });
   });
 
+  test("a pane may name its registration, and a name already live is refused", async () => {
+    if (process.platform === "win32") return;
+    await withDesktopManagerHarness(async ({ config }) => {
+      await registerSharedWorkspaces(config);
+      const manager = new DesktopSessionManager({
+        config,
+        experimentsService: createExperimentsService(true),
+        workspaceService: createWorkspaceService(() => Promise.resolve(null)),
+      });
+      const controller = new AbortController();
+      try {
+        const watcher = manager.watchViewer("isolated", controller.signal, "pane-chosen");
+        const ready: IteratorResult<DesktopViewerEvent> = await watcher.next();
+        expect(ready.value).toEqual({ type: "ready", viewerId: "pane-chosen" });
+        // A colliding name could displace this registration and retract its graces on detach.
+        const duplicate = manager.watchViewer("isolated", controller.signal, "pane-chosen");
+        let refusal: unknown = null;
+        try {
+          await duplicate.next();
+        } catch (error) {
+          refusal = error;
+        }
+        expect(String(refusal)).toMatch(/already registered/);
+        expect(manager.hasAttachedViewers("isolated")).toBe(true);
+        // Detaching by the chosen name works before the pane ever saw ready.
+        manager.detachViewer("pane-chosen");
+        expect(manager.hasAttachedViewers("isolated")).toBe(false);
+        controller.abort();
+        await watcher.return(undefined);
+        expect(manager.hasAttachedViewers("isolated")).toBe(false);
+      } finally {
+        controller.abort();
+        await manager.closeAll();
+      }
+    });
+  });
+
   test("a borrower's detachment grace follows it to the owner it currently resolves to", async () => {
     if (process.platform === "win32") return;
     await withDesktopManagerHarness(async ({ config }) => {

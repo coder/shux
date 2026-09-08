@@ -35,11 +35,11 @@ export interface UseDesktopConnectionResult {
    * inline pane once a live detached child is confirmed (Electron manager truth, or a bring-back
    * in flight), so the inline registration covers the popout→inline handoff. A bare persisted
    * browser hint never registers: it is recovery UI, not proof that a popout is alive. Resolves
-   * once the backend reports the registration ready (immediately when one is already ready, and
-   * without a lease when none can be made right now), so the coordinator can wait for the lease
-   * before asking the child to close; it never rejects.
+   * true once the backend reports the registration ready (immediately when one already is) and
+   * false when no lease can be made (no API client, registration refused, pane not registering),
+   * so the coordinator can refuse to close the child without a live lease; it never rejects.
    */
-  register: () => Promise<void>;
+  register: () => Promise<boolean>;
   controlling: boolean;
   setControlling: (value: boolean) => void;
   scaleToFit: boolean;
@@ -204,7 +204,7 @@ export function useDesktopConnection(
   // always routes through the manager's cleanup) retracts the bridge's grace all the same.
   const anonymousBridgeIdRef = useRef<string | null>(null);
   // Readiness of the current registration attempt, for register() callers that wait on it.
-  const registrationReadyRef = useRef<Promise<void> | null>(null);
+  const registrationReadyRef = useRef<Promise<boolean> | null>(null);
   const bootstrapViewerId = (): string | null => {
     if (registerViewer) return viewerIdRef.current;
     anonymousBridgeIdRef.current ??= crypto.randomUUID();
@@ -337,28 +337,32 @@ export function useDesktopConnection(
     setReason(null);
   };
 
-  const register = (): Promise<void> => {
+  const register = (): Promise<boolean> => {
     if (!registerViewer || viewerReleasedRef.current || terminalRef.current) {
-      return Promise.resolve();
+      return Promise.resolve(false);
     }
     if (viewerRegistrationRef.current !== null) {
-      return registrationReadyRef.current ?? Promise.resolve();
+      return registrationReadyRef.current ?? Promise.resolve(viewerReadyRef.current);
     }
     const client = apiRef.current;
     if (!client) {
       // The API provider may still be connecting; retry until a client is published.
       scheduleViewerReregistration();
-      return Promise.resolve();
+      return Promise.resolve(false);
     }
-    return registerViewerRegistration(client).catch(() => {
-      if (
-        !isDisposedRef.current &&
-        !terminalRef.current &&
-        viewerRegistrationRef.current === null
-      ) {
-        scheduleViewerReregistration();
+    return registerViewerRegistration(client).then(
+      () => true,
+      () => {
+        if (
+          !isDisposedRef.current &&
+          !terminalRef.current &&
+          viewerRegistrationRef.current === null
+        ) {
+          scheduleViewerReregistration();
+        }
+        return false;
       }
-    });
+    );
   };
 
   /**
@@ -370,8 +374,13 @@ export function useDesktopConnection(
    */
   const registerViewerRegistration = (client: NonNullable<typeof api>): Promise<void> => {
     const registration = new AbortController();
+    // Named up front: the backend registers this pane before its ready event arrives, so a pane
+    // that unmounts or is disconnected in between must still be able to give the registration up
+    // definitively instead of leaving a dropped-viewer grace behind.
+    const viewerId = crypto.randomUUID();
     viewerRegistrationRef.current = registration;
     viewerReadyRef.current = false;
+    viewerIdRef.current = viewerId;
     const isCurrent = () => viewerRegistrationRef.current === registration;
     const retire = () => {
       if (isCurrent()) {
@@ -383,10 +392,10 @@ export function useDesktopConnection(
     };
     const ready = new Promise<void>((resolve, reject) => {
       void (async () => {
-        let viewerId: string | null = null;
+        let isReady = false;
         try {
           const events = await client.desktop.watchViewer(
-            { workspaceId },
+            { workspaceId, viewerId },
             { signal: registration.signal }
           );
           if (registration.signal.aborted || isDisposedRef.current) {
@@ -396,10 +405,13 @@ export function useDesktopConnection(
           for await (const event of events) {
             if (registration.signal.aborted || isDisposedRef.current) break;
             if (event.type === "ready") {
-              assertDesktop(viewerId === null, "Desktop viewer registered more than once.");
-              viewerId = event.viewerId;
-              viewerReadyRef.current = true;
-              if (isCurrent()) viewerIdRef.current = viewerId;
+              assertDesktop(!isReady, "Desktop viewer registered more than once.");
+              assertDesktop(
+                event.viewerId === viewerId,
+                "Desktop viewer ready has no matching registration."
+              );
+              isReady = true;
+              if (isCurrent()) viewerReadyRef.current = true;
               reregisterAttemptRef.current = 0;
               resolve();
               continue;
@@ -430,8 +442,11 @@ export function useDesktopConnection(
           }
           if (!registration.signal.aborted) throw new Error("Desktop release subscription ended.");
         } catch (error) {
-          if (viewerId === null) {
-            // Never ready: the connection attempt awaiting us fails and owns the recovery.
+          if (!isReady) {
+            // Never ready: the connection attempt awaiting us fails and owns the recovery. The
+            // backend may have registered the pane anyway, so remember the id for the terminal
+            // settlement or the next definitive detach to retract its grace.
+            if (isCurrent()) supersededViewerIdsRef.current.push(viewerId);
             retire();
             reject(error instanceof Error ? error : new Error(getErrorMessage(error)));
             return;
@@ -454,7 +469,10 @@ export function useDesktopConnection(
     });
     // register() hands the pending readiness to the popout coordinator; rejection is reported to
     // the caller of this function, so the shared copy only ever resolves.
-    registrationReadyRef.current = ready.catch(() => undefined);
+    registrationReadyRef.current = ready.then(
+      () => true,
+      () => false
+    );
     return ready;
   };
 

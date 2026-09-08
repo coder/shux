@@ -3214,13 +3214,8 @@ export const DesktopViewerEventSchema = z.object({
 });
 
 export const desktop = {
-  /**
-   * The pane may name its registration (`viewerId`, a fresh UUID) so it knows the identity
-   * before `ready` arrives and can give it up definitively even if it unmounts in between;
-   * an id already registered is refused. Omitted, the backend assigns one.
-   */
   watchViewer: {
-    input: z.object({ workspaceId: z.string().min(1), viewerId: z.string().min(1).nullish() }),
+    input: z.object({ workspaceId: z.string().min(1) }),
     output: eventIterator(DesktopViewerEventSchema),
   },
   acknowledgeViewerRelease: {

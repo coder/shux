@@ -2076,7 +2076,11 @@ export const router = (authToken?: string) => {
         .input(schemas.desktop.watchViewer.input)
         .output(schemas.desktop.watchViewer.output)
         .handler(({ context, input, signal }) =>
-          context.desktopSessionManager.watchViewer(input.workspaceId, signal)
+          context.desktopSessionManager.watchViewer(
+            input.workspaceId,
+            signal,
+            input.viewerId ?? undefined
+          )
         ),
       acknowledgeViewerRelease: t
         .input(schemas.desktop.acknowledgeViewerRelease.input)

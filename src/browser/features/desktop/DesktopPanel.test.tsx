@@ -152,7 +152,7 @@ describe("DesktopPanel binding", () => {
     const viewer = await connectedViewer();
     expect(getBootstrap).toHaveBeenCalledWith({
       workspaceId: "caller",
-      viewerId: "desktop-fixture",
+      viewerId: expect.any(String) as string,
     });
     expect(getBootstrap).not.toHaveBeenCalledWith(
       expect.objectContaining({ workspaceId: "owner" })
@@ -208,7 +208,7 @@ describe("DesktopPanel binding", () => {
     await waitFor(() => expect(FakeRfb.instances).toHaveLength(2));
     expect(getBootstrap).toHaveBeenLastCalledWith({
       workspaceId: "isolated",
-      viewerId: "desktop-fixture",
+      viewerId: expect.any(String) as string,
     });
     expect(FakeRfb.instances[1].url).toBe(
       "ws://localhost/desktop/ws/isolated?token=isolated-token"
@@ -225,7 +225,7 @@ describe("DesktopPanel binding", () => {
     await waitFor(() =>
       expect(getBootstrap).toHaveBeenCalledWith({
         workspaceId: "caller",
-        viewerId: "desktop-fixture",
+        viewerId: expect.any(String) as string,
       })
     );
     getBootstrap.mockResolvedValue({ ...sharedBootstrap, capability: ownCapability });
@@ -239,7 +239,7 @@ describe("DesktopPanel binding", () => {
     expect(view.queryByText(/Original desktop/)).toBeNull();
     expect(getBootstrap).toHaveBeenLastCalledWith({
       workspaceId: "isolated",
-      viewerId: "desktop-fixture",
+      viewerId: expect.any(String) as string,
     });
   });
 });

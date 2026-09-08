@@ -103,15 +103,27 @@ export class DesktopSessionManager {
   private disposed = false;
   private closeAllPromise: Promise<void> | undefined;
 
-  watchViewer(workspaceId: string, signal?: AbortSignal): AsyncGenerator<DesktopViewerEvent> {
+  /**
+   * `viewerId` lets the pane name its registration up front (so it can detach it definitively
+   * before ready arrives); it must not collide with a live registration — a colliding id would
+   * let one pane displace another's registration and, on detach, retract its graces.
+   */
+  watchViewer(
+    workspaceId: string,
+    signal?: AbortSignal,
+    viewerId: string = randomUUID()
+  ): AsyncGenerator<DesktopViewerEvent> {
     return asyncIterableFromSubscription<DesktopViewerEvent>({
       signal,
       subscribe: (push) => {
         // Admission and registration share one synchronous block: cleanup either sees this
         // viewer in its snapshot or rejects its registration before sending ready.
         const target = this.resolveActiveTarget(workspaceId);
+        if (this.viewers.has(viewerId)) {
+          throw new Error(`Desktop viewer ${viewerId} is already registered`);
+        }
         const viewer: DesktopViewerRegistration = {
-          viewerId: randomUUID(),
+          viewerId,
           workspaceId,
           ownerWorkspaceId: target.ownerWorkspaceId,
           push,

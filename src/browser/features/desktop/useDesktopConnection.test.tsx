@@ -101,12 +101,16 @@ describe("useDesktopConnection control ownership", () => {
     detachViewer.mockReset();
     detachViewer.mockResolvedValue(undefined);
     watchViewer.mockReset();
-    watchViewer.mockImplementation((_input, { signal } = {}) => {
+    watchViewer.mockImplementation((input, { signal } = {}) => {
       if (!signal) throw new Error("Viewer registration must be abortable");
+      // The pane names its registration up front (a fresh UUID per attempt).
+      if (typeof input.viewerId !== "string" || input.viewerId.length === 0) {
+        throw new Error("Viewer registration must be named by the pane");
+      }
       const registration = {
         queue: createAsyncMessageQueue<DesktopViewerEvent>(),
         signal,
-        viewerId: `viewer-${registrations.length}`,
+        viewerId: input.viewerId,
         failure: null as Error | null,
       };
       registrations.push(registration);
@@ -566,13 +570,13 @@ describe("useDesktopConnection control ownership", () => {
 
   test("register attaches without bootstrapping and connect reuses the registration", async () => {
     const view = mountConnection();
-    let ready: Promise<void> | undefined;
+    let ready: Promise<boolean> | undefined;
     act(() => {
       ready = view.desktop.register();
     });
     await waitFor(() => expect(registrations).toHaveLength(1));
     // Resolves once the backend reported the registration ready, so a handoff can wait for it.
-    await ready;
+    expect(await ready).toBe(true);
     expect(getBootstrap).not.toHaveBeenCalled();
     expect(view.desktop.state).toBe("idle");
     await connect(view);
@@ -660,6 +664,19 @@ describe("useDesktopConnection control ownership", () => {
     expect(detachViewer).toHaveBeenCalledWith({ viewerId: registration.viewerId });
     expect(abortedAtDetach).toEqual([false]);
     await waitFor(() => expect(registration.signal.aborted).toBe(true));
+  });
+
+  test("a pane that unmounts before ready still gives its named registration up definitively", async () => {
+    autoReady = false;
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(registrations).toHaveLength(1));
+    const registration = registrations[0];
+    act(() => view.unmount());
+    // The backend registered the pane before ready reached it: the id the pane chose is detached
+    // before the abort, so no dropped-viewer grace is left behind.
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registration.viewerId });
+    expect(registration.signal.aborted).toBe(true);
   });
 
   test("normal unmount unregisters after releasing held input", async () => {
