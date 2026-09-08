@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Brain, Check, ChevronDown, ChevronRight, File, Pause } from "lucide-react-native";
 import type { MuxMessage, MuxToolPart } from "../../../../src/common/types/message";
+import type { NestedToolCall } from "../../../../src/common/orpc/schemas/message";
 import type {
   AskUserQuestionQuestion,
   AskUserQuestionToolArgs,
@@ -122,8 +123,16 @@ function toolHint(input: unknown): string | undefined {
   }
 }
 
-function toolStatus(part: MuxToolPart, streaming: boolean, interrupted: boolean): string {
-  if (part.state === "output-redacted") return part.failed ? "Failed" : "Redacted";
+type ToolPart = MuxToolPart | NestedToolCall;
+
+function toolStatus(
+  part: ToolPart,
+  streaming: boolean,
+  interrupted: boolean,
+  nested: boolean
+): string {
+  if ("failed" in part && part.failed) return "Failed";
+  if (part.state === "output-redacted") return "Redacted";
   if (part.state === "output-available") {
     return record(part.output) && (part.output.success === false || part.output.error)
       ? "Failed"
@@ -131,7 +140,10 @@ function toolStatus(part: MuxToolPart, streaming: boolean, interrupted: boolean)
   }
   if (!streaming) return interrupted ? "Interrupted" : "No result";
   if (part.toolName === "ask_user_question") return "Needs input";
-  return part.executionStartedAt != null ? "Running" : "Pending";
+  // Nested bridge start events mark execution directly; they have no separate start timestamp.
+  return nested || ("executionStartedAt" in part && part.executionStartedAt != null)
+    ? "Running"
+    : "Pending";
 }
 
 const MAX_TOOL_CHARACTERS = 24_000;
@@ -163,7 +175,8 @@ function ToolValue(props: { label: string; value: unknown }) {
 }
 
 function Tool(props: {
-  part: MuxToolPart;
+  part: ToolPart;
+  nested?: boolean;
   streaming: boolean;
   interrupted: boolean;
   canAnswer: boolean;
@@ -171,19 +184,26 @@ function Tool(props: {
 }) {
   const [inspecting, setInspecting] = useState(false);
   const questionInput =
-    props.part.toolName === "ask_user_question" && props.part.state === "input-available"
+    !props.nested &&
+    props.part.toolName === "ask_user_question" &&
+    props.part.state === "input-available"
       ? AskUserQuestionToolArgsSchema.safeParse(props.part.input).data
       : undefined;
   const name = props.part.toolName
     .replaceAll("_", " ")
     .replace(/^./, (letter) => letter.toUpperCase());
   const hint = toolHint(props.part.input);
-  const status = toolStatus(props.part, props.streaming, props.interrupted);
+  const status = toolStatus(props.part, props.streaming, props.interrupted, Boolean(props.nested));
   // Live tools execute serially: queued questions are not registered for answers yet.
   // Recovered partials rely on the parent's eligibility check instead of an execution timestamp.
-  const waitingForExecution = props.streaming && props.part.executionStartedAt == null;
+  const waitingForExecution =
+    props.streaming &&
+    (!("executionStartedAt" in props.part) || props.part.executionStartedAt == null);
+  // The bridge schema has one flat child level and excludes interactive questions.
+  const nestedCalls =
+    !props.nested && "nestedCalls" in props.part ? props.part.nestedCalls : undefined;
   return (
-    <View style={{ gap: spacing.sm }}>
+    <View style={{ gap: spacing.sm, minWidth: 0 }}>
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`${name}: ${status}${hint ? `. ${hint}` : ""}`}
@@ -226,6 +246,21 @@ function Tool(props: {
           disabled={!props.canAnswer || waitingForExecution}
           onSubmit={(answers) => props.onAnswer(props.part.toolCallId, answers)}
         />
+      )}
+      {nestedCalls && nestedCalls.length > 0 && (
+        <View role="group" accessibilityLabel="Nested tool calls" style={styles.nestedTools}>
+          {nestedCalls.map((call) => (
+            <Tool
+              key={call.toolCallId}
+              part={call}
+              nested
+              streaming={props.streaming && props.part.state === "input-available"}
+              interrupted={props.interrupted}
+              canAnswer={false}
+              onAnswer={props.onAnswer}
+            />
+          ))}
+        </View>
       )}
     </View>
   );
@@ -389,6 +424,14 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.sm,
     borderLeftWidth: StyleSheet.hairlineWidth,
     borderLeftColor: colors.border,
+  },
+  nestedTools: {
+    minWidth: 0,
+    marginLeft: spacing.sm,
+    paddingLeft: spacing.sm,
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderLeftColor: colors.border,
+    gap: spacing.sm,
   },
   toolName: { ...typography.footnote, color: colors.muted },
   toolHint: { color: colors.text },

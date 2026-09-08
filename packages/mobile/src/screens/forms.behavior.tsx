@@ -1185,6 +1185,206 @@ test.each([
   expect(view.getByRole("button").querySelector(`svg[data-icon="${icon}"]`)).not.toBeNull();
 });
 
+test("nested tool events render in parent order and update an open child inspector through replay", () => {
+  let transcript = applyChatEvent(createTranscriptState(), {
+    type: "stream-start",
+    workspaceId: "workspace",
+    messageId: "nested",
+    historySequence: 1,
+    startTime: 0,
+    model: "local:one",
+  });
+  transcript = applyChatEvent(transcript, {
+    type: "tool-call-start",
+    workspaceId: "workspace",
+    messageId: "nested",
+    toolCallId: "parent",
+    toolName: "code_execution",
+    args: { code: "await xum.file_read({path:'notes.txt'})" },
+    tokens: 1,
+    timestamp: 1,
+    executionStartedAt: 1,
+  });
+  const renderMessage = () => (
+    <View style={{ width: 375 }}>
+      <Message
+        message={transcript.messages[0]}
+        streaming={transcript.streaming}
+        canAnswer
+        onAnswer={async () => {
+          throw new Error("Nested calls cannot answer");
+        }}
+      />
+    </View>
+  );
+  const view = render(renderMessage());
+  for (const [toolCallId, toolName, args] of [
+    ["read", "file_read", { path: "notes.txt" }],
+    ["shell", "bash", { script: "printf ok" }],
+  ] as const)
+    transcript = applyChatEvent(transcript, {
+      type: "tool-call-start",
+      workspaceId: "workspace",
+      messageId: "nested",
+      parentToolCallId: "parent",
+      toolCallId,
+      toolName,
+      args,
+      tokens: 0,
+      timestamp: 2,
+    });
+  view.rerender(renderMessage());
+  expect(view.getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual([
+    "Code execution: Running",
+    "File read: Running. notes.txt",
+    "Bash: Running. printf ok",
+  ]);
+  const children = within(view.getByRole("group", { name: "Nested tool calls" }));
+  expect(children.getAllByRole("button")).toHaveLength(2);
+  expect(
+    children
+      .getByRole("button", { name: "File read: Running. notes.txt" })
+      .querySelector('svg[data-icon="BookOpen"]')
+  ).not.toBeNull();
+  fireEvent.click(children.getByRole("button", { name: "File read: Running. notes.txt" }));
+  const hostile = '<img src=x onerror="alert(1)">' + " long-path/".repeat(50);
+  transcript = applyChatEvent(transcript, {
+    type: "tool-call-end",
+    workspaceId: "workspace",
+    messageId: "nested",
+    parentToolCallId: "parent",
+    toolCallId: "read",
+    toolName: "file_read",
+    result: hostile,
+    timestamp: 3,
+  });
+  view.rerender(renderMessage());
+  expect(view.getByText(hostile)).toBeDefined();
+  expect(document.querySelector("img")).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Close" }));
+  transcript = applyChatEvent(transcript, {
+    type: "tool-call-end",
+    workspaceId: "workspace",
+    messageId: "nested",
+    parentToolCallId: "parent",
+    toolCallId: "shell",
+    toolName: "bash",
+    result: { error: "Command failed" },
+    timestamp: 4,
+  });
+  transcript = applyChatEvent(transcript, {
+    type: "tool-call-end",
+    workspaceId: "workspace",
+    messageId: "nested",
+    toolCallId: "parent",
+    toolName: "code_execution",
+    result: { success: true, result: "Wrapper result" },
+    timestamp: 5,
+  });
+  view.unmount();
+  const replay = render(
+    <View style={{ width: 200 }}>
+      <Message
+        message={JSON.parse(JSON.stringify(transcript.messages[0])) as MuxMessage}
+        canAnswer={false}
+        onAnswer={async () => {}}
+      />
+    </View>
+  );
+  expect(replay.getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual([
+    "Code execution: Done",
+    "File read: Done. notes.txt",
+    "Bash: Failed. printf ok",
+  ]);
+  fireEvent.click(replay.getByRole("button", { name: "Bash: Failed. printf ok" }));
+  expect(replay.getByText(/Command failed/)).toBeDefined();
+  fireEvent.click(replay.getByRole("button", { name: "Close" }));
+  fireEvent.click(replay.getByRole("button", { name: "Code execution: Done" }));
+  expect(replay.getByText(/Wrapper result/)).toBeDefined();
+});
+
+test("nested replay preserves failure/redaction/interruption metadata and never offers child questions", () => {
+  const question = prefilledQuestionPart({ "Which branch?": "main" });
+  let answers = 0;
+  const part: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "wrapper",
+    toolName: "code_execution",
+    input: {},
+    state: "input-available",
+    nestedCalls: [
+      {
+        toolCallId: "redacted",
+        toolName: "bash",
+        state: "output-redacted",
+        output: "must stay hidden",
+      },
+      { toolCallId: "failed", toolName: "file_read", state: "output-available", failed: true },
+      {
+        toolCallId: "pending",
+        toolName: "web_fetch",
+        input: { url: "https://example.test" },
+        state: "input-available",
+      },
+      {
+        toolCallId: "question",
+        toolName: "ask_user_question",
+        input: question.input,
+        state: "input-available",
+      },
+    ],
+  };
+  const view = render(
+    <Message
+      message={toolMessage(part, { partial: true })}
+      canAnswer
+      onAnswer={async () => {
+        answers++;
+      }}
+    />
+  );
+  expect(view.getByRole("button", { name: "Code execution: Interrupted" })).toBeDefined();
+  expect(view.getByRole("button", { name: "File read: Failed" })).toBeDefined();
+  expect(view.getByRole("button", { name: "Web fetch: Interrupted" })).toBeDefined();
+  fireEvent.click(view.getByRole("button", { name: "Bash: Redacted" }));
+  expect(view.queryByText("must stay hidden")).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Close" }));
+  fireEvent.click(view.getByRole("button", { name: "Ask user question: Interrupted" }));
+  expect(view.getByText(/Which branch/)).toBeDefined();
+  expect(view.queryByRole("button", { name: "Send answers" })).toBeNull();
+  expect(view.queryByRole("radio")).toBeNull();
+  expect(answers).toBe(0);
+});
+
+test("nested rows stay at the supported child depth instead of recursively consuming narrow width", () => {
+  const child = {
+    toolCallId: "child",
+    toolName: "file_read",
+    state: "output-available" as const,
+    output: "Child result",
+    nestedCalls: [{ toolCallId: "unsupported-depth", toolName: "bash", state: "input-available" }],
+  };
+  const part: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "parent",
+    toolName: "code_execution",
+    input: {},
+    state: "output-available",
+    output: {},
+    nestedCalls: [child],
+  };
+  const view = render(
+    <View style={{ width: 200 }}>
+      <Message message={toolMessage(part)} canAnswer={false} onAnswer={async () => {}} />
+    </View>
+  );
+  expect(view.getAllByRole("group", { name: "Nested tool calls" })).toHaveLength(1);
+  expect(view.getAllByRole("button")).toHaveLength(2);
+  fireEvent.click(view.getByRole("button", { name: "File read: Done" }));
+  expect(view.getByText("Child result")).toBeDefined();
+  expect(view.queryByRole("button", { name: /Bash/ })).toBeNull();
+});
+
 test("tool headers distinguish execution, completion, failure, redaction, and interrupted replay", () => {
   const part: MuxToolPart = {
     type: "dynamic-tool",
