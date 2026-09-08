@@ -3,7 +3,13 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { MessageListProvider } from "./MessageListContext";
-import { getCurrentHighlightedCodeBlockLines, markdownComponents } from "./MarkdownComponents";
+import type { HighlightedCodeBlockLines } from "./MarkdownComponents";
+import { resolveCodeBlockLines, markdownComponents } from "./MarkdownComponents";
+
+// Mirrors the plain-line derivation in CodeBlock (drop the trailing empty line).
+function toPlainLines(code: string): string[] {
+  return code.split("\n").filter((line, idx, arr) => idx < arr.length - 1 || line !== "");
+}
 
 function renderCodeBlock(
   className: string,
@@ -60,29 +66,99 @@ describe("MarkdownComponents command code blocks", () => {
 
     expect(queryByRole("button", { name: "Run command" })).toBeNull();
   });
+});
 
-  test("ignores highlighted lines from a previous code block revision", () => {
-    const highlighted = {
-      code: "const oldValue = 1;",
+describe("resolveCodeBlockLines streaming highlight", () => {
+  const highlightedLine = (text: string) => `<span>${text}</span>`;
+
+  test("renders plain text before any highlight is available", () => {
+    const code = "const a = 1;\nconst b";
+    expect(resolveCodeBlockLines(null, code, toPlainLines(code), "typescript", "dark")).toEqual([
+      { content: "const a = 1;", highlighted: false },
+      { content: "const b", highlighted: false },
+    ]);
+  });
+
+  test("fully highlights when the highlight matches the current code", () => {
+    const code = "const a = 1;";
+    const highlighted: HighlightedCodeBlockLines = {
+      code,
       shikiLanguage: "typescript",
-      theme: "dark" as const,
-      lines: ["<span>highlighted old value</span>"],
+      theme: "dark",
+      lines: [highlightedLine("const a = 1;")],
     };
+    expect(
+      resolveCodeBlockLines(highlighted, code, toPlainLines(code), "typescript", "dark")
+    ).toEqual([{ content: highlightedLine("const a = 1;"), highlighted: true }]);
+  });
 
-    // A streaming code fence can receive a new chunk while Shiki output for the
-    // previous chunk is still cached. The renderer should fall back to current
-    // plain text until highlight output catches up to this exact code/theme tuple.
+  test("keeps finalized prefix lines highlighted while the streaming tail stays plain", () => {
+    // Previous highlight ended on a newline, so its line is complete and safe to reuse.
+    const highlighted: HighlightedCodeBlockLines = {
+      code: "const a = 1;\n",
+      shikiLanguage: "typescript",
+      theme: "dark",
+      lines: [highlightedLine("const a = 1;")],
+    };
+    const code = "const a = 1;\nconst b = 2;";
+
+    // The finalized first line stays colored (no flash back to plain); only the still-
+    // growing last line renders as plain text until the next highlight lands.
     expect(
-      getCurrentHighlightedCodeBlockLines(
-        highlighted,
-        "const nextValue = 2;\nconsole.log(nextValue);",
-        "typescript",
-        "dark"
-      )
-    ).toBeNull();
+      resolveCodeBlockLines(highlighted, code, toPlainLines(code), "typescript", "dark")
+    ).toEqual([
+      { content: highlightedLine("const a = 1;"), highlighted: true },
+      { content: "const b = 2;", highlighted: false },
+    ]);
+  });
+
+  test("does not reuse the last highlighted line when it was still incomplete", () => {
+    // No trailing newline => the last highlighted line ("const b = 2") was mid-stream and
+    // must not be shown as stale text once more characters arrive.
+    const highlighted: HighlightedCodeBlockLines = {
+      code: "const a = 1;\nconst b = 2",
+      shikiLanguage: "typescript",
+      theme: "dark",
+      lines: [highlightedLine("const a = 1;"), highlightedLine("const b = 2")],
+    };
+    const code = "const a = 1;\nconst b = 22;";
+
     expect(
-      getCurrentHighlightedCodeBlockLines(highlighted, "const oldValue = 1;", "typescript", "dark")
-    ).toEqual(["<span>highlighted old value</span>"]);
+      resolveCodeBlockLines(highlighted, code, toPlainLines(code), "typescript", "dark")
+    ).toEqual([
+      { content: highlightedLine("const a = 1;"), highlighted: true },
+      { content: "const b = 22;", highlighted: false },
+    ]);
+  });
+
+  test("falls back to plain text on theme change", () => {
+    const code = "const a = 1;";
+    const highlighted: HighlightedCodeBlockLines = {
+      code,
+      shikiLanguage: "typescript",
+      theme: "dark",
+      lines: [highlightedLine("const a = 1;")],
+    };
+    expect(
+      resolveCodeBlockLines(highlighted, code, toPlainLines(code), "typescript", "light")
+    ).toEqual([{ content: "const a = 1;", highlighted: false }]);
+  });
+
+  test("falls back to plain text when the highlight is not a prefix of the current code", () => {
+    const highlighted: HighlightedCodeBlockLines = {
+      code: "const oldValue = 1;\n",
+      shikiLanguage: "typescript",
+      theme: "dark",
+      lines: [highlightedLine("const oldValue = 1;")],
+    };
+    const code = "const nextValue = 2;\nconsole.log(nextValue);";
+
+    expect(
+      resolveCodeBlockLines(highlighted, code, toPlainLines(code), "typescript", "dark")
+    ).toEqual([
+      { content: "const nextValue = 2;", highlighted: false },
+      { content: "console.log(nextValue);", highlighted: false },
+    ]);
   });
 });
 

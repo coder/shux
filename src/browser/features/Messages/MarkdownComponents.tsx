@@ -137,21 +137,64 @@ export interface HighlightedCodeBlockLines {
   lines: string[];
 }
 
-export function getCurrentHighlightedCodeBlockLines(
+export interface ResolvedCodeBlockLine {
+  /** Either Shiki HTML (when `highlighted`) or plain source text. */
+  content: string;
+  /** When true, `content` is trusted Shiki HTML; otherwise it is plain text. */
+  highlighted: boolean;
+}
+
+/**
+ * Resolve which lines to render while async Shiki output may lag behind the current code.
+ *
+ * Streaming code fences grow one chunk at a time, so the previous highlight is almost
+ * always a prefix of the current code. Every line terminated by a newline in that prefix
+ * is final (left-to-right tokenization means a completed line's colors never change based
+ * on later lines), so we keep those lines highlighted and only fall back to plain text for
+ * the still-growing tail. This shows correct partial highlighting instead of flashing the
+ * whole block between plain and colored on every streamed chunk.
+ */
+export function resolveCodeBlockLines(
   highlighted: HighlightedCodeBlockLines | null,
   code: string,
+  plainLines: string[],
   shikiLanguage: string,
   theme: "light" | "dark"
-): string[] | null {
-  if (
-    highlighted?.code === code &&
-    highlighted.shikiLanguage === shikiLanguage &&
-    highlighted.theme === theme
-  ) {
-    return highlighted.lines;
+): ResolvedCodeBlockLine[] {
+  const asPlain = (): ResolvedCodeBlockLine[] =>
+    plainLines.map((content) => ({ content, highlighted: false }));
+
+  // No highlight yet, or it targets a different language/theme: render plain.
+  if (!highlighted) {
+    return asPlain();
+  }
+  if (highlighted.shikiLanguage !== shikiLanguage || highlighted.theme !== theme) {
+    return asPlain();
   }
 
-  return null;
+  // Highlight matches the current code exactly: fully highlighted.
+  if (highlighted.code === code) {
+    return highlighted.lines.map((content) => ({ content, highlighted: true }));
+  }
+
+  // Streaming append: keep the finalized prefix highlighted, render the tail plain.
+  if (code.startsWith(highlighted.code)) {
+    // A trailing newline means every highlighted line is complete; otherwise the last
+    // highlighted line is still growing and must not be reused (it would show stale text).
+    const finalizedCount = highlighted.code.endsWith("\n")
+      ? highlighted.lines.length
+      : highlighted.lines.length - 1;
+    const safeCount = Math.max(0, Math.min(finalizedCount, plainLines.length));
+    return plainLines.map((content, idx) =>
+      idx < safeCount
+        ? { content: highlighted.lines[idx], highlighted: true }
+        : { content, highlighted: false }
+    );
+  }
+
+  // Highlight no longer corresponds to the current code (e.g. theme/code reset): render
+  // plain until the async highlighter catches up.
+  return asPlain();
 }
 
 /**
@@ -207,16 +250,9 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     ? normalizeSuggestedShellCommand(code)
     : "";
   const showRunButton = Boolean(openTerminal) && runnableCommand.length > 0;
-  // Ignore highlighted output from a previous stream chunk until the async highlighter
-  // catches up to the current code/theme. Otherwise streaming code fences briefly render
-  // stale highlighted lines with the old height, then flash to the current content.
-  const highlightedLines = getCurrentHighlightedCodeBlockLines(
-    highlighted,
-    code,
-    shikiLanguage,
-    theme
-  );
-  const lines = highlightedLines ?? plainLines;
+  // Keep finalized lines highlighted while the async highlighter catches up to the
+  // streaming tail, instead of flashing the whole block between plain and colored.
+  const lines = resolveCodeBlockLines(highlighted, code, plainLines, shikiLanguage, theme);
   const isSingleLine = lines.length === 1;
 
   return (
@@ -224,7 +260,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
       className={`code-block-wrapper${isSingleLine ? " code-block-single-line" : ""}${showRunButton ? " code-block-runnable" : ""}`}
     >
       <div className="code-block-container">
-        {lines.map((content, idx) => (
+        {lines.map((line, idx) => (
           <React.Fragment key={idx}>
             <div className="line-number">{idx + 1}</div>
             {/* SECURITY AUDIT: dangerouslySetInnerHTML usage
@@ -238,9 +274,9 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
              */}
             <div
               className="code-line"
-              {...(highlightedLines
-                ? { dangerouslySetInnerHTML: { __html: content } }
-                : { children: <code>{content}</code> })}
+              {...(line.highlighted
+                ? { dangerouslySetInnerHTML: { __html: line.content } }
+                : { children: <code>{line.content}</code> })}
             />
           </React.Fragment>
         ))}
