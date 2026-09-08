@@ -31,10 +31,12 @@ function harness() {
     mutate: mock(
       (
         mutation: CompactionCancellationMutation,
-        isCurrent: () => boolean
+        isCurrent: () => boolean,
+        onCommitted: (record: CompactionCancellationRecord | null) => undefined
       ): Promise<CompactionCancellationMutationOutcome> => {
         if (!isCurrent()) return Promise.resolve("superseded");
         shared.record = mutation.kind === "retire" ? null : structuredClone(mutation.record);
+        onCommitted(shared.record);
         return Promise.resolve("applied");
       }
     ),
@@ -67,13 +69,13 @@ describe("inactive cancellation state core", () => {
     expect(state.blocksRecovery).toBe(true);
     expect(storage.read).not.toHaveBeenCalled();
     await assert.rejects(state.narrow(first!.nonce, summary), /sidecar publication failed/);
-    storage.mutate.mockImplementationOnce(async (mutation, current) => {
+    storage.mutate.mockImplementationOnce(async (mutation, current, onCommitted) => {
       assert(mutation.kind === "publish");
       expect(mutation.record.nonce).toBe(first!.nonce);
       expect(mutation.publication).toBe(publication!);
       expect(mutation.publication.predecessor).toBe(frontier);
       expect(mutation.publication.attempts).toBe(2);
-      return apply(mutation, current);
+      return apply(mutation, current, onCommitted);
     });
     expect(await state.retry()).toBe("applied");
     expect(shared.record?.nonce).toBe(first!.nonce);
@@ -114,11 +116,11 @@ describe("inactive cancellation state core", () => {
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const apply = storage.mutate.getMockImplementation()!;
-    storage.mutate.mockImplementationOnce(async (mutation, current) => {
+    storage.mutate.mockImplementationOnce(async (mutation, current, onCommitted) => {
       entered.resolve();
       await release.promise;
       expect(current()).toBe(false);
-      return apply(mutation, current);
+      return apply(mutation, current, onCommitted);
     });
     const first = state.cancel();
     await entered.promise;
@@ -151,16 +153,16 @@ describe("inactive cancellation state core", () => {
     const successorEntered = Promise.withResolvers<void>();
     const releaseSuccessor = Promise.withResolvers<void>();
     const apply = storage.mutate.getMockImplementation()!;
-    storage.mutate.mockImplementationOnce(async (mutation, current) => {
-      const outcome = await apply(mutation, current);
+    storage.mutate.mockImplementationOnce(async (mutation, current, onCommitted) => {
+      const outcome = await apply(mutation, current, onCommitted);
       committed.resolve();
       await acknowledge.promise;
       return outcome;
     });
-    storage.mutate.mockImplementationOnce(async (mutation, current) => {
+    storage.mutate.mockImplementationOnce(async (mutation, current, onCommitted) => {
       successorEntered.resolve();
       await releaseSuccessor.promise;
-      return apply(mutation, current);
+      return apply(mutation, current, onCommitted);
     });
     const first = state.cancel();
     await committed.promise;
@@ -254,6 +256,142 @@ describe("inactive cancellation state core", () => {
     await state.retireReplacement({ nonce: first.nonce });
     expect(await state.read()).toEqual(second);
   });
+
+  it("preserves retention inherited by the adapter without first reading the predecessor", async () => {
+    const { state, storage, shared } = harness();
+    shared.record = { ...cancellation("retained-predecessor"), retainUntilReplacement: true };
+    const apply = storage.mutate.getMockImplementation()!;
+    storage.mutate.mockImplementationOnce((mutation, current, onCommitted) => {
+      assert(mutation.kind === "publish");
+      expect(mutation.record.retainUntilReplacement).toBeUndefined();
+      // Inheritance happens under the adapter lock, without mutating the submitted record.
+      return apply(
+        { ...mutation, record: { ...mutation.record, retainUntilReplacement: true } },
+        current,
+        onCommitted
+      );
+    });
+    await state.cancel();
+    const committed = structuredClone(shared.record);
+    assert(committed);
+    await state.narrow(committed.nonce, summary);
+    await state.retire(committed.nonce);
+    expect(shared.record).toEqual(committed);
+    expect(storage.mutate).toHaveBeenCalledTimes(1);
+    expect(storage.read).not.toHaveBeenCalled();
+    await state.cancel();
+    expect(shared.record?.retainUntilReplacement).toBe(true);
+  });
+
+  it.each(["record", "malformed", "I/O"])(
+    "a read spanning committed witnessed retirement cannot restore its retention or error (%s)",
+    async (outcome) => {
+      const { state, storage, shared } = harness();
+      await state.cancel({ retainUntilReplacement: true });
+      const record = structuredClone(shared.record);
+      assert(record);
+      const snapshot = Promise.withResolvers<CompactionCancellationRecord | null>();
+      storage.read.mockReturnValueOnce(snapshot.promise);
+      const retirement = state.retireReplacement({ nonce: record.nonce });
+      const reading = state.read();
+      await retirement;
+      expect(shared.record).toBeNull();
+      if (outcome === "record") snapshot.resolve(record);
+      else
+        snapshot.reject(
+          outcome === "malformed"
+            ? new MalformedCompactionCancellationError("old bytes")
+            : new Error("old I/O failure")
+        );
+      expect(await reading).toBeNull();
+      expect(storage.repair).not.toHaveBeenCalled();
+      await state.cancel();
+      expect(shared.record?.retainUntilReplacement).toBeUndefined();
+    }
+  );
+
+  it.each([
+    { outcome: "failed", completion: "before" },
+    { outcome: "failed", completion: "after" },
+    { outcome: "superseded", completion: "before" },
+    { outcome: "superseded", completion: "after" },
+  ])(
+    "uncommitted retirement preserves a foreign read ($outcome, completion=$completion)",
+    async ({ outcome, completion }) => {
+      const { state, storage, shared } = harness();
+      await state.cancel({ retainUntilReplacement: true });
+      const record = shared.record;
+      assert(record);
+      const snapshot = Promise.withResolvers<CompactionCancellationRecord | null>();
+      storage.read.mockReturnValueOnce(snapshot.promise);
+      const acknowledge = Promise.withResolvers<CompactionCancellationMutationOutcome>();
+      storage.mutate.mockReturnValueOnce(acknowledge.promise);
+      const retirement = state.retireReplacement({ nonce: record.nonce });
+      const reading = state.read();
+      const foreign = { ...cancellation("foreign-b"), retainUntilReplacement: true };
+      if (completion === "before") {
+        snapshot.resolve(foreign);
+        expect(await reading).toEqual(foreign);
+      }
+      if (outcome === "failed") acknowledge.reject(new Error("unlink failed"));
+      else acknowledge.resolve("superseded");
+      if (outcome === "failed") await assert.rejects(retirement, /unlink failed/);
+      else await retirement;
+      if (completion === "after") {
+        snapshot.resolve(foreign);
+        expect(await reading).toEqual(foreign);
+      }
+      await state.cancel();
+      expect(shared.record?.retainUntilReplacement).toBe(true);
+    }
+  );
+
+  it.each([
+    { completion: "before", failedCleanup: false },
+    { completion: "after", failedCleanup: false },
+    { completion: "before", failedCleanup: true },
+    { completion: "after", failedCleanup: true },
+  ])(
+    "preserves a post-deletion foreign read (completion=$completion, failed cleanup=$failedCleanup)",
+    async ({ completion, failedCleanup }) => {
+      const { state, storage, shared } = harness();
+      await state.cancel({ retainUntilReplacement: true });
+      const record = shared.record;
+      assert(record);
+      const deleted = Promise.withResolvers<void>();
+      const acknowledge = Promise.withResolvers<void>();
+      storage.mutate.mockImplementationOnce(async (_mutation, _current, onCommitted) => {
+        shared.record = null;
+        onCommitted(null);
+        deleted.resolve();
+        await acknowledge.promise;
+        if (failedCleanup) throw new Error("cleanup failed after deletion");
+        return "applied";
+      });
+      const retirement = state.retireReplacement({ nonce: record.nonce });
+      await deleted.promise;
+      const foreign = { ...cancellation("foreign-b"), retainUntilReplacement: true };
+      shared.record = foreign;
+      const snapshot = Promise.withResolvers<CompactionCancellationRecord | null>();
+      storage.read.mockReturnValueOnce(snapshot.promise);
+      const reading = state.read();
+      if (completion === "before") {
+        snapshot.resolve(foreign);
+        expect(await reading).toEqual(foreign);
+      }
+      acknowledge.resolve();
+      if (failedCleanup) await assert.rejects(retirement, /cleanup failed/);
+      else await retirement;
+      expect(state.needsPersistence).toBe(failedCleanup);
+      if (completion === "after") {
+        snapshot.resolve(foreign);
+        expect(await reading).toEqual(foreign);
+      }
+      // No refresh is needed for the next Stop to carry B's full-clear obligation.
+      await state.cancel();
+      expect(shared.record?.retainUntilReplacement).toBe(true);
+    }
+  );
 
   it("witnessed deletion debt allows fresh reads without adopting a foreign Stop for retry", async () => {
     const { state, storage, shared } = harness();
@@ -364,11 +502,11 @@ describe("inactive cancellation state core", () => {
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
       const apply = storage.mutate.getMockImplementation()!;
-      storage.mutate.mockImplementationOnce(async (mutation, current) => {
+      storage.mutate.mockImplementationOnce(async (mutation, current, onCommitted) => {
         entered.resolve();
         await release.promise;
         if (failed) throw new Error("retry failure");
-        return apply(mutation, current);
+        return apply(mutation, current, onCommitted);
       });
       const readers = [state.readForReplacement(), state.readForReplacement()];
       await entered.promise;

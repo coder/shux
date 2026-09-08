@@ -52,10 +52,14 @@ export interface CompactionCancellationStorage {
    * isCurrent immediately before publication. Preserve inherited retention, including an
    * unreadable predecessor. Retirement requires the exact nonce and, for retained records,
    * a verified replacement witness. Superseded means no authority to apply this mutation.
+   * Call onCommitted synchronously at the durable commit/confirmation, before releasing
+   * the lock or awaiting cleanup, with inherited retention or null after retirement.
+   * Every applied outcome requires this receipt; later failure cannot undo the commit.
    */
   mutate(
     mutation: CompactionCancellationMutation,
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    onCommitted: (record: CompactionCancellationRecord | null) => undefined
   ): Promise<CompactionCancellationMutationOutcome>;
   /**
    * Re-read under the lock; preserve newer valid records. Neutralize obsolete recovery
@@ -117,7 +121,7 @@ export class CompactionCancellation {
     if (this.blocksRecovery) return this.effectiveRecord();
     const mutation = this.mutation;
     const pending = this.pending;
-    // Only an accepted newer read displaces an earlier snapshot/error/repair.
+    // Only an accepted newer read or committed mutation displaces a snapshot/error/repair.
     // A pending successor is not evidence of absence and cannot hide a valid Stop.
     const generation = ++this.readGeneration;
     const isCurrent = () =>
@@ -278,21 +282,24 @@ export class CompactionCancellation {
     this.mutation = mutation;
     this.unsettled = true;
     this.inFlight = true;
+    const generation = this.acceptedReadGeneration;
     const isCurrent = () => this.mutation === mutation;
     const result = this.pending
       .catch(() => undefined)
       .then(async (): Promise<CompactionCancellationMutationOutcome> => {
         if (!isCurrent()) return "superseded";
         if (mutation.kind === "publish") mutation.publication.attempts++;
-        const outcome = await this.storage.mutate(mutation, isCurrent);
+        const outcome = await this.storage.mutate(mutation, isCurrent, (record) => {
+          if (!isCurrent()) return;
+          this.current = structuredClone(record);
+          // Commit invalidates pre-deletion reads before lock release. A later foreign
+          // read must survive acknowledgment delayed by adapter cleanup.
+          this.acceptedReadGeneration = ++this.readGeneration;
+        });
         if (isCurrent()) {
           this.unsettled = false;
-          this.current =
-            outcome === "superseded"
-              ? undefined
-              : mutation.kind === "retire"
-                ? null
-                : structuredClone(mutation.record);
+          if (outcome === "superseded" && this.acceptedReadGeneration === generation)
+            this.current = undefined;
         }
         return outcome;
       });
