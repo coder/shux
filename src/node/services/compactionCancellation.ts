@@ -136,6 +136,11 @@ export class CompactionCancellation {
         if (!(error instanceof MalformedCompactionCancellationError) || !isCurrent()) throw error;
         return this.storage.repair(isCurrent, () => {
           this.repairedHistoryRevision++;
+          if (!isCurrent()) return;
+          // Removal is already committed; pre-repair reads must not restore retention
+          // while the adapter is still finishing lock cleanup.
+          this.current = null;
+          this.acceptedReadGeneration = ++this.readGeneration;
         });
       });
       if (isCurrent()) {
@@ -192,9 +197,10 @@ export class CompactionCancellation {
       const reading = this.read();
       const generation = this.readGeneration;
       try {
-        const record = await reading;
+        await reading;
         if (this.current === undefined) return this.refreshForReplacement();
-        if (!this.blocksRecovery) return record;
+        // A Stop or newer read can commit after reading resolves but before we resume.
+        if (!this.blocksRecovery) return this.effectiveRecord();
       } catch (error) {
         if (error instanceof CompactionCancellationReadRefusedError) throw error;
         // Refresh unknown state once; propagate that read's failure instead of repeatedly

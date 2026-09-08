@@ -631,6 +631,64 @@ describe("inactive cancellation state core", () => {
     }
   );
 
+  it.each([
+    { completion: "before", successor: "cancel" },
+    { completion: "after", successor: "cancel" },
+    { completion: "before", successor: "read" },
+    { completion: "after", successor: "read" },
+  ])(
+    "repair receipt fences retained reads before acknowledgment (read=$completion, successor=$successor)",
+    async ({ completion, successor }) => {
+      const { state, storage, shared } = harness();
+      const retained = { ...cancellation("older-a"), retainUntilReplacement: true };
+      const olderSnapshot = Promise.withResolvers<CompactionCancellationRecord | null>();
+      const entered = Promise.withResolvers<void>();
+      const commit = Promise.withResolvers<void>();
+      const committed = Promise.withResolvers<void>();
+      const acknowledge = Promise.withResolvers<void>();
+      storage.read
+        .mockReturnValueOnce(olderSnapshot.promise)
+        .mockRejectedValueOnce(new MalformedCompactionCancellationError());
+      storage.repair.mockImplementationOnce(async (current, onCommitted) => {
+        entered.resolve();
+        await commit.promise;
+        assert(current());
+        shared.record = null;
+        onCommitted();
+        committed.resolve();
+        await acknowledge.promise;
+        return null;
+      });
+      const older = state.read();
+      const repairing = state.read();
+      await entered.promise;
+      if (completion === "before") {
+        olderSnapshot.resolve(retained);
+        expect(await older).toEqual(retained);
+      }
+      commit.resolve();
+      await committed.promise;
+      expect(state.repairRevision).toBe(1);
+      try {
+        if (completion === "after") {
+          olderSnapshot.resolve(retained);
+          expect(await older).toBeNull();
+        }
+        if (successor === "cancel") {
+          await state.cancel();
+          expect(shared.record?.retainUntilReplacement).toBeUndefined();
+        } else {
+          shared.record = cancellation("newer-b");
+          expect(await state.read()).toEqual(shared.record);
+        }
+      } finally {
+        acknowledge.resolve();
+        await repairing;
+      }
+      expect(await repairing).toEqual(shared.record);
+    }
+  );
+
   it("out-of-order reads preserve the original witnessed retirement retry", async () => {
     const { state, storage, shared } = harness();
     await state.cancel();
@@ -877,6 +935,29 @@ describe("inactive cancellation state core", () => {
       expect(await stopping).toBe("applied");
       expect(await state.readForReplacement()).toEqual(shared.record);
       expect(state.blocksRecovery).toBe(false);
+    }
+  );
+
+  it.each(["record", "absence"])(
+    "replacement returns the committed Stop admitted after a successful read (%s)",
+    async (snapshot) => {
+      const { state, storage, shared } = harness();
+      shared.record = snapshot === "record" ? cancellation("older-a") : null;
+      const read = state.read.bind(state);
+      const checkedRead = spyOn(state, "read").mockImplementationOnce(() =>
+        read().then(async (record) => {
+          await state.cancel();
+          return record;
+        })
+      );
+      try {
+        expect(await state.readForReplacement()).toEqual(shared.record);
+        expect(shared.record).not.toBeNull();
+        expect(state.blocksRecovery).toBe(false);
+        expect(storage.read).toHaveBeenCalledTimes(1);
+      } finally {
+        checkedRead.mockRestore();
+      }
     }
   );
 
