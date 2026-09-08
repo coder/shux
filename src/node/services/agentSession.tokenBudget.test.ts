@@ -1531,6 +1531,54 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   });
 
+  test("middleware registered during the flush turn cannot block the promised reset", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await h.finishAndDispatch();
+    expect(warningRows(await allRows(h)).filter(isFinalFlushRow)).toHaveLength(1);
+    const unregister = eventSpine.useBefore(
+      "request.assemble",
+      (ctx) => {
+        delete ctx.tools.session_history;
+      },
+      { workspaceId }
+    );
+    try {
+      expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
+      h.settleStream(1);
+      await h.waitForRequest(3);
+      expect(rolloverRows(await allRows(h))).toHaveLength(1);
+      // The reset is pinned to the snapshot admitted with the flush, not the changed registry.
+      expect(h.requests[2].requestAssemblySnapshot?.preservesToolset).toBe(true);
+    } finally {
+      unregister();
+    }
+  });
+
+  test("a crash after only the flush placeholder keeps the notes-writing step", async () => {
+    const first = await setup();
+    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await first.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await first.finishAndDispatch();
+    // The builder appends an empty assistant placeholder before any output exists.
+    const placeholder = createMuxMessage("flush-placeholder", "assistant", "", {
+      model,
+      partial: true,
+    });
+    expect((await first.historyService.appendToHistory(workspaceId, placeholder)).success).toBe(
+      true
+    );
+    await first.session.dispose();
+    const h = await setup({ previous: first });
+    expect((await h.session.resumeStream(options)).success).toBe(true);
+    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    expect(applyToolPolicyToNames(["memory", "bash"], h.requests[0].toolPolicy)).toEqual([
+      "memory",
+      "bash",
+    ]);
+  });
+
   test("an emergency rollover during the flush turn sanitizes the flush trigger", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);

@@ -964,6 +964,8 @@ export class AgentSession {
   /** Latest context-usage snapshot used for on-send compaction checks. */
   private lastUsageState?: AutoCompactionUsageState;
   private pendingRollover?: ContextWindowRollover;
+  /** Request-assembly snapshot admitted when a final flush was promised; pins the sealing reset. */
+  private pendingRolloverSnapshot?: RequestAssemblySnapshot;
   private contextBudgetWarningClaimed = false;
   /** One final pre-rollover notes flush per window; derived from history on restart. */
   private contextBudgetFlushClaimed = false;
@@ -5005,6 +5007,7 @@ export class AgentSession {
   private clearContextBudgetState(): void {
     this.contextBudgetGeneration += 1;
     this.pendingRollover = undefined;
+    this.pendingRolloverSnapshot = undefined;
     this.pendingBudgetWarning = undefined;
     this.contextBudgetWarningClaimed = false;
     this.contextBudgetFlushClaimed = false;
@@ -5655,16 +5658,19 @@ export class AgentSession {
       // The prompt promises that the next message seals the window, so require the same
       // admission the rollover itself needs (history access, toolset-preserving middleware).
       // Threshold 100% disables automatic rollover: a flush promising a sealed window would lie.
-      if (
+      const admitted =
         this.pendingRollover != null &&
         rolloverEnabled &&
         flushStillSafe &&
         this.contextBudgetMemoryWritable === true &&
         this.contextBudgetHistoryAvailable &&
-        (await this.checkContextBudgetHistoryAccess(options)).success &&
-        (await this.captureRolloverRequestAssembly()).success
-      ) {
-        // Keep pendingRollover: the next dispatch seals this window regardless of usage.
+        (await this.checkContextBudgetHistoryAccess(options)).success
+          ? await this.captureRolloverRequestAssembly()
+          : undefined;
+      if (admitted?.success) {
+        // Keep pendingRollover and pin this admitted snapshot: the promised reset must not be
+        // invalidated by registry changes that happen during the flush turn itself.
+        this.pendingRolloverSnapshot = admitted.data;
         return Ok({
           prefix: [
             createContextBudgetWarning(decision.projected, maxTokens, true, true, {
@@ -5716,7 +5722,11 @@ export class AgentSession {
     );
     if (!freshBudget.success) return freshBudget;
     if (rollover) {
-      const captured = await this.captureRolloverRequestAssembly();
+      const pinned =
+        this.pendingRollover != null && rollover === this.pendingRollover
+          ? this.pendingRolloverSnapshot
+          : undefined;
+      const captured = pinned ? Ok(pinned) : await this.captureRolloverRequestAssembly();
       if (!captured.success) return captured;
       this.pendingRollover = rollover;
       userMessage.metadata = {
@@ -7130,8 +7140,15 @@ export class AgentSession {
       const flushAlreadyStepped =
         contextBudgetFlushTurn &&
         lastUserMessage != null &&
-        historyResult.data.indexOf(lastUserMessage) <
-          historyResult.data.findLastIndex((row) => row.role === "assistant");
+        historyResult.data.slice(historyResult.data.indexOf(lastUserMessage) + 1).some(
+          (row) =>
+            row.role === "assistant" &&
+            // An empty placeholder is appended before streaming; only a settled tool call
+            // proves the single flush step actually happened.
+            row.parts.some(
+              (part) => part.type === "dynamic-tool" && part.state === "output-available"
+            )
+        );
       // Mid-stream compaction runs after the original send options have already been resolved against
       // history (notably bash-monitor wakes). Persist the actual correlation used by this stream so the
       // post-compaction continuation remains the same delegated workspace turn.
