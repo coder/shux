@@ -4,8 +4,11 @@ import { promises as fs, rmSync } from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
 import { COMPACTION_CANCELLATION_FILE } from "@/constants/continuousCompaction";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { HistoryService } from "./historyService";
 import { publishCompactionFile } from "./continuousCompactionJournal";
+import { hasAmbiguousResetKeys } from "./historyScanner";
 
 export interface CompactionCancellationSummary {
   id: string;
@@ -97,6 +100,18 @@ const CancellationRecordSchema = z.strictObject({
   ]),
 });
 
+function assertCancellationSize(contents: string): void {
+  if (Buffer.byteLength(contents, "utf8") > SESSION_HISTORY_MAX_LINE_BYTES)
+    throw new CompactionCancellationReadRefusedError("Cancellation record exceeds supported size");
+}
+
+function serializeCancellation(record: CompactionCancellationRecord) {
+  // JSON normalization must agree with both confirmation comparisons and commit receipts.
+  const contents = JSON.stringify(record);
+  assertCancellationSize(contents);
+  return { contents, record: CancellationRecordSchema.parse(JSON.parse(contents)) };
+}
+
 /** Inactive real adapter. H2b supplies accepted-row verification; H2c wires runtime consumers. */
 export class FileCompactionCancellationStorage implements CompactionCancellationStorage {
   readonly path: string;
@@ -124,9 +139,21 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
     }
+    // The duplicate scanner's size ceiling must refuse inspection, never authorize repair.
+    assertCancellationSize(contents);
     try {
-      return CancellationRecordSchema.parse(JSON.parse(contents));
-    } catch {
+      const parsed: unknown = JSON.parse(contents);
+      if (
+        isPlainObject(parsed) &&
+        typeof parsed.version === "number" &&
+        Number.isInteger(parsed.version) &&
+        parsed.version > 1
+      )
+        throw new CompactionCancellationReadRefusedError("Unsupported cancellation record version");
+      if (hasAmbiguousResetKeys(contents)) throw new Error("Duplicate cancellation fields");
+      return CancellationRecordSchema.parse(parsed);
+    } catch (error) {
+      if (error instanceof CompactionCancellationReadRefusedError) throw error;
       // Do not include the bytes: pending requests can contain private user content.
       throw new MalformedCompactionCancellationError("Invalid compaction cancellation record");
     }
@@ -146,7 +173,8 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
       )
         throw new Error("Cancellation frontier was not captured; a new Stop is required");
       const current = await this.read().catch((error: unknown) => {
-        if (mutation.kind !== "publish") throw error;
+        if (mutation.kind !== "publish" || error instanceof CompactionCancellationReadRefusedError)
+          throw error;
         // Explicit Stop may overwrite unreadable state, inheriting its unknown
         // full-clear obligation. Reads and automatic repair never gain this authority.
         return undefined;
@@ -167,6 +195,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         if (current === undefined || current?.retainUntilReplacement)
           mutation.record.retainUntilReplacement = true;
         if (!isCurrent()) return "superseded";
+        const { contents, record: committed } = serializeCancellation(mutation.record);
         // Record admission before advancing, and advancement at its commit point.
         // Unobserved failures remain blocking until a new explicit Stop captures a frontier.
         await journal.advanceGenerationUnderHistoryLock((advanced) => {
@@ -174,12 +203,12 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         }, checkLock);
         return (await publishCompactionFile(
           this.path,
-          JSON.stringify(mutation.record),
+          contents,
           isCurrent,
           () => {
-            frontier.nonce = mutation.record.nonce;
+            frontier.nonce = committed.nonce;
             // Install inherited retention before cleanup can admit a newer read.
-            onCommitted(mutation.record);
+            onCommitted(committed);
           },
           checkLock
         ))
@@ -190,8 +219,9 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
       if (current?.nonce !== nonce) return "superseded";
       if (mutation.kind === "narrow") {
         if (current.retainUntilReplacement) return "superseded";
+        const { contents, record: committed } = serializeCancellation(mutation.record);
         if (current.scope.kind !== "unresolved") {
-          if (!isDeepStrictEqual(current, mutation.record)) return "superseded";
+          if (!isDeepStrictEqual(current, committed)) return "superseded";
           await checkLock();
           if (!isCurrent()) return "superseded";
           onCommitted(current);
@@ -199,9 +229,9 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         }
         return (await publishCompactionFile(
           this.path,
-          JSON.stringify(mutation.record),
+          contents,
           isCurrent,
-          () => onCommitted(mutation.record),
+          () => onCommitted(committed),
           checkLock
         ))
           ? "applied"

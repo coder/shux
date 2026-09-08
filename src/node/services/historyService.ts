@@ -361,7 +361,18 @@ export class HistoryService {
         const sessionDir = this.getSessionDir(workspaceId);
         await assertStillOwned();
         await ensurePrivateDir(sessionDir);
-        return operation(sessionDir, assertStillOwned);
+        const result = await operation(sessionDir, assertStillOwned);
+        // The receipt tracks visible bytes; success clears debt only after directory sync.
+        // Match append provenance's platform policy: Windows cannot sync directory handles.
+        if (process.platform !== "win32") {
+          const directory = await fs.open(sessionDir, "r");
+          try {
+            await directory.sync();
+          } finally {
+            await directory.close();
+          }
+        }
+        return result;
       })
     );
   }

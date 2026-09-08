@@ -5,6 +5,7 @@ import * as nodeFs from "node:fs";
 import callbackFs from "node:fs";
 import * as path from "node:path";
 import { createMuxMessage } from "@/common/types/message";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
@@ -106,7 +107,11 @@ describe("inactive real cancellation storage", () => {
     async (phase) => {
       const narrowed: CompactionCancellationRecord = {
         ...record("existing"),
-        scope: { kind: "summary", ...summary },
+        scope: {
+          kind: "summary",
+          ...summary,
+          pendingFollowUp: { text: "Continue", providerOptions: { omitted: undefined } },
+        },
       };
       const existing = phase === "confirm" ? narrowed : record("existing");
       if (phase === "publish") existing.retainUntilReplacement = true;
@@ -122,7 +127,14 @@ describe("inactive real cancellation storage", () => {
           ? { ...record("replacement"), retainUntilReplacement: true }
           : phase === "retire"
             ? null
-            : narrowed;
+            : {
+                ...narrowed,
+                scope: {
+                  kind: "summary",
+                  ...summary,
+                  pendingFollowUp: { text: "Continue", providerOptions: {} },
+                },
+              };
       const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
       const cleanup = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
@@ -148,7 +160,7 @@ describe("inactive real cancellation storage", () => {
       try {
         await cleanup.promise;
         expect(mutationCommitted).toHaveBeenCalledTimes(1);
-        expect(mutationCommitted).toHaveBeenCalledWith(expected);
+        assert.deepEqual(mutationCommitted.mock.calls[0]?.[0], expected);
         expect(await storage.read()).toEqual(expected);
         expect(nodeFs.existsSync(lockPath)).toBe(true);
       } finally {
@@ -156,6 +168,54 @@ describe("inactive real cancellation storage", () => {
         await writing;
       }
       expect(await writing).toBe("applied");
+    }
+  );
+
+  it.skipIf(process.platform === "win32").each(["publish", "narrow", "retire"] as const)(
+    "keeps %s debt after directory sync fails without losing the visible receipt",
+    async (phase) => {
+      await state.cancel();
+      const previous = (await storage.read())!;
+      const syncing = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const open = fs.open;
+      let fail = true;
+      spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+        const handle = await open(...args);
+        if (args[0] === sessionDir && fail) {
+          fail = false;
+          spyOn(handle, "sync").mockImplementation(async () => {
+            syncing.resolve();
+            await release.promise;
+            throw new Error("directory sync failed");
+          });
+        }
+        return handle;
+      });
+      const writing =
+        phase === "publish"
+          ? state.cancel()
+          : phase === "narrow"
+            ? state.narrow(previous.nonce, summary)
+            : state.retire(previous.nonce);
+      try {
+        await Promise.race([
+          syncing.promise,
+          writing.then(() => assert.fail("mutation settled without syncing its directory")),
+        ]);
+        // Fresh disk bytes and the core's blocked read already agree before acknowledgment.
+        expect(await state.read()).toEqual(await storage.read());
+        expect(state.needsPersistence).toBe(true);
+        expect(nodeFs.existsSync(historyWriteLockPath(h.config.rootDir, workspaceId))).toBe(true);
+      } finally {
+        release.resolve();
+        await assert.rejects(writing, /directory sync failed/);
+      }
+      expect(state.needsPersistence).toBe(true);
+      const committed = await storage.read();
+      await state.retry();
+      expect(state.needsPersistence).toBe(false);
+      expect(await storage.read()).toEqual(committed);
     }
   );
 
@@ -206,6 +266,52 @@ describe("inactive real cancellation storage", () => {
       expect(await storage.read()).toEqual(successor);
       expect(await fs.readFile(generationPath, "utf8")).toBe("foreign-generation");
       expect(await fs.readFile(lockPath, "utf8")).toBe(`${process.pid}:foreign-holder`);
+    }
+  );
+
+  it.each(["newer", "oversized", "oversized newer"] as const)(
+    "preserves %s cancellation and recovery bytes through every refusal path",
+    async (kind) => {
+      const bytes =
+        " ".repeat(kind === "newer" ? 0 : SESSION_HISTORY_MAX_LINE_BYTES) +
+        JSON.stringify({ ...record("preserved"), version: kind === "oversized" ? 1 : 2 });
+      await fs.writeFile(storage.path, bytes);
+      await fs.writeFile(
+        path.join(sessionDir, "partial.json"),
+        JSON.stringify(
+          createMuxMessage("pending", "assistant", "summary", {
+            muxMetadata: { type: "compaction-summary", pendingFollowUp: followUp() },
+          })
+        )
+      );
+      const before = new Map(
+        await Promise.all(
+          (await fs.readdir(sessionDir)).map(
+            async (file) => [file, await fs.readFile(path.join(sessionDir, file))] as const
+          )
+        )
+      );
+      for (const operation of [
+        () => storage.read(),
+        () =>
+          storage.repair(
+            () => true,
+            () => mutationCommitted(null)
+          ),
+        () => state.readForReplacement(),
+        () => state.cancel(),
+      ]) {
+        await assert.rejects(
+          operation,
+          (error: unknown) =>
+            error instanceof Error && !(error instanceof MalformedCompactionCancellationError)
+        );
+        expect((await fs.readdir(sessionDir)).sort()).toEqual([...before.keys()].sort());
+        for (const [file, contents] of before)
+          expect(await fs.readFile(path.join(sessionDir, file))).toEqual(contents);
+      }
+      expect(state.repairRevision).toBe(0);
+      expect(mutationCommitted).not.toHaveBeenCalled();
     }
   );
 
@@ -418,6 +524,25 @@ describe("inactive real cancellation storage", () => {
     expect(await storage.read()).toBeNull();
   });
 
+  it("refuses a narrowing it could not read without replacing the current Stop", async () => {
+    await state.cancel();
+    const current = (await storage.read())!;
+    const scope = {
+      kind: "summary" as const,
+      ...summary,
+      pendingFollowUp: { text: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES) },
+    };
+    await assert.rejects(
+      storage.mutate(
+        { kind: "narrow", record: { ...current, scope } },
+        () => true,
+        mutationCommitted
+      )
+    );
+    expect(await storage.read()).toEqual(current);
+    expect(mutationCommitted).not.toHaveBeenCalled();
+  });
+
   it("requires an explicit in-lock verifier and rechecks local authority after verification", async () => {
     await state.cancel({ retainUntilReplacement: true });
     const retained = (await storage.read())!;
@@ -625,8 +750,14 @@ describe("inactive real cancellation storage", () => {
     expect(await storage.read()).not.toBeNull();
   });
 
-  it.each(["{broken", JSON.stringify({ ...record("bad"), retainUntilReplacement: "unknown" })])(
-    "repairs malformed cancellation while preserving raw privacy floors (%s)",
+  it.each([
+    "{broken",
+    JSON.stringify({ ...record("bad"), retainUntilReplacement: "unknown" }),
+    '{"version":1,"nonce":"duplicate","retainUntilReplacement":true,"retainUntilReplacement":false,"scope":{"kind":"unresolved"}}',
+    String.raw`{"version":1,"nonce":"escaped","retainUntilReplacement":true,"ret\u0061inUntilReplacement":false,"scope":{"kind":"unresolved"}}`,
+    '{"version":1,"nonce":"nested","scope":{"kind":"summary","id":"summary","pendingFollowUp":{"text":"old","text":"new"}}}',
+  ])(
+    "repairs malformed cancellation, syncs its directory, and preserves raw privacy floors (%s)",
     async (bytes) => {
       const summaryRow = createMuxMessage("summary", "assistant", "summary", {
         muxMetadata: { type: "compaction-summary", pendingFollowUp: followUp() },
@@ -645,8 +776,22 @@ describe("inactive real cancellation storage", () => {
       await fs.writeFile(storage.path, bytes);
       const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
       const generation = await journal.captureGeneration();
+      let syncedRepair = false;
+      const open = fs.open;
+      spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+        const handle = await open(...args);
+        if (args[0] === sessionDir) {
+          const sync = handle.sync.bind(handle);
+          spyOn(handle, "sync").mockImplementation(async () => {
+            await sync();
+            syncedRepair ||= state.repairRevision === 1;
+          });
+        }
+        return handle;
+      });
       expect(await state.read()).toBeNull();
       expect(state.repairRevision).toBe(1);
+      if (process.platform !== "win32") expect(syncedRepair).toBe(true);
       expect(await journal.captureGeneration()).not.toBe(generation);
       for (const file of ["chat-archive.jsonl", "chat.jsonl"]) {
         const repaired = await fs.readFile(path.join(sessionDir, file));
