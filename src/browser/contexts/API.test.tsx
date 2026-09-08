@@ -257,7 +257,9 @@ describe("API reconnection", () => {
       if (cookie) document.cookie = "mux-session=existing-user-session";
       let mints = 0;
       fetchImpl = (input) => {
-        if (String(input).includes("issueWebSocketTicket")) {
+        if (
+          (input instanceof Request ? input.url : input.toString()).includes("issueWebSocketTicket")
+        ) {
           mints++;
           return Promise.resolve(new Response("Unauthorized", { status: 401 }));
         }
@@ -513,7 +515,9 @@ describe("API reconnection", () => {
     expect(states.at(-1)?.status).toBe("connected");
     let mintFailures = 0;
     fetchImpl = (input) => {
-      if (String(input).includes("issueWebSocketTicket")) {
+      if (
+        (input instanceof Request ? input.url : input.toString()).includes("issueWebSocketTicket")
+      ) {
         mintFailures++;
         return Promise.resolve(new Response("Unauthorized", { status: 401 }));
       }
