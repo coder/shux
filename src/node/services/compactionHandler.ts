@@ -673,9 +673,9 @@ export class CompactionHandler {
     loadedSkills: LoadedSkillSnapshot[],
     readFiles: string[],
     boundaryMessageId?: string,
-    previousState?: PersistedPostCompactionStateV1
+    previousState?: PersistedPostCompactionStateV1,
+    owner = Symbol()
   ): Promise<void> {
-    const owner = Symbol();
     this.pendingStateOwner = owner;
     try {
       for (const snapshot of loadedSkills) {
@@ -749,6 +749,7 @@ export class CompactionHandler {
   ): Promise<boolean> {
     await this.loadPersistedPendingStateIfNeeded();
     const previous = {
+      owner: this.pendingStateOwner,
       pending: this.postCompactionAttachmentsPending,
       diffs: this.cachedFileDiffs,
       loadedSkills: this.cachedLoadedSkills,
@@ -778,6 +779,8 @@ export class CompactionHandler {
     } finally {
       // Never roll an older apply back over a newer preparation/consumption.
       if (!applied && this.pendingStateBoundaryMessageId === boundaryMessageId) {
+        // Restoring A must preserve the authority already captured by A's request.
+        this.pendingStateOwner = previous.owner;
         this.postCompactionAttachmentsPending = previous.pending;
         this.cachedFileDiffs = previous.diffs;
         this.cachedLoadedSkills = previous.loadedSkills;
@@ -788,7 +791,9 @@ export class CompactionHandler {
             previous.diffs,
             previous.loadedSkills,
             previous.readFiles,
-            previous.boundaryMessageId
+            previous.boundaryMessageId,
+            undefined,
+            previous.owner
           );
         } else {
           await this.deletePersistedPendingStateBestEffort();
@@ -1508,8 +1513,14 @@ export class CompactionHandler {
           ? await this.historyService.updateHistory(this.workspaceId, summaryMessage)
           : await this.historyService.appendToHistory(this.workspaceId, summaryMessage);
     if (!persistenceResult.success) {
+      // No boundary committed: retire this provisional snapshot independently of an older
+      // request's acknowledgement, which correctly cannot consume its replacement owner.
+      this.pendingStateOwner = Symbol();
+      this.pendingStateBoundaryMessageId = undefined;
+      this.postCompactionAttachmentsPending = false;
       this.cachedFileDiffs = [];
       this.cachedLoadedSkills = [];
+      this.cachedReadFilePaths = [];
       await this.deletePersistedPendingStateBestEffort();
       const operation =
         preservedTailCopies.length > 0

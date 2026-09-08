@@ -3,12 +3,28 @@ import { EventEmitter } from "events";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { createMuxMessage } from "@/common/types/message";
+import { Err } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { CompactionHandler } from "./compactionHandler";
 import { createTestHistoryService } from "./testHistoryService";
 
 const workspaceId = "pending-consumers";
 const followUp = { text: "wake", model: "openai:gpt-4o", agentId: "exec" };
+
+function readMessage(id: string) {
+  const message = createMuxMessage(id, "assistant", "");
+  message.parts = [
+    {
+      type: "dynamic-tool",
+      toolCallId: id,
+      toolName: "file_read",
+      state: "output-available",
+      input: { path: `/${id}.ts` },
+      output: { success: true },
+    },
+  ];
+  return message;
+}
 
 describe("exact pending snapshot consumption", () => {
   let store: Awaited<ReturnType<typeof createTestHistoryService>>;
@@ -39,18 +55,7 @@ describe("exact pending snapshot consumption", () => {
 
   async function publish(id?: string) {
     if (id) {
-      const message = createMuxMessage(id, "assistant", "");
-      message.parts = [
-        {
-          type: "dynamic-tool",
-          toolCallId: id,
-          toolName: "file_read",
-          state: "output-available",
-          input: { path: `/${id}.ts` },
-          output: { success: true },
-        },
-      ];
-      await store.historyService.appendToHistory(workspaceId, message);
+      await store.historyService.appendToHistory(workspaceId, readMessage(id));
     }
     expect(
       (
@@ -179,4 +184,72 @@ describe("exact pending snapshot consumption", () => {
     expect((await handler.peekPendingState())?.readFiles).toContain("/b.ts");
     expect((await restart().peekPendingState())?.readFiles).toContain("/b.ts");
   });
+
+  it("a failed manual boundary cannot expose uncommitted successor state", async () => {
+    const consumed = await publish("a");
+    await store.historyService.appendToHistory(workspaceId, readMessage("b"));
+    await store.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("compact-b", "user", "compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    spyOn(store.historyService, "appendToHistory").mockResolvedValueOnce(Err("B boundary failed"));
+    expect(
+      await handler.handleCompletion({
+        type: "stream-end",
+        workspaceId,
+        messageId: "b-summary",
+        metadata: { model: followUp.model },
+        parts: [{ type: "text", text: "B summary" }],
+      })
+    ).toBe(false);
+
+    const history = await store.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(history.success, "Expected readable history after failed boundary");
+    expect(history.data.some((message) => message.metadata?.compacted === "user")).toBe(false);
+    expect(await handler.peekPendingState()).toBeNull();
+    await handler.ackPendingStateConsumed(consumed);
+    expect(await handler.peekPendingState()).toBeNull();
+    expect(await restart().peekPendingState()).toBeNull();
+  });
+
+  it.each(
+    (["ack", "discard"] as const).flatMap((action) =>
+      [false, true].map((failedRestore) => ({ action, failedRestore }))
+    )
+  )(
+    "request A can $action after continuous rollback (failed rewrite=$failedRestore)",
+    async ({ action, failedRestore }) => {
+      const consumed = await publish("a");
+      let restore: ReturnType<typeof spyOn<typeof fs, "mkdir">> | undefined;
+      const mkdir = fs.mkdir;
+      try {
+        expect(
+          await handler.withContinuousPendingState(
+            [readMessage("b")],
+            () => {
+              if (failedRestore) {
+                restore = spyOn(fs, "mkdir").mockImplementation((async (
+                  ...args: Parameters<typeof fs.mkdir>
+                ) => {
+                  if (String(args[0]) === sessionDir) throw new Error("restore mkdir failed");
+                  return mkdir(...args);
+                }) as typeof fs.mkdir);
+              }
+              return Promise.resolve(false);
+            },
+            "b"
+          )
+        ).toBe(false);
+      } finally {
+        restore?.mockRestore();
+      }
+      expect((await handler.peekPendingState())?.readFiles).toEqual(["/a.ts"]);
+      if (action === "ack") await handler.ackPendingStateConsumed(consumed);
+      else await handler.discardPendingState("context_exceeded", consumed);
+      expect(await handler.peekPendingState()).toBeNull();
+      expect(await restart().peekPendingState()).toBeNull();
+    }
+  );
 });
