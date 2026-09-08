@@ -189,6 +189,9 @@ export function useDesktopConnection(
   const viewerReleasedRef = useRef(false);
   const reregisterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reregisterAttemptRef = useRef(0);
+  // Set when the pane settles in a terminal unavailable/error state with no retry pending: a
+  // background re-registration must not outlive that and re-attach a pane showing nothing.
+  const terminalRef = useRef(false);
 
   const connectImplRef = useRef<() => void>(() => undefined);
   const disconnectImplRef = useRef<() => void>(() => undefined);
@@ -293,7 +296,12 @@ export function useDesktopConnection(
   };
 
   const register = () => {
-    if (!registerViewer || viewerReleasedRef.current || viewerRegistrationRef.current !== null) {
+    if (
+      !registerViewer ||
+      viewerReleasedRef.current ||
+      terminalRef.current ||
+      viewerRegistrationRef.current !== null
+    ) {
       return;
     }
     const client = apiRef.current;
@@ -303,7 +311,11 @@ export function useDesktopConnection(
       return;
     }
     registerViewerRegistration(client).catch(() => {
-      if (!isDisposedRef.current && viewerRegistrationRef.current === null) {
+      if (
+        !isDisposedRef.current &&
+        !terminalRef.current &&
+        viewerRegistrationRef.current === null
+      ) {
         scheduleViewerReregistration();
       }
     });
@@ -414,10 +426,12 @@ export function useDesktopConnection(
     reregisterAttemptRef.current += 1;
     reregisterTimerRef.current = setTimeout(() => {
       reregisterTimerRef.current = null;
-      // A connection attempt started meanwhile registers on its own; do not race it.
+      // A connection attempt started meanwhile registers on its own; do not race it. A pane
+      // that settled in a terminal state must not re-attach either.
       if (
         isDisposedRef.current ||
         viewerReleasedRef.current ||
+        terminalRef.current ||
         viewerRegistrationRef.current !== null
       ) {
         return;
@@ -429,7 +443,11 @@ export function useDesktopConnection(
         return;
       }
       registerViewerRegistration(client).catch(() => {
-        if (!isDisposedRef.current && viewerRegistrationRef.current === null) {
+        if (
+          !isDisposedRef.current &&
+          !terminalRef.current &&
+          viewerRegistrationRef.current === null
+        ) {
           scheduleViewerReregistration();
         }
       });
@@ -442,6 +460,7 @@ export function useDesktopConnection(
       const generation = generationRef.current + 1;
       generationRef.current = generation;
       isDisposedRef.current = false;
+      terminalRef.current = false;
       clearReconnectTimer();
       // Only a registration that already reported ready is reusable; a still-pending one is
       // superseded by this attempt's own registration.
@@ -496,7 +515,9 @@ export function useDesktopConnection(
             scheduleReconnectRef.current();
             return;
           }
-          // Terminal: nothing to view, so stop counting this pane as an attached viewer.
+          // Terminal: nothing to view, so stop counting this pane as an attached viewer (and
+          // keep any in-flight re-registration from attaching it again).
+          terminalRef.current = true;
           disconnectCurrentRfb();
           setState("unavailable");
           setReason(UNAVAILABLE_REASONS[result.capability.reason]);
@@ -572,6 +593,7 @@ export function useDesktopConnection(
             if (generationRef.current !== generation || isDisposedRef.current) {
               return;
             }
+            terminalRef.current = true;
             disconnectCurrentRfb();
             setState("error");
             const securityReason = event.detail.reason.trim();
@@ -594,8 +616,11 @@ export function useDesktopConnection(
         if (generationRef.current !== generation || isDisposedRef.current) {
           return;
         }
-        // A failed attempt inside the reconnect loop keeps a ready registration: the pane is
-        // still mounted and about to retry, so it must stay attached through the backoff.
+        // A first attempt that fails is terminal (flagged before the abort below so no
+        // background re-registration can re-attach the pane); a failed attempt inside the
+        // reconnect loop keeps a ready registration instead: the pane is still mounted and
+        // about to retry, so it must stay attached through the backoff.
+        if (!hasEverConnectedRef.current) terminalRef.current = true;
         disconnectCurrentRfb({
           keepViewerRegistration: hasEverConnectedRef.current && viewerReadyRef.current,
         });

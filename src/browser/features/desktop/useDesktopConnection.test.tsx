@@ -582,6 +582,37 @@ describe("useDesktopConnection control ownership", () => {
     expect(registrations[0].signal.aborted).toBe(true);
   });
 
+  test("a terminal bootstrap failure stops background re-registration for good", async () => {
+    let resolveBootstrap!: (value: typeof bootstrap) => void;
+    getBootstrap = mock(
+      () =>
+        new Promise<typeof bootstrap>((done) => {
+          resolveBootstrap = done;
+        })
+    );
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(getBootstrap).toHaveBeenCalledTimes(1));
+    // The subscription drops after ready while bootstrap is still pending: a replacement
+    // registration is requested in the background.
+    autoReady = false;
+    registrations[0].queue.end();
+    await waitFor(() => expect(registrations).toHaveLength(2));
+    // Bootstrap then settles terminally unavailable: the replacement is aborted...
+    await act(async () => {
+      resolveBootstrap({
+        ...bootstrap,
+        capability: { available: false, reason: "disabled" },
+      } as unknown as typeof bootstrap);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
+    expect(registrations[1].signal.aborted).toBe(true);
+    // ...and no further registration is scheduled, even after the backoff would have fired.
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_200));
+    expect(registrations).toHaveLength(2);
+  });
+
   test("normal unmount unregisters after releasing held input", async () => {
     const view = mountConnection();
     const rfb = await connect(view);

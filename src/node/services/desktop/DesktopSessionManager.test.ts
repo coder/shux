@@ -646,8 +646,16 @@ describe("DesktopSessionManager browser viewer releases", () => {
 
   test("an Electron popout counts against its requester's current owner", async () => {
     if (process.platform === "win32") return;
-    await withDesktopManagerHarness(async ({ config }) => {
+    await withDesktopManagerHarness(async ({ config, tempDir }) => {
+      process.env.PATH = "";
       await registerSharedWorkspaces(config);
+      // openWindow checks capability, which needs a resolvable PortableDesktop binary.
+      await installPortableDesktopShim({
+        rootDir: tempDir,
+        config: {
+          startupInfo: createStartupInfo({ display: 26, vncPort: 5916, geometry: "1024x768" }),
+        },
+      });
       const manager = new DesktopSessionManager({
         config,
         experimentsService: createExperimentsService(true),
