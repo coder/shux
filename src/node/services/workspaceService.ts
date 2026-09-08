@@ -2737,6 +2737,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
+    finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   };
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
   private agentTaskIntegration?: AgentTaskIntegration;
@@ -3080,6 +3081,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
+    finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   }): void {
     this.memoryConsolidationService = service;
   }
@@ -4208,6 +4210,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         if (isAffected(workspaceId)) session.invalidateMemoryContext();
       }
     }
+  }
+
+  /** TurnRequestBuilder → session: the agent's workspace-memory write policy for this turn. */
+  recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): void {
+    (
+      this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
+    )?.recordWorkspaceMemoryWritable(writable);
   }
 
   /** Transfer destructive cleanup out of a callback that still owns a session lease. */
@@ -6243,8 +6252,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       // Same for in-flight dream/harvest consolidation (r60): abort + drain
       // before the session directory disappears (idempotent; normally
-      // already cancelled before the usage rollup above).
+      // already cancelled before the usage rollup above). Retryable harvest
+      // records are finalized too: their transcript goes with the session.
       await this.memoryConsolidationService?.cancelInFlightConsolidation(workspaceId);
+      await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
 
       // Cancel and drain any background branch-summary writer BEFORE deleting
       // the session directory: a mid-flight append could otherwise recreate
@@ -6326,6 +6337,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           workspaceId
         );
         if (memoryOwnerId !== workspaceId) {
+          // Descendants that outlive this intermediate node would otherwise
+          // lose their path to the root: pin the owner on them first.
+          await this.config.editConfig((cfg) => {
+            for (const project of cfg.projects.values()) {
+              for (const workspace of project.workspaces) {
+                if (
+                  workspace.parentWorkspaceId === workspaceId &&
+                  !workspace.memoryOwnerWorkspaceId
+                ) {
+                  workspace.memoryOwnerWorkspaceId = memoryOwnerId;
+                }
+              }
+            }
+            return cfg;
+          });
           // The child's memory edits live on in the owner's store; keep their
           // audit trail / rollback IDs there too before the journal is deleted.
           try {

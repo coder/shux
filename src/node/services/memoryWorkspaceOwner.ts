@@ -46,6 +46,13 @@ export function resolveWorkspaceMemoryOwnerId(cfg: ProjectsConfig, workspaceId: 
       }
       return workspaceId;
     }
+    // A pinned owner (recorded when an intermediate ancestor was removed)
+    // short-circuits the walk; if that owner is itself gone, fall through to
+    // the parent chain, which then dangles and resolves to self.
+    const pinned = entry.workspace.memoryOwnerWorkspaceId;
+    if (pinned !== undefined && pinned !== "" && findWorkspaceEntry(cfg, pinned) !== null) {
+      return pinned;
+    }
     const parentWorkspaceId = entry.workspace.parentWorkspaceId;
     if (parentWorkspaceId === undefined || parentWorkspaceId === "") return current;
     current = parentWorkspaceId;

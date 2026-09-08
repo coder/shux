@@ -1052,6 +1052,18 @@ export class AgentSession {
   private memoryContextGeneration = 0;
 
   /**
+   * Workspace-memory write policy of the last normal turn (TurnRequestBuilder
+   * via WorkspaceService). Attached to compaction completions so the memory
+   * harvest — which writes to the (possibly shared) workspace store on this
+   * agent's behalf — can honor a read-only agent's policy.
+   */
+  private workspaceMemoryWritable: boolean | undefined;
+
+  recordWorkspaceMemoryWritable(writable: boolean): void {
+    this.workspaceMemoryWritable = writable;
+  }
+
+  /**
    * Cache the last-known experiment state so we don't spam metadata refresh
    * when post-compaction context is disabled.
    */
@@ -1213,7 +1225,12 @@ export class AgentSession {
         this.coordinator.recordCompactionSummary(
           (metadata.preservedTailMessageCount ?? 0) > 0 ? metadata.summaryMessageId : null
         );
-        onCompactionComplete?.(metadata);
+        onCompactionComplete?.({
+          ...metadata,
+          ...(this.workspaceMemoryWritable !== undefined
+            ? { workspaceMemoryWritable: this.workspaceMemoryWritable }
+            : {}),
+        });
       },
       onIdleCompactionOutcome,
     });

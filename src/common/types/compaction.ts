@@ -1,5 +1,13 @@
 export interface CompactionCompletionMetadata {
   workspaceId: string;
+  /**
+   * Whether the workspace's agent may write `/memories/workspace` (its memory
+   * access policy on the last non-compaction turn). Post-compaction harvest
+   * writes candidates into that store — for a sub-agent, the OWNER's shared
+   * notebook — so a read-only (explore-like) agent must not harvest. Absent on
+   * legacy records; only an explicit `false` refuses.
+   */
+  workspaceMemoryWritable?: boolean;
   summaryMessageId: string;
   summaryHistorySequence: number;
   compactionEpoch: number;

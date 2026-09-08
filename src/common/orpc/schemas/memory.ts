@@ -96,6 +96,7 @@ export type MemoryConsolidationRecordPayload = z.infer<typeof MemoryConsolidatio
 
 export const CompactionCompletionMetadataSchema = z.object({
   workspaceId: z.string(),
+  workspaceMemoryWritable: z.boolean().optional(),
   summaryMessageId: z.string(),
   summaryHistorySequence: z.number(),
   compactionEpoch: z.number(),

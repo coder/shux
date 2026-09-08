@@ -536,6 +536,10 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   workflowResultContinuationSender?: WorkflowResultContinuationSender;
   workspaceHeartbeatService?: ToolConfiguration["workspaceHeartbeatService"];
+  /** Receives each normal turn's workspace-memory write policy (see recordWorkspaceMemoryWritable). */
+  workspaceMemoryPolicySink?: {
+    recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): void;
+  };
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
   desktopSessionManager?: DesktopSessionManager;
 }
@@ -1416,6 +1420,16 @@ export class TurnRequestBuilder {
       planLike: agentIsPlanLike,
       editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
     });
+    // Post-compaction harvest writes to /memories/workspace on the agent's
+    // behalf; it must honor the same policy the memory tool enforces. The
+    // compaction turn itself runs the "compact" agent, so record only normal
+    // turns' policy (the session attaches it to the compaction completion).
+    if (!isCompactionRequest) {
+      this.dependencies.bindings.workspaceMemoryPolicySink?.recordWorkspaceMemoryWritable(
+        workspaceId,
+        memoryAccess.workspace === "readwrite"
+      );
+    }
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
     // repo hook execution (tool_env/tool_pre/tool_post) while keeping

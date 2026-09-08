@@ -17,6 +17,7 @@ import {
 import { Ok } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
+  HARVEST_MAX_ATTEMPTS,
   MemoryConsolidationService,
   resolveDreamAgentBody,
   resolveDreamModelString,
@@ -1148,6 +1149,64 @@ describe("MemoryConsolidationService", () => {
     const status = await fixture.service.getStatus("ws-sub");
     expect(status.latestHarvestRecord?.status).toBe("completed");
     expect(status.latestHarvestRecord?.attemptCount).toBe(2);
+  });
+
+  it("refuses to harvest (and sweep) for an agent whose workspace memory is read-only", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    const metadata = await seedCompactionEpoch(fixture);
+    const refused = await fixture.service.maybeHarvestThenSweep({
+      ...metadata,
+      workspaceMemoryWritable: false,
+    });
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("read-only");
+    expect(fixture.modelCalls).toHaveLength(0);
+    expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toBeNull();
+
+    // Explicitly writable (and legacy records without the flag) harvest as before.
+    const allowed = await fixture.service.maybeHarvestThenSweep({
+      ...metadata,
+      workspaceMemoryWritable: true,
+    });
+    expect(allowed.success).toBe(true);
+    expect(fixture.modelCalls.length).toBeGreaterThan(0);
+  });
+
+  it("finalizes a removed workspace's retryable harvest records so they are never retried", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [metadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: metadata.summaryMessageId,
+              compactionEpoch: metadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: metadata,
+            },
+          },
+        },
+      })
+    );
+    await fixture.service.finalizeHarvestsForRemoval("ws-sub");
+    const record = (await fixture.service.getStatus("ws-sub")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+    // The owner's run no longer sees a retryable child bucket.
+    expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+    expect((await fixture.service.getStatus("ws-sub")).latestHarvestRecord?.attemptCount).toBe(
+      HARVEST_MAX_ATTEMPTS
+    );
   });
 
   it("normalizes stale max-attempt pending harvest records to failed", async () => {

@@ -537,6 +537,7 @@ export const CoreWiringLive: Layer.Layer<
     });
 
     turnRequestBuilderBindings.workspaceHeartbeatService = workspaceService;
+    turnRequestBuilderBindings.workspaceMemoryPolicySink = workspaceService;
     // Tool-started workflows share the same sidebar activity cache as ORPC-started workflows,
     // so terminal updates must prune active run counts regardless of launch path.
     turnRequestBuilderBindings.onWorkflowRunStatusChanged = (event) =>

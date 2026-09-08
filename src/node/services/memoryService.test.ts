@@ -821,6 +821,41 @@ describe("MemoryService", () => {
       );
     });
 
+    it("keeps a grandchild on the root store via the pinned owner after its parent is removed", async () => {
+      using fixture = await createFixture("ws-grandchild");
+      await registerTaskTree(fixture);
+      // Removal of the intermediate "ws-child" pins memoryOwnerWorkspaceId on
+      // its children before deregistering it (WorkspaceService.remove).
+      await fixture.config.editConfig((cfg) => {
+        const project = cfg.projects.get(FIXTURE_PROJECT_PATH)!;
+        for (const ws of project.workspaces) {
+          if (ws.parentWorkspaceId === "ws-child") ws.memoryOwnerWorkspaceId = "ws-owner";
+        }
+        project.workspaces = project.workspaces.filter((ws) => ws.id !== "ws-child");
+        return cfg;
+      });
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-grandchild")).toBe("ws-owner");
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/still-shared.md",
+        "root store",
+        "agent"
+      );
+      expect(created.success).toBe(true);
+      expect(
+        await pathExists(
+          path.join(fixture.config.sessionsDir, "ws-owner", "memory", "still-shared.md")
+        )
+      ).toBe(true);
+      // A pinned owner that is itself gone falls back to self.
+      await fixture.config.editConfig((cfg) => {
+        const project = cfg.projects.get(FIXTURE_PROJECT_PATH)!;
+        project.workspaces = project.workspaces.filter((ws) => ws.id !== "ws-owner");
+        return cfg;
+      });
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-grandchild")).toBe("ws-grandchild");
+    });
+
     it("stores a sub-agent's workspace notes in the owner's session dir, visible to the whole tree", async () => {
       using fixture = await createFixture("ws-grandchild");
       await registerTaskTree(fixture);

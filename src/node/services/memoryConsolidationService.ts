@@ -285,7 +285,7 @@ function pruneHarvestRecords(records: Record<string, MemoryHarvestRecord>): void
   }
 }
 
-const HARVEST_MAX_ATTEMPTS = 3;
+export const HARVEST_MAX_ATTEMPTS = 3;
 
 export class MemoryConsolidationService extends EventEmitter {
   private readonly sidecarPath: string;
@@ -599,6 +599,40 @@ export class MemoryConsolidationService extends EventEmitter {
   }
 
   /**
+   * Removal teardown for harvest state: the workspace's transcript is about
+   * to be deleted, so its failed/stale-pending harvest records can never be
+   * retried (recovery needs the compaction epoch's messages) — and once the
+   * config entry is gone they could not even be associated with the memory
+   * owner. Mark them terminal now so nothing lingers as "retryable".
+   */
+  async finalizeHarvestsForRemoval(workspaceId: string): Promise<void> {
+    const sidecar = await this.load();
+    const records = sidecar.harvestsByWorkspace[workspaceId];
+    if (records === undefined) return;
+    const workspace = this.config.findWorkspace(workspaceId);
+    const projectPath = workspace == null ? "" : resolveConsolidationProjectPath(workspace);
+    for (const [boundaryKey, record] of Object.entries(records)) {
+      if (record.status === "completed") continue;
+      if (record.status === "failed" && record.attemptCount >= HARVEST_MAX_ATTEMPTS) continue;
+      await Effect.runPromise(
+        this.saveHarvestRecordEffect(
+          workspaceId,
+          boundaryKey,
+          {
+            ...record,
+            status: "failed",
+            completedAt: record.completedAt ?? Date.now(),
+            attemptCount: HARVEST_MAX_ATTEMPTS,
+            error:
+              "workspace removed before the harvest could be retried; transcript no longer available",
+          },
+          projectPath
+        )
+      );
+    }
+  }
+
+  /**
    * Teardown pipeline: uninterruptible end-to-end so the r61 mark, the abort
    * loop, and the residual-run handoff can never be separated, with the
    * bounded drain explicitly opted back into interruptibility — it is a wait,
@@ -878,6 +912,12 @@ export class MemoryConsolidationService extends EventEmitter {
     if (!this.enabled()) return Err("memory-consolidation experiment is disabled");
     if (this.removalCancelled.has(metadata.workspaceId)) {
       return Err("workspace is being removed; harvest refused");
+    }
+    // The harvest writes /memories/workspace on the agent's behalf — for a
+    // sub-agent, into the OWNER's shared notebook — and then sweeps it. A
+    // read-only (explore-like) agent's transcript must not reach either.
+    if (metadata.workspaceMemoryWritable === false) {
+      return Err("workspace memory is read-only for this agent; harvest and sweep refused");
     }
 
     const boundaryRunKey = `${metadata.workspaceId}:${metadata.summaryMessageId}`;

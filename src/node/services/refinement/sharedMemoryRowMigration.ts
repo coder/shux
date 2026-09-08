@@ -86,13 +86,21 @@ export async function migrateSharedMemoryRefinementRows(args: {
       .filter((row) => row.data.rollbackOf !== undefined)
       .map((row) => [row.data.rollbackOf!, row] as const)
   );
-  const isLive = (rowId: string): boolean => {
+  // Returns null on a corrupted (cyclic / absurdly long) lineage: such a row
+  // is treated as non-migratable instead of hanging removal.
+  const isLive = (rowId: string): boolean | null => {
+    const visited = new Set<string>([rowId]);
     let depth = 0;
     for (
       let next = rollbackByTarget.get(rowId);
       next !== undefined;
       next = rollbackByTarget.get(next.id)
     ) {
+      if (visited.has(next.id) || depth >= 1024) {
+        log.warn("[refinement] corrupted rollback lineage; skipping row migration", { rowId });
+        return null;
+      }
+      visited.add(next.id);
       depth++;
     }
     return depth % 2 === 0;
@@ -108,9 +116,8 @@ export async function migrateSharedMemoryRefinementRows(args: {
   const childJournal = sharedDurableEventJournal(args.childSessionDir);
   let migrated = 0;
   for (const row of rows) {
-    if (row.data.kind !== "memory" || row.data.rollbackOf !== undefined || !isLive(row.id)) {
-      continue;
-    }
+    if (row.data.kind !== "memory" || row.data.rollbackOf !== undefined) continue;
+    if (isLive(row.id) !== true) continue;
     const migratedFrom = `${args.childWorkspaceId}:${row.id}`;
     if (alreadyMigrated.has(migratedFrom)) continue;
     const inverse = RefinementInverseSchema.safeParse(row.data.inverse);

@@ -667,8 +667,12 @@ export class MemoryService extends EventEmitter {
    */
   private readonly ownerByContext = new WeakMap<MemoryScopeContext, string>();
 
-  /** Owner of the workspace scope for this context ("" when there is no workspace). */
-  private ownerWorkspaceIdFor(ctx: MemoryScopeContext): string {
+  /**
+   * Owner of the workspace scope for this context ("" when there is no
+   * workspace). Public so callers that key sidecar metadata for the same
+   * context (memoryOperations) bind to the exact owner the store resolved to.
+   */
+  ownerWorkspaceIdFor(ctx: MemoryScopeContext): string {
     if (ctx.workspaceId === "") return "";
     const cached = this.ownerByContext.get(ctx);
     if (cached !== undefined) return cached;

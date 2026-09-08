@@ -81,15 +81,18 @@ function resolveMemoryScope(
     const metadata = yield* Effect.promise(() => context.workspaceService.getInfo(workspaceId));
     if (!metadata) return yield* Effect.fail(new MemoryWorkspaceNotFoundError({ workspaceId }));
     const projectPath = resolveMemoryProjectIdentity(metadata);
+    const scopeCtx: MemoryScopeContext = {
+      runtime: createRuntimeForWorkspace(metadata),
+      checkoutCwd: "",
+      workspaceId,
+      projectPath,
+    };
     return {
       projectPath,
-      ownerWorkspaceId: context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId),
-      scopeCtx: {
-        runtime: createRuntimeForWorkspace(metadata),
-        checkoutCwd: "",
-        workspaceId,
-        projectPath,
-      },
+      // Same per-context resolution the store/notify paths use, so sidecar keys
+      // and the physical store never disagree about the owner within a request.
+      ownerWorkspaceId: context.memoryService.ownerWorkspaceIdFor(scopeCtx),
+      scopeCtx,
     };
   });
 }
