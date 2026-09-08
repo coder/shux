@@ -37,6 +37,30 @@ export function createTranscriptState(): TranscriptState {
   };
 }
 
+/**
+ * Base state for a since-mode replay: the server re-sends every row at or above the
+ * anchor plus the active stream, so those are dropped here and rebuilt from the
+ * replay while older rows and pagination survive the reconnect untouched.
+ */
+export function resumeTranscriptState(
+  state: TranscriptState,
+  anchorHistorySequence: number
+): TranscriptState {
+  return {
+    ...state,
+    messages: state.messages.filter(
+      (message) =>
+        message.metadata?.historySequence !== undefined &&
+        message.metadata.historySequence < anchorHistorySequence
+    ),
+    streaming: false,
+    streamingMessageId: null,
+    streamingWorkspaceId: null,
+    error: null,
+    caughtUp: false,
+  };
+}
+
 function upsert(messages: MuxMessage[], message: MuxMessage): MuxMessage[] {
   const index = messages.findIndex((item) => item.id === message.id);
   const next = [...messages];

@@ -1,6 +1,6 @@
 function isLoopbackHost(hostname: string): boolean {
   if (hostname === "localhost" || hostname === "[::1]") return true;
-  // Ticket minting still sends the master bearer: private networks are not a
+  // Every request carries the master bearer: private networks are not a
   // confidentiality boundary. Classify URL-normalized literals without DNS lookups.
   const octets = hostname.split(".").map(Number);
   if (octets.length !== 4 || octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {

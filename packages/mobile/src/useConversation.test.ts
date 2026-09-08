@@ -7,6 +7,7 @@ import type { MobileClient } from "./api";
 import { getVisibleMessages } from "./transcript";
 import type { WorkspaceChatMessage } from "./transcript";
 import { useConversation } from "./useConversation";
+import { wakeStreams } from "./streams";
 import type { RestoredInput } from "./draft";
 import type { SettingsData } from "./settings";
 
@@ -78,6 +79,7 @@ function fixture(
   }
   const restored: RestoredInput[] = [];
   const chatRequests: AbortSignal[] = [];
+  const chatInputs: unknown[] = [];
   const requests: Array<{ input: unknown; signal?: AbortSignal }> = [];
   const client = createORPCClient<MobileClient>({
     call: async (path, input, options) => {
@@ -120,6 +122,7 @@ function fixture(
           return reads.agents ? reads.agents() : [];
         case "workspace.onChat":
           chatRequests.push(options.signal!);
+          chatInputs.push(input);
           return new ReadableStream<WorkspaceChatMessage>({
             start(controller) {
               eventController = controller;
@@ -170,6 +173,7 @@ function fixture(
     requests,
     restored,
     chatRequests,
+    chatInputs,
     policyRequests,
     policySubscriptions,
     configSubscriptions,
@@ -304,7 +308,9 @@ test("restore and disconnect flush pending text immediately; deleting history ca
   await view.emit(displayStart);
   await view.emit(displayDelta("Keep on disconnect"));
   await view.disconnect();
-  expect(view.result.current.error).not.toBeNull();
+  // A dropped stream is not an error: the transcript stays, but is read-only until resynced.
+  expect(view.result.current.error).toBeNull();
+  expect(view.result.current.transcript.caughtUp).toBe(false);
   expect(view.result.current.transcript.messages.at(-1)?.parts[0]).toMatchObject({
     text: "Keep on disconnect",
   });
@@ -642,12 +648,11 @@ test("settings subscriptions precede reads and refresh privacy, routes and provi
   await view.ready();
   expect(view.configSubscriptions).toHaveLength(1);
   expect(view.providerSubscriptions).toHaveLength(1);
-  expect(view.settingsOrder.slice(0, 4)).toEqual([
-    "config.subscribe",
-    "providers.subscribe",
-    "config.listen",
-    "providers.listen",
-  ]);
+  // Both subscriptions are registered before any settings snapshot is read.
+  expect(view.settingsOrder.slice(0, 2)).toEqual(["config.subscribe", "providers.subscribe"]);
+  expect(view.settingsOrder.slice(2)).toEqual(
+    expect.arrayContaining(["config.read", "agents.read", "providers.read"])
+  );
   config = {
     ...config,
     routePriority: ["coder"],
@@ -805,3 +810,88 @@ test.each(["workspace", "connection"])(
     expect(view.result.current.settings?.config).toEqual(current);
   }
 );
+
+const anchor = { messageId: "10", historySequence: 10, oldestHistorySequence: 9 };
+
+test.each(["since", "full"] as const)(
+  "a dropped conversation resumes from the server cursor and reconciles a %s replay atomically",
+  async (replay) => {
+    const view = fixture();
+    await waitFor(() => expect(view.chatInputs).toHaveLength(1));
+    await view.emit(message(9, "older"));
+    await view.emit(message(10, "anchor"));
+    await view.emit(displayStart);
+    await view.emit({ type: "caught-up", hasOlderHistory: true, cursor: { history: anchor } });
+    await waitFor(() => expect(view.result.current.transcript.caughtUp).toBe(true));
+    expect(view.result.current.transcript.streaming).toBe(true);
+    await view.disconnect();
+    // The transcript stays on screen, read-only, while the suffix is re-synced.
+    expect(view.result.current.transcript.caughtUp).toBe(false);
+    expect(view.result.current.transcript.messages.map((row) => row.id)).toEqual([
+      "9",
+      "10",
+      "live",
+    ]);
+    act(() => wakeStreams());
+    await waitFor(() => expect(view.chatInputs).toHaveLength(2));
+    expect(view.chatInputs[1]).toEqual({
+      workspaceId: "workspace",
+      mode: { type: "since", cursor: { history: anchor } },
+    });
+    expect(view.chatRequests[0].aborted).toBe(true);
+    // Replayed rows are buffered: nothing changes until caught-up arrives.
+    await view.emit(message(10, "anchor rewritten"));
+    await view.emit({ ...message(11, "finished while offline"), id: "live" });
+    if (replay === "full") await view.emit(message(8, "row the client never had"));
+    expect(view.result.current.transcript.messages.map((row) => row.parts[0])).toEqual([
+      { type: "text", text: "older" },
+      { type: "text", text: "anchor" },
+    ]);
+    expect(view.result.current.transcript.messages[2].metadata?.partial).toBe(true);
+    await view.emit(
+      replay === "since"
+        ? {
+            type: "caught-up",
+            replay: "since",
+            cursor: { history: { ...anchor, historySequence: 11, messageId: "live" } },
+          }
+        : {
+            type: "caught-up",
+            replay: "full",
+            downgradeReason: "oldest-mismatch",
+            hasOlderHistory: false,
+          }
+    );
+    const { transcript } = view.result.current;
+    expect(transcript.caughtUp).toBe(true);
+    expect(transcript.streaming).toBe(false);
+    expect(transcript.messages.map((row) => [row.id, row.parts[0]])).toEqual(
+      replay === "since"
+        ? [
+            ["9", { type: "text", text: "older" }],
+            ["10", { type: "text", text: "anchor rewritten" }],
+            ["live", { type: "text", text: "finished while offline" }],
+          ]
+        : [
+            ["8", { type: "text", text: "row the client never had" }],
+            ["10", { type: "text", text: "anchor rewritten" }],
+            ["live", { type: "text", text: "finished while offline" }],
+          ]
+    );
+    // A since replay keeps the pagination the client already knows; a full one is authoritative.
+    expect(transcript.hasOlderHistory).toBe(replay === "since");
+    expect(view.result.current.error).toBeNull();
+  }
+);
+
+test("without a server cursor a dropped conversation replays in full from an empty transcript", async () => {
+  const view = fixture();
+  await view.ready();
+  await view.disconnect();
+  act(() => wakeStreams());
+  await waitFor(() => expect(view.chatInputs).toHaveLength(2));
+  expect(view.chatInputs[1]).toEqual({ workspaceId: "workspace", mode: { type: "full" } });
+  expect(view.result.current.transcript.messages).toEqual([]);
+  await view.emit(message(12, "fresh"));
+  expect(view.result.current.transcript.messages.map((row) => row.id)).toEqual(["12"]);
+});

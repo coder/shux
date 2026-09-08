@@ -2,9 +2,10 @@ import { navigatorUpdates } from "./navigatorTestProfiler";
 import { secureStore, stackState } from "./sessionTestPlatform";
 import { afterEach, describe, expect, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { createORPCClient } from "@orpc/client";
+import { createORPCClient, ORPCError } from "@orpc/client";
 import { ConnectedApp } from "../../App";
 import type { Connection } from "./ConnectScreen";
+import { wakeStreams } from "../streams";
 import type { MobileClient } from "../api";
 import type { SettingsData } from "../settings";
 import { getWebComposerKeyAction } from "../composerKeyboard";
@@ -56,6 +57,7 @@ function fixture(
     workspaceId: string;
     signal: AbortSignal;
     events: ReadableStreamDefaultController<WorkspaceChatMessage>;
+    fail: (cause: unknown) => void;
     end: () => void;
   }> = [];
   const calls: Array<{ path: string; input: unknown; signal?: AbortSignal }> = [];
@@ -85,7 +87,11 @@ function fixture(
   function events<T>(
     signal?: AbortSignal,
     initial: T[] = [],
-    onStart?: (controller: ReadableStreamDefaultController<T>, end: () => void) => void
+    onStart?: (
+      controller: ReadableStreamDefaultController<T>,
+      end: () => void,
+      fail: (cause: unknown) => void
+    ) => void
   ) {
     return new ReadableStream<T>({
       start(controller) {
@@ -95,9 +101,14 @@ function fixture(
           ended = true;
           controller.close();
         };
+        const fail = (cause: unknown) => {
+          if (ended) return;
+          ended = true;
+          controller.error(cause);
+        };
         signal?.addEventListener("abort", end, { once: true });
         initial.forEach((event) => controller.enqueue(event));
-        onStart?.(controller, end);
+        onStart?.(controller, end, fail);
       },
     }).values();
   }
@@ -141,7 +152,8 @@ function fixture(
           return events<WorkspaceChatMessage>(
             signal,
             [...messages, { type: "caught-up" }],
-            (controller, end) => chats.push({ workspaceId, signal, events: controller, end })
+            (controller, end, fail) =>
+              chats.push({ workspaceId, signal, events: controller, end, fail })
           );
         }
         case "workspace.answerAskUserQuestion":
@@ -550,10 +562,12 @@ test("failed credential clearing leaves the session usable and reconnectable bef
   fireEvent.change(view.getByLabelText("Message"), { target: { value: "Still usable" } });
   await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
   expect(view.calls.filter((call) => call.path === "workspace.sendMessage")).toHaveLength(1);
+  // A dropped conversation stream heals on its own; the session itself stays connected.
   await act(async () => view.chats[0].end());
-  await act(async () => fireEvent.click(await view.findByRole("button", { name: "Retry" })));
-  await waitFor(() => expect(view.reconnected).toBe(1));
+  expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+  act(() => wakeStreams());
   await waitFor(() => expect(view.chats).toHaveLength(2));
+  expect(view.reconnected).toBe(0);
   secureStore.clear = async () => {};
   fireEvent.click(view.getByRole("button", { name: "Connection settings" }));
   fireEvent.click(view.getByRole("button", { name: "Disconnect" }));
@@ -857,7 +871,7 @@ test("answer recovery does not reappear after an intentional Stop and reconnect"
   expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
   expect(view.queryByRole("button", { name: "Send answers" })).toBeNull();
   await act(async () => view.chats.at(-1)!.end());
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "Retry" })));
+  act(() => wakeStreams());
   await waitFor(() => expect(view.chats).toHaveLength(2));
   expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
   expect(callCount(view, "resumeStream")).toBe(1);
@@ -890,7 +904,7 @@ test("replayed saved answers offer manual resume, preserve no-op/error retries, 
   expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
   expect(callCount(view, "answerAskUserQuestion")).toBe(0);
   await act(async () => view.chats[0].end());
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "Retry" })));
+  act(() => wakeStreams());
   await waitFor(() => expect(view.chats).toHaveLength(2));
   expect(await view.findByRole("button", { name: "Resume agent" })).toBeDefined();
   expect(callCount(view, "resumeStream")).toBe(3);
@@ -1039,15 +1053,33 @@ test("a competing stream or newer turn prevents recovery from resuming a stale a
   }
 });
 
-test("reconnect cancels the old answer's resume continuation and reconciles pending recovery", async () => {
+test("a dropped stream keeps a pending answer's resume continuation, resuming once after the resync", async () => {
   const view = fixture([question()], true);
   await view.select("alpha");
   const oldAnswer = deferred<unknown>();
   view.setAnswer(() => oldAnswer.promise);
   await submitAnswer(view);
   await act(async () => view.chats[0].end());
+  act(() => wakeStreams());
+  await waitFor(() => expect(view.chats).toHaveLength(2));
+  await waitFor(() => expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull());
+  // Same client, same session: the answer RPC is still the user's action, so it completes.
+  await act(async () => oldAnswer.resolve({ success: true }));
+  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
+  expect(callCount(view, "resumeStream")).toBe(1);
+});
+
+test("a session reconnect cancels the old answer's resume continuation and reconciles pending recovery", async () => {
+  const view = fixture([question()], true);
+  await view.select("alpha");
+  const oldAnswer = deferred<unknown>();
+  view.setAnswer(() => oldAnswer.promise);
+  await submitAnswer(view);
+  // Only a rejected credential stops the stream from healing itself and exposes Retry.
+  await act(async () => view.chats[0].fail(new ORPCError("UNAUTHORIZED")));
   await act(async () => fireEvent.click(await view.findByRole("button", { name: "Retry" })));
   await waitFor(() => expect(view.chats).toHaveLength(2));
+  expect(view.reconnected).toBe(1);
   await act(async () => oldAnswer.resolve({ success: true }));
   expect(callCount(view, "resumeStream")).toBe(0);
   view.setAnswer(async () => ({ success: true }));
@@ -1361,7 +1393,7 @@ test("interrupt restores the full queue into the existing draft once and keeps i
   fireEvent.click(view.getByRole("button", { name: "Back to workspaces" }));
   await view.select("alpha");
   await act(async () => view.chats.at(-1)!.end());
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "Retry" })));
+  act(() => wakeStreams());
   await waitFor(() => expect(view.chats).toHaveLength(3));
   expect(view.getByLabelText("Message")).toHaveProperty(
     "value",

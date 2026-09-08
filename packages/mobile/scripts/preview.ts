@@ -16,6 +16,8 @@ export function createPreviewServer(options: PreviewOptions) {
   const endpoint = normalizeEndpoint(options.endpoint);
   const target = new URL(endpoint);
   const origin = new URL(options.origin);
+  // Subscriptions are long-lived streamed responses; the server's keep-alive comments
+  // arrive well within this idle bound, so only a dead upstream trips it.
   const proxy = httpProxy.createProxyServer({ changeOrigin: true, proxyTimeout: 30_000 });
   const allowed = (req: http.IncomingMessage) =>
     req.headers.host === origin.host &&
@@ -24,11 +26,7 @@ export function createPreviewServer(options: PreviewOptions) {
 
   function route(req: http.IncomingMessage): string | null {
     const pathname = (req.url ?? "/").split("?")[0];
-    if (
-      pathname === "/__xum/orpc" ||
-      pathname === "/__xum/orpc/ws" ||
-      pathname?.startsWith("/__xum/orpc/")
-    ) {
+    if (pathname === "/__xum/orpc" || pathname?.startsWith("/__xum/orpc/")) {
       req.url = `${target.pathname.replace(/\/$/, "")}${req.url!.slice("/__xum".length)}`;
       // SECURITY: only a same-origin caller can use this fixed upstream. Do not
       // leak preview cookies/forwarded identity or let the client pick a target.
@@ -73,18 +71,6 @@ export function createPreviewServer(options: PreviewOptions) {
       return;
     }
     res.writeHead(404).end("Not found");
-  });
-  server.on("upgrade", (req, socket, head) => {
-    if (!allowed(req)) {
-      socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
-      return;
-    }
-    const upstream = route(req);
-    if (!upstream) {
-      socket.destroy();
-      return;
-    }
-    proxy.ws(req, socket, head, { target: upstream }, () => socket.destroy());
   });
   server.on("close", () => proxy.close());
   return server;

@@ -8,6 +8,7 @@ import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/wor
 import { Button, Field, Loading, Notice, Sheet } from "../components/Controls";
 import { colors, layout, radii, spacing, typography } from "../theme";
 import { linkedAbortController } from "../useConnection";
+import { watch } from "../streams";
 import { resolveWorkspaceCreationScope } from "../../../../src/common/utils/subProjects";
 import type { PolicyGetResponse } from "../../../../src/common/orpc/types";
 import { RUNTIME_MODE } from "../../../../src/common/types/runtime";
@@ -89,40 +90,31 @@ export function CreateWorkspace(props: {
       publish(null, POLICY_UNAVAILABLE_MESSAGE);
     }
     publish(null);
-    async function watch() {
-      const events = await props.client.policy.onChanged(undefined, { signal: lifetime.signal });
-      if (lifetime.signal.aborted) {
-        await events.return?.();
-        return;
-      }
-      function refresh() {
-        if (lifetime.signal.aborted) return;
-        request?.abort();
-        const next = linkedAbortController(lifetime.signal);
-        request = next;
-        publish(null);
-        props.client.policy
-          .get(undefined, { signal: next.signal })
-          .then(
-            (response) => {
-              if (!next.signal.aborted) publish(response);
-            },
-            () => {
-              if (!next.signal.aborted) unavailable();
-            }
-          )
-          .finally(() => next.abort());
-      }
+    function refresh() {
       // Listen first, and keep consuming invalidations while a read is pending.
-      refresh();
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Notifications have no payload.
-      for await (const _ of events) {
-        if (lifetime.signal.aborted) return;
-        refresh();
-      }
-      unavailable();
+      request?.abort();
+      const next = linkedAbortController(lifetime.signal);
+      request = next;
+      publish(null);
+      props.client.policy
+        .get(undefined, { signal: next.signal })
+        .then(
+          (response) => {
+            if (!next.signal.aborted) publish(response);
+          },
+          () => {
+            if (!next.signal.aborted) unavailable();
+          }
+        )
+        .finally(() => next.abort());
     }
-    if (!props.signal.aborted) watch().catch(unavailable);
+    watch({
+      signal: lifetime.signal,
+      open: (attempt) => props.client.policy.onChanged(undefined, { signal: attempt.signal }),
+      onOpen: refresh,
+      onEvent: refresh,
+      onLost: unavailable,
+    }).catch(unavailable);
     return () => {
       lifetime.abort();
       request?.abort();

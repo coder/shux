@@ -4,8 +4,14 @@ import type { FrontendWorkspaceMetadata } from "../../../src/common/types/worksp
 import { isWorkspaceArchived } from "../../../src/common/utils/archive";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "../../../src/common/constants/scratch";
 import { linkedAbortController } from "./useConnection";
+import { watch } from "./streams";
 
 export type Projects = Awaited<ReturnType<MobileClient["projects"]["list"]>>;
+type MetadataEvent =
+  Awaited<ReturnType<MobileClient["workspace"]["onMetadata"]>> extends AsyncIterable<infer Event>
+    ? Event
+    : never;
+
 export function useProjects(client: MobileClient, signal: AbortSignal) {
   const [projects, setProjects] = useState<Projects>([]);
   const [workspaces, setWorkspaces] = useState<FrontendWorkspaceMetadata[]>([]);
@@ -20,84 +26,109 @@ export function useProjects(client: MobileClient, signal: AbortSignal) {
       setLoading(false);
       return;
     }
-    let projectRequest: AbortController | null = null;
-    let projectsLoaded = false;
-    let workspacesLoaded = false;
-    function finishLoading() {
-      if (projectsLoaded && workspacesLoaded) setLoading(false);
+    const loaded = { projects: false, workspaces: false };
+    let failed: object | null = null;
+    /**
+     * One snapshot reader per catalog. Invalidations keep arriving while a read is
+     * pending, and only the newest read may publish. A failed read exposes retry
+     * without discarding the catalog that is already on screen; the next successful
+     * read of the same catalog clears that error.
+     */
+    function reader<T>(
+      read: (signal: AbortSignal) => Promise<T>,
+      apply: (value: T) => void,
+      onFailure?: () => void
+    ) {
+      const self = {};
+      let pending: AbortController | null = null;
+      return () => {
+        if (controller.signal.aborted) return;
+        pending?.abort();
+        const request = linkedAbortController(controller.signal);
+        pending = request;
+        read(request.signal)
+          .then(
+            (value) => {
+              if (request.signal.aborted) return;
+              apply(value);
+              if (failed === self) {
+                failed = null;
+                setError(null);
+              }
+              if (loaded.projects && loaded.workspaces) setLoading(false);
+            },
+            (cause: unknown) => {
+              if (request.signal.aborted) return;
+              failed = self;
+              setError(
+                cause instanceof Error ? cause.message : "Could not load projects or workspaces."
+              );
+              setLoading(false);
+              onFailure?.();
+            }
+          )
+          .finally(() => request.abort());
+      };
     }
-    function fail(cause: unknown) {
+    const refreshProjects = reader(
+      (signal) => client.projects.list(undefined, { signal }),
+      (projectList) => {
+        // Scratch chats have their own creation path, not a git worktree target.
+        setProjects(projectList.filter(([path]) => path !== SCRATCH_PROJECT_CONFIG_KEY));
+        loaded.projects = true;
+      }
+    );
+    function applyMetadata(event: MetadataEvent) {
+      setWorkspaces((current) => {
+        const rest = current.filter((workspace) => workspace.id !== event.workspaceId);
+        return event.metadata &&
+          !isWorkspaceArchived(event.metadata.archivedAt, event.metadata.unarchivedAt)
+          ? [...rest, event.metadata]
+          : rest;
+      });
+    }
+    // Events observed while a snapshot is in flight are newer than the snapshot's
+    // view, so they are held back and applied on top of it.
+    let heldMetadata: MetadataEvent[] | null = null;
+    function releaseMetadata() {
+      for (const event of heldMetadata ?? []) applyMetadata(event);
+      heldMetadata = null;
+    }
+    const refreshWorkspaces = reader(
+      (signal) => client.workspace.list(undefined, { signal }),
+      (workspaceList) => {
+        setWorkspaces(workspaceList);
+        loaded.workspaces = true;
+        releaseMetadata();
+      },
+      releaseMetadata
+    );
+    // Each subscription is registered before the snapshot it guards is read, so
+    // changes during the read cannot be missed; a reopened one re-reads because
+    // changes may have happened while it was down.
+    Promise.all([
+      watch({
+        signal: controller.signal,
+        open: (attempt) => client.workspace.onMetadata(undefined, { signal: attempt.signal }),
+        onOpen: () => {
+          heldMetadata = [];
+          refreshWorkspaces();
+        },
+        onEvent: (event) => (heldMetadata ? heldMetadata.push(event) : applyMetadata(event)),
+      }),
+      watch({
+        signal: controller.signal,
+        open: (attempt) => client.config.onConfigChanged(undefined, { signal: attempt.signal }),
+        onOpen: refreshProjects,
+        onEvent: refreshProjects,
+      }),
+    ]).catch(() => {
+      // Only a rejected credential ends the watches; everything else retries.
       if (controller.signal.aborted) return;
-      controller.abort();
-      setError(cause instanceof Error ? cause.message : "Could not load projects or workspaces.");
+      setError("The server rejected this session. Retry to reconnect or sign in again.");
       setLoading(false);
-    }
-    function refreshProjects() {
-      if (controller.signal.aborted) return;
-      // Keep consuming invalidations while reading: an older response must never
-      // overwrite a newer catalog used by the navigator and workspace picker.
-      projectRequest?.abort();
-      const request = linkedAbortController(controller.signal);
-      projectRequest = request;
-      client.projects
-        .list(undefined, { signal: request.signal })
-        .then(
-          (projectList) => {
-            if (request.signal.aborted) return;
-            // Scratch chats have their own creation path, not a git worktree target.
-            setProjects(projectList.filter(([path]) => path !== SCRATCH_PROJECT_CONFIG_KEY));
-            projectsLoaded = true;
-            finishLoading();
-          },
-          (cause: unknown) => {
-            if (!request.signal.aborted) fail(cause);
-          }
-        )
-        .finally(() => request.abort());
-    }
-    async function load() {
-      // Register both sources before reading either snapshot so changes cannot be missed.
-      const [events, configEvents] = await Promise.all([
-        client.workspace.onMetadata(undefined, { signal: controller.signal }),
-        client.config.onConfigChanged(undefined, { signal: controller.signal }),
-      ]);
-      if (controller.signal.aborted) return;
-      const watching = Promise.all([
-        (async () => {
-          // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Notifications have no payload.
-          for await (const _ of configEvents) {
-            if (controller.signal.aborted) return;
-            refreshProjects();
-          }
-          if (!controller.signal.aborted)
-            throw new Error("Project updates disconnected. Refresh the list to reconnect.");
-        })(),
-        (async () => {
-          const workspaceList = await client.workspace.list(undefined, {
-            signal: controller.signal,
-          });
-          if (controller.signal.aborted) return;
-          setWorkspaces(workspaceList);
-          workspacesLoaded = true;
-          finishLoading();
-          for await (const event of events) {
-            if (controller.signal.aborted) return;
-            setWorkspaces((current) => {
-              const rest = current.filter((workspace) => workspace.id !== event.workspaceId);
-              return event.metadata &&
-                !isWorkspaceArchived(event.metadata.archivedAt, event.metadata.unarchivedAt)
-                ? [...rest, event.metadata]
-                : rest;
-            });
-          }
-          if (!controller.signal.aborted)
-            throw new Error("Workspace updates disconnected. Refresh the list to reconnect.");
-        })(),
-      ]);
-      refreshProjects();
-      await watching;
-    }
-    load().catch(fail);
+      controller.abort();
+    });
     return () => controller.abort();
   }, [client, signal, generation]);
   return {

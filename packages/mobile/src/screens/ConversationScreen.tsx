@@ -102,7 +102,9 @@ export function ConversationScreen(props: {
   // Answer RPCs can outlive stream updates from another client. Consult the latest
   // committed transcript before starting recovery, not the pre-answer render.
   useEffect(() => {
-    if (transcript.streaming) setStartedResumeMessageId(null);
+    // A resync after a dropped stream is authoritative too: if the started turn is not
+    // in the replay, manual recovery must be offered again.
+    if (transcript.streaming || !transcript.caughtUp) setStartedResumeMessageId(null);
     latestTranscript.current = transcript;
   }, [transcript]);
   const agentId = resolvePersistedAgentId(props.workspace);
@@ -260,8 +262,11 @@ export function ConversationScreen(props: {
   async function resumeAnsweredQuestion(messageId: string, signal: AbortSignal) {
     const current = latestTranscript.current;
     const latest = current.messages.at(-1);
+    // An unsynced transcript (stream being re-established) is not evidence; the
+    // replay will re-offer manual recovery if the turn is still waiting.
     if (
       signal.aborted ||
+      !current.caughtUp ||
       current.streaming ||
       latest?.id !== messageId ||
       latest?.metadata?.userStopped ||

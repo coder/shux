@@ -1,6 +1,13 @@
-import { createContext, useContext, useRef, useState, useSyncExternalStore } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type { ComponentProps, ReactNode } from "react";
-import { StatusBar, Text, useWindowDimensions, View } from "react-native";
+import { AppState, StatusBar, Text, useWindowDimensions, View } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { DarkTheme, NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
@@ -18,6 +25,7 @@ import { Button, Header, Loading, Notice } from "./src/components/Controls";
 import { KeyboardProvider } from "./src/components/Keyboard";
 import { useProjects } from "./src/useProjects";
 import { useConnection } from "./src/useConnection";
+import { useStreamsReconnecting, wakeStreams } from "./src/streams";
 import { colors, layout, WIDE_LAYOUT_MIN_WIDTH } from "./src/theme";
 import { createSessionDrafts } from "./src/sessionDrafts";
 import type { ChatSettings } from "./src/settings";
@@ -69,6 +77,14 @@ export default function App() {
 export function ConnectedApp(props: { connection: Connection; onDisconnect: () => void }) {
   const session = useConnection(props.connection);
   const data = useProjects(session.connection.client, session.signal);
+  useEffect(() => {
+    // Backgrounded apps lose their streams; retry the moment the user returns rather
+    // than waiting out a backoff that was scheduled while suspended.
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") wakeStreams();
+    });
+    return () => subscription.remove();
+  }, []);
   // Full drafts and unsent model choices survive native back/pop and reconnection.
   const [drafts] = useState(createSessionDrafts);
   const [selections, setSelections] = useState<Record<string, ChatSettings>>({});
@@ -251,11 +267,12 @@ function DraftConversation(
 
 function ConversationRoute(props: NativeStackScreenProps<MobileRoutes, "Conversation">) {
   const { session, data, selections, setSelection } = useSession();
+  const streamsReconnecting = useStreamsReconnecting();
   const { workspaceId } = props.route.params;
   const workspace = data.workspaces.find((item) => item.id === workspaceId);
   return (
     <ScreenLayout navigation={props.navigation} workspaceId={workspaceId}>
-      {session.reconnecting && <Loading label="Reconnecting…" />}
+      {(session.reconnecting || streamsReconnecting) && <Loading label="Reconnecting…" />}
       {session.error && <Notice onRetry={session.reconnect}>{session.error}</Notice>}
       {workspace ? (
         <DraftConversation

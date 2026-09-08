@@ -36,7 +36,7 @@ describe("fixed-target mobile preview", () => {
     const preview = await listen(
       createPreviewServer({ endpoint: `${endpoint}/@me/dev/apps/xum`, origin })
     );
-    const result = await fetch(`${preview}/__xum/orpc/serverAuth/issueWebSocketTicket`, {
+    const result = await fetch(`${preview}/__xum/orpc/workspace/list`, {
       method: "POST",
       headers: {
         host,
@@ -49,7 +49,7 @@ describe("fixed-target mobile preview", () => {
     });
     const body = await result.json();
     expect(result.status).toBe(200);
-    expect(body.url).toBe("/@me/dev/apps/xum/orpc/serverAuth/issueWebSocketTicket");
+    expect(body.url).toBe("/@me/dev/apps/xum/orpc/workspace/list");
     expect(body.headers.authorization).toBe("Bearer test-only");
     expect(body.headers.origin).toBe(endpoint);
     expect(body.headers.cookie).toBeUndefined();
@@ -86,4 +86,27 @@ describe("fixed-target mobile preview", () => {
       (await fetch(`${preview}/__xum/https://attacker.test`, { headers: { host } })).status
     ).toBe(404);
   });
+});
+
+test("streams a long-lived subscription response through without buffering", async () => {
+  let push!: (chunk: string) => void;
+  const endpoint = await listen(
+    http.createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      push = (chunk) => res.write(chunk);
+      push(": open\n\n");
+    })
+  );
+  const preview = await listen(createPreviewServer({ endpoint, origin }));
+  const response = await fetch(`${preview}/__xum/orpc/workspace/onChat`, {
+    method: "POST",
+    headers: { host, origin },
+  });
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  expect(decoder.decode((await reader.read()).value)).toContain(": open");
+  // A second chunk must arrive while the upstream response is still open.
+  push("event: message\ndata: {}\n\n");
+  expect(decoder.decode((await reader.read()).value)).toContain("event: message");
+  await reader.cancel();
 });

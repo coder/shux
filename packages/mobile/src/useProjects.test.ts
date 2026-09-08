@@ -6,6 +6,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "../../../src/common/constants/scratc
 import type { FrontendWorkspaceMetadata } from "../../../src/common/types/workspace";
 import type { MobileClient } from "./api";
 import { useProjects, type Projects } from "./useProjects";
+import { wakeStreams } from "./streams";
 
 afterEach(cleanup);
 
@@ -228,33 +229,38 @@ test.each([
   { kind: "metadata", ending: "end" },
   { kind: "metadata", ending: "fail" },
 ] as const)(
-  "a $kind subscription $ending aborts pending work and retry reconnects",
+  "a $kind subscription $ending keeps the catalog, reopens on its own and re-reads its snapshot",
   async ({ kind, ending }) => {
     const view = mount();
     await view.ready();
     const { source } = view;
-    expect(source.config).toHaveLength(1);
-    await act(async () => source.config[0].emit());
-    await waitFor(() => expect(source.projectReads).toHaveLength(2));
+    const other = kind === "config" ? "metadata" : "config";
     await act(async () => source[kind][0][ending]());
-    expect(view.result.current.error).not.toBeNull();
-    expect(view.result.current.loading).toBe(false);
-    expect(source.projectReads[1].signal.aborted).toBe(true);
-    expect(source.metadata[0].signal.aborted).toBe(true);
-    await act(async () => source.projectReads[1].resolve(catalog("late after disconnect")));
+    expect(view.result.current.error).toBeNull();
     expect(view.result.current.projects).toEqual(catalog("initial"));
-    act(() => view.result.current.retry());
-    await waitFor(() => expect(source.projectReads).toHaveLength(3));
+    expect(source[other][0].signal.aborted).toBe(false);
+    act(() => wakeStreams());
+    await waitFor(() => expect(source[kind]).toHaveLength(2));
+    // The reopened subscription is registered before its guarded snapshot is re-read.
+    const reads = kind === "config" ? source.projectReads : source.workspaceReads;
+    await waitFor(() => expect(reads).toHaveLength(2));
+    expect(source.order.slice(-2)).toEqual([
+      kind === "config" ? "config.onConfigChanged" : "workspace.onMetadata",
+      kind === "config" ? "projects.list" : "workspace.list",
+    ]);
     await act(async () => {
-      source.projectReads[2].resolve(catalog("healed"));
-      source.workspaceReads[1].resolve([workspace]);
+      if (kind === "config") source.projectReads[1].resolve(catalog("healed"));
+      else source.workspaceReads[1].resolve([{ ...workspace, name: "healed" }]);
     });
     expect(view.result.current.error).toBeNull();
-    expect(view.result.current.projects).toEqual(catalog("healed"));
+    expect(
+      kind === "config" ? view.result.current.projects : view.result.current.workspaces
+    ).toEqual(kind === "config" ? catalog("healed") : [{ ...workspace, name: "healed" }]);
+    expect(source[other]).toHaveLength(1);
   }
 );
 
-test("a failed refresh exposes retry without losing existing catalog or applying a later stale success", async () => {
+test("a failed refresh exposes retry without losing the catalog, and the next read of that catalog clears it", async () => {
   const view = mount();
   await view.ready();
   const { source } = view;
@@ -262,22 +268,31 @@ test("a failed refresh exposes retry without losing existing catalog or applying
   await act(async () => source.config[0].emit());
   await waitFor(() => expect(source.projectReads).toHaveLength(2));
   await act(async () => source.projectReads[1].reject(new Error("refresh failed")));
-  expect(view.result.current.error).not.toBeNull();
+  expect(view.result.current.error).toBe("refresh failed");
   expect(view.result.current.projects).toEqual(catalog("initial"));
-  expect(source.config[0].signal.aborted).toBe(true);
-  expect(source.metadata[0].signal.aborted).toBe(true);
+  // Subscriptions stay live: a later invalidation can heal the catalog without Retry.
+  expect(source.config[0].signal.aborted).toBe(false);
+  expect(source.metadata[0].signal.aborted).toBe(false);
+  await act(async () => source.metadata[0].emit({ workspaceId: "w", metadata: null }));
+  expect(view.result.current.workspaces).toEqual([]);
+  await act(async () => source.config[0].emit());
+  await waitFor(() => expect(source.projectReads).toHaveLength(3));
+  await act(async () => source.projectReads[2].resolve(catalog("healed")));
+  expect(view.result.current.error).toBeNull();
+  expect(view.result.current.projects).toEqual(catalog("healed"));
 });
 
-test("initial snapshot failure cancels the other read and retry restores both catalogs", async () => {
+test("one catalog's failure is not cleared by the other catalog's success, and retry restores both", async () => {
   const view = mount();
   const { source } = view;
   await waitFor(() => expect(source.workspaceReads).toHaveLength(1));
   await act(async () => source.workspaceReads[0].reject(new Error("workspace read failed")));
   expect(view.result.current.loading).toBe(false);
-  expect(view.result.current.error).not.toBeNull();
-  expect(source.projectReads[0].signal.aborted).toBe(true);
-  await act(async () => source.projectReads[0].resolve(catalog("late initial result")));
-  expect(view.result.current.projects).toEqual([]);
+  expect(view.result.current.error).toBe("workspace read failed");
+  expect(source.projectReads[0].signal.aborted).toBe(false);
+  await act(async () => source.projectReads[0].resolve(catalog("initial result")));
+  expect(view.result.current.projects).toEqual(catalog("initial result"));
+  expect(view.result.current.error).toBe("workspace read failed");
   act(() => view.result.current.retry());
   await waitFor(() => expect(source.projectReads).toHaveLength(2));
   await act(async () => {
@@ -288,4 +303,20 @@ test("initial snapshot failure cancels the other read and retry restores both ca
   expect(view.result.current.error).toBeNull();
   expect(view.result.current.projects).toEqual(catalog("retried"));
   expect(view.result.current.workspaces).toEqual([workspace]);
+});
+
+test("metadata held during a failed snapshot read is applied to the retained list", async () => {
+  const view = mount();
+  await view.ready();
+  const { source } = view;
+  await act(async () => source.metadata[0].end());
+  act(() => wakeStreams());
+  await waitFor(() => expect(source.workspaceReads).toHaveLength(2));
+  await act(async () =>
+    source.metadata[1].emit({ workspaceId: "w", metadata: { ...workspace, title: "during read" } })
+  );
+  expect(view.result.current.workspaces[0].title).toBeUndefined();
+  await act(async () => source.workspaceReads[1].reject(new Error("relist failed")));
+  expect(view.result.current.error).toBe("relist failed");
+  expect(view.result.current.workspaces[0].title).toBe("during read");
 });
