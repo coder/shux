@@ -37,3 +37,14 @@ export const DESKTOP_POPOUT_CLOSE_POLL_MS = 100;
 export const DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS = 500;
 /** Allow browser viewers to release input and acknowledge over the authenticated transport. */
 export const DESKTOP_VIEWER_RELEASE_TIMEOUT_MS = 3_000;
+
+/**
+ * How long a workspace's desktop still counts as attached after its last known viewer or VNC
+ * bridge detached. Agent-driven archive gates consult this so the transitional windows between
+ * two independent client transports (reconnect backoff, viewer re-registration, inline↔popout
+ * handoffs) cannot be mistaken for "nobody is watching"; no deterministic signal spans them.
+ * Covers one full reconnect backoff plus the cooperative release timeout. Bounded on purpose: a
+ * client gone for longer is indistinguishable from a closed pane.
+ */
+export const DESKTOP_ATTACHMENT_GRACE_MS =
+  DESKTOP_DEFAULTS.RECONNECT_MAX_DELAY_MS + DESKTOP_VIEWER_RELEASE_TIMEOUT_MS;

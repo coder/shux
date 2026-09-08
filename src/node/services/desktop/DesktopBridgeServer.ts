@@ -30,7 +30,8 @@ export interface DesktopBridgeServerOptions {
   desktopSessionManager: Pick<
     DesktopSessionManager,
     "getLiveSessionConnection" | "onWorkspaceClose" | "watchWorkspaceConfig"
-  >;
+  > &
+    Partial<Pick<DesktopSessionManager, "noteDetached">>;
   desktopTokenManager: Pick<DesktopTokenManager, "validate">;
 }
 
@@ -105,7 +106,8 @@ export class DesktopBridgeServer {
   private readonly desktopSessionManager: Pick<
     DesktopSessionManager,
     "getLiveSessionConnection" | "onWorkspaceClose" | "watchWorkspaceConfig"
-  >;
+  > &
+    Partial<Pick<DesktopSessionManager, "noteDetached">>;
   private readonly desktopTokenManager: Pick<DesktopTokenManager, "validate">;
   private readonly wss: WebSocketServer;
   private readonly activePairs = new Set<BridgePair>();
@@ -539,6 +541,9 @@ export class DesktopBridgeServer {
 
     pair.closed = true;
     this.activePairs.delete(pair);
+    // A closed bridge was a known attachment: let the manager's archive gate keep the requester
+    // and owner attached for the bounded grace while the client reconnects or hands off.
+    this.desktopSessionManager.noteDetached?.([pair.requesterWorkspaceId, pair.ownerWorkspaceId]);
     if (this.activePairs.size === 0) {
       const stopConfigWatch = this.stopConfigWatch;
       this.stopConfigWatch = undefined;

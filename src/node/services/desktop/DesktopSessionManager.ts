@@ -3,7 +3,11 @@ import { asyncIterableFromSubscription } from "@/common/utils/asyncEventIterator
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { DesktopWindowManager } from "@/desktop/desktopWindowManager";
-import { DESKTOP_DEFAULTS, DESKTOP_VIEWER_RELEASE_TIMEOUT_MS } from "@/common/constants/desktop";
+import {
+  DESKTOP_ATTACHMENT_GRACE_MS,
+  DESKTOP_DEFAULTS,
+  DESKTOP_VIEWER_RELEASE_TIMEOUT_MS,
+} from "@/common/constants/desktop";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   DesktopActionResult,
@@ -52,6 +56,8 @@ export class DesktopSessionManager {
   }>();
   private readonly windowOwners = new Map<string, string>();
   private readonly closingWorkspaces = new Map<string, Promise<void>>();
+  /** workspaceId → expiry of its recent-attachment grace (see noteDetached). */
+  private readonly recentDetachments = new Map<string, number>();
   private disposed = false;
   private closeAllPromise: Promise<void> | undefined;
 
@@ -74,7 +80,7 @@ export class DesktopSessionManager {
         // Losing the subscription is not proof that held remote input was released:
         // a pending teardown still waits for its deadline rather than resolving here.
         const unsubscribe = () => {
-          this.viewers.delete(viewer.viewerId);
+          if (this.viewers.delete(viewer.viewerId)) this.noteDetached(this.viewerTargets(viewer));
         };
         signal?.addEventListener("abort", unsubscribe, { once: true });
         return () => {
@@ -93,7 +99,7 @@ export class DesktopSessionManager {
     viewer.release ??= new Promise<void>((resolve) => {
       const complete = () => {
         clearTimeout(timeout);
-        this.viewers.delete(viewer.viewerId);
+        if (this.viewers.delete(viewer.viewerId)) this.noteDetached(this.viewerTargets(viewer));
         viewer.acknowledge = undefined;
         resolve();
       };
@@ -179,6 +185,8 @@ export class DesktopSessionManager {
       experimentsService: ExperimentsService;
       workspaceService: WorkspaceService;
       inputCoordinator?: DesktopInputCoordinator;
+      /** Clock for the recent-attachment grace; tests inject a controllable one. */
+      now?: () => number;
     }
   ) {
     this.inputCoordinator = deps.inputCoordinator ?? new DesktopInputCoordinator(deps.config);
@@ -377,7 +385,7 @@ export class DesktopSessionManager {
     // A session whose process exited or crashed is NOT live — stale map entries linger until
     // the next ensureStarted()/close() touches them.
     return (
-      (this.sessions.get(workspaceId)?.isAlive() ?? false) || this.hasAttachedViewers(workspaceId)
+      (this.sessions.get(workspaceId)?.isAlive() ?? false) || this.hasLiveAttachment(workspaceId)
     );
   }
 
@@ -394,23 +402,77 @@ export class DesktopSessionManager {
   }
 
   /**
+   * The workspaces a viewer attaches: the requester and the desktop owner it currently resolves
+   * to. The owner is re-resolved rather than read from the registration so a shared-desktop
+   * borrower whose owner changed does not keep the OLD owner attached indefinitely; the captured
+   * owner is only the fallback when the requester can no longer be resolved.
+   */
+  private viewerTargets(viewer: DesktopViewerRegistration): string[] {
+    let ownerWorkspaceId = viewer.ownerWorkspaceId;
+    try {
+      ownerWorkspaceId = this.inputCoordinator.resolveTarget(viewer.workspaceId).ownerWorkspaceId;
+    } catch {
+      // Requester removed or unresolvable: fall back to the owner captured at registration.
+    }
+    return ownerWorkspaceId === viewer.workspaceId
+      ? [viewer.workspaceId]
+      : [viewer.workspaceId, ownerWorkspaceId];
+  }
+
+  /**
+   * A known viewer or VNC bridge just detached from these workspaces: keep them counted as
+   * attached for DESKTOP_ATTACHMENT_GRACE_MS. The client's two transports (oRPC viewer
+   * registration, VNC bridge WebSocket) drop and return independently during reconnects,
+   * re-registration, and inline↔popout handoffs, and no deterministic signal spans that gap;
+   * a bounded grace after a KNOWN attachment is the only way an agent-driven archive can tell
+   * "reconnecting" from "closed". An idle desktop that never had an attachment gets no grace.
+   */
+  noteDetached(workspaceIds: Iterable<string>): void {
+    const expiresAt = this.now() + DESKTOP_ATTACHMENT_GRACE_MS;
+    for (const workspaceId of workspaceIds) {
+      assert(workspaceId.length > 0, "noteDetached requires non-empty workspace IDs");
+      this.recentDetachments.set(workspaceId, expiresAt);
+    }
+  }
+
+  private now(): number {
+    return this.deps.now?.() ?? Date.now();
+  }
+
+  private hasRecentDetachment(workspaceId: string): boolean {
+    const expiresAt = this.recentDetachments.get(workspaceId);
+    if (expiresAt === undefined) return false;
+    if (expiresAt <= this.now()) {
+      this.recentDetachments.delete(workspaceId);
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * Whether someone is attached to this workspace's desktop: a startup still resolving, a
    * registered browser viewer, a live VNC bridge connection (inline Electron pane, inline
-   * browser pane, popouts), or an open/pending popout window (including borrowers of a
-   * shared desktop this workspace owns). Agent-driven archive gates consult this instead of
-   * has(): the bare desktop process is disposable infrastructure that lingers after the agent
-   * that started it finished (nothing idles it out), and archive closes it exactly like the
-   * user-driven path does — so an idle process alone must not stall an archive. A pending
-   * startup still counts: a user-initiated start that has not resolved yet exists only in
-   * startupPromises, and the gate must observe it instead of letting close() cancel it
+   * browser pane, popouts), an open/pending popout window (including borrowers of a shared
+   * desktop this workspace owns), or a viewer/bridge that detached within
+   * DESKTOP_ATTACHMENT_GRACE_MS (see noteDetached). Agent-driven archive gates consult this
+   * instead of has(): the bare desktop process is disposable infrastructure that lingers after
+   * the agent that started it finished (nothing idles it out), and archive closes it exactly
+   * like the user-driven path does — so an idle process alone must not stall an archive. A
+   * pending startup still counts: a user-initiated start that has not resolved yet exists only
+   * in startupPromises, and the gate must observe it instead of letting close() cancel it
    * mid-startup.
    */
   hasAttachedViewers(workspaceId: string): boolean {
+    return this.hasLiveAttachment(workspaceId) || this.hasRecentDetachment(workspaceId);
+  }
+
+  /** Attachments that exist right now (no grace); also what has() counts as live. */
+  private hasLiveAttachment(workspaceId: string): boolean {
     return (
       this.startupPromises.has(workspaceId) ||
       this.bridgeConnectionProbe?.(workspaceId) === true ||
-      Array.from(this.viewers.values()).some(
-        (viewer) => viewer.workspaceId === workspaceId || viewer.ownerWorkspaceId === workspaceId
+      Array.from(this.viewers.values()).some((viewer) =>
+        this.viewerTargets(viewer).includes(workspaceId)
       ) ||
       this.getWindow(workspaceId) !== null ||
       Array.from(this.pendingWindowOpens).some(
