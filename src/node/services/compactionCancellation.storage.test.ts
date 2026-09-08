@@ -25,6 +25,8 @@ type RejectsAsync<Observer> = (() => Promise<void>) extends Observer ? false : t
 type RequireTrue<T extends true> = T;
 // Type-only contracts: widening any commit observer to void would admit async state installation.
 export type SynchronousCancellationObservers = [
+  RequireTrue<RejectsAsync<Parameters<CompactionCancellationStorage["mutate"]>[2]>>,
+  RequireTrue<RejectsAsync<Parameters<FileCompactionCancellationStorage["mutate"]>[2]>>,
   RequireTrue<RejectsAsync<Parameters<CompactionCancellationStorage["repair"]>[1]>>,
   RequireTrue<RejectsAsync<Parameters<FileCompactionCancellationStorage["repair"]>[1]>>,
   RequireTrue<
@@ -76,8 +78,10 @@ describe("inactive real cancellation storage", () => {
   let state: CompactionCancellation;
   let foreign: HistoryService;
   let sessionDir: string;
+  const mutationCommitted = mock((_record: CompactionCancellationRecord | null) => undefined);
 
   beforeEach(async () => {
+    mutationCommitted.mockClear();
     h = await createTestHistoryService();
     foreign = new HistoryService(h.config);
     storage = new FileCompactionCancellationStorage(h.historyService, workspaceId);
@@ -96,6 +100,64 @@ describe("inactive real cancellation storage", () => {
     mock.restore();
     await h.cleanup();
   });
+
+  it.each(["publish", "narrow", "confirm", "retire"] as const)(
+    "reports the exact %s receipt before cleanup or lock release",
+    async (phase) => {
+      const narrowed: CompactionCancellationRecord = {
+        ...record("existing"),
+        scope: { kind: "summary", ...summary },
+      };
+      const existing = phase === "confirm" ? narrowed : record("existing");
+      if (phase === "publish") existing.retainUntilReplacement = true;
+      await fs.writeFile(storage.path, JSON.stringify(existing));
+      const mutation: CompactionCancellationMutation =
+        phase === "publish"
+          ? publication("replacement")
+          : phase === "retire"
+            ? { kind: "retire", nonce: existing.nonce }
+            : { kind: "narrow", record: narrowed };
+      const expected =
+        phase === "publish"
+          ? { ...record("replacement"), retainUntilReplacement: true }
+          : phase === "retire"
+            ? null
+            : narrowed;
+      const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
+      const cleanup = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      // Pause real post-commit work so promise settlement cannot masquerade as a receipt.
+      const pauseCleanup = async () => {
+        cleanup.resolve();
+        await release.promise;
+      };
+      if (phase === "publish" || phase === "narrow") {
+        const remove = nodeFs.promises.rm;
+        spyOn(nodeFs.promises, "rm").mockImplementation(async (file, options) => {
+          if (String(file).startsWith(`${storage.path}.continuous-`)) await pauseCleanup();
+          await remove(file, options);
+        });
+      } else {
+        const unlink = fs.unlink;
+        spyOn(fs, "unlink").mockImplementation(async (file) => {
+          if (file === lockPath) await pauseCleanup();
+          await unlink(file);
+        });
+      }
+      const writing = storage.mutate(mutation, () => true, mutationCommitted);
+      try {
+        await cleanup.promise;
+        expect(mutationCommitted).toHaveBeenCalledTimes(1);
+        expect(mutationCommitted).toHaveBeenCalledWith(expected);
+        expect(await storage.read()).toEqual(expected);
+        expect(nodeFs.existsSync(lockPath)).toBe(true);
+      } finally {
+        release.resolve();
+        await writing;
+      }
+      expect(await writing).toBe("applied");
+    }
+  );
 
   it.each(["generation", "publication", "narrowing", "retirement"] as const)(
     "a displaced history-lock holder cannot commit %s over its successor",
@@ -136,10 +198,11 @@ describe("inactive real cancellation storage", () => {
             ? { kind: "narrow", record: { ...original, scope: { kind: "summary", ...summary } } }
             : publication("obsolete-publisher");
       await assert.rejects(
-        storage.mutate(mutation, () => true),
+        storage.mutate(mutation, () => true, mutationCommitted),
         /no longer owned/
       );
       expect(displaced).toBe(true);
+      expect(mutationCommitted).not.toHaveBeenCalled();
       expect(await storage.read()).toEqual(successor);
       expect(await fs.readFile(generationPath, "utf8")).toBe("foreign-generation");
       expect(await fs.readFile(lockPath, "utf8")).toBe(`${process.pid}:foreign-holder`);
@@ -283,7 +346,7 @@ describe("inactive real cancellation storage", () => {
       await release.promise;
     });
     await entered.promise;
-    const stopping = storage.mutate(publication("locked"), () => true);
+    const stopping = storage.mutate(publication("locked"), () => true, mutationCommitted);
     // Queued behind Stop on the same real mutex, this callback observes its commit.
     const following = workspaceFileLocks.withLock(workspaceId, async () => {
       expect(await storage.read()).not.toBeNull();
@@ -312,7 +375,7 @@ describe("inactive real cancellation storage", () => {
     const obsolete = publication("obsolete");
     obsolete.publication.attempts = 2;
     obsolete.publication.predecessor = { nonce: null, generation: undefined };
-    const writing = storage.mutate(obsolete, () => true);
+    const writing = storage.mutate(obsolete, () => true, mutationCommitted);
     try {
       await attempted.promise;
       expect(await storage.read()).toBeNull();
@@ -339,7 +402,7 @@ describe("inactive real cancellation storage", () => {
       { kind: "retire", nonce: old.nonce },
       { kind: "retire", nonce: old.nonce, replacementWitness: { nonce: old.nonce } },
     ] satisfies CompactionCancellationMutation[]) {
-      expect(await storage.mutate(mutation, () => true)).toBe("superseded");
+      expect(await storage.mutate(mutation, () => true, mutationCommitted)).toBe("superseded");
       expect(await storage.read()).toEqual(expected);
     }
     await state.cancel();
@@ -363,18 +426,18 @@ describe("inactive real cancellation storage", () => {
       nonce: retained.nonce,
       replacementWitness: { nonce: retained.nonce },
     };
-    expect(await storage.mutate({ kind: "retire", nonce: retained.nonce }, () => true)).toBe(
-      "superseded"
-    );
+    expect(
+      await storage.mutate({ kind: "retire", nonce: retained.nonce }, () => true, mutationCommitted)
+    ).toBe("superseded");
     await assert.rejects(
-      storage.mutate(mutation, () => true),
+      storage.mutate(mutation, () => true, mutationCommitted),
       /not configured/
     );
     const refusing = new FileCompactionCancellationStorage(foreign, workspaceId, () =>
       Promise.resolve(false)
     );
     await assert.rejects(
-      refusing.mutate(mutation, () => true),
+      refusing.mutate(mutation, () => true, mutationCommitted),
       /not verified/
     );
     expect(await storage.read()).toEqual(retained);
@@ -391,10 +454,10 @@ describe("inactive real cancellation storage", () => {
         return true;
       }
     );
-    expect(await verifying.mutate(mutation, () => current)).toBe("superseded");
+    expect(await verifying.mutate(mutation, () => current, mutationCommitted)).toBe("superseded");
     expect(await storage.read()).toEqual(retained);
     // This injected authority exercises the seam only; real accepted-row proof belongs to H2b.
-    expect(await verifying.mutate(mutation, () => true)).toBe("applied");
+    expect(await verifying.mutate(mutation, () => true, mutationCommitted)).toBe("applied");
     expect(await storage.read()).toBeNull();
   });
 
@@ -420,11 +483,11 @@ describe("inactive real cancellation storage", () => {
       throw new Error("after generation commit");
     });
     await assert.rejects(
-      storage.mutate(mutation, () => true),
+      storage.mutate(mutation, () => true, mutationCommitted),
       /after generation commit/
     );
     mutation.publication.attempts++;
-    expect(await storage.mutate(mutation, () => true)).toBe("applied");
+    expect(await storage.mutate(mutation, () => true, mutationCommitted)).toBe("applied");
     expect((await storage.read())?.nonce).toBe("retry-me");
   });
 
@@ -450,7 +513,7 @@ describe("inactive real cancellation storage", () => {
           }
         );
       }
-      await assert.rejects(storage.mutate(mutation, () => true));
+      await assert.rejects(storage.mutate(mutation, () => true, mutationCommitted));
       await foreign.getContinuousCompactionJournal(workspaceId).advanceGeneration();
       const expected = await fs.readFile(
         path.join(sessionDir, CONTINUOUS_COMPACTION_GENERATION_FILE)
@@ -458,11 +521,11 @@ describe("inactive real cancellation storage", () => {
       mutation.publication.attempts++;
       if (stage === "unobserved") {
         await assert.rejects(
-          storage.mutate(mutation, () => true),
+          storage.mutate(mutation, () => true, mutationCommitted),
           /frontier was not captured/
         );
       } else {
-        expect(await storage.mutate(mutation, () => true)).toBe("superseded");
+        expect(await storage.mutate(mutation, () => true, mutationCommitted)).toBe("superseded");
       }
       expect(await storage.read()).toBeNull();
       expect(
@@ -539,7 +602,9 @@ describe("inactive real cancellation storage", () => {
       await advance(...args);
       current = false;
     });
-    expect(await storage.mutate(publication("stale"), () => current)).toBe("superseded");
+    expect(await storage.mutate(publication("stale"), () => current, mutationCommitted)).toBe(
+      "superseded"
+    );
     expect(await storage.read()).toBeNull();
     expect((await fs.readdir(sessionDir)).some((file) => file.includes(".continuous-"))).toBe(
       false

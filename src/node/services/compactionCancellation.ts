@@ -134,7 +134,8 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
 
   mutate(
     mutation: CompactionCancellationMutation,
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    onCommitted: (record: CompactionCancellationRecord | null) => undefined
   ): Promise<CompactionCancellationMutationOutcome> {
     return this.history.withCompactionStorageLock(this.workspaceId, async (_dir, checkLock) => {
       if (!isCurrent()) return "superseded";
@@ -177,6 +178,8 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
           isCurrent,
           () => {
             frontier.nonce = mutation.record.nonce;
+            // Install inherited retention before cleanup can admit a newer read.
+            onCommitted(mutation.record);
           },
           checkLock
         ))
@@ -187,15 +190,18 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
       if (current?.nonce !== nonce) return "superseded";
       if (mutation.kind === "narrow") {
         if (current.retainUntilReplacement) return "superseded";
-        if (current.scope.kind !== "unresolved")
-          return isCurrent() && isDeepStrictEqual(current, mutation.record)
-            ? "applied"
-            : "superseded";
+        if (current.scope.kind !== "unresolved") {
+          if (!isDeepStrictEqual(current, mutation.record)) return "superseded";
+          await checkLock();
+          if (!isCurrent()) return "superseded";
+          onCommitted(current);
+          return "applied";
+        }
         return (await publishCompactionFile(
           this.path,
           JSON.stringify(mutation.record),
           isCurrent,
-          undefined,
+          () => onCommitted(mutation.record),
           checkLock
         ))
           ? "applied"
@@ -211,6 +217,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
       await checkLock();
       if (!isCurrent()) return "superseded";
       rmSync(this.path, { force: true });
+      onCommitted(null);
       return "applied";
     });
   }
