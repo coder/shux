@@ -1112,6 +1112,106 @@ describe("HistoryService", () => {
     }
 
     it.each(
+      ["user", "system"].flatMap((role) =>
+        ["single", "batch", "archive"].flatMap((method) =>
+          [
+            { newerFloor: "none", tail: false },
+            { newerFloor: "none", tail: true },
+            { newerFloor: "boundary", tail: true },
+            { newerFloor: "raw reset", tail: true },
+          ].map((scenario) => ({ role, method, ...scenario }))
+        )
+      )
+    )(
+      "$method deletion fences a readable $role reset floor (newer: $newerFloor, tail: $tail)",
+      async ({ role, method, newerFloor, tail }) => {
+        assert(role === "user" || role === "system");
+        const floor: MuxMessage = { ...reset(), role };
+        const source = [row("old"), floor];
+        const suffix = [
+          ...(newerFloor === "boundary" ? [boundary()] : []),
+          ...(tail ? [row("fresh")] : []),
+        ];
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(
+          method === "archive" ? source : [],
+          [...(method === "archive" ? [] : source), ...suffix]
+        );
+        if (newerFloor === "raw reset") {
+          await fs.writeFile(
+            chatPath,
+            Buffer.concat([
+              bytes(method === "archive" ? [] : source),
+              Buffer.from('{"metadata":{"contextBoundaryKind":"reset"}\n'),
+              bytes(suffix),
+            ])
+          );
+        }
+        const before = await service.getHistoryFromLatestBoundary(ws);
+        assert(before.success);
+        expect(before.data.map((message) => message.id)).toEqual(
+          suffix.map((message) => message.id)
+        );
+        const { store, receipt } = await capturePublication();
+        const untouchedPath = method === "archive" ? chatPath : archivePath;
+        const untouched = await fs.readFile(untouchedPath);
+        const result =
+          method === "batch"
+            ? await service.deleteMessages(ws, [floor.id])
+            : await service.deleteMessage(ws, floor.id);
+        expect(result.success).toBe(true);
+        expect(await fs.readFile(untouchedPath)).toEqual(untouched);
+        const after = await service.getHistoryFromLatestBoundary(ws);
+        assert(after.success);
+        expect(after.data.map((message) => message.id)).toEqual([
+          ...(newerFloor === "none" ? ["old"] : []),
+          ...suffix.map((message) => message.id),
+        ]);
+        const changed = newerFloor === "none";
+        expect((await store.captureGeneration()) !== receipt.publicationGeneration).toBe(changed);
+        const foreign = new HistoryService(config).getContinuousCompactionJournal(ws);
+        expect(
+          (await foreign.recordFallbackPrefix(
+            receipt,
+            { modelString: "anthropic:next", prefix },
+            () => true
+          )) !== null
+        ).toBe(!changed);
+      }
+    );
+
+    it.each(
+      ["contiguous", "token-separated"].flatMap((variant) =>
+        [false, true].map((readableDuplicate) => ({ variant, readableDuplicate }))
+      )
+    )(
+      "single deletion preserves an active protected $variant reset ID shared with archive (readable duplicate: $readableDuplicate)",
+      async ({ variant, readableDuplicate }) => {
+        const floor = {
+          ...(variant === "contiguous" ? reset() : createMuxMessage("reset", "assistant", "")),
+          contextBoundaryKind: 0,
+          padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES),
+          candidate: "reset",
+        };
+        const placeholder = createMuxMessage(floor.id, "assistant", "");
+        const fresh = row("fresh");
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(
+          [row(floor.id)],
+          [floor, ...(readableDuplicate ? [placeholder] : []), fresh]
+        );
+        const beforeChat = await fs.readFile(chatPath);
+        const beforeArchive = await fs.readFile(archivePath);
+        const { store, receipt } = await capturePublication();
+        expect((await service.deleteMessage(ws, floor.id)).success).toBe(readableDuplicate);
+        expect(await fs.readFile(chatPath)).toEqual(
+          readableDuplicate ? bytes([floor, fresh]) : beforeChat
+        );
+        expect(await fs.readFile(archivePath)).toEqual(beforeArchive);
+        expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+        expect(await store.read()).toEqual(receipt);
+      }
+    );
+
+    it.each(
       ["single", "batch", "archive"].flatMap((method) => [0, 1].map((extra) => ({ method, extra })))
     )(
       "$method deletion counts JSON bytes without the LF at the reset limit (+$extra)",

@@ -19,6 +19,7 @@ import {
   type BoundedHistoryScanOptions,
 } from "./historyScanner";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
+import { isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
@@ -99,6 +100,7 @@ interface HistoryTruncateTransaction extends HistoryTruncateHashes {
 interface HistoryRewriteRow {
   raw: Buffer;
   message: MuxMessage | undefined;
+  protectedMessageId?: string;
 }
 
 function splitHistoryLines(raw: Buffer): Buffer[] {
@@ -2663,20 +2665,21 @@ export class HistoryService {
       // Match the provider scanner's row budget without the JSONL delimiter.
       const content = line.at(-1) === 10 ? line.subarray(0, -1) : line;
       const text = content.toString("utf8");
-      return {
-        raw: line,
-        message: this.parseMessages(text, filePath, (value) =>
-          isReadableHistoryMessage(value) &&
-          !(hasRawResetMarker(text) && hasAmbiguousResetKeys(text)) &&
+      const parsed = this.parseMessages(text, filePath, (value) =>
+        isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null
+      )[0];
+      const protectedReset =
+        parsed !== undefined &&
+        ((hasRawResetMarker(text) && hasAmbiguousResetKeys(text)) ||
           // Oversized rows use the provider scanner's token probe, even when
           // intervening bytes prevent a contiguous raw reset marker match.
-          !(
-            content.length > SESSION_HISTORY_MAX_LINE_BYTES &&
-            hasUnreadableHistoryResetEvidence([line])
-          )
-            ? normalizeLegacyMuxMetadata(value)
-            : null
-        )[0],
+          (content.length > SESSION_HISTORY_MAX_LINE_BYTES &&
+            hasUnreadableHistoryResetEvidence([line])));
+      return {
+        raw: line,
+        message: protectedReset ? undefined : parsed,
+        // Preserve identity for active-first lookup even when the raw floor cannot be rewritten.
+        protectedMessageId: protectedReset ? parsed?.id : undefined,
       };
     });
     return { rows, messages: rows.flatMap((row) => (row.message ? [row.message] : [])) };
@@ -3495,7 +3498,8 @@ export class HistoryService {
         chat: this.getChatHistoryPath(workspaceId),
         archive: this.getChatArchivePath(workspaceId),
       },
-      0
+      0,
+      { includeReadableResetFloor: true }
     );
     // Archive fallback excludes all newer chat rows. Matching IDs across files
     // would conflate retained duplicates with occurrences this write removes.
@@ -3506,6 +3510,7 @@ export class HistoryService {
       .filter((message) => deletedIds.has(message.id));
     if (
       tailCutChangesProviderContext(removed) ||
+      removed.some((message) => isManualHistoryReset(message)) ||
       deletionCreatesRawReset(rows, deletedIds, new Set(removed))
     ) {
       // Call only after serialization admits the rewrite, immediately before
@@ -3527,6 +3532,9 @@ export class HistoryService {
       const filteredMessages = messages.filter((msg) => msg.id !== messageId);
 
       if (filteredMessages.length === messages.length) {
+        if (rows.some((row) => row.protectedMessageId === messageId)) {
+          return Err(`Message with ID ${messageId} is protected reset evidence in active history`);
+        }
         // Not in the active epoch — the row may live in the sealed archive
         // (rare: cleanup paths almost always target recent rows).
         const { rows: archiveRows, messages: archiveMessages } = await this.readHistoryForRewrite(
