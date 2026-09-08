@@ -1,15 +1,20 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import * as path from "node:path";
-import { randomUUID } from "node:crypto";
+import * as path from "path";
+import { randomUUID } from "crypto";
 import type { UpdateStatus } from "@/common/orpc/types";
 import type { BashToolResult } from "@/common/types/tools";
 import { createConfigStores } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import type { BashMonitorRegistryStore } from "@/node/services/bashMonitorRegistryStore";
 import { ServiceContainer } from "@/node/services/serviceContainer";
 import { createBashTool } from "@/node/services/tools/bash";
 import type { WorkspaceService } from "@/node/services/workspaceService";
-import { cleanupTestEnvironment, createTestEnvironment, type TestEnvironment } from "./setup";
+import {
+  cleanupTestEnvironment,
+  createTestEnvironment,
+  shouldRunIntegrationTests,
+  type TestEnvironment,
+} from "./setup";
 import { cleanupTempGitRepo, createTempGitRepo, createWorkspace } from "./helpers";
 
 function monitorInternals(service: WorkspaceService) {
@@ -21,14 +26,16 @@ function monitorInternals(service: WorkspaceService) {
   };
 }
 
-describe("Server update restart blockers", () => {
+const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
+
+describeIntegration("Server update restart blockers", () => {
   let env: TestEnvironment;
   let repo: string;
   let workspaceId: string;
   let workspacePath: string;
   let statuses: UpdateStatus[];
   let unsubscribe: (() => void) | undefined;
-  let restart: ReturnType<typeof mock<() => Promise<void>>>;
+  let restart: jest.Mock<Promise<void>, []>;
   let processes: { id: string; pid: number }[];
   let recovered: ServiceContainer | undefined;
 
@@ -43,7 +50,7 @@ describe("Server update restart blockers", () => {
     workspaceId = result.metadata.id;
     workspacePath = result.metadata.namedWorkspacePath ?? repo;
     await monitorInternals(env.services.workspaceService).bashMonitorRecoveryPromise;
-    restart = mock(() => Promise.resolve());
+    restart = jest.fn(() => Promise.resolve());
     await env.services.updateService.enableServerUpdater(
       {
         supported: true,
@@ -85,7 +92,7 @@ describe("Server update restart blockers", () => {
       try {
         process.kill(child.pid, "SIGKILL");
       } catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+        if (!isErrnoWithCode(error, "ESRCH")) throw error;
       }
     }
     await cleanupTempGitRepo(repo);
@@ -160,13 +167,13 @@ describe("Server update restart blockers", () => {
     const workspaceService = env.services.workspaceService;
     const original = workspaceService.getRestartSafeBashMonitors.bind(workspaceService);
     // Hold the asynchronous preparation, not the final synchronous blocker snapshot.
-    const refresh = spyOn(workspaceService, "getRestartSafeBashMonitors").mockImplementationOnce(
-      async (processes) => {
+    const refresh = jest
+      .spyOn(workspaceService, "getRestartSafeBashMonitors")
+      .mockImplementationOnce(async (processes) => {
         entered.resolve();
         await gate.promise;
         return original(processes);
-      }
-    );
+      });
     const install = env.orpc.update.install();
     try {
       expect(
@@ -204,9 +211,9 @@ describe("Server update restart blockers", () => {
 
   test("a background bash whose monitor registration failed blocks the install until it is stopped, and a fresh durable monitor is exempt", async () => {
     const internal = monitorInternals(env.services.workspaceService);
-    const upsert = spyOn(internal.bashMonitorRegistryStore, "upsert").mockRejectedValueOnce(
-      new Error("EACCES: simulated registry write failure")
-    );
+    const upsert = jest
+      .spyOn(internal.bashMonitorRegistryStore, "upsert")
+      .mockRejectedValueOnce(new Error("EACCES: simulated registry write failure"));
     try {
       const failedProcessId = await spawnQuietMonitor();
       expect(
@@ -247,9 +254,9 @@ describe("Server update restart blockers", () => {
       recovered = new ServiceContainer(createConfigStores(env.tempDir));
       const recovery = monitorInternals(recovered.workspaceService);
       // Observe startup recovery without dispatching the synthetic wake.
-      const schedule = spyOn(recovery, "scheduleBashMonitorWakeReconcile").mockImplementation(
-        () => undefined
-      );
+      const schedule = jest
+        .spyOn(recovery, "scheduleBashMonitorWakeReconcile")
+        .mockImplementation(() => undefined);
       try {
         await recovery.bashMonitorRecoveryPromise;
         expect(schedule).toHaveBeenCalledWith(workspaceId);
