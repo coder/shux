@@ -94,8 +94,9 @@ export function DesktopViewer(props: {
   /** See UseDesktopConnectionOptions.nativeWindowCleanup. */
   nativeWindowCleanup?: boolean;
   /**
-   * Mounted while the desktop is shown in a popout: register as an attached viewer but do not
-   * connect; the popout coordinator resumes the connection when the desktop comes back.
+   * Mounted while the desktop is shown in a popout: do not connect; the popout coordinator
+   * registers the pane once it has confirmed a live child and resumes the connection when the
+   * desktop comes back.
    */
   suspended?: boolean;
   hidden?: boolean;
@@ -106,8 +107,7 @@ export function DesktopViewer(props: {
 
   useEffect(() => {
     const detach = props.attach?.(desktop);
-    if (props.suspended) desktop.register();
-    else desktop.connect();
+    if (!props.suspended) desktop.connect();
     return detach;
     // disconnect handled by hook's own cleanup
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -198,7 +198,9 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
       {snapshot.state !== "checking" ? (
         <DesktopViewer
           workspaceId={props.workspaceId}
-          attach={(desktop) => popout.attach(desktop.suspend, desktop.connect, !inline)}
+          attach={(desktop) =>
+            popout.attach(desktop.suspend, desktop.connect, !inline, desktop.register)
+          }
           onDetach={detach}
           suspended={!inline}
           hidden={!inline}

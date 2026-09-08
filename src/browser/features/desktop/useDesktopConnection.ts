@@ -30,7 +30,12 @@ export interface UseDesktopConnectionResult {
    * backend keeps refusing agent-driven archives) across the handoff and the detached period.
    */
   suspend: () => void;
-  /** Register as a viewer without connecting (a pane mounted while its desktop is detached). */
+  /**
+   * Register as a viewer without connecting: the popout coordinator calls this for a suspended
+   * inline pane once a live detached child is confirmed (Electron manager truth, or a bring-back
+   * in flight), so the inline registration covers the popout→inline handoff. A bare persisted
+   * browser hint never registers: it is recovery UI, not proof that a popout is alive.
+   */
   register: () => void;
   controlling: boolean;
   setControlling: (value: boolean) => void;
@@ -288,13 +293,13 @@ export function useDesktopConnection(
   };
 
   const register = () => {
+    if (!registerViewer || viewerReleasedRef.current || viewerRegistrationRef.current !== null) {
+      return;
+    }
     const client = apiRef.current;
-    if (
-      !registerViewer ||
-      viewerReleasedRef.current ||
-      viewerRegistrationRef.current !== null ||
-      !client
-    ) {
+    if (!client) {
+      // The API provider may still be connecting; retry until a client is published.
+      scheduleViewerReregistration();
       return;
     }
     registerViewerRegistration(client).catch(() => {

@@ -59,7 +59,9 @@ export class DesktopPopout {
   private closeTimer: number | undefined;
   private suspendInline: (() => void) | undefined;
   private resumeInline: (() => void) | undefined;
+  private registerInline: (() => void) | undefined;
   private inlineSuspended = false;
+  private childConfirmed = false;
 
   constructor(
     private readonly workspaceId: string,
@@ -100,6 +102,7 @@ export class DesktopPopout {
             updatePersistedState(this.storageKey, this.instanceId);
             this.update("detached");
           }
+          this.confirmChild();
           this.send("grant");
           break;
         case "grant":
@@ -109,6 +112,7 @@ export class DesktopPopout {
           if (this.snapshot.state !== "detached") return;
           this.grantPending = false;
           clearTimeout(this.deadline);
+          this.confirmChild();
           break;
         case "closed":
           this.restore();
@@ -133,6 +137,7 @@ export class DesktopPopout {
     this.channel?.close();
     this.channel = null;
     updatePersistedState(this.storageKey, null);
+    this.childConfirmed = false;
     this.update("inline", error);
     // The inline viewer stays mounted while detached; reconnect it only if we suspended it
     // (a blocked popup never suspended, so its connection must not be restarted).
@@ -147,15 +152,40 @@ export class DesktopPopout {
     this.inlineSuspended = true;
   }
 
-  /** `suspended` marks an inline viewer that mounted while the desktop was already detached. */
-  attach(suspend: () => void, resume?: () => void, suspended = false): () => void {
+  /**
+   * A live child was confirmed (its own message, or Electron manager truth). Only then may a
+   * suspended inline pane register as an attached viewer; a bare persisted browser hint is
+   * recovery UI and must not become a backend attachment for a popout that may be gone.
+   */
+  private confirmChild() {
+    this.childConfirmed = true;
+    if (this.inlineSuspended) this.registerInline?.();
+  }
+
+  /**
+   * `suspended` marks an inline viewer that mounted while the desktop was already detached.
+   * `register` attaches that suspended viewer without connecting; it is invoked only once a live
+   * child is confirmed (Electron manager truth, or a bring-back in flight), never from a bare
+   * persisted browser hint, so a stale hint cannot turn into a backend attachment.
+   */
+  attach(
+    suspend: () => void,
+    resume?: () => void,
+    suspended = false,
+    register?: () => void
+  ): () => void {
     this.suspendInline = suspend;
     this.resumeInline = resume;
-    if (suspended) this.inlineSuspended = true;
+    this.registerInline = register;
+    if (suspended) {
+      this.inlineSuspended = true;
+      if (this.childConfirmed) register?.();
+    }
     return () => {
       if (this.suspendInline === suspend) {
         this.suspendInline = undefined;
         this.resumeInline = undefined;
+        this.registerInline = undefined;
       }
     };
   }
@@ -176,6 +206,7 @@ export class DesktopPopout {
           // hint, permits completing the handoff now or when a late ready arrives.
           this.grantPending = true;
           this.update("detached");
+          this.confirmChild();
           this.send("grant");
         } else this.restore();
       } else if (this.popup?.closed) this.restore();
@@ -215,6 +246,7 @@ export class DesktopPopout {
           clearTimeout(this.deadline);
           this.instanceId = opened.instanceId;
           this.update("detached");
+          this.confirmChild();
           this.send("grant");
           return;
         }
@@ -237,6 +269,9 @@ export class DesktopPopout {
     if (!this.instanceId) return;
     this.returning = true;
     this.grantPending = false;
+    // Attach the inline pane before the child disconnects so the desktop stays marked as in
+    // use through the handoff; a dead child still ends in restore(), which resumes inline.
+    this.registerInline?.();
     this.send("bring-back");
   }
 

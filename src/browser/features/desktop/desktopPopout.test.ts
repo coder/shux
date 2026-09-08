@@ -204,12 +204,19 @@ describe("DesktopPopout handoff", () => {
     expect(resume).toHaveBeenCalledTimes(1);
   });
 
-  test("an inline viewer mounted while detached is resumed on restore", async () => {
+  test("an inline viewer mounted while detached registers only once a live child is confirmed", async () => {
     const popout = new DesktopPopout(workspaceId, false);
     const resume = mock(() => undefined);
-    popout.attach(() => undefined, resume, /* suspended */ true);
+    const register = mock(() => undefined);
+    // A persisted browser hint alone must not become a backend attachment.
+    popout.attach(() => undefined, resume, /* suspended */ true, register);
+    expect(register).not.toHaveBeenCalled();
     await popout.open(api);
+    // The child's own ready message confirms it; bring-back re-asserts before the handoff.
     message("ready");
+    expect(register).toHaveBeenCalledTimes(1);
+    popout.bringBack();
+    expect(register).toHaveBeenCalledTimes(2);
     message("closed");
     expect(resume).toHaveBeenCalledTimes(1);
   });
