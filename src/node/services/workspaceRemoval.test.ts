@@ -15,6 +15,7 @@ import {
   refineApplyLockPath,
   REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS,
   removeSessionDirUnderMemoryLocks,
+  SharedMemoryLockUnavailableError,
   rollbackRemovalTombstoneIfOwned,
   TombstoneNotDurableError,
   workspaceRemovalTombstonePath,
@@ -135,6 +136,51 @@ describe("workspaceRemoval", () => {
       )
     ).toBe(true);
   });
+
+  test("sub-agent removal aborts (no tombstone) when the owner store lock cannot be acquired", async () => {
+    using tmp = new DisposableTempDir("workspace-removal-test");
+    const rootDir = path.join(tmp.path, "xum-home");
+    const ownerSessionDir = path.join(rootDir, "sessions", "ws-owner");
+    const childId = "ws-child-locked";
+    const childSessionDir = path.join(rootDir, "sessions", childId);
+    await fsPromises.mkdir(path.join(ownerSessionDir, "memory"), { recursive: true });
+    await fsPromises.mkdir(childSessionDir, { recursive: true });
+
+    // A foreign process holds the OWNER store's cross-process lock (as in the
+    // r62 test): acquisition times out instead of reclaiming.
+    const lockPath = targetMutationLockFilePath(rootDir, path.join(ownerSessionDir, "memory"));
+    await fsPromises.mkdir(path.dirname(lockPath), { recursive: true });
+    const birth = getProcessBirth(process.pid);
+    const token =
+      birth === null
+        ? `${process.pid}:feed`
+        : `${process.pid}:feed:${Buffer.from(birth).toString("hex")}`;
+    await fsPromises.writeFile(lockPath, token, { flag: "wx" });
+
+    let thrown: unknown;
+    try {
+      await removeSessionDirUnderMemoryLocks({
+        rootDir,
+        sessionDir: childSessionDir,
+        workspaceId: childId,
+        attemptId: "test-attempt",
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(SharedMemoryLockUnavailableError);
+    // Unlike the own-store orphan path, NO tombstone is published: the
+    // wedged holder targets the owner's live notebook, so the child must
+    // stay registered and removal be retried.
+    expect(await isWorkspaceRemovalTombstoned(rootDir, childId)).toBe(false);
+    expect(
+      await fsPromises.access(childSessionDir).then(
+        () => true,
+        () => false
+      )
+    ).toBe(true);
+  }, 20_000);
 
   test("waits on the refine lock BEFORE taking the teardown target locks (r67)", async () => {
     using tmp = new DisposableTempDir("workspace-removal-test");

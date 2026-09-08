@@ -49,6 +49,22 @@ import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
  * ENOSPC) clears — while the workspace no longer exists anywhere else.
  * Keeping the workspace registered keeps removal retryable instead.
  */
+/**
+ * A sub-agent's removal could not take its memory owner's store lock (r61
+ * for shared stores). The caller must ABORT the removal — no tombstone, no
+ * deregistration — because the orphan fallback would leave an admitted child
+ * write free to land in the owner's live notebook after removal.
+ */
+export class SharedMemoryLockUnavailableError extends Error {
+  constructor(workspaceId: string, options?: ErrorOptions) {
+    super(
+      `Could not lock the shared workspace-memory store while removing ${workspaceId}; removal aborted`,
+      options
+    );
+    this.name = "SharedMemoryLockUnavailableError";
+  }
+}
+
 export class TombstoneNotDurableError extends Error {
   constructor(workspaceId: string, options?: ErrorOptions) {
     super(
@@ -192,6 +208,7 @@ export async function removeSessionDirUnderMemoryLocks(args: {
       })
     );
   };
+  let targetLocksHeld = false;
   try {
     // Refine serialization (r66) — acquired FIRST (r67): a /refine apply in
     // ANOTHER backend is untouched by the remover's process-local
@@ -218,6 +235,7 @@ export async function removeSessionDirUnderMemoryLocks(args: {
       args.rootDir,
       [sessionDirKey, workspaceMemoryKey, sharedMemoryKey, ...ownerMemoryKeys],
       async () => {
+        targetLocksHeld = true;
         // History append serialization (r63): a foreign backend's in-flight
         // stream can be mid-append under the history write lock; acquiring
         // that same (session-dir-external) lock here means the append either
@@ -237,6 +255,15 @@ export async function removeSessionDirUnderMemoryLocks(args: {
       }
     );
   } catch (error) {
+    // The orphan path below assumes a wedged writer's target is THIS
+    // workspace's retained session dir. A sub-agent's admitted memory write
+    // targets its OWNER's live notebook instead, so if the owner-store lock
+    // could not be taken, publishing the tombstone outside it would let a
+    // holder that already passed its commit check finish after removal.
+    // Abort instead: the workspace stays registered and removal is retried.
+    if (ownerMemoryKeys.length > 0 && !targetLocksHeld) {
+      throw new SharedMemoryLockUnavailableError(args.workspaceId, { cause: error });
+    }
     // Fail-closed orphan path (r62): a wedged writer blocks the deletion,
     // but the caller proceeds to deregister the workspace regardless — so
     // the terminal marker must still become durable or a foreign backend

@@ -506,8 +506,9 @@ export class MemoryConsolidationService extends EventEmitter {
       const records = Object.entries(sidecar.harvestsByWorkspace)
         .filter(
           ([bucketId]) =>
-            bucketId === workspaceId ||
-            self.memoryService.resolveWorkspaceMemoryOwnerId(bucketId, () => cfg) === workspaceId
+            !self.removalCancelled.has(bucketId) &&
+            (bucketId === workspaceId ||
+              self.memoryService.resolveWorkspaceMemoryOwnerId(bucketId, () => cfg) === workspaceId)
         )
         .flatMap(([, bucket]) => Object.values(bucket));
       if (records.length === 0) return;
@@ -731,7 +732,10 @@ export class MemoryConsolidationService extends EventEmitter {
       this.inFlight.delete(workspaceId);
       removal.dispose();
     }
-    if (options.skipHarvestRecovery !== true) {
+    // Removal cancelled this run: recovery would spawn child harvests outside
+    // the cancellation registry being drained (their controllers were never
+    // registered), mutating the shared inbox during destructive teardown.
+    if (options.skipHarvestRecovery !== true && !this.removalCancelled.has(workspaceId)) {
       await Effect.runPromise(this.recoverRetryableHarvestsEffect(workspaceId));
     }
     return result;

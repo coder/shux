@@ -399,6 +399,30 @@ describe("MemoryConsolidationService", () => {
           },
         }),
     });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const childMetadata = await seedCompactionEpoch(fixture, "ws-sub");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [childMetadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: childMetadata.summaryMessageId,
+              compactionEpoch: childMetadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: childMetadata,
+            },
+          },
+        },
+      })
+    );
     const run = fixture.service.maybeRun("ws-dream", "manual");
     await started;
     await fixture.service.cancelInFlightConsolidation("ws-dream");
@@ -409,6 +433,14 @@ describe("MemoryConsolidationService", () => {
     if (!result.success) {
       expect(result.error).toContain("stream failed");
     }
+    // The cancelled owner's continuation must not start recovery of a
+    // sub-agent's retryable harvest (work outside the drained registry).
+    const childRecords = (
+      JSON.parse(
+        await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
+      ) as { harvestsByWorkspace: Record<string, Record<string, { attemptCount: number }>> }
+    ).harvestsByWorkspace["ws-sub"];
+    expect(Object.values(childRecords).map((record) => record.attemptCount)).toEqual([1]);
     // Idempotent with nothing in flight (the phantom-metadata removal path).
     await fixture.service.cancelInFlightConsolidation("ws-dream");
   });

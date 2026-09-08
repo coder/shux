@@ -198,6 +198,9 @@ export function subscribeLogs(
   });
 }
 
+/** How often an open memory subscription re-checks its workspace's memory owner. */
+const MEMORY_OWNERSHIP_PROBE_INTERVAL_MS = 30_000;
+
 export function subscribeMemoryChanges(
   context: ORPCContext,
   workspaceId: string | null,
@@ -244,10 +247,21 @@ export function subscribeMemoryChanges(
           });
           emit.push({ kind: "consolidation_status", workspaceId, projectPath: projectPath ?? "" });
         };
+        // ownersInvalidated is emitted lazily, when something probes ownership.
+        // Another backend (multi-instance) removing the owner leaves an idle
+        // tab with nothing to trigger that probe, so probe here: one stat of
+        // config.json per interval (see Config.configFileStamp).
+        const ownershipProbe = workspaceId
+          ? setInterval(
+              () => context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId),
+              MEMORY_OWNERSHIP_PROBE_INTERVAL_MS
+            ).unref()
+          : undefined;
         context.memoryService.on("change", onChange);
         context.memoryService.on("ownersInvalidated", onOwnersInvalidated);
         context.memoryConsolidationService.on("statusChange", onStatusChange);
         return () => {
+          if (ownershipProbe !== undefined) clearInterval(ownershipProbe);
           context.memoryService.off("change", onChange);
           context.memoryService.off("ownersInvalidated", onOwnersInvalidated);
           context.memoryConsolidationService.off("statusChange", onStatusChange);

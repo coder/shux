@@ -131,6 +131,7 @@ import {
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
   removeSessionDirUnderMemoryLocks,
+  SharedMemoryLockUnavailableError,
   refineApplyLockPath,
   rollbackRemovalTombstoneIfOwned,
   startRemovalTombstoneLease,
@@ -6335,7 +6336,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // writable by foreign backends forever — abort the removal (the
         // workspace stays registered and retryable) instead of proceeding
         // to deregistration below.
-        if (error instanceof TombstoneNotDurableError) {
+        if (
+          error instanceof TombstoneNotDurableError ||
+          error instanceof SharedMemoryLockUnavailableError
+        ) {
           throw error;
         }
         log.error(`Failed to remove session directory for ${workspaceId}:`, error);
