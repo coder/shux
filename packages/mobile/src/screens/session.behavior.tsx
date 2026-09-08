@@ -159,6 +159,8 @@ function fixture(
           return send();
         case "workspace.executeBash":
           return { success: true, data: { success: true, output: "" } };
+        case "workspace.getProjectDiffs":
+          return [];
         default:
           throw new Error(`Unexpected call: ${name}`);
       }
@@ -1823,4 +1825,22 @@ describe("web composer keyboard", () => {
     expect(key(input, "Escape")).toBe(false);
     expect(callCount(view, "interruptStream")).toBe(1);
   });
+});
+
+test("an open Changes screen retires itself when live metadata marks the checkout gone", async () => {
+  const view = fixture();
+  await view.select("alpha");
+  fireEvent.click(view.getByRole("button", { name: "View changes" }));
+  await waitFor(() => expect(callCount(view, "getProjectDiffs")).toBe(1));
+  expect(stackState.routes.at(-1)?.name).toBe("Changes");
+  await view.updateWorkspace({ ...workspaces[0], transcriptOnly: true });
+  expect(view.getByText(/so there are no changes to show/)).toBeDefined();
+  expect(view.queryByRole("button", { name: "Refresh changes" })).toBeNull();
+  expect(callCount(view, "getProjectDiffs")).toBe(1);
+  // Restoring the checkout brings the live view back without navigating.
+  await view.updateWorkspace(workspaces[0]);
+  await waitFor(() => expect(callCount(view, "getProjectDiffs")).toBe(2));
+  expect(stackState.routes.at(-1)?.name).toBe("Changes");
+  fireEvent.click(view.getByRole("button", { name: "Refresh changes" }));
+  await waitFor(() => expect(callCount(view, "getProjectDiffs")).toBe(3));
 });

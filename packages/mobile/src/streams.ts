@@ -11,8 +11,10 @@ export const STREAM_RETRY_MIN_MS = 1_000;
 export const STREAM_RETRY_MAX_MS = 30_000;
 
 const wakers = new Set<() => void>();
+let wakeGeneration = 0;
 /** Skip pending backoff, e.g. when the app returns to the foreground. */
 export function wakeStreams(): void {
+  wakeGeneration++;
   for (const wake of [...wakers]) wake();
 }
 
@@ -76,6 +78,7 @@ export async function watch<T>(options: WatchOptions<T>): Promise<void> {
   try {
     while (!options.signal.aborted) {
       const attempt = linkedAbortController(options.signal);
+      const wakesBefore = wakeGeneration;
       let openedAt: number | null = null;
       let cause: unknown;
       try {
@@ -100,7 +103,10 @@ export async function watch<T>(options: WatchOptions<T>): Promise<void> {
       if (openedAt !== null && Date.now() - openedAt >= STREAM_RETRY_MAX_MS) retries = 0;
       setReconnecting(stream, true);
       options.onLost?.(cause);
-      await sleep(backoff(retries++), options.signal);
+      // A wake during this attempt (e.g. foregrounding while the stream was already
+      // dying) is not lost to a race with the loss detection: retry right away.
+      if (wakeGeneration === wakesBefore) await sleep(backoff(retries), options.signal);
+      retries++;
     }
   } finally {
     setReconnecting(stream, false);

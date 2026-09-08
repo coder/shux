@@ -309,16 +309,37 @@ function ConversationRoute(props: NativeStackScreenProps<MobileRoutes, "Conversa
 }
 
 function ChangesRoute(props: NativeStackScreenProps<MobileRoutes, "Changes">) {
-  const { session } = useSession();
+  const { session, data } = useSession();
+  const { workspaceId } = props.route.params;
+  const workspace = data.workspaces.find((item) => item.id === workspaceId);
+  // Live metadata decides whether Git can still run here: a checkout deleted while
+  // this screen is open must retire it rather than keep refreshing into errors.
+  const available = workspace !== undefined && workspace.transcriptOnly !== true;
   return (
-    <ScreenLayout navigation={props.navigation} workspaceId={props.route.params.workspaceId}>
-      <ChangesScreen
-        client={session.connection.client}
-        workspaceId={props.route.params.workspaceId}
-        signal={session.signal}
-        onReconnect={session.reconnect}
-        onBack={() => props.navigation.goBack()}
-      />
+    <ScreenLayout navigation={props.navigation} workspaceId={workspaceId}>
+      {available ? (
+        <ChangesScreen
+          client={session.connection.client}
+          workspaceId={workspaceId}
+          signal={session.signal}
+          onReconnect={session.reconnect}
+          onBack={() => props.navigation.goBack()}
+        />
+      ) : (
+        <>
+          <Header title="Changes" onBack={() => props.navigation.goBack()} />
+          <View style={layout.content}>
+            <Text style={layout.text}>
+              {workspace
+                ? "This workspace's worktree is no longer available, so there are no changes to show."
+                : "This workspace is no longer available."}
+            </Text>
+            <Button secondary onPress={() => props.navigation.popTo("Workspaces")}>
+              Back to workspaces
+            </Button>
+          </View>
+        </>
+      )}
     </ScreenLayout>
   );
 }
