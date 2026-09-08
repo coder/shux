@@ -664,6 +664,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Test comment classification
+        run: make test-codex-comments
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/check_codex_comments.sh ${{ github.event.pull_request.number }}

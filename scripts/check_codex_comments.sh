@@ -13,6 +13,7 @@ if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
 fi
 
 BOT_LOGIN_GRAPHQL="chatgpt-codex-connector"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
 REGULAR_COMMENTS='[]'
 UNRESOLVED_THREADS='[]'
@@ -83,9 +84,9 @@ compute_codex_sets_from_arrays() {
   # JSON goes through stdin, never argv: a long review history exceeds Linux's
   # per-argument limit (MAX_ARG_STRLEN, ~128KB) and made --argjson fail with
   # "Argument list too long". printf is a shell builtin, so it has no such limit.
-  REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c --arg bot "$BOT_LOGIN_GRAPHQL" '[
+  REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" 'include "codex_comments"; [
     .[]
-    | select(.author.login == $bot and .isMinimized == false and (.body | test("Didn.t find any major issues|usage limits have been reached|create a Codex account") | not))
+    | select(.author.login == $bot and .isMinimized == false and (codex_comment_is_informational($bot) | not))
   ]')
 
   UNRESOLVED_THREADS=$(printf '%s' "$threads_json" | jq -c --arg bot "$BOT_LOGIN_GRAPHQL" '[
