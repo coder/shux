@@ -250,30 +250,140 @@ describe("API reconnection", () => {
     expect(clearStoredAuthTokenMock).not.toHaveBeenCalled();
   });
 
+  test.each([false, true])(
+    "a rejected stale token reconnects without bearer credentials (cookie=%s)",
+    async (cookie) => {
+      storedAuthToken = "stale-master";
+      if (cookie) document.cookie = "mux-session=existing-user-session";
+      let mints = 0;
+      fetchImpl = (input) => {
+        if (String(input).includes("issueWebSocketTicket")) {
+          mints++;
+          return Promise.resolve(new Response("Unauthorized", { status: 401 }));
+        }
+        return Promise.resolve(new Response("", { status: 404 }));
+      };
+      const reload = spyOn(window.location, "reload").mockImplementation(() => undefined);
+      let state: UseAPIResult | undefined;
+      const statuses: string[] = [];
+      try {
+        render(
+          <APIProvider createWebSocket={createMockWebSocket}>
+            <APIStateObserver
+              onState={(value) => {
+                state = value.apiState;
+                statuses.push(value.status);
+              }}
+            />
+          </APIProvider>
+        );
+        await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+        const clean = MockWebSocket.lastInstance()!;
+        expect(clean.url).toBe("wss://mux.example.com/orpc/ws");
+        expect(clean.protocols).toBeUndefined();
+        expect(storedAuthToken).toBeNull();
+        await act(async () => {
+          clean.simulateOpen();
+          await Promise.resolve();
+        });
+        expect(state?.status).toBe("connected");
+        expect(statuses).not.toContain("auth_required");
+        act(() => state!.retry());
+        expect(MockWebSocket.instances).toHaveLength(2);
+        expect(MockWebSocket.lastInstance()!.protocols).toBeUndefined();
+        expect(mints).toBe(1);
+        expect(reload).not.toHaveBeenCalled();
+      } finally {
+        reload.mockRestore();
+      }
+    }
+  );
+
+  test("a superseded mint's late 401 cannot erase newly authenticated credentials", async () => {
+    storedAuthToken = "stale-master";
+    const first = Promise.withResolvers<Response>();
+    let mints = 0;
+    fetchImpl = () => (++mints === 1 ? first.promise : Promise.resolve(ticketResponse()));
+    let state: UseAPIResult | undefined;
+    render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <APIStateObserver
+          onState={(value) => {
+            state = value.apiState;
+          }}
+        />
+      </APIProvider>
+    );
+    await waitFor(() => expect(mints).toBe(1));
+    act(() => state!.authenticate("new-master"));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    await act(async () => {
+      first.resolve(new Response("Unauthorized", { status: 401 }));
+      await Promise.resolve();
+    });
+    expect(storedAuthToken).toBe("new-master");
+    expect(clearStoredAuthTokenMock).not.toHaveBeenCalled();
+    const socket = MockWebSocket.lastInstance()!;
+    expect(socket.protocols).toEqual([ORPC_WS_PROTOCOL, `${ORPC_WS_TICKET_PREFIX}${testTicket}`]);
+    await act(async () => {
+      socket.simulateOpen();
+      await Promise.resolve();
+    });
+    expect(state?.status).toBe("connected");
+  });
+
   test.each([
     [401, "auth_required"],
     [404, "error"],
-  ] as const)(
-    "ticket HTTP %s produces %s without a socket or secret fallback",
-    async (status, expected) => {
-      storedAuthToken = "master-secret";
-      fetchImpl = () => Promise.resolve(new Response("master-secret", { status }));
-      let state: UseAPIResult | undefined;
-      render(
-        <APIProvider createWebSocket={createMockWebSocket}>
-          <APIStateObserver
-            onState={(value) => {
-              state = value.apiState;
-            }}
-          />
-        </APIProvider>
-      );
-      await waitFor(() => expect(state?.status).toBe(expected));
-      expect(MockWebSocket.instances).toHaveLength(0);
-      expect(state?.error).not.toContain("master-secret");
-      expect(clearStoredAuthTokenMock).toHaveBeenCalledTimes(status === 401 ? 1 : 0);
+  ] as const)("ticket HTTP %s produces %s without a secret fallback", async (status, expected) => {
+    storedAuthToken = "master-secret";
+    fetchImpl = () => Promise.resolve(new Response("master-secret", { status }));
+    let state: UseAPIResult | undefined;
+    render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <APIStateObserver
+          onState={(value) => {
+            state = value.apiState;
+          }}
+        />
+      </APIProvider>
+    );
+    if (status === 401) {
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+      expect(MockWebSocket.lastInstance()!.protocols).toBeUndefined();
+      act(() => MockWebSocket.lastInstance()!.simulateClose(4401));
     }
-  );
+    await waitFor(() => expect(state?.status).toBe(expected));
+    expect(MockWebSocket.instances).toHaveLength(status === 401 ? 1 : 0);
+    expect(state?.error).not.toContain("master-secret");
+    if (status === 401) expect(storedAuthToken).toBeNull();
+    else expect(clearStoredAuthTokenMock).not.toHaveBeenCalled();
+  });
+
+  test("transient mint errors retry with the same bearer rather than probing anonymously", async () => {
+    storedAuthToken = "valid-master";
+    const authorizations: Array<string | null> = [];
+    fetchImpl = (_input, init) => {
+      authorizations.push(new Headers(init?.headers).get("Authorization"));
+      return Promise.resolve(
+        authorizations.length === 1
+          ? new Response("Unavailable", { status: 503 })
+          : ticketResponse()
+      );
+    };
+    render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <APIStateObserver onState={() => undefined} />
+      </APIProvider>
+    );
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    expect(authorizations).toEqual(["Bearer valid-master", "Bearer valid-master"]);
+    expect(MockWebSocket.lastInstance()!.protocols).toEqual([
+      ORPC_WS_PROTOCOL,
+      `${ORPC_WS_TICKET_PREFIX}${testTicket}`,
+    ]);
+    expect(clearStoredAuthTokenMock).not.toHaveBeenCalled();
+  });
 
   test("superseding token and unmount cancel pending ticket requests and discard late responses", async () => {
     storedAuthToken = "old-secret";
@@ -385,7 +495,7 @@ describe("API reconnection", () => {
     expect(clearStoredAuthTokenMock).not.toHaveBeenCalled();
   });
 
-  test("HTTP authentication failures after reconnect stop the loop instead of reusing an expired ticket", async () => {
+  test("HTTP authentication failures after reconnect probe anonymously once before requiring auth", async () => {
     storedAuthToken = "master-secret";
     fetchImpl = () => Promise.resolve(ticketResponse());
     const states: ObservedState[] = [];
@@ -401,11 +511,23 @@ describe("API reconnection", () => {
       await Promise.resolve();
     });
     expect(states.at(-1)?.status).toBe("connected");
-    fetchImpl = () => Promise.resolve(new Response("Unauthorized", { status: 401 }));
+    let mintFailures = 0;
+    fetchImpl = (input) => {
+      if (String(input).includes("issueWebSocketTicket")) {
+        mintFailures++;
+        return Promise.resolve(new Response("Unauthorized", { status: 401 }));
+      }
+      return Promise.resolve(Response.json({ security: [{ bearerAuth: [] }] }));
+    };
     act(() => first.simulateClose(1006));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2));
+    const probe = MockWebSocket.lastInstance()!;
+    expect(probe.protocols).toBeUndefined();
+    act(() => probe.simulateClose(1006));
     await waitFor(() => expect(states.at(-1)?.status).toBe("auth_required"));
-    expect(MockWebSocket.instances).toHaveLength(1);
-    expect(clearStoredAuthTokenMock).toHaveBeenCalledTimes(1);
+    expect(MockWebSocket.instances).toHaveLength(2);
+    expect(mintFailures).toBe(1);
+    expect(storedAuthToken).toBeNull();
   });
 
   test("injected clients skip internal auth token setup", async () => {

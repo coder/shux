@@ -195,6 +195,8 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     return getStoredAuthToken();
   });
 
+  // Connection callbacks can schedule retries before React commits a token change.
+  const authTokenRef = useRef(authToken);
   const cleanupRef = useRef<(() => void) | null>(null);
   const hasConnectedRef = useRef(false);
   const reconnectAttemptRef = useRef(0);
@@ -284,10 +286,15 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
         cleanup();
         forceReconnectInProgressRef.current = false;
         if (error instanceof WebSocketTicketError && error.reason === "authentication") {
-          authRequiredRef.current = true;
           clearStoredAuthToken();
+          authTokenRef.current = null;
+          setAuthToken(null);
+          // Auth may have been disabled, or an existing cookie may suffice. Try the
+          // ordinary credential-free path once; its auth checks still own the modal.
           hasConnectedRef.current = false;
-          setState({ status: "auth_required", error: error.message });
+          authProbeAttemptedRef.current = false;
+          reconnectAttemptRef.current = 0;
+          scheduleReconnectRef.current?.();
         } else if (error instanceof WebSocketTicketError && error.reason === "unsupported") {
           setState({ status: "error", error: error.message });
         } else {
@@ -543,9 +550,9 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     setState({ status: "reconnecting", attempt: attempt + 1 });
 
     reconnectTimeoutRef.current = setTimeout(() => {
-      connect(authToken);
+      connect(authTokenRef.current);
     }, delay);
-  }, [authToken, connect]);
+  }, [connect]);
 
   // Keep ref in sync with latest scheduleReconnect
   scheduleReconnectRef.current = scheduleReconnect;
@@ -583,7 +590,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
       forceReconnectInProgressRef.current = true;
       console.warn(`[APIProvider] ${reason}; reconnecting...`);
       cleanup();
-      if (!effectDisposed) connect(authToken);
+      if (!effectDisposed) connect(authTokenRef.current);
       return true;
     };
 
@@ -688,11 +695,12 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
       clearInterval(intervalId);
       outstandingProbeRef.current = null;
     };
-  }, [liveClient, liveCleanup, props.createWebSocket, connect, authToken]);
+  }, [liveClient, liveCleanup, props.createWebSocket, connect]);
 
   const authenticate = useCallback(
     (token: string) => {
       authProbeAttemptedRef.current = false;
+      authTokenRef.current = token;
       setStoredAuthToken(token);
       setAuthToken(token);
       connect(token);
@@ -702,8 +710,8 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
 
   const retry = useCallback(() => {
     authProbeAttemptedRef.current = false;
-    connect(authToken);
-  }, [connect, authToken]);
+    connect(authTokenRef.current);
+  }, [connect]);
 
   // Convert internal state to the discriminated union API
   const value = useMemo((): UseAPIResult => {
