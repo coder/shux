@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it, spyOn } from
 import * as fs from "node:fs/promises";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import * as atomicWrite from "write-file-atomic";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
@@ -99,53 +100,69 @@ describe("HistoryService private publication seam", () => {
   }
 
   for (const kind of ["single", "batch", "update"] as const) {
-    it(`${kind}: a reclaimed birth-less lock preserves the successor's history`, async () => {
-      const lockPath = historyWriteLockPath(fixture.config.rootDir, workspaceId);
-      const successorBytes = Buffer.concat([
-        await fs.readFile(chatPath),
-        Buffer.from(
-          JSON.stringify({
-            ...createMuxMessage("successor", "user", "foreign row", { historySequence: 2 }),
-            workspaceId,
-          }) + "\n"
-        ),
-      ]);
-      let successor: Awaited<ReturnType<typeof acquireProcessFileLock>> | undefined;
-      let commits = 0;
-      const staging = afterPublicationStaging(async () => {
-        // Model an expired birth-less lease while staging is held, then let
-        // the real lock protocol reclaim it and a successor publish new bytes.
-        const token = await fs.readFile(lockPath, "utf8");
-        await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
-        await fs.utimes(lockPath, new Date(0), new Date(0));
-        successor = await acquireProcessFileLock({
-          lockPath,
-          timeoutMs: 1000,
-          label: "successor history writer",
+    it.each(["pending", "stable"] as const)(
+      `${kind}: a reclaimed birth-less lock preserves the successor's history and %s receipt`,
+      async (receiptState) => {
+        const lockPath = historyWriteLockPath(fixture.config.rootDir, workspaceId);
+        const successorBytes = Buffer.concat([
+          await fs.readFile(chatPath),
+          Buffer.from(
+            JSON.stringify({
+              ...createMuxMessage("successor", "user", "foreign row", { historySequence: 2 }),
+              workspaceId,
+            }) + "\n"
+          ),
+        ]);
+        const provenance = new HistoryAppendProvenance(path.dirname(chatPath));
+        let successorReceiptBytes = Buffer.alloc(0);
+        let successor: Awaited<ReturnType<typeof acquireProcessFileLock>> | undefined;
+        let commits = 0;
+        const staging = afterPublicationStaging(async () => {
+          // Model an expired birth-less lease while staging is held, then let
+          // the real lock protocol reclaim it and a successor publish new bytes.
+          const token = await fs.readFile(lockPath, "utf8");
+          await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
+          await fs.utimes(lockPath, new Date(0), new Date(0));
+          successor = await acquireProcessFileLock({
+            lockPath,
+            timeoutMs: 1000,
+            label: "successor history writer",
+          });
+          await fs.writeFile(chatPath, successorBytes);
+          successorReceiptBytes = Buffer.from(
+            JSON.stringify({
+              version: 1,
+              epoch: randomUUID(),
+              state: receiptState,
+              files: await provenance.stamps(),
+            })
+          );
+          await fs.writeFile(provenance.receiptPath, successorReceiptBytes);
+          expect((await provenance.read()).receipt?.state).toBe(receiptState);
         });
-        await fs.writeFile(chatPath, successorBytes);
-      });
-      try {
-        const result = await publish(kind, {
-          isCurrent: () => true,
-          onCommitted: () => {
-            commits++;
-          },
-        });
-        expect(successor).toBeDefined();
-        expect(result.success).toBe(false);
-        expect(commits).toBe(0);
-        expect(await fs.readFile(chatPath)).toEqual(successorBytes);
-        expect(
-          (await fs.readdir(path.dirname(chatPath))).filter((name) =>
-            name.includes(".publication-")
-          )
-        ).toEqual([]);
-      } finally {
-        staging.mockRestore();
-        await successor?.[Symbol.asyncDispose]();
+        try {
+          const result = await publish(kind, {
+            isCurrent: () => true,
+            onCommitted: () => {
+              commits++;
+            },
+          });
+          expect(successor).toBeDefined();
+          expect(result.success).toBe(false);
+          expect(commits).toBe(0);
+          expect(await fs.readFile(chatPath)).toEqual(successorBytes);
+          expect(await fs.readFile(provenance.receiptPath)).toEqual(successorReceiptBytes);
+          expect(
+            (await fs.readdir(path.dirname(chatPath))).filter((name) =>
+              name.includes(".publication-")
+            )
+          ).toEqual([]);
+        } finally {
+          staging.mockRestore();
+          await successor?.[Symbol.asyncDispose]();
+        }
       }
-    });
+    );
 
     it(`${kind}: rechecks logical ownership after the awaited file-lock check`, async () => {
       const before = await fs.readFile(chatPath);

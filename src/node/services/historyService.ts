@@ -2768,12 +2768,13 @@ export class HistoryService {
       // crashed transaction from another backend's live rewrite — rolling
       // back a live transaction mid-flight resurrects discarded history with
       // mismatched archive/chat state.
+      // Receipt finalization must also leave a successor's provenance untouched after reclamation.
       return this.getAppendProvenance(workspaceId).runMutation(async () => {
         if (await this.truncateRecoveryArtifactsPresent(workspaceId))
           invalidateHistoryAppendProvenance();
         await this.recoverTruncateTransactionUnlocked(workspaceId);
         return operation(assertStillOwned);
-      });
+      }, assertStillOwned);
     });
   }
 
