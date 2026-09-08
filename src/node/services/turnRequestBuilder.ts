@@ -235,7 +235,7 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { isMemoryToolDisabled, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -1425,19 +1425,28 @@ export class TurnRequestBuilder {
       editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
     });
     // Post-compaction harvest writes to /memories/workspace on the agent's
-    // behalf; it must honor the same policy the memory tool enforces. The
+    // behalf; it must honor exactly what the memory tool enforces: the scope
+    // access AND the tool's presence in the final toolset. The tool exists
+    // only with the experiment + service (tools.ts) and survives only if the
+    // effective policy keeps it (applied later in tool assembly, mirrored
+    // here) — tool-search deferral is not a permission decision. The
     // compaction turn itself runs the "compact" agent, so record only normal
     // turns' policy (the session attaches it to the compaction completion).
+    const workspaceMemoryWritable =
+      memoryAccess.workspace === "readwrite" &&
+      memoryExperimentEnabled &&
+      this.dependencies.bindings.memoryService !== undefined &&
+      !isMemoryToolDisabled(effectiveToolPolicy);
     if (!isCompactionRequest && this.dependencies.bindings.workspaceMemoryPolicySink) {
       // Awaited (a config write happens only when the value changes) so the
       // durable policy is in place before this turn can produce a compaction.
       const persisted =
         await this.dependencies.bindings.workspaceMemoryPolicySink.recordWorkspaceMemoryWritable(
           workspaceId,
-          memoryAccess.workspace === "readwrite"
+          workspaceMemoryWritable
         );
       if (!persisted) {
-        if (memoryAccess.workspace !== "readwrite") {
+        if (!workspaceMemoryWritable) {
           // A stale persisted `true` would let this now read-only agent's
           // transcript harvest into the (shared) workspace notebook after a
           // restart. Refuse to run the turn until the deny is durable.

@@ -55,6 +55,7 @@ test("memory subscriptions match workspace-scope events on the shared memory own
     memoryService: Object.assign(memoryService, {
       resolveWorkspaceMemoryOwnerId: (workspaceId: string) =>
         ownerOf.get(workspaceId) ?? workspaceId,
+      workspaceMemoryRevision: () => Promise.resolve("rev-1"),
     }),
     memoryConsolidationService,
   } as unknown as ORPCContext;

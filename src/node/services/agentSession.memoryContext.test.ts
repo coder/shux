@@ -32,7 +32,7 @@ function createSession(args: {
   historyService: HistoryService;
   sessionDir: string;
   buildMemorySessionContext: AIService["buildMemorySessionContext"];
-  probeMemoryOwnership?: AIService["probeMemoryOwnership"];
+  probeMemoryStore?: AIService["probeMemoryStore"];
   isExperimentEnabled?: AIService["isExperimentEnabled"];
 }): AgentSession {
   const aiEmitter = new EventEmitter();
@@ -51,7 +51,7 @@ function createSession(args: {
     ),
     stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
     buildMemorySessionContext: args.buildMemorySessionContext,
-    probeMemoryOwnership: args.probeMemoryOwnership,
+    probeMemoryStore: args.probeMemoryStore,
     isExperimentEnabled: args.isExperimentEnabled ?? (() => false),
   } as unknown as AIService;
 
@@ -165,14 +165,15 @@ describe("AgentSession memory context", () => {
     // synchronous ownersInvalidated → core.ts → invalidateMemoryContext chain.
     let ownerRemoved = false;
     const sessionRef: { current?: AgentSession } = {};
-    const probeMemoryOwnership = mock(() => {
+    const probeMemoryStore = mock(() => {
       if (ownerRemoved) sessionRef.current?.invalidateMemoryContext();
+      return Promise.resolve(undefined);
     });
     const session = createSession({
       historyService,
       sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
       buildMemorySessionContext,
-      probeMemoryOwnership,
+      probeMemoryStore,
       isExperimentEnabled: (id) => id === EXPERIMENT_IDS.MEMORY,
     });
     sessionRef.current = session;
@@ -181,10 +182,43 @@ describe("AgentSession memory context", () => {
       await priv.resolveMemoryContext("test-model");
       await priv.resolveMemoryContext("test-model");
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
-      expect(probeMemoryOwnership).toHaveBeenCalledTimes(2);
+      expect(probeMemoryStore).toHaveBeenCalledTimes(2);
 
       ownerRemoved = true;
       // The probe runs before the cache read, so THIS request rebuilds.
+      await priv.resolveMemoryContext("test-model");
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  test("rebuilds when the owner store's revision advanced without an in-process change event", async () => {
+    using sessionDir = new DisposableTempDir("agent-session-memory-context-revision");
+    const { historyService, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+    const context: MemorySessionContext = { indexEntries: [], hotMemoriesBlock: null };
+    const buildMemorySessionContext = mock(() => Promise.resolve(context));
+    // Another backend process writing the shared notebook: no change event
+    // reaches this session, only the durable revision token differs.
+    let revision = "rev-1";
+    const session = createSession({
+      historyService,
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      buildMemorySessionContext,
+      probeMemoryStore: () => Promise.resolve(revision),
+      isExperimentEnabled: (id) => id === EXPERIMENT_IDS.MEMORY,
+    });
+    const priv = session as unknown as PrivateSessionAccess;
+    try {
+      await priv.resolveMemoryContext("test-model");
+      await priv.resolveMemoryContext("test-model");
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
+
+      revision = "rev-2";
+      await priv.resolveMemoryContext("test-model");
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
+      // Stable again: the rebuilt context is cached under the new token.
       await priv.resolveMemoryContext("test-model");
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {

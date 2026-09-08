@@ -1,5 +1,5 @@
 import { resolveToolPolicyForAgent } from "./agentDefinitions/resolveToolPolicy";
-import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
+import { isMemoryToolDisabled, isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
 import { resolveAgentFrontmatter } from "./agentDefinitions/agentDefinitionsService";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { ToolBridge } from "./ptc/toolBridge";
@@ -549,6 +549,30 @@ describe("resolveBackendGatedPtcExperiments", () => {
 });
 
 describe("token budget history policy", () => {
+  test.each([
+    { add: [], allowed: false },
+    { add: ["file_read"], allowed: false },
+    { add: ["memory"], allowed: true },
+    { add: ["mem.*"], allowed: true },
+    { add: [".*"], allowed: true },
+  ])("harvest permission mirrors the assembled memory tool: $add", async ({ add, allowed }) => {
+    // The persisted workspaceMemoryWritable bit is derived from the policy
+    // before tool assembly; it must agree with whether `memory` survives it.
+    const policy = resolveToolPolicyForAgent({
+      agents: [{ tools: { add } }],
+      isSubagent: true,
+      disableTaskToolsForDepth: false,
+    });
+    const memory = executableTool("Memory");
+    const result = await applyToolPolicyAndExperiments({
+      allTools: { memory, file_read: executableTool("Read") },
+      effectiveToolPolicy: policy,
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(isMemoryToolDisabled(policy)).toBe(!allowed);
+    expect(result.memory === undefined).toBe(!allowed);
+  });
+
   test.each([
     { add: [], allowed: false },
     { add: ["file_read"], allowed: false },

@@ -17,6 +17,14 @@
 export const MEMORY_VIRTUAL_ROOT = "/memories";
 
 export const MEMORY_SCOPES = ["global", "project", "workspace"] as const;
+
+/**
+ * `<sessionsDir>/<owner>/memory.revision`: opaque token rewritten on every
+ * mutation of that owner's shared `/memories/workspace` store. Sessions and
+ * Memory tabs in OTHER backend processes (multi-instance) compare it before
+ * reusing a cached index/hot set — in-process consumers get change events.
+ */
+export const WORKSPACE_MEMORY_REVISION_FILE_NAME = "memory.revision";
 export type MemoryScope = (typeof MEMORY_SCOPES)[number];
 
 export type MemoryAccessLevel = "read" | "readwrite";

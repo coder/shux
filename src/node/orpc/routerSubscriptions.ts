@@ -218,6 +218,23 @@ export function subscribeMemoryChanges(
     yield* runtimeSubscription(context, {
       signal,
       subscribe: (emit) => {
+        // Revision token of the displayed workspace store (see
+        // MemoryService.workspaceMemoryRevision), refreshed by every
+        // workspace event this subscription forwards so the probe below only
+        // fires for mutations this process never saw. Reads are async; a
+        // failed refresh leaves the old token, costing at most one redundant
+        // refresh on the next probe.
+        let storeRevision: string | null = null;
+        const refreshStoreRevision = () => {
+          if (!workspaceId) return;
+          context.memoryService.workspaceMemoryRevision(workspaceId).then(
+            (revision) => {
+              storeRevision = revision;
+            },
+            () => undefined
+          );
+        };
+        refreshStoreRevision();
         const onChange = (event: MemoryChangeEvent) => {
           if (
             event.scope === "workspace" &&
@@ -228,6 +245,7 @@ export function subscribeMemoryChanges(
           )
             return;
           if (event.scope === "project" && event.projectPath !== projectPath) return;
+          if (event.scope === "workspace") refreshStoreRevision();
           emit.push(event);
         };
         const onStatusChange = (event: MemoryConsolidationStatusChangeEventPayload) =>
@@ -248,14 +266,29 @@ export function subscribeMemoryChanges(
           emit.push({ kind: "consolidation_status", workspaceId, projectPath: projectPath ?? "" });
         };
         // ownersInvalidated is emitted lazily, when something probes ownership.
-        // Another backend (multi-instance) removing the owner leaves an idle
-        // tab with nothing to trigger that probe, so probe here: one stat of
-        // config.json per interval (see Config.configFileStamp).
+        // Another backend (multi-instance) removing the owner — or writing the
+        // shared store — leaves an idle tab with nothing to trigger that probe
+        // and no in-process change event, so probe here: one stat of
+        // config.json plus one small revision read per interval. A foreign
+        // write shows up as a changed token and synthesizes the same
+        // root-addressed refresh an ownership change does.
         const ownershipProbe = workspaceId
-          ? setInterval(
-              () => context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId),
-              MEMORY_OWNERSHIP_PROBE_INTERVAL_MS
-            ).unref()
+          ? setInterval(() => {
+              context.memoryService.workspaceMemoryRevision(workspaceId).then(
+                (revision) => {
+                  if (revision === storeRevision) return;
+                  storeRevision = revision;
+                  emit.push({
+                    scope: "workspace",
+                    path: toVirtualPath("workspace", ""),
+                    actor: "agent",
+                    workspaceId: context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId),
+                    projectPath: projectPath ?? "",
+                  });
+                },
+                () => undefined
+              );
+            }, MEMORY_OWNERSHIP_PROBE_INTERVAL_MS).unref()
           : undefined;
         context.memoryService.on("change", onChange);
         context.memoryService.on("ownersInvalidated", onOwnersInvalidated);

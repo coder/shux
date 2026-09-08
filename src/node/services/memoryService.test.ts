@@ -1085,6 +1085,61 @@ describe("MemoryService", () => {
       expect(invalidated).toEqual([["ws-child"]]);
     });
 
+    it("advances the owner store's revision token on shared writes, visible to another backend", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      // A second MemoryService over the same Xum root stands in for another
+      // backend process: it receives none of this instance's change events.
+      const foreign = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
+      expect(await foreign.workspaceMemoryRevision("ws-owner")).toBe("missing");
+
+      await fixture.service.create(fixture.ctx, "/memories/workspace/shared.md", "v1", "agent");
+      const afterCreate = await foreign.workspaceMemoryRevision("ws-owner");
+      expect(afterCreate).not.toBe("missing");
+      // Child and owner read the same (owner-keyed) token.
+      expect(await foreign.workspaceMemoryRevision("ws-child")).toBe(afterCreate);
+
+      // Other scopes leave the workspace store's token alone...
+      await fixture.service.create(fixture.ctx, "/memories/global/g.md", "g", "agent");
+      expect(await foreign.workspaceMemoryRevision("ws-owner")).toBe(afterCreate);
+      // ...while every shared-store mutation advances it.
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/workspace/shared.md",
+        "v1",
+        "v2",
+        "agent"
+      );
+      expect(await foreign.workspaceMemoryRevision("ws-owner")).not.toBe(afterCreate);
+    });
+
+    it("refuses to commit into a self-fallback store once config.json has recovered", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const configFile = path.join(fixture.xumHome, "config.json");
+      const parked = `${configFile}.parked`;
+      // The command resolves its store while config.json is unreadable...
+      await fsPromises.rename(configFile, parked);
+      expect(fixture.service.ownerWorkspaceIdFor(fixture.ctx)).toBe("ws-child");
+      // ...and the file recovers before it commits: the write must not land in
+      // the private store now that the tree is shared again.
+      await fsPromises.rename(parked, configFile);
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/late.md",
+        "x",
+        "agent"
+      );
+      expect(created.success).toBe(false);
+      if (!created.success) expect(created.error).toContain("Ownership of the workspace notebook");
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-child", "memory", "late.md"))
+      ).toBe(false);
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-owner", "memory", "late.md"))
+      ).toBe(false);
+    });
+
     it("refuses a child's rollback into the shared store once the owner is tombstoned", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -1345,7 +1400,7 @@ describe("MemoryService", () => {
       const events: MemoryChangeEvent[] = [];
       fixture.service.on("change", (event: MemoryChangeEvent) => events.push(event));
       const ownerMemory = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
-      fixture.service.notifyExternalMutation(fixture.ctx, [
+      await fixture.service.notifyExternalMutation(fixture.ctx, [
         path.join(ownerMemory, "a.md"),
         path.join(ownerMemory, "dir", "b.md"),
         path.join(fixture.xumHome, "memory", "global", "g.md"),

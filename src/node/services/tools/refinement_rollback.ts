@@ -87,7 +87,7 @@ export function createRefinementRollbackTool(ctx: {
       // Rollback writes inverses straight to disk, bypassing MemoryService's
       // change events; announce them so the (possibly shared) store's other
       // readers — owner, siblings, open Memory tabs — do not keep stale context.
-      ctx.memory?.service.notifyExternalMutation(ctx.memory.ctx, [
+      await ctx.memory?.service.notifyExternalMutation(ctx.memory.ctx, [
         ...result.data.restored,
         ...result.data.deleted,
         ...(result.data.renamed === undefined

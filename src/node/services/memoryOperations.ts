@@ -243,12 +243,12 @@ export function setMemoryPinnedEffect(
         input.pinned
       )
       .pipe(
-        Effect.map(() => {
-          // Pins live in the sidecar, not the store, so nothing else emits a
-          // change: notify so the other tree members' tabs refetch too.
-          context.memoryService.notifyPinChange(resolved.scopeCtx, input.path);
-          return { success: true as const, data: undefined };
-        }),
+        // Pins live in the sidecar, not the store, so nothing else emits a
+        // change: notify so the other tree members' tabs refetch too.
+        Effect.flatMap(() =>
+          Effect.promise(() => context.memoryService.notifyPinChange(resolved.scopeCtx, input.path))
+        ),
+        Effect.map(() => ({ success: true as const, data: undefined })),
         // Sidecar write failures (disk full, permissions) arrive as the typed
         // MemoryMetaWriteError and map onto the legacy string error channel
         // instead of escaping as an untyped INTERNAL_SERVER_ERROR rejection.

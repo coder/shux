@@ -676,7 +676,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   replayStream?(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
   getProvidersConfig(): ProvidersConfigMap | null;
   isExperimentEnabled(experimentId: ExperimentId): boolean;
-  probeMemoryOwnership?(workspaceId: string): void;
+  probeMemoryStore?(workspaceId: string): Promise<string | undefined>;
   buildMemorySessionContext?(
     workspaceId: string,
     modelString: string,
@@ -747,6 +747,8 @@ interface CachedMemoryContext {
   tokenBudgetActive: boolean;
   memoryEnabled: boolean;
   hotSetEnabled: boolean;
+  /** Owner store revision (AIService.probeMemoryStore) the context was built from. */
+  storeRevision: string | undefined;
 }
 
 interface SendMessageInternalOptions {
@@ -9841,11 +9843,15 @@ export class AgentSession {
       this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
-    // Ownership probe first: a removed owner invalidates this cache
-    // synchronously (see AIService.probeMemoryOwnership), so the lookup below
-    // never serves an index built from a store this workspace no longer reads.
-    if (memoryEnabled && typeof this.aiService.probeMemoryOwnership === "function") {
-      this.aiService.probeMemoryOwnership(this.workspaceId);
+    // Store probe first: a removed owner invalidates this cache synchronously
+    // (see AIService.probeMemoryStore), so the lookup below never serves an
+    // index built from a store this workspace no longer reads; and a store
+    // revision advanced by ANOTHER backend process (no in-process change
+    // event) fails the comparison below. Read before the build so a write
+    // racing the build is caught on the next probe.
+    let storeRevision: string | undefined;
+    if (memoryEnabled && typeof this.aiService.probeMemoryStore === "function") {
+      storeRevision = await this.aiService.probeMemoryStore(this.workspaceId);
     }
     const cached = cache.get(modelString);
     // Policy changes must not retain a previously injected extra (including index-only lookups).
@@ -9853,6 +9859,7 @@ export class AgentSession {
       cached?.tokenBudgetActive === tokenBudgetActive &&
       cached.memoryEnabled === memoryEnabled &&
       cached.hotSetEnabled === hotSetEnabled &&
+      cached.storeRevision === storeRevision &&
       (cached.includesHotMemories || !includeHotMemories)
     ) {
       return cached.context ?? undefined;
@@ -9875,6 +9882,7 @@ export class AgentSession {
       tokenBudgetActive,
       memoryEnabled,
       hotSetEnabled,
+      storeRevision,
     });
     return context ?? undefined;
   }

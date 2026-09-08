@@ -287,6 +287,25 @@ function pruneHarvestRecords(records: Record<string, MemoryHarvestRecord>): void
 
 export const HARVEST_MAX_ATTEMPTS = 3;
 
+/** Completed, or failed with retries exhausted: nothing may retry it. */
+function isTerminalHarvestRecord(record: MemoryHarvestRecord): boolean {
+  return (
+    record.status === "completed" ||
+    (record.status === "failed" && record.attemptCount >= HARVEST_MAX_ATTEMPTS)
+  );
+}
+
+/** Terminal marker for a bucket whose transcript is being deleted (see finalizeHarvestsForRemoval). */
+function finalizeHarvestRecordForRemoval(record: MemoryHarvestRecord): MemoryHarvestRecord {
+  return {
+    ...record,
+    status: "failed",
+    completedAt: record.completedAt ?? Date.now(),
+    attemptCount: HARVEST_MAX_ATTEMPTS,
+    error: "workspace removed before the harvest could be retried; transcript no longer available",
+  };
+}
+
 export class MemoryConsolidationService extends EventEmitter {
   private readonly sidecarPath: string;
   /** Serializes sidecar read-modify-write cycles (journal persistence only). */
@@ -479,16 +498,27 @@ export class MemoryConsolidationService extends EventEmitter {
     const self = this;
     return Effect.uninterruptible(
       Effect.gen(function* () {
-        yield* Effect.promise(() =>
+        const saved = yield* Effect.promise(() =>
           self.locks.withLock(self.sidecarPath, async () => {
             const file = await self.load();
             file.harvestsByWorkspace[workspaceId] ??= {};
+            const existing = file.harvestsByWorkspace[workspaceId][boundaryKey];
+            // A terminal record is never reopened: removal finalization
+            // (finalizeHarvestsForRemoval) races the bounded cancellation
+            // drain's residual harvest runs on this file, and a residual
+            // pending/retryable-failure write landing afterwards would turn
+            // a bucket whose transcript is gone back into a retry candidate.
+            // Only a genuine completion may replace it (the writes happened).
+            if (existing !== undefined && isTerminalHarvestRecord(existing)) {
+              if (record.status !== "completed") return false;
+            }
             file.harvestsByWorkspace[workspaceId][boundaryKey] = record;
             pruneHarvestRecords(file.harvestsByWorkspace[workspaceId]);
             await writeFileAtomic(self.sidecarPath, JSON.stringify(file, null, 2));
+            return true;
           })
         );
-        self.emitStatusChange(workspaceId, projectPath);
+        if (saved) self.emitStatusChange(workspaceId, projectPath);
       })
     );
   }
@@ -638,30 +668,29 @@ export class MemoryConsolidationService extends EventEmitter {
    * owner. Mark them terminal now so nothing lingers as "retryable".
    */
   async finalizeHarvestsForRemoval(workspaceId: string): Promise<void> {
-    const sidecar = await this.load();
-    const records = sidecar.harvestsByWorkspace[workspaceId];
-    if (records === undefined) return;
+    // One read-check-write under the sidecar lock: residual harvest runs
+    // (cancelInFlightConsolidation's drain is bounded) may still be recording
+    // outcomes, and a completion landing between an unlocked read and this
+    // write must not be overwritten with a failure.
+    const finalized = await this.locks.withLock(this.sidecarPath, async () => {
+      const file = await this.load();
+      const records = file.harvestsByWorkspace[workspaceId];
+      if (records === undefined) return false;
+      let changed = false;
+      for (const [boundaryKey, record] of Object.entries(records)) {
+        if (isTerminalHarvestRecord(record)) continue;
+        records[boundaryKey] = finalizeHarvestRecordForRemoval(record);
+        changed = true;
+      }
+      if (changed) await writeFileAtomic(this.sidecarPath, JSON.stringify(file, null, 2));
+      return changed;
+    });
+    if (!finalized) return;
     const workspace = this.config.findWorkspace(workspaceId);
-    const projectPath = workspace == null ? "" : resolveConsolidationProjectPath(workspace);
-    for (const [boundaryKey, record] of Object.entries(records)) {
-      if (record.status === "completed") continue;
-      if (record.status === "failed" && record.attemptCount >= HARVEST_MAX_ATTEMPTS) continue;
-      await Effect.runPromise(
-        this.saveHarvestRecordEffect(
-          workspaceId,
-          boundaryKey,
-          {
-            ...record,
-            status: "failed",
-            completedAt: record.completedAt ?? Date.now(),
-            attemptCount: HARVEST_MAX_ATTEMPTS,
-            error:
-              "workspace removed before the harvest could be retried; transcript no longer available",
-          },
-          projectPath
-        )
-      );
-    }
+    this.emitStatusChange(
+      workspaceId,
+      workspace == null ? "" : resolveConsolidationProjectPath(workspace)
+    );
   }
 
   /**

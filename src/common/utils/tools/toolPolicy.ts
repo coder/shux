@@ -82,3 +82,13 @@ export function applyToolPolicy(
 export function isSessionHistoryDisabled(policy?: ToolPolicy): boolean {
   return applyToolPolicyToNames(["session_history"], policy).length === 0;
 }
+
+/**
+ * Whether the effective policy strips the `memory` tool. The persisted
+ * post-compaction harvest permission must reflect the FINAL toolset, not just
+ * the agent class: an editing-capable sub-agent whose policy denies memory
+ * must not have its transcript harvested into the (shared) workspace notebook.
+ */
+export function isMemoryToolDisabled(policy?: ToolPolicy): boolean {
+  return applyToolPolicyToNames(["memory"], policy).length === 0;
+}

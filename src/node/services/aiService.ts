@@ -247,15 +247,20 @@ export class AIService extends EventEmitter {
   }
 
   /**
-   * Re-check who owns this workspace's `/memories/workspace` store. Memoized
-   * and stamp-validated in MemoryService, so this is one stat per call; when
-   * another backend removed the owner since the last turn, the resulting
+   * Re-check who owns this workspace's `/memories/workspace` store and return
+   * that store's revision token. Ownership is memoized and stamp-validated in
+   * MemoryService (one stat), the token is one small read; when another
+   * backend removed the owner since the last turn, the resulting
    * `ownersInvalidated` event clears the affected sessions' cached context
-   * synchronously — AgentSession calls this BEFORE consulting its cache so the
-   * current request, not the next one, rebuilds from the right store.
+   * synchronously, and when another backend WROTE the shared store (no
+   * in-process change event) the token differs from the one recorded with the
+   * cached context. AgentSession calls this BEFORE consulting its cache so the
+   * current request, not the next one, rebuilds from the right, current store.
    */
-  probeMemoryOwnership(workspaceId: string): void {
-    this.turnRequestBuilderBindings.memoryService?.resolveWorkspaceMemoryOwnerId(workspaceId);
+  async probeMemoryStore(workspaceId: string): Promise<string | undefined> {
+    return await this.turnRequestBuilderBindings.memoryService?.workspaceMemoryRevision(
+      workspaceId
+    );
   }
 
   /**
