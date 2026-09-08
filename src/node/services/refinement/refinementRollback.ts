@@ -53,6 +53,7 @@ import {
   type RefinementInverseDraft,
 } from "./refinementJournal";
 import { withTargetMutationLocks } from "./targetMutationLocks";
+import { advanceWorkspaceMemoryRevision } from "./workspaceMemoryRevision";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 
 export type RefinementEvent = Extract<DurableEvent, { kind: "refinement" }>;
@@ -343,6 +344,24 @@ function resolveConfinementRoot(
   throw new RollbackError(
     `Refusing rollback: path is outside every memory scope root: '${filePath}'`
   );
+}
+
+/**
+ * Whether `root` (a confinement root from resolveConfinementRoot) is a
+ * workspace memory root — this session's own or the sanctioned owner's. Its
+ * parent is then the session dir that carries the store's clock
+ * (workspaceMemoryRevision.ts).
+ */
+function isWorkspaceMemoryRoot(
+  sessionDir: string,
+  root: string,
+  sharedWorkspaceMemorySessionDir: string | undefined
+): boolean {
+  const candidates = [path.join(path.resolve(sessionDir), "memory")];
+  if (sharedWorkspaceMemorySessionDir !== undefined) {
+    candidates.push(path.join(path.resolve(sharedWorkspaceMemorySessionDir), "memory"));
+  }
+  return candidates.includes(path.resolve(root));
 }
 
 /**
@@ -1020,6 +1039,24 @@ export async function rollbackRefinement(
         // Inverse blob puts + the append referencing them run under the
         // journal blob lock: a concurrent reclamation pass must never
         // observe the put→append window (see withBlobLock).
+        // A workspace-memory rollback is a store mutation like any other:
+        // advance the owner store's clock (under the target lock held here)
+        // for this row's cross-journal order AND as the cross-process change
+        // signal — the debug CLI reaches this engine without MemoryService,
+        // so nothing else would tell other backends' caches and Memory tabs.
+        const workspaceMemoryRoot = [...new Set(roots.values())].find((root) =>
+          isWorkspaceMemoryRoot(opts.sessionDir, root, opts.sharedWorkspaceMemorySessionDir)
+        );
+        let sourceTs: number | undefined;
+        if (kind === "memory" && workspaceMemoryRoot !== undefined) {
+          try {
+            sourceTs = await advanceWorkspaceMemoryRevision(path.dirname(workspaceMemoryRoot));
+          } catch (error) {
+            // Best-effort like the rest of this block: the row must still be
+            // journaled (falling back to its own `ts` for ordering).
+            log.debug("[refinement] failed to advance workspace memory revision", { error });
+          }
+        }
         let publishedBlobs: BlobQuotaEntry[] = [];
         const row = await journal.withBlobLock(async () => {
           const resolved = await resolveRefinementInverse(journal.blobs, newInverse);
@@ -1040,6 +1077,7 @@ export async function rollbackRefinement(
                 ...(opts.evidence.actor !== undefined ? { actor: opts.evidence.actor } : {}),
               },
               rollbackOf: opts.id,
+              ...(sourceTs !== undefined ? { sourceTs } : {}),
             },
           });
         });

@@ -1116,14 +1116,13 @@ describe("MemoryService", () => {
     it("refuses to commit into a self-fallback store once config.json has recovered", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
-      const configFile = path.join(fixture.xumHome, "config.json");
-      const parked = `${configFile}.parked`;
-      // The command resolves its store while config.json is unreadable...
-      await fsPromises.rename(configFile, parked);
-      expect(fixture.service.ownerWorkspaceIdFor(fixture.ctx)).toBe("ws-child");
-      // ...and the file recovers before it commits: the write must not land in
-      // the private store now that the tree is shared again.
-      await fsPromises.rename(parked, configFile);
+      // Mid-command race: the command resolves its store while config.json is
+      // unreadable (self-fallback) and the file recovers before the commit
+      // check inside the mutation lock. Only the command's FIRST resolution
+      // is faked; the pre-commit re-resolution sees the recovered tree.
+      spyOn(fixture.service, "resolveWorkspaceMemoryOwnerId").mockImplementationOnce(
+        () => "ws-child"
+      );
       const created = await fixture.service.create(
         fixture.ctx,
         "/memories/workspace/late.md",
@@ -1138,6 +1137,32 @@ describe("MemoryService", () => {
       expect(
         await pathExists(path.join(fixture.config.sessionsDir, "ws-owner", "memory", "late.md"))
       ).toBe(false);
+    });
+
+    it("re-resolves the owner per command and refuses reads once the owner is tombstoned", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      // One context serves a whole stream (createMemoryTool): a cached owner
+      // must not outlive the command that resolved it.
+      expect(fixture.service.ownerWorkspaceIdFor(fixture.ctx)).toBe("ws-owner");
+      const resolve = spyOn(fixture.service, "resolveWorkspaceMemoryOwnerId");
+      expect((await fixture.service.view(fixture.ctx, "/memories/workspace/n.md")).success).toBe(
+        true
+      );
+      expect(resolve).toHaveBeenCalled();
+
+      // Another backend removed the owner: its durable tombstone (no local
+      // event) must stop the child's reads of the shared notebook.
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-owner");
+      await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-owner" }));
+      const refused = await fixture.service.view(fixture.ctx, "/memories/workspace/n.md");
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("was removed");
+      const root = await fixture.service.view(fixture.ctx, "/memories");
+      expect(root.success).toBe(true);
+      if (root.success) expect(root.output).toContain("unavailable");
     });
 
     it("refuses a child's rollback into the shared store once the owner is tombstoned", async () => {
@@ -1356,6 +1381,70 @@ describe("MemoryService", () => {
       expect(await pathExists(shared)).toBe(false);
     });
 
+    it("orders owner and child rows of the shared store by one store clock, advanced by rollbacks too", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      // Interleaved edits from two journals: `ts`/`seq` are not comparable
+      // across them (and can tie within a millisecond), the store clock is.
+      await fixture.service.create(fixture.ctx, "/memories/workspace/s.md", "c1", "agent");
+      await fixture.service.strReplace(ownerCtx, "/memories/workspace/s.md", "c1", "o1", "agent");
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/workspace/s.md",
+        "o1",
+        "c2",
+        "agent"
+      );
+      const [childCreate, childEdit] = await readRefinementEvents(childSessionDir);
+      const [ownerEdit] = await readRefinementEvents(ownerSessionDir);
+      const clocks = [childCreate, ownerEdit, childEdit].map((row) => row.data.sourceTs);
+      expect(clocks.every((clock) => typeof clock === "number")).toBe(true);
+      expect(clocks[0]!).toBeLessThan(clocks[1]!);
+      expect(clocks[1]!).toBeLessThan(clocks[2]!);
+      // The published token never lags a row's clock (change events tick it once more).
+      expect(
+        Number(await fixture.service.workspaceMemoryRevision("ws-child"))
+      ).toBeGreaterThanOrEqual(Math.max(...(clocks as number[])));
+
+      // The owner's edit is not the newest for that path: refused without force.
+      const stale = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: ownerEdit.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(stale.success).toBe(false);
+      // A rollback (here through the engine directly, as the debug CLI does)
+      // is a store mutation too: it advances the clock other backends watch...
+      const before = await fixture.service.workspaceMemoryRevision("ws-owner");
+      const undone = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        id: childEdit.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(undone.success).toBe(true);
+      const after = await fixture.service.workspaceMemoryRevision("ws-owner");
+      expect(Number(after)).toBeGreaterThan(Number(before));
+      // ...and its row takes the next clock value, so the owner's edit is now
+      // the newest and rolls back cleanly.
+      const rollbackRow = (await readRefinementEvents(childSessionDir)).find(
+        (row) => row.data.rollbackOf === childEdit.id
+      )!;
+      expect(rollbackRow.data.sourceTs).toBe(Number(after));
+      expect(
+        (
+          await rollbackRefinement({
+            sessionDir: ownerSessionDir,
+            id: ownerEdit.id,
+            evidence: { toolName: "test", actor: "user" },
+          })
+        ).success
+      ).toBe(true);
+    });
+
     it("the refinement_rollback tool refuses memory rollbacks into a read-only scope", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -1383,6 +1472,27 @@ describe("MemoryService", () => {
       const refused = await run({ global: "read", project: "read", workspace: "read" });
       expect(refused.success).toBe(false);
       expect(refused.error).toContain("read-only");
+      expect(await pathExists(physical)).toBe(true);
+
+      // A context whose scope roots do not contain the row's paths (here an
+      // unrelated workspace's) cannot evaluate the policy: fail closed even
+      // with read-write access.
+      const foreignTool = createRefinementRollbackTool({
+        workspaceId: "ws-child",
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        memory: {
+          service: fixture.service,
+          ctx: { ...fixture.ctx, workspaceId: "ws-solo" },
+          access: { global: "readwrite", project: "readwrite", workspace: "readwrite" },
+        },
+      });
+      const unclassifiable = (await foreignTool.execute!(
+        { id: row.id, reason: "test" },
+        mockToolCallOptions
+      )) as { success: boolean; error?: string };
+      expect(unclassifiable.success).toBe(false);
+      expect(unclassifiable.error).toContain("Cannot classify");
       expect(await pathExists(physical)).toBe(true);
 
       const allowed = await run({

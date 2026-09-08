@@ -78,7 +78,11 @@ export interface RefinementEmitArgs {
   postState?: RefinementPostState;
   /** Source identity of a row copied from a removed sub-agent's journal (see durableEvent.ts). */
   migratedFrom?: string;
-  /** Source row's `ts` for a migrated row (see durableEvent.ts). */
+  /**
+   * Cross-journal order key (see durableEvent.ts): the shared store's clock
+   * for a workspace-scope mutation (workspaceMemoryRevision.ts), or the
+   * source row's value/`ts` for a migrated row.
+   */
   sourceTs?: number;
   /**
    * "remote" when the mutation ran through a non-local runtime (SSH/Docker).
@@ -179,10 +183,10 @@ export async function reclaimExcessRefinementInverseBlobs(
   options?: {
     /**
      * The published payloads belong to rows appended out of chronological
-     * order (shared-memory row migration stamps `sourceTs`): re-derive the
-     * retained set from the journal in source order instead of treating them
-     * as the newest, so an old migrated inverse cannot evict the owner's
-     * genuinely recent rollback data.
+     * order (shared-memory row migration): re-derive the retained set from
+     * the journal in source order instead of treating them as the newest, so
+     * an old migrated inverse cannot evict the owner's genuinely recent
+     * rollback data.
      */
     resweep?: boolean;
   }
@@ -284,8 +288,10 @@ export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Pr
   const publishedBlobs = await journal.withBlobLock(() =>
     appendRefinementEventUnderBlobLock(journal, args)
   );
+  // Live rows may carry a store-clock `sourceTs` too (MemoryService); only
+  // MIGRATED rows are appended out of order and need the source-order resweep.
   await reclaimRefinementInverseBlobsBestEffort(journal, publishedBlobs, {
-    resweep: args.sourceTs !== undefined,
+    resweep: args.migratedFrom !== undefined,
   });
 }
 

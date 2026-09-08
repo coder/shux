@@ -17,7 +17,7 @@
  * documented limitation.
  */
 import { EventEmitter } from "events";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
@@ -32,7 +32,6 @@ import {
   MEMORY_SCOPES,
   MEMORY_VIEW_MAX_DEPTH,
   MEMORY_VIRTUAL_ROOT,
-  WORKSPACE_MEMORY_REVISION_FILE_NAME,
   type MemoryScope,
 } from "@/common/constants/memory";
 import { PlatformPaths } from "@/common/utils/paths";
@@ -48,6 +47,10 @@ import {
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
+import {
+  advanceWorkspaceMemoryRevision,
+  readWorkspaceMemoryRevision,
+} from "@/node/services/refinement/workspaceMemoryRevision";
 import {
   REFINEMENT_CAPTURE_MAX_FILES,
   REFINEMENT_CAPTURE_MAX_TOTAL_BYTES,
@@ -816,8 +819,15 @@ export class MemoryService extends EventEmitter {
   }
 
   private async runCommand(
+    ctx: MemoryScopeContext,
     operation: () => Promise<MemoryCommandResult>
   ): Promise<MemoryCommandResult> {
+    // The per-context owner cache is scoped to ONE command: createMemoryTool
+    // reuses a context for a whole stream, and a cached owner would otherwise
+    // let a child keep reading its parent's notebook after the tree changed
+    // (owner removed by another backend — no local event) for as long as the
+    // stream lives. Re-resolving costs one memoized, stamp-validated lookup.
+    this.ownerByContext.delete(ctx);
     try {
       return await operation();
     } catch (error) {
@@ -843,9 +853,49 @@ export class MemoryService extends EventEmitter {
     relPath: string
   ): Promise<MemoryStore> {
     const store = this.getStore(ctx, scope);
+    if (scope === "workspace") await this.assertWorkspaceStoreReadable(ctx, store);
     await store.assertRootSafe();
     await store.assertContained(relPath);
     return store;
+  }
+
+  /**
+   * The workspace whose session dir physically holds `store`
+   * (<sessionsDir>/<owner>/memory → owner), or null for global/project roots,
+   * which live elsewhere.
+   */
+  private storeOwnerWorkspaceId(store: MemoryStore): string | null {
+    const rel = path.relative(this.config.sessionsDir, store.physicalRoot);
+    if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+    return rel.split(path.sep)[0];
+  }
+
+  /** Acting workspace plus the store's owner: both must be alive to touch the store. */
+  private guardedWorkspaceIds(ctx: MemoryScopeContext, store: MemoryStore): string[] {
+    const owner = this.storeOwnerWorkspaceId(store);
+    return [...new Set(owner === null ? [ctx.workspaceId] : [ctx.workspaceId, owner])];
+  }
+
+  /**
+   * Reads have no commit guard, so a removed child's stream in ANOTHER backend
+   * (which the remover cannot cancel) could keep viewing its former owner's
+   * notebook — including notes written after the removal — through the
+   * shared store. Refuse workspace-scope reads once the acting workspace or
+   * the store's owner is tombstoned (the tombstone is durable and
+   * cross-process; see workspaceRemoval.ts).
+   */
+  private async assertWorkspaceStoreReadable(
+    ctx: MemoryScopeContext,
+    store: MemoryStore
+  ): Promise<void> {
+    if (ctx.workspaceId === "") return;
+    for (const workspaceId of this.guardedWorkspaceIds(ctx, store)) {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+        throw new MemoryCommandError(
+          `Workspace ${workspaceId} was removed; the workspace memory store is no longer available`
+        );
+      }
+    }
   }
 
   private requireFilePath(parsed: ParsedMemoryPath, virtualPath: string): MemoryScope {
@@ -872,6 +922,7 @@ export class MemoryService extends EventEmitter {
    */
   private async journalRefinement(
     ctx: MemoryScopeContext,
+    store: MemoryStore,
     action: MemoryRefinementAction,
     inverse: RefinementInverseDraft,
     actor: MemoryActor,
@@ -884,6 +935,9 @@ export class MemoryService extends EventEmitter {
       });
       return;
     }
+    // Workspace-scope rows carry the owner store's clock so rows from every
+    // tree member's journal order consistently (see workspaceMemoryRevision.ts).
+    const sourceTs = await this.advanceStoreRevision(store);
     await appendRefinementEvent({
       sessionDir: path.join(this.config.sessionsDir, ctx.workspaceId),
       workspaceId: ctx.workspaceId,
@@ -896,6 +950,7 @@ export class MemoryService extends EventEmitter {
         ...(toolCallId !== undefined ? { toolCallId } : {}),
       },
       ...(postFiles !== undefined ? { postFiles } : {}),
+      ...(sourceTs !== undefined ? { sourceTs } : {}),
     });
   }
 
@@ -946,12 +1001,8 @@ export class MemoryService extends EventEmitter {
       );
     }
     if (ctx.workspaceId === "") return;
-    const guarded = new Set([ctx.workspaceId]);
-    // <sessionsDir>/<owner>/memory → owner; global/project roots live elsewhere.
-    const rel = path.relative(this.config.sessionsDir, store.physicalRoot);
-    if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) {
-      const boundOwner = rel.split(path.sep)[0];
-      guarded.add(boundOwner);
+    const boundOwner = this.storeOwnerWorkspaceId(store);
+    if (boundOwner !== null) {
       const currentOwner = this.resolveWorkspaceMemoryOwnerId(ctx.workspaceId);
       if (currentOwner !== boundOwner) {
         throw new MemoryCommandError(
@@ -959,7 +1010,7 @@ export class MemoryService extends EventEmitter {
         );
       }
     }
-    for (const workspaceId of guarded) {
+    for (const workspaceId of this.guardedWorkspaceIds(ctx, store)) {
       if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
         throw new MemoryCommandError(
           `Workspace ${workspaceId} was removed; refusing to commit the mutation of ${virtualPath}`
@@ -1091,41 +1142,32 @@ export class MemoryService extends EventEmitter {
       workspaceId: this.ownerWorkspaceIdFor(ctx),
       projectPath: ctx.projectPath,
     };
+    // Pin toggles and rollback announcements reach the store's other readers
+    // only through this event, so the cross-process token moves here as well
+    // (mutations already advanced it for their row's sourceTs; a second tick
+    // is harmless — the clock only ever grows).
     if (scope === "workspace" && event.workspaceId !== "") {
-      await this.bumpWorkspaceMemoryRevision(event.workspaceId);
+      await this.advanceStoreRevision(this.getStore(ctx, "workspace"));
     }
     this.emit("change", event);
   }
 
-  private workspaceMemoryRevisionPath(ownerWorkspaceId: string): string {
-    return path.join(
-      this.config.sessionsDir,
-      ownerWorkspaceId,
-      WORKSPACE_MEMORY_REVISION_FILE_NAME
-    );
-  }
-
   /**
-   * Rewrite the owner store's revision token (see
-   * WORKSPACE_MEMORY_REVISION_FILE_NAME) after a workspace-scope mutation.
-   * Runs before the in-process change event so an in-process rebuild
-   * triggered by the event records the new token. Best-effort and never
-   * creates the session directory: a pin toggle on a never-written store has
-   * no cache to invalidate, and a removed owner's directory must not be
-   * recreated (mutations are already refused pre-commit; see
-   * assertMutationCommittable).
+   * Advance the owner store's clock (see workspaceMemoryRevision.ts) for a
+   * workspace-scope mutation and return it for the row's `sourceTs`. Callers
+   * hold the store's target mutation lock. Best-effort: a failure (removed
+   * owner directory — mutations are already refused pre-commit, see
+   * assertMutationCommittable; a pin toggle on a never-written store) must
+   * not fail the command, so the row then falls back to its journal `ts`.
    */
-  private async bumpWorkspaceMemoryRevision(ownerWorkspaceId: string): Promise<void> {
+  private async advanceStoreRevision(store: MemoryStore): Promise<number | undefined> {
+    const owner = this.storeOwnerWorkspaceId(store);
+    if (owner === null) return undefined;
     try {
-      await fsPromises.writeFile(
-        this.workspaceMemoryRevisionPath(ownerWorkspaceId),
-        `${Date.now()}:${randomUUID()}`
-      );
+      return await advanceWorkspaceMemoryRevision(path.join(this.config.sessionsDir, owner));
     } catch (error) {
-      log.debug("[MemoryService] failed to write workspace memory revision", {
-        ownerWorkspaceId,
-        error,
-      });
+      log.debug("[MemoryService] failed to advance workspace memory revision", { owner, error });
+      return undefined;
     }
   }
 
@@ -1140,14 +1182,10 @@ export class MemoryService extends EventEmitter {
    */
   async workspaceMemoryRevision(workspaceId: string): Promise<string> {
     assert(workspaceId.length > 0, "workspaceMemoryRevision requires a workspaceId");
-    try {
-      return await fsPromises.readFile(
-        this.workspaceMemoryRevisionPath(this.resolveWorkspaceMemoryOwnerId(workspaceId)),
-        "utf-8"
-      );
-    } catch {
-      return "missing";
-    }
+    const revision = await readWorkspaceMemoryRevision(
+      path.join(this.config.sessionsDir, this.resolveWorkspaceMemoryOwnerId(workspaceId))
+    );
+    return revision === null ? "missing" : String(revision);
   }
 
   /**
@@ -1232,7 +1270,7 @@ export class MemoryService extends EventEmitter {
     virtualPath: string,
     options?: { offset?: number; limit?: number }
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
       if (parsed.scope === null) {
         // Virtual root: list every scope.
@@ -1241,6 +1279,7 @@ export class MemoryService extends EventEmitter {
           sections.push(`- ${scope}/`);
           try {
             const store = this.getStore(ctx, scope);
+            if (scope === "workspace") await this.assertWorkspaceStoreReadable(ctx, store);
             // Read-only: never create roots just to list (missing ⇒ empty).
             await store.assertRootSafe();
             const files = await store.listFiles();
@@ -1289,7 +1328,7 @@ export class MemoryService extends EventEmitter {
     toolCallId?: string,
     abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       assertWithinFileSizeCap(fileText);
@@ -1318,6 +1357,7 @@ export class MemoryService extends EventEmitter {
         // Row is written before the create is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
+          store,
           { op: "create", path: toVirtualPath(scope, parsed.relPath) },
           { op: "delete-files", paths: [store.physicalPath(parsed.relPath)] },
           actor,
@@ -1343,7 +1383,7 @@ export class MemoryService extends EventEmitter {
     toolCallId?: string,
     abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       if (oldStr.length === 0) {
@@ -1359,6 +1399,7 @@ export class MemoryService extends EventEmitter {
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
+          store,
           { op: "str_replace", path: toVirtualPath(scope, parsed.relPath) },
           {
             op: "restore-files",
@@ -1385,7 +1426,7 @@ export class MemoryService extends EventEmitter {
     expectedFingerprint?: string,
     abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
@@ -1412,6 +1453,7 @@ export class MemoryService extends EventEmitter {
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
+          store,
           { op: "insert", path: toVirtualPath(scope, parsed.relPath) },
           {
             op: "restore-files",
@@ -1450,7 +1492,7 @@ export class MemoryService extends EventEmitter {
       | { command: "delete"; path: string }
       | { command: "rename"; path: string; new_path: string }
   ): Promise<{ ok: true } | { ok: false; error: string }> {
-    const result = await this.runCommand(async () => {
+    const result = await this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(command.path);
       const scope = this.requireFilePath(parsed, command.path);
       switch (command.command) {
@@ -1565,7 +1607,7 @@ export class MemoryService extends EventEmitter {
     expectedFingerprint?: string,
     abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
@@ -1595,6 +1637,7 @@ export class MemoryService extends EventEmitter {
         if (inverse !== null) {
           await this.journalRefinement(
             ctx,
+            store,
             { op: "delete", path: toVirtualPath(scope, parsed.relPath) },
             inverse,
             actor,
@@ -1619,7 +1662,7 @@ export class MemoryService extends EventEmitter {
     toolCallId?: string,
     abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const oldParsed = parseMemoryPath(oldVirtualPath);
       const newParsed = parseMemoryPath(newVirtualPath);
       const scope = this.requireFilePath(oldParsed, oldVirtualPath);
@@ -1657,6 +1700,7 @@ export class MemoryService extends EventEmitter {
         // Row is written before the rename is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
+          store,
           {
             op: "rename",
             path: toVirtualPath(scope, oldParsed.relPath),

@@ -42,7 +42,15 @@ async function refuseReadOnlyMemoryRollback(
         : [...inverse.data.files.map((file) => file.path), ...(inverse.data.deletePaths ?? [])];
   for (const physicalPath of paths) {
     const scope = memory.service.scopeOfPhysicalPath(memory.ctx, physicalPath);
-    if (scope !== null && memory.access[scope] !== "readwrite") {
+    // Fail closed: a memory row's paths always lie in some scope root, so
+    // "unclassifiable" means this context's roots no longer match the row
+    // (e.g. the owner root admitted at preparation time while the per-context
+    // resolver now falls back to self because config.json is unreadable) —
+    // the policy cannot be evaluated, so the write must not proceed.
+    if (scope === null) {
+      return `Cannot classify '${physicalPath}' against this agent's memory scopes; refusing to roll back '${id}'.`;
+    }
+    if (memory.access[scope] !== "readwrite") {
       return `The ${scope} memory scope is read-only for this agent; rolling back '${id}' would write into it.`;
     }
   }
