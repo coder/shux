@@ -2389,6 +2389,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         !process.isForeground &&
         process.monitor != null &&
         !process.monitor.stopped &&
+        // Registry recovery cannot restore match lines awaiting flush or wake acceptance.
+        process.monitor.pendingLines.length === 0 &&
+        process.monitor.retainedMatches.length === 0 &&
         durableMonitorGenerations?.get(process.id) === process.monitor.armMetadata.createdAt
       ) {
         continue;
