@@ -332,7 +332,7 @@ export function projectMemoryDirName(projectPath: string): string {
   return `${base}-${hash}`;
 }
 
-function toVirtualPath(scope: MemoryScope, relPath: string): string {
+export function toVirtualPath(scope: MemoryScope, relPath: string): string {
   return relPath === ""
     ? `${MEMORY_VIRTUAL_ROOT}/${scope}`
     : `${MEMORY_VIRTUAL_ROOT}/${scope}/${relPath}`;

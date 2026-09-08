@@ -1333,6 +1333,15 @@ describe("MemoryConsolidationService", () => {
       "agent"
     );
     const dayAgo = Date.now() - 25 * 60 * 60 * 1000;
+    // A recently-used child keeps the whole tree's notebook "not idle": the
+    // owner must not be swept on its own stale recency.
+    await fixture.service.runLaunchSweep(
+      new Map([
+        ["ws-sub", Date.now()],
+        ["ws-dream", dayAgo],
+      ])
+    );
+    expect(fixture.modelCalls).toHaveLength(0);
     await fixture.service.runLaunchSweep(
       new Map([
         ["ws-sub", dayAgo],

@@ -24,6 +24,7 @@ import type { LogEntry } from "@/node/services/logBuffer";
 import { subscribeLogFeed } from "@/node/services/logBuffer";
 import {
   resolveMemoryProjectIdentity,
+  toVirtualPath,
   type MemoryChangeEvent,
 } from "@/node/services/memoryService";
 
@@ -228,10 +229,27 @@ export function subscribeMemoryChanges(
         };
         const onStatusChange = (event: MemoryConsolidationStatusChangeEventPayload) =>
           emit.push(event);
+        // Ownership changed for this workspace (its owner was removed; it
+        // now reads its own store). No mutation event accompanies a removal,
+        // so synthesize a root-addressed refresh for the file list and the
+        // consolidation status, both of which described the old store.
+        const onOwnersInvalidated = (workspaceIds: string[]) => {
+          if (!workspaceId || !workspaceIds.includes(workspaceId)) return;
+          emit.push({
+            scope: "workspace",
+            path: toVirtualPath("workspace", ""),
+            actor: "user",
+            workspaceId: context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId),
+            projectPath: projectPath ?? "",
+          });
+          emit.push({ kind: "consolidation_status", workspaceId, projectPath: projectPath ?? "" });
+        };
         context.memoryService.on("change", onChange);
+        context.memoryService.on("ownersInvalidated", onOwnersInvalidated);
         context.memoryConsolidationService.on("statusChange", onStatusChange);
         return () => {
           context.memoryService.off("change", onChange);
+          context.memoryService.off("ownersInvalidated", onOwnersInvalidated);
           context.memoryConsolidationService.off("statusChange", onStatusChange);
         };
       },

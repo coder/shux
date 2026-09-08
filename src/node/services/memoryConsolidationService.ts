@@ -1238,8 +1238,6 @@ export class MemoryConsolidationService extends EventEmitter {
       const archivedById = new Map<string, boolean>();
       const projectPathByWorkspace = new Map<string, string>();
       const cfg = self.config.loadConfigOrDefault();
-      const sharesOwnerStore = (workspaceId: string) =>
-        self.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId, () => cfg) !== workspaceId;
       for (const [configProjectPath, project] of cfg.projects) {
         for (const workspace of project.workspaces) {
           if (workspace.id === undefined) continue;
@@ -1263,14 +1261,21 @@ export class MemoryConsolidationService extends EventEmitter {
         ])
       );
 
-      let started = 0;
+      // Shared stores: a child's writes are keyed under its owner, so the
+      // owner's row absorbs every tree member's recency (a notebook is idle
+      // only when the WHOLE tree is) and child rows are then dropped —
+      // running a child would just redirect to the owner anyway.
+      const treeRecency = new Map<string, number>();
       for (const [workspaceId, recency] of recencyByWorkspace) {
+        const ownerId = self.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId, () => cfg);
+        treeRecency.set(ownerId, Math.max(treeRecency.get(ownerId) ?? 0, recency));
+      }
+
+      let started = 0;
+      for (const [workspaceId, recency] of treeRecency) {
         if (started >= MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP) break;
         if (now - recency < MEMORY_CONSOLIDATION_IDLE_MS) continue;
         if (archivedById.get(workspaceId) === true) continue;
-        // Shared store: the owner's own sweep covers a child's writes (they
-        // are keyed under the owner); running the child would just redirect.
-        if (sharesOwnerStore(workspaceId)) continue;
         const lastRunAt = sidecar.workspaces[workspaceId]?.lastRunAt ?? 0;
         const projectPath = projectPathByWorkspace.get(workspaceId) ?? "";
         const projectRunAt = projectPath === "" ? 0 : (projectLastRunAt.get(projectPath) ?? 0);
