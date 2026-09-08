@@ -1014,6 +1014,10 @@ export class AIService extends EventEmitter {
           startupState.pendingRunMetadataId = null;
         }
         await buildOutcome.deleteAbortedPlaceholder(buildOutcome.assistantMessageId);
+      } else {
+        // The stream is live: durable effects gated on "actually started"
+        // (memory harvest grant) may land now.
+        await buildOutcome.onStreamStarted?.();
       }
 
       buildOutcome.logStartOutcome("started");

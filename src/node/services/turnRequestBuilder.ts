@@ -512,6 +512,13 @@ type TurnRequestBuildOutcome =
       assistantMessageId: string;
       deleteAbortedPlaceholder: (messageId: string) => Promise<void>;
       logStartOutcome: (outcome: "started" | "stream_start_failed", errorType?: string) => void;
+      /**
+       * Durable side effects that must only land once the stream has actually
+       * started (a granted memory harvest permission): every earlier exit —
+       * append failure, late abort, thinking rebuild, stream start failure —
+       * then leaves nothing behind. Awaited by the caller after startStream.
+       */
+      onStreamStarted?: () => Promise<void>;
     };
 
 export interface PreparedStreamMessage extends AsyncDisposable {
@@ -1443,16 +1450,17 @@ export class TurnRequestBuilder {
       memoryExperimentEnabled &&
       this.dependencies.bindings.memoryService !== undefined &&
       !isMemoryToolDisabled(effectiveToolPolicy);
-    // Persist the harvest permission for a request that is about to stream:
-    // NOT at preparation time — an admission-only candidate
-    // (prepareStreamMessage) may be rejected or disposed without running and
-    // must not leave a writable bit behind for the preceding read-only
-    // transcript. Awaited (a config write happens only when the value
-    // changes) so the durable policy is in place before the turn can produce
-    // a compaction. Returns false when a DENY could not be persisted: a stale
-    // persisted `true` would let a now read-only agent's transcript harvest
-    // into the (shared) workspace notebook after a restart, so the turn must
-    // not start.
+    // Persisting the harvest permission is asymmetric because the two values
+    // fail differently when the turn then never streams: a stale DENY only
+    // fails closed (the preceding transcript is not harvested), a stale GRANT
+    // would let the preceding read-only transcript harvest into the (shared)
+    // workspace notebook after a restart. So a deny is persisted inside
+    // `start` before anything else (and refuses the turn when it cannot be
+    // made durable), while a grant is persisted only once the stream has
+    // actually started (onStreamStarted) — never at preparation time, where
+    // an admission-only candidate (prepareStreamMessage) may be rejected or
+    // disposed without running. Awaited (a config write happens only when
+    // the value changes). Returns false when a deny could not be persisted.
     const persistWorkspaceMemoryWritable = async (writable: boolean): Promise<boolean> => {
       const sink = this.dependencies.bindings.workspaceMemoryPolicySink;
       if (isCompactionRequest || !sink) return true;
@@ -2761,12 +2769,11 @@ export class TurnRequestBuilder {
         };
       // Final toolset of the request being started: request.assemble
       // middleware ran inside prepareModelRequest, and `memory` is a built-in
-      // that tool search never defers, so its absence means denied.
-      if (
-        !(await persistWorkspaceMemoryWritable(
-          workspaceMemoryWritable && tools.memory !== undefined
-        ))
-      ) {
+      // that tool search never defers, so its absence means denied. The deny
+      // lands now; the grant waits for onStreamStarted (see
+      // persistWorkspaceMemoryWritable).
+      const finalWorkspaceMemoryWritable = workspaceMemoryWritable && tools.memory !== undefined;
+      if (!finalWorkspaceMemoryWritable && !(await persistWorkspaceMemoryWritable(false))) {
         const errorEvent = createErrorEvent(workspaceId, {
           messageId: createAssistantMessageId(),
           error: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR,
@@ -3026,12 +3033,14 @@ export class TurnRequestBuilder {
                   throw error;
                 }
                 // The fallback runs its own request.assemble pass, which may
-                // strip `memory`; the persisted harvest permission must follow
-                // the request actually streamed, not the refused primary.
+                // strip or keep `memory` independently of the primary; the
+                // persisted harvest permission must follow the request
+                // actually streamed, in both directions. The stream is
+                // already running here, so a grant may land immediately.
                 if (
-                  workspaceMemoryWritable &&
-                  nextRequest.tools.memory === undefined &&
-                  !(await persistWorkspaceMemoryWritable(false))
+                  !(await persistWorkspaceMemoryWritable(
+                    workspaceMemoryWritable && nextRequest.tools.memory !== undefined
+                  ))
                 ) {
                   runLanguageModelCleanup(nextRequest.model);
                   return Err(WORKSPACE_MEMORY_POLICY_PERSIST_ERROR);
@@ -3206,6 +3215,16 @@ export class TurnRequestBuilder {
         assistantMessageId,
         deleteAbortedPlaceholder,
         logStartOutcome,
+        ...(finalWorkspaceMemoryWritable
+          ? {
+              // Best-effort once streaming: the turn really runs with a
+              // writable memory tool, so an unpersisted grant only fails the
+              // harvest closed (persistWorkspaceMemoryWritable warns).
+              onStreamStarted: async () => {
+                await persistWorkspaceMemoryWritable(true);
+              },
+            }
+          : {}),
       };
     };
     retained = true;
