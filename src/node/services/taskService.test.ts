@@ -12,6 +12,7 @@ import {
 } from "@/constants/terminationTimeouts";
 import { Config, type ProjectsConfig, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
+import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import * as subagentGitPatchArtifacts from "@/node/services/subagentGitPatchArtifacts";
 import {
   getSubagentGitPatchMboxPath,
@@ -16827,6 +16828,113 @@ describe("TaskService", () => {
     expect(remainingTaskIds).toContain(childTwoId);
   });
 
+  test("best-of finalization never ships a report a resumed sibling is replacing", async () => {
+    const parentId = "parent-best-of-resumed-sibling";
+    const childOneId = "child-best-of-resumed-sibling-1";
+    const childTwoId = "child-best-of-resumed-sibling-2";
+    const bestOf = { groupId: "best-of-resumed-sibling", index: 0, total: 2 } as const;
+
+    const { config, historyService, partialService, taskService } =
+      await createBestOfTaskServiceTestHarness({
+        parentId,
+        children: [
+          {
+            id: childOneId,
+            name: "agent_explore_child_1",
+            taskStatus: "running",
+            bestOf,
+          },
+          {
+            // Reported once, then its re-run was stopped: the user resume below replaces its report.
+            id: childTwoId,
+            name: "agent_explore_child_2",
+            taskStatus: "interrupted",
+            bestOf: { ...bestOf, index: 1 },
+          },
+        ],
+      });
+
+    await writePendingBestOfParentPartial({
+      partialService,
+      parentId,
+      messageId: "assistant-parent-best-of-resumed-sibling",
+      toolCallId: "task-best-of-resumed-sibling-call",
+      title: "Best of 2",
+      n: 2,
+      timestamp: Date.now(),
+    });
+    await upsertTestSubagentReports({
+      config,
+      parentId,
+      reports: [
+        {
+          childTaskId: childTwoId,
+          reportMarkdown: "Report from child two (pre-continuation)",
+          title: "Option two (stale)",
+        },
+      ],
+    });
+
+    // Barrier at the commit of child one's grouped output: its assembly has already read child
+    // two's old artifact. Resume child two and let its replacement report race the commit. The
+    // replacement is started, not awaited (awaiting it under the assembly's lock would deadlock);
+    // the barrier lifts once child two asks for the group lock, so it has run as far as the lock
+    // lets it: blocked before publishing, or, were publication unserialized, already published
+    // and queueing for delivery.
+    const groupLocks = (taskService as unknown as { deferredBestOfLocks: MutexMap<string> })
+      .deferredBestOfLocks;
+    const withGroupLock = groupLocks.withLock.bind(groupLocks);
+    let onGroupLockRequested: (() => void) | undefined;
+    spyOn(groupLocks, "withLock").mockImplementation(((
+      key: string,
+      operation: () => Promise<unknown>
+    ) => {
+      if (key === parentId) onGroupLockRequested?.();
+      return withGroupLock(key, operation);
+    }) as typeof groupLocks.withLock);
+    const updatePartial = historyService.updatePartialIfMessageIdMatches.bind(historyService);
+    let replacementReport: Promise<void> | undefined;
+    spyOn(historyService, "updatePartialIfMessageIdMatches").mockImplementationOnce(
+      async (workspaceId, messageId, updater) => {
+        expect(await taskService.markInterruptedTaskRunning(childTwoId)).toBe(true);
+        const groupLockRequested = new Promise<void>((resolve) => {
+          onGroupLockRequested = resolve;
+        });
+        replacementReport = finalizeReportedChildTaskForTest({
+          historyService,
+          partialService,
+          taskService,
+          childId: childTwoId,
+          reportMarkdown: "Report from child two (continuation)",
+          title: "Option two",
+        });
+        await groupLockRequested;
+        return updatePartial(workspaceId, messageId, updater);
+      }
+    );
+
+    await finalizeReportedChildTaskForTest({
+      historyService,
+      partialService,
+      taskService,
+      childId: childOneId,
+      reportMarkdown: "Report from child one",
+      title: "Option one",
+    });
+    expect(replacementReport).toBeDefined();
+    await replacementReport;
+    await flushTerminalAttentionDrains(taskService);
+
+    const toolPart = getTaskToolPart(await partialService.readPartial(parentId));
+    expect(toolPart?.state).toBe("output-available");
+    const serializedOutput = JSON.stringify(toolPart?.output);
+    expect(serializedOutput).toContain("Report from child one");
+    expect(serializedOutput).toContain("Report from child two (continuation)");
+    expect(serializedOutput).not.toContain("pre-continuation");
+    const parentHistory = await collectFullHistory(historyService, parentId);
+    expect(JSON.stringify(parentHistory)).not.toContain("pre-continuation");
+  });
+
   test("agent_report recovers a pending legacy variants task call", async () => {
     const parentId = "parent-legacy-variants";
     const childOneId = "child-legacy-variant-1";
@@ -17050,9 +17158,11 @@ describe("TaskService", () => {
             bestOf,
           },
           {
+            // Already reported (artifact seeded below) and then stopped; its late stream-end
+            // below re-delivers the same report.
             id: childTwoId,
             name: "agent_explore_child_2",
-            taskStatus: "running",
+            taskStatus: "interrupted",
             bestOf: { ...bestOf, index: 1 },
           },
         ],
