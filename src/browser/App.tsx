@@ -80,6 +80,7 @@ import {
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import type { BranchListResult } from "@/common/orpc/types";
+import type { UpdateChannel } from "@/common/types/project";
 import { useTelemetry } from "./hooks/useTelemetry";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation } from "./hooks/useStartWorkspaceCreation";
@@ -191,6 +192,23 @@ function AppInner() {
   const { layoutPresets, applySlotToWorkspace, saveCurrentWorkspaceToSlot } = useUILayouts();
   const { getMinOverride: getMinThinkingOverride } = useMinThinkingLevels();
   const { api, status, error, authenticate, retry } = useAPI();
+  const [supportedUpdateChannels, setSupportedUpdateChannels] = useState<UpdateChannel[]>([]);
+
+  useEffect(() => {
+    setSupportedUpdateChannels([]);
+    if (!api) return;
+
+    let active = true;
+    api.update
+      .getChannel()
+      .then(({ supportedChannels }) => {
+        if (active) setSupportedUpdateChannels(supportedChannels);
+      })
+      .catch(console.error);
+    return () => {
+      active = false;
+    };
+  }, [api]);
 
   const {
     userProjects,
@@ -967,6 +985,7 @@ function AppInner() {
     onSetTheme: setThemePreference,
     onOpenSettings: openSettings,
     onOpenAbout: openAboutDialog,
+    supportedUpdateChannels,
     layoutPresets,
     onApplyLayoutSlot: (workspaceId, slot) => {
       void applySlotToWorkspace(workspaceId, slot).catch(() => {

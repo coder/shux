@@ -3,6 +3,7 @@ import { Download, Loader2, RefreshCw } from "lucide-react";
 import { VERSION } from "@/version";
 import type { RestartBlocker, UpdateStatus } from "@/common/orpc/types";
 import type { UpdateChannel } from "@/common/types/project";
+import { UPDATE_CHANNEL_LABELS } from "@/constants/updateChannels";
 import XumLogoDark from "@/browser/assets/logos/xum-logo-dark.svg?react";
 import XumLogoLight from "@/browser/assets/logos/xum-logo-light.svg?react";
 import { useTheme } from "@/browser/contexts/ThemeContext";
@@ -15,11 +16,6 @@ import {
   ToggleGroupItem,
 } from "@/browser/components/ToggleGroupPrimitive/ToggleGroupPrimitive";
 
-const channelLabels: Record<UpdateChannel, string> = {
-  stable: "Stable",
-  nightly: "Nightly",
-  npm: "Newest npm",
-};
 const channelDescriptions: Record<UpdateChannel, string> = {
   stable: "Official releases only.",
   nightly: "Nightly pre-release builds from main.",
@@ -266,7 +262,7 @@ export function AboutDialog() {
                     >
                       {supportedChannels.map((option) => (
                         <ToggleGroupItem key={option} value={option} size="sm">
-                          {channelLabels[option]}
+                          {UPDATE_CHANNEL_LABELS[option]}
                         </ToggleGroupItem>
                       ))}
                     </ToggleGroup>

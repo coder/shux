@@ -69,8 +69,10 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { RuntimeConfig } from "@/common/types/runtime";
+import type { UpdateChannel } from "@/common/types/project";
 import { isGoalPendingPersistence, type GoalSetError, type GoalStatus } from "@/common/types/goal";
 import { GOAL_OBJECTIVE_PLACEHOLDER } from "@/constants/goals";
+import { UPDATE_CHANNEL_LABELS } from "@/constants/updateChannels";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { getErrorMessage } from "@/common/utils/errors";
 import { parseGoalBudgetCents } from "@/browser/utils/slashCommands/registry";
@@ -85,6 +87,7 @@ import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions"
 
 export interface BuildSourcesParams {
   api: APIClient | null;
+  supportedUpdateChannels: readonly UpdateChannel[];
   userProjects: Map<string, ProjectConfig>;
   /** Map of workspace ID to workspace metadata (keyed by metadata.id, not path) */
   workspaceMetadata: Map<string, FrontendWorkspaceMetadata>;
@@ -1498,9 +1501,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["update", "upgrade", "restart"],
         run: updateCommand((api) => api.update.install()),
       },
-      ...(["stable", "nightly"] as const).map((channel) => ({
+      ...p.supportedUpdateChannels.map((channel) => ({
         id: CommandIds.updateChannel(channel),
-        title: `Update Channel: ${channel === "stable" ? "Stable" : "Nightly"}`,
+        title: `Update Channel: ${UPDATE_CHANNEL_LABELS[channel]}`,
         section: section.help,
         keywords: ["update", "channel", channel],
         // The dialog reads the channel once when it opens, so the change must land first.

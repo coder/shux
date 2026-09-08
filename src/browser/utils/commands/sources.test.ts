@@ -12,6 +12,8 @@ import {
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { APIClient } from "@/browser/contexts/API";
+import type { UpdateChannel } from "@/common/types/project";
+import { CommandIds } from "@/browser/utils/commandIds";
 
 const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const userProjects = new Map<string, ProjectConfig>();
@@ -38,6 +40,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const params: Parameters<typeof buildCoreSources>[0] = {
     userProjects,
     themePreference: "dark",
+    supportedUpdateChannels: ["stable", "nightly"],
     workspaceMetadata,
     selectedWorkspace: {
       projectPath: "/repo/a",
@@ -508,32 +511,52 @@ test("Login with Coder command opens providers expanded on Coder and starts the 
   });
 });
 
-test("update commands run the operation and open the About dialog, and need an About opener", async () => {
-  const onOpenAbout = mock();
-  const install = mock(() => Promise.resolve());
-  let settleChannel!: () => void;
-  const setChannel = mock(
-    () =>
-      new Promise<void>((resolve) => {
-        settleChannel = resolve;
-      })
-  );
-  const actions = getActions({
-    onOpenAbout,
-    api: { update: { install, setChannel } } as unknown as APIClient,
-  });
-  await actions.find((a) => a.title === "Install Update and Restart")!.run();
-  expect(install).toHaveBeenCalledTimes(1);
-  expect(onOpenAbout).toHaveBeenCalledTimes(1);
-  // About reads the channel when it opens, so the switch must persist before the dialog appears.
-  const switched = actions.find((a) => a.title === "Update Channel: Nightly")!.run();
-  expect(setChannel).toHaveBeenCalledWith({ channel: "nightly" });
-  expect(onOpenAbout).toHaveBeenCalledTimes(1);
-  settleChannel();
-  await switched;
-  expect(onOpenAbout).toHaveBeenCalledTimes(2);
-  expect(getActions().some((a) => a.title === "Check for Updates")).toBe(false);
-});
+test.each([
+  ["Electron", ["stable", "nightly"]],
+  ["server", ["stable", "nightly", "npm"]],
+  ["unknown", []],
+] satisfies Array<[string, UpdateChannel[]]>)(
+  "update channel actions follow %s capabilities",
+  (_runtime, supportedUpdateChannels) => {
+    const actions = getActions({ onOpenAbout: mock(), supportedUpdateChannels });
+    expect(actions.filter((a) => a.id.startsWith("update:channel:")).map((a) => a.id)).toEqual(
+      supportedUpdateChannels.map(CommandIds.updateChannel)
+    );
+  }
+);
+
+test.each(["stable", "nightly", "npm"] as const)(
+  "update commands persist %s before opening About and need an About opener",
+  async (channel) => {
+    const onOpenAbout = mock();
+    const install = mock(() => Promise.resolve());
+    let settleChannel!: () => void;
+    const setChannel = mock(
+      () =>
+        new Promise<void>((resolve) => {
+          settleChannel = resolve;
+        })
+    );
+    const actions = getActions({
+      onOpenAbout,
+      api: { update: { install, setChannel } } as unknown as APIClient,
+      supportedUpdateChannels: ["stable", "nightly", "npm"],
+    });
+    await actions.find((a) => a.title === "Install Update and Restart")!.run();
+    expect(install).toHaveBeenCalledTimes(1);
+    expect(onOpenAbout).toHaveBeenCalledTimes(1);
+    // About reads the channel when it opens, so the switch must persist before the dialog appears.
+    const switchAction = actions.find((a) => a.id === CommandIds.updateChannel(channel));
+    expect(switchAction).toBeDefined();
+    const switched = switchAction!.run();
+    expect(setChannel).toHaveBeenCalledWith({ channel });
+    expect(onOpenAbout).toHaveBeenCalledTimes(1);
+    settleChannel();
+    await switched;
+    expect(onOpenAbout).toHaveBeenCalledTimes(2);
+    expect(getActions().some((a) => a.title === "Check for Updates")).toBe(false);
+  }
+);
 
 test("Login with Coder command hides itself when a custom provider shadows the coder id", () => {
   // Regression: an upgraded install can carry a custom OpenAI-compatible
