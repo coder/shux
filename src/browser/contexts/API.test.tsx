@@ -247,6 +247,8 @@ describe("API reconnection", () => {
       if (scenario === "cross-origin") process.env.VITE_BACKEND_URL = "https://api.example.com";
       const reload = spyOn(window.location, "reload").mockImplementation(() => undefined);
       const requests: string[] = [];
+      const jsonReady = Promise.withResolvers<void>();
+      let responseJson: Promise<unknown> | undefined;
       fetchImpl = (input) => {
         requests.push(
           typeof input === "string" ? input : input instanceof URL ? input.href : input.url
@@ -265,7 +267,12 @@ describe("API reconnection", () => {
             ),
             { status: 200 }
           )
-        );
+        ).then((response) => {
+          const parsedJson = response.json();
+          responseJson = jsonReady.promise.then(() => parsedJson);
+          spyOn(response, "json").mockReturnValue(responseJson);
+          return response;
+        });
       };
       window.location.href = "https://coder.example.com/@u/ws/apps/mux/";
       let latestState: UseAPIResult | null = null;
@@ -294,6 +301,14 @@ describe("API reconnection", () => {
       expect(requests).toEqual(
         scenario === "cross-origin" ? [] : ["https://coder.example.com/@u/ws/apps/mux/version"]
       );
+      expect(latestState!.status).toBe("connected");
+      expect(reload).not.toHaveBeenCalled();
+      // Reconnection does not await the version probe. Finish its JSON response explicitly
+      // so the reload assertion cannot race body parsing under CI load.
+      await act(async () => {
+        jsonReady.resolve();
+        await responseJson;
+      });
       const reloads = scenario === "changed" || scenario === "rebuilt" ? 1 : 0;
       expect(reload).toHaveBeenCalledTimes(reloads);
       if (reloads === 0) expect(latestState!.status).toBe("connected");
