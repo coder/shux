@@ -1049,6 +1049,17 @@ export class AgentSession {
    * prompt-cache-stable bytes without preserving stale files forever.
    */
   private memoryContextByModelString = new Map<string, CachedMemoryContext>();
+
+  /**
+   * Drop the cached memory context so the next stream rebuilds the index and
+   * hot set from disk. Own memory tool calls clear it on tool-call-end; this
+   * entry point is for writes by OTHER sessions to a store this session also
+   * reads (a sub-agent editing the task tree's shared workspace notes).
+   */
+  invalidateMemoryContext(): void {
+    this.memoryContextByModelString.clear();
+  }
+
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
    * when post-compaction context is disabled.

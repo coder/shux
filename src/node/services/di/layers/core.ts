@@ -57,7 +57,7 @@ import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
 import { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
-import { MemoryService } from "@/node/services/memoryService";
+import { MemoryService, type MemoryChangeEvent } from "@/node/services/memoryService";
 import { ProviderService } from "@/node/services/providerService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { StreamManager } from "@/node/services/streamManager";
@@ -573,6 +573,15 @@ export const CoreWiringLive: Layer.Layer<
       workspaceService.emitWorkflowRunActivity(event);
     turnRequestBuilderBindings.workflowResultContinuationSender = workspaceService;
     workspaceService.setMemoryConsolidationService(memoryConsolidationService);
+    // Workspace-scope change events carry the memory OWNER (task-tree root);
+    // every live session resolving to that owner reads the same notebook.
+    memoryService.on("change", (event: MemoryChangeEvent) => {
+      if (event.scope !== "workspace" || event.workspaceId === "") return;
+      workspaceService.invalidateMemoryContextWhere(
+        (workspaceId) =>
+          memoryService.resolveWorkspaceMemoryOwnerId(workspaceId) === event.workspaceId
+      );
+    });
     if (opts.devToolsService) {
       // DevTools debug-log cleanup when workspaces are archived/removed.
       workspaceService.setDevToolsService(opts.devToolsService);

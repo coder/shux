@@ -4200,6 +4200,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     for (const session of this.sessions.values()) session.beginShutdown();
   }
 
+  /**
+   * Sub-agents share their task-tree owner's /memories/workspace store, so a
+   * workspace-scope write by one tree member stales the cached memory context
+   * of every live session in that tree, not just the acting one (which already
+   * clears its own cache on tool-call-end). `isAffected` decides membership.
+   */
+  invalidateMemoryContextWhere(isAffected: (workspaceId: string) => boolean): void {
+    for (const [workspaceId, session] of this.sessions) {
+      if (isAffected(workspaceId)) session.invalidateMemoryContext();
+    }
+  }
+
   /** Transfer destructive cleanup out of a callback that still owns a session lease. */
   deferWorkspaceCleanup(run: () => Promise<void>): void {
     this.trackWorkspaceCleanup(run).catch((error: unknown) =>

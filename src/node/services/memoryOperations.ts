@@ -57,6 +57,8 @@ function workspaceNotFound(workspaceId: string | null | undefined): string {
 
 interface ResolvedMemoryScope {
   projectPath: string;
+  /** Task-tree root whose store backs workspace scope ("" without a workspace); keys sidecar pins/stats. */
+  ownerWorkspaceId: string;
   scopeCtx: MemoryScopeContext;
 }
 
@@ -73,6 +75,7 @@ function resolveMemoryScope(
     if (workspaceId == null)
       return {
         projectPath: "",
+        ownerWorkspaceId: "",
         scopeCtx: { runtime: null, checkoutCwd: "", workspaceId: "", projectPath: "" },
       };
     const metadata = yield* Effect.promise(() => context.workspaceService.getInfo(workspaceId));
@@ -80,6 +83,7 @@ function resolveMemoryScope(
     const projectPath = resolveMemoryProjectIdentity(metadata);
     return {
       projectPath,
+      ownerWorkspaceId: context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId),
       scopeCtx: {
         runtime: createRuntimeForWorkspace(metadata),
         checkoutCwd: "",
@@ -102,7 +106,7 @@ export function listMemoryEffect(context: MemoryContext, input: Input<typeof sch
       context.memoryService.listIndexEntries(resolved.scopeCtx)
     );
     const meta = yield* context.memoryMetaService.effects.getEntries();
-    const ids = { projectPath: resolved.projectPath, workspaceId: input.workspaceId ?? "" };
+    const ids = { projectPath: resolved.projectPath, workspaceId: resolved.ownerWorkspaceId };
     return {
       success: true as const,
       data: {
@@ -231,7 +235,7 @@ export function setMemoryPinnedEffect(
       .setPinned(
         memoryLogicalKey(scope, relPath, {
           projectPath: resolved.projectPath,
-          workspaceId: input.workspaceId ?? "",
+          workspaceId: resolved.ownerWorkspaceId,
         }),
         input.pinned
       )

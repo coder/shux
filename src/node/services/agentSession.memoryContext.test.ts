@@ -127,6 +127,12 @@ describe("AgentSession memory context", () => {
       expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
       expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
+
+      // A write by another task-tree member to the shared workspace notebook
+      // invalidates from outside; the next resolve rebuilds from disk.
+      session.invalidateMemoryContext();
+      expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
       await session.dispose();
     }

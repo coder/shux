@@ -16,7 +16,7 @@ import {
   type MemoryScopeContext,
   type PinnedFileMutation,
 } from "./memoryService";
-import { MemoryMetaService } from "./memoryMeta";
+import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
 import {
   MemoryRefinementActionSchema,
   REFINEMENT_CAPTURE_MAX_FILES,
@@ -860,6 +860,138 @@ describe("MemoryService", () => {
       if (viewed.success) {
         expect(viewed.output).toContain("remember me");
       }
+    });
+  });
+
+  describe("sub-agent workspace memory sharing", () => {
+    /** Register owner → child → grandchild so parentWorkspaceId chains resolve. */
+    async function registerTaskTree(fixture: MemoryFixture): Promise<void> {
+      await fixture.config.editConfig((cfg) => {
+        cfg.projects.set(FIXTURE_PROJECT_PATH, {
+          workspaces: [
+            { id: "ws-owner", name: "owner", path: "/checkouts/owner" },
+            {
+              id: "ws-child",
+              name: "child",
+              path: "/checkouts/child",
+              parentWorkspaceId: "ws-owner",
+            },
+            {
+              id: "ws-grandchild",
+              name: "grandchild",
+              path: "/checkouts/grandchild",
+              parentWorkspaceId: "ws-child",
+            },
+            { id: "ws-solo", name: "solo", path: "/checkouts/solo" },
+          ],
+        });
+        return cfg;
+      });
+    }
+
+    it("resolves the task-tree root as the owner; unknown and parentless ids resolve to themselves", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-owner")).toBe("ws-owner");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-grandchild")).toBe("ws-owner");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-solo")).toBe("ws-solo");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-unregistered")).toBe(
+        "ws-unregistered"
+      );
+    });
+
+    it("stores a sub-agent's workspace notes in the owner's session dir, visible to the whole tree", async () => {
+      using fixture = await createFixture("ws-grandchild");
+      await registerTaskTree(fixture);
+      const events: unknown[] = [];
+      fixture.service.on("change", (event) => events.push(event));
+
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/context-notes.md",
+        "found the bug in parser.ts",
+        "agent"
+      );
+      expect(created.success).toBe(true);
+
+      // Physically in the OWNER's session dir, not the grandchild's.
+      const ownerPhysical = path.join(
+        fixture.config.sessionsDir,
+        "ws-owner",
+        "memory",
+        "context-notes.md"
+      );
+      expect(await fsPromises.readFile(ownerPhysical, "utf-8")).toBe("found the bug in parser.ts");
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-grandchild", "memory"))
+      ).toBe(false);
+
+      // Owner and sibling child read the same file through their own contexts.
+      for (const workspaceId of ["ws-owner", "ws-child"]) {
+        const viewed = await fixture.service.view(
+          { ...fixture.ctx, workspaceId },
+          "/memories/workspace/context-notes.md"
+        );
+        expect(viewed.success).toBe(true);
+        if (viewed.success) expect(viewed.output).toContain("found the bug in parser.ts");
+      }
+      // An unrelated workspace does not see it.
+      const solo = await fixture.service.view(
+        { ...fixture.ctx, workspaceId: "ws-solo" },
+        "/memories/workspace/context-notes.md"
+      );
+      expect(solo.success).toBe(false);
+
+      // Change events name the owner so the owner's Memory tab (and every
+      // tree member's) refreshes; sidecar stats are keyed by the owner too.
+      expect(events).toEqual([
+        {
+          scope: "workspace",
+          path: "/memories/workspace/context-notes.md",
+          actor: "agent",
+          workspaceId: "ws-owner",
+          projectPath: FIXTURE_PROJECT_PATH,
+        },
+      ]);
+      const meta = await fixture.metaService.getEntries();
+      expect(
+        meta.get(
+          memoryLogicalKey("workspace", "context-notes.md", {
+            projectPath: "",
+            workspaceId: "ws-owner",
+          })
+        )?.lastWriteAt
+      ).not.toBeNull();
+      expect(
+        meta.has(
+          memoryLogicalKey("workspace", "context-notes.md", {
+            projectPath: "",
+            workspaceId: "ws-grandchild",
+          })
+        )
+      ).toBe(false);
+    });
+
+    it("journals a sub-agent's workspace-scope mutation into the owner's session (where rollback is confined)", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      // Global scope stays attributed to the acting child.
+      await fixture.service.create(fixture.ctx, "/memories/global/g.md", "mine", "agent");
+
+      const ownerEvents = await readRefinementEvents(
+        path.join(fixture.config.sessionsDir, "ws-owner")
+      );
+      expect(ownerEvents.map((event) => event.data.action)).toEqual([
+        { op: "create", path: "/memories/workspace/n.md" },
+      ]);
+      const childEvents = await readRefinementEvents(
+        path.join(fixture.config.sessionsDir, "ws-child")
+      );
+      expect(childEvents.map((event) => event.data.action)).toEqual([
+        { op: "create", path: "/memories/global/g.md" },
+      ]);
     });
   });
 

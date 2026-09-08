@@ -733,6 +733,16 @@ export class MemoryConsolidationService extends EventEmitter {
 
       const workspace = self.config.findWorkspace(workspaceId);
       if (!workspace) return Err(`workspace not found: ${workspaceId}`);
+      // Sub-agents share their task-tree owner's /memories/workspace store
+      // (MemoryService.resolveWorkspaceMemoryOwnerId), so a Dream run from a
+      // child would consolidate the owner's notebook concurrently with the
+      // owner's own runs. Children still harvest into the shared inbox; only
+      // the owner sweeps it.
+      if (workspace.parentWorkspaceId) {
+        return Err(
+          "sub-agent workspaces share their owner's workspace memory; the owner consolidates it"
+        );
+      }
 
       const agentBody = yield* Effect.promise(() => resolveDreamAgentBody(self.config.rootDir));
       if (agentBody === null) return Err("dream agent definition is missing");
@@ -1192,10 +1202,12 @@ export class MemoryConsolidationService extends EventEmitter {
       // covering pass, not one per idle workspace in the same sweep.
       let globalLastRunAt = findNewestWorkspaceRecord(sidecar.workspaces)?.lastRunAt ?? 0;
       const archivedById = new Map<string, boolean>();
+      const subAgentIds = new Set<string>();
       const projectPathByWorkspace = new Map<string, string>();
       for (const [configProjectPath, project] of self.config.loadConfigOrDefault().projects) {
         for (const workspace of project.workspaces) {
           if (workspace.id === undefined) continue;
+          if (workspace.parentWorkspaceId) subAgentIds.add(workspace.id);
           archivedById.set(
             workspace.id,
             isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
@@ -1221,6 +1233,9 @@ export class MemoryConsolidationService extends EventEmitter {
         if (started >= MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP) break;
         if (now - recency < MEMORY_CONSOLIDATION_IDLE_MS) continue;
         if (archivedById.get(workspaceId) === true) continue;
+        // Shared store: the owner's own sweep covers a child's writes (they
+        // are keyed under the owner), and runLockedEffect refuses children.
+        if (subAgentIds.has(workspaceId)) continue;
         const lastRunAt = sidecar.workspaces[workspaceId]?.lastRunAt ?? 0;
         const projectPath = projectPathByWorkspace.get(workspaceId) ?? "";
         const projectRunAt = projectPath === "" ? 0 : (projectLastRunAt.get(projectPath) ?? 0);
