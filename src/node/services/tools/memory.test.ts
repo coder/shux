@@ -330,9 +330,13 @@ describe("memory tool", () => {
           })
         ).success
       ).toBe(true);
-      expect((await run(fixture.tool, { command: "view", path: "/memories/global" })).success).toBe(
-        true
-      );
+      expect((await run(fixture.tool, { command: "view", path: notes })).success).toBe(true);
+      // Reads are pinned too: other stores must not be disclosed from the hidden turn.
+      for (const path of ["/memories/global", "/memories/workspace", "/memories/project/x.md"]) {
+        const result = await run(fixture.tool, { command: "view", path });
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("may only access");
+      }
     });
 
     it("rejects mutations elsewhere, rename away from the pin, and non-workspace scopes", async () => {
@@ -349,7 +353,7 @@ describe("memory tool", () => {
       ] as const) {
         const result = await run(fixture.tool, input);
         expect(result.success).toBe(false);
-        if (!result.success) expect(result.error).toContain("may only modify");
+        if (!result.success) expect(result.error).toContain("may only access");
       }
       expect((await run(fixture.tool, { command: "view", path: notes })).success).toBe(true);
     });

@@ -95,45 +95,55 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
   );
 
   /**
-   * Returns a recoverable error result when the (parsed) scope is read-only
-   * for this agent or the mutation leaves the pinned write path; null when the
-   * mutation may proceed. Invalid paths fall through (null) so the service
-   * produces its canonical validation error.
+   * SECURITY: a hidden flush turn runs on a transcript that may carry injected tool output;
+   * pinning every command (reads included) to one file keeps it from reaching or disclosing
+   * other memory stores. Invalid paths fall through (null) to the canonical validation error.
    */
-  function checkWriteAccess(virtualPath: string): MemoryToolResult | null {
+  function checkPinnedPath(virtualPath: string): MemoryToolResult | null {
+    if (writePath == null || !writePin) return null;
     let parsed: ReturnType<typeof parseMemoryPath>;
     try {
       parsed = parseMemoryPath(virtualPath);
     } catch {
       return null;
     }
-    const scope: MemoryScope | null = parsed.scope;
+    return parsed.scope !== writePin.scope || parsed.relPath !== writePin.relPath
+      ? {
+          success: false,
+          error: `This turn may only access ${writePath}; other memory paths are unavailable.`,
+        }
+      : null;
+  }
+
+  /**
+   * Returns a recoverable error result when the (parsed) scope is read-only
+   * for this agent or the mutation leaves the pinned path; null when the
+   * mutation may proceed. Invalid paths fall through (null) so the service
+   * produces its canonical validation error.
+   */
+  function checkWriteAccess(virtualPath: string): MemoryToolResult | null {
+    let scope: MemoryScope | null;
+    try {
+      scope = parseMemoryPath(virtualPath).scope;
+    } catch {
+      return null;
+    }
     if (scope !== null && access[scope] !== "readwrite") {
       return {
         success: false,
         error: `The ${scope} memory scope is read-only for this agent; only 'view' is allowed.`,
       };
     }
-    // SECURITY: a hidden flush turn runs on a transcript that may carry injected tool
-    // output; pinning writes to one file keeps it from reaching other memory stores.
-    if (
-      writePath != null &&
-      writePin &&
-      (scope !== writePin.scope || parsed.relPath !== writePin.relPath)
-    ) {
-      return {
-        success: false,
-        error: `This turn may only modify ${writePath}; other memory paths are view-only.`,
-      };
-    }
-    return null;
+    return checkPinnedPath(virtualPath);
   }
 
   return tool({
     description: buildMemoryDescription(config),
     inputSchema: TOOL_DEFINITIONS.memory.schema,
     execute: (input, { toolCallId }): Promise<MemoryToolResult> =>
-      executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId),
+      executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId, {
+        checkReadAccess: checkPinnedPath,
+      }),
   });
 };
 
@@ -175,6 +185,8 @@ export async function executeMemoryCommand(
      * I/O unblocks. Ignored by reads.
      */
     abortSignal?: AbortSignal;
+    /** Read guard (view); the agent tool uses it to pin flush turns to one file. */
+    checkReadAccess?: (virtualPath: string) => MemoryToolResult | null;
   }
 ): Promise<MemoryToolResult> {
   try {
@@ -183,6 +195,8 @@ export async function executeMemoryCommand(
         if (input.path == null) {
           return { success: false, error: "view requires 'path'" };
         }
+        const pinned = options?.checkReadAccess?.(input.path);
+        if (pinned) return pinned;
         return await memoryService.view(ctx, input.path, {
           offset: input.offset ?? undefined,
           limit: input.limit ?? undefined,

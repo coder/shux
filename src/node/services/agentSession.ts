@@ -1116,6 +1116,8 @@ export class AgentSession {
     /** Goal identity matching goalKind, so mid-stream compaction follow-ups stay goal-scoped. */
     goalId?: string;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+    /** The active stream is a context-budget final-flush turn (bounded to one provider step). */
+    contextBudgetFlushTurn?: boolean;
   };
 
   private activeCompactionRequest?: {
@@ -5135,7 +5137,13 @@ export class AgentSession {
     estimate?: number
   ): Promise<
     Result<
-      { snapshot: RequestAssemblySnapshot; request: PreparedStreamMessage } | undefined,
+      | {
+          snapshot: RequestAssemblySnapshot;
+          request: PreparedStreamMessage;
+          /** Send options for the retry (a flush trigger's marker is stripped). */
+          options: SendMessageOptions | undefined;
+        }
+      | undefined,
       SendMessageError
     >
   > {
@@ -5186,9 +5194,16 @@ export class AgentSession {
       if (maxTokens == null || maxTokens <= 0) return Ok(undefined);
       // An admitted final-flush trigger that overflowed at assembly must not carry its
       // internal text or flag into the fresh window; without the flag the request builder
-      // applies the ordinary toolset again, so it continues as a normal turn.
+      // applies the ordinary toolset again, so it continues as a normal turn. Delegated turns
+      // resolve stream metadata from the send options, so strip the flag there too.
       const wasFlush = user.metadata?.muxMetadata?.contextBudgetFlush === true;
-      const access = await this.checkContextBudgetHistoryAccess(context.options);
+      const optionsMuxMetadata = context.options?.muxMetadata as MuxMessageMetadata | undefined;
+      let retryOptions = context.options;
+      if (wasFlush && context.options && optionsMuxMetadata?.contextBudgetFlush === true) {
+        const { contextBudgetFlush: _flag, ...rest } = optionsMuxMetadata;
+        retryOptions = { ...context.options, muxMetadata: rest };
+      }
+      const access = await this.checkContextBudgetHistoryAccess(retryOptions);
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return Ok(undefined);
       if (!access.success) return access;
@@ -5293,7 +5308,7 @@ export class AgentSession {
       const freshBudget = await this.checkFreshContextBudget(
         continuation,
         model,
-        context.options,
+        retryOptions,
         retryPrelude,
         context.providersConfig
       );
@@ -5313,7 +5328,7 @@ export class AgentSession {
       const candidate = await this.prepareRolloverRequest(
         rows,
         model,
-        context.options,
+        retryOptions,
         captured.data,
         context.agentInitiated
       );
@@ -5363,7 +5378,7 @@ export class AgentSession {
         return Ok(undefined);
       for (const row of rows) this.emitChatEvent({ ...row, type: "message" });
       transferred = true;
-      return Ok({ snapshot: captured.data, request: candidate.data });
+      return Ok({ snapshot: captured.data, request: candidate.data, options: retryOptions });
     } catch (error) {
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
@@ -5828,7 +5843,12 @@ export class AgentSession {
       threshold: this.compactionMonitor.getThreshold(),
       warningEmitted: this.contextBudgetWarningClaimed,
     });
-    if (decision.decision === "continue" || decision.decision === "block") return decision.decision;
+    if (decision.decision === "block") return "block";
+    // A flush turn is bounded to one provider step even when the step no longer crosses the
+    // threshold (larger model after a restart) or rollover was disabled meanwhile: stopping
+    // here lets the queued rollover continuation, if any, seal the window.
+    if (decision.decision === "continue")
+      return context.contextBudgetFlushTurn === true ? "rollover" : "continue";
     let offerFlush = false;
     if (decision.decision === "rollover") {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
@@ -7099,11 +7119,25 @@ export class AgentSession {
         lastUserMessage?.metadata?.muxMetadata,
         requestMessages
       );
+      // A final-flush trigger (fresh dispatch or resumed after restart) keeps its flag so the
+      // request builder applies the memory-only ceiling regardless of the caller's current send
+      // options; the flag is request-local and never becomes the workspace-turn correlation.
+      const contextBudgetFlushTurn =
+        lastUserMessage?.metadata?.muxMetadata?.contextBudgetFlush === true;
+      // The flush turn is bounded to one provider step. If a crash left that step's completed
+      // memory call on disk (committed above), the resumed request gets no tools at all so the
+      // turn can only end, after which the queued rollover seals the window.
+      const flushAlreadyStepped =
+        contextBudgetFlushTurn &&
+        lastUserMessage != null &&
+        historyResult.data.indexOf(lastUserMessage) <
+          historyResult.data.findLastIndex((row) => row.role === "assistant");
       // Mid-stream compaction runs after the original send options have already been resolved against
       // history (notably bash-monitor wakes). Persist the actual correlation used by this stream so the
       // post-compaction continuation remains the same delegated workspace turn.
       if (this.activeStreamContext != null) {
         this.activeStreamContext.workspaceTurnMetadata = streamMuxMetadata;
+        this.activeStreamContext.contextBudgetFlushTurn = contextBudgetFlushTurn;
       }
       const acpPromptId =
         normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(optionsMuxMetadata);
@@ -7127,7 +7161,9 @@ export class AgentSession {
         thinkingLevel: effectiveThinkingLevel,
         // Orthogonal to thinking level; buildRequestHeaders gates it per model.
         reasoningMode: options?.reasoningMode,
-        toolPolicy: options?.toolPolicy,
+        toolPolicy: flushAlreadyStepped
+          ? [...(options?.toolPolicy ?? []), { regex_match: ".*", action: "disable" }]
+          : options?.toolPolicy,
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
         maxOutputTokens: options?.maxOutputTokens,
@@ -7136,13 +7172,9 @@ export class AgentSession {
         agentId: options?.agentId,
         acpPromptId,
         delegatedToolNames,
-        // A resumed final-flush turn must keep its flag so the request builder applies the
-        // memory-only ceiling regardless of the caller's current send options; the flag is
-        // request-local and never becomes the stream's workspace-turn correlation.
-        muxMetadata:
-          lastUserMessage?.metadata?.muxMetadata?.contextBudgetFlush === true
-            ? { ...(streamMuxMetadata ?? { type: "normal" }), contextBudgetFlush: true }
-            : streamMuxMetadata,
+        muxMetadata: contextBudgetFlushTurn
+          ? { ...(streamMuxMetadata ?? { type: "normal" }), contextBudgetFlush: true }
+          : streamMuxMetadata,
         recordFileState,
         postCompactionAttachments,
         // Invoked by AIService after runtime.ensureReady() (project-scope
@@ -7205,7 +7237,7 @@ export class AgentSession {
             return await this.streamWithHistory(
               turn,
               streamResult.error.model,
-              options,
+              rolled.data.options ?? options,
               openaiTruncationModeOverride,
               true,
               agentInitiated,
@@ -7869,7 +7901,7 @@ export class AgentSession {
           retry = await this.streamWithHistory(
             preparedTurn,
             model,
-            context.options,
+            rolled.data.options ?? context.options,
             context.openaiTruncationModeOverride,
             true,
             context.agentInitiated,

@@ -16,6 +16,7 @@ import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
@@ -1579,10 +1580,11 @@ describe("AgentSession token-budget lifecycle", () => {
     const h = await setup({ previous: first });
     expect((await h.session.resumeStream(options)).success).toBe(true);
     // The sealing intent is restored with the resumed turn: the rollover continuation is
-    // queued up front and survives a step that no longer crosses the threshold.
+    // queued up front, and the flush stays bounded to one step even though the resumed step
+    // no longer crosses the threshold.
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
     expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    expect(await h.requests[0].onStepSettled?.(step(50_000))).toBe("continue");
+    expect(await h.requests[0].onStepSettled?.(step(50_000))).toBe("rollover");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
     h.settleStream(0);
     await h.waitForRequest(2);
@@ -1593,6 +1595,44 @@ describe("AgentSession token-budget lifecycle", () => {
       reason: "mid-stream",
       flushOpportunity: true,
     });
+  });
+
+  test("a flush whose step already completed before a crash gets no second memory call", async () => {
+    const first = await setup();
+    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await first.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await first.finishAndDispatch();
+    // The flush step's memory call settled into the partial before the crash. StreamManager
+    // first persists an assistant placeholder to reserve its history sequence.
+    const partial = createMuxMessage("flush-partial", "assistant", "", {
+      model,
+      partial: true,
+      stepStartPartIndices: [0],
+    });
+    expect((await first.historyService.appendToHistory(workspaceId, partial)).success).toBe(true);
+    partial.parts = [
+      {
+        type: "dynamic-tool",
+        toolName: "memory",
+        toolCallId: "flush-write",
+        state: "output-available",
+        input: { command: "create", path: "/memories/workspace/context-notes.md", file_text: "x" },
+        output: { success: true },
+      },
+    ];
+    expect((await first.historyService.writePartial(workspaceId, partial)).success).toBe(true);
+    await first.session.dispose();
+    const h = await setup({ previous: first });
+    expect((await h.session.resumeStream(options)).success).toBe(true);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    // No tools at all: the resumed turn can only end, then the queued rollover seals the window.
+    expect(applyToolPolicyToNames(["memory", "session_history"], h.requests[0].toolPolicy)).toEqual(
+      []
+    );
+    h.settleStream(0, { finishReason: "stop" });
+    await h.waitForRequest(2);
+    expect(rolloverRows(await allRows(h))).toHaveLength(1);
   });
 
   test("the final flush is offered once per window, including after a restart", async () => {
