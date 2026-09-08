@@ -1,14 +1,12 @@
-function isLocalHost(hostname: string): boolean {
+function isLoopbackHost(hostname: string): boolean {
   if (hostname === "localhost" || hostname === "[::1]") return true;
-  // Cleartext is a development-only escape hatch for literal LAN addresses,
-  // not arbitrary DNS names which could resolve to a public server.
-  if (/^\[(?:f[cd][\da-f]{2}:|fe[89ab][\da-f]:)/i.test(hostname)) return true;
+  // Ticket minting still sends the master bearer: private networks are not a
+  // confidentiality boundary. Classify URL-normalized literals without DNS lookups.
   const octets = hostname.split(".").map(Number);
   if (octets.length !== 4 || octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
     return false;
   }
-  const [a, b] = octets;
-  return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  return octets[0] === 127;
 }
 
 /** The endpoint is a server base URL, including any reverse-proxy path prefix. */
@@ -28,15 +26,13 @@ export function normalizeEndpoint(input: string): string {
   if (url.username || url.password || value.split("/")[2].includes("@")) {
     throw new Error("Enter the server token separately, not in the URL.");
   }
-  if (url.protocol === "http:" && !isLocalHost(url.hostname)) {
-    throw new Error(
-      "Remote servers require HTTPS. HTTP is only allowed for localhost or private LAN addresses."
-    );
+  if (url.protocol === "http:" && !isLoopbackHost(url.hostname)) {
+    throw new Error("Remote servers require HTTPS. HTTP is only allowed for loopback addresses.");
   }
   return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
 }
 
-/** Show a warning: native HTTP LAN development sends the token without TLS. */
+/** Loopback HTTP development still sends the token without TLS. */
 export function isInsecureEndpoint(endpoint: string): boolean {
   return normalizeEndpoint(endpoint).startsWith("http:");
 }

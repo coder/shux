@@ -10,6 +10,7 @@ import { once } from "node:events";
 import assert from "node:assert/strict";
 import { WebSocketServer } from "ws";
 import { connect } from "./api";
+import { connect as connectPreview } from "./connection.web";
 import {
   ORPC_WS_PROTOCOL,
   ORPC_WS_TICKET_PREFIX,
@@ -486,4 +487,28 @@ describe("mobile WebSocket connection", () => {
     await server.closed;
     expect(server.upgrades()).toBe(1);
   }, 15_000);
+});
+
+test("non-loopback HTTP is rejected before ticket or preview fetch even with saved credentials", async () => {
+  const fetchMock = spyOn(globalThis, "fetch").mockRejectedValue(
+    new Error("Network must not be reached")
+  );
+  try {
+    for (const endpoint of [
+      "http://10.0.0.2:3000/prefix",
+      "http://192.168.1.2",
+      "http://172.16.0.1",
+      "http://169.254.1.2",
+      "http://[fd00::1]",
+      "http://[fe80::1]",
+      "http://server.local",
+    ]) {
+      const saved = { endpoint, token: "private token/+?" };
+      await expectFailure(connect(saved.endpoint, saved.token), "HTTPS");
+      await expectFailure(connectPreview(saved.endpoint, saved.token), "HTTPS");
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  } finally {
+    fetchMock.mockRestore();
+  }
 });

@@ -147,8 +147,8 @@ export function ConnectScreen(props: { onConnect: (connection: Connection) => vo
               </View>
               {insecure && (
                 <Notice severity="warning">
-                  HTTP is not encrypted. Your token and conversations can be read by others on the
-                  network. Connect only on a trusted local network.
+                  HTTP is not encrypted. Use loopback HTTP only for development on this device.
+                  Connections to other devices require HTTPS.
                 </Notice>
               )}
               {error && <Notice>{error}</Notice>}

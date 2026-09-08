@@ -7093,7 +7093,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "Before opening a WebSocket, the companion exchanges the token in an HTTP Authorization header for a short-lived, single-use upgrade ticket. The long-lived token is not included in the WebSocket URL or subprotocols. Older servers without ticket support must be updated; there is no credential-URL fallback.",
       "",
-      "Public endpoints require HTTPS. Literal private LAN and loopback HTTP addresses are accepted for development, with a plaintext-token warning. Mobile platform transport policies may still restrict cleartext networking; prefer HTTPS on devices. A phone's `localhost` refers to the phone, not your development computer.",
+      "All non-loopback endpoints—including private LAN, ULA, and link-local addresses—require HTTPS. HTTP is accepted only for `localhost`, IPv4 loopback (`127.0.0.0/8`), or IPv6 loopback (`[::1]`) for development, with a plaintext-token warning. A phone's `localhost` refers to the phone, not your development computer: use a trusted HTTPS endpoint to reach that computer from a device.",
       "",
       "## Develop with React Native Web",
       "",
