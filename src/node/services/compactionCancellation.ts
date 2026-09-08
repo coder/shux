@@ -166,10 +166,15 @@ export class CompactionCancellation {
         }
         continue;
       }
+      const mutation = this.mutation;
+      const pending = this.pending;
       try {
         const record = await this.read();
         if (!this.blocksRecovery) return record;
       } catch {
+        // read() checks before rejecting, but a newer Stop/retry can enter before
+        // this rejection resumes. Fallback must still own that exact failed read.
+        if (this.mutation !== mutation || this.pending !== pending) continue;
         // Explicit intervention may replace unreadable state, but cannot lose an unknown
         // full-clear obligation. Failed publication remains blocking and visible.
         await this.cancel({ retainUntilReplacement: true });
@@ -181,7 +186,19 @@ export class CompactionCancellation {
     const captured = structuredClone(summary);
     const mutation = this.mutation;
     const pending = this.pending;
-    await pending;
+    try {
+      await pending;
+    } catch (error) {
+      if (this.mutation !== mutation || this.pending !== pending) return;
+      // An old witnessed unlink is ancillary once a fresh read discovers B.
+      // Its failure cannot block B's narrowing; B's own failed writes still do.
+      if (
+        mutation?.kind !== "retire" ||
+        mutation.replacementWitness?.nonce !== mutation.nonce ||
+        mutation.nonce === nonce
+      )
+        throw error;
+    }
     // Retirement can claim the same nonce during this join. Narrowing must not
     // supersede its deletion or discard witnessed cleanup debt on resumption.
     if (

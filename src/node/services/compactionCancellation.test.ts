@@ -1,4 +1,4 @@
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import assert from "node:assert/strict";
 import {
   CompactionCancellation,
@@ -278,6 +278,37 @@ describe("inactive cancellation state core", () => {
     expect(state.needsPersistence).toBe(false);
   });
 
+  it.each([false, true])(
+    "foreign narrowing is independent of witnessed deletion debt (narrow failure=%s)",
+    async (failed) => {
+      const { state, storage, shared } = harness();
+      await state.cancel();
+      const first = (await state.read())!;
+      storage.mutate.mockRejectedValueOnce(new Error("old unlink failed"));
+      await assert.rejects(state.retireReplacement({ nonce: first.nonce }), /old unlink failed/);
+      shared.record = cancellation("foreign-b");
+      expect(await state.readForReplacement()).toEqual(shared.record);
+
+      if (failed) storage.mutate.mockRejectedValueOnce(new Error("new narrowing failed"));
+      const narrowing = state.narrow("foreign-b", summary);
+      if (failed) {
+        await assert.rejects(narrowing, /new narrowing failed/);
+        expect(state.blocksRecovery).toBe(true);
+        expect(await state.read()).toEqual(cancellation("foreign-b"));
+        expect(await state.retry()).toBe("applied");
+      } else expect(await narrowing).toBe("applied");
+
+      expect(shared.record).toEqual({
+        ...cancellation("foreign-b"),
+        scope: { kind: "summary", ...summary },
+      });
+      expect(storage.mutate.mock.calls.slice(2).map(([mutation]) => mutation.kind)).toEqual(
+        failed ? ["narrow", "narrow"] : ["narrow"]
+      );
+      expect(state.needsPersistence).toBe(false);
+    }
+  );
+
   it("a stale witness cannot make a newer failed Stop non-blocking", async () => {
     const { state, storage } = harness();
     await state.cancel();
@@ -419,6 +450,61 @@ describe("inactive cancellation state core", () => {
     expect(await state.readForReplacement()).toMatchObject({ retainUntilReplacement: true });
     expect(storage.repair).not.toHaveBeenCalled();
     expect(storage.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("fallback cannot replace a Stop admitted after the read's final error check", async () => {
+    const { state, storage } = harness();
+    storage.read.mockRejectedValueOnce(new Error("read unavailable"));
+    const read = state.read.bind(state);
+    let stopping: ReturnType<CompactionCancellation["cancel"]> | undefined;
+    let newerRecord: ReturnType<CompactionCancellation["read"]> | undefined;
+    // Enter the promise boundary after read() has checked ownership and rejected,
+    // before readForReplacement() receives that rejection and considers fallback.
+    const checkedRead = spyOn(state, "read").mockImplementationOnce(() =>
+      read().catch((error: unknown) => {
+        stopping = state.cancel();
+        newerRecord = read();
+        throw error;
+      })
+    );
+    try {
+      const replacement = await state.readForReplacement();
+      expect(await stopping).toBe("applied");
+      assert(newerRecord);
+      expect(replacement).toEqual(await newerRecord);
+      expect(storage.mutate).toHaveBeenCalledTimes(1);
+    } finally {
+      checkedRead.mockRestore();
+    }
+  });
+
+  it("fallback cannot replace a same-mutation retry started after the checked read fails", async () => {
+    const { state, storage, shared } = harness();
+    await state.cancel();
+    const first = (await state.read())!;
+    storage.mutate.mockRejectedValueOnce(new Error("unlink failed"));
+    await assert.rejects(state.retireReplacement({ nonce: first.nonce }), /unlink failed/);
+    storage.read.mockRejectedValueOnce(new Error("read unavailable"));
+    const read = state.read.bind(state);
+    let retry: ReturnType<CompactionCancellation["retry"]> | undefined;
+    const checkedRead = spyOn(state, "read").mockImplementationOnce(() =>
+      read().catch((error: unknown) => {
+        retry = state.retry();
+        throw error;
+      })
+    );
+    try {
+      expect(await state.readForReplacement()).toBeNull();
+      expect(await retry).toBe("applied");
+      expect(shared.record).toBeNull();
+      expect(storage.mutate.mock.calls.map(([mutation]) => mutation.kind)).toEqual([
+        "publish",
+        "retire",
+        "retire",
+      ]);
+    } finally {
+      checkedRead.mockRestore();
+    }
   });
 
   it("failed explicit fence publication stays blocking and is reported", async () => {
