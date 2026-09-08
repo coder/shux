@@ -146,9 +146,15 @@ function createHydrationStory(workspaceId: string): AppStory {
   }
   const exerciseHydration: AppStory["play"] = async ({ canvasElement, step }) => {
     const canvas = within(canvasElement);
+    const exposedStatuses = () =>
+      within(canvas.getByTestId("message-window")).queryAllByRole("status");
     await step("First fetch is visible before the transcript and decorations reveal", async () => {
       await checkLoadingLayout(canvasElement);
       await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
+      await expect(exposedStatuses()).toHaveLength(1);
+      await expect(exposedStatuses()[0]).toBe(
+        canvas.getByTestId("transcript-hydration-placeholder")
+      );
       await expect(canvas.getByRole("textbox")).toBeEnabled();
       emitChat(history);
       emitChat({
@@ -160,6 +166,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       await expect(
         await canvas.findByText("Previously loaded response.", {}, { timeout: 5000 })
       ).toBeVisible();
+      await expect(exposedStatuses()).toHaveLength(0);
     });
 
     await step(
@@ -175,6 +182,8 @@ function createHydrationStory(workspaceId: string): AppStory {
         await checkLoadingLayout(canvasElement);
         await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
         await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+        await expect(exposedStatuses()).toHaveLength(1);
+        await expect(exposedStatuses()[0]).toBe(getLoadingStatus(canvasElement));
       }
     );
 

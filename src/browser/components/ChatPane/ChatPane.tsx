@@ -1693,7 +1693,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   {isHydratingTranscript && !shouldMountStreamingBarrier && (
                     <ChatDockSurface>
                       <div
-                        role="status"
+                        role={showTranscriptHydrationPlaceholder ? undefined : "status"}
                         data-testid="transcript-loading-status"
                         className="text-muted flex items-center gap-2 px-3 py-1 text-xs"
                       >
