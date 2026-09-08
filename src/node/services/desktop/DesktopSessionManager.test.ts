@@ -559,10 +559,10 @@ describe("DesktopSessionManager browser viewer releases", () => {
       await nextViewerEvent(borrower, "release");
       manager.acknowledgeViewerRelease(ready.viewerId);
       await closing;
-      // The detached viewer leaves a bounded grace behind (see the dedicated grace test); the
-      // live attachment itself is gone.
+      // An explicit close of the borrower is deterministic: it leaves no grace behind on the
+      // owner, whose desktop process stays alive but unattached.
       expect(manager.has("owner")).toBe(true);
-      expect(manager.hasAttachedViewers("owner")).toBe(true);
+      expect(manager.hasAttachedViewers("owner")).toBe(false);
     });
   });
 
@@ -604,10 +604,14 @@ describe("DesktopSessionManager browser viewer releases", () => {
         now += DESKTOP_ATTACHMENT_GRACE_MS;
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
 
-        // An explicit close is definitive: it clears the grace it would otherwise leave behind.
+        // An explicit close is definitive: it clears the grace it would otherwise leave behind,
+        // but a grace another detachment stamped earlier on a related workspace survives.
         manager.noteDetached(["isolated"]);
         await manager.close("isolated");
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
+        manager.noteDetached(["owner"]);
+        await manager.close("child");
+        expect(manager.hasAttachedViewers("owner")).toBe(true);
       } finally {
         await manager.closeAll();
       }

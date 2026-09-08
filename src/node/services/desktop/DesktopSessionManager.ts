@@ -551,6 +551,23 @@ export class DesktopSessionManager {
         this.windowOwners.delete(requesterId);
       }
     }
+    // Every attachment this teardown releases (its own, its viewers' targets, its shared owner)
+    // will stamp a recent-detachment grace as it goes. That grace exists for transports that may
+    // come back; an explicit close is deterministic, so restore each related workspace's grace
+    // to what it was before the close (a borrower closing must not leave its owner "attached").
+    const graceBefore = new Map<string, number | undefined>();
+    for (const id of [
+      workspaceId,
+      ...browserViewers.flatMap((viewer) => this.viewerTargets(viewer)),
+    ]) {
+      graceBefore.set(id, this.recentDetachments.get(id));
+    }
+    try {
+      const ownerWorkspaceId = this.inputCoordinator.resolveTarget(workspaceId).ownerWorkspaceId;
+      graceBefore.set(ownerWorkspaceId, this.recentDetachments.get(ownerWorkspaceId));
+    } catch {
+      // Unresolvable requester (already removed): nothing further to restore.
+    }
     // Latch before entering the async teardown, but leave established bridges alive long enough
     // for borrower viewers to release held keys/buttons on their owner's still-live desktop.
     const closing = Promise.resolve().then(async () => {
@@ -565,6 +582,10 @@ export class DesktopSessionManager {
         for (const listener of this.closeListeners) listener(workspaceId);
       } finally {
         await this.closeSession(workspaceId);
+        for (const [id, previous] of graceBefore) {
+          if (id === workspaceId || previous === undefined) this.recentDetachments.delete(id);
+          else this.recentDetachments.set(id, previous);
+        }
       }
     });
     this.closingWorkspaces.set(workspaceId, closing);
