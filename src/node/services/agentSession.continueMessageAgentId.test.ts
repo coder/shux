@@ -31,7 +31,7 @@ interface SessionInternals {
   sendMessage: (
     message: string,
     options?: SendOptions,
-    internal?: { synthetic?: boolean; agentInitiated?: boolean }
+    internal?: { synthetic?: boolean; agentInitiated?: boolean; onAccepted?: () => void }
   ) => Promise<SendMessageResult>;
   runStartupRecovery: () => Promise<void>;
   lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
@@ -385,7 +385,8 @@ describe("AgentSession continue-message agentId fallback", () => {
     const { session, historyService, internals } = await createSession([
       compactionSummaryMessage("summary-idle-only", idleFollowUp()),
     ]);
-    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    const send = mock((_message: string) => Promise.resolve({ success: true as const }));
+    internals.sendMessage = send;
     session.queueMessage(
       "user returned",
       { model: "openai:gpt-4o", agentId: "exec" },
@@ -395,7 +396,8 @@ describe("AgentSession continue-message agentId fallback", () => {
     const dispatched = await internals.dispatchPendingFollowUp();
 
     expect(dispatched).toBe(false);
-    expect(internals.sendMessage).not.toHaveBeenCalled();
+    expect(internals.sendMessage).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[0]).toBe("user returned");
 
     const lastMessages = await historyService.getLastMessages("ws", 1);
     expect(lastMessages.success).toBe(true);
@@ -411,7 +413,8 @@ describe("AgentSession continue-message agentId fallback", () => {
       earlierMessage,
       heartbeatBoundaryMessage(),
     ]);
-    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    const send = mock((_message: string) => Promise.resolve({ success: true as const }));
+    internals.sendMessage = send;
     session.queueMessage(
       "user returned",
       { model: "openai:gpt-4o", agentId: "exec" },
@@ -421,7 +424,8 @@ describe("AgentSession continue-message agentId fallback", () => {
     const dispatched = await internals.dispatchPendingFollowUp();
 
     expect(dispatched).toBe(false);
-    expect(internals.sendMessage).not.toHaveBeenCalled();
+    expect(internals.sendMessage).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[0]).toBe("user returned");
 
     const historyResult = await historyService.getLastMessages("ws", 10);
     expect(historyResult.success).toBe(true);
@@ -504,7 +508,12 @@ describe("AgentSession continue-message agentId fallback", () => {
       compactionSummaryMessage("summary-completing-turn", idleFollowUp()),
     ]);
     const completingInternals = internals as SessionInternals & { coordinator: TurnCoordinator };
-    completingInternals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    completingInternals.sendMessage = mock<SessionInternals["sendMessage"]>(
+      (_message, _options, internal) => {
+        internal?.onAccepted?.();
+        return Promise.resolve({ success: true as const });
+      }
+    );
     completingInternals.coordinator.beginPolicy(completingInternals.coordinator.turnId);
 
     const dispatched = await completingInternals.dispatchPendingFollowUp();

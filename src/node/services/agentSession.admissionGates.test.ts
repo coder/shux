@@ -210,6 +210,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
 
     expect(result).toEqual({
       success: false,
+      superseded: true,
       error: { type: "unknown", raw: CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE },
     });
     // Accepted, then notified so delivered-state bookkeeping can revert
