@@ -522,6 +522,10 @@ export interface PreparedTurnRequest extends AsyncDisposable {
   start(thinkingOverride?: ActiveTurnThinkingOverride): Promise<TurnRequestBuildOutcome>;
 }
 
+/** Turn refused because a memory-policy DENY could not be made durable (see persistWorkspaceMemoryWritable). */
+const WORKSPACE_MEMORY_POLICY_PERSIST_ERROR =
+  "Could not persist this workspace's read-only memory policy; refusing to start the turn so a restart cannot fall back to a stale write permission. Retry once the config directory is writable.";
+
 type PreparedTurnRequestOutcome =
   | Extract<TurnRequestBuildOutcome, { type: "finished" }>
   | { type: "prepared"; request: PreparedTurnRequest };
@@ -1429,48 +1433,36 @@ export class TurnRequestBuilder {
     // access AND the tool's presence in the final toolset. The tool exists
     // only with the experiment + service (tools.ts) and survives only if the
     // effective policy keeps it (applied later in tool assembly, mirrored
-    // here). request.assemble middleware can still strip it — that is
-    // re-checked against the prepared request below. The compaction turn
-    // itself runs the "compact" agent, so record only normal turns' policy
-    // (the session attaches it to the compaction completion).
-    let workspaceMemoryWritable =
+    // here); request.assemble middleware can still strip it, so the FINAL
+    // check happens against the toolset of the request actually started (see
+    // persistWorkspaceMemoryWritable). The compaction turn itself runs the
+    // "compact" agent, so only normal turns record their policy (the session
+    // attaches it to the compaction completion).
+    const workspaceMemoryWritable =
       memoryAccess.workspace === "readwrite" &&
       memoryExperimentEnabled &&
       this.dependencies.bindings.memoryService !== undefined &&
       !isMemoryToolDisabled(effectiveToolPolicy);
-    // Awaited (a config write happens only when the value changes) so the
-    // durable policy is in place before this turn can produce a compaction.
-    // Returns the turn-refusing outcome when a DENY could not be persisted: a
-    // stale persisted `true` would let this now read-only agent's transcript
-    // harvest into the (shared) workspace notebook after a restart.
-    const persistWorkspaceMemoryWritable = async (
-      writable: boolean
-    ): Promise<Extract<TurnRequestBuildOutcome, { type: "finished" }> | null> => {
+    // Persist the harvest permission for a request that is about to stream:
+    // NOT at preparation time — an admission-only candidate
+    // (prepareStreamMessage) may be rejected or disposed without running and
+    // must not leave a writable bit behind for the preceding read-only
+    // transcript. Awaited (a config write happens only when the value
+    // changes) so the durable policy is in place before the turn can produce
+    // a compaction. Returns false when a DENY could not be persisted: a stale
+    // persisted `true` would let a now read-only agent's transcript harvest
+    // into the (shared) workspace notebook after a restart, so the turn must
+    // not start.
+    const persistWorkspaceMemoryWritable = async (writable: boolean): Promise<boolean> => {
       const sink = this.dependencies.bindings.workspaceMemoryPolicySink;
-      if (isCompactionRequest || !sink) return null;
-      if (await sink.recordWorkspaceMemoryWritable(workspaceId, writable)) return null;
-      if (!writable) {
-        const errorMessage =
-          "Could not persist this workspace's read-only memory policy; refusing to start the turn so a restart cannot fall back to a stale write permission. Retry once the config directory is writable.";
-        const errorEvent = createErrorEvent(workspaceId, {
-          messageId: createAssistantMessageId(),
-          error: errorMessage,
-          errorType: "unknown",
-          acpPromptId,
-        });
-        if (!context.admissionOnly) this.dependencies.emit("error", errorEvent);
-        onPreStartError?.(errorEvent);
-        return { type: "finished", result: Err({ type: "unknown", raw: errorMessage }) };
-      }
+      if (isCompactionRequest || !sink) return true;
+      if (await sink.recordWorkspaceMemoryWritable(workspaceId, writable)) return true;
+      if (!writable) return false;
       log.warn("Workspace memory write policy could not be persisted; harvests will fail closed", {
         workspaceId,
       });
-      return null;
+      return true;
     };
-    {
-      const refused = await persistWorkspaceMemoryWritable(workspaceMemoryWritable);
-      if (refused) return refused;
-    }
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
     // repo hook execution (tool_env/tool_pre/tool_post) while keeping
@@ -2714,19 +2706,6 @@ export class TurnRequestBuilder {
       throw error;
     }
     const tools = primaryRequest.tools;
-    // request.assemble middleware ran inside prepareModelRequest and may have
-    // stripped `memory` from the final toolset; the persisted harvest
-    // permission must follow it. Tool search defers MCP tools only, so an
-    // absent built-in `memory` here means denied, not deferred. Fallback
-    // attempts run the same middleware and cannot widen the permission.
-    if (workspaceMemoryWritable && tools.memory === undefined) {
-      workspaceMemoryWritable = false;
-      const refused = await persistWorkspaceMemoryWritable(false);
-      if (refused) {
-        runLanguageModelCleanup(modelResult.data.model);
-        return refused;
-      }
-    }
     systemMessage = primaryRequest.system;
     systemMessageTokens = primaryRequest.systemMessageTokens;
     const finalMessages = primaryRequest.messages;
@@ -2780,6 +2759,27 @@ export class TurnRequestBuilder {
             this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
           ),
         };
+      // Final toolset of the request being started: request.assemble
+      // middleware ran inside prepareModelRequest, and `memory` is a built-in
+      // that tool search never defers, so its absence means denied.
+      if (
+        !(await persistWorkspaceMemoryWritable(
+          workspaceMemoryWritable && tools.memory !== undefined
+        ))
+      ) {
+        const errorEvent = createErrorEvent(workspaceId, {
+          messageId: createAssistantMessageId(),
+          error: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR,
+          errorType: "unknown",
+          acpPromptId,
+        });
+        if (!context.admissionOnly) this.dependencies.emit("error", errorEvent);
+        onPreStartError?.(errorEvent);
+        return {
+          type: "finished",
+          result: Err({ type: "unknown", raw: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR }),
+        };
+      }
       const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
         timestamp: Date.now(),
@@ -3024,6 +3024,17 @@ export class TurnRequestBuilder {
                 } catch (error) {
                   if (error instanceof ContextBudgetExceededError) return Err(error.details);
                   throw error;
+                }
+                // The fallback runs its own request.assemble pass, which may
+                // strip `memory`; the persisted harvest permission must follow
+                // the request actually streamed, not the refused primary.
+                if (
+                  workspaceMemoryWritable &&
+                  nextRequest.tools.memory === undefined &&
+                  !(await persistWorkspaceMemoryWritable(false))
+                ) {
+                  runLanguageModelCleanup(nextRequest.model);
+                  return Err(WORKSPACE_MEMORY_POLICY_PERSIST_ERROR);
                 }
                 let nextHeaders = nextRequest.headers;
                 if (pendingRunMetadataId != null) {
