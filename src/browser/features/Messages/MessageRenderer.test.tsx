@@ -34,7 +34,7 @@ describe("MessageRenderer goal continuation rows", () => {
       historySequence: 1,
       content,
       isSynthetic: true,
-      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000 },
+      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000, final: false },
     };
     const view = render(
       <TooltipProvider>
@@ -43,11 +43,27 @@ describe("MessageRenderer goal continuation rows", () => {
     );
     const toggle = view.container.querySelector("[data-context-budget-warning] button");
     expect(toggle).not.toBeNull();
+    expect(toggle!.textContent).toContain("Context budget warning");
     expect(view.queryByText(content)).toBeNull();
     fireEvent.click(toggle!);
     expect(view.getByText(content)).toBeDefined();
     fireEvent.click(toggle!);
     expect(view.queryByText(content)).toBeNull();
+
+    // The final pre-rollover flush is the same collapsible row with an ending summary.
+    view.rerender(
+      <TooltipProvider>
+        <MessageRenderer
+          message={{
+            ...message,
+            contextBudgetWarning: { ...message.contextBudgetWarning!, final: true },
+          }}
+        />
+      </TooltipProvider>
+    );
+    expect(
+      view.container.querySelector("[data-context-budget-warning] button")!.textContent
+    ).toContain("Context window ending: notes flush");
 
     view.rerender(
       <TooltipProvider>

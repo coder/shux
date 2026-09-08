@@ -56,6 +56,26 @@ describe("step budget decisions", () => {
     expect(evaluate({ contextTokens: 75_000, warningEmitted: true }).decision).toBe("rollover");
   });
 
+  test("rollover flush opportunity requires reserve headroom below the hard ceiling", () => {
+    const hardCeiling = 100_000 - OUTPUT_RESERVE_TOKENS;
+    expect(evaluate({ contextTokens: hardCeiling - WARNING_RESERVE_TOKENS - 1 })).toMatchObject({
+      decision: "rollover",
+      flushOpportunity: true,
+    });
+    expect(evaluate({ contextTokens: hardCeiling - WARNING_RESERVE_TOKENS })).toMatchObject({
+      decision: "rollover",
+      flushOpportunity: false,
+    });
+    // Real-encoding tool tokens can exceed the chars/4 heuristic and consume the reserve.
+    expect(
+      evaluate({
+        contextTokens: hardCeiling - WARNING_RESERVE_TOKENS - 100,
+        toolResultChars: 4,
+        toolResultTokens: 100,
+      })
+    ).toMatchObject({ decision: "rollover", flushOpportunity: false });
+  });
+
   test("hard ceiling overrides a higher configured threshold", () => {
     const hardCeiling = 100_000 - OUTPUT_RESERVE_TOKENS;
     expect(evaluate({ contextTokens: hardCeiling, threshold: 0.99 })).toMatchObject({

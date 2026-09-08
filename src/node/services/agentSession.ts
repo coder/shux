@@ -13,6 +13,7 @@ import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
+  WARNING_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
@@ -963,6 +964,8 @@ export class AgentSession {
   private lastUsageState?: AutoCompactionUsageState;
   private pendingRollover?: ContextWindowRollover;
   private contextBudgetWarningClaimed = false;
+  /** One final pre-rollover notes flush per window; derived from history on restart. */
+  private contextBudgetFlushClaimed = false;
   private pendingBudgetWarning?: true;
   private contextBudgetGeneration = 0;
   // Unknown after restart: do not spend the window's warning on guessed permissions.
@@ -4433,6 +4436,11 @@ export class AgentSession {
       this.contextBudgetWarningClaimed ||=
         contextBudgetPrefix.length > 0 ||
         userMessage.metadata?.muxMetadata?.type === "context-budget-warning";
+      this.contextBudgetFlushClaimed ||= contextBudgetPrefix.some(
+        (row) =>
+          row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+          row.metadata.muxMetadata.final === true
+      );
       this.pendingBudgetWarning = undefined;
     }
 
@@ -4996,6 +5004,7 @@ export class AgentSession {
     this.pendingRollover = undefined;
     this.pendingBudgetWarning = undefined;
     this.contextBudgetWarningClaimed = false;
+    this.contextBudgetFlushClaimed = false;
     this.contextBudgetMemoryWritable = undefined;
     this.contextBudgetHistoryAvailable = false;
     this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY);
@@ -5540,6 +5549,13 @@ export class AgentSession {
     this.contextBudgetWarningClaimed = history.data.some(
       (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
     );
+    // `||=`: the in-memory claim set at offer time must survive a read that runs before the
+    // final row is durable.
+    this.contextBudgetFlushClaimed ||= history.data.some(
+      (row) =>
+        row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+        row.metadata.muxMetadata.final === true
+    );
     const providersConfig = this.getProvidersConfigSafe();
     const maxTokens = getEffectiveContextLimit(
       options.model,
@@ -5607,6 +5623,31 @@ export class AgentSession {
       threshold: this.compactionMonitor.getThreshold(),
       warningEmitted: this.contextBudgetWarningClaimed,
     });
+    // The queued flush entry must be recognized before the rollover logic below, which
+    // `pendingRollover` would otherwise pre-empt. Re-check the headroom and the tool gates
+    // with on-send numbers; degrade to an ordinary continuation when any no longer holds.
+    if (userMessage.metadata?.muxMetadata?.contextBudgetFlush === true) {
+      const recoveryAvailable =
+        this.contextBudgetHistoryAvailable && !isSessionHistoryDisabled(options.toolPolicy);
+      const flushStillSafe =
+        decision.hardCeiling !== undefined &&
+        decision.projected + WARNING_RESERVE_TOKENS < decision.hardCeiling;
+      if (
+        this.pendingRollover != null &&
+        flushStillSafe &&
+        this.contextBudgetMemoryWritable === true &&
+        recoveryAvailable
+      ) {
+        // Keep pendingRollover: the next dispatch seals this window regardless of usage.
+        return Ok({
+          prefix: [createContextBudgetWarning(decision.projected, maxTokens, true, true, true)],
+        });
+      }
+      // Neither the trigger text nor the flush flag may leak into the fresh window.
+      userMessage.parts = [{ type: "text", text: "Continue" }];
+      const { contextBudgetFlush: _dropped, ...rest } = userMessage.metadata.muxMetadata;
+      userMessage.metadata.muxMetadata = rest;
+    }
     const shouldRollover =
       this.compactionMonitor.getThreshold() < 1 &&
       (this.pendingRollover != null || decision.decision === "rollover");
@@ -5717,11 +5758,21 @@ export class AgentSession {
       warningEmitted: this.contextBudgetWarningClaimed,
     });
     if (decision.decision === "continue" || decision.decision === "block") return decision.decision;
+    let offerFlush = false;
     if (decision.decision === "rollover") {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) throw new Error(history.error);
       if (this.activeStreamContext !== context || this.contextBudgetGeneration !== generation)
         return "continue";
+      // Offer one final notes flush before sealing when a writing step still fits and the
+      // reset that follows can actually be admitted (session_history available).
+      offerFlush =
+        this.pendingRollover == null &&
+        !this.contextBudgetFlushClaimed &&
+        decision.flushOpportunity &&
+        step.memoryWritable &&
+        step.sessionHistoryAvailable &&
+        this.messageQueue.isEmpty();
       this.pendingRollover ??= {
         type: "context-window-rollover",
         rolloverId: randomUUID(),
@@ -5735,22 +5786,23 @@ export class AgentSession {
       this.contextBudgetWarningClaimed = true;
       this.pendingBudgetWarning = true;
     }
-    if (this.messageQueue.isEmpty()) {
-      const warning = decision.decision === "warn";
+    // Keep the continuation's delegated-turn/goal attribution; the warning
+    // itself is a separate durable prefix row when this entry dispatches.
+    const streamOptions = context.options;
+    const enqueue = (text: string, dedupeKey: string, flush: boolean) =>
       this.messageQueue.addOnce(
-        // Keep the continuation's delegated-turn/goal attribution; the warning
-        // itself is a separate durable prefix row when this entry dispatches.
-        "Continue",
+        text,
         {
-          ...context.options,
+          ...streamOptions,
           model: step.model,
           queueDispatchMode: "tool-end",
           muxMetadata: {
             ...(context.workspaceTurnMetadata ?? { type: "normal" }),
             contextBudgetContinuation: true,
+            ...(flush ? { contextBudgetFlush: true as const } : {}),
           },
         },
-        warning ? CONTEXT_WARNING_DEDUPE_KEY : CONTEXT_CONTINUE_DEDUPE_KEY,
+        dedupeKey,
         {
           synthetic: true,
           agentInitiated: true,
@@ -5759,6 +5811,25 @@ export class AgentSession {
           goalKind: context.goalKind,
           goalId: context.goalId,
         }
+      );
+    if (offerFlush) {
+      assert(
+        !this.messageQueue.hasDedupeKey(CONTEXT_WARNING_DEDUPE_KEY) &&
+          !this.messageQueue.hasDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY),
+        "flush offer requires no pending budget continuation"
+      );
+      this.contextBudgetFlushClaimed = true;
+      // Entry 1 is the flush turn (hidden trigger text; the visible prefix carries the prompt).
+      // Entry 2 is the unconditional rollover; its tool-end dispatch also bounds the flush
+      // turn to a single provider step.
+      enqueue("Flush context notes now.", CONTEXT_WARNING_DEDUPE_KEY, true);
+      enqueue("Continue", CONTEXT_CONTINUE_DEDUPE_KEY, false);
+      this.emitQueuedMessageChanged();
+    } else if (this.messageQueue.isEmpty()) {
+      enqueue(
+        "Continue",
+        decision.decision === "warn" ? CONTEXT_WARNING_DEDUPE_KEY : CONTEXT_CONTINUE_DEDUPE_KEY,
+        false
       );
       this.emitQueuedMessageChanged();
     }

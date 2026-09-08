@@ -16,6 +16,10 @@ import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import {
+  CONTEXT_CONTINUE_DEDUPE_KEY,
+  CONTEXT_WARNING_DEDUPE_KEY,
+} from "@/common/constants/contextBudget";
 import type { AgentSessionAIService } from "./agentSession";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 import { createTurnCompletionController, type SettledStepBudget } from "./streamManager";
@@ -61,6 +65,15 @@ function step(inputTokens: number, overrides?: Partial<SettledStepBudget>): Sett
 
 function rolloverRows(rows: MuxMessage[]): MuxMessage[] {
   return rows.filter((row) => row.metadata?.muxMetadata?.type === "context-window-rollover");
+}
+
+function warningRows(rows: MuxMessage[]): MuxMessage[] {
+  return rows.filter((row) => row.metadata?.muxMetadata?.type === "context-budget-warning");
+}
+
+function isFinalFlushRow(row: MuxMessage): boolean {
+  const meta = row.metadata?.muxMetadata;
+  return meta?.type === "context-budget-warning" && meta.final === true;
 }
 
 async function allRows(h: AgentSessionHarness): Promise<MuxMessage[]> {
@@ -120,6 +133,16 @@ describe("AgentSession token-budget lifecycle", () => {
   }) {
     const requests: Request[] = [];
     const secondRequest = Promise.withResolvers<Request>();
+    const requestWaiters = new Map<number, PromiseWithResolvers<Request>>();
+    const waitForRequest = (count: number) => {
+      let waiter = requestWaiters.get(count);
+      if (!waiter) {
+        waiter = Promise.withResolvers<Request>();
+        requestWaiters.set(count, waiter);
+        if (requests.length >= count) waiter.resolve(requests[count - 1]);
+      }
+      return waiter.promise;
+    };
     const completions: Array<ReturnType<typeof createTurnCompletionController>> = [];
     const streamMessage = mock<AgentSessionAIService["streamMessage"]>(async (request) => {
       requests.push(request);
@@ -135,6 +158,7 @@ describe("AgentSession token-budget lifecycle", () => {
       });
       const completion = createTurnCompletionController();
       completions.push(completion);
+      requestWaiters.get(requests.length)?.resolve(request);
       // This controlled provider has no engine supervisor; shutdown still retires its handle.
       const close = () => completion.settle({ status: "aborted", abortReason: "system" });
       const signal = h.session.closingSignal;
@@ -168,19 +192,46 @@ describe("AgentSession token-budget lifecycle", () => {
       } as FrontendWorkspaceMetadata)
     );
     h.session.setAutoCompactionThreshold(0.7);
-    const finishAndDispatch = async () => {
-      completions[0].settle({
+    const settleStream = (
+      index: number,
+      metadata?: { finishReason?: string; contextUsage?: { inputTokens: number } }
+    ) => {
+      const contextUsage = metadata?.contextUsage
+        ? {
+            ...metadata.contextUsage,
+            outputTokens: 10,
+            totalTokens: metadata.contextUsage.inputTokens + 10,
+          }
+        : undefined;
+      completions[index].settle({
         status: "completed",
         streamEnd: {
           type: "stream-end",
           workspaceId,
-          metadata: { model, agentId: "exec", finishReason: "tool-calls" },
+          metadata: {
+            model,
+            agentId: "exec",
+            finishReason: metadata?.finishReason ?? "tool-calls",
+            ...(contextUsage ? { contextUsage } : {}),
+          },
           parts: [],
         },
       });
+    };
+    const finishAndDispatch = async () => {
+      settleStream(0);
       await secondRequest.promise;
     };
-    return { ...h, requests, completions, streamMessage, secondRequest, finishAndDispatch };
+    return {
+      ...h,
+      requests,
+      completions,
+      streamMessage,
+      secondRequest,
+      finishAndDispatch,
+      settleStream,
+      waitForRequest,
+    };
   }
 
   for (const field of [
@@ -1251,20 +1302,24 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(rows)).toHaveLength(0);
   });
 
-  test.each([110_000, 127_000])(
-    "force/ceiling at %i tokens suppresses warning and preserves continuation correlation",
-    async (inputTokens) => {
+  test.each([
+    ["at the hard ceiling", step(127_000), false],
+    ["with read-only memory", step(110_000, { memoryWritable: false }), true],
+    ["without session_history", step(110_000, { sessionHistoryAvailable: false }), true],
+  ])(
+    "settled rollover %s skips the final flush and preserves continuation correlation",
+    async (_label, settled, flushOpportunity) => {
       const h = await setup();
       expect(
         (await h.session.sendMessage("Work", { ...options, muxMetadata: correlation })).success
       ).toBe(true);
-      expect(await h.requests[0].onStepSettled?.(step(inputTokens))).toBe("rollover");
+      expect(await h.requests[0].onStepSettled?.(settled)).toBe("rollover");
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
       await h.finishAndDispatch();
       const rows = await allRows(h);
       expect(rolloverRows(rows)).toHaveLength(1);
-      expect(rows.some((row) => row.metadata?.muxMetadata?.type === "context-budget-warning")).toBe(
-        false
-      );
+      expect(rolloverRows(rows)[0].metadata?.muxMetadata).toMatchObject({ flushOpportunity });
+      expect(warningRows(rows)).toHaveLength(0);
       expect(rows.at(-1)?.metadata).toMatchObject({
         synthetic: true,
         retrySendOptions: { agentInitiated: true },
@@ -1272,6 +1327,152 @@ describe("AgentSession token-budget lifecycle", () => {
       });
     }
   );
+
+  test("settled rollover with headroom offers exactly one final flush step, then seals", async () => {
+    const h = await setup();
+    expect(
+      (await h.session.sendMessage("Work", { ...options, muxMetadata: correlation })).success
+    ).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    await h.finishAndDispatch();
+    let rows = await allRows(h);
+    expect(rolloverRows(rows)).toHaveLength(0);
+    const finalRows = warningRows(rows);
+    expect(finalRows).toHaveLength(1);
+    expect(finalRows[0].metadata?.muxMetadata).toMatchObject({ final: true });
+    expect(rows.at(-1)?.metadata).toMatchObject({
+      synthetic: true,
+      uiVisible: false,
+      muxMetadata: { ...correlation, contextBudgetContinuation: true, contextBudgetFlush: true },
+    });
+    // The flush turn's own settlement re-evaluates as rollover without queuing a second flush.
+    expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    h.settleStream(1);
+    await h.waitForRequest(3);
+    rows = await allRows(h);
+    expect(warningRows(rows)).toHaveLength(1);
+    const [reset] = rolloverRows(rows);
+    expect(reset.metadata?.muxMetadata).toMatchObject({
+      reason: "mid-stream",
+      flushOpportunity: true,
+    });
+    expect(finalRows[0].metadata!.historySequence!).toBeLessThan(reset.metadata!.historySequence!);
+    expect(rows.at(-1)?.metadata).toMatchObject({
+      synthetic: true,
+      retrySendOptions: { agentInitiated: true },
+      muxMetadata: { ...correlation, contextBudgetContinuation: true },
+    });
+    expect(text(rows.at(-1)!)).toBe("Continue");
+    expect(
+      sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages).some((row) =>
+        text(row).startsWith("Flush context notes")
+      )
+    ).toBe(false);
+  });
+
+  test("a text-only flush turn still rolls over at stream end", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await h.finishAndDispatch();
+    expect(warningRows(await allRows(h)).filter(isFinalFlushRow)).toHaveLength(1);
+    h.settleStream(1, { finishReason: "stop" });
+    await h.waitForRequest(3);
+    expect(rolloverRows(await allRows(h))).toHaveLength(1);
+  });
+
+  test("a queued user message defers the flush and rolls over on its own dispatch", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(h.session.queueMessage("Later question", options)).not.toBeNull();
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    await h.finishAndDispatch();
+    const rows = await allRows(h);
+    expect(warningRows(rows)).toHaveLength(0);
+    expect(rolloverRows(rows)).toHaveLength(1);
+    expect(text(rows.at(-1)!)).toBe("Later question");
+  });
+
+  test("a user message queued behind the flush pair lands in the fresh window", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    expect(h.session.queueMessage("Later question", options)).not.toBeNull();
+    await h.finishAndDispatch();
+    expect(text((await allRows(h)).at(-1)!)).toBe("Flush context notes now.");
+    expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
+    h.settleStream(1);
+    await h.waitForRequest(3);
+    h.settleStream(2, { finishReason: "stop" });
+    await h.waitForRequest(4);
+    const rows = await allRows(h);
+    const [reset] = rolloverRows(rows);
+    const later = rows.find((row) => text(row) === "Later question")!;
+    expect(reset.metadata!.historySequence!).toBeLessThan(later.metadata!.historySequence!);
+    const fresh = sliceMessagesForProviderFromLatestContextBoundary(h.requests[3].messages);
+    expect(fresh.find((row) => row.role === "user" && row.metadata?.synthetic !== true)?.id).toBe(
+      later.id
+    );
+  });
+
+  test("removing the flush entry lets the rollover entry seal the window directly", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    expect(
+      h.session.removeQueuedMessagesByDedupeKeyPrefix(CONTEXT_WARNING_DEDUPE_KEY, "removed")
+    ).toBe(1);
+    await h.finishAndDispatch();
+    const rows = await allRows(h);
+    expect(warningRows(rows)).toHaveLength(0);
+    expect(rolloverRows(rows)).toHaveLength(1);
+    expect(text(rows.at(-1)!)).toBe("Continue");
+  });
+
+  test("the flush entry degrades to a plain rollover when dispatch-time headroom is gone", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    // Usage reported at stream end exceeds ceiling - reserve, so the promised write cannot fit.
+    h.settleStream(0, { contextUsage: { inputTokens: 118_500 } });
+    await h.waitForRequest(2);
+    const rows = await allRows(h);
+    expect(warningRows(rows)).toHaveLength(0);
+    expect(rolloverRows(rows)).toHaveLength(1);
+    const trigger = rows.at(-1)!;
+    expect(text(trigger)).toBe("Continue");
+    expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    expect(h.requests[1].messages.some((row) => text(row).startsWith("Flush context notes"))).toBe(
+      false
+    );
+  });
+
+  test("the final flush is offered once per window, including after a restart", async () => {
+    const first = await setup();
+    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await first.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await first.finishAndDispatch();
+    expect(warningRows(await allRows(first)).filter(isFinalFlushRow)).toHaveLength(1);
+    await first.session.dispose();
+    const h = await setup({ previous: first });
+    expect((await h.session.sendMessage("Resume after restart", options)).success).toBe(true);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+    await h.finishAndDispatch();
+    const rows = await allRows(h);
+    expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
+    expect(rolloverRows(rows)).toHaveLength(1);
+    // A later window starts with a fresh claim.
+    expect(await h.requests[1].onStepSettled?.(step(110_000))).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+  });
 
   const exceeded: SendMessageError = {
     type: "context_budget_exceeded",
@@ -1723,6 +1924,8 @@ describe("AgentSession token-budget lifecycle", () => {
       expect((await h.session.sendMessage("Work", options)).success).toBe(true);
       expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
       expect(h.session.hasPendingManualFollowUp()).toBe(true);
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
       if (action === "manual-reset") {
         h.session.clearUsageState();
       } else {
@@ -1745,6 +1948,8 @@ describe("AgentSession token-budget lifecycle", () => {
         await h.session.waitForIdle();
       }
       expect(h.session.hasPendingManualFollowUp()).toBe(false);
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
       expect(rolloverRows(await allRows(h))).toHaveLength(0);
     }
   );

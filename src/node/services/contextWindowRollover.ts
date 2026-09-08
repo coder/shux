@@ -61,10 +61,24 @@ export function buildBudgetWarningText(
   contextTokens: number,
   maxTokens: number,
   memoryWritable: boolean,
-  sessionHistoryAvailable: boolean
+  sessionHistoryAvailable: boolean,
+  final = false
 ): string {
   assert(maxTokens > 0, "context budget warnings require a known positive limit");
-  return `Context window ~${Math.round((contextTokens / maxTokens) * 100)}% used (${Math.ceil(contextTokens)} of ${maxTokens} tokens). ${
+  const usage = `Context window ~${Math.round((contextTokens / maxTokens) * 100)}% used (${Math.ceil(contextTokens)} of ${maxTokens} tokens).`;
+  if (final) {
+    // The final flush is only offered while memory is writable and history recovery is
+    // available, so no degraded wording is needed here.
+    assert(memoryWritable && sessionHistoryAvailable, "final flush requires memory and recovery");
+    return [
+      usage,
+      "This is the last step in this context window: the next message starts a fresh provider context that does not carry this transcript.",
+      `${CONTEXT_NOTES_MEMORY_PATH} stays available through the memory tool and, when memory hot-set loading is enabled, is preloaded there if present (bounded to 8 KiB); session_history can retrieve earlier messages.`,
+      "Write or update that file now in a single memory call, essential state first: goal, decisions, invariants, open tasks, blockers, and the exact paths/IDs needed to resume. If the file is already preloaded, use str_replace/insert; otherwise create.",
+      "Do not continue the task or reply to the user in this step.",
+    ].join(" ");
+  }
+  return `${usage} ${
     memoryWritable
       ? `If you have state worth keeping, write/update ${CONTEXT_NOTES_MEMORY_PATH} now (essential state first, at most 8 KiB), then continue the current task without commentary.`
       : sessionHistoryAvailable
@@ -77,17 +91,29 @@ export function createContextBudgetWarning(
   contextTokens: number,
   maxTokens: number,
   memoryWritable: boolean,
-  sessionHistoryAvailable: boolean
+  sessionHistoryAvailable: boolean,
+  final = false
 ): MuxMessage {
   return createMuxMessage(
     createUserMessageId(),
     "user",
-    buildBudgetWarningText(contextTokens, maxTokens, memoryWritable, sessionHistoryAvailable),
+    buildBudgetWarningText(
+      contextTokens,
+      maxTokens,
+      memoryWritable,
+      sessionHistoryAvailable,
+      final
+    ),
     {
       timestamp: Date.now(),
       synthetic: true,
       uiVisible: true,
-      muxMetadata: { type: "context-budget-warning", contextTokens, maxTokens },
+      muxMetadata: {
+        type: "context-budget-warning",
+        contextTokens,
+        maxTokens,
+        ...(final ? { final: true as const } : {}),
+      },
     }
   );
 }

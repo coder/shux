@@ -110,15 +110,18 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     };
   }
   if (input.threshold >= 1) return result;
+  // A flush opportunity means one more notes-writing step fits below the hard ceiling.
+  // Use the real-encoding projection where available: it can exceed the chars/4 heuristic.
+  const safeFlush = hardProjected + WARNING_RESERVE_TOKENS < hardCeiling;
   if (projected >= limit * ((input.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT) / 100)) {
-    return { ...result, decision: "rollover", flushOpportunity: projected < hardCeiling };
+    return { ...result, decision: "rollover", flushOpportunity: safeFlush };
   }
   if (
     !input.warningEmitted &&
     projected >= limit * ((input.threshold * 100 - WARNING_ADVANCE_PERCENT) / 100)
   ) {
     // Never spend the last usable context tokens telling the agent to flush notes.
-    return projected + WARNING_RESERVE_TOKENS < hardCeiling
+    return safeFlush
       ? { ...result, decision: "warn", flushOpportunity: true }
       : { ...result, decision: "rollover" };
   }

@@ -565,6 +565,8 @@ interface MuxMessageMetadataBase {
   mcpPromptRefs?: MCPPromptReference[];
   /** Internal budget control turn; retains delegation metadata without a human prompt bubble. */
   contextBudgetContinuation?: true;
+  /** Budget continuation that asks for one final notes flush before the window is sealed. */
+  contextBudgetFlush?: true;
   /** Display-only insertion point within an assistant message that was streaming. */
   transcriptAnchor?: TranscriptAnchor;
 }
@@ -629,6 +631,8 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         type: "context-budget-warning";
         contextTokens: number;
         maxTokens: number;
+        /** Final pre-rollover flush prompt (absent on the advance warning). */
+        final?: true;
       }
     | {
         type: "compaction-request";
@@ -1232,6 +1236,8 @@ export type DisplayedMessage =
       contextBudgetWarning?: {
         contextTokens: number;
         maxTokens: number;
+        /** Final pre-rollover flush prompt rather than the advance warning. */
+        final: boolean;
       };
     }
   | {
