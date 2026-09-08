@@ -420,6 +420,11 @@ export class CompactionHandler {
   private cachedFileDiffs: FileEditDiff[] = [];
   /** Rollback snapshot for synthetic heartbeat reset boundaries that get skipped before dispatch. */
   private heartbeatResetRollbackState: HeartbeatResetRollbackState | null = null;
+  // Request consumers retain this identity rather than claiming whichever snapshot is current later.
+  private pendingStateOwner = Symbol();
+  private pendingStateFileOwner?: symbol;
+  private pendingStateWrites: Promise<unknown> = Promise.resolve();
+  private readonly pendingStateOwners = new WeakMap<PendingPostCompactionState, symbol>();
   /** Cached loaded skill snapshots extracted from history before appending compaction summary */
   private cachedLoadedSkills: LoadedSkillSnapshot[] = [];
   /** Cumulative file paths read in summarized epochs (paths only, newest-first, capped). */
@@ -441,16 +446,28 @@ export class CompactionHandler {
     this.onIdleCompactionOutcome = options.onIdleCompactionOutcome;
   }
 
+  private enqueuePendingStateWrite<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.pendingStateWrites.then(operation);
+    this.pendingStateWrites = result.catch(() => undefined);
+    return result;
+  }
+
   private async loadPersistedPendingStateIfNeeded(): Promise<void> {
     if (this.persistedPendingStateLoaded || this.postCompactionAttachmentsPending) {
       return;
     }
 
     this.persistedPendingStateLoaded = true;
+    const owner = Symbol();
+    this.pendingStateOwner = owner;
 
     let raw: string;
     try {
-      raw = await fsPromises.readFile(this.postCompactionStatePath, "utf-8");
+      raw = await this.enqueuePendingStateWrite(async () => {
+        const contents = await fsPromises.readFile(this.postCompactionStatePath, "utf-8");
+        this.pendingStateFileOwner = owner;
+        return contents;
+      });
     } catch {
       return;
     }
@@ -460,21 +477,21 @@ export class CompactionHandler {
       parsed = JSON.parse(raw);
     } catch {
       log.warn("Invalid post-compaction state JSON; ignoring", { workspaceId: this.workspaceId });
-      await this.deletePersistedPendingStateBestEffort();
+      await this.deletePersistedPendingStateBestEffort(owner);
       return;
     }
 
     let state = coercePersistedPostCompactionState(parsed);
     if (!state) {
       log.warn("Invalid post-compaction state schema; ignoring", { workspaceId: this.workspaceId });
-      await this.deletePersistedPendingStateBestEffort();
+      await this.deletePersistedPendingStateBestEffort(owner);
       return;
     }
 
     if (state.boundaryMessageId) {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) {
-        this.persistedPendingStateLoaded = false;
+        if (this.pendingStateOwner === owner) this.persistedPendingStateLoaded = false;
         return;
       }
       const boundaryId = history.data.findLast(isDurableContextBoundaryMarker)?.id;
@@ -483,11 +500,13 @@ export class CompactionHandler {
         // nor lose an older, still-pending attachment snapshot.
         state = state.previousState ?? null;
         if (!state || (state.boundaryMessageId && state.boundaryMessageId !== boundaryId)) {
-          await this.deletePersistedPendingStateBestEffort();
+          await this.deletePersistedPendingStateBestEffort(owner);
           return;
         }
       }
     }
+    // A load must not relabel a snapshot written while its history check was awaiting I/O.
+    if (this.pendingStateOwner !== owner) return;
     this.pendingStateBoundaryMessageId = state.boundaryMessageId;
     this.cachedFileDiffs = state.diffs;
     this.cachedLoadedSkills = state.loadedSkills;
@@ -508,11 +527,13 @@ export class CompactionHandler {
       return null;
     }
 
-    return {
+    const state = {
       diffs: this.cachedFileDiffs,
       loadedSkills: this.cachedLoadedSkills,
       readFiles: this.cachedReadFilePaths,
     };
+    this.pendingStateOwners.set(state, this.pendingStateOwner);
+    return state;
   }
 
   /**
@@ -536,47 +557,44 @@ export class CompactionHandler {
    * seen" memory, so the next compaction must merge them even when the pending
    * state was consumed in between.
    */
-  async ackPendingStateConsumed(): Promise<void> {
-    this.pendingStateBoundaryMessageId = undefined;
-    // If we never loaded persisted state but it exists, clear it anyway.
-    if (!this.postCompactionAttachmentsPending && !this.persistedPendingStateLoaded) {
-      await this.loadPersistedPendingStateIfNeeded();
-    }
-
-    this.postCompactionAttachmentsPending = false;
-    this.cachedFileDiffs = [];
-    await this.deletePersistedPendingStateBestEffort();
+  async ackPendingStateConsumed(expected?: PendingPostCompactionState | null): Promise<void> {
+    await this.consumePendingState(expected, false);
   }
 
   /**
    * Drop pending post-compaction state (e.g., because it caused context_exceeded).
    */
-  async discardPendingState(reason: string): Promise<void> {
-    this.pendingStateBoundaryMessageId = undefined;
-    await this.loadPersistedPendingStateIfNeeded();
-
-    const hadPendingState = this.postCompactionAttachmentsPending;
-    if (
-      !hadPendingState &&
-      this.cachedLoadedSkills.length === 0 &&
-      this.cachedReadFilePaths.length === 0
-    ) {
-      return;
-    }
-
-    log.warn("Discarding pending post-compaction state", {
+  async discardPendingState(
+    reason: string,
+    expected?: PendingPostCompactionState | null
+  ): Promise<void> {
+    log.debug("Discarding pending post-compaction state", {
       workspaceId: this.workspaceId,
       reason,
-      trackedFiles: this.cachedFileDiffs.length,
-      loadedSkills: this.cachedLoadedSkills.length,
-      readFiles: this.cachedReadFilePaths.length,
     });
+    await this.consumePendingState(expected, true);
+  }
 
-    if (hadPendingState) {
-      await this.ackPendingStateConsumed();
+  private async consumePendingState(
+    expected: PendingPostCompactionState | null | undefined,
+    discard: boolean
+  ): Promise<void> {
+    if (expected === undefined) await this.loadPersistedPendingStateIfNeeded();
+    const owner =
+      expected === undefined
+        ? this.pendingStateOwner
+        : expected && this.pendingStateOwners.get(expected);
+    if (!owner || this.pendingStateOwner !== owner) return;
+
+    // Clear this request's cache before yielding. A queued unlink must not later clear B's cache.
+    this.pendingStateBoundaryMessageId = undefined;
+    this.postCompactionAttachmentsPending = false;
+    this.cachedFileDiffs = [];
+    if (discard) {
+      this.cachedLoadedSkills = [];
+      this.cachedReadFilePaths = [];
     }
-    this.cachedLoadedSkills = [];
-    this.cachedReadFilePaths = [];
+    await this.deletePersistedPendingStateBestEffort(owner);
   }
 
   /**
@@ -591,7 +609,10 @@ export class CompactionHandler {
   async discardPendingStateDurably(reason: string): Promise<void> {
     await this.discardPendingState(reason);
     try {
-      await fsPromises.unlink(this.postCompactionStatePath);
+      await this.enqueuePendingStateWrite(async () => {
+        await fsPromises.unlink(this.postCompactionStatePath);
+        this.pendingStateFileOwner = undefined;
+      });
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return;
@@ -600,9 +621,13 @@ export class CompactionHandler {
     }
   }
 
-  private async deletePersistedPendingStateBestEffort(): Promise<void> {
+  private async deletePersistedPendingStateBestEffort(owner?: symbol): Promise<void> {
     try {
-      await fsPromises.unlink(this.postCompactionStatePath);
+      await this.enqueuePendingStateWrite(async () => {
+        if (owner && this.pendingStateFileOwner !== owner) return;
+        await fsPromises.unlink(this.postCompactionStatePath);
+        this.pendingStateFileOwner = undefined;
+      });
     } catch {
       // ignore
     }
@@ -650,9 +675,9 @@ export class CompactionHandler {
     boundaryMessageId?: string,
     previousState?: PersistedPostCompactionStateV1
   ): Promise<void> {
+    const owner = Symbol();
+    this.pendingStateOwner = owner;
     try {
-      await fsPromises.mkdir(this.sessionDir, { recursive: true });
-
       for (const snapshot of loadedSkills) {
         assert(snapshot.name.trim().length > 0, "loaded skill snapshot name must not be empty");
       }
@@ -666,7 +691,13 @@ export class CompactionHandler {
         ...(boundaryMessageId && { boundaryMessageId, previousState }),
       };
 
-      await fsPromises.writeFile(this.postCompactionStatePath, JSON.stringify(persisted));
+      await this.enqueuePendingStateWrite(async () => {
+        // This write owns retirement even if it fails and leaves earlier bytes on disk.
+        // Queueing writes with consumption prevents a held unlink from deleting a later write.
+        this.pendingStateFileOwner = owner;
+        await fsPromises.mkdir(this.sessionDir, { recursive: true });
+        await fsPromises.writeFile(this.postCompactionStatePath, JSON.stringify(persisted));
+      });
     } catch (error) {
       log.warn("Failed to persist post-compaction state", {
         workspaceId: this.workspaceId,

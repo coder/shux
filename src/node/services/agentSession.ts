@@ -1016,11 +1016,15 @@ export class AgentSession {
   private postCompactionReadFilePaths: string[] = [];
 
   /**
-   * When true, clear any persisted post-compaction state after the next successful non-compaction stream.
+   * Retain the exact injected snapshot so a late completion cannot consume a replacement.
    *
    * This is intentionally delayed until stream-end so a crash mid-stream doesn't lose the diffs.
    */
-  private ackPendingPostCompactionStateOnStreamEnd = false;
+  private pendingPostCompactionStateToAcknowledge: Awaited<
+    ReturnType<CompactionHandler["peekPendingState"]>
+  > = null;
+  /** Periodic reinjection retains the consumed owner of the cached skill/read carryover. */
+  private postCompactionState: typeof this.pendingPostCompactionStateToAcknowledge = null;
 
   /**
    * Cached memory session context (memory experiment): index snapshot for
@@ -6723,7 +6727,7 @@ export class AgentSession {
       // Reset per-stream flags (used for retries / crash-safe bookkeeping).
       this.compactionMonitor.resetForNewStream();
       this.clearLiveUsageState();
-      this.ackPendingPostCompactionStateOnStreamEnd = false;
+      this.pendingPostCompactionStateToAcknowledge = null;
       this.activeStreamHadAnyDelta = false;
       this.activeStreamHadPostCompactionInjection = false;
       const providersConfig = this.getProvidersConfigSafe();
@@ -7366,10 +7370,10 @@ export class AgentSession {
     return true;
   }
 
-  private async maybeRetryWithoutPostCompactionOnContextExceeded(data: {
-    messageId: string;
-    errorType?: string;
-  }): Promise<boolean> {
+  private async maybeRetryWithoutPostCompactionOnContextExceeded(
+    data: { messageId: string; errorType?: string },
+    pendingState = this.pendingPostCompactionStateToAcknowledge
+  ): Promise<boolean> {
     const expectedTurnId = this.coordinator.turnId;
     const expectedOperationId = this.coordinator.operationId;
     if (data.errorType !== "context_exceeded") {
@@ -7405,10 +7409,13 @@ export class AgentSession {
     });
 
     // The post-compaction context is likely the culprit; discard it so we don't loop.
-    this.postCompactionLoadedSkills = [];
-    this.postCompactionReadFilePaths = [];
+    if (this.postCompactionState === pendingState) {
+      this.postCompactionLoadedSkills = [];
+      this.postCompactionReadFilePaths = [];
+      this.postCompactionState = null;
+    }
     try {
-      await this.compactionHandler.discardPendingState("context_exceeded");
+      await this.compactionHandler.discardPendingState("context_exceeded", pendingState);
       this.onPostCompactionStateChange?.();
     } catch (error) {
       log.warn("Failed to discard pending post-compaction state", {
@@ -7608,7 +7615,7 @@ export class AgentSession {
     this.activeStreamStartedAtMs = undefined;
     this.activeStreamHadPostCompactionInjection = false;
     this.activeStreamHadAnyDelta = false;
-    this.ackPendingPostCompactionStateOnStreamEnd = false;
+    this.pendingPostCompactionStateToAcknowledge = null;
   }
 
   private async handleStreamError(
@@ -7616,6 +7623,7 @@ export class AgentSession {
     operation = this.coordinator.operationId
   ): Promise<void> {
     const turn = this.coordinator.turnId;
+    const pendingStateToDiscard = this.pendingPostCompactionStateToAcknowledge;
     this.coordinator.beginPolicy(turn);
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
@@ -7712,10 +7720,10 @@ export class AgentSession {
       return;
 
     if (
-      await this.maybeRetryWithoutPostCompactionOnContextExceeded({
-        messageId: data.messageId,
-        errorType: data.errorType,
-      })
+      await this.maybeRetryWithoutPostCompactionOnContextExceeded(
+        { messageId: data.messageId, errorType: data.errorType },
+        pendingStateToDiscard
+      )
     ) {
       return; // retry set PREPARING
     }
@@ -7944,6 +7952,7 @@ export class AgentSession {
     operation = this.coordinator.operationId
   ): Promise<void> {
     const turn = this.coordinator.turnId;
+    const pendingStateToAcknowledge = this.pendingPostCompactionStateToAcknowledge;
     this.coordinator.beginPolicy(turn);
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
@@ -8004,10 +8013,11 @@ export class AgentSession {
         this.emitChatEvent(payload);
         emittedStreamEnd = true;
 
-        if (this.ackPendingPostCompactionStateOnStreamEnd) {
-          this.ackPendingPostCompactionStateOnStreamEnd = false;
+        if (pendingStateToAcknowledge) {
+          if (this.pendingPostCompactionStateToAcknowledge === pendingStateToAcknowledge)
+            this.pendingPostCompactionStateToAcknowledge = null;
           try {
-            await this.compactionHandler.ackPendingStateConsumed();
+            await this.compactionHandler.ackPendingStateConsumed(pendingStateToAcknowledge);
             if (
               !this.coordinator.isCurrentTurn(turn) ||
               !this.coordinator.isCurrentOperation(operation)
@@ -9726,6 +9736,7 @@ export class AgentSession {
    * (compactionOccurred + the in-session mirrors).
    */
   async clearPostCompactionState(): Promise<void> {
+    this.postCompactionState = null;
     this.memoryContextByModelString.clear();
     // In-memory clears stay unconditional: they stop THIS session from
     // injecting carryover even when the durable discard below fails.
@@ -9733,7 +9744,7 @@ export class AgentSession {
     this.turnsSinceLastAttachment = TURNS_BETWEEN_ATTACHMENTS;
     this.postCompactionLoadedSkills = [];
     this.postCompactionReadFilePaths = [];
-    this.ackPendingPostCompactionStateOnStreamEnd = false;
+    this.pendingPostCompactionStateToAcknowledge = null;
     // Durable-or-throw: a swallowed unlink failure would leave the stale
     // post-compaction.json to re-inject pre-boundary carryover after a
     // restart while the boundary caller reports success — the same
@@ -9812,7 +9823,8 @@ export class AgentSession {
     // Check if compaction just occurred (immediate injection with cached post-compaction state)
     const pendingState = await this.compactionHandler.peekPendingState();
     if (pendingState !== null) {
-      this.ackPendingPostCompactionStateOnStreamEnd = true;
+      this.postCompactionState = pendingState;
+      this.pendingPostCompactionStateToAcknowledge = pendingState;
       this.compactionOccurred = true;
       this.turnsSinceLastAttachment = 0;
       this.postCompactionLoadedSkills = pendingState.loadedSkills;
@@ -9840,6 +9852,7 @@ export class AgentSession {
 
     // Check cooldown for subsequent injections (re-read from current history)
     if (this.compactionOccurred && this.turnsSinceLastAttachment >= TURNS_BETWEEN_ATTACHMENTS) {
+      this.pendingPostCompactionStateToAcknowledge = this.postCompactionState;
       this.turnsSinceLastAttachment = 0;
       return this.generatePostCompactionAttachments(includeReadFiles);
     }
