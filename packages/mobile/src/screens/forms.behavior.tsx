@@ -428,6 +428,84 @@ test.each([false, true])(
   }
 );
 
+test.each(["restore", "reselect"])(
+  "removed project blocks creation without losing drafts, then %s recovers",
+  async (recovery) => {
+    const calls: unknown[] = [];
+    const client = createORPCClient<MobileClient>({
+      call: async (path, input) => {
+        if (path.join(".") === "projects.listBranches")
+          return { branches: ["main"], recommendedTrunk: "main" };
+        if (path.join(".") !== "workspace.create")
+          throw new Error("Must not silently create a scratch chat");
+        calls.push(input);
+        return { success: true, metadata: workspace };
+      },
+    });
+    const signal = new AbortController().signal;
+    const catalog: Parameters<typeof CreateWorkspace>[0]["projects"] = [
+      ["/project", { workspaces: [], displayName: "Example" }],
+      ["/available", { workspaces: [], displayName: "Available" }],
+    ];
+    const renderForm = (projects: typeof catalog) => (
+      <CreateWorkspace
+        client={client}
+        signal={signal}
+        connected
+        projects={projects}
+        onReconnect={async () => {}}
+        onClose={() => {}}
+        onCreated={() => {}}
+      />
+    );
+    const view = render(renderForm(catalog));
+    fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+    fireEvent.click(view.getByRole("button", { name: "Example" }));
+    await waitFor(() => expect(view.getByDisplayValue("main")).toBeDefined());
+    fireEvent.change(view.getByLabelText("Title (optional)"), {
+      target: { value: "Keep this title" },
+    });
+    fireEvent.change(view.getByLabelText("Branch name (optional)"), {
+      target: { value: "keep-this-branch" },
+    });
+    fireEvent.change(view.getByLabelText("Base branch"), { target: { value: "release" } });
+    view.rerender(renderForm(catalog.slice(1)));
+    const create = view.getByRole("button", { name: "Create worktree" });
+    expect(create.getAttribute("aria-disabled")).toBe("true");
+    expect(view.queryByRole("button", { name: "Create scratch chat" })).toBeNull();
+    expect(view.getByRole("alert")).toBeDefined();
+    expect(view.getByDisplayValue("Keep this title")).toBeDefined();
+    expect(view.getByDisplayValue("keep-this-branch")).toBeDefined();
+    expect(view.getByDisplayValue("release")).toBeDefined();
+    fireEvent.click(create);
+    fireEvent.keyDown(view.getByLabelText("Base branch"), { key: "Enter", keyCode: 13 });
+    expect(calls).toHaveLength(0);
+    if (recovery === "restore") {
+      view.rerender(renderForm(catalog));
+      expect(view.getByDisplayValue("keep-this-branch")).toBeDefined();
+      expect(view.getByDisplayValue("release")).toBeDefined();
+    } else {
+      fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+      fireEvent.click(view.getByRole("button", { name: "Available" }));
+      await waitFor(() => expect(view.getByDisplayValue("main")).toBeDefined());
+    }
+    expect(view.queryByRole("alert")).toBeNull();
+    expect(view.getByDisplayValue("Keep this title")).toBeDefined();
+    expect(
+      view.getByRole("button", { name: "Create worktree" }).getAttribute("aria-disabled")
+    ).not.toBe("true");
+    await act(async () => {
+      fireEvent.keyDown(view.getByLabelText("Base branch"), { key: "Enter", keyCode: 13 });
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      projectPath: recovery === "restore" ? "/project" : "/available",
+      title: "Keep this title",
+      trunkBranch: recovery === "restore" ? "release" : "main",
+    });
+  }
+);
+
 const pickerValue: ChatSettings = {
   agentId: "exec",
   model: "local:one",

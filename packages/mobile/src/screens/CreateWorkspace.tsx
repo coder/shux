@@ -70,11 +70,16 @@ export function CreateWorkspace(props: {
     setError(null);
   }
 
+  const selectedProject = props.projects.find(([path]) => path === project);
+  // Catalog refreshes must block a removed selection without discarding its drafts.
+  const projectUnavailable = project !== null && !selectedProject;
+
   async function create() {
     if (
       pending.current ||
       !props.connected ||
       props.signal.aborted ||
+      projectUnavailable ||
       loading ||
       (project && !trunk.trim())
     )
@@ -115,7 +120,6 @@ export function CreateWorkspace(props: {
     }
   }
 
-  const selectedProject = props.projects.find(([path]) => path === project);
   const projectName =
     selectedProject?.[1].displayName ??
     project?.split(/[\\/]/).filter(Boolean).at(-1) ??
@@ -134,6 +138,7 @@ export function CreateWorkspace(props: {
             disabled={
               !props.connected ||
               props.signal.aborted ||
+              projectUnavailable ||
               loading ||
               (project !== null && !trunk.trim())
             }
@@ -197,6 +202,11 @@ export function CreateWorkspace(props: {
           </View>
         )}
       </View>
+      {projectUnavailable && (
+        <Notice severity="warning">
+          The selected project is no longer available. Choose another project to continue.
+        </Notice>
+      )}
       <View style={[layout.group, styles.form]}>
         <Field
           label="Title (optional)"
