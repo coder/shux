@@ -370,7 +370,7 @@ test.each([false, true])(
         client={client}
         signal={signal}
         connected={connected}
-        projects={[["/project", { workspaces: [], displayName: "Example" }]]}
+        projects={[["/project", { workspaces: [], displayName: "Example", trusted: true }]]}
         onReconnect={async () => {}}
         onClose={() => {}}
         onCreated={(value) => {
@@ -444,8 +444,8 @@ test.each(["restore", "reselect"])(
     });
     const signal = new AbortController().signal;
     const catalog: Parameters<typeof CreateWorkspace>[0]["projects"] = [
-      ["/project", { workspaces: [], displayName: "Example" }],
-      ["/available", { workspaces: [], displayName: "Available" }],
+      ["/project", { workspaces: [], displayName: "Example", trusted: true }],
+      ["/available", { workspaces: [], displayName: "Available", trusted: true }],
     ];
     const renderForm = (projects: typeof catalog) => (
       <CreateWorkspace
@@ -505,6 +505,228 @@ test.each(["restore", "reselect"])(
     });
   }
 );
+
+test.each(["root", "subproject"])(
+  "creation follows live owner trust and preserves drafts (%s)",
+  async (kind) => {
+    const calls: unknown[] = [];
+    let branchReads = 0;
+    const client = createORPCClient<MobileClient>({
+      call: async (path, input) => {
+        if (path.join(".") === "projects.listBranches") {
+          branchReads++;
+          return { branches: ["main"], recommendedTrunk: "main" };
+        }
+        if (path.join(".") !== "workspace.create") throw new Error("Unexpected creation path");
+        calls.push(input);
+        return { success: true, metadata: workspace };
+      },
+    });
+    const signal = new AbortController().signal;
+    const catalog = (
+      trusted: boolean | undefined,
+      childTrusted: boolean,
+      ownerPresent = true
+    ): Parameters<typeof CreateWorkspace>[0]["projects"] => {
+      const entries: Parameters<typeof CreateWorkspace>[0]["projects"] = [
+        ["/owner", { workspaces: [], displayName: "Owner", trusted }],
+        [
+          "/owner/child",
+          {
+            workspaces: [],
+            displayName: "Child",
+            parentProjectPath: "/owner",
+            trusted: childTrusted,
+          },
+        ],
+      ];
+      return ownerPresent ? entries : entries.slice(1);
+    };
+    const renderForm = (
+      trusted: boolean | undefined,
+      childTrusted: boolean,
+      ownerPresent = true
+    ) => (
+      <CreateWorkspace
+        client={client}
+        signal={signal}
+        connected
+        projects={catalog(trusted, childTrusted, ownerPresent)}
+        onReconnect={async () => {}}
+        onClose={() => {}}
+        onCreated={() => {}}
+      />
+    );
+    const view = render(renderForm(undefined, true));
+    fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+    fireEvent.click(view.getByRole("button", { name: kind === "root" ? "Owner" : "Child" }));
+    await waitFor(() => expect(view.getByDisplayValue("main")).toBeDefined());
+    fireEvent.change(view.getByLabelText("Title (optional)"), {
+      target: { value: "Preserve trust draft" },
+    });
+    fireEvent.change(view.getByLabelText("Branch name (optional)"), {
+      target: { value: "my-branch" },
+    });
+    fireEvent.change(view.getByLabelText("Base branch"), { target: { value: "release" } });
+    const attempt = () => {
+      fireEvent.click(view.getByRole("button", { name: "Create worktree" }));
+      fireEvent.keyDown(view.getByLabelText("Base branch"), { key: "Enter", keyCode: 13 });
+    };
+    expect(
+      view.getByRole("button", { name: "Create worktree" }).getAttribute("aria-disabled")
+    ).toBe("true");
+    expect(view.getByRole("alert")).toBeDefined();
+    attempt();
+    expect(calls).toHaveLength(0);
+    view.rerender(renderForm(true, false));
+    expect(view.queryByRole("alert")).toBeNull();
+    expect(
+      view.getByRole("button", { name: "Create worktree" }).getAttribute("aria-disabled")
+    ).not.toBe("true");
+    view.rerender(renderForm(false, true));
+    attempt();
+    expect(calls).toHaveLength(0);
+    if (kind === "subproject") {
+      view.rerender(renderForm(true, true, false));
+      attempt();
+      expect(calls).toHaveLength(0);
+    }
+    view.rerender(renderForm(true, false));
+    expect(view.getByDisplayValue("Preserve trust draft")).toBeDefined();
+    expect(view.getByDisplayValue("my-branch")).toBeDefined();
+    expect(view.getByDisplayValue("release")).toBeDefined();
+    expect(branchReads).toBe(1);
+    await act(async () => {
+      fireEvent.keyDown(view.getByLabelText("Base branch"), { key: "Enter", keyCode: 13 });
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      projectPath: kind === "root" ? "/owner" : "/owner/child",
+      title: "Preserve trust draft",
+      branchName: "my-branch",
+      trunkBranch: "release",
+    });
+  }
+);
+
+test.each(["empty", "error"])(
+  "branch discovery %s cannot be bypassed by typing a base and does not block scratch",
+  async (outcome) => {
+    type BranchResult = Awaited<ReturnType<MobileClient["projects"]["listBranches"]>>;
+    let resolve!: (value: BranchResult) => void;
+    let reject!: (reason: Error) => void;
+    const result = new Promise<BranchResult>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    const calls: string[] = [];
+    const client = createORPCClient<MobileClient>({
+      call: async (path) => {
+        const method = path.join(".");
+        if (method === "projects.listBranches") return result;
+        calls.push(method);
+        return { success: true, metadata: workspace };
+      },
+    });
+    const view = render(
+      <CreateWorkspace
+        client={client}
+        signal={new AbortController().signal}
+        connected
+        projects={[["/project", { workspaces: [], displayName: "Project", trusted: true }]]}
+        onReconnect={async () => {}}
+        onClose={() => {}}
+        onCreated={() => {}}
+      />
+    );
+    fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+    fireEvent.click(view.getByRole("button", { name: "Project" }));
+    expect(view.queryByRole("alert")).toBeNull();
+    expect(
+      view.getByRole("button", { name: "Create worktree" }).getAttribute("aria-disabled")
+    ).toBe("true");
+    await act(async () => {
+      if (outcome === "empty") resolve({ branches: [], recommendedTrunk: null });
+      else reject(new Error("Repository read failed"));
+    });
+    fireEvent.change(view.getByLabelText("Base branch"), { target: { value: "arbitrary-base" } });
+    expect(
+      view.getByRole("button", { name: "Create worktree" }).getAttribute("aria-disabled")
+    ).toBe("true");
+    const alert = view.getByRole("alert");
+    if (outcome === "error") expect(alert.textContent).toContain("Repository read failed");
+    fireEvent.click(view.getByRole("button", { name: "Create worktree" }));
+    fireEvent.keyDown(view.getByLabelText("Base branch"), { key: "Enter", keyCode: 13 });
+    expect(calls).toHaveLength(0);
+    fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+    fireEvent.click(view.getByRole("button", { name: "Scratch chat" }));
+    expect(view.queryByRole("alert")).toBeNull();
+    await act(async () => {
+      fireEvent.keyDown(view.getByLabelText("Title (optional)"), { key: "Enter", keyCode: 13 });
+    });
+    expect(calls).toEqual(["workspace.createScratch"]);
+  }
+);
+
+test("late branch results cannot change a newly selected project's eligibility", async () => {
+  type BranchResult = Awaited<ReturnType<MobileClient["projects"]["listBranches"]>>;
+  let resolveOld!: (value: BranchResult) => void;
+  const oldResult = new Promise<BranchResult>((done) => {
+    resolveOld = done;
+  });
+  const reads: Array<AbortSignal | undefined> = [];
+  const calls: unknown[] = [];
+  const client = createORPCClient<MobileClient>({
+    call: async (path, input, options) => {
+      if (path.join(".") === "projects.listBranches") {
+        reads.push(options.signal);
+        return (input as { projectPath: string }).projectPath === "/old"
+          ? oldResult
+          : { branches: ["main"], recommendedTrunk: "main" };
+      }
+      calls.push(input);
+      return { success: true, metadata: workspace };
+    },
+  });
+  const view = render(
+    <CreateWorkspace
+      client={client}
+      signal={new AbortController().signal}
+      connected
+      projects={[
+        ["/old", { workspaces: [], displayName: "Old", trusted: true }],
+        ["/new", { workspaces: [], displayName: "New", trusted: true }],
+      ]}
+      onReconnect={async () => {}}
+      onClose={() => {}}
+      onCreated={() => {}}
+    />
+  );
+  fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+  fireEvent.click(view.getByRole("button", { name: "Old" }));
+  fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+  fireEvent.click(view.getByRole("button", { name: "New" }));
+  await waitFor(() => expect(view.getByDisplayValue("main")).toBeDefined());
+  expect(reads[0]?.aborted).toBe(true);
+  await act(async () => {
+    resolveOld({ branches: [], recommendedTrunk: null });
+  });
+  expect(view.queryByRole("alert")).toBeNull();
+  expect(view.getByDisplayValue("main")).toBeDefined();
+  fireEvent.change(view.getByLabelText("Branch name (optional)"), {
+    target: { value: "keep-this-draft" },
+  });
+  fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+  fireEvent.click(view.getByRole("button", { name: "New" }));
+  expect(view.queryByRole("button", { name: "New" })).toBeNull();
+  expect(view.getByDisplayValue("keep-this-draft")).toBeDefined();
+  expect(view.getByDisplayValue("main")).toBeDefined();
+  await act(async () => {
+    fireEvent.keyDown(view.getByLabelText("Base branch"), { key: "Enter", keyCode: 13 });
+  });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toMatchObject({ projectPath: "/new", trunkBranch: "main" });
+});
 
 const pickerValue: ChatSettings = {
   agentId: "exec",

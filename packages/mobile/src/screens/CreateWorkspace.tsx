@@ -8,6 +8,7 @@ import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/wor
 import { Button, Field, Loading, Notice, Sheet } from "../components/Controls";
 import { colors, layout, radii, spacing, typography } from "../theme";
 import { linkedAbortController } from "../useConnection";
+import { resolveWorkspaceCreationScope } from "../../../../src/common/utils/subProjects";
 
 export function CreateWorkspace(props: {
   client: MobileClient;
@@ -23,7 +24,8 @@ export function CreateWorkspace(props: {
   const [title, setTitle] = useState("");
   const [branch, setBranch] = useState("");
   const [trunk, setTrunk] = useState("");
-  const [branches, setBranches] = useState<string[]>([]);
+  // Null is unresolved/failed discovery; an empty successful list cannot back a worktree.
+  const [branches, setBranches] = useState<string[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -37,6 +39,7 @@ export function CreateWorkspace(props: {
     controller.current = abort;
     pending.current = false;
     setBusy(false);
+    setBranches(null);
     if (abort.signal.aborted || !project) {
       setLoading(false);
       return () => abort.abort();
@@ -62,28 +65,34 @@ export function CreateWorkspace(props: {
 
   function selectProject(path: string | null) {
     if (pending.current) return;
-    setProject(path);
     setChoosingProject(false);
+    if (path === project) return;
+    setProject(path);
     setBranch("");
     setTrunk("");
-    setBranches([]);
+    setBranches(null);
     setError(null);
   }
 
-  const selectedProject = props.projects.find(([path]) => path === project);
+  const projectsByPath = new Map(props.projects);
+  const selectedProject = project === null ? undefined : projectsByPath.get(project);
   // Catalog refreshes must block a removed selection without discarding its drafts.
   const projectUnavailable = project !== null && !selectedProject;
+  // Subprojects share their owning project's trust, regardless of their own raw flag.
+  const projectTrusted =
+    project === null ||
+    projectsByPath.get(resolveWorkspaceCreationScope(project, projectsByPath).projectPath)
+      ?.trusted === true;
+  const repositoryUnsupported = project !== null && branches?.length === 0;
+  const creationDisabled =
+    !props.connected ||
+    props.signal.aborted ||
+    loading ||
+    (project !== null &&
+      (projectUnavailable || !projectTrusted || !branches?.length || !trunk.trim()));
 
   async function create() {
-    if (
-      pending.current ||
-      !props.connected ||
-      props.signal.aborted ||
-      projectUnavailable ||
-      loading ||
-      (project && !trunk.trim())
-    )
-      return;
+    if (pending.current || creationDisabled) return;
     pending.current = true;
     setBusy(true);
     setError(null);
@@ -121,7 +130,7 @@ export function CreateWorkspace(props: {
   }
 
   const projectName =
-    selectedProject?.[1].displayName ??
+    selectedProject?.displayName ??
     project?.split(/[\\/]/).filter(Boolean).at(-1) ??
     "Scratch chat";
   return (
@@ -133,17 +142,7 @@ export function CreateWorkspace(props: {
       dismissDisabled={busy}
       footer={
         <>
-          <Button
-            busy={busy}
-            disabled={
-              !props.connected ||
-              props.signal.aborted ||
-              projectUnavailable ||
-              loading ||
-              (project !== null && !trunk.trim())
-            }
-            onPress={create}
-          >
+          <Button busy={busy} disabled={creationDisabled} onPress={create}>
             {project ? "Create worktree" : "Create scratch chat"}
           </Button>
           {busy && (
@@ -207,6 +206,17 @@ export function CreateWorkspace(props: {
           The selected project is no longer available. Choose another project to continue.
         </Notice>
       )}
+      {!projectUnavailable && !projectTrusted && (
+        <Notice severity="warning">
+          Trust the owning project in Xum desktop (Settings → Security) before creating a worktree.
+        </Notice>
+      )}
+      {!projectUnavailable && projectTrusted && repositoryUnsupported && (
+        <Notice severity="warning">
+          Mobile worktrees require a Git repository with an initial commit and a local branch. Set
+          it up in Xum desktop or your terminal, then reopen this sheet.
+        </Notice>
+      )}
       <View style={[layout.group, styles.form]}>
         <Field
           label="Title (optional)"
@@ -241,7 +251,7 @@ export function CreateWorkspace(props: {
               returnKeyType="done"
               onSubmitEditing={create}
             />
-            {branches.length > 0 && (
+            {branches !== null && branches.length > 0 && (
               <View style={styles.branches}>
                 {branches.slice(0, 6).map((name) => (
                   <Pressable
