@@ -44,6 +44,9 @@ export type CompactionCancellationMutationOutcome = "applied" | "superseded";
 /** Only successfully read bytes with invalid JSON/schema authorize automatic repair. */
 export class MalformedCompactionCancellationError extends Error {}
 
+/** Unsupported or oversized records must be preserved instead of repaired or overwritten. */
+export class CompactionCancellationReadRefusedError extends Error {}
+
 export interface CompactionCancellationStorage {
   /** Fresh shared state; absence and unreadable I/O must remain distinguishable. */
   read(): Promise<CompactionCancellationRecord | null>;
@@ -141,8 +144,10 @@ export class CompactionCancellation {
       }
     } catch (error) {
       // A stale read/repair cannot hide a newer local Stop or trigger its replacement.
-      if (isCurrent()) throw error;
+      if (isCurrent() || this.current === undefined) throw error;
     }
+    // Supersession without a receipt leaves unknown state, never evidence of absence.
+    if (this.current === undefined) throw new Error("Cancellation state changed during read");
     return this.effectiveRecord();
   }
 
@@ -179,6 +184,7 @@ export class CompactionCancellation {
             if (retried === this.pending) throw error;
           }
         }
+        if (this.current === undefined) return this.refreshForReplacement();
         continue;
       }
       const mutation = this.mutation;
@@ -187,8 +193,14 @@ export class CompactionCancellation {
       const generation = this.readGeneration;
       try {
         const record = await reading;
+        if (this.current === undefined) return this.refreshForReplacement();
         if (!this.blocksRecovery) return record;
-      } catch {
+      } catch (error) {
+        if (error instanceof CompactionCancellationReadRefusedError) throw error;
+        // Refresh unknown state once; propagate that read's failure instead of repeatedly
+        // publishing fallback Stops that a foreign cancellation keeps superseding.
+        if (this.current === undefined && (this.mutation !== mutation || this.pending !== pending))
+          return this.refreshForReplacement();
         // read() checks before rejecting, but a newer Stop/retry/read can enter before
         // this rejection resumes. Fallback must still own that exact failed read.
         if (
@@ -202,6 +214,16 @@ export class CompactionCancellation {
         await this.cancel({ retainUntilReplacement: true });
       }
     }
+  }
+
+  private async refreshForReplacement(): Promise<CompactionCancellationRecord | null> {
+    const pending = this.pending;
+    await this.read();
+    // One refresh cannot turn another Stop's tentative state into replacement authority.
+    // Further overlap requires a new request rather than an unbounded refresh/retry loop.
+    if (this.pending !== pending || this.blocksRecovery || this.current === undefined)
+      throw new Error("Cancellation changed during replacement refresh");
+    return this.effectiveRecord();
   }
 
   async narrow(nonce: string, summary: CompactionCancellationSummary) {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   CompactionCancellation,
   MalformedCompactionCancellationError,
+  CompactionCancellationReadRefusedError,
   matchesCompactionCancellation,
   type CompactionCancellationMutation,
   type CompactionCancellationMutationOutcome,
@@ -716,6 +717,16 @@ describe("inactive cancellation state core", () => {
     expect(state.repairRevision).toBe(0);
   });
 
+  it("replacement propagates a read refusal without repair or fallback publication", async () => {
+    const { state, storage } = harness();
+    const refusal = new CompactionCancellationReadRefusedError("Read refused");
+    storage.read.mockRejectedValueOnce(refusal);
+    await assert.rejects(state.readForReplacement(), (error) => error === refusal);
+    expect(storage.repair).not.toHaveBeenCalled();
+    expect(storage.mutate).not.toHaveBeenCalled();
+    expect(state.needsPersistence).toBe(false);
+  });
+
   it("ordinary read failure never repairs; explicit replacement publishes a retained fence", async () => {
     const { state, storage } = harness();
     storage.read.mockRejectedValueOnce(new Error("permission denied"));
@@ -727,6 +738,147 @@ describe("inactive cancellation state core", () => {
     expect(storage.repair).not.toHaveBeenCalled();
     expect(storage.mutate).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    { completion: "before", freshFailure: false },
+    { completion: "after", freshFailure: false },
+    { completion: "before", freshFailure: true },
+    { completion: "after", freshFailure: true },
+  ])(
+    "replacement refreshes unknown state (error=$completion supersession, fresh failure=$freshFailure)",
+    async ({ completion, freshFailure }) => {
+      const { state, storage, shared } = harness();
+      shared.record = { ...cancellation("foreign-b"), retainUntilReplacement: true };
+      const failure = Promise.withResolvers<CompactionCancellationRecord | null>();
+      const superseded = Promise.withResolvers<CompactionCancellationMutationOutcome>();
+      const readFinished = Promise.withResolvers<void>();
+      const deliver = Promise.withResolvers<void>();
+      storage.read.mockReturnValueOnce(failure.promise);
+      if (freshFailure) storage.read.mockRejectedValueOnce(new Error("fresh read unavailable"));
+      storage.mutate.mockReturnValueOnce(superseded.promise);
+      const read = state.read.bind(state);
+      const checkedRead = spyOn(state, "read").mockImplementationOnce(async () => {
+        try {
+          const record = await read();
+          readFinished.resolve();
+          if (completion === "before") await deliver.promise;
+          return record;
+        } finally {
+          readFinished.resolve();
+        }
+      });
+      try {
+        const replacement = state.readForReplacement();
+        const stopping = state.cancel();
+        if (completion === "before") {
+          failure.reject(new Error("old read failed"));
+          await readFinished.promise;
+        }
+        superseded.resolve("superseded");
+        expect(await stopping).toBe("superseded");
+        deliver.resolve();
+        if (completion === "after") failure.reject(new Error("old read failed"));
+        if (freshFailure) await assert.rejects(replacement, /fresh read unavailable/);
+        else expect(await replacement).toEqual(shared.record);
+        expect(storage.read).toHaveBeenCalledTimes(2);
+        expect(storage.mutate).toHaveBeenCalledTimes(1);
+      } finally {
+        checkedRead.mockRestore();
+      }
+    }
+  );
+
+  it.each([
+    { overlap: false, readFailure: true },
+    { overlap: true, readFailure: true },
+    { overlap: true, readFailure: false },
+  ])(
+    "replacement bounds its refresh (another overlap=$overlap, read failure=$readFailure)",
+    async ({ overlap, readFailure }) => {
+      const { state, storage, shared } = harness();
+      shared.record = cancellation("foreign-b");
+      const failure = Promise.withResolvers<CompactionCancellationRecord | null>();
+      const refresh = Promise.withResolvers<CompactionCancellationRecord | null>();
+      const refreshEntered = Promise.withResolvers<void>();
+      storage.read.mockReturnValueOnce(failure.promise).mockImplementationOnce(() => {
+        refreshEntered.resolve();
+        return refresh.promise;
+      });
+      storage.mutate.mockResolvedValue("superseded");
+      const replacement = state.readForReplacement();
+      await state.cancel();
+      failure.reject(new Error("old read failed"));
+      // The race allows no absence decision before the fresh authoritative read starts.
+      await Promise.race([refreshEntered.promise, replacement]);
+      expect(storage.read).toHaveBeenCalledTimes(2);
+      if (overlap) await state.cancel();
+      if (readFailure) {
+        refresh.reject(new Error("fresh read unavailable"));
+        await assert.rejects(replacement, /fresh read unavailable/);
+      } else {
+        refresh.resolve(null);
+        await assert.rejects(replacement);
+      }
+      expect(storage.read).toHaveBeenCalledTimes(2);
+      expect(storage.mutate).toHaveBeenCalledTimes(overlap ? 2 : 1);
+      expect(shared.record).toEqual(cancellation("foreign-b"));
+    }
+  );
+
+  it("joining a superseded Stop surfaces a failed authoritative read without fallback", async () => {
+    const { state, storage, shared } = harness();
+    shared.record = cancellation("foreign-b");
+    storage.read.mockRejectedValue(new Error("fresh read unavailable"));
+    storage.mutate.mockResolvedValueOnce("superseded");
+    storage.mutate.mockRejectedValue(new Error("unexpected fallback"));
+    const stopping = state.cancel();
+    const replacement = state.readForReplacement();
+    expect(await stopping).toBe("superseded");
+    await assert.rejects(replacement, /fresh read unavailable/);
+    expect(storage.read).toHaveBeenCalledTimes(1);
+    expect(storage.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])(
+    "a bounded refresh refuses another Stop overlapping its read (publication settled=%s)",
+    async (settled) => {
+      const { state, storage, shared } = harness();
+      shared.record = cancellation("foreign-a");
+      const failedRead = Promise.withResolvers<CompactionCancellationRecord | null>();
+      const refresh = Promise.withResolvers<CompactionCancellationRecord | null>();
+      const refreshEntered = Promise.withResolvers<void>();
+      const publish = Promise.withResolvers<void>();
+      storage.read.mockReturnValueOnce(failedRead.promise).mockImplementationOnce(() => {
+        refreshEntered.resolve();
+        return refresh.promise;
+      });
+      const apply = storage.mutate.getMockImplementation()!;
+      storage.mutate
+        .mockResolvedValueOnce("superseded")
+        .mockImplementationOnce(async (mutation, current, onCommitted) => {
+          await publish.promise;
+          return apply(mutation, current, onCommitted);
+        });
+      const replacement = state.readForReplacement();
+      await state.cancel();
+      failedRead.reject(new Error("old read unavailable"));
+      await refreshEntered.promise;
+      const stopping = state.cancel();
+      if (settled) {
+        publish.resolve();
+        expect(await stopping).toBe("applied");
+      }
+      refresh.resolve(shared.record);
+      await assert.rejects(replacement);
+      expect(state.blocksRecovery).toBe(!settled);
+      expect(state.needsPersistence).toBe(!settled);
+      expect(storage.read).toHaveBeenCalledTimes(2);
+      publish.resolve();
+      expect(await stopping).toBe("applied");
+      expect(await state.readForReplacement()).toEqual(shared.record);
+      expect(state.blocksRecovery).toBe(false);
+    }
+  );
 
   it("fallback cannot replace a Stop admitted after the read's final error check", async () => {
     const { state, storage } = harness();
