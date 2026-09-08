@@ -340,6 +340,31 @@ describe("DesktopPopout handoff", () => {
     expect(popout.getSnapshot().state).toBe("inline");
   });
 
+  test("manager truth confirms the window a bring-back is already waiting on", async () => {
+    updatePersistedState(`desktop-popout:${workspaceId}`, "existing");
+    const popout = new DesktopPopout(workspaceId, true);
+    popout.attach(() => undefined, undefined, /* suspended */ true, leasable);
+    const lookup = deferred<{ instanceId: string } | null>();
+    api.getWindow = mock(() => lookup.promise);
+    const reconciling = popout.reconcile(api);
+    // Bring back clicked while the initial manager lookup is still pending: the hung child
+    // never answers the ping, so only manager truth can confirm it.
+    const returning = popout.bringBack();
+    await settle();
+    expect(channel().sent).toEqual([{ type: "ping", instanceId: "existing" }]);
+    lookup.resolve({ instanceId: "existing" });
+    await reconciling;
+    expect(await returning).toBe(true);
+    expect(channel().sent.at(-1)).toEqual({ type: "bring-back", instanceId: "existing" });
+    // The hint was not rolled back as stale: the window stays manager-owned until it closes.
+    expect(popout.getSnapshot().state).not.toBe("inline");
+    expect(readPersistedState<string | null>(`desktop-popout:${workspaceId}`, null)).toBe(
+      "existing"
+    );
+    message("closed", "existing");
+    expect(popout.getSnapshot()).toEqual({ state: "inline", error: null });
+  });
+
   test("Electron recovery never force-closes a child kept open for want of an inline lease", async () => {
     const popout = new DesktopPopout(workspaceId, true);
     api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));

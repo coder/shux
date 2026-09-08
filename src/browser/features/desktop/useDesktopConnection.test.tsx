@@ -7,7 +7,6 @@ import {
   describe,
   expect,
   mock,
-  spyOn,
   test,
   type Mock,
 } from "bun:test";
@@ -391,30 +390,37 @@ describe("useDesktopConnection control ownership", () => {
     expect(DesktopRfbFixture.instances).toHaveLength(0);
   });
 
-  test("a late subscription from a superseded generation cannot construct another RFB", async () => {
+  test("a reconnect while the first registration is still pending reuses it instead of superseding it", async () => {
     const pending =
       Promise.withResolvers<Awaited<ReturnType<APIClient["desktop"]["watchViewer"]>>>();
     watchViewer.mockReturnValueOnce(pending.promise);
     const view = mountConnection();
     act(() => view.desktop.connect());
     await waitFor(() => expect(watchViewer).toHaveBeenCalledTimes(1));
-    const oldSignal = watchViewer.mock.calls[0][1]?.signal;
-    const replacement = await connect(view);
-    expect(oldSignal?.aborted).toBe(true);
+    const [input, init] = watchViewer.mock.calls[0];
+    // Superseding the pending registration would give it up definitively before a successor is
+    // ready; the new attempt waits for it instead.
+    act(() => view.desktop.connect());
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+    expect(init?.signal?.aborted).toBe(false);
+    expect(detachViewer).not.toHaveBeenCalled();
     const events = wrapAsyncIterator(
       (async function* () {
-        yield await Promise.resolve({ type: "ready" as const, viewerId: "stale" });
+        yield await Promise.resolve({ type: "ready" as const, viewerId: input.viewerId ?? "" });
+        await new Promise<void>((resolve) => {
+          init?.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
       })(),
       {}
     );
-    const close = spyOn(events, "return");
     await act(async () => {
       pending.resolve(events);
       await pending.promise;
     });
-    expect(close).toHaveBeenCalledTimes(1);
-    expect(DesktopRfbFixture.instances).toEqual([replacement]);
-    expect(replacement.disconnectCount).toBe(0);
+    await waitFor(() => expect(view.desktop.state).toBe("connected"));
+    expect(DesktopRfbFixture.instances).toHaveLength(1);
+    expect(watchViewer).toHaveBeenCalledTimes(1);
   });
 
   test.each([false, true])(

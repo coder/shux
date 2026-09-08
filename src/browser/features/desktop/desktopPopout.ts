@@ -265,7 +265,13 @@ export class DesktopPopout {
         const current = await api.getWindow({ workspaceId: this.workspaceId });
         if (snapshot !== this.snapshot || snapshot.state === "opening") return;
         if (current) {
-          if (this.returning) return;
+          if (this.returning) {
+            // A bring-back is already awaiting confirmation of this very window: manager truth
+            // confirms it (a hung renderer cannot answer the ping, and an unanswered hint would
+            // be rolled back as stale, orphaning the native window).
+            if (current.instanceId === this.instanceId) this.confirmChild();
+            return;
+          }
           this.suspend();
           this.instanceId = current.instanceId;
           this.listen();

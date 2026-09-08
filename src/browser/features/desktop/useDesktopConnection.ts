@@ -563,12 +563,12 @@ export function useDesktopConnection(
       isDisposedRef.current = false;
       terminalRef.current = false;
       clearReconnectTimer();
-      // Only a registration that already reported ready is reusable; a still-pending one is
-      // superseded by this attempt's own registration.
+      // An existing registration is reused, ready or still pending: superseding a pending one
+      // would give it up definitively (deleting its grace) before its successor is ready, and
+      // an agent-driven archive could close the desktop in that gap. A pending one that fails is
+      // replaced below.
       const reuseViewerRegistration =
-        viewerRegistrationRef.current !== null &&
-        !viewerRegistrationRef.current.signal.aborted &&
-        viewerReadyRef.current;
+        viewerRegistrationRef.current !== null && !viewerRegistrationRef.current.signal.aborted;
       disconnectCurrentRfb({ keepViewerRegistration: reuseViewerRegistration });
       setReason(null);
 
@@ -593,8 +593,14 @@ export function useDesktopConnection(
         // a registration made after it would leave a window in which nothing marks this pane
         // as attached and an agent-driven archive could close the desktop the pane is about to
         // show. A ready registration from before a transient drop is reused as is.
-        if (registerViewer && !reuseViewerRegistration) {
-          await registerViewerRegistration(api);
+        if (registerViewer) {
+          const reusedReady = reuseViewerRegistration
+            ? await (registrationReadyRef.current ?? Promise.resolve(viewerReadyRef.current))
+            : false;
+          if (generationRef.current !== generation || isDisposedRef.current) {
+            return;
+          }
+          if (!reusedReady) await registerViewerRegistration(api);
           if (generationRef.current !== generation || isDisposedRef.current) {
             return;
           }
