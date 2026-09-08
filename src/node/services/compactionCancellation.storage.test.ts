@@ -2,12 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:te
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as nodeFs from "node:fs";
+import callbackFs from "node:fs";
 import * as path from "node:path";
 import { createMuxMessage } from "@/common/types/message";
 import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { HistoryService } from "./historyService";
+import { HISTORY_APPEND_PROVENANCE_FILE } from "./historyAppendProvenance";
 import { createTestHistoryService } from "./testHistoryService";
 import { historyWriteLockPath, removeSessionDirUnderMemoryLocks } from "./workspaceRemoval";
 import {
@@ -52,6 +54,22 @@ const publication = (
   publication: { attempts: 1 },
 });
 
+function afterCompactionStaging(target: string, action: () => void) {
+  // write-file-atomic consumes CommonJS fs, so intercept its shared default export.
+  const rename = callbackFs.rename;
+  spyOn(callbackFs, "rename").mockImplementation(
+    Object.assign(
+      (...[source, destination, callback]: Parameters<typeof rename>) => {
+        rename(source, destination, (error) => {
+          if (!error && String(destination).startsWith(`${target}.continuous-`)) action();
+          callback(error);
+        });
+      },
+      { __promisify__: rename.__promisify__ }
+    )
+  );
+}
+
 describe("inactive real cancellation storage", () => {
   let h: Awaited<ReturnType<typeof createTestHistoryService>>;
   let storage: FileCompactionCancellationStorage;
@@ -78,6 +96,157 @@ describe("inactive real cancellation storage", () => {
     mock.restore();
     await h.cleanup();
   });
+
+  it.each(["generation", "publication", "narrowing", "retirement"] as const)(
+    "a displaced history-lock holder cannot commit %s over its successor",
+    async (phase) => {
+      await state.cancel();
+      const original = (await storage.read())!;
+      const successor = { ...record("foreign-successor"), retainUntilReplacement: true };
+      const generationPath = path.join(sessionDir, CONTINUOUS_COMPACTION_GENERATION_FILE);
+      const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
+      let displaced = false;
+      const displace = () => {
+        displaced = true;
+        // Deterministically model lease reclamation while the first holder is
+        // suspended in I/O. The real ownership check must reject this new token.
+        nodeFs.writeFileSync(lockPath, `${process.pid}:foreign-holder`);
+        nodeFs.writeFileSync(storage.path, JSON.stringify(successor));
+        nodeFs.writeFileSync(generationPath, "foreign-generation");
+      };
+      if (phase === "retirement") {
+        const read = nodeFs.promises.readFile;
+        spyOn(nodeFs.promises, "readFile").mockImplementation((async (
+          ...args: Parameters<typeof read>
+        ) => {
+          const result = await read(...args);
+          if (args[0] === storage.path && !displaced) displace();
+          return result;
+        }) as typeof read);
+      } else {
+        const target = phase === "generation" ? generationPath : storage.path;
+        afterCompactionStaging(target, () => {
+          if (!displaced) displace();
+        });
+      }
+      const mutation: CompactionCancellationMutation =
+        phase === "retirement"
+          ? { kind: "retire", nonce: original.nonce }
+          : phase === "narrowing"
+            ? { kind: "narrow", record: { ...original, scope: { kind: "summary", ...summary } } }
+            : publication("obsolete-publisher");
+      await assert.rejects(
+        storage.mutate(mutation, () => true),
+        /no longer owned/
+      );
+      expect(displaced).toBe(true);
+      expect(await storage.read()).toEqual(successor);
+      expect(await fs.readFile(generationPath, "utf8")).toBe("foreign-generation");
+      expect(await fs.readFile(lockPath, "utf8")).toBe(`${process.pid}:foreign-holder`);
+    }
+  );
+
+  it.each([
+    "partial",
+    "archive",
+    "chat",
+    "truncate",
+    "pending receipt",
+    "final receipt",
+    "repair retirement",
+  ] as const)(
+    "a displaced repair cannot commit %s over successor recovery state",
+    async (phase) => {
+      const partialPath = path.join(sessionDir, "partial.json");
+      const archivePath = path.join(sessionDir, "chat-archive.jsonl");
+      const chatPath = path.join(sessionDir, "chat.jsonl");
+      const receiptPath = path.join(sessionDir, HISTORY_APPEND_PROVENANCE_FILE);
+      const generationPath = path.join(sessionDir, CONTINUOUS_COMPACTION_GENERATION_FILE);
+      const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
+      const pending = createMuxMessage("old-summary", "assistant", "old", {
+        muxMetadata: { type: "compaction-summary", pendingFollowUp: followUp() },
+      });
+      const oldBytes = JSON.stringify(pending);
+      await fs.writeFile(storage.path, "{damaged cancellation");
+      await fs.writeFile(partialPath, oldBytes);
+      await fs.writeFile(archivePath, oldBytes + "\n");
+      await fs.writeFile(chatPath, oldBytes + "\n");
+      if (phase === "truncate") {
+        await fs.writeFile(`${archivePath}.truncate`, oldBytes + "\n");
+        await fs.writeFile(`${archivePath}.truncate.json`, "damaged truncate marker");
+      }
+      const successor = { ...record("foreign-repair-successor"), retainUntilReplacement: true };
+      const expected = new Map([
+        [storage.path, JSON.stringify(successor)],
+        [generationPath, "foreign-generation"],
+        [partialPath, JSON.stringify({ ...pending, id: "foreign-partial" })],
+        [archivePath, JSON.stringify({ ...pending, id: "foreign-archive" }) + "\n"],
+        [chatPath, JSON.stringify({ ...pending, id: "foreign-chat" }) + "\n"],
+        [receiptPath, "foreign-provenance-receipt"],
+      ]);
+      let displaced = false;
+      const displace = () => {
+        if (displaced) return;
+        displaced = true;
+        nodeFs.writeFileSync(lockPath, `${process.pid}:foreign-repair-holder`);
+        for (const [file, contents] of expected) nodeFs.writeFileSync(file, contents);
+      };
+      if (phase === "partial" || phase === "archive" || phase === "chat") {
+        afterCompactionStaging(
+          { partial: partialPath, archive: archivePath, chat: chatPath }[phase],
+          displace
+        );
+      } else if (phase === "truncate") {
+        const remove = fs.rm;
+        spyOn(fs, "rm").mockImplementation(async (file, options) => {
+          await remove(file, options);
+          if (file === archivePath) displace();
+        });
+      } else if (phase === "repair retirement") {
+        const rename = fs.rename;
+        spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+          await rename(source, destination);
+          if (
+            destination === receiptPath &&
+            (JSON.parse(nodeFs.readFileSync(receiptPath, "utf8")) as { state?: unknown }).state ===
+              "stable"
+          )
+            displace();
+        });
+      } else {
+        const open = fs.open;
+        spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+          const handle = await open(...args);
+          if (String(args[0]).startsWith(`${receiptPath}.`) && String(args[0]).endsWith(".tmp")) {
+            const close = handle.close.bind(handle);
+            spyOn(handle, "close").mockImplementation(async () => {
+              await close();
+              const receipt: unknown = JSON.parse(nodeFs.readFileSync(args[0], "utf8"));
+              const expectedState = phase === "pending receipt" ? "pending" : "stable";
+              if (
+                receipt &&
+                typeof receipt === "object" &&
+                "state" in receipt &&
+                receipt.state === expectedState
+              )
+                displace();
+            });
+          }
+          return handle;
+        });
+      }
+      const committed = mock(() => undefined);
+      await assert.rejects(
+        storage.repair(() => true, committed),
+        /no longer owned/
+      );
+      expect(displaced).toBe(true);
+      expect(committed).not.toHaveBeenCalled();
+      for (const [file, contents] of expected)
+        expect(await fs.readFile(file, "utf8")).toBe(contents);
+      expect(await fs.readFile(lockPath, "utf8")).toBe(`${process.pid}:foreign-repair-holder`);
+    }
+  );
 
   it("fresh reads distinguish absence, malformed bytes and I/O errors", async () => {
     expect(await storage.read()).toBeNull();
@@ -243,15 +412,13 @@ describe("inactive real cancellation storage", () => {
 
     const mutation = publication("retry-me");
     const advance = journal.advanceGenerationUnderHistoryLock.bind(journal);
-    spyOn(journal, "advanceGenerationUnderHistoryLock").mockImplementationOnce(
-      async (onCommitted) => {
-        await advance(onCommitted);
-        expect(mutation.publication.predecessor?.generation).toBe(
-          await journal.captureGenerationUnderHistoryLock()
-        );
-        throw new Error("after generation commit");
-      }
-    );
+    spyOn(journal, "advanceGenerationUnderHistoryLock").mockImplementationOnce(async (...args) => {
+      await advance(...args);
+      expect(mutation.publication.predecessor?.generation).toBe(
+        await journal.captureGenerationUnderHistoryLock()
+      );
+      throw new Error("after generation commit");
+    });
     await assert.rejects(
       storage.mutate(mutation, () => true),
       /after generation commit/
@@ -277,8 +444,8 @@ describe("inactive real cancellation storage", () => {
       } else {
         const advance = journal.advanceGenerationUnderHistoryLock.bind(journal);
         spyOn(journal, "advanceGenerationUnderHistoryLock").mockImplementationOnce(
-          async (committed) => {
-            await advance(committed);
+          async (...args) => {
+            await advance(...args);
             throw new Error("after advance");
           }
         );
@@ -368,12 +535,10 @@ describe("inactive real cancellation storage", () => {
     let current = true;
     const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
     const advance = journal.advanceGenerationUnderHistoryLock.bind(journal);
-    spyOn(journal, "advanceGenerationUnderHistoryLock").mockImplementationOnce(
-      async (committed) => {
-        await advance(committed);
-        current = false;
-      }
-    );
+    spyOn(journal, "advanceGenerationUnderHistoryLock").mockImplementationOnce(async (...args) => {
+      await advance(...args);
+      current = false;
+    });
     expect(await storage.mutate(publication("stale"), () => current)).toBe("superseded");
     expect(await storage.read()).toBeNull();
     expect((await fs.readdir(sessionDir)).some((file) => file.includes(".continuous-"))).toBe(
@@ -559,8 +724,8 @@ describe("inactive real cancellation storage", () => {
     let current = true;
     const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
     const advance = journal.advanceGenerationUnderHistoryLock.bind(journal);
-    spyOn(journal, "advanceGenerationUnderHistoryLock").mockImplementationOnce(async () => {
-      await advance();
+    spyOn(journal, "advanceGenerationUnderHistoryLock").mockImplementationOnce(async (...args) => {
+      await advance(...args);
       current = false;
     });
     expect(await storage.repair(() => current, committed)).toBeNull();

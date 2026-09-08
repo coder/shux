@@ -129,7 +129,10 @@ export class HistoryAppendProvenance {
     }
   }
 
-  private async publish(receipt: HistoryAppendReceipt): Promise<void> {
+  private async publish(
+    receipt: HistoryAppendReceipt,
+    assertStillOwned?: () => Promise<void>
+  ): Promise<void> {
     const bytes = Buffer.from(JSON.stringify(receipt));
     assert(
       bytes.length <= HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
@@ -145,6 +148,7 @@ export class HistoryAppendProvenance {
         await handle.close();
       }
       // Rename replaces a destination symlink rather than following it.
+      if (assertStillOwned) await assertStillOwned();
       await fs.rename(temporary, this.receiptPath);
       await this.syncDirectory();
     } finally {
@@ -188,7 +192,10 @@ export class HistoryAppendProvenance {
     return current.bytesRead;
   }
 
-  async runMutation<T>(operation: () => Promise<T>): Promise<T> {
+  async runMutation<T>(
+    operation: () => Promise<T>,
+    assertStillOwned?: () => Promise<void>
+  ): Promise<T> {
     assert(
       transactions.getStore()?.active !== true,
       "history provenance transactions must not nest"
@@ -199,10 +206,11 @@ export class HistoryAppendProvenance {
     const epoch = matched ? receipt.epoch : randomUUID();
     let tracking = true;
     try {
-      await this.publish({ version: 1, epoch, state: "pending", files: initial });
+      await this.publish({ version: 1, epoch, state: "pending", files: initial }, assertStillOwned);
     } catch (error) {
       // No mutation may begin while an old stable receipt remains trusted.
       // Deletion is the fallback; if that too fails, abort BEFORE the operation.
+      if (assertStillOwned) await assertStillOwned();
       await fs.rm(this.receiptPath, { force: true });
       await this.syncDirectory();
       tracking = false;
@@ -227,7 +235,10 @@ export class HistoryAppendProvenance {
           const files = await this.stamps();
           const stableEpoch =
             transaction.certified && sameStamps(files, transaction.expected) ? epoch : randomUUID();
-          await this.publish({ version: 1, epoch: stableEpoch, state: "stable", files });
+          await this.publish(
+            { version: 1, epoch: stableEpoch, state: "stable", files },
+            assertStillOwned
+          );
         } catch (error) {
           log.warn("Failed to finalize history append receipt", { error });
         }

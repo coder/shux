@@ -352,15 +352,16 @@ export class HistoryService {
   /** Inactive sidecar seam: Stop must remain publishable when transcript recovery fails. */
   withCompactionStorageLock<T>(
     workspaceId: string,
-    operation: (sessionDir: string) => Promise<T>
+    operation: (sessionDir: string, assertStillOwned: () => Promise<void>) => Promise<T>
   ): Promise<T> {
     return this.fileLocks.withLock(workspaceId, () =>
-      this.withHistoryWriteFileLock(workspaceId, async () => {
+      this.withHistoryWriteFileLock(workspaceId, async (assertStillOwned) => {
         if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
           throw new Error(`workspace ${workspaceId} was removed; refusing compaction mutation`);
         const sessionDir = this.getSessionDir(workspaceId);
+        await assertStillOwned();
         await ensurePrivateDir(sessionDir);
-        return operation(sessionDir);
+        return operation(sessionDir, assertStillOwned);
       })
     );
   }
@@ -368,13 +369,14 @@ export class HistoryService {
   /** Caller holds both history locks and has already fenced obsolete journal publication. */
   async neutralizeCompactionRecoveryUnderHistoryLock(
     workspaceId: string,
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    assertStillOwned: () => Promise<void>
   ): Promise<boolean> {
     if (!isCurrent()) return false;
     return this.getAppendProvenance(workspaceId).runMutation(async () => {
       if (!isCurrent()) return false;
       invalidateHistoryAppendProvenance();
-      await this.recoverTruncateTransactionUnlocked(workspaceId);
+      await this.recoverTruncateTransactionUnlocked(workspaceId, assertStillOwned);
       const clearFollowUp = (row: MuxMessage): MuxMessage => {
         const metadata = row.metadata?.muxMetadata;
         if (!isCompactionSummaryMetadata(metadata) || metadata.pendingFollowUp === undefined)
@@ -403,7 +405,13 @@ export class HistoryService {
         const cleared = clearFollowUp(partial);
         if (
           cleared !== partial &&
-          !(await publishCompactionFile(partialPath, JSON.stringify(cleared), isCurrent))
+          !(await publishCompactionFile(
+            partialPath,
+            JSON.stringify(cleared),
+            isCurrent,
+            undefined,
+            assertStillOwned
+          ))
         )
           return false;
       }
@@ -435,10 +443,14 @@ export class HistoryService {
           changed ||= cleared !== row;
           return cleared;
         });
-        if (changed && !(await publishCompactionFile(filePath, contents, isCurrent))) return false;
+        if (
+          changed &&
+          !(await publishCompactionFile(filePath, contents, isCurrent, undefined, assertStillOwned))
+        )
+          return false;
       }
       return isCurrent();
-    });
+    }, assertStillOwned);
   }
 
   async getSubagentTranscript(
@@ -785,7 +797,10 @@ export class HistoryService {
     );
   }
 
-  private async recoverTruncateTransactionUnlocked(workspaceId: string): Promise<boolean> {
+  private async recoverTruncateTransactionUnlocked(
+    workspaceId: string,
+    assertStillOwned?: () => Promise<void>
+  ): Promise<boolean> {
     const archivePath = this.getChatArchivePath(workspaceId);
     const archiveTombstonePath = `${archivePath}.truncate`;
     const tombstoneExists = await fs.stat(archiveTombstonePath).then(
@@ -804,6 +819,7 @@ export class HistoryService {
         return false;
       }
       const archiveExists = (await this.readExistingFileBytes(archivePath)) !== null;
+      if (assertStillOwned) await assertStillOwned();
       if (archiveExists) {
         await fs.rm(archiveTombstonePath);
       } else {
@@ -814,6 +830,7 @@ export class HistoryService {
 
     const marker = this.parseTruncateTransaction(markerContents);
     if (!tombstoneExists) {
+      if (assertStillOwned) await assertStillOwned();
       await fs.rm(markerPath, { force: true });
       if (marker === null) {
         return false;
@@ -849,14 +866,19 @@ export class HistoryService {
           marker.rawHashes?.finalChatHash
         );
       if (committed) {
+        if (assertStillOwned) await assertStillOwned();
         await fs.rm(archiveTombstonePath);
+        if (assertStillOwned) await assertStillOwned();
         await fs.rm(markerPath, { force: true });
         return true;
       }
     }
 
+    if (assertStillOwned) await assertStillOwned();
     await fs.rm(archivePath, { force: true });
+    if (assertStillOwned) await assertStillOwned();
     await fs.rename(archiveTombstonePath, archivePath);
+    if (assertStillOwned) await assertStillOwned();
     await fs.rm(markerPath, { force: true });
     return false;
   }
@@ -2723,14 +2745,14 @@ export class HistoryService {
   /** Bare cross-process history file lock; see withCrossProcessWriteLock. */
   private async withHistoryWriteFileLock<T>(
     workspaceId: string,
-    operation: () => Promise<T>
+    operation: (assertStillOwned: () => Promise<void>) => Promise<T>
   ): Promise<T> {
     await using _lock = await acquireProcessFileLock({
       lockPath: historyWriteLockPath(this.config.rootDir, workspaceId),
       timeoutMs: HISTORY_WRITE_LOCK_TIMEOUT_MS,
       label: "history write lock",
     });
-    return await operation();
+    return await operation(() => _lock.assertStillOwned());
   }
 
   /**

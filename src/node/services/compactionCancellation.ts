@@ -136,7 +136,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
     mutation: CompactionCancellationMutation,
     isCurrent: () => boolean
   ): Promise<CompactionCancellationMutationOutcome> {
-    return this.history.withCompactionStorageLock(this.workspaceId, async () => {
+    return this.history.withCompactionStorageLock(this.workspaceId, async (_dir, checkLock) => {
       if (!isCurrent()) return "superseded";
       if (
         mutation.kind === "publish" &&
@@ -170,14 +170,15 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         // Unobserved failures remain blocking until a new explicit Stop captures a frontier.
         await journal.advanceGenerationUnderHistoryLock((advanced) => {
           frontier.generation = advanced;
-        });
+        }, checkLock);
         return (await publishCompactionFile(
           this.path,
           JSON.stringify(mutation.record),
           isCurrent,
           () => {
             frontier.nonce = mutation.record.nonce;
-          }
+          },
+          checkLock
         ))
           ? "applied"
           : "superseded";
@@ -190,7 +191,13 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
           return isCurrent() && isDeepStrictEqual(current, mutation.record)
             ? "applied"
             : "superseded";
-        return (await publishCompactionFile(this.path, JSON.stringify(mutation.record), isCurrent))
+        return (await publishCompactionFile(
+          this.path,
+          JSON.stringify(mutation.record),
+          isCurrent,
+          undefined,
+          checkLock
+        ))
           ? "applied"
           : "superseded";
       }
@@ -201,6 +208,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         if (witness.nonce !== nonce || !(await this.verifyReplacementUnderHistoryLock(witness)))
           throw new Error("Replacement witness was not verified");
       } else if (current.retainUntilReplacement) return "superseded";
+      await checkLock();
       if (!isCurrent()) return "superseded";
       rmSync(this.path, { force: true });
       return "applied";
@@ -211,7 +219,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
     isCurrent: () => boolean,
     onCommitted: () => undefined
   ): Promise<CompactionCancellationRecord | null> {
-    return this.history.withCompactionStorageLock(this.workspaceId, async () => {
+    return this.history.withCompactionStorageLock(this.workspaceId, async (_dir, checkLock) => {
       if (!isCurrent()) return null;
       try {
         return await this.read();
@@ -221,15 +229,18 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
       if (!isCurrent()) return null;
       await this.history
         .getContinuousCompactionJournal(this.workspaceId)
-        .advanceGenerationUnderHistoryLock();
+        .advanceGenerationUnderHistoryLock(undefined, checkLock);
       if (
         !(await this.history.neutralizeCompactionRecoveryUnderHistoryLock(
           this.workspaceId,
-          isCurrent
+          isCurrent,
+          checkLock
         )) ||
         !isCurrent()
       )
         return null;
+      await checkLock();
+      if (!isCurrent()) return null;
       // Keep malformed bytes until all obsolete recovery has been neutralized.
       // No await separates removal from the repair receipt or its final guard.
       rmSync(this.path, { force: true });
