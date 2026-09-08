@@ -170,11 +170,9 @@ jobs:
     name: Test / Unit
     needs: [changes]
     if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    # Bound the unit job (healthy runs finish in ~6-8 min). The suite shares one bun
-    # process, so a single order-dependent test that hangs (e.g. a leaked module mock
-    # driving an infinite render loop) would otherwise stall the runner for GitHub's
-    # 6h default. Fail fast with logs instead. Test / Integration is capped the same way.
-    timeout-minutes: 15
+    # Bound hung runs while allowing setup, build, coverage, and cleanup to finish.
+    # Healthy unit jobs can exceed the previous wall-clock budget.
+    timeout-minutes: 20
     runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
