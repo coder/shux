@@ -5201,16 +5201,19 @@ export class AgentSession {
         maxTokens,
       };
       const { historySequence: _sequence, ...metadata } = user.metadata ?? {};
+      // An admitted final-flush trigger that overflowed at assembly must not carry its
+      // internal text or flag into the fresh window; it continues as an ordinary turn.
+      const { contextBudgetFlush: wasFlush, ...muxMetadata } = metadata.muxMetadata ?? {
+        type: "context-window-continuation" as const,
+      };
       const continuation: MuxMessage = {
         ...user,
         id: createUserMessageId(),
+        ...(wasFlush ? { parts: [{ type: "text", text: "Continue" }] } : {}),
         metadata: {
           ...metadata,
           timestamp: Date.now(),
-          muxMetadata: {
-            ...(metadata.muxMetadata ?? { type: "context-window-continuation" }),
-            rolloverId: rollover.rolloverId,
-          },
+          muxMetadata: { ...muxMetadata, rolloverId: rollover.rolloverId },
         },
       };
       // Snapshot/payload rows are part of the accepted request, not just its
@@ -5627,18 +5630,21 @@ export class AgentSession {
     // `pendingRollover` would otherwise pre-empt. Re-check the headroom and the tool gates
     // with on-send numbers; degrade to an ordinary continuation when any no longer holds.
     if (userMessage.metadata?.muxMetadata?.contextBudgetFlush === true) {
-      const recoveryAvailable =
-        this.contextBudgetHistoryAvailable && !isSessionHistoryDisabled(options.toolPolicy);
+      const rolloverEnabled = this.compactionMonitor.getThreshold() < 1;
       const flushStillSafe =
         decision.hardCeiling !== undefined &&
         decision.projected + WARNING_RESERVE_TOKENS < decision.hardCeiling;
+      // The prompt promises that the next message seals the window, so require the same
+      // admission the rollover itself needs (history access, toolset-preserving middleware).
       // Threshold 100% disables automatic rollover: a flush promising a sealed window would lie.
       if (
         this.pendingRollover != null &&
-        this.compactionMonitor.getThreshold() < 1 &&
+        rolloverEnabled &&
         flushStillSafe &&
         this.contextBudgetMemoryWritable === true &&
-        recoveryAvailable
+        this.contextBudgetHistoryAvailable &&
+        (await this.checkContextBudgetHistoryAccess(options)).success &&
+        (await this.captureRolloverRequestAssembly()).success
       ) {
         // Keep pendingRollover: the next dispatch seals this window regardless of usage.
         return Ok({
@@ -5649,6 +5655,13 @@ export class AgentSession {
       userMessage.parts = [{ type: "text", text: "Continue" }];
       const { contextBudgetFlush: _dropped, ...rest } = userMessage.metadata.muxMetadata;
       userMessage.metadata.muxMetadata = rest;
+      if (!rolloverEnabled) {
+        // Rollover was disabled after the pair was queued: drop the paired rollover entry and
+        // the stale claim so nothing seals the window if rollover is re-enabled later.
+        this.pendingRollover = undefined;
+        if (this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY).removedCount > 0)
+          this.emitQueuedMessageChanged();
+      }
     }
     const shouldRollover =
       this.compactionMonitor.getThreshold() < 1 &&

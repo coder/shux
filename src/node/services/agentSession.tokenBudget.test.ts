@@ -1465,6 +1465,84 @@ describe("AgentSession token-budget lifecycle", () => {
     const trigger = rows.at(-1)!;
     expect(text(trigger)).toBe("Continue");
     expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    // The paired rollover entry and the stale claim go with it: re-enabling rollover later
+    // must not seal the window without fresh pressure.
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    h.session.setAutoCompactionThreshold(0.7);
+    expect(await h.requests[1].onStepSettled?.(step(50_000))).toBe("continue");
+    h.settleStream(1, { finishReason: "stop" });
+    await h.session.waitForIdle();
+    expect(h.requests).toHaveLength(2);
+    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+  });
+
+  test("toolset-changing middleware blocks the flush dispatch like the rollover it promises", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    const unregister = eventSpine.useBefore(
+      "request.assemble",
+      (ctx) => {
+        delete ctx.tools.session_history;
+      },
+      { workspaceId }
+    );
+    try {
+      h.settleStream(0);
+      await h.session.waitForIdle();
+      expect(h.requests).toHaveLength(1);
+      const rows = await allRows(h);
+      expect(warningRows(rows)).toHaveLength(0);
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(rows.some((row) => text(row).startsWith("Flush context notes"))).toBe(false);
+      expect(
+        h.events.some(
+          (event) =>
+            event.type === "stream-error" &&
+            (event as { errorType?: string }).errorType === "context_budget_blocked"
+        )
+      ).toBe(true);
+    } finally {
+      unregister();
+    }
+  });
+
+  test("an emergency rollover during the flush turn sanitizes the flush trigger", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await h.finishAndDispatch();
+    expect(text((await allRows(h)).at(-1)!)).toBe("Flush context notes now.");
+    const streamError = {
+      workspaceId,
+      messageId: "assistant-2",
+      error: "context limit",
+      errorType: "context_exceeded" as const,
+      contextBudgetExceeded: {
+        type: "context_budget_exceeded" as const,
+        model,
+        estimate: 127_000,
+        hardCeiling: 119_808,
+      },
+    };
+    h.aiEmitter.emit("error", streamError);
+    h.completions[1].settle({ status: "failed", streamError });
+    expect(await h.session.waitForPendingStreamErrorRecoveryDecision("assistant-2")).toBe(
+      "retry-started"
+    );
+    await h.waitForRequest(3);
+    const rows = await allRows(h);
+    const [reset] = rolloverRows(rows);
+    expect(reset.metadata?.muxMetadata).toMatchObject({ reason: "context-exceeded" });
+    const fresh = sliceMessagesForProviderFromLatestContextBoundary(rows);
+    const trigger = fresh.findLast((row) => row.role === "user")!;
+    expect(text(trigger)).toBe("Continue");
+    expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    expect(fresh.some((row) => text(row).startsWith("Flush context notes"))).toBe(false);
+    expect(h.requests[2].messages.some((row) => text(row).startsWith("Flush context notes"))).toBe(
+      false
+    );
   });
 
   test("the final flush is offered once per window, including after a restart", async () => {
