@@ -568,6 +568,22 @@ describe("useDesktopConnection control ownership", () => {
     expect(getBootstrap).toHaveBeenCalledTimes(2);
   });
 
+  test("suspend keeps a registration that is still awaiting ready instead of detaching it", async () => {
+    autoReady = false;
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(registrations).toHaveLength(1));
+    const registration = registrations[0];
+    // The popout child registers only once granted; the pending inline registration stays the
+    // pane's lease through the handoff rather than being given up definitively.
+    act(() => view.desktop.suspend());
+    expect(registration.signal.aborted).toBe(false);
+    expect(detachViewer).not.toHaveBeenCalled();
+    registration.queue.push({ type: "ready", viewerId: registration.viewerId });
+    await waitFor(() => expect(view.desktop.register()).resolves.toBe(true));
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+  });
+
   test("register attaches without bootstrapping and connect reuses the registration", async () => {
     const view = mountConnection();
     let ready: Promise<boolean> | undefined;

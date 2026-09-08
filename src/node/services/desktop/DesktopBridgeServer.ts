@@ -142,10 +142,22 @@ export class DesktopBridgeServer {
    * the archive guard), so an archive gate observing no pair cannot be beaten by a connection
    * admitted earlier.
    */
-  hasActiveBridge(workspaceId: string): boolean {
+  hasActiveBridge(
+    workspaceId: string,
+    // The owner captured at admission goes stale when a borrower is rebound before the config
+    // watcher revalidates the pair; the manager re-resolves it so the new owner counts as
+    // attached (and the old one no longer does) from the moment the binding changes.
+    resolveOwner: (requesterWorkspaceId: string, capturedOwnerWorkspaceId: string) => string = (
+      _requester,
+      capturedOwner
+    ) => capturedOwner
+  ): boolean {
     assert(workspaceId.length > 0, "hasActiveBridge requires a workspaceId");
     for (const pair of this.activePairs) {
-      if (pair.requesterWorkspaceId === workspaceId || pair.ownerWorkspaceId === workspaceId) {
+      if (
+        pair.requesterWorkspaceId === workspaceId ||
+        resolveOwner(pair.requesterWorkspaceId, pair.ownerWorkspaceId) === workspaceId
+      ) {
         return true;
       }
     }

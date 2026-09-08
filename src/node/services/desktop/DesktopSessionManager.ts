@@ -50,6 +50,15 @@ interface DetachmentGrace {
   excludedOwnerWorkspaceId?: string;
 }
 
+/**
+ * Whether a live VNC bridge attaches `workspaceId`, classifying each bridge's requester against
+ * the owner it CURRENTLY resolves to (see viewerTargets) rather than the one captured at admission.
+ */
+export type DesktopBridgeConnectionProbe = (
+  workspaceId: string,
+  resolveOwner: (requesterWorkspaceId: string, capturedOwnerWorkspaceId: string) => string
+) => boolean;
+
 /** Grace source key of the VNC bridge a viewer bootstrapped (or an anonymous bridge). */
 function bridgeSourceKey(viewerIdOrSequence: string): string {
   return `bridge:${viewerIdOrSequence}`;
@@ -468,7 +477,7 @@ export class DesktopSessionManager {
     );
   }
 
-  private bridgeConnectionProbe: ((workspaceId: string) => boolean) | undefined;
+  private bridgeConnectionProbe: DesktopBridgeConnectionProbe | undefined;
 
   /**
    * DesktopBridgeServer reports its live VNC bridge WebSockets through this probe (it depends
@@ -476,7 +485,7 @@ export class DesktopSessionManager {
    * without registering a browser viewer, so without this probe hasAttachedViewers() would
    * report nobody attached while a user watches or controls the desktop in Electron.
    */
-  setBridgeConnectionProbe(probe: (workspaceId: string) => boolean): void {
+  setBridgeConnectionProbe(probe: DesktopBridgeConnectionProbe): void {
     this.bridgeConnectionProbe = probe;
   }
 
@@ -629,7 +638,9 @@ export class DesktopSessionManager {
   private hasLiveAttachment(workspaceId: string): boolean {
     return (
       this.startupPromises.has(workspaceId) ||
-      this.bridgeConnectionProbe?.(workspaceId) === true ||
+      this.bridgeConnectionProbe?.(workspaceId, (requester, capturedOwner) =>
+        this.currentOwnerOf(requester, capturedOwner)
+      ) === true ||
       Array.from(this.viewers.values()).some((viewer) =>
         this.viewerTargets(viewer).includes(workspaceId)
       ) ||

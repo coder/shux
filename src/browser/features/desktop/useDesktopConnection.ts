@@ -358,10 +358,16 @@ export function useDesktopConnection(
 
   const suspend = () => {
     // Bumping the generation retires in-flight attempts and reconnect timers without disposing
-    // the hook, so the registration loop keeps delivering a release while suspended.
+    // the hook, so the registration loop keeps delivering a release while suspended. A
+    // registration still awaiting ready is kept too (it becomes this pane's lease when ready);
+    // with none at all, the bridge's grace is left in place — the popout child registers only
+    // once granted, so a definitive detach here would leave the desktop unattached meanwhile.
     generationRef.current += 1;
     clearReconnectTimer();
-    disconnectCurrentRfb({ keepViewerRegistration: viewerReadyRef.current });
+    disconnectCurrentRfb({
+      keepViewerRegistration: viewerRegistrationRef.current !== null,
+      keepGrace: true,
+    });
     setState("idle");
     setReason(null);
   };

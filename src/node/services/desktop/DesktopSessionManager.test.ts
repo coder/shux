@@ -787,6 +787,14 @@ describe("DesktopSessionManager browser viewer releases", () => {
         // ...nor by the bridge the rebind revokes (its captured owner is stale too).
         manager.noteDetached("child", "owner");
         expect(manager.hasAttachedViewers("owner")).toBe(false);
+        // A bridge still live through the rebind (admitted for "child" under "owner") is
+        // classified against the borrower's current owner too, ahead of the config watcher.
+        manager.setBridgeConnectionProbe(
+          (target, resolveOwner) => target === "child" || resolveOwner("child", "owner") === target
+        );
+        expect(manager.hasAttachedViewers("owner")).toBe(false);
+        expect(manager.hasAttachedViewers("child")).toBe(true);
+        manager.setBridgeConnectionProbe(() => false);
         // Closing the old owner must not release the viewer that no longer targets it.
         const released: DesktopViewerEvent[] = [];
         const drain = (async () => {

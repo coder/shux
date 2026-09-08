@@ -813,6 +813,13 @@ describe("DesktopBridgeServer", () => {
       expect(bridgeServer.hasActiveBridge("child")).toBe(true);
       expect(bridgeServer.hasActiveBridge("owner")).toBe(true);
       expect(bridgeServer.hasActiveBridge("isolated")).toBe(false);
+      // The owner is re-resolved on request: a borrower rebound before the config watcher
+      // revalidates the pair already attaches its new owner, not the one captured at admission.
+      const reboundToGrand = (requester: string, captured: string) =>
+        requester === "child" ? "grand" : captured;
+      expect(bridgeServer.hasActiveBridge("grand", reboundToGrand)).toBe(true);
+      expect(bridgeServer.hasActiveBridge("owner", reboundToGrand)).toBe(false);
+      expect(bridgeServer.hasActiveBridge("child", reboundToGrand)).toBe(true);
       await closeWebSocket(ws);
       ws = null;
       // The client's close event can land before the server finishes its own close handling.
