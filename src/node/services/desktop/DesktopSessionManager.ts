@@ -35,11 +35,6 @@ interface DesktopViewerRegistration {
   push: (event: DesktopViewerEvent) => void;
   release?: Promise<void>;
   acknowledge?: () => void;
-  /**
-   * The requester's last bootstrap reported no desktop (disabled, unsupported, startup failed).
-   * Its pane will not reconnect to anything, so its detachment leaves no attachment grace.
-   */
-  desktopUnavailable?: boolean;
 }
 
 export class DesktopSessionManager {
@@ -114,12 +109,12 @@ export class DesktopSessionManager {
   /**
    * The pane behind this registration settled in a terminal state (no desktop, or its first
    * connection failed with no retry pending) and is giving the registration up for good. Drop
-   * it without the attachment grace: that grace is for transports that may come back.
+   * it without the attachment grace: that grace is for transports that may come back. This is
+   * the only detachment that skips the grace — the client alone knows whether it will retry
+   * (a previously connected pane keeps retrying through an unavailable bootstrap), so the
+   * backend never infers "will not reconnect" from a bootstrap outcome.
    */
   detachViewer(viewerId: string): void {
-    const viewer = this.viewers.get(viewerId);
-    if (!viewer) return;
-    viewer.desktopUnavailable = true;
     this.viewers.delete(viewerId);
   }
 
@@ -486,7 +481,6 @@ export class DesktopSessionManager {
   }
 
   private noteViewerDetached(viewer: DesktopViewerRegistration): void {
-    if (viewer.desktopUnavailable === true) return;
     this.noteDetached(viewer.workspaceId, viewer.ownerWorkspaceId);
   }
 
@@ -500,17 +494,6 @@ export class DesktopSessionManager {
     for (const [target, byRequester] of this.recentDetachments) {
       byRequester.delete(requesterWorkspaceId);
       if (byRequester.size === 0) this.recentDetachments.delete(target);
-    }
-  }
-
-  /**
-   * getDesktopBootstrap reports whether the requester's desktop exists. Viewers of a workspace
-   * whose desktop is unavailable will never reconnect to anything, so their eventual detachment
-   * must not hold the workspace "attached"; a later successful bootstrap re-arms the grace.
-   */
-  noteBootstrapOutcome(workspaceId: string, available: boolean): void {
-    for (const viewer of this.viewers.values()) {
-      if (viewer.workspaceId === workspaceId) viewer.desktopUnavailable = !available;
     }
   }
 

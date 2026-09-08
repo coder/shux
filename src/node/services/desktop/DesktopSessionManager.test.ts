@@ -659,11 +659,14 @@ describe("DesktopSessionManager browser viewer releases", () => {
         await definitive.watcher.return(undefined);
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
 
-        // A viewer whose bootstrap reported no desktop leaves no grace when it detaches.
-        const unavailable = await registerViewer("isolated");
-        manager.noteBootstrapOutcome("isolated", false);
-        unavailable.controller.abort();
-        await unavailable.watcher.return(undefined);
+        // A viewer that simply loses its subscription keeps the grace regardless of what its
+        // bootstrap reported: only the client knows whether it will retry (a previously
+        // connected pane keeps reconnecting through an unavailable bootstrap).
+        const reconnecting = await registerViewer("isolated");
+        reconnecting.controller.abort();
+        await reconnecting.watcher.return(undefined);
+        expect(manager.hasAttachedViewers("isolated")).toBe(true);
+        now += DESKTOP_ATTACHMENT_GRACE_MS;
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
       } finally {
         await manager.closeAll();

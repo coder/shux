@@ -6,21 +6,12 @@ interface DesktopContext {
   desktopSessionManager: Pick<
     ORPCContext["desktopSessionManager"],
     "getCapability" | "ensureStarted" | "resolveTarget"
-  > &
-    Partial<Pick<ORPCContext["desktopSessionManager"], "noteBootstrapOutcome">>;
+  >;
   desktopTokenManager: Pick<ORPCContext["desktopTokenManager"], "mint">;
   serverService: Pick<ORPCContext["serverService"], "getServerInfo">;
 }
 
 export async function getDesktopBootstrap(context: DesktopContext, workspaceId: string) {
-  const result = await bootstrapDesktop(context, workspaceId);
-  // Viewers register before bootstrap; tell the manager whether they have a desktop at all so a
-  // pane that learns "unavailable" and detaches leaves no attachment grace behind.
-  context.desktopSessionManager.noteBootstrapOutcome?.(workspaceId, result.capability.available);
-  return result;
-}
-
-async function bootstrapDesktop(context: DesktopContext, workspaceId: string) {
   const capability = await context.desktopSessionManager.getCapability(workspaceId);
   if (!capability.available) return { capability };
   const serverInfo = context.serverService.getServerInfo();
