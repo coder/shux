@@ -75,6 +75,8 @@ const attachment: z.ZodType<PostCompactionAttachment> = z.discriminatedUnion("ty
 export const ContinuousCompactionJournalSchema = z
   .object({
     version: z.literal(1),
+    // Legacy journals are valid until a durable publication generation is advanced.
+    publicationGeneration: z.string().optional(),
     boundary: row,
     staticCopies: z.array(row),
     liveTailCopySpec: z.object({

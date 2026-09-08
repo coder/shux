@@ -17,6 +17,7 @@ import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail
 import { ContinuousCompactor, type ContinuousCompactionContext } from "./continuousCompactor";
 import { CompactionHandler } from "./compactionHandler";
 import { createTestHistoryService } from "./testHistoryService";
+import { HistoryService } from "./historyService";
 
 type Dependencies = ConstructorParameters<typeof ContinuousCompactor>[0];
 type LiveSnapshot = NonNullable<ReturnType<Dependencies["streamManager"]["getStreamInfo"]>> & {
@@ -677,7 +678,15 @@ describe("ContinuousCompactor", () => {
     expect(fastApply).not.toHaveBeenCalled();
     expect((await rows())[0].id).toBe("old-user");
     const journalStore = store.historyService.getContinuousCompactionJournal(workspaceId);
-    const journal = await journalStore.write(swap.journal, swap.prefix, () => true);
+    const publishedSwap = swap;
+    const journal = await journalStore.write(
+      swap.journal,
+      swap.prefix,
+      () => true,
+      (committed) => {
+        publishedSwap.journal = committed;
+      }
+    );
     assert(journal, "Expected reproducible journal");
     state = consumed ? "consumed" : "pending";
     swap.consumed = consumed;
@@ -716,6 +725,73 @@ describe("ContinuousCompactor", () => {
       expect(completed).not.toHaveBeenCalled();
     });
   }
+
+  it.each(["user-interrupt", "edit", "context-mutation"])(
+    "%s does not recover an interrupted startup journal on the next attempt",
+    async (reason) => {
+      const { dependencies, journalStore } = await activateJournaledSwap();
+      compactor.reset("shutdown");
+      streaming = false;
+      live = undefined;
+      compactor = new ContinuousCompactor(dependencies);
+      const entered = deferred();
+      const release = deferred();
+      const read = journalStore.read.bind(journalStore);
+      spyOn(journalStore, "read").mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return read(...args);
+      });
+      const recovering = compactor.recover();
+      try {
+        await entered.promise;
+        compactor.reset(reason);
+        release.resolve();
+        expect(await recovering).toBe(false);
+        compactor = new ContinuousCompactor(dependencies);
+        expect(await compactor.recover()).toBe(false);
+        expect((await rows())[0].id).toBe("old-user");
+      } finally {
+        release.resolve();
+        await recovering;
+      }
+    }
+  );
+
+  it("preserves a successor published after exact postcommit cleanup releases its lock", async () => {
+    const { journalStore, journal, swap } = await activateJournaledSwap();
+    streaming = false;
+    live = undefined;
+    const foreign = new HistoryService(store.config).getContinuousCompactionJournal(workspaceId);
+    const successor = {
+      ...journal,
+      boundary: { ...journal.boundary, id: "successor-boundary" },
+    };
+    const clear = journalStore.clear.bind(journalStore);
+    spyOn(journalStore, "clear").mockImplementationOnce(async (expected) => {
+      await clear(expected);
+      expect(await foreign.write(successor, swap.prefix, () => true)).not.toBeNull();
+    });
+    expect(await compactor.observe(0, context)).toBe("applied");
+    expect((await foreign.read())?.boundary.id).toBe(successor.boundary.id);
+    expect((await rows())[0].id).toBe(journal.boundary.id);
+  });
+
+  it.each(["failed-fast-apply", "legacy-fallback", "delete-message", "dispose"])(
+    "%s only cleans its captured journal",
+    async (reason) => {
+      const { journalStore, journal, swap } = await activateJournaledSwap();
+      const foreign = new HistoryService(store.config).getContinuousCompactionJournal(workspaceId);
+      await foreign.clear(journal);
+      const successor = {
+        ...journal,
+        boundary: { ...journal.boundary, id: "foreign-successor" },
+      };
+      expect(await foreign.write(successor, swap.prefix, () => true)).not.toBeNull();
+      compactor.reset(reason);
+      expect((await journalStore.read())?.boundary.id).toBe(successor.boundary.id);
+    }
+  );
 
   it("uses P1 durable fallback when the first retained live step has no tool anchor", async () => {
     await seedLiveTurn(true, true);

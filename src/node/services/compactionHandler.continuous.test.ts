@@ -55,6 +55,65 @@ describe("continuous compaction provider replay", () => {
     expect((await makeHandler().peekPendingState())?.diffs).toEqual(diffs);
   });
 
+  it("retains committed pending state when a completion observer throws", async () => {
+    const sessionDir = path.join(store.tempDir, "pending");
+    const source = createMuxMessage("edited", "assistant", "Fixed the bug");
+    source.parts.push({
+      type: "dynamic-tool",
+      toolCallId: "edit",
+      toolName: "file_edit_replace_string",
+      state: "output-available",
+      input: { path: "/tmp/fix.ts" },
+      output: { success: true, diff: "@@ -1 +1 @@\n-old\n+new\n" },
+    });
+    expect((await store.historyService.appendToHistory(workspaceId, source)).success).toBe(true);
+    const handler = new CompactionHandler({
+      workspaceId,
+      historyService: store.historyService,
+      sessionDir,
+      emitter: new EventEmitter(),
+      onCompactionComplete: () => {
+        throw new Error("observer failed");
+      },
+    });
+    const publication = {
+      generation: await store.historyService
+        .getContinuousCompactionJournal(workspaceId)
+        .captureGeneration(),
+    };
+    expect(
+      await handler
+        .withContinuousPendingState([source], (boundaryMessageId, onCommitted) =>
+          handler.persistContinuousCompaction({
+            boundaryMessageId,
+            onCommitted,
+            publication,
+            shouldPersist: () => true,
+            messages: [source],
+            tail: [],
+            text: "Fix completed",
+            model: "anthropic:test",
+            systemMessageTokens: 0,
+            attachmentTokens: 0,
+          })
+        )
+        .catch((error: unknown) => error)
+    ).toEqual(new Error("observer failed"));
+    const restarted = new CompactionHandler({
+      workspaceId,
+      historyService: store.historyService,
+      sessionDir,
+      emitter: new EventEmitter(),
+    });
+    expect((await restarted.peekPendingState())?.diffs).toMatchObject([
+      { path: "/tmp/fix.ts", diff: "@@ -1 +1 @@\n-old\n+new\n" },
+    ]);
+    const rows = await store.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(rows.success, "Expected committed boundary");
+    expect(rows.data).toHaveLength(1);
+    expect(rows.data[0].metadata?.compactionBoundary).toBe(true);
+  });
+
   for (const provider of ["anthropic", "openai"]) {
     it(`replays the durable summary, prompt, and sliced tool pairs through the ${provider} pipeline`, async () => {
       const old = createMuxMessage(

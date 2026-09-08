@@ -17,10 +17,14 @@ import {
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import * as path from "path";
-import { createHash, randomUUID } from "node:crypto";
-import { renameSync } from "node:fs";
+import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
-import { ContinuousCompactionJournalStore } from "./continuousCompactionJournal";
+import {
+  ContinuousCompactionJournalStore,
+  publishCompactionFile,
+  type ContinuousCompactionPublication,
+} from "./continuousCompactionJournal";
+import { CONTINUOUS_COMPACTION_JOURNAL_FILE } from "@/constants/continuousCompaction";
 import writeFileAtomic from "write-file-atomic";
 import assert from "node:assert";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
@@ -324,8 +328,15 @@ export class HistoryService {
     let journal = this.continuousJournals.get(workspaceId);
     if (!journal) {
       journal = new ContinuousCompactionJournalStore(
-        path.join(this.getSessionDir(workspaceId), "continuous-compaction.json"),
-        workspaceId
+        path.join(this.getSessionDir(workspaceId), CONTINUOUS_COMPACTION_JOURNAL_FILE),
+        workspaceId,
+        (operation) =>
+          this.withHistoryWriteFileLock(workspaceId, async () => {
+            if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
+              throw new Error(`workspace ${workspaceId} was removed; refusing journal mutation`);
+            await ensurePrivateDir(this.getSessionDir(workspaceId));
+            return operation();
+          })
       );
       this.continuousJournals.set(workspaceId, journal);
     }
@@ -2969,13 +2980,24 @@ export class HistoryService {
     summaryMessage: MuxMessage,
     tailCopies: readonly MuxMessage[],
     updateExisting: boolean,
-    shouldPersist?: (messages: MuxMessage[]) => boolean
+    shouldPersist?: (messages: MuxMessage[]) => boolean,
+    commit?: {
+      publication: ContinuousCompactionPublication;
+      onCommitted: () => void;
+    }
   ): Promise<Result<void>> {
     // Continuous compaction may intentionally keep no tail when no complete turn fits.
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to persist compaction boundary with tail copies",
       async () => {
+        if (
+          commit &&
+          !(await this.getContinuousCompactionJournal(
+            workspaceId
+          ).isPublicationCurrentUnderHistoryLock(commit.publication))
+        )
+          return Err("Compaction publication changed");
         invalidateHistoryAppendProvenance();
         try {
           // r52: this path assigns fresh sequences (appended summary + every
@@ -3064,17 +3086,17 @@ export class HistoryService {
             messages.slice(sourceMessages.length)
           );
           if (shouldPersist) {
-            const stagedPath = `${historyPath}.continuous-${randomUUID()}`;
-            try {
-              await writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
-              // Bulk I/O remains asynchronous, but the final generation check and
-              // publication must not yield to reset(), abandonment, or a new stream.
-              if (!shouldPersist(sourceMessages)) return Err("Compaction snapshot changed");
-              renameSync(stagedPath, historyPath);
-            } finally {
-              await fs.rm(stagedPath, { force: true });
-            }
+            if (
+              !(await publishCompactionFile(
+                historyPath,
+                serialized,
+                () => shouldPersist(sourceMessages),
+                commit?.onCommitted
+              ))
+            )
+              return Err("Compaction snapshot changed");
           } else {
+            assert(!commit, "Compaction commit receipts require a final ownership predicate");
             await writeFileAtomic(historyPath, serialized);
           }
 

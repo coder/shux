@@ -76,6 +76,7 @@ interface Dependencies {
   ): Promise<boolean>;
 }
 interface StagedSummary {
+  publicationGeneration: string | undefined;
   generation: number;
   epoch: number;
   boundarySequence?: number;
@@ -134,6 +135,7 @@ export class ContinuousCompactor {
   private applying: Promise<Verdict> | null = null;
   private swapAttempted: StagedSummary | null = null;
   private activeSwap: ContinuousPrefixSwap | null = null;
+  private ownedJournal: ContinuousCompactionJournal | undefined;
 
   constructor(private readonly deps: Dependencies) {
     assert(deps.workspaceId.length > 0, "ContinuousCompactor requires a workspace");
@@ -148,19 +150,31 @@ export class ContinuousCompactor {
     // Hydrating settings must not erase a previous process's journal before recovery.
     // It also keeps the disabled hot path free of journal I/O when no swap ever activated.
     const discardJournal = !settingsOnly || this.activeSwap !== null || this.swapAttempted !== null;
+    const journal = this.ownedJournal ?? this.activeSwap?.journal;
     this.generation++;
     this.job?.abort.abort();
     this.job = null;
     this.staged = null;
     this.swapAttempted = null;
     this.activeSwap = null;
+    this.ownedJournal = undefined;
     this.deps.streamManager.clearPrefixSwap?.(this.deps.workspaceId);
-    // Graceful shutdown retains the write-ahead record for ordinary startup recovery.
-    if (discardJournal && reason !== "shutdown") {
-      this.deps.historyService
-        .getContinuousCompactionJournal(this.deps.workspaceId)
-        .clear()
-        .catch((error: unknown) => log.warn("[continuous-compaction] journal clear failed", error));
+    // Shutdown retains recovery. Successful apply already performed exact cleanup;
+    // clearing again here could erase a successor published after that lock released.
+    if (discardJournal && reason !== "shutdown" && reason !== "applied") {
+      const store = this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId);
+      // Preserve legacy explicit reset authority until durable invalidation is added.
+      // Failed apply, fallback and settings changes only own their captured journal.
+      const explicitReset = [
+        "user-interrupt",
+        "edit",
+        "context-mutation",
+        "compaction-request",
+      ].includes(reason);
+      const clearing = explicitReset ? store.clearForReset() : store.clear(journal);
+      clearing.catch((error: unknown) =>
+        log.warn("[continuous-compaction] journal clear failed", error)
+      );
     }
     log.debug("[continuous-compaction] reset", { workspaceId: this.deps.workspaceId, reason });
   }
@@ -308,6 +322,10 @@ export class ContinuousCompactor {
     job: NonNullable<ContinuousCompactor["job"]>,
     context: ContinuousCompactionContext
   ): Promise<void> {
+    const publicationGeneration = await this.deps.historyService
+      .getContinuousCompactionJournal(this.deps.workspaceId)
+      .captureGeneration();
+    if (job.generation !== this.generation) return;
     await this.deps.prepare();
     if (job.generation !== this.generation) return;
     const rows = await this.readSnapshot();
@@ -341,6 +359,7 @@ export class ContinuousCompactor {
       "Rolling head must have a durable sequence"
     );
     const stagedBase = {
+      publicationGeneration,
       generation: job.generation,
       ...boundaryIdentity(rows),
       cut,
@@ -497,6 +516,7 @@ export class ContinuousCompactor {
     try {
       const journal: ContinuousCompactionJournal = {
         version: 1,
+        publicationGeneration: staged.publicationGeneration,
         boundary,
         staticCopies,
         liveTailCopySpec: {
@@ -571,7 +591,12 @@ export class ContinuousCompactor {
   private async finalizeJournal(pendingFollowUp?: CompactionFollowUpRequest): Promise<boolean> {
     const generation = this.generation;
     const store = this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId);
-    const journal = await store.read();
+    const journal = await store.read(
+      () => generation === this.generation,
+      (read) => {
+        this.ownedJournal = read;
+      }
+    );
     if (generation !== this.generation) return false;
     if (!journal) {
       this.activeSwap = null;
@@ -586,7 +611,9 @@ export class ContinuousCompactor {
       journal.staticCopies.every((copy) => rows.some((row) => row.id === copy.id)) &&
       rows.some((row) => row.id === journal.liveTailCopySpec.copyId);
     if (rows.some((row) => row.id === journal.boundary.id) && copiesPresent) {
-      await store.clear();
+      await store.clear(journal);
+      if (generation !== this.generation) return false;
+      this.ownedJournal = undefined;
       this.activeSwap = null;
       return true;
     }
@@ -622,7 +649,9 @@ export class ContinuousCompactor {
       log.warn("[continuous-compaction] discarded mismatched journal", {
         workspaceId: this.deps.workspaceId,
       });
-      await store.clear();
+      await store.clear(journal);
+      if (generation !== this.generation) return false;
+      this.ownedJournal = undefined;
       this.activeSwap = null;
       return false;
     }
@@ -645,7 +674,7 @@ export class ContinuousCompactor {
       boundary.metadata.muxMetadata.pendingFollowUp = pendingFollowUp;
     const applied = await this.deps.compactionHandler.withContinuousPendingState(
       head,
-      async () => {
+      async (_boundaryMessageId, onCommitted) => {
         if (
           generation !== this.generation ||
           this.deps.streamManager.isStreaming(this.deps.workspaceId)
@@ -664,7 +693,10 @@ export class ContinuousCompactor {
             [],
             journal.postCompactionAttachments
           ).reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0),
-          prepared: { boundary, copies: [...journal.staticCopies, liveCopy] },
+          // Sequence assignment must not mutate the exact journal receipt used by cleanup.
+          prepared: { boundary, copies: [...structuredClone(journal.staticCopies), liveCopy] },
+          publication: { generation: journal.publicationGeneration, journal },
+          onCommitted,
           shouldPersist: (current) =>
             generation === this.generation &&
             !this.deps.streamManager.isStreaming(this.deps.workspaceId) &&
@@ -673,9 +705,12 @@ export class ContinuousCompactor {
       },
       boundary.id
     );
-    if (applied) {
-      await store.clear();
-      this.reset("applied");
+    if (applied && generation === this.generation) {
+      await store.clear(journal);
+      if (generation === this.generation) {
+        this.ownedJournal = undefined;
+        this.reset("applied");
+      }
     }
     return applied;
   }
@@ -697,7 +732,7 @@ export class ContinuousCompactor {
     if (staged.generation !== this.generation) return false;
     return this.deps.compactionHandler.withContinuousPendingState(
       head,
-      async (boundaryMessageId) => {
+      async (boundaryMessageId, onCommitted) => {
         // Pending-state persistence yields; a reset/edit during it must still invalidate this job.
         rows = await this.readSnapshot();
         if (!rows || !this.isValid(staged, rows)) return false;
@@ -713,6 +748,8 @@ export class ContinuousCompactor {
         const snapshotFingerprint = fingerprint(rows);
         const applied = await this.deps.compactionHandler.persistContinuousCompaction({
           boundaryMessageId,
+          publication: { generation: staged.publicationGeneration },
+          onCommitted,
           shouldPersist: (currentRows) => {
             const current = sliceMessagesFromLatestCompactionBoundary(currentRows);
             return (
@@ -730,7 +767,7 @@ export class ContinuousCompactor {
           attachmentTokens: context.attachmentTokens ?? 0,
           pendingFollowUp,
         });
-        if (applied) this.reset("applied");
+        if (applied && staged.generation === this.generation) this.reset("applied");
         return applied;
       }
     );

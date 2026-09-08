@@ -7,6 +7,7 @@ import * as path from "path";
 import type { HistoryService } from "./historyService";
 
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
+import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
 import type { StreamEndEvent } from "@/common/types/stream";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
@@ -712,7 +713,7 @@ export class CompactionHandler {
 
   async withContinuousPendingState(
     messages: MuxMessage[],
-    apply: (boundaryMessageId: string) => Promise<boolean>,
+    apply: (boundaryMessageId: string, onCommitted: () => void) => Promise<boolean>,
     boundaryMessageId = createCompactionSummaryMessageId()
   ): Promise<boolean> {
     await this.loadPersistedPendingStateIfNeeded();
@@ -736,7 +737,12 @@ export class CompactionHandler {
     let applied = false;
     try {
       await this.preparePendingStateFromMessages(messages, boundaryMessageId, previousState);
-      applied = await apply(boundaryMessageId);
+      // A committed boundary must retain its pending attachments even if a later
+      // observer or cleanup throws before the apply promise returns.
+      const result = await apply(boundaryMessageId, () => {
+        applied = true;
+      });
+      applied ||= result;
       return applied;
     } finally {
       // Never roll an older apply back over a newer preparation/consumption.
@@ -1237,6 +1243,8 @@ export class CompactionHandler {
     params: Parameters<CompactionHandler["buildContinuousCompactionRows"]>[0] & {
       prepared?: { boundary: MuxMessage; copies: MuxMessage[] };
       shouldPersist: (messages: MuxMessage[]) => boolean;
+      publication?: ContinuousCompactionPublication;
+      onCommitted?: () => void;
     }
   ): Promise<boolean> {
     const { boundary, copies } = params.prepared ?? this.buildContinuousCompactionRows(params);
@@ -1258,7 +1266,15 @@ export class CompactionHandler {
       boundary,
       copies,
       false,
-      params.shouldPersist
+      params.shouldPersist,
+      params.publication
+        ? {
+            publication: params.publication,
+            onCommitted: () => {
+              params.onCommitted?.();
+            },
+          }
+        : undefined
     );
     if (!result.success) {
       log.warn("[continuous-compaction] persist failed", result.error);

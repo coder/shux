@@ -2,6 +2,10 @@ import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { addInterruptedSentinel } from "@/browser/utils/messages/modelMessageTransform";
 import { applyCacheControl } from "@/common/utils/ai/cacheStrategy";
 import { promises as fs } from "node:fs";
+import { renameSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import * as path from "node:path";
+import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import { isDeepStrictEqual } from "node:util";
 import { modelMessageSchema, type ModelMessage } from "ai";
 import writeFileAtomic from "write-file-atomic";
@@ -79,22 +83,119 @@ export async function rebuildContinuousPrefix(
   ];
 }
 
-/** Serialized journal I/O plus a synchronous invalidation fence shared by reset and prepareStep. */
+/** A captured generation plus the exact journal being folded; absence requires an empty slot. */
+export interface ContinuousCompactionPublication {
+  generation: string | undefined;
+  journal?: ContinuousCompactionJournal;
+}
+
+/** Publish the receipt before cleanup or lock release can admit a successor. */
+export async function publishCompactionFile(
+  filePath: string,
+  contents: string | Buffer,
+  isCurrent: () => boolean,
+  onCommitted?: () => void
+): Promise<boolean> {
+  const stagedPath = `${filePath}.continuous-${randomUUID()}`;
+  try {
+    await writeFileAtomic(stagedPath, contents, { mode: 0o600 });
+    if (!isCurrent()) return false;
+    renameSync(stagedPath, filePath);
+    try {
+      onCommitted?.();
+    } catch (error) {
+      // An observer cannot undo the rename or turn a committed boundary into a retry.
+      log.error("[continuous-compaction] commit observer failed", error);
+    }
+    return true;
+  } finally {
+    await fs.rm(stagedPath, { force: true }).catch((error: unknown) => {
+      log.warn("[continuous-compaction] staged file cleanup failed", error);
+    });
+  }
+}
+
+/** Journal publication and history folding serialize on the same cross-process history lock. */
 export class ContinuousCompactionJournalStore {
   private generation = 0;
   private pending: Promise<unknown> = Promise.resolve();
   constructor(
     readonly path: string,
-    private readonly workspaceId: string
+    private readonly workspaceId: string,
+    private readonly withHistoryLock: <T>(operation: () => Promise<T>) => Promise<T>
   ) {}
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.pending.then(operation);
+    const result = this.pending.then(() => this.withHistoryLock(operation));
     this.pending = result.catch(() => undefined);
     return result;
   }
 
-  clear(): Promise<void> {
+  async captureGenerationUnderHistoryLock(): Promise<string | undefined> {
+    try {
+      // Opaque bytes also fence old work if the file is damaged; fresh capture can proceed.
+      const contents = await fs.readFile(
+        path.join(path.dirname(this.path), CONTINUOUS_COMPACTION_GENERATION_FILE)
+      );
+      return createHash("sha256").update(contents).digest("hex");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  captureGeneration(): Promise<string | undefined> {
+    return this.enqueue(() => this.captureGenerationUnderHistoryLock());
+  }
+
+  /** Caller already holds the history lock; never re-enter the journal queue here. */
+  async advanceGenerationUnderHistoryLock(): Promise<void> {
+    await writeFileAtomic(
+      path.join(path.dirname(this.path), CONTINUOUS_COMPACTION_GENERATION_FILE),
+      randomUUID(),
+      { mode: 0o600 }
+    );
+  }
+
+  advanceGeneration(): Promise<void> {
+    return this.enqueue(() => this.advanceGenerationUnderHistoryLock());
+  }
+
+  private async readUnderHistoryLock(): Promise<ContinuousCompactionJournal | null> {
+    try {
+      return ContinuousCompactionJournalSchema.parse(
+        JSON.parse(await fs.readFile(this.path, "utf8"))
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  async isPublicationCurrentUnderHistoryLock(
+    publication: ContinuousCompactionPublication
+  ): Promise<boolean> {
+    return (
+      publication.generation === (await this.captureGenerationUnderHistoryLock()) &&
+      isDeepStrictEqual(await this.readUnderHistoryLock(), publication.journal ?? null)
+    );
+  }
+
+  clear(expected: ContinuousCompactionJournal | undefined): Promise<void> {
+    // No receipt means no authority to adopt and erase a successor's journal.
+    if (!expected) return this.pending.then(() => undefined);
+    return this.enqueue(() => this.clearOwnedUnderHistoryLock(expected));
+  }
+
+  private async clearOwnedUnderHistoryLock(expected: ContinuousCompactionJournal): Promise<void> {
+    if (isDeepStrictEqual(await this.readUnderHistoryLock(), expected))
+      await fs.rm(this.path, { force: true });
+  }
+
+  clearForReset(): Promise<void> {
+    // Migration seam: explicit destructive intent retains main's unconditional
+    // clearing and synchronous local fence. Exact asynchronous cleanup cannot
+    // assume this authority; durable cross-backend reset fencing is separate.
     this.generation++;
     return this.enqueue(() => fs.rm(this.path, { force: true }));
   }
@@ -112,23 +213,38 @@ export class ContinuousCompactionJournalStore {
     });
   }
 
-  read(): Promise<ContinuousCompactionJournal | null> {
+  read(
+    isCurrent: () => boolean = () => true,
+    onRead?: (journal: ContinuousCompactionJournal) => void
+  ): Promise<ContinuousCompactionJournal | null> {
+    const generation = this.generation;
+    const current = () => generation === this.generation && isCurrent();
     return this.enqueue(async () => {
+      if (!current()) return null;
+      let contents: string;
       try {
-        return ContinuousCompactionJournalSchema.parse(
-          JSON.parse(await fs.readFile(this.path, "utf8"))
-        );
+        contents = await fs.readFile(this.path, "utf8");
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-          log.warn("[continuous-compaction] discarded invalid journal", error);
-          await fs
-            .rm(this.path, { force: true })
-            .catch((cleanupError: unknown) =>
-              log.warn("[continuous-compaction] invalid journal cleanup failed", cleanupError)
-            );
-        }
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+          log.warn("[continuous-compaction] journal unavailable", error);
         return null;
       }
+      if (!current()) return null;
+      let journal: ContinuousCompactionJournal;
+      try {
+        journal = ContinuousCompactionJournalSchema.parse(JSON.parse(contents));
+      } catch (error) {
+        log.warn("[continuous-compaction] discarded invalid journal", error);
+        await fs.rm(this.path, { force: true });
+        return null;
+      }
+      if (journal.publicationGeneration !== (await this.captureGenerationUnderHistoryLock())) {
+        await fs.rm(this.path, { force: true });
+        return null;
+      }
+      if (!current()) return null;
+      onRead?.(journal);
+      return journal;
     });
   }
 
@@ -140,15 +256,20 @@ export class ContinuousCompactionJournalStore {
       providerOptions?: Record<string, unknown>;
       system?: string | ModelMessage;
     },
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    onCommitted?: (journal: ContinuousCompactionJournal) => void
   ): Promise<ContinuousCompactionJournal | null> {
     const generation = this.generation;
+    const current = () => generation === this.generation && isCurrent();
     return this.enqueue(async () => {
       try {
-        const current = ContinuousCompactionJournalSchema.parse(
-          JSON.parse(await fs.readFile(this.path, "utf8"))
-        );
-        if (generation !== this.generation || !isCurrent() || !isDeepStrictEqual(current, journal))
+        if (
+          !(await this.isPublicationCurrentUnderHistoryLock({
+            generation: journal.publicationGeneration,
+            journal,
+          })) ||
+          !current()
+        )
           return null;
         const prefix = request.prefix.map(exactJson);
         const parsedPrefix = prefix.map((message) => modelMessageSchema.parse(message));
@@ -157,24 +278,23 @@ export class ContinuousCompactionJournalStore {
           "Fallback prefix schema dropped request fields"
         );
         const payload = exactJson({
-          ...current,
-          fallbackPrefixes: [...(current.fallbackPrefixes ?? []), { ...request, prefix }],
+          ...journal,
+          fallbackPrefixes: [...(journal.fallbackPrefixes ?? []), { ...request, prefix }],
         });
         const updated = ContinuousCompactionJournalSchema.parse(payload);
         assert(
           isDeepStrictEqual(exactJson(updated), payload),
           "Fallback journal dropped request fields"
         );
-        if (generation !== this.generation || !isCurrent()) return null;
-        await writeFileAtomic(this.path, JSON.stringify(payload), { mode: 0o600 });
-        const reread = ContinuousCompactionJournalSchema.parse(
-          JSON.parse(await fs.readFile(this.path, "utf8"))
+        const committed = await publishCompactionFile(
+          this.path,
+          JSON.stringify(payload),
+          current,
+          () => {
+            onCommitted?.(updated);
+          }
         );
-        assert(
-          isDeepStrictEqual(exactJson(reread), payload),
-          "Fallback journal round-trip mismatch"
-        );
-        return generation === this.generation && isCurrent() ? reread : null;
+        return committed && current() ? updated : null;
       } catch (error) {
         // Unlike the initial write, this record already describes a consumed request.
         // Failure must keep it available for P1's durable fold or startup recovery.
@@ -190,11 +310,20 @@ export class ContinuousCompactionJournalStore {
   write(
     journal: ContinuousCompactionJournal,
     prefix: ModelMessage[],
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    onCommitted?: (journal: ContinuousCompactionJournal) => void
   ): Promise<ContinuousCompactionJournal | null> {
     const generation = this.generation;
+    const current = () => generation === this.generation && isCurrent();
     return this.enqueue(async () => {
       try {
+        if (
+          !(await this.isPublicationCurrentUnderHistoryLock({
+            generation: journal.publicationGeneration,
+          })) ||
+          !current()
+        )
+          return null;
         let wire: ContinuousCompactionJournal["prefix"];
         try {
           wire = z.array(z.json()).parse(exactJson(prefix));
@@ -218,20 +347,23 @@ export class ContinuousCompactionJournalStore {
           isDeepStrictEqual(exactJson(parsed), payload),
           "Journal schema dropped request fields"
         );
-        if (generation !== this.generation || !isCurrent()) return null;
-        await writeFileAtomic(this.path, JSON.stringify(payload), { mode: 0o600 });
-        const reread = ContinuousCompactionJournalSchema.parse(
-          JSON.parse(await fs.readFile(this.path, "utf8"))
+        const committed = await publishCompactionFile(
+          this.path,
+          JSON.stringify(payload),
+          current,
+          () => {
+            onCommitted?.(parsed);
+          }
         );
-        assert(isDeepStrictEqual(exactJson(reread), payload), "Journal round-trip mismatch");
-        if (generation !== this.generation || !isCurrent()) {
-          await fs.rm(this.path, { force: true });
+        if (committed && !current()) {
+          // Ownership can change during staged-file cleanup after the receipt.
+          // This initial prefix was never consumed; retire only its exact record.
+          await this.clearOwnedUnderHistoryLock(parsed);
           return null;
         }
-        return reread;
+        return committed ? parsed : null;
       } catch (error) {
         log.warn("[continuous-compaction] prefix not swapped: journal failed", error);
-        await fs.rm(this.path, { force: true }).catch(() => undefined);
         return null;
       }
     });

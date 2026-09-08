@@ -2635,7 +2635,10 @@ export class StreamManager {
             const journal = await store.write(
               { ...swap.journal, stepNumber },
               swap.prefix,
-              isCurrent
+              isCurrent,
+              (committed) => {
+                swap.journal = committed;
+              }
             );
             if (journal && isCurrent()) {
               swap.journal = journal;
@@ -2644,7 +2647,7 @@ export class StreamManager {
               effectiveMessages = swapped;
             } else if (journal && stepTracker.pendingPrefixSwap === swap) {
               // A thinking change can also arrive after write()'s last fence.
-              await store.clear();
+              await store.clear(journal);
             }
           }
           if (stepTracker.pendingPrefixSwap === swap) stepTracker.pendingPrefixSwap = undefined;
@@ -3640,7 +3643,10 @@ export class StreamManager {
                 providerOptions: nextRequest.providerOptions,
                 system: nextRequest.system,
               },
-              isCurrent
+              isCurrent,
+              (committed) => {
+                consumedSwap.journal = committed;
+              }
             );
           if (journal && isCurrent()) {
             consumedSwap.journal = journal;

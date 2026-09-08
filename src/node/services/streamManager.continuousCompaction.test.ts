@@ -5,6 +5,11 @@ import { prepareMessagesForProvider } from "./messagePipeline";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as ai from "ai";
 import * as atomicWrite from "write-file-atomic";
+import { promises as journalFs } from "node:fs";
+import * as fileLock from "@/node/utils/concurrency/fileLock";
+import * as path from "node:path";
+import { HistoryService } from "./historyService";
+import { historyWriteLockPath, removeSessionDirUnderMemoryLocks } from "./workspaceRemoval";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { readFile, writeFile } from "node:fs/promises";
 import assert from "@/common/utils/assert";
@@ -171,6 +176,307 @@ describe("continuous prefix prepareStep and journal", () => {
     const store = history.historyService.getContinuousCompactionJournal(workspaceId);
     return { ...harness, store, tracker, swap, manager };
   }
+
+  it("cannot overwrite or clear a foreign journal revision in the same generation", async () => {
+    const { store, swap } = await setup();
+    const original = await store.write(swap.journal, swap.prefix, () => true);
+    assert(original, "Expected original journal");
+    const foreign = new HistoryService(history.config).getContinuousCompactionJournal(workspaceId);
+    expect(await foreign.write(swap.journal, swap.prefix, () => true)).toBeNull();
+    const successor = await foreign.recordFallbackPrefix(
+      original,
+      { modelString: "anthropic:fallback", prefix: swap.prefix },
+      () => true
+    );
+    assert(successor, "Expected fallback revision");
+    await store.clear(original);
+    await store.clear(undefined);
+    expect(
+      await store.recordFallbackPrefix(
+        original,
+        { modelString: "anthropic:stale", prefix: swap.prefix },
+        () => true
+      )
+    ).toBeNull();
+    const receipt = mock();
+    const folded = await history.historyService.persistBoundaryWithTailCopies(
+      workspaceId,
+      structuredClone(original.boundary),
+      [],
+      false,
+      () => true,
+      {
+        publication: { generation: original.publicationGeneration, journal: original },
+        onCommitted: receipt,
+      }
+    );
+    expect(folded.success).toBe(false);
+    expect(receipt).not.toHaveBeenCalled();
+    expect(await foreign.read()).toEqual(successor);
+    const rows = await history.historyService.getLastMessages(workspaceId, 10);
+    assert(rows.success, "Expected history");
+    expect(rows.data.map((row) => row.id)).toEqual(["live"]);
+    await foreign.clear(successor);
+    expect(await store.read()).toBeNull();
+  });
+
+  it("captures durable generations across instances without activating destructive resets", async () => {
+    const { store, swap } = await setup();
+    const foreign = new HistoryService(history.config).getContinuousCompactionJournal(workspaceId);
+    const original = await store.write(swap.journal, swap.prefix, () => true);
+    assert(original, "Expected legacy journal");
+    await foreign.advanceGeneration();
+    expect(await store.write(swap.journal, swap.prefix, () => true)).toBeNull();
+    expect(
+      await store.recordFallbackPrefix(
+        original,
+        { modelString: "anthropic:stale", prefix: swap.prefix },
+        () => true
+      )
+    ).toBeNull();
+    expect(await store.read()).toBeNull();
+    const generation = await store.captureGeneration();
+    expect(generation).toBeDefined();
+    const candidate = { ...swap.journal, publicationGeneration: generation };
+    const fresh = await store.write(candidate, swap.prefix, () => true);
+    expect(await foreign.read()).toEqual(fresh);
+    const failure = spyOn(foreign, "advanceGenerationUnderHistoryLock").mockRejectedValueOnce(
+      new Error("generation unavailable")
+    );
+    expect(await foreign.advanceGeneration().catch((error: unknown) => error)).toEqual(
+      new Error("generation unavailable")
+    );
+    failure.mockRestore();
+    expect(await store.captureGeneration()).toBe(generation);
+    expect(await store.read()).toEqual(fresh);
+  });
+
+  it.each(["initial", "fallback"] as const)(
+    "reset fences a queued %s publication even when its caller predicate stays true",
+    async (kind) => {
+      const { store, swap } = await setup();
+      const original =
+        kind === "fallback" ? await store.write(swap.journal, swap.prefix, () => true) : null;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const capture = store.captureGenerationUnderHistoryLock.bind(store);
+      spyOn(store, "captureGenerationUnderHistoryLock").mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        return capture();
+      });
+      const blocking = store.captureGeneration();
+      const receipt = mock();
+      const writing = original
+        ? store.recordFallbackPrefix(
+            original,
+            { modelString: "anthropic:next", prefix: swap.prefix },
+            () => true,
+            receipt
+          )
+        : store.write(swap.journal, swap.prefix, () => true, receipt);
+      let resetting: Promise<void> | undefined;
+      try {
+        await entered.promise;
+        resetting = store.clearForReset();
+        release.resolve();
+        await blocking;
+        expect(await writing).toBeNull();
+        await resetting;
+        expect(receipt).not.toHaveBeenCalled();
+        expect(await store.read()).toBeNull();
+      } finally {
+        release.resolve();
+        await Promise.all([blocking, writing, resetting]);
+      }
+    }
+  );
+
+  it.each(["initial", "fallback"] as const)(
+    "reset fences an in-flight %s publication through its final rename",
+    async (kind) => {
+      const { store, swap } = await setup();
+      const original =
+        kind === "fallback" ? await store.write(swap.journal, swap.prefix, () => true) : null;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const atomic = atomicWrite.default;
+      spyOn(atomicWrite, "default").mockImplementationOnce(
+        Object.assign(
+          async (filename: string, data: string | Buffer) => {
+            await atomic(filename, data);
+            entered.resolve();
+            await release.promise;
+          },
+          { sync: atomic.sync }
+        )
+      );
+      const receipt = mock();
+      const writing = original
+        ? store.recordFallbackPrefix(
+            original,
+            { modelString: "anthropic:next", prefix: swap.prefix },
+            () => true,
+            receipt
+          )
+        : store.write(swap.journal, swap.prefix, () => true, receipt);
+      let resetting: Promise<void> | undefined;
+      try {
+        await entered.promise;
+        resetting = store.clearForReset();
+        release.resolve();
+        expect(await writing).toBeNull();
+        await resetting;
+        expect(receipt).not.toHaveBeenCalled();
+        expect(await store.read()).toBeNull();
+      } finally {
+        release.resolve();
+        await Promise.all([writing, resetting]);
+      }
+    }
+  );
+
+  it("publishes a receipt before cleanup and preserves success when cleanup or its observer fails", async () => {
+    const { store, swap } = await setup();
+    const receipt = mock<(journal: ContinuousCompactionJournal) => void>(() => {
+      throw new Error("observer failed");
+    });
+    let cleanupObserved = false;
+    const remove = journalFs.rm;
+    spyOn(journalFs, "rm").mockImplementation(async (...args) => {
+      if (String(args[0]).startsWith(`${store.path}.continuous-`)) {
+        cleanupObserved = true;
+        expect(receipt).toHaveBeenCalledTimes(1);
+        const persisted = JSON.parse(await readFile(store.path, "utf8")) as unknown;
+        expect(persisted).toEqual(receipt.mock.calls[0]?.[0]);
+        throw new Error("cleanup unavailable");
+      }
+      return remove(...args);
+    });
+    const published = await store.write(swap.journal, swap.prefix, () => true, receipt);
+    expect(cleanupObserved).toBe(true);
+    expect(published).not.toBeNull();
+    expect(await store.read()).toEqual(published);
+  });
+
+  it("cleans only the committed initial prefix when ownership changes during staged cleanup", async () => {
+    const { store, swap } = await setup();
+    let current = true;
+    const remove = journalFs.rm;
+    spyOn(journalFs, "rm").mockImplementation(async (...args) => {
+      if (String(args[0]).startsWith(`${store.path}.continuous-`)) current = false;
+      return remove(...args);
+    });
+    const receipt = mock();
+    expect(await store.write(swap.journal, swap.prefix, () => current, receipt)).toBeNull();
+    expect(receipt).toHaveBeenCalledTimes(1);
+    expect(await store.read()).toBeNull();
+  });
+
+  it("cannot recreate a removed workspace through journal capture, publication or cleanup", async () => {
+    const { store, swap } = await setup();
+    const original = await store.write(swap.journal, swap.prefix, () => true);
+    assert(original, "Expected journal");
+    const sessionDir = path.dirname(store.path);
+    await removeSessionDirUnderMemoryLocks({
+      rootDir: history.config.rootDir,
+      sessionDir,
+      workspaceId,
+      attemptId: "journal-removal-test",
+    });
+    for (const operation of [
+      () => store.captureGeneration(),
+      () => store.write(original, swap.prefix, () => true),
+      () => store.clear(original),
+    ])
+      expect(await operation().catch((error: unknown) => error)).toHaveProperty(
+        "message",
+        expect.stringContaining("was removed")
+      );
+    await store.clear(undefined);
+    expect(await journalFs.stat(sessionDir).catch((error: unknown) => error)).toHaveProperty(
+      "code",
+      "ENOENT"
+    );
+  });
+
+  it("publishes the history receipt before asynchronous cleanup without reporting a failed commit", async () => {
+    const { swap } = await setup();
+    const receipt = mock();
+    let cleanupObserved = false;
+    const remove = journalFs.rm;
+    spyOn(journalFs, "rm").mockImplementation(async (...args) => {
+      if (String(args[0]).includes("chat.jsonl.continuous-")) {
+        cleanupObserved = true;
+        expect(receipt).toHaveBeenCalledTimes(1);
+        throw new Error("history staging cleanup failed");
+      }
+      return remove(...args);
+    });
+    const result = await history.historyService.persistBoundaryWithTailCopies(
+      workspaceId,
+      structuredClone(swap.journal.boundary),
+      [],
+      false,
+      () => true,
+      { publication: { generation: undefined }, onCommitted: receipt }
+    );
+    expect(cleanupObserved).toBe(true);
+    expect(result.success).toBe(true);
+    const rows = await history.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(rows.success, "Expected history");
+    expect(rows.data.map((row) => row.id)).toEqual([swap.journal.boundary.id]);
+  });
+
+  it("waits for a foreign process holding the history lock before admitting a journal write", async () => {
+    const { store, swap } = await setup();
+    const foreign = {
+      ...swap.journal,
+      boundary: { ...swap.journal.boundary, id: "foreign-boundary" },
+    };
+    const script = `
+      import { acquireProcessFileLock } from "./src/node/utils/concurrency/fileLock.ts";
+      import { writeFile } from "node:fs/promises";
+      const [lockPath, journalPath, journal] = process.argv.slice(-3);
+      await using lock = await acquireProcessFileLock({ lockPath, timeoutMs: 5000, label: "journal test" });
+      process.stdout.write("locked\\n");
+      await Bun.stdin.text();
+      await writeFile(journalPath, journal);
+    `;
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        "--eval",
+        script,
+        historyWriteLockPath(history.config.rootDir, workspaceId),
+        store.path,
+        JSON.stringify(foreign),
+      ],
+      { stdin: "pipe", stdout: "pipe", stderr: "pipe" }
+    );
+    let writing: ReturnType<typeof store.write> | undefined;
+    try {
+      const reader = child.stdout.getReader();
+      expect(new TextDecoder().decode((await reader.read()).value)).toBe("locked\n");
+      reader.releaseLock();
+      const entered = Promise.withResolvers<void>();
+      const acquire = fileLock.acquireProcessFileLock;
+      spyOn(fileLock, "acquireProcessFileLock").mockImplementationOnce((options) => {
+        entered.resolve();
+        return acquire(options);
+      });
+      writing = store.write(swap.journal, swap.prefix, () => true);
+      await entered.promise;
+      await child.stdin.end();
+      expect(await child.exited).toBe(0);
+      expect(await writing).toBeNull();
+      expect(await store.read()).toEqual(foreign);
+    } finally {
+      child.kill();
+      await child.exited;
+      await writing;
+    }
+  });
 
   it("journals before returning, swaps once by content identity, and strips retained cache markers", async () => {
     const { run, tracker, store, swap } = await setup();
@@ -487,7 +793,7 @@ describe("continuous prefix prepareStep and journal", () => {
       let cleared = Promise.resolve();
       if (mode === "reset-before-write") {
         tracker.pendingPrefixSwap = undefined;
-        cleared = store.clear();
+        cleared = store.clearForReset();
       } else {
         controller.abort();
       }
