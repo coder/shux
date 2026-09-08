@@ -390,6 +390,94 @@ describe("WorktreeArchiveSnapshotService", () => {
     expect(await pathExists(path.join(sessionDir, "archive-attachments"))).toBe(false);
   });
 
+  test("leaves attachment copies a snapshot does not reference alone when clearing it", async () => {
+    // A downgrade cycle can strand copies here: the older build restores (deleting only
+    // archive-state) and re-archives without stagedAttachmentDirs.
+    const orphan = path.join(
+      fixture.config.sessionsDir,
+      fixture.workspaceId,
+      "archive-attachments",
+      "project",
+      ".xum",
+      "user-attachments",
+      "old-upload",
+      "notes.txt"
+    );
+    await fs.mkdir(path.dirname(orphan), { recursive: true });
+    await fs.writeFile(orphan, "kept", "utf-8");
+    await makeWorkspaceDirty(fixture);
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    if (!captureResult.success) {
+      return;
+    }
+    expect(captureResult.data.projects[0]?.stagedAttachmentDirs).toBeUndefined();
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+      if (!workspace) {
+        throw new Error("Missing workspace entry");
+      }
+      workspace.worktreeArchiveSnapshot = captureResult.data;
+      return cfg;
+    });
+    runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
+
+    const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(restoreResult).toEqual({ success: true, data: "restored" });
+    expect(await fs.readFile(orphan, "utf-8")).toBe("kept");
+  });
+
+  test("captures the contents behind a symlinked staging directory instead of the link", async () => {
+    // The staging directory is a link to an ignored directory elsewhere in the checkout; the
+    // worktree removal would take the target with it, so the copy must hold real files.
+    const storeDir = path.join(fixture.workspacePath, "store");
+    await fs.mkdir(path.join(storeDir, "upload"), { recursive: true });
+    await fs.writeFile(path.join(storeDir, "upload", "notes.txt"), "payload", "utf-8");
+    await fs.mkdir(path.join(fixture.workspacePath, ".xum"));
+    await fs.symlink(storeDir, path.join(fixture.workspacePath, ".xum", "user-attachments"));
+    const excludePath = runGit(fixture.workspacePath, ["rev-parse", "--git-path", "info/exclude"]);
+    await fs.mkdir(path.dirname(path.resolve(fixture.workspacePath, excludePath)), {
+      recursive: true,
+    });
+    await fs.writeFile(
+      path.resolve(fixture.workspacePath, excludePath),
+      "/.xum/user-attachments\n/store/\n",
+      "utf-8"
+    );
+    expect(runGit(fixture.workspacePath, ["status", "--porcelain"])).toBe("");
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    if (!captureResult.success) {
+      return;
+    }
+    const artifact = captureResult.data.projects[0]?.stagedAttachmentDirs?.[0];
+    expect(artifact).toBeDefined();
+    if (!artifact) {
+      return;
+    }
+    runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
+    const artifactDir = path.join(
+      fixture.config.sessionsDir,
+      fixture.workspaceId,
+      artifact.artifactPath
+    );
+    expect((await fs.lstat(artifactDir)).isSymbolicLink()).toBe(false);
+    expect(await fs.readFile(path.join(artifactDir, "upload", "notes.txt"), "utf-8")).toBe(
+      "payload"
+    );
+  });
+
   test("fails capture when the staged attachment directory cannot be inspected", async () => {
     const bytes = Buffer.from("attachment payload");
     const staged = await stageWorkspaceAttachment({
