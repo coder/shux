@@ -110,3 +110,30 @@ test("streams a long-lived subscription response through without buffering", asy
   expect(decoder.decode((await reader.read()).value)).toContain("event: message");
   await reader.cancel();
 });
+
+test("a subscription response ends for the browser when the upstream dies mid-stream", async () => {
+  let upstreamResponse!: http.ServerResponse;
+  const endpoint = await listen(
+    http.createServer((_req, res) => {
+      upstreamResponse = res;
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(": open\n\n");
+    })
+  );
+  const preview = await listen(createPreviewServer({ endpoint, origin }));
+  const response = await fetch(`${preview}/__xum/orpc/workspace/onChat`, {
+    method: "POST",
+    headers: { host, origin },
+  });
+  const reader = response.body!.getReader();
+  await reader.read();
+  upstreamResponse.destroy();
+  const outcome = await Promise.race([
+    reader.read().then(
+      (result) => (result.done ? "ended" : "data"),
+      () => "errored"
+    ),
+    new Promise<string>((resolve) => setTimeout(() => resolve("still open"), 2_000)),
+  ]);
+  expect(["ended", "errored"]).toContain(outcome);
+});

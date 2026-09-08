@@ -386,8 +386,8 @@ function createFormClient(
   return createORPCClient<MobileClient>({
     call: async (path, input, options) => {
       if (path.join(".") === "policy.get") return unrestrictedCreationPolicy;
-      if (path.join(".") === "policy.onChanged")
-        return new ReadableStream<void>({
+      if (path.join(".") === "server.onChanged")
+        return new ReadableStream<never>({
           start(controller) {
             options.signal?.addEventListener("abort", () => controller.close(), { once: true });
           },
@@ -846,9 +846,9 @@ function creationPolicyClient() {
   const client = createORPCClient<MobileClient>({
     call: async (path, input, options) => {
       const method = path.join(".");
-      if (method === "policy.onChanged") {
+      if (method === "server.onChanged") {
         order.push(method);
-        return new ReadableStream<void>({
+        return new ReadableStream<{ type: "policy" }>({
           start(controller) {
             let closed = false;
             const close = () => {
@@ -857,7 +857,11 @@ function creationPolicyClient() {
                 controller.close();
               }
             };
-            subscriptions.push({ signal: options.signal, emit: () => controller.enqueue(), close });
+            subscriptions.push({
+              signal: options.signal,
+              emit: () => controller.enqueue({ type: "policy" }),
+              close,
+            });
             options.signal?.addEventListener("abort", close, { once: true });
           },
         }).values();
@@ -924,7 +928,7 @@ test("creation policy subscribes before reading, fails closed, cancels stale rea
   fireEvent.keyDown(title, { key: "Enter", keyCode: 13 });
   expect(fixture.calls).toHaveLength(0);
   await waitFor(() => expect(fixture.reads).toHaveLength(1));
-  expect(fixture.order).toEqual(["policy.onChanged", "policy.get"]);
+  expect(fixture.order).toEqual(["server.onChanged", "policy.get"]);
   fixture.setRead(() => Promise.reject(new Error("policy unavailable")));
   await act(async () => {
     fixture.subscriptions[0].emit();
@@ -1194,10 +1198,8 @@ test.each([
         switch (path.join(".")) {
           case "policy.get":
             return pickerData.policy;
-          case "config.onConfigChanged":
-          case "providers.onConfigChanged":
-          case "policy.onChanged":
-            return new ReadableStream<void>({
+          case "server.onChanged":
+            return new ReadableStream<never>({
               start(controller) {
                 request.signal?.addEventListener("abort", () => controller.close(), { once: true });
               },

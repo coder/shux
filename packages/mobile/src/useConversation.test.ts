@@ -44,38 +44,41 @@ function fixture(
   });
   let eventController!: ReadableStreamDefaultController<WorkspaceChatMessage>;
   const policyRequests: AbortSignal[] = [];
-  const policySubscriptions: Array<{
+  type ChangeEvent =
+    Awaited<ReturnType<MobileClient["server"]["onChanged"]>> extends AsyncIterable<infer Event>
+      ? Event
+      : never;
+  type Notifier = {
     signal: AbortSignal;
-    events: ReadableStreamDefaultController<void>;
+    events: { enqueue: () => void };
     fail: (error: Error) => void;
-  }> = [];
-  const configSubscriptions: typeof policySubscriptions = [];
-  const providerSubscriptions: typeof policySubscriptions = [];
+  };
+  // One shared change stream serves policy, config and provider notifications; the
+  // per-kind views below let each test speak about the kind it cares about.
+  const policySubscriptions: Notifier[] = [];
+  const configSubscriptions: Notifier[] = [];
+  const providerSubscriptions: Notifier[] = [];
   const settingsRequests: Array<{ path: string; signal: AbortSignal }> = [];
   const settingsOrder: string[] = [];
-  function notifications(
-    subscriptions: typeof policySubscriptions,
-    signal: AbortSignal,
-    source: string
-  ) {
-    const events = new ReadableStream<void>({
+  function changes(signal: AbortSignal) {
+    settingsOrder.push("changes.subscribe");
+    return new ReadableStream<ChangeEvent>({
       start(controller) {
         const close = () => controller.close();
-        subscriptions.push({
-          signal,
-          events: controller,
-          fail(error) {
-            signal.removeEventListener("abort", close);
-            controller.error(error);
-          },
-        });
+        const fail = (error: Error) => {
+          signal.removeEventListener("abort", close);
+          controller.error(error);
+        };
+        for (const [list, type] of [
+          [policySubscriptions, "policy"],
+          [configSubscriptions, "config"],
+          [providerSubscriptions, "providers"],
+        ] as const) {
+          list.push({ signal, events: { enqueue: () => controller.enqueue({ type }) }, fail });
+        }
         signal.addEventListener("abort", close, { once: true });
       },
-    });
-    return (async function* () {
-      settingsOrder.push(`${source}.listen`);
-      yield* events.values();
-    })();
+    }).values();
   }
   const restored: RestoredInput[] = [];
   const chatRequests: AbortSignal[] = [];
@@ -87,27 +90,8 @@ function fixture(
         case "policy.get":
           policyRequests.push(options.signal!);
           return getPolicy();
-        case "policy.onChanged":
-          return new ReadableStream<void>({
-            start(controller) {
-              const close = () => controller.close();
-              policySubscriptions.push({
-                signal: options.signal!,
-                events: controller,
-                fail(error) {
-                  options.signal?.removeEventListener("abort", close);
-                  controller.error(error);
-                },
-              });
-              options.signal?.addEventListener("abort", close, { once: true });
-            },
-          }).values();
-        case "config.onConfigChanged":
-          settingsOrder.push("config.subscribe");
-          return notifications(configSubscriptions, options.signal!, "config");
-        case "providers.onConfigChanged":
-          settingsOrder.push("providers.subscribe");
-          return notifications(providerSubscriptions, options.signal!, "providers");
+        case "server.onChanged":
+          return changes(options.signal!);
         case "config.getConfig":
           settingsOrder.push("config.read");
           settingsRequests.push({ path: "config", signal: options.signal! });
@@ -592,8 +576,10 @@ test("a failed policy read stays unavailable without hiding settings and a chang
   fail = false;
   await act(async () => view.policySubscriptions[0].events.enqueue());
   await waitFor(() => expect(view.result.current.settings?.policy).toEqual(disabledPolicy));
+  // Losing the shared change stream withdraws every snapshot it guards until it reopens.
   await act(async () => view.policySubscriptions[0].fail(new Error("subscription lost")));
-  await waitFor(() => expect(view.result.current.settings?.policy).toBeNull());
+  await waitFor(() => expect(view.result.current.settings).toBeNull());
+  expect(view.result.current.settingsError).not.toBeNull();
 });
 
 test("a late policy response cannot update an aborted connection lifetime", async () => {
@@ -648,9 +634,9 @@ test("settings subscriptions precede reads and refresh privacy, routes and provi
   await view.ready();
   expect(view.configSubscriptions).toHaveLength(1);
   expect(view.providerSubscriptions).toHaveLength(1);
-  // Both subscriptions are registered before any settings snapshot is read.
-  expect(view.settingsOrder.slice(0, 2)).toEqual(["config.subscribe", "providers.subscribe"]);
-  expect(view.settingsOrder.slice(2)).toEqual(
+  // The change stream is registered before any settings snapshot is read.
+  expect(view.settingsOrder[0]).toBe("changes.subscribe");
+  expect(view.settingsOrder.slice(1)).toEqual(
     expect.arrayContaining(["config.read", "agents.read", "providers.read"])
   );
   config = {

@@ -8,7 +8,7 @@ import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/wor
 import { Button, Field, Loading, Notice, Sheet } from "../components/Controls";
 import { colors, layout, radii, spacing, typography } from "../theme";
 import { linkedAbortController } from "../useConnection";
-import { watch } from "../streams";
+import { watchServerChanges } from "../streams";
 import { resolveWorkspaceCreationScope } from "../../../../src/common/utils/subProjects";
 import type { PolicyGetResponse } from "../../../../src/common/orpc/types";
 import { RUNTIME_MODE } from "../../../../src/common/types/runtime";
@@ -108,11 +108,12 @@ export function CreateWorkspace(props: {
         )
         .finally(() => next.abort());
     }
-    watch({
+    watchServerChanges(props.client, {
       signal: lifetime.signal,
-      open: (attempt) => props.client.policy.onChanged(undefined, { signal: attempt.signal }),
       onOpen: refresh,
-      onEvent: refresh,
+      onEvent: (event) => {
+        if (event.type === "policy") refresh();
+      },
       onLost: unavailable,
     }).catch(unavailable);
     return () => {

@@ -102,6 +102,7 @@ import {
   subscribeBackgroundBashes,
   subscribeMemoryChanges,
   subscribeMetadata,
+  subscribeServerChanges,
   subscribeOpenSettings,
   subscribePolicyChanges,
   subscribeDesignExperiment,
@@ -236,6 +237,10 @@ export const router = (authToken?: string) => {
         .input(schemas.server.getLaunchProject.input)
         .output(schemas.server.getLaunchProject.output)
         .handler(async ({ context }) => context.serverService.getLaunchProject()),
+      onChanged: t
+        .input(schemas.server.onChanged.input)
+        .output(schemas.server.onChanged.output)
+        .handler(({ context, signal }) => subscribeServerChanges(context, signal)),
       getSshHost: t
         .input(schemas.server.getSshHost.input)
         .output(schemas.server.getSshHost.output)

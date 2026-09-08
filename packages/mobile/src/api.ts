@@ -15,7 +15,10 @@ type SchemaClient<T> = T extends {
   ? Client<ClientContext, InferSchemaInput<I>, InferSchemaOutput<O>, Error>
   : { [K in keyof T]: SchemaClient<T[K]> };
 export type MobileClient = SchemaClient<
-  Pick<typeof schemas, "projects" | "workspace" | "providers" | "agents" | "config" | "policy">
+  Pick<
+    typeof schemas,
+    "projects" | "workspace" | "providers" | "agents" | "config" | "policy" | "server"
+  >
 >;
 export interface MobileConnection {
   client: MobileClient;

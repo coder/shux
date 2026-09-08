@@ -2,7 +2,15 @@ import "./testDom";
 import { afterEach, expect, test } from "bun:test";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { ORPCError } from "@orpc/client";
-import { STREAM_RETRY_MAX_MS, merge, useStreamsReconnecting, wakeStreams, watch } from "./streams";
+import {
+  STREAM_RETRY_MAX_MS,
+  useStreamsReconnecting,
+  wakeStreams,
+  watch,
+  watchServerChanges,
+} from "./streams";
+import type { MobileClient } from "./api";
+import type { ServerChangeEvent } from "../../../src/common/orpc/schemas/api";
 
 afterEach(cleanup);
 
@@ -187,30 +195,76 @@ test("health reports reconnecting while any watch waits and clears once all are 
   expect(health.result.current).toBe(false);
 });
 
-test.each(["end", "fail"] as const)(
-  "merge interleaves sources in arrival order and finishes when any source %ss",
-  async (ending) => {
-    const controllers: Array<ReadableStreamDefaultController<string>> = [];
-    const sources = [0, 1].map(() =>
-      new ReadableStream<string>({
-        start(controller) {
-          controllers.push(controller);
-        },
-      }).values()
-    );
-    const merged = merge(sources);
-    const first = merged.next();
-    controllers[1].enqueue("b1");
-    controllers[0].enqueue("a1");
-    expect((await first).value).toBe("b1");
-    expect((await merged.next()).value).toBe("a1");
-    const third = merged.next();
-    if (ending === "end") {
-      controllers[0].close();
-      expect((await third).done).toBe(true);
-    } else {
-      controllers[1].error(new Error("boom"));
-      expect(await third.catch((cause: unknown) => String(cause))).toContain("boom");
-    }
-  }
-);
+function changesClient() {
+  const stream = source<ServerChangeEvent>();
+  const client = {
+    server: {
+      onChanged: (_input: undefined, options: { signal?: AbortSignal }) =>
+        stream.open({ signal: options.signal!, retries: 0 }),
+    },
+  } as unknown as Pick<MobileClient, "server">;
+  return { client, stream };
+}
+
+test("consumers share one change stream per client; it opens with the first and closes with the last", async () => {
+  const { client, stream } = changesClient();
+  const log: string[] = [];
+  const consumer = (name: string) => {
+    const controller = new AbortController();
+    const done = watchServerChanges(client, {
+      signal: controller.signal,
+      onOpen: () => log.push(`${name}:open`),
+      onEvent: (event) => log.push(`${name}:${event.type}`),
+      onLost: () => log.push(`${name}:lost`),
+    });
+    return { controller, done };
+  };
+  const a = consumer("a");
+  await settled();
+  expect(stream.attempts).toHaveLength(1);
+  // A late joiner reads its snapshot immediately: the subscription is already registered.
+  const b = consumer("b");
+  await settled();
+  expect(stream.attempts).toHaveLength(1);
+  stream.attempts[0].emit({ type: "policy" });
+  await settled();
+  expect(log).toEqual(["a:open", "b:open", "a:policy", "b:policy"]);
+  a.controller.abort();
+  await a.done;
+  stream.attempts[0].emit({ type: "config" });
+  await settled();
+  expect(stream.attempts[0].signal.aborted).toBe(false);
+  expect(log.slice(-1)).toEqual(["b:config"]);
+  stream.attempts[0].end();
+  await settled();
+  expect(log.slice(-1)).toEqual(["b:lost"]);
+  b.controller.abort();
+  await b.done;
+  expect(stream.attempts[0].signal.aborted).toBe(true);
+  // A new consumer after everyone left starts a fresh stream rather than joining a dead one.
+  const c = consumer("c");
+  await settled();
+  expect(stream.attempts).toHaveLength(2);
+  c.controller.abort();
+  await c.done;
+});
+
+test("a rejected credential on the shared stream rejects every attached consumer once", async () => {
+  const { client, stream } = changesClient();
+  const controllers = [new AbortController(), new AbortController()];
+  const outcomes = controllers.map((controller) =>
+    watchServerChanges(client, { signal: controller.signal, onEvent: () => {} }).then(
+      () => "resolved",
+      (cause: unknown) => (cause instanceof ORPCError ? cause.code : "other")
+    )
+  );
+  await settled();
+  stream.attempts[0].fail(new ORPCError("UNAUTHORIZED"));
+  expect(await Promise.all(outcomes)).toEqual(["UNAUTHORIZED", "UNAUTHORIZED"]);
+  const retry = new AbortController();
+  const again = watchServerChanges(client, { signal: retry.signal, onEvent: () => {} });
+  await settled();
+  expect(stream.attempts).toHaveLength(2);
+  retry.abort();
+  await again;
+});

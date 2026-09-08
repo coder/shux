@@ -6,7 +6,7 @@ import {
   resumeTranscriptState,
   type WorkspaceChatMessage,
 } from "./transcript";
-import { merge, watch } from "./streams";
+import { watch, watchServerChanges } from "./streams";
 import {
   MOBILE_STREAM_DISPLAY_BATCH_MS,
   MOBILE_STREAM_MAX_PENDING_DELTAS,
@@ -95,24 +95,10 @@ export function useConversation(
         )
         .finally(() => request.abort());
     }
-    watch({
-      signal: controller.signal,
-      // Subscribe before the initial read so changes during that read are not lost.
-      open: (attempt) => client.policy.onChanged(undefined, { signal: attempt.signal }),
-      onOpen: refreshPolicy,
-      onEvent: refreshPolicy,
-      onLost: () => {
-        policyRequest?.abort();
-        setPolicy(null);
-      },
-    }).catch(() => {
-      if (!controller.signal.aborted) setPolicy(null);
-    });
-    const settingsController = linkedAbortController(controller.signal);
     let settingsRequest: AbortController | null = null;
     function refreshSettings() {
       settingsRequest?.abort();
-      const request = linkedAbortController(settingsController.signal);
+      const request = linkedAbortController(controller.signal);
       settingsRequest = request;
       // A notification invalidates the old privacy options immediately. Consume
       // further notifications while reading, so an older snapshot cannot win.
@@ -139,23 +125,26 @@ export function useConversation(
       setSettings(null);
       setSettingsError("Settings unavailable. Retry to reconnect.");
     }
-    // Both subscriptions are registered before the snapshot they guard is read; a
-    // reopened pair re-reads because changes may have happened while it was down.
-    watch({
-      signal: settingsController.signal,
-      open: async (attempt) =>
-        merge(
-          await Promise.all([
-            client.config.onConfigChanged(undefined, { signal: attempt.signal }),
-            client.providers.onConfigChanged(undefined, { signal: attempt.signal }),
-          ])
-        ),
-      onOpen: refreshSettings,
-      onEvent: refreshSettings,
-      onLost: settingsUnavailable,
+    // The change stream is registered before any snapshot is read, and a reopened one
+    // re-reads everything because changes may have happened while it was down.
+    watchServerChanges(client, {
+      signal: controller.signal,
+      onOpen: () => {
+        refreshPolicy();
+        refreshSettings();
+      },
+      onEvent: (event) => {
+        if (event.type === "policy") refreshPolicy();
+        else if (event.type === "config" || event.type === "providers") refreshSettings();
+      },
+      onLost: () => {
+        policyRequest?.abort();
+        setPolicy(null);
+        settingsUnavailable();
+      },
     }).catch(() => {
       if (controller.signal.aborted) return;
-      settingsController.abort();
+      setPolicy(null);
       settingsUnavailable();
     });
     type Anchor = NonNullable<

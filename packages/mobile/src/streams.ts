@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
-import { isAuthenticationError } from "./api";
+import type { ServerChangeEvent } from "../../../src/common/orpc/schemas/api";
+import { isAuthenticationError, type MobileClient } from "./api";
 import { linkedAbortController } from "./useConnection";
 
 // Each HTTP subscription is an independent long-lived response, so each one heals
@@ -53,25 +54,6 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-/**
- * Interleave several subscriptions into one. When any of them ends or fails the merged
- * stream does too, so a watch over the group reopens them together and re-reads the
- * snapshot they jointly guard exactly once. The survivors are not closed here: a
- * generator blocked in `next()` cannot be returned, so the sources must share the
- * attempt signal that `watch` aborts after every attempt.
- */
-export async function* merge<T>(sources: AsyncIterable<T>[]): AsyncGenerator<T> {
-  const iterators = sources.map((source) => source[Symbol.asyncIterator]());
-  const advance = (index: number) => iterators[index].next().then((result) => ({ index, result }));
-  const pending = iterators.map((_, index) => advance(index));
-  while (true) {
-    const { index, result } = await Promise.race(pending);
-    if (result.done) return;
-    yield result.value;
-    pending[index] = advance(index);
-  }
-}
-
 export interface WatchOptions<T> {
   signal: AbortSignal;
   /** Open one attempt. `retries` counts consecutive reopen attempts since the last stable stream. */
@@ -123,4 +105,84 @@ export async function watch<T>(options: WatchOptions<T>): Promise<void> {
   } finally {
     setReconnecting(stream, false);
   }
+}
+
+interface ChangeConsumer {
+  signal: AbortSignal;
+  onOpen?: () => void;
+  onEvent: (event: ServerChangeEvent) => void;
+  onLost?: () => void;
+}
+interface SharedChanges {
+  consumers: Set<ChangeConsumer>;
+  controller: AbortController;
+  open: boolean;
+  settled: Promise<void>;
+}
+const sharedChanges = new WeakMap<object, SharedChanges>();
+
+/**
+ * Config, provider, policy and workspace-metadata changes all arrive on one
+ * server stream, shared by every consumer of the same client while any is mounted.
+ * Browsers and mobile URLSession cap HTTP/1.1 connections per host at about six, so
+ * with the conversation stream this leaves the unary calls that read the changed
+ * snapshots room to run. Resolves when `signal` aborts; rejects only when the
+ * credential is rejected.
+ */
+export function watchServerChanges(
+  client: Pick<MobileClient, "server">,
+  consumer: ChangeConsumer
+): Promise<void> {
+  if (consumer.signal.aborted) return Promise.resolve();
+  let shared = sharedChanges.get(client);
+  if (!shared) {
+    const controller = new AbortController();
+    const created: SharedChanges = {
+      consumers: new Set(),
+      controller,
+      open: false,
+      settled: watch<ServerChangeEvent>({
+        signal: controller.signal,
+        open: (attempt) => client.server.onChanged(undefined, { signal: attempt.signal }),
+        onOpen: () => {
+          created.open = true;
+          for (const each of [...created.consumers]) each.onOpen?.();
+        },
+        onEvent: (event) => {
+          for (const each of [...created.consumers]) each.onEvent(event);
+        },
+        onLost: () => {
+          created.open = false;
+          for (const each of [...created.consumers]) each.onLost?.();
+        },
+      }).finally(() => {
+        if (sharedChanges.get(client) === created) sharedChanges.delete(client);
+      }),
+    };
+    shared = created;
+    sharedChanges.set(client, shared);
+  }
+  const owner = shared;
+  owner.consumers.add(consumer);
+  // Joining an already registered subscription: the snapshot can be read right away.
+  if (owner.open) consumer.onOpen?.();
+  return new Promise<void>((resolve, reject) => {
+    const leave = () => {
+      owner.consumers.delete(consumer);
+      if (owner.consumers.size === 0) {
+        // Release synchronously: a remounting consumer must start a fresh stream, not
+        // join this aborted one before its watch has settled.
+        if (sharedChanges.get(client) === owner) sharedChanges.delete(client);
+        owner.controller.abort();
+      }
+      resolve();
+    };
+    consumer.signal.addEventListener("abort", leave, { once: true });
+    owner.settled.catch((cause: unknown) => {
+      if (!owner.consumers.has(consumer)) return;
+      consumer.signal.removeEventListener("abort", leave);
+      owner.consumers.delete(consumer);
+      reject(cause);
+    });
+  });
 }

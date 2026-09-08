@@ -2472,6 +2472,18 @@ export const ServerAuthSessionSchema = z.object({
   isCurrent: z.boolean(),
 });
 
+export const ServerChangeEventSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("config") }),
+  z.object({ type: z.literal("providers") }),
+  z.object({ type: z.literal("policy") }),
+  z.object({
+    type: z.literal("metadata"),
+    workspaceId: z.string(),
+    metadata: FrontendWorkspaceMetadataSchema.nullable(),
+  }),
+]);
+export type ServerChangeEvent = z.infer<typeof ServerChangeEventSchema>;
+
 export const server = {
   getLaunchProject: {
     input: z.void(),
@@ -2496,6 +2508,17 @@ export const server = {
       serveWebUi: z.boolean().nullable().optional(),
     }),
     output: ApiServerStatusSchema,
+  },
+  /**
+   * Subscription: every control-plane change a thin client tracks, on one stream.
+   * HTTP clients hold one long-lived response per subscription, and browsers and
+   * mobile URLSession cap HTTP/1.1 connections per host at about six, so the
+   * separate config/providers/policy/metadata subscriptions would starve the
+   * unary calls that must read the changed snapshots.
+   */
+  onChanged: {
+    input: z.void(),
+    output: eventIterator(ServerChangeEventSchema),
   },
 };
 

@@ -25,10 +25,8 @@ test("120 separately delivered deltas render Markdown once per display flush whi
           return [{ id: "exec", name: "Exec", uiSelectable: true }];
         case "policy.get":
           return { source: "none", status: { state: "disabled" }, policy: null };
-        case "config.onConfigChanged":
-        case "providers.onConfigChanged":
-        case "policy.onChanged":
-          return new ReadableStream<void>({
+        case "server.onChanged":
+          return new ReadableStream<never>({
             start(controller) {
               options.signal?.addEventListener("abort", () => controller.close(), { once: true });
             },

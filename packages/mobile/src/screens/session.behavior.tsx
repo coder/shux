@@ -45,9 +45,11 @@ function fixture(
   initialWorkspaces: FrontendWorkspaceMetadata[] = workspaces
 ) {
   let workspaceList = initialWorkspaces;
-  const metadataEvents: Array<
-    ReadableStreamDefaultController<{ workspaceId: string; metadata: FrontendWorkspaceMetadata }>
-  > = [];
+  type ChangeEvent =
+    Awaited<ReturnType<MobileClient["server"]["onChanged"]>> extends AsyncIterable<infer Event>
+      ? Event
+      : never;
+  const changeEvents: ReadableStreamDefaultController<ChangeEvent>[] = [];
   Object.defineProperty(document.documentElement, "clientWidth", {
     configurable: true,
     value: wide ? 1200 : 375,
@@ -72,11 +74,8 @@ function fixture(
     { id: "scout", name: "Scout", uiSelectable: true },
     { id: "plan", name: "Plan", uiSelectable: true },
   ].map((agent) => ({ ...agent, scope: "built-in", subagentRunnable: true }));
-  const configEvents: ReadableStreamDefaultController<void>[] = [];
-  const providerEvents: ReadableStreamDefaultController<void>[] = [];
   let configRead = async () => config;
   let policy = initialPolicy;
-  const policyEvents: ReadableStreamDefaultController<void>[] = [];
   let closed = 0;
   let reconnected = 0;
   let disconnected = 0;
@@ -117,8 +116,8 @@ function fixture(
       const name = path.join(".");
       calls.push({ path: name, input, signal: options.signal });
       switch (name) {
-        case "workspace.onMetadata":
-          return events(options.signal, [], (controller) => metadataEvents.push(controller));
+        case "server.onChanged":
+          return events(options.signal, [], (controller) => changeEvents.push(controller));
         case "workspace.list":
           return workspaceList;
         case "projects.list":
@@ -126,12 +125,6 @@ function fixture(
         case "policy.get":
           if (policy instanceof Error) throw policy;
           return policy;
-        case "policy.onChanged":
-          return events<void>(options.signal, [], (controller) => policyEvents.push(controller));
-        case "config.onConfigChanged":
-          return events<void>(options.signal, [], (controller) => configEvents.push(controller));
-        case "providers.onConfigChanged":
-          return events<void>(options.signal, [], (controller) => providerEvents.push(controller));
         case "config.getConfig":
           return configRead();
         case "providers.getConfig":
@@ -228,29 +221,31 @@ function fixture(
       workspaceList = workspaceList.map((workspace) =>
         workspace.id === metadata.id ? metadata : workspace
       );
-      await act(async () => metadataEvents.at(-1)!.enqueue({ workspaceId: metadata.id, metadata }));
+      await act(async () =>
+        changeEvents.at(-1)!.enqueue({ type: "metadata", workspaceId: metadata.id, metadata })
+      );
     },
     get agents() {
       return agents;
     },
     async updateAgents(next: SettingsData["agents"]) {
       agents = next;
-      await act(async () => configEvents.at(-1)!.enqueue());
+      await act(async () => changeEvents.at(-1)!.enqueue({ type: "config" }));
     },
     setConfigRead(read: typeof configRead) {
       configRead = read;
     },
     async updateConfig(next: SettingsData["config"]) {
       config = next;
-      await act(async () => configEvents.at(-1)!.enqueue());
+      await act(async () => changeEvents.at(-1)!.enqueue({ type: "config" }));
     },
     async updateProviders(next: SettingsData["providers"]) {
       providers = next;
-      await act(async () => providerEvents.at(-1)!.enqueue());
+      await act(async () => changeEvents.at(-1)!.enqueue({ type: "providers" }));
     },
     async updatePolicy(next: Policy) {
       policy = next;
-      await act(async () => policyEvents.at(-1)!.enqueue());
+      await act(async () => changeEvents.at(-1)!.enqueue({ type: "policy" }));
     },
     async emit(event: WorkspaceChatMessage) {
       await act(async () => chats.at(-1)!.events.enqueue(event));

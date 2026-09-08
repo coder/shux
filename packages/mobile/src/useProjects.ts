@@ -1,16 +1,14 @@
 import { useEffect, useState } from "react";
 import type { MobileClient } from "./api";
 import type { FrontendWorkspaceMetadata } from "../../../src/common/types/workspace";
+import type { ServerChangeEvent } from "../../../src/common/orpc/schemas/api";
 import { isWorkspaceArchived } from "../../../src/common/utils/archive";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "../../../src/common/constants/scratch";
 import { linkedAbortController } from "./useConnection";
-import { watch } from "./streams";
+import { watchServerChanges } from "./streams";
 
 export type Projects = Awaited<ReturnType<MobileClient["projects"]["list"]>>;
-type MetadataEvent =
-  Awaited<ReturnType<MobileClient["workspace"]["onMetadata"]>> extends AsyncIterable<infer Event>
-    ? Event
-    : never;
+type MetadataEvent = Extract<ServerChangeEvent, { type: "metadata" }>;
 
 export function useProjects(client: MobileClient, signal: AbortSignal) {
   const [projects, setProjects] = useState<Projects>([]);
@@ -103,27 +101,24 @@ export function useProjects(client: MobileClient, signal: AbortSignal) {
       },
       releaseMetadata
     );
-    // Each subscription is registered before the snapshot it guards is read, so
-    // changes during the read cannot be missed; a reopened one re-reads because
+    // The change stream is registered before either snapshot is read, so changes
+    // during a read cannot be missed; a reopened stream re-reads both because
     // changes may have happened while it was down.
-    Promise.all([
-      watch({
-        signal: controller.signal,
-        open: (attempt) => client.workspace.onMetadata(undefined, { signal: attempt.signal }),
-        onOpen: () => {
-          heldMetadata = [];
-          refreshWorkspaces();
-        },
-        onEvent: (event) => (heldMetadata ? heldMetadata.push(event) : applyMetadata(event)),
-      }),
-      watch({
-        signal: controller.signal,
-        open: (attempt) => client.config.onConfigChanged(undefined, { signal: attempt.signal }),
-        onOpen: refreshProjects,
-        onEvent: refreshProjects,
-      }),
-    ]).catch(() => {
-      // Only a rejected credential ends the watches; everything else retries.
+    watchServerChanges(client, {
+      signal: controller.signal,
+      onOpen: () => {
+        heldMetadata = [];
+        refreshWorkspaces();
+        refreshProjects();
+      },
+      onEvent: (event) => {
+        if (event.type === "config") refreshProjects();
+        else if (event.type === "metadata")
+          if (heldMetadata) heldMetadata.push(event);
+          else applyMetadata(event);
+      },
+    }).catch(() => {
+      // Only a rejected credential ends the stream; everything else retries.
       if (controller.signal.aborted) return;
       setError("The server rejected this session. Retry to reconnect or sign in again.");
       setLoading(false);

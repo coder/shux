@@ -11,6 +11,7 @@ import type {
   MemoryChangeEventPayload,
   MemoryConsolidationStatusChangeEventPayload,
 } from "@/common/orpc/schemas/memory";
+import type { ServerChangeEvent } from "@/common/orpc/schemas/api";
 import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import type { TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
 import type { DevToolsEvent } from "@/common/types/devtools";
@@ -303,6 +304,29 @@ export function subscribeWorkspaceChat(
       );
       replayRelay.finishReplay();
       session.scheduleStartupRecovery();
+    },
+  });
+}
+
+/** Fan-in of the change sources a thin HTTP client would otherwise stream separately. */
+export function subscribeServerChanges(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<ServerChangeEvent> {
+  return runtimeSubscription<ServerChangeEvent>(context, {
+    signal,
+    subscribe: (emit) => {
+      const onMetadata = (event: MetadataEvent) => emit.push({ type: "metadata", ...event });
+      context.workspaceService.on("metadata", onMetadata);
+      const unsubscribe = [
+        context.config.onConfigChanged(() => emit.push({ type: "config" })),
+        context.providerService.onConfigChanged(() => emit.push({ type: "providers" })),
+        context.policyService.onPolicyChanged(() => emit.push({ type: "policy" })),
+        () => context.workspaceService.off("metadata", onMetadata),
+      ];
+      return () => {
+        for (const dispose of unsubscribe) dispose();
+      };
     },
   });
 }

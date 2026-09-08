@@ -19,6 +19,13 @@ export function createPreviewServer(options: PreviewOptions) {
   // Subscriptions are long-lived streamed responses; the server's keep-alive comments
   // arrive well within this idle bound, so only a dead upstream trips it.
   const proxy = httpProxy.createProxyServer({ changeOrigin: true, proxyTimeout: 30_000 });
+  proxy.on("proxyRes", (proxyRes, _req, res) => {
+    // http-proxy leaves the browser's streamed response open when the upstream dies
+    // mid-stream; the client must see the drop to reconnect.
+    proxyRes.once("close", () => {
+      if (!res.writableEnded) res.destroy();
+    });
+  });
   const allowed = (req: http.IncomingMessage) =>
     req.headers.host === origin.host &&
     (!req.headers.origin || req.headers.origin === origin.origin) &&
