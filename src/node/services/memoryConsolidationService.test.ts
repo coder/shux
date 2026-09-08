@@ -36,6 +36,7 @@ import { MemoryService } from "./memoryService";
 import { SessionUsageService } from "./sessionUsageService";
 import { TestTempDir } from "./tools/testHelpers";
 import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 /**
  * Behavior under test: the orchestration rails around the runner —
@@ -1273,6 +1274,54 @@ describe("MemoryConsolidationService", () => {
     await save({ ...base, status: "completed", completedAt: Date.now(), acceptedCandidates: 1 });
     await fixture.service.finalizeHarvestsForRemoval("ws-sub");
     expect((await latest())?.status).toBe("completed");
+  });
+
+  it("serializes sidecar harvest writes with other backends through the cross-process lock", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+    await fsPromises.writeFile(
+      sidecarPath,
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [metadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: metadata.summaryMessageId,
+              compactionEpoch: metadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: metadata,
+            },
+          },
+        },
+      })
+    );
+    // Another backend mid read-modify-write: it holds the sidecar's file lock
+    // (the in-process MutexMap cannot see it), so this finalization must wait.
+    const foreignHold = await acquireProcessFileLock({
+      lockPath: `${sidecarPath}.lock`,
+      timeoutMs: 1_000,
+      label: "test foreign backend",
+    });
+    let finalized = false;
+    const finalizing = fixture.service.finalizeHarvestsForRemoval("ws-sub").then(() => {
+      finalized = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(finalized).toBe(false);
+    expect((await fixture.service.getStatus("ws-sub")).latestHarvestRecord?.attemptCount).toBe(1);
+    await foreignHold[Symbol.asyncDispose]();
+    await finalizing;
+    expect((await fixture.service.getStatus("ws-sub")).latestHarvestRecord?.attemptCount).toBe(
+      HARVEST_MAX_ATTEMPTS
+    );
   });
 
   it("normalizes stale max-attempt pending harvest records to failed", async () => {

@@ -36,6 +36,7 @@ import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { PTCExecutionResult } from "@/node/services/ptc/types";
 import { sandboxHostService, type SandboxMount } from "@/node/services/sandbox/sandboxHostService";
 import { createRefinementRollbackTool } from "@/node/services/tools/refinement_rollback";
+import { READ_ONLY_ACCESS } from "@/node/services/tools/memory";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import type { MemoryScopeAccess } from "@/common/constants/memory";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
@@ -338,8 +339,19 @@ export async function applyToolPolicyAndExperiments(
         // disables the tool, e.g. a broad regex disable rule) must not gain a
         // harness-rollback surface. Unlike code_execution in exclusive mode,
         // rollback is never mandatory, so policy may freely remove it.
+        // A memory-row rollback is a memory WRITE. When policy or grants deny
+        // the memory tool itself (checked on the grant-and-policy-filtered base
+        // set: in PTC mode the tool may be bridged rather than model-visible),
+        // rollback must not become a side door into the (shared) notebook —
+        // hand it a view-only policy so every memory row is refused, exactly
+        // as an explore-like agent's would be.
+        const memoryToolAvailable = policyFilteredTools.memory !== undefined;
         let rollback: Record<string, Tool> = {
-          refinement_rollback: createRefinementRollbackTool(sandbox),
+          refinement_rollback: createRefinementRollbackTool(
+            sandbox.memory === undefined || memoryToolAvailable
+              ? sandbox
+              : { ...sandbox, memory: { ...sandbox.memory, access: READ_ONLY_ACCESS } }
+          ),
         };
         rollback = applyToolPolicy(rollback, effectiveToolPolicy);
         if (opts.capabilityGrants) {

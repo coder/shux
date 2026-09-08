@@ -14,7 +14,7 @@ import {
 } from "@/node/services/memoryService";
 
 /** Safe default: without an explicit policy, every scope is read-only. */
-const READ_ONLY_ACCESS: MemoryScopeAccess = {
+export const READ_ONLY_ACCESS: MemoryScopeAccess = {
   global: "read",
   project: "read",
   workspace: "read",

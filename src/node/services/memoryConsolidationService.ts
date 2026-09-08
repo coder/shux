@@ -58,6 +58,7 @@ import {
 } from "@/node/services/branchSummary";
 import { USAGE_WRITE_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { Err, Ok } from "@/common/types/result";
@@ -287,6 +288,12 @@ function pruneHarvestRecords(records: Record<string, MemoryHarvestRecord>): void
 
 export const HARVEST_MAX_ATTEMPTS = 3;
 
+/**
+ * Bound on waiting for the cross-process sidecar lock; holders only do one
+ * small read-modify-write, so hitting it means another backend is wedged.
+ */
+const MEMORY_CONSOLIDATION_SIDECAR_LOCK_TIMEOUT_MS = 5_000;
+
 /** Completed, or failed with retries exhausted: nothing may retry it. */
 function isTerminalHarvestRecord(record: MemoryHarvestRecord): boolean {
   return (
@@ -310,6 +317,26 @@ export class MemoryConsolidationService extends EventEmitter {
   private readonly sidecarPath: string;
   /** Serializes sidecar read-modify-write cycles (journal persistence only). */
   private readonly locks = new MutexMap<string>();
+
+  /**
+   * Sidecar read-modify-write section. Two legs, like the durable journal's
+   * locks: the in-process MutexMap orders callers on this instance cheaply,
+   * and a cross-process lockfile (`<sidecar>.lock`) excludes OTHER backends
+   * over the same Xum root (multi-instance) — a residual harvest recording in
+   * one process must not read a stale record around another process's
+   * removal finalization, or the terminal-record guard in
+   * saveHarvestRecordEffect would be checked against a stale read.
+   */
+  private withSidecarLock<T>(fn: () => Promise<T>): Promise<T> {
+    return this.locks.withLock(this.sidecarPath, async () => {
+      await using _fileLock = await acquireProcessFileLock({
+        lockPath: `${this.sidecarPath}.lock`,
+        timeoutMs: MEMORY_CONSOLIDATION_SIDECAR_LOCK_TIMEOUT_MS,
+        label: "memory consolidation sidecar",
+      });
+      return await fn();
+    });
+  }
   /**
    * Per-workspace run lock holding the active run's promise. Reserved
    * SYNCHRONOUSLY in maybeRun before any await so two near-simultaneous
@@ -472,7 +499,7 @@ export class MemoryConsolidationService extends EventEmitter {
     return Effect.uninterruptible(
       Effect.gen(function* () {
         yield* Effect.promise(() =>
-          self.locks.withLock(self.sidecarPath, async () => {
+          self.withSidecarLock(async () => {
             const file = await self.load();
             file.workspaces[workspaceId] = record;
             if (projectPath !== "") {
@@ -499,7 +526,7 @@ export class MemoryConsolidationService extends EventEmitter {
     return Effect.uninterruptible(
       Effect.gen(function* () {
         const saved = yield* Effect.promise(() =>
-          self.locks.withLock(self.sidecarPath, async () => {
+          self.withSidecarLock(async () => {
             const file = await self.load();
             file.harvestsByWorkspace[workspaceId] ??= {};
             const existing = file.harvestsByWorkspace[workspaceId][boundaryKey];
@@ -672,7 +699,7 @@ export class MemoryConsolidationService extends EventEmitter {
     // (cancelInFlightConsolidation's drain is bounded) may still be recording
     // outcomes, and a completion landing between an unlocked read and this
     // write must not be overwritten with a failure.
-    const finalized = await this.locks.withLock(this.sidecarPath, async () => {
+    const finalized = await this.withSidecarLock(async () => {
       const file = await this.load();
       const records = file.harvestsByWorkspace[workspaceId];
       if (records === undefined) return false;
