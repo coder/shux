@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test, type Mock } from "bun:test";
 import assert from "@/common/utils/assert";
 import { createMuxMessage, type CompactionFollowUpRequest } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
@@ -11,6 +11,7 @@ const sendOptions = { model: "openai:gpt-4o", agentId: "exec" };
 
 describe("AgentSession correlated compaction handoff", () => {
   let h: AgentSessionHarness;
+  let streamMessage: Mock<AgentSessionHarness["aiService"]["streamMessage"]>;
   afterEach(async () => {
     await h?.session.dispose();
     await h?.cleanup();
@@ -26,6 +27,7 @@ describe("AgentSession correlated compaction handoff", () => {
       workspaceGoalService: options?.workspaceGoalService,
       captureEvents: true,
     });
+    streamMessage = spyOn(h.aiService, "streamMessage");
     const followUp: CompactionFollowUpRequest = {
       text: "Resume captured work",
       ...sendOptions,
@@ -66,10 +68,10 @@ describe("AgentSession correlated compaction handoff", () => {
     try {
       await gate.entered;
       expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
-      expect(h.aiService.streamMessage).not.toHaveBeenCalled();
+      expect(streamMessage).not.toHaveBeenCalled();
       gate.release();
       expect(await dispatch).toBe(true);
-      expect(h.aiService.streamMessage).toHaveBeenCalledTimes(1);
+      expect(streamMessage).toHaveBeenCalledTimes(1);
       expect((await rows()).filter((row) => row.role === "user")).toHaveLength(1);
     } finally {
       gate.release();
@@ -100,7 +102,7 @@ describe("AgentSession correlated compaction handoff", () => {
         }
         gate.release();
         expect(await dispatch).toBe(false);
-        expect(h.aiService.streamMessage).not.toHaveBeenCalled();
+        expect(streamMessage).not.toHaveBeenCalled();
         const history = await rows();
         expect(history).toHaveLength(1);
         expect(history[0].metadata?.muxMetadata).toHaveProperty("pendingFollowUp");
@@ -123,7 +125,7 @@ describe("AgentSession correlated compaction handoff", () => {
         else coordinator.beginShutdown();
         gate.release();
         expect(await dispatch).toBe(false);
-        expect(h.aiService.streamMessage).not.toHaveBeenCalled();
+        expect(streamMessage).not.toHaveBeenCalled();
         const history = await rows();
         expect(history).toHaveLength(1);
         expect(history[0].metadata?.muxMetadata).toEqual({
@@ -168,7 +170,7 @@ describe("AgentSession correlated compaction handoff", () => {
       expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
       await Promise.resolve();
       expect(settled).toBe(false);
-      expect(h.aiService.streamMessage).not.toHaveBeenCalled();
+      expect(streamMessage).not.toHaveBeenCalled();
       expect((await rows()).map((row) => row.id)).toEqual(["summary"]);
       release.resolve();
       expect(await dispatch).toBe(false);
@@ -206,7 +208,7 @@ describe("AgentSession correlated compaction handoff", () => {
       const history = await rows();
       expect(history).toHaveLength(1);
       expect(history[0].metadata?.muxMetadata).not.toHaveProperty("pendingFollowUp");
-      expect(h.aiService.streamMessage).not.toHaveBeenCalled();
+      expect(streamMessage).not.toHaveBeenCalled();
     } finally {
       release.resolve();
       await dispatch;
@@ -243,7 +245,7 @@ describe("AgentSession correlated compaction handoff", () => {
         }
         release.resolve();
         expect(await dispatch).toBe(true);
-        expect(h.aiService.streamMessage).not.toHaveBeenCalled();
+        expect(streamMessage).not.toHaveBeenCalled();
         const history = await rows();
         expect(history).toHaveLength(2);
         expect(history[0].metadata?.muxMetadata).toHaveProperty("pendingFollowUp");
@@ -264,12 +266,12 @@ describe("AgentSession correlated compaction handoff", () => {
 
   test("a real startup error remains a failure after the continuation becomes durable", async () => {
     await setup();
-    spyOn(h.aiService, "streamMessage").mockResolvedValueOnce(
-      Err({ type: "unknown", raw: "startup failed" })
-    );
-    await expect(h.session.dispatchPendingCompactionFollowUpIfNeeded()).rejects.toThrow(
-      "Failed to dispatch pending follow-up"
-    );
+    streamMessage.mockResolvedValueOnce(Err({ type: "unknown", raw: "startup failed" }));
+    const outcome = await h.session
+      .dispatchPendingCompactionFollowUpIfNeeded()
+      .catch((error: unknown) => error);
+    assert(outcome instanceof Error, "Expected a startup rejection");
+    expect(outcome.message).toContain("Failed to dispatch pending follow-up");
     const history = await rows();
     expect(history[0].metadata?.muxMetadata).toHaveProperty("pendingFollowUp");
     expect(history.some((row) => row.role === "user")).toBe(true);

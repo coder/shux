@@ -139,7 +139,8 @@ describe("TurnCoordinator", () => {
   });
 
   test("an existing edit excludes observation and an abandoned handoff cannot admit a turn", () => {
-    const { coordinator, callbacks } = setup();
+    const phaseChanged = mock(() => undefined);
+    const { coordinator } = setup({ phaseChanged });
     const edit = coordinator.reserve("edit");
     expect(coordinator.claimCompactionFollowUp()).toBeUndefined();
     edit[Symbol.dispose]();
@@ -149,7 +150,7 @@ describe("TurnCoordinator", () => {
     coordinator.streamStarted(startEvent("new-stream"));
     coordinator.finishTurn(coordinator.turnId);
     const install = mock(() => undefined);
-    callbacks.phaseChanged.mockClear();
+    phaseChanged.mockClear();
     const result = coordinator.prepare(
       {
         kind: "fresh",
@@ -162,7 +163,7 @@ describe("TurnCoordinator", () => {
     );
     expect(result).toEqual({ status: "rejected", reason: "retired" });
     expect(install).not.toHaveBeenCalled();
-    expect(callbacks.phaseChanged).not.toHaveBeenCalled();
+    expect(phaseChanged).not.toHaveBeenCalled();
     coordinator.finishCompactionFollowUp(token);
   });
 
