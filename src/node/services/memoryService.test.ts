@@ -25,6 +25,7 @@ import {
 } from "@/common/types/refinement";
 import { applyRefinementInverse, readRefinementEvents } from "./refinement/refinementTestHelpers";
 import { rollbackRefinement } from "./refinement/refinementRollback";
+import { migrateSharedMemoryRefinementRows } from "./refinement/sharedMemoryRowMigration";
 import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 import { TestTempDir } from "./tools/testHelpers";
 
@@ -1035,6 +1036,67 @@ describe("MemoryService", () => {
       if (!refused.success) expect(refused.error).toContain("this workspace was removed");
       expect(await pathExists(path.join(ownerSessionDir, "memory", "n.md"))).toBe(true);
       expect(await readRefinementEvents(childSessionDir)).toHaveLength(1);
+    });
+
+    it("migrates a removed sub-agent's live shared-memory rows into the owner's journal, rollbackable there", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      // Shared-store edit (migrates), an edit already rolled back (skipped),
+      // and a global edit (not the owner's store: stays with the child).
+      await fixture.service.create(fixture.ctx, "/memories/workspace/keep.md", "v1", "agent");
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/workspace/keep.md",
+        "v1",
+        "v2",
+        "agent"
+      );
+      await fixture.service.create(fixture.ctx, "/memories/workspace/undone.md", "x", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/g.md", "g", "agent");
+      const childRows = await readRefinementEvents(childSessionDir);
+      const undone = childRows.find(
+        (row) => (row.data.action as { path: string }).path === "/memories/workspace/undone.md"
+      )!;
+      const rolledBack = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        id: undone.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(rolledBack.success).toBe(true);
+
+      expect(
+        await migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        })
+      ).toBe(2);
+      const ownerRows = await readRefinementEvents(ownerSessionDir);
+      expect(
+        ownerRows.map((row) => [
+          (row.data.action as { op: string }).op,
+          (row.data.action as { path: string }).path,
+          (row.data.evidence as { workspaceId: string }).workspaceId,
+        ])
+      ).toEqual([
+        ["create", "/memories/workspace/keep.md", "ws-owner"],
+        ["str_replace", "/memories/workspace/keep.md", "ws-owner"],
+      ]);
+
+      // The child is gone; the owner rolls the edit back from its own journal
+      // (payload blobs were copied, postState hashes preserved).
+      await fsPromises.rm(childSessionDir, { recursive: true, force: true });
+      const keep = path.join(ownerSessionDir, "memory", "keep.md");
+      const undo = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: ownerRows[1].id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(undo.success).toBe(true);
+      expect(await fsPromises.readFile(keep, "utf-8")).toBe("v1");
     });
 
     it("notifyExternalMutation emits one owner-addressed event per touched scope", async () => {

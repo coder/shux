@@ -11,6 +11,7 @@ import {
 import { acquireProcessFileLock, getProcessBirth } from "@/node/utils/concurrency/fileLock";
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
+  historyWriteLockPath,
   isWorkspaceRemovalTombstoned,
   refineApplyLockPath,
   REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS,
@@ -181,6 +182,43 @@ describe("workspaceRemoval", () => {
       )
     ).toBe(true);
   }, 20_000);
+
+  test("sub-agent removal aborts when a failure lands after the target locks but before the tombstone", async () => {
+    using tmp = new DisposableTempDir("workspace-removal-test");
+    const rootDir = path.join(tmp.path, "xum-home");
+    const ownerSessionDir = path.join(rootDir, "sessions", "ws-owner");
+    const childId = "ws-child-history-locked";
+    const childSessionDir = path.join(rootDir, "sessions", childId);
+    await fsPromises.mkdir(path.join(ownerSessionDir, "memory"), { recursive: true });
+    await fsPromises.mkdir(childSessionDir, { recursive: true });
+
+    // Target locks succeed; the history write lock (taken INSIDE them) is
+    // held by a foreign process and times out. The old orphan path would now
+    // publish the tombstone with the owner-store lock already released.
+    const historyLock = await acquireProcessFileLock({
+      lockPath: historyWriteLockPath(rootDir, childId),
+      timeoutMs: 1_000,
+      label: "history write lock (test holder)",
+    });
+    try {
+      let thrown: unknown;
+      try {
+        await removeSessionDirUnderMemoryLocks({
+          rootDir,
+          sessionDir: childSessionDir,
+          workspaceId: childId,
+          attemptId: "test-attempt",
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(SharedMemoryLockUnavailableError);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, childId)).toBe(false);
+    } finally {
+      await historyLock[Symbol.asyncDispose]();
+    }
+  }, 30_000);
 
   test("waits on the refine lock BEFORE taking the teardown target locks (r67)", async () => {
     using tmp = new DisposableTempDir("workspace-removal-test");

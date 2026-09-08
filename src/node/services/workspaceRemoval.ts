@@ -208,7 +208,7 @@ export async function removeSessionDirUnderMemoryLocks(args: {
       })
     );
   };
-  let targetLocksHeld = false;
+  let tombstonePublishedUnderLocks = false;
   try {
     // Refine serialization (r66) — acquired FIRST (r67): a /refine apply in
     // ANOTHER backend is untouched by the remover's process-local
@@ -235,7 +235,6 @@ export async function removeSessionDirUnderMemoryLocks(args: {
       args.rootDir,
       [sessionDirKey, workspaceMemoryKey, sharedMemoryKey, ...ownerMemoryKeys],
       async () => {
-        targetLocksHeld = true;
         // History append serialization (r63): a foreign backend's in-flight
         // stream can be mid-append under the history write lock; acquiring
         // that same (session-dir-external) lock here means the append either
@@ -251,17 +250,19 @@ export async function removeSessionDirUnderMemoryLocks(args: {
         // deleted directory cannot be recreated by a late mutation or
         // journal append.
         await publishTombstone();
+        tombstonePublishedUnderLocks = true;
         await fsPromises.rm(args.sessionDir, { recursive: true, force: true });
       }
     );
   } catch (error) {
     // The orphan path below assumes a wedged writer's target is THIS
     // workspace's retained session dir. A sub-agent's admitted memory write
-    // targets its OWNER's live notebook instead, so if the owner-store lock
-    // could not be taken, publishing the tombstone outside it would let a
-    // holder that already passed its commit check finish after removal.
+    // targets its OWNER's live notebook instead, so unless the tombstone was
+    // already published UNDER the owner-store lock, publishing it outside
+    // (after the lock was released, or never taken) would let a holder that
+    // passed its commit check — or a new writer — finish after removal.
     // Abort instead: the workspace stays registered and removal is retried.
-    if (ownerMemoryKeys.length > 0 && !targetLocksHeld) {
+    if (ownerMemoryKeys.length > 0 && !tombstonePublishedUnderLocks) {
       throw new SharedMemoryLockUnavailableError(args.workspaceId, { cause: error });
     }
     // Fail-closed orphan path (r62): a wedged writer blocks the deletion,

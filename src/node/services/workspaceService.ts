@@ -138,6 +138,7 @@ import {
   TombstoneNotDurableError,
 } from "@/node/services/workspaceRemoval";
 import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
+import { migrateSharedMemoryRefinementRows } from "@/node/services/refinement/sharedMemoryRowMigration";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
@@ -6321,6 +6322,23 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           this.config.loadConfigOrDefault(),
           workspaceId
         );
+        if (memoryOwnerId !== workspaceId) {
+          // The child's memory edits live on in the owner's store; keep their
+          // audit trail / rollback IDs there too before the journal is deleted.
+          try {
+            await migrateSharedMemoryRefinementRows({
+              childSessionDir: sessionDir,
+              ownerSessionDir: path.join(this.config.sessionsDir, memoryOwnerId),
+              ownerWorkspaceId: memoryOwnerId,
+            });
+          } catch (error) {
+            log.warn("Failed to migrate shared-memory refinement rows to the owner", {
+              workspaceId,
+              memoryOwnerId,
+              error: getErrorMessage(error),
+            });
+          }
+        }
         await removeSessionDirUnderMemoryLocks({
           rootDir: this.config.rootDir,
           sessionDir,

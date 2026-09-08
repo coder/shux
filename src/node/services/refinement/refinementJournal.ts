@@ -71,6 +71,12 @@ export interface RefinementEmitArgs {
    */
   postFiles?: RefinementFileCapture[];
   /**
+   * Already-hashed post state, for re-appending an existing row whose
+   * contents are no longer available (shared-memory row migration). Ignored
+   * when `postFiles` is given.
+   */
+  postState?: RefinementPostState;
+  /**
    * "remote" when the mutation ran through a non-local runtime (SSH/Docker).
    * Such rows carry runtime-namespace paths and are refused by rollback,
    * which only applies inverses to the host filesystem.
@@ -255,7 +261,7 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
                 sha256: sha256Hex(file.content),
               })),
             }
-          : undefined;
+          : args.postState;
       await journal.append({
         workspaceId: args.workspaceId,
         kind: "refinement",
