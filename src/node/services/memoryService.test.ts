@@ -1516,7 +1516,7 @@ describe("MemoryService", () => {
       const events: MemoryChangeEvent[] = [];
       fixture.service.on("change", (event: MemoryChangeEvent) => events.push(event));
       const ownerMemory = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
-      await fixture.service.notifyExternalMutation(fixture.ctx, [
+      fixture.service.notifyExternalMutation(fixture.ctx, [
         path.join(ownerMemory, "a.md"),
         path.join(ownerMemory, "dir", "b.md"),
         path.join(fixture.xumHome, "memory", "global", "g.md"),

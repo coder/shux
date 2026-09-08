@@ -1127,12 +1127,12 @@ export class MemoryService extends EventEmitter {
     }
   }
 
-  private async emitChange(
+  private emitChange(
     ctx: MemoryScopeContext,
     scope: MemoryScope,
     relPath: string,
     actor: MemoryActor
-  ): Promise<void> {
+  ): void {
     const event: MemoryChangeEvent = {
       scope,
       path: toVirtualPath(scope, relPath),
@@ -1197,16 +1197,13 @@ export class MemoryService extends EventEmitter {
    * clock is not touched: the rollback engine advanced it under the target
    * lock when it journaled its row (refinementRollback.ts).
    */
-  async notifyExternalMutation(
-    ctx: MemoryScopeContext,
-    physicalPaths: readonly string[]
-  ): Promise<void> {
+  notifyExternalMutation(ctx: MemoryScopeContext, physicalPaths: readonly string[]): void {
     const touched = new Set<MemoryScope>();
     for (const physicalPath of physicalPaths) {
       const scope = this.scopeOfPhysicalPath(ctx, physicalPath);
       if (scope !== null) touched.add(scope);
     }
-    for (const scope of touched) await this.emitChange(ctx, scope, "", "agent");
+    for (const scope of touched) this.emitChange(ctx, scope, "", "agent");
   }
 
   /**
@@ -1248,7 +1245,7 @@ export class MemoryService extends EventEmitter {
         this.advanceStoreRevision(store)
       );
     }
-    await this.emitChange(ctx, scope, parsed.relPath, "user");
+    this.emitChange(ctx, scope, parsed.relPath, "user");
   }
 
   /**
@@ -1376,7 +1373,7 @@ export class MemoryService extends EventEmitter {
           [{ path: store.physicalPath(parsed.relPath), content: fileText }]
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
-        await this.emitChange(ctx, scope, parsed.relPath, actor);
+        this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
           output: `Created ${toVirtualPath(scope, parsed.relPath)}`,
@@ -1421,7 +1418,7 @@ export class MemoryService extends EventEmitter {
           [{ path: store.physicalPath(parsed.relPath), content: updated }]
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
-        await this.emitChange(ctx, scope, parsed.relPath, actor);
+        this.emitChange(ctx, scope, parsed.relPath, actor);
         return { success: true as const, output: `Edited ${toVirtualPath(scope, parsed.relPath)}` };
       });
     });
@@ -1475,7 +1472,7 @@ export class MemoryService extends EventEmitter {
           [{ path: store.physicalPath(parsed.relPath), content: updated }]
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
-        await this.emitChange(ctx, scope, parsed.relPath, actor);
+        this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
           output: `Inserted ${insertedLineCount} line(s) into ${toVirtualPath(scope, parsed.relPath)} after line ${insertLine}`,
@@ -1656,7 +1653,7 @@ export class MemoryService extends EventEmitter {
           );
         }
         await this.recordDelete(ctx, scope, parsed.relPath);
-        await this.emitChange(ctx, scope, parsed.relPath, actor);
+        this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
           output: `Deleted ${toVirtualPath(scope, parsed.relPath)}`,
@@ -1726,8 +1723,8 @@ export class MemoryService extends EventEmitter {
           toolCallId
         );
         await this.recordRename(ctx, scope, oldParsed.relPath, newParsed.relPath);
-        await this.emitChange(ctx, scope, oldParsed.relPath, actor);
-        await this.emitChange(ctx, scope, newParsed.relPath, actor);
+        this.emitChange(ctx, scope, oldParsed.relPath, actor);
+        this.emitChange(ctx, scope, newParsed.relPath, actor);
         return {
           success: true as const,
           output: `Renamed ${toVirtualPath(scope, oldParsed.relPath)} to ${toVirtualPath(scope, newParsed.relPath)}`,
@@ -1863,7 +1860,7 @@ export class MemoryService extends EventEmitter {
           // UI saves are not journaled, so advance the store clock here (in-lock).
           await this.advanceStoreRevision(store);
           await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
-          await this.emitChange(ctx, scope, parsed.relPath, actor);
+          this.emitChange(ctx, scope, parsed.relPath, actor);
           return { success: true as const, data: { sha256: sha256Hex(content) } };
         }
       );
