@@ -27,11 +27,16 @@ import {
 import { log } from "@/node/services/log";
 import { ensureGitInfoExclude } from "@/node/utils/git/ensureGitInfoExclude";
 import { execFileAsync } from "@/node/utils/disposableExec";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 
 const SNAPSHOT_VERSION = 1;
 const SNAPSHOT_DIR_NAME = "archive-state";
+// Kept outside SNAPSHOT_DIR_NAME on purpose: an older build restoring a newer snapshot ignores
+// stagedAttachmentDirs and deletes archive-state, so a sibling directory keeps the only copy of
+// the uploads recoverable across a downgrade instead of destroying it.
+const ATTACHMENTS_DIR_NAME = "archive-attachments";
 const SNAPSHOT_METADATA_FILE_NAME = "metadata.json";
 const NOOP_INIT_LOGGER: InitLogger = {
   logStep: () => undefined,
@@ -255,14 +260,16 @@ export class WorktreeArchiveSnapshotService {
 
     const sessionDir = path.join(this.config.sessionsDir, args.workspaceId);
     const stateDir = path.join(sessionDir, SNAPSHOT_DIR_NAME);
-    const tempStateDir = path.join(
-      sessionDir,
-      `${SNAPSHOT_DIR_NAME}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`
-    );
+    const attachmentsDir = path.join(sessionDir, ATTACHMENTS_DIR_NAME);
+    const tempSuffix = `.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const tempStateDir = path.join(sessionDir, `${SNAPSHOT_DIR_NAME}${tempSuffix}`);
+    const tempAttachmentsDir = path.join(sessionDir, `${ATTACHMENTS_DIR_NAME}${tempSuffix}`);
 
     await fsPromises.mkdir(sessionDir, { recursive: true });
     await fsPromises.rm(tempStateDir, { recursive: true, force: true });
     await fsPromises.mkdir(tempStateDir, { recursive: true });
+    await fsPromises.rm(tempAttachmentsDir, { recursive: true, force: true });
+    await fsPromises.mkdir(tempAttachmentsDir, { recursive: true });
 
     try {
       const projectRepos = getWorkspaceProjectRepos({
@@ -382,7 +389,7 @@ export class WorktreeArchiveSnapshotService {
           workspaceName,
           projectRepo,
           sessionDir,
-          stateDir: tempStateDir,
+          attachmentsDir: tempAttachmentsDir,
         });
 
         projectSnapshots.push({
@@ -412,6 +419,12 @@ export class WorktreeArchiveSnapshotService {
         JSON.stringify(snapshot, null, 2),
         "utf-8"
       );
+      // Attachments land first so the metadata rename (the commit point) never references
+      // artifacts that are not in place yet.
+      await fsPromises.rm(attachmentsDir, { recursive: true, force: true });
+      if (projectSnapshots.some((project) => project.stagedAttachmentDirs != null)) {
+        await fsPromises.rename(tempAttachmentsDir, attachmentsDir);
+      }
       await fsPromises.rm(stateDir, { recursive: true, force: true });
       await fsPromises.rename(tempStateDir, stateDir);
 
@@ -420,6 +433,7 @@ export class WorktreeArchiveSnapshotService {
       return Err(`Failed to capture archive snapshot: ${getErrorMessage(error)}`);
     } finally {
       await fsPromises.rm(tempStateDir, { recursive: true, force: true });
+      await fsPromises.rm(tempAttachmentsDir, { recursive: true, force: true });
     }
   }
 
@@ -474,6 +488,18 @@ export class WorktreeArchiveSnapshotService {
             projectSnapshot: existingProjectSnapshot,
           }))
         ) {
+          // The git checks above say nothing about ignored uploads, so put them back before the
+          // snapshot (and with it their only other copy) is cleared.
+          await this.restoreStagedAttachments({
+            workspaceId: args.workspaceId,
+            projectSnapshot: existingProjectSnapshot,
+            workspacePath: persistedWorkspacePath,
+            runtime: createRuntime(args.workspaceMetadata.runtimeConfig, {
+              projectPath: existingProjectSnapshot.projectPath,
+              workspaceName,
+            }),
+            tolerateMissingArtifacts: true,
+          });
           await this.clearSnapshotState(args.workspaceId, snapshot);
           return Ok("skipped");
         }
@@ -604,6 +630,7 @@ export class WorktreeArchiveSnapshotService {
           projectSnapshot,
           workspacePath: restoreResult.workspacePath,
           runtime,
+          tolerateMissingArtifacts: false,
         });
       }
 
@@ -940,7 +967,7 @@ export class WorktreeArchiveSnapshotService {
     workspaceName: string;
     projectRepo: WorkspaceProjectRepo;
     sessionDir: string;
-    stateDir: string;
+    attachmentsDir: string;
   }): Promise<WorktreeArchiveSnapshotProject["stagedAttachmentDirs"]> {
     const runtime = createRuntime(args.workspaceMetadata.runtimeConfig, {
       projectPath: args.projectRepo.projectPath,
@@ -955,17 +982,19 @@ export class WorktreeArchiveSnapshotService {
     const captured: NonNullable<WorktreeArchiveSnapshotProject["stagedAttachmentDirs"]> = [];
     for (const relativeDir of STAGED_ATTACHMENT_DIRS) {
       const sourceDir = path.join(stagingRoot, relativeDir);
-      if (!(await this.isDirectory(sourceDir))) {
+      if (!(await this.isExistingDirectory(sourceDir))) {
+        continue;
+      }
+      // A repo-controlled symlink (e.g. a tracked `.xum`) can point the staging directory outside
+      // the checkout; whatever lives there is not removed with the worktree, so leave it alone.
+      if (!(await this.realPathIsInsideDir(args.projectRepo.repoCwd, sourceDir))) {
         continue;
       }
       const repoRelativeDir = path.relative(args.projectRepo.repoCwd, sourceDir);
 
-      // Written under the temp state dir, recorded under its final name (like writeArtifact).
-      const artifactRelativeDir = path.join(
-        `${args.projectRepo.storageKey}.attachments`,
-        repoRelativeDir
-      );
-      const artifactDir = path.join(args.stateDir, artifactRelativeDir);
+      // Written under the temp attachments dir, recorded under its final name (like writeArtifact).
+      const artifactRelativeDir = path.join(args.projectRepo.storageKey, repoRelativeDir);
+      const artifactDir = path.join(args.attachmentsDir, artifactRelativeDir);
       assert(
         isPathInsideDir(args.sessionDir, artifactDir),
         `captureStagedAttachments: artifact path escaped session dir (${artifactDir})`
@@ -973,7 +1002,7 @@ export class WorktreeArchiveSnapshotService {
       await fsPromises.cp(sourceDir, artifactDir, { recursive: true });
       captured.push({
         repoRelativeDir,
-        artifactPath: path.join(SNAPSHOT_DIR_NAME, artifactRelativeDir),
+        artifactPath: path.join(ATTACHMENTS_DIR_NAME, artifactRelativeDir),
       });
     }
     return captured.length > 0 ? captured : undefined;
@@ -984,19 +1013,30 @@ export class WorktreeArchiveSnapshotService {
     projectSnapshot: WorktreeArchiveSnapshotProject;
     workspacePath: string;
     runtime: Runtime;
+    /**
+     * A fresh restore has no other copy, so a missing artifact fails it (like the patch
+     * artifacts). Reconciling an existing checkout has nothing left to recover from a missing
+     * artifact, so it skips the entry the same way missing tracked artifacts are treated there.
+     */
+    tolerateMissingArtifacts: boolean;
   }): Promise<void> {
     const sessionDir = path.join(this.config.sessionsDir, args.workspaceId);
     for (const entry of args.projectSnapshot.stagedAttachmentDirs ?? []) {
       const artifactDir = this.resolveSessionRelativePath(sessionDir, entry.artifactPath);
-      if (!(await this.isDirectory(artifactDir))) {
+      if (!(await this.isExistingDirectory(artifactDir))) {
+        if (args.tolerateMissingArtifacts) {
+          continue;
+        }
         throw new Error(
           `Failed to restore ${args.projectSnapshot.projectName}: staged attachments artifact is unavailable.`
         );
       }
-      // repoRelativeDir comes from user-editable config, so keep the copy inside the checkout.
+      // repoRelativeDir comes from user-editable config and its ancestors from the repo, so the
+      // copy target is checked through symlinks, not just lexically.
       const targetDir = path.resolve(args.workspacePath, entry.repoRelativeDir);
       assert(
-        isPathInsideDir(args.workspacePath, targetDir) && targetDir !== args.workspacePath,
+        targetDir !== path.resolve(args.workspacePath) &&
+          (await this.realPathIsInsideDir(args.workspacePath, targetDir)),
         `restoreStagedAttachments: refusing to restore outside ${args.workspacePath}`
       );
       await fsPromises.cp(artifactDir, targetDir, { recursive: true });
@@ -1016,12 +1056,36 @@ export class WorktreeArchiveSnapshotService {
     }
   }
 
-  private async isDirectory(targetPath: string): Promise<boolean> {
+  /** Only genuine absence counts as "not a directory"; other stat failures must abort. */
+  private async isExistingDirectory(targetPath: string): Promise<boolean> {
     try {
       return (await fsPromises.stat(targetPath)).isDirectory();
-    } catch {
-      return false;
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
+        return false;
+      }
+      throw error;
     }
+  }
+
+  /**
+   * Symlink-aware containment: resolves the deepest existing ancestor of targetPath so a link
+   * anywhere above it cannot redirect reads or writes outside rootDir.
+   */
+  private async realPathIsInsideDir(rootDir: string, targetPath: string): Promise<boolean> {
+    let existing = path.resolve(targetPath);
+    while (!(await this.pathExists(existing))) {
+      const parent = path.dirname(existing);
+      if (parent === existing) {
+        return false;
+      }
+      existing = parent;
+    }
+    const realTarget = path.join(
+      await fsPromises.realpath(existing),
+      path.relative(existing, path.resolve(targetPath))
+    );
+    return isPathInsideDir(await fsPromises.realpath(rootDir), realTarget);
   }
 
   private async writeArtifact(args: {
@@ -1050,6 +1114,10 @@ export class WorktreeArchiveSnapshotService {
     const sessionDir = path.join(this.config.sessionsDir, workspaceId);
     const stateDir = this.resolveSessionRelativePath(sessionDir, snapshot.stateDirPath);
     await fsPromises.rm(stateDir, { recursive: true, force: true });
+    await fsPromises.rm(path.join(sessionDir, ATTACHMENTS_DIR_NAME), {
+      recursive: true,
+      force: true,
+    });
 
     await this.config.editConfig((config) => {
       const workspaceEntry = findWorkspaceEntryByIdOrPath(this.config, config, workspaceId);
