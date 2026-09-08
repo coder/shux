@@ -605,7 +605,7 @@ describe("DesktopSessionManager browser viewer releases", () => {
         expect(manager.hasAttachedViewers("child")).toBe(false);
 
         // A closed VNC bridge reports through noteDetached the same way.
-        manager.noteDetached(["isolated"], "isolated");
+        manager.noteDetached("isolated", "isolated");
         expect(manager.hasAttachedViewers("isolated")).toBe(true);
         now += DESKTOP_ATTACHMENT_GRACE_MS;
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
@@ -614,19 +614,40 @@ describe("DesktopSessionManager browser viewer releases", () => {
         // the graces that requester left on itself AND on its owner — whether stamped before
         // the close (an earlier drop) or during it (the bridge closes before the release ACK) —
         // while a grace another requester left on the same owner survives.
-        manager.noteDetached(["child", "owner"], "child");
-        manager.noteDetached(["owner"], "isolated");
+        manager.noteDetached("child", "owner");
+        // Another (already removed, hence unresolvable) borrower's attachment to the owner.
+        manager.noteDetached("former-borrower", "owner");
         const closed = await registerViewer("child");
         const closing = manager.close("child");
         const release: IteratorResult<DesktopViewerEvent> = await closed.watcher.next();
         expect(release.done).toBe(false);
         expect(release.value).toMatchObject({ type: "release" });
-        manager.noteDetached(["child", "owner"], "child");
+        manager.noteDetached("child", "owner");
         if (!release.done && release.value.type === "release") {
           manager.acknowledgeViewerRelease(release.value.viewerId);
         }
         await closing;
         await closed.watcher.return(undefined);
+        expect(manager.hasAttachedViewers("child")).toBe(false);
+        expect(manager.hasAttachedViewers("owner")).toBe(true);
+        now += DESKTOP_ATTACHMENT_GRACE_MS;
+        expect(manager.hasAttachedViewers("owner")).toBe(false);
+
+        // Closing the OWNER retracts the graces of the borrowers it releases (their viewers and
+        // bridges), not only its own — while an unrelated requester's grace on the owner stays.
+        const borrowerViewer = await registerViewer("child");
+        manager.noteDetached("former-borrower", "owner");
+        const ownerClosing = manager.close("owner");
+        const ownerRelease: IteratorResult<DesktopViewerEvent> =
+          await borrowerViewer.watcher.next();
+        expect(ownerRelease.value).toMatchObject({ type: "release" });
+        // The borrower's bridge closes during the owner's teardown.
+        manager.noteDetached("child", "owner");
+        if (!ownerRelease.done && ownerRelease.value.type === "release") {
+          manager.acknowledgeViewerRelease(ownerRelease.value.viewerId);
+        }
+        await ownerClosing;
+        await borrowerViewer.watcher.return(undefined);
         expect(manager.hasAttachedViewers("child")).toBe(false);
         expect(manager.hasAttachedViewers("owner")).toBe(true);
         now += DESKTOP_ATTACHMENT_GRACE_MS;
@@ -714,10 +735,13 @@ describe("DesktopSessionManager browser viewer releases", () => {
           delete child.taskDesktopOwnerWorkspaceId;
           return current;
         });
-        // The old owner is not held indefinitely by the stale registration.
+        // The old owner is not held indefinitely by the stale registration...
         now += DESKTOP_ATTACHMENT_GRACE_MS;
         expect(manager.hasAttachedViewers("owner")).toBe(false);
         expect(manager.hasAttachedViewers("child")).toBe(true);
+        // ...nor by the bridge the rebind revokes (its captured owner is stale too).
+        manager.noteDetached("child", "owner");
+        expect(manager.hasAttachedViewers("owner")).toBe(false);
         // Closing the old owner must not release the viewer that no longer targets it.
         const released: DesktopViewerEvent[] = [];
         const drain = (async () => {

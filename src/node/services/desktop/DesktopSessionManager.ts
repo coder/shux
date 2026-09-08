@@ -68,6 +68,12 @@ export class DesktopSessionManager {
    * other requesters left on the same owner (see noteDetached / retractDetachments).
    */
   private readonly recentDetachments = new Map<string, Map<string, number>>();
+  /**
+   * Closes in flight, keyed by the closing workspace → requesters whose attachments to it
+   * detached during the teardown (borrowers' viewers and bridges when an owner closes). One
+   * entry per close, so overlapping teardowns never share state.
+   */
+  private readonly teardownRequesters = new Map<string, Set<string>>();
   private disposed = false;
   private closeAllPromise: Promise<void> | undefined;
 
@@ -445,23 +451,31 @@ export class DesktopSessionManager {
    * a bounded grace after a KNOWN attachment is the only way an agent-driven archive can tell
    * "reconnecting" from "closed". An idle desktop that never had an attachment gets no grace.
    */
-  noteDetached(detached: Iterable<string>, requesterWorkspaceId: string): void {
+  noteDetached(requesterWorkspaceId: string, capturedOwnerWorkspaceId: string): void {
     assert(requesterWorkspaceId.length > 0, "noteDetached requires the detached requester");
+    assert(capturedOwnerWorkspaceId.length > 0, "noteDetached requires the attachment's owner");
+    // Classify against the requester's CURRENT owner: a bridge revoked because the borrower was
+    // rebound will reconnect to the new owner, so the old one gets no grace from it.
+    const ownerWorkspaceId = this.currentOwnerOf(requesterWorkspaceId, capturedOwnerWorkspaceId);
+    const targets =
+      ownerWorkspaceId === requesterWorkspaceId
+        ? [requesterWorkspaceId]
+        : [requesterWorkspaceId, ownerWorkspaceId];
     const expiresAt = this.now() + DESKTOP_ATTACHMENT_GRACE_MS;
-    for (const workspaceId of detached) {
-      assert(workspaceId.length > 0, "noteDetached requires non-empty workspace IDs");
+    for (const workspaceId of targets) {
       let byRequester = this.recentDetachments.get(workspaceId);
       if (!byRequester) {
         byRequester = new Map();
         this.recentDetachments.set(workspaceId, byRequester);
       }
       byRequester.set(requesterWorkspaceId, expiresAt);
+      this.teardownRequesters.get(workspaceId)?.add(requesterWorkspaceId);
     }
   }
 
   private noteViewerDetached(viewer: DesktopViewerRegistration): void {
     if (viewer.desktopUnavailable === true) return;
-    this.noteDetached(this.viewerTargets(viewer), viewer.workspaceId);
+    this.noteDetached(viewer.workspaceId, viewer.ownerWorkspaceId);
   }
 
   /**
@@ -469,10 +483,10 @@ export class DesktopSessionManager {
    * any more, and every attachment it held as a requester on some owner is gone too. Retract
    * those graces (whenever they were stamped); graces other requesters left stay untouched.
    */
-  private retractDetachments(workspaceId: string): void {
-    this.recentDetachments.delete(workspaceId);
+  private retractDetachments(requesterWorkspaceId: string): void {
+    this.recentDetachments.delete(requesterWorkspaceId);
     for (const [target, byRequester] of this.recentDetachments) {
-      byRequester.delete(workspaceId);
+      byRequester.delete(requesterWorkspaceId);
       if (byRequester.size === 0) this.recentDetachments.delete(target);
     }
   }
@@ -618,6 +632,15 @@ export class DesktopSessionManager {
     // transports that may come back; an explicit close is deterministic, so retract exactly the
     // graces produced by this teardown's own sources afterwards — a borrower closing must not
     // leave its owner "attached", while a grace an unrelated viewer stamped meanwhile survives.
+    // Every requester whose attachment to this workspace is released by the teardown (itself,
+    // its popouts, and — when it is a shared owner — its borrowers' viewers and bridges) is
+    // collected so the finished close can retract their graces definitively.
+    const releasedRequesters = new Set([
+      workspaceId,
+      ...viewers,
+      ...browserViewers.map((viewer) => viewer.workspaceId),
+    ]);
+    this.teardownRequesters.set(workspaceId, releasedRequesters);
     // Latch before entering the async teardown, but leave established bridges alive long enough
     // for borrower viewers to release held keys/buttons on their owner's still-live desktop.
     const closing = Promise.resolve().then(async () => {
@@ -632,8 +655,9 @@ export class DesktopSessionManager {
         for (const listener of this.closeListeners) listener(workspaceId);
       } finally {
         await this.closeSession(workspaceId);
-        // The teardown's own detachments (and any this requester left earlier) are definitive.
-        this.retractDetachments(workspaceId);
+        this.teardownRequesters.delete(workspaceId);
+        // The teardown's detachments (and any these requesters left earlier) are definitive.
+        for (const requester of releasedRequesters) this.retractDetachments(requester);
       }
     });
     this.closingWorkspaces.set(workspaceId, closing);

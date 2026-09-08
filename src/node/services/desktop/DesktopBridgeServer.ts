@@ -546,10 +546,7 @@ export class DesktopBridgeServer {
     // off. A pair that never reached VNC (admission/TCP/revalidation failure) never showed a
     // desktop, so its loss is not evidence of a viewer.
     if (pair.tcp !== null) {
-      this.desktopSessionManager.noteDetached?.(
-        [pair.requesterWorkspaceId, pair.ownerWorkspaceId],
-        pair.requesterWorkspaceId
-      );
+      this.desktopSessionManager.noteDetached?.(pair.requesterWorkspaceId, pair.ownerWorkspaceId);
     }
     if (this.activePairs.size === 0) {
       const stopConfigWatch = this.stopConfigWatch;

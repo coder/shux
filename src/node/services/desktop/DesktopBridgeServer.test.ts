@@ -784,7 +784,7 @@ describe("DesktopBridgeServer", () => {
         ? { ownerWorkspaceId: "owner", sessionId: "owner-session", vncPort: tcpHarness.port }
         : null
     );
-    const noteDetached = mock((_workspaceIds: Iterable<string>, _requester: string) => undefined);
+    const noteDetached = mock((_requester: string, _owner: string) => undefined);
     const bridgeServer = new DesktopBridgeServer({
       desktopTokenManager: tokens,
       desktopSessionManager: {
@@ -817,7 +817,7 @@ describe("DesktopBridgeServer", () => {
       expect(bridgeServer.hasActiveBridge("child")).toBe(false);
       expect(bridgeServer.hasActiveBridge("owner")).toBe(false);
       // The closed bridge hands requester and owner to the manager's bounded attachment grace.
-      expect(noteDetached).toHaveBeenCalledWith(["child", "owner"], "child");
+      expect(noteDetached).toHaveBeenCalledWith("child", "owner");
       expect(getLiveSessionConnection.mock.calls.map((call) => call[0])).toEqual([
         "child",
         "child",
@@ -992,7 +992,7 @@ describe("DesktopBridgeServer", () => {
   });
 
   test("a bridge that never reached VNC leaves no attachment grace", async () => {
-    const noteDetached = mock((_workspaceIds: Iterable<string>, _requester: string) => undefined);
+    const noteDetached = mock((_requester: string, _owner: string) => undefined);
     const bridgeServer = new DesktopBridgeServer({
       desktopTokenManager: {
         validate: () => ({ workspaceId: VALID_WORKSPACE_ID, sessionId: VALID_SESSION_ID }),
