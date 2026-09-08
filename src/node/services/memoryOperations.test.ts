@@ -273,6 +273,15 @@ describe("memory operations", () => {
     expect(await memoryMetaService.getPinnedKeys()).toEqual(new Set());
   });
 
+  // The subscription announces its store-revision baseline once with a
+  // root-addressed workspace refresh (see subscribeMemoryChanges); tests
+  // about forwarded events skip it.
+  const isBaselineRefresh = (event: MemoryChangeEventPayload): boolean =>
+    !("kind" in event) &&
+    event.scope === "workspace" &&
+    event.path === "/memories/workspace" &&
+    event.actor === "agent";
+
   test("onChange streams change events from UI saves", async () => {
     const client = createClient({ enabled: true });
     const controller = new AbortController();
@@ -283,6 +292,7 @@ describe("memory operations", () => {
 
     const firstEvent = (async () => {
       for await (const event of iterator) {
+        if (isBaselineRefresh(event)) continue;
         return event;
       }
       return null;
@@ -436,6 +446,7 @@ describe("memory operations", () => {
     const received: MemoryChangeEventPayload[] = [];
     const consumer = (async () => {
       for await (const event of iterator) {
+        if (isBaselineRefresh(event)) continue;
         received.push(event);
         if (received.length >= 3) break;
       }
@@ -508,6 +519,7 @@ describe("memory operations", () => {
     const received: MemoryChangeEventPayload[] = [];
     const consumer = (async () => {
       for await (const event of iterator) {
+        if (isBaselineRefresh(event)) continue;
         received.push(event);
         break;
       }

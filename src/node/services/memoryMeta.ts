@@ -13,6 +13,7 @@
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { Effect, Schema, Semaphore } from "effect";
 import type { MemoryScope } from "@/common/constants/memory";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -136,6 +137,9 @@ export class MemoryMetaWriteError extends Schema.TaggedError<MemoryMetaWriteErro
   }
 ) {}
 
+/** Bound on waiting for another backend's sidecar read-modify-write (one small file). */
+const MEMORY_META_LOCK_TIMEOUT_MS = 5_000;
+
 export class MemoryMetaService {
   private readonly metaPath: string;
   /**
@@ -145,7 +149,19 @@ export class MemoryMetaService {
    * waiting for the permit never runs its critical section.
    */
   private readonly writeLock = Semaphore.makeUnsafe(1);
+  /**
+   * Parsed sidecar, valid for `cacheStamp` (size + mtime + inode of the
+   * file it was read from). Backends sharing one Xum root
+   * (XUM_ALLOW_MULTIPLE_INSTANCES) each write this file, and a shared
+   * workspace store's cross-process revision token (workspaceMemoryRevision.ts)
+   * makes another backend rebuild its hot set from these pins/usage stats —
+   * a forever-cache would feed it stale metadata and its next mutation would
+   * then rewrite the whole file from that stale copy, discarding the foreign
+   * update. Every load re-stats the file (cheap) and reparses on a changed
+   * stamp; mutations additionally hold a cross-process lockfile.
+   */
   private cache: MemoryMetaFile | null = null;
+  private cacheStamp: string | null = null;
 
   /**
    * Effect-native API. The Promise methods below are thin `Effect.runPromise`
@@ -250,7 +266,8 @@ export class MemoryMetaService {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
-      if (self.cache !== null) return self.cache;
+      const stamp = yield* Effect.promise(() => self.fileStamp());
+      if (self.cache !== null && stamp === self.cacheStamp) return self.cache;
       const parsed = yield* Effect.tryPromise({
         try: async (): Promise<unknown> =>
           JSON.parse(await fsPromises.readFile(self.metaPath, "utf-8")),
@@ -265,12 +282,24 @@ export class MemoryMetaService {
         })
       );
       self.cache = sanitizeMetaFile(parsed);
+      self.cacheStamp = stamp;
       return self.cache;
     });
   }
 
+  /** Cheap change signal for the sidecar (same scheme as Config.configFileStamp). */
+  private async fileStamp(): Promise<string> {
+    try {
+      const st = await fsPromises.stat(this.metaPath, { bigint: true });
+      return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
+    } catch {
+      return "missing";
+    }
+  }
+
   /**
-   * Read-modify-write cycle under the sidecar semaphore. Persists before
+   * Read-modify-write cycle under the sidecar semaphore (in-process) and the
+   * sidecar lockfile (other backends over the same Xum root). Persists before
    * updating the in-memory cache so observers never see state that didn't make
    * it to disk. Entries that end up entirely default are dropped.
    */
@@ -281,6 +310,18 @@ export class MemoryMetaService {
     const self = this;
     return this.writeLock.withPermit(
       Effect.gen(function* () {
+        const fileLock = yield* Effect.tryPromise({
+          try: () =>
+            acquireProcessFileLock({
+              lockPath: `${self.metaPath}.lock`,
+              timeoutMs: MEMORY_META_LOCK_TIMEOUT_MS,
+              label: "memory metadata sidecar",
+            }),
+          catch: (cause) =>
+            new MemoryMetaWriteError({ metaPath: self.metaPath, reason: getErrorMessage(cause) }),
+        });
+        yield* Effect.addFinalizer(() => Effect.promise(() => fileLock[Symbol.asyncDispose]()));
+        // Stamp-validated: sees a foreign backend's write that landed since.
         const meta = yield* self.load();
         const entries = { ...meta.entries };
         update(entries);
@@ -307,9 +348,10 @@ export class MemoryMetaService {
                 }),
             });
             self.cache = next;
+            self.cacheStamp = yield* Effect.promise(() => self.fileStamp());
           })
         );
-      })
+      }).pipe(Effect.scoped)
     );
   }
 

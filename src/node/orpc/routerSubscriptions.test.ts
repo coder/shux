@@ -61,6 +61,16 @@ test("memory subscriptions match workspace-scope events on the shared memory own
   } as unknown as ORPCContext;
   const stream = subscribeMemoryChanges(context, "ws-child", controller.signal);
   try {
+    // Baseline handshake: the store revision is announced once as a
+    // root-addressed refresh so the client's listing catches up with a write
+    // that landed between its initial fetch and this subscription.
+    expect((await stream.next()).value).toEqual({
+      scope: "workspace",
+      path: "/memories/workspace",
+      actor: "agent",
+      workspaceId: "ws-owner",
+      projectPath: "",
+    });
     const first = stream.next();
     // The listener attaches once the generator has started running.
     while (memoryService.listenerCount("change") === 0) {

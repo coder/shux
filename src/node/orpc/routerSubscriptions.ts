@@ -225,16 +225,31 @@ export function subscribeMemoryChanges(
         // failed refresh leaves the old token, costing at most one redundant
         // refresh on the next probe.
         let storeRevision: string | null = null;
-        const refreshStoreRevision = () => {
+        const rootRefresh = (): MemoryChangeEventPayload => ({
+          scope: "workspace",
+          path: toVirtualPath("workspace", ""),
+          actor: "agent",
+          workspaceId: workspaceId
+            ? context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId)
+            : "",
+          projectPath: projectPath ?? "",
+        });
+        const refreshStoreRevision = (options?: { announce: boolean }) => {
           if (!workspaceId) return;
           context.memoryService.workspaceMemoryRevision(workspaceId).then(
             (revision) => {
               storeRevision = revision;
+              if (options?.announce) emit.push(rootRefresh());
             },
             () => undefined
           );
         };
-        refreshStoreRevision();
+        // Baseline handshake: the client's initial listing and this
+        // subscription start independently, so a foreign write landing between
+        // them would be adopted here as the baseline while the listing shows
+        // the old files. Announce the baseline once it is read: the client
+        // refetches, and the listing is then at least as new as the token.
+        refreshStoreRevision({ announce: true });
         const onChange = (event: MemoryChangeEvent) => {
           if (
             event.scope === "workspace" &&
@@ -278,13 +293,7 @@ export function subscribeMemoryChanges(
                 (revision) => {
                   if (revision === storeRevision) return;
                   storeRevision = revision;
-                  emit.push({
-                    scope: "workspace",
-                    path: toVirtualPath("workspace", ""),
-                    actor: "agent",
-                    workspaceId: context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId),
-                    projectPath: projectPath ?? "",
-                  });
+                  emit.push(rootRefresh());
                 },
                 () => undefined
               );

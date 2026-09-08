@@ -64,6 +64,22 @@ describe("MemoryMetaService", () => {
     );
   });
 
+  it("sees another backend's sidecar writes and never overwrites them from a stale cache", async () => {
+    using tempDir = new TestTempDir("test-memory-meta");
+    // Two services over one Xum root stand in for two backend processes
+    // (XUM_ALLOW_MULTIPLE_INSTANCES): neither sees the other's in-memory cache.
+    const a = new MemoryMetaService(tempDir.path);
+    const b = new MemoryMetaService(tempDir.path);
+    await b.getEntries(); // B caches the (empty) sidecar
+    await a.setPinned("workspace:ws-owner:notes.md", true);
+    // B's stamp-validated load picks up A's write...
+    expect(await b.getPinnedKeys()).toEqual(new Set(["workspace:ws-owner:notes.md"]));
+    // ...and B's own mutation starts from the current file, keeping A's pin.
+    await b.recordAccess("global:other.md", { write: false });
+    expect(await a.getPinnedKeys()).toEqual(new Set(["workspace:ws-owner:notes.md"]));
+    expect((await a.getEntries()).has("global:other.md")).toBe(true);
+  });
+
   it("unpinning removes the key", async () => {
     using tempDir = new TestTempDir("test-memory-meta");
     const service = new MemoryMetaService(tempDir.path);
