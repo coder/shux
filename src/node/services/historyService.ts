@@ -3653,6 +3653,12 @@ export class HistoryService {
           const keepTargetMessage = options?.keepTargetMessage === true;
 
           if (messageIndex === -1) {
+            // A protected active target must not redirect an edit/fork to an older duplicate.
+            if (rows.some((row) => row.protectedMessage?.id === messageId)) {
+              return Err(
+                `Message with ID ${messageId} is protected reset evidence in active history`
+              );
+            }
             // Editing/forking from a pre-boundary message: the target lives in the
             // sealed archive. Everything after the cut (the archive tail AND the
             // entire active epoch) is discarded, so collapse the remainder back

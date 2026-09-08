@@ -1212,6 +1212,78 @@ describe("HistoryService", () => {
     );
 
     it.each(
+      ["oversized", "ambiguous"].flatMap((variant) =>
+        [false, true].flatMap((keepTargetMessage) =>
+          ["protected", "readable", "archive"].map((targetKind) => ({
+            variant,
+            keepTargetMessage,
+            targetKind,
+          }))
+        )
+      )
+    )(
+      "truncation keeps protected active identity ($variant, $targetKind, keep=$keepTargetMessage)",
+      async ({ variant, keepTargetMessage, targetKind }) => {
+        const target = row("target");
+        const floor = {
+          ...createMuxMessage(
+            targetKind === "archive" ? "other-protected" : target.id,
+            "assistant",
+            "",
+            variant === "oversized" ? { contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET } : {}
+          ),
+          ...(variant === "oversized" && { padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES) }),
+        };
+        const placeholder = createMuxMessage(target.id, "assistant", "");
+        const fresh = row("fresh");
+        const archive = [row("archive-before"), target, row("archive-after")];
+        const activeTail = [...(targetKind === "readable" ? [placeholder] : []), fresh];
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(archive, [
+          floor,
+          ...activeTail,
+        ]);
+        // Preserve duplicate metadata keys as raw evidence; parsing alone loses the reset.
+        const floorLine = messageLine(ws, floor) + "\n";
+        const rawFloor = Buffer.from(
+          variant === "ambiguous"
+            ? floorLine.replace(
+                '"metadata":',
+                '"metadata":{"contextBoundaryKind":"reset"},"metadata":'
+              )
+            : floorLine
+        );
+        await fs.writeFile(chatPath, Buffer.concat([rawFloor, bytes(activeTail)]));
+        const beforeChat = await fs.readFile(chatPath);
+        const beforeArchive = await fs.readFile(archivePath);
+        const { store, receipt } = await capturePublication();
+        const result = await service.truncateAfterMessage(ws, target.id, { keepTargetMessage });
+
+        expect(result.success).toBe(targetKind !== "protected");
+        if (targetKind === "protected") {
+          expect(await fs.readFile(chatPath)).toEqual(beforeChat);
+          expect(await fs.readFile(archivePath)).toEqual(beforeArchive);
+          expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+          expect(await store.read()).toEqual(receipt);
+        } else {
+          const retainedArchive =
+            targetKind === "archive" ? archive.slice(0, keepTargetMessage ? 2 : 1) : [];
+          const retainedActive =
+            targetKind === "readable" && keepTargetMessage ? [placeholder] : [];
+          expect(await fs.readFile(chatPath)).toEqual(
+            Buffer.concat([bytes(retainedArchive), rawFloor, bytes(retainedActive)])
+          );
+          if (targetKind === "archive") {
+            const archiveStat = await fs.stat(archivePath).catch((error: unknown) => error);
+            expect(archiveStat).toMatchObject({ code: "ENOENT" });
+          } else {
+            expect(await fs.readFile(archivePath)).toEqual(beforeArchive);
+          }
+          expect(await store.captureGeneration()).not.toBe(receipt.publicationGeneration);
+        }
+      }
+    );
+
+    it.each(
       ["single", "batch", "archive"].flatMap((method) => [0, 1].map((extra) => ({ method, extra })))
     )(
       "$method deletion counts JSON bytes without the LF at the reset limit (+$extra)",
