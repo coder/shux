@@ -996,6 +996,10 @@ describe("HistoryService", () => {
   describe("destructive context publication fencing", () => {
     const ws = "context-publication";
     const row = (id: string) => createMuxMessage(id, "user", `Context for ${id}`);
+    const reasoning = (id: string): MuxMessage => ({
+      ...createMuxMessage(id, "assistant", "", { synthetic: true }),
+      parts: [{ type: "reasoning", text: "Provider-visible thinking" }],
+    });
     const display = () =>
       createMuxMessage("display", "user", "Workflow display", {
         muxMetadata: { type: "workflow-trigger-display", rawCommand: "/wf", runId: "run" },
@@ -1118,6 +1122,33 @@ describe("HistoryService", () => {
         rows: [row("old"), row("tail")],
         mutate: () => service.truncateAfterMessage(ws, "tail"),
         expected: ["old"],
+      },
+      {
+        name: "reasoning-only active edit",
+        rows: [row("old"), reasoning("tail")],
+        mutate: () => service.truncateAfterMessage(ws, "tail"),
+        expected: ["old"],
+      },
+      {
+        name: "reasoning-only active prefix",
+        rows: [reasoning("old"), row("tail")],
+        mutate: () => service.truncateHistory(ws, 0.2),
+        expected: ["tail"],
+      },
+      {
+        name: "reasoning-only context-budget rejection",
+        // A quarantined trigger isolates a still-visible owned reasoning prelude on retry.
+        rows: [
+          row("old"),
+          reasoning("prelude"),
+          createContextBudgetRejectedMessage(
+            createMuxMessage("trigger", "user", "Rejected request", {
+              requestPreludeMessageIds: ["prelude"],
+            })
+          ),
+        ],
+        mutate: rejectLatestBudgetRequest,
+        expected: ["old", "prelude", "trigger"],
       },
       {
         name: "archived edit",
@@ -1374,6 +1405,13 @@ describe("HistoryService", () => {
       {
         name: "sealed prefix",
         rows: [row("old"), boundary(), row("tail")],
+        mutate: () => service.truncateHistory(ws, 0.1),
+        expected: ["sealed", "tail"],
+        success: true,
+      },
+      {
+        name: "sealed reasoning-only prefix",
+        rows: [reasoning("old"), boundary(), row("tail")],
         mutate: () => service.truncateHistory(ws, 0.1),
         expected: ["sealed", "tail"],
         success: true,

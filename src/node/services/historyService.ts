@@ -122,7 +122,10 @@ function tailCutChangesProviderContext(removedMessages: MuxMessage[]): boolean {
   // provider view; unreadable reset evidence is preserved outside this parsed tail.
   return (
     removedMessages.some(isDurableContextBoundaryMarker) ||
-    hasProviderEligibleMessages(filterWorkflowDisplayOnlyMessages(removedMessages))
+    // Shared history may be replayed with Anthropic thinking enabled.
+    hasProviderEligibleMessages(filterWorkflowDisplayOnlyMessages(removedMessages), {
+      preserveReasoningOnly: true,
+    })
   );
 }
 
@@ -2879,7 +2882,8 @@ export class HistoryService {
               (row.role === "assistant" && row.metadata?.synthetic === true));
           if (row !== persisted && !ownedPrelude) return row;
           providerContextChanged ||= hasProviderEligibleMessages(
-            filterWorkflowDisplayOnlyMessages([row])
+            filterWorkflowDisplayOnlyMessages([row]),
+            { preserveReasoningOnly: true }
           );
           const marked = createContextBudgetRejectedMessage(row);
           rejected.push(marked);
@@ -3669,7 +3673,8 @@ export class HistoryService {
             removeCount - (messages.length - activeMessages.length)
           );
           const activeContextChanged = hasProviderEligibleMessages(
-            filterWorkflowDisplayOnlyMessages(activeMessages.slice(0, activeRemoveCount))
+            filterWorkflowDisplayOnlyMessages(activeMessages.slice(0, activeRemoveCount)),
+            { preserveReasoningOnly: true }
           );
           const sanitize = activeContextChanged
             ? stripContextUsage
