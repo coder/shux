@@ -94,11 +94,14 @@ export async function publishCompactionFile(
   filePath: string,
   contents: string | Buffer,
   isCurrent: () => boolean,
-  onCommitted?: () => void
+  onCommitted?: () => void,
+  assertStillOwned?: () => Promise<void>
 ): Promise<boolean> {
   const stagedPath = `${filePath}.continuous-${randomUUID()}`;
   try {
     await writeFileAtomic(stagedPath, contents, { mode: 0o600 });
+    // Staging can outlive the lock lease; check ownership after that final I/O.
+    if (assertStillOwned) await assertStillOwned();
     if (!isCurrent()) return false;
     renameSync(stagedPath, filePath);
     try {
@@ -154,11 +157,19 @@ export class ContinuousCompactionJournalStore {
   }
 
   /** Caller already holds the history lock; never re-enter the journal queue here. */
-  async advanceGenerationUnderHistoryLock(): Promise<void> {
-    await writeFileAtomic(
+  async advanceGenerationUnderHistoryLock(
+    onCommitted?: (generation: string) => undefined,
+    assertStillOwned?: () => Promise<void>
+  ): Promise<void> {
+    const generation = randomUUID();
+    await publishCompactionFile(
       path.join(path.dirname(this.path), CONTINUOUS_COMPACTION_GENERATION_FILE),
-      randomUUID(),
-      { mode: 0o600 }
+      generation,
+      () => true,
+      // The cancellation retry must learn its exact frontier at rename, before
+      // cleanup or lock release can fail or admit a foreign generation.
+      () => onCommitted?.(createHash("sha256").update(generation).digest("hex")),
+      assertStillOwned
     );
   }
 

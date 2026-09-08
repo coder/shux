@@ -64,6 +64,230 @@ function reduce(events: CoordinatorEvent[]) {
 }
 
 describe("TurnCoordinator", () => {
+  test.each(["admission", "edit"] as const)(
+    "%s reservations exclude follow-up claims until released",
+    (kind) => {
+      const { coordinator } = setup();
+      const hold = coordinator.reserve(kind);
+      expect(coordinator.claimCompactionFollowUp()).toBeUndefined();
+      hold[Symbol.dispose]();
+      const token = coordinator.claimCompactionFollowUp();
+      assert(token != null, "Expected a claim after the reservation releases");
+      coordinator.finishCompactionFollowUp(token);
+    }
+  );
+
+  test.each([false, true])("edit reservation retires intent only on commit=%s", (committed) => {
+    const { coordinator } = setup();
+    const token = coordinator.claimCompactionFollowUp();
+    assert(token != null, "Expected a follow-up owner before the edit");
+    const edit = coordinator.reserve("edit");
+    expect(coordinator.isCurrentCompactionFollowUp(token)).toBe(false);
+    expect(coordinator.canClearCompactionFollowUp(token)).toBe(false);
+    if (committed) coordinator.retireCompactionFollowUp();
+    edit[Symbol.dispose]();
+    expect(coordinator.midStreamCompactionPending).toBe(true);
+    expect(coordinator.isCurrentCompactionFollowUp(token)).toBe(!committed);
+    expect(coordinator.canClearCompactionFollowUp(token)).toBe(!committed);
+    const admission = coordinator.prepare({
+      kind: "fresh",
+      intent: "direct",
+      expectedTurnId: coordinator.turnId,
+      compactionHandoff: token,
+    });
+    expect(admission.status).toBe(committed ? "rejected" : "admitted");
+    coordinator.finishCompactionFollowUp(token);
+  });
+
+  test("continuation admission keeps only its own source current across a turn change", () => {
+    const { coordinator } = setup();
+    const token = coordinator.claimCompactionFollowUp();
+    assert(token != null, "Expected follow-up owner");
+    expect(coordinator.claimCompactionFollowUp()).toBeUndefined();
+    const previous = coordinator.turnId;
+    const admission = coordinator.prepare({
+      kind: "fresh",
+      intent: "direct",
+      expectedTurnId: previous,
+      compactionHandoff: token,
+    });
+    expect(admission.status).toBe("admitted");
+    expect(coordinator.turnId).not.toBe(previous);
+    expect(coordinator.isCurrentCompactionFollowUp(token)).toBe(true);
+    coordinator.finishTurn(coordinator.turnId);
+    prepare(coordinator);
+    expect(coordinator.isCurrentCompactionFollowUp(token)).toBe(false);
+    expect(coordinator.canClearCompactionFollowUp(token)).toBe(false);
+    coordinator.finishCompactionFollowUp(token);
+  });
+
+  test("a continuation cannot borrow the active edit's reservation to admit itself", () => {
+    const { coordinator } = setup();
+    const token = coordinator.claimCompactionFollowUp();
+    assert(token != null, "Expected a follow-up owner before the edit");
+    using edit = coordinator.reserve("edit");
+    const expectedTurnId = coordinator.turnId;
+    const install = mock(() => undefined);
+    const result = coordinator.prepare(
+      {
+        kind: "fresh",
+        intent: "direct",
+        expectedTurnId,
+        compactionHandoff: token,
+        editReservation: edit.id,
+      },
+      undefined,
+      install
+    );
+    expect(result).toEqual({ status: "deferred", reason: "busy" });
+    expect(coordinator.turnId).toBe(expectedTurnId);
+    expect(install).not.toHaveBeenCalled();
+    coordinator.finishCompactionFollowUp(token);
+  });
+
+  test.each(["abandon", "retire", "finish"] as const)(
+    "%s during PREPARING publication prevents a successful continuation handoff",
+    (action) => {
+      const { coordinator } = setup({
+        phaseChanged: (phase) => {
+          if (phase !== "preparing") return;
+          assert(token != null, "Expected the published follow-up owner");
+          if (action === "abandon") coordinator.abandonCompaction();
+          if (action === "retire") coordinator.retireCompactionFollowUp();
+          if (action === "finish") coordinator.finishCompactionFollowUp(token);
+        },
+      });
+      const token = coordinator.claimCompactionFollowUp();
+      assert(token != null, "Expected a follow-up owner");
+      let installed: TurnId | undefined;
+      try {
+        const result = coordinator.prepare(
+          {
+            kind: "fresh",
+            intent: "direct",
+            expectedTurnId: coordinator.turnId,
+            compactionHandoff: token,
+          },
+          undefined,
+          (turnId) => {
+            installed = turnId;
+          }
+        );
+        expect(result).toEqual({ status: "rejected", reason: "retired" });
+        expect(coordinator.isCurrentCompactionFollowUp(token)).toBe(false);
+        expect(coordinator.midStreamCompactionPending).toBe(action !== "finish");
+      } finally {
+        if (installed != null) coordinator.finishPreparation(installed);
+        coordinator.finishCompactionFollowUp(token);
+      }
+    }
+  );
+
+  test.each(["mutation", "replacement", "abandon", "dispose"] as const)(
+    "%s cannot release a continuation's physical slot or its waiting batch",
+    async (action) => {
+      const { coordinator } = setup();
+      const token = coordinator.claimCompactionFollowUp();
+      assert(token != null, "Expected follow-up owner");
+      let settled = false;
+      const wait = coordinator.waitForMidStreamCompactionSettled().then(() => {
+        settled = true;
+      });
+      if (action === "mutation") coordinator.retireCompactionFollowUp();
+      if (action === "replacement") coordinator.finishTurn(prepare(coordinator));
+      if (action === "abandon") coordinator.abandonCompaction();
+      if (action === "dispose") coordinator.dispose();
+      expect(coordinator.isCurrentCompactionFollowUp(token)).toBe(false);
+      expect(coordinator.canClearCompactionFollowUp(token)).toBe(action === "abandon");
+      expect(coordinator.claimCompactionFollowUp()).toBeUndefined();
+      coordinator.finishCompactionFollowUp(Symbol("not the owner"));
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      coordinator.finishCompactionFollowUp(token);
+      await wait;
+      expect(settled).toBe(true);
+      if (action !== "dispose") {
+        const next = coordinator.claimCompactionFollowUp();
+        assert(next != null, "Expected replacement slot after physical finish");
+        coordinator.finishCompactionFollowUp(token);
+        expect(coordinator.midStreamCompactionPending).toBe(true);
+        coordinator.finishCompactionFollowUp(next);
+      }
+    }
+  );
+
+  test("compaction waiters join both the observation and its pending continuation", async () => {
+    const { coordinator } = setup();
+    const observation = coordinator.beginCompactionObservation("continuous");
+    const followUp = coordinator.claimCompactionFollowUp();
+    assert(observation != null && followUp != null, "Expected both owners");
+    coordinator.setCompactionStage(observation, "stopped");
+    let settled = false;
+    const wait = coordinator.waitForMidStreamCompactionSettled().then(() => {
+      settled = true;
+    });
+    coordinator.finishCompactionObservation(observation);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    coordinator.finishCompactionFollowUp(followUp);
+    await wait;
+    expect(settled).toBe(true);
+  });
+
+  test("Stop cancels the existing handoff but a later claim needs no intervening stream", () => {
+    const phaseChanged = mock(() => undefined);
+    const { coordinator } = setup({ phaseChanged });
+    const token = coordinator.claimCompactionFollowUp();
+    assert(token != null, "Expected follow-up owner before Stop");
+    coordinator.abandonCompaction();
+    const install = mock(() => undefined);
+    phaseChanged.mockClear();
+    const result = coordinator.prepare(
+      {
+        kind: "fresh",
+        intent: "direct",
+        expectedTurnId: coordinator.turnId,
+        compactionHandoff: token,
+      },
+      new AbortController(),
+      install
+    );
+    expect(result).toEqual({ status: "rejected", reason: "retired" });
+    expect(install).not.toHaveBeenCalled();
+    expect(phaseChanged).not.toHaveBeenCalled();
+    coordinator.finishCompactionFollowUp(token);
+    const next = coordinator.claimCompactionFollowUp();
+    assert(next != null, "Expected a new owner after Stop's physical work settles");
+    expect(coordinator.isCurrentCompactionFollowUp(next)).toBe(true);
+    expect(
+      coordinator.prepare({
+        kind: "fresh",
+        intent: "direct",
+        expectedTurnId: coordinator.turnId,
+        compactionHandoff: next,
+      }).status
+    ).toBe("admitted");
+    coordinator.finishCompactionFollowUp(next);
+  });
+
+  test("without a follow-up claim, observation settlement and fresh admission keep their behavior", async () => {
+    const { coordinator } = setup();
+    const observation = coordinator.beginCompactionObservation("continuous");
+    assert(observation != null, "Expected an observation");
+    expect(coordinator.midStreamCompactionPending).toBe(false);
+    coordinator.setCompactionStage(observation, "stopped");
+    expect(coordinator.midStreamCompactionPending).toBe(true);
+    const settled = coordinator.waitForMidStreamCompactionSettled();
+    coordinator.abandonCompaction();
+    coordinator.finishCompactionObservation(observation);
+    await settled;
+    expect(coordinator.midStreamCompactionPending).toBe(false);
+    const turn = prepare(coordinator);
+    expect(coordinator.isCurrentTurn(turn)).toBe(true);
+    coordinator.finishTurn(turn);
+    expect(coordinator.isBusy()).toBe(false);
+  });
+
   test.each(["continuous", "legacy"] as const)(
     "%s observation completion cannot change a replacement or release its waiter",
     async (kind) => {

@@ -166,8 +166,9 @@ describe("AgentSession scoped turn lifetimes", () => {
       release.resolve();
       await Promise.all([send, closing]);
       expect(spyOn(h.aiService, "streamMessage")).not.toHaveBeenCalled();
+      // The joined append is then rolled back: the refused turn leaves no row for startup recovery.
       const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(history.success && history.data.some((message) => message.role === "user")).toBe(true);
+      expect(history).toEqual(Ok([]));
     } finally {
       release.resolve();
       await send;

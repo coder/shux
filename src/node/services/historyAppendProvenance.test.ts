@@ -424,13 +424,15 @@ if (!result.success) throw new Error(result.error);
   });
 
   test("an atomic rollover batch published before a rename error remains accepted once", async () => {
+    // write-file-atomic resolves symlinked temp roots before renaming an existing file.
+    const chatPath = await fs.realpath(store.chatPath);
     const rename = nodeFs.rename;
     let publishedRenames = 0;
     const failed = spyOn(nodeFs, "rename").mockImplementation(
       Object.assign(
         (...[source, target, callback]: Parameters<typeof nodeFs.rename>) => {
           rename(source, target, (error) => {
-            if (!error && target === store.chatPath) {
+            if (!error && target === chatPath) {
               publishedRenames++;
               callback(new Error("post-rename error"));
             } else callback(error);

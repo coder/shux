@@ -8,6 +8,7 @@ import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
 export type TurnId = symbol;
 export type OperationId = symbol;
 export type CompactionToken = symbol;
+export type CompactionFollowUpToken = symbol;
 export type TurnPhase = "idle" | "preparing" | "streaming" | "completing";
 export type StreamErrorRecoveryOutcome = "retry-started" | "terminal";
 export type QueueDrainTrigger = "idle" | "terminal" | "provider-tool" | "send-immediately";
@@ -17,6 +18,7 @@ export type PreparationRequest =
       intent: "direct" | "resume" | "handoff" | QueueDrainTrigger;
       expectedTurnId: TurnId;
       editReservation?: symbol;
+      compactionHandoff?: CompactionFollowUpToken;
     }
   | { kind: "adopt"; turnId: TurnId };
 export type PreparationAdmission =
@@ -37,6 +39,12 @@ interface CompactionIntent {
   readonly abandoned: boolean;
   readonly observation?: CompactionObservation;
   readonly summaryId: string | null;
+  readonly followUp?: {
+    readonly token: CompactionFollowUpToken;
+    readonly turnId: TurnId;
+    readonly retired: boolean;
+    readonly canceled: boolean;
+  };
 }
 
 type Operation = {
@@ -102,6 +110,8 @@ export type CoordinatorEvent =
   | { type: "compaction-finish"; token: CompactionToken }
   | { type: "compaction-abandon" }
   | { type: "compaction-summary"; summaryId: string | null }
+  | { type: "compaction-follow-up" | "compaction-follow-up-finish"; token: CompactionFollowUpToken }
+  | { type: "compaction-follow-up-retire" }
   | { type: "shutdown" | "dispose" };
 
 type CoordinatorCommand =
@@ -188,6 +198,7 @@ export function transition(
   if (
     state.lifetime === "disposed" &&
     event.type !== "compaction-finish" &&
+    event.type !== "compaction-follow-up-finish" &&
     event.type !== "compaction-stage" &&
     event.type !== "compaction-summary"
   )
@@ -210,9 +221,9 @@ export function transition(
       }
       const request = event.request;
       // An edit owns history before PREPARING. Only its exact reservation can claim the
-      // replacement; sharing the idle turn epoch never authorizes a competing send.
+      // replacement, never a compaction handoff; sharing the idle turn epoch is not ownership.
       const editOwner =
-        request.kind === "fresh" && request.intent === "direct"
+        request.kind === "fresh" && request.intent === "direct" && request.compactionHandoff == null
           ? request.editReservation
           : undefined;
       if (hasConflictingEdit(state, editOwner)) {
@@ -243,6 +254,23 @@ export function transition(
         ) {
           admission = { status: "deferred", reason: "busy" };
           break;
+        }
+        const followUp = state.compaction.followUp;
+        if (request.compactionHandoff != null) {
+          if (
+            followUp?.token !== request.compactionHandoff ||
+            followUp.turnId !== state.turn.id ||
+            followUp.retired ||
+            followUp.canceled
+          ) {
+            admission = { status: "rejected", reason: "retired" };
+            break;
+          }
+          // A continuation changes TurnId without retiring its own source or cleanup.
+          next = {
+            ...next,
+            compaction: { ...next.compaction, followUp: { ...followUp, turnId: event.id } },
+          };
         }
         if (current) commands.push({ type: "retire", id: current.id });
         phase({ phase: "preparing", id: event.id });
@@ -410,7 +438,51 @@ export function transition(
         next = { ...state, compaction: { ...state.compaction, observation: undefined } };
       break;
     case "compaction-abandon":
-      next = { ...state, compaction: { ...state.compaction, abandoned: true } };
+      next = {
+        ...state,
+        compaction: {
+          ...state.compaction,
+          abandoned: true,
+          followUp: state.compaction.followUp
+            ? { ...state.compaction.followUp, canceled: true }
+            : undefined,
+        },
+      };
+      break;
+    case "compaction-follow-up":
+      if (
+        state.lifetime === "open" &&
+        !state.compaction.followUp &&
+        !hasConflictingEdit(state) &&
+        !state.reservations.some((entry) => entry.kind === "admission")
+      )
+        next = {
+          ...state,
+          compaction: {
+            ...state.compaction,
+            followUp: {
+              token: event.token,
+              turnId: state.turn.id,
+              retired: false,
+              // Stop cancels its existing owner, not work created after that Stop.
+              canceled: false,
+            },
+          },
+        };
+      break;
+    case "compaction-follow-up-retire":
+      if (state.compaction.followUp)
+        next = {
+          ...state,
+          compaction: {
+            ...state.compaction,
+            followUp: { ...state.compaction.followUp, retired: true },
+          },
+        };
+      break;
+    case "compaction-follow-up-finish":
+      if (state.compaction.followUp?.token === event.token)
+        next = { ...state, compaction: { ...state.compaction, followUp: undefined } };
       break;
     case "compaction-summary":
       next = { ...state, compaction: { ...state.compaction, summaryId: event.summaryId } };
@@ -603,7 +675,7 @@ export class TurnCoordinator {
 
   get midStreamCompactionPending(): boolean {
     const stage = this.state.compaction.observation?.stage;
-    return stage === "stopping" || stage === "stopped";
+    return stage === "stopping" || stage === "stopped" || this.state.compaction.followUp != null;
   }
 
   beginCompactionObservation(kind: CompactionObservation["kind"]): CompactionToken | undefined {
@@ -620,8 +692,51 @@ export class TurnCoordinator {
   finishCompactionObservation(token: CompactionToken): boolean {
     if (this.state.compaction.observation?.token !== token) return false;
     this.dispatch({ type: "compaction-finish", token });
-    for (const resolve of this.compactionWaiters.splice(0)) resolve();
+    this.settleCompactionWaiters();
     return true;
+  }
+
+  // Intentionally not wired into AgentSession yet: activation must handle targeted dispatch
+  // contention, failed-recovery queue ordering, and retirement after committed history changes.
+  claimCompactionFollowUp(): CompactionFollowUpToken | undefined {
+    const token = Symbol("compaction follow-up");
+    this.dispatch({ type: "compaction-follow-up", token });
+    return this.state.compaction.followUp?.token === token ? token : undefined;
+  }
+
+  isCurrentCompactionFollowUp(token: CompactionFollowUpToken): boolean {
+    return (
+      !this.closing &&
+      this.canClearCompactionFollowUp(token) &&
+      this.state.compaction.followUp?.canceled === false
+    );
+  }
+
+  canClearCompactionFollowUp(token: CompactionFollowUpToken): boolean {
+    const followUp = this.state.compaction.followUp;
+    return (
+      followUp?.token === token &&
+      !followUp.retired &&
+      followUp.turnId === this.state.turn.id &&
+      !this.editReserved &&
+      (!this.closing || followUp.canceled)
+    );
+  }
+
+  retireCompactionFollowUp(): void {
+    // A reservation may fail without changing history; only a committed mutation retires intent.
+    this.dispatch({ type: "compaction-follow-up-retire" });
+  }
+
+  finishCompactionFollowUp(token: CompactionFollowUpToken): void {
+    this.dispatch({ type: "compaction-follow-up-finish", token });
+    this.settleCompactionWaiters();
+  }
+
+  private settleCompactionWaiters(): void {
+    // Retired work still serializes dispatch, cleanup and waiters until its physical finally.
+    if (!this.midStreamCompactionPending)
+      for (const resolve of this.compactionWaiters.splice(0)) resolve();
   }
 
   abandonCompaction(): void {
@@ -829,7 +944,12 @@ export class TurnCoordinator {
     // service preflight handoff or dequeue on the strength of that obsolete publication.
     if (
       admission.status === "admitted" &&
-      (!this.isCurrentTurn(id) || this.closing || this.phase !== "preparing")
+      (!this.isCurrentTurn(id) ||
+        this.closing ||
+        this.phase !== "preparing" ||
+        (request.kind === "fresh" &&
+          request.compactionHandoff != null &&
+          !this.isCurrentCompactionFollowUp(request.compactionHandoff)))
     )
       return { status: "rejected", reason: "retired" };
     return admission;
