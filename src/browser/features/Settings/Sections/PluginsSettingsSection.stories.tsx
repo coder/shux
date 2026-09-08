@@ -421,6 +421,38 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
   },
 };
 
+const UPDATE_REVIEW_OPTIONS: MockORPCClientOptions = {
+  agentPlugins: {
+    items: [MANAGED_ITEM],
+    updateChecks: [
+      {
+        name: "grill",
+        status: "update-available",
+        remoteSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
+      },
+    ],
+    updateReview: {
+      name: "grill",
+      fromSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+      toSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
+      version: "1.3.0",
+      changes: [
+        {
+          summary: "changes the model-visible advertisement of skill 'grilling'",
+          before: "Grill the user about a plan or decision.",
+          after:
+            "Grill the user relentlessly about a plan, decision, or idea. Use when the user wants to stress-test their thinking.",
+        },
+        {
+          summary: "adds MCP server 'planner'",
+          after: "node ~/.mux/plugins/grill/server.js --port 0",
+        },
+      ],
+      warnings: [],
+    },
+  },
+};
+
 /**
  * Update → inline capability review. The pending update rewords a skill's
  * model-visible description and adds an MCP server, so Update opens the
@@ -429,39 +461,7 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
  */
 export const UpdateRequiresReview: Story = {
   render: () => (
-    <PluginsSectionStoryShell
-      options={{
-        agentPlugins: {
-          items: [MANAGED_ITEM],
-          updateChecks: [
-            {
-              name: "grill",
-              status: "update-available",
-              remoteSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
-            },
-          ],
-          updateReview: {
-            name: "grill",
-            fromSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-            toSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
-            version: "1.3.0",
-            changes: [
-              {
-                summary: "changes the model-visible advertisement of skill 'grilling'",
-                before: "Grill the user about a plan or decision.",
-                after:
-                  "Grill the user relentlessly about a plan, decision, or idea. Use when the user wants to stress-test their thinking.",
-              },
-              {
-                summary: "adds MCP server 'planner'",
-                after: "node ~/.mux/plugins/grill/server.js --port 0",
-              },
-            ],
-            warnings: [],
-          },
-        },
-      }}
-    >
+    <PluginsSectionStoryShell options={UPDATE_REVIEW_OPTIONS}>
       <PluginsSettingsSection />
     </PluginsSectionStoryShell>
   ),
@@ -474,5 +474,43 @@ export const UpdateRequiresReview: Story = {
     await canvas.findByText("Grill the user about a plan or decision.");
     await canvas.findByText(/adds MCP server 'planner'/);
     await canvas.findByRole("button", { name: /Apply update/ });
+  },
+};
+
+/**
+ * Update review at phone width: long capability summaries, before/after
+ * values, and MCP command lines must wrap inside the card instead of
+ * overflowing its right edge.
+ */
+export const UpdateRequiresReviewPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={UPDATE_REVIEW_OPTIONS}>
+      {/* Fixed phone width so the play's overflow assertion holds in the CI
+          test-runner too, which ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: /^Update$/ }));
+    const applyButton = await canvas.findByRole("button", { name: /Apply update/ });
+    const card = applyButton.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) {
+      throw new Error("Update review card not found");
+    }
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("Update review overflows its card at phone width");
+    }
   },
 };

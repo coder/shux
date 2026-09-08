@@ -1312,7 +1312,9 @@ export class AgentPluginInstallService {
   private async capabilitySurface(
     plugin: AgentPluginInfo,
     instanceId: string,
-    finalTargetPath: string
+    finalTargetPath: string,
+    /** Receives component-loader diagnostics (skills that will not load, mcp.json problems). */
+    warnings: string[]
   ): Promise<{
     hook: AgentPluginPreviewHook | undefined;
     /** serverName → { fingerprint (compared), display (shown in the update review) }. */
@@ -1324,7 +1326,7 @@ export class AgentPluginInstallService {
   }> {
     const hook = this.collectHook(plugin);
     const skills = new Map<string, { fingerprint: string; display: string }>();
-    for (const skill of await this.collectSkills(plugin, [])) {
+    for (const skill of await this.collectSkills(plugin, warnings)) {
       // EVERY model-visible advertisement field: description, whenToUse
       // (both interpolate into the agent_skill_read tool description on each
       // request), and advertise (a flip from hidden to visible surfaces a
@@ -1357,10 +1359,11 @@ export class AgentPluginInstallService {
     ]);
     const servers = new Map<string, { fingerprint: string; display: string }>();
     if (plugin.mcpConfigPath !== undefined) {
-      const { servers: infos } = await loadPluginMcpServers(plugin, {
+      const { servers: infos, diagnostics } = await loadPluginMcpServers(plugin, {
         xumHome: this.config.rootDir,
         instanceId,
       });
+      warnings.push(...diagnostics.map((d) => d.message));
       const normalize = (value: string): string => value.split(plugin.rootPath).join("<plugin>");
       const rewrite = (value: string): string => value.split(plugin.rootPath).join(finalTargetPath);
       for (const info of Object.values(infos)) {
@@ -1399,22 +1402,34 @@ export class AgentPluginInstallService {
    * (conservative: nothing inspectable was consented to at this path).
    * Capability REMOVALS and grant reductions are not changes here: they
    * apply without re-consent.
+   *
+   * `stagedWarnings` receives the staged tree's component-loader diagnostics
+   * (a skill or MCP entry that will stop loading): the review must disclose
+   * them alongside the capability changes, exactly like the install preview
+   * does, or a consent could silently accept a broken component.
    */
   private async collectCapabilityChanges(
     name: string,
     installedPath: string,
-    stagedPlugin: AgentPluginInfo
+    stagedPlugin: AgentPluginInfo,
+    stagedWarnings: string[]
   ): Promise<AgentPluginCapabilityChange[]> {
     const instanceId = this.instanceIdFor(name);
     const { plugin: currentPlugin } = await discoverAgentPluginAt({
       pluginDir: installedPath,
       scope: "global",
     });
-    const staged = await this.capabilitySurface(stagedPlugin, instanceId, installedPath);
+    const staged = await this.capabilitySurface(
+      stagedPlugin,
+      instanceId,
+      installedPath,
+      stagedWarnings
+    );
+    // Diagnostics of the CURRENT tree are not news to the user; discard them.
     const current =
       currentPlugin === null
         ? undefined
-        : await this.capabilitySurface(currentPlugin, instanceId, installedPath);
+        : await this.capabilitySurface(currentPlugin, instanceId, installedPath, []);
 
     const changes: AgentPluginCapabilityChange[] = [];
     const describeGrants = (grants: string[]): string =>
@@ -3754,7 +3769,8 @@ export class AgentPluginInstallService {
         const changes = await this.collectCapabilityChanges(
           entry.name,
           this.targetPathFor(entry.name),
-          plugin
+          plugin,
+          warnings
         );
         return {
           name: entry.name,
@@ -3815,7 +3831,7 @@ export class AgentPluginInstallService {
         // capability surface against the installed tree; changes need a
         // consent from previewUpdate naming this exact (from, to) pair,
         // which the user gave after seeing every change.
-        const changes = await this.collectCapabilityChanges(entry.name, targetPath, plugin);
+        const changes = await this.collectCapabilityChanges(entry.name, targetPath, plugin, []);
         if (changes.length > 0 && args.consent === undefined) {
           throw new Error(
             `The update to '${entry.name}' ${changes.map((change) => change.summary).join("; ")}. Updates cannot expand a plugin's capabilities without review — open Settings → Plugins and review the update to confirm it.`

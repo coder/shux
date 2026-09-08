@@ -744,6 +744,25 @@ describe("AgentPluginInstallService", () => {
     const neutral = await service.previewUpdate({ name: "demo-plugin" });
     expect(neutral.fromSha).toBe(rewordedHead);
     expect(neutral.changes).toEqual([]);
+    expect(neutral.warnings).toEqual([]);
+
+    // Component-loader diagnostics of the STAGED tree ride along with the
+    // review (as in the install preview): an update that adds a skill while
+    // breaking an existing one must not present consent for the addition
+    // and stay silent about the skill that stops loading.
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "greet", "SKILL.md"),
+      "---\nname: mismatched\ndescription: Greets people\n---\n\nSay hi.\n"
+    );
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "extra"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "extra", "SKILL.md"),
+      "---\nname: extra\ndescription: Extra skill\n---\n\nMore.\n"
+    );
+    await commitAll(remoteDir, "adds a skill, breaks greet's frontmatter name");
+    const broken = await service.previewUpdate({ name: "demo-plugin" });
+    expect(broken.changes.map((change) => change.summary)).toEqual(["adds skill 'extra'"]);
+    expect(broken.warnings.some((warning) => warning.startsWith("skills/greet:"))).toBe(true);
   });
 
   test("update accepts an env property reordering as capability-neutral", async () => {
