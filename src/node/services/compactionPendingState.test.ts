@@ -143,18 +143,89 @@ describe("unactivated compaction pending-file protocol", () => {
     expect(await restart().load(() => true)).toBeUndefined();
   });
 
+  it.each(["{", JSON.stringify({ version: 1, createdAt: 1, publicationGeneration: false })])(
+    "heals unusable persisted state (%s)",
+    async (raw) => {
+      await fs.writeFile(filePath, raw);
+      expect(await store.load(() => true)).toBeUndefined();
+      expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+      await prepare("fresh");
+      await boundary("fresh");
+      expect((await store.load(() => true))?.attachments.readFiles).toEqual(["/fresh.ts"]);
+    }
+  );
+
   it.each([
-    "{",
-    JSON.stringify({ version: 2 }),
-    JSON.stringify({ version: 1, createdAt: 1, publicationGeneration: false }),
-  ])("heals unusable persisted state (%s)", async (raw) => {
+    { version: 2, publicationGeneration: "future-generation", ...attachments("future") },
+    { schema: "future", data: { attachments: ["keep"] } },
+  ])("preserves unknown schema bytes across loads and restart (%j)", async (future) => {
+    const raw = JSON.stringify(future, null, 2);
     await fs.writeFile(filePath, raw);
     expect(await store.load(() => true)).toBeUndefined();
-    expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+    expect(await restart().load(() => true)).toBeUndefined();
+    expect(await bytes()).toBe(raw);
     await prepare("fresh");
     await boundary("fresh");
-    expect((await store.load(() => true))?.attachments.readFiles).toEqual(["/fresh.ts"]);
+    expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/fresh.ts"]);
   });
+
+  it.each(["corrupt JSON", "invalid V1", "stale generation"] as const)(
+    "load cleanup failure suppresses unusable attachments and remains retryable (%s)",
+    async (scenario) => {
+      if (scenario === "stale generation") {
+        await prepare("old");
+        await boundary("old");
+        await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+      } else {
+        await fs.writeFile(
+          filePath,
+          scenario === "corrupt JSON" ? "{" : JSON.stringify({ version: 1 })
+        );
+      }
+      const original = await bytes();
+      const unlink = fs.unlink;
+      let failed = false;
+      spyOn(fs, "unlink").mockImplementation((file) => {
+        if (file === filePath && !failed) {
+          failed = true;
+          return Promise.reject(Object.assign(new Error("read-only sidecar"), { code: "EACCES" }));
+        }
+        return unlink(file);
+      });
+      expect(await store.load(() => true)).toBeUndefined();
+      expect(await bytes()).toBe(original);
+      expect(await store.load(() => true)).toBeUndefined();
+      expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+      await prepare("fresh");
+      await boundary("fresh");
+      expect((await store.load(() => true))?.attachments.readFiles).toEqual(["/fresh.ts"]);
+    }
+  );
+
+  it.each(["consume", "rollback"] as const)(
+    "exact cleanup failures remain visible and retryable (%s)",
+    async (operation) => {
+      const receipt = await prepare("pending");
+      const original = await bytes();
+      const unlink = fs.unlink;
+      let failed = false;
+      spyOn(fs, "unlink").mockImplementation((file) => {
+        if (file === filePath && !failed) {
+          failed = true;
+          return Promise.reject(new Error("disk unavailable"));
+        }
+        return unlink(file);
+      });
+      const cleanup = () =>
+        operation === "consume" ? store.consume(receipt) : store.rollback(receipt, () => true);
+      expect(await cleanup().catch((error: unknown) => error)).toMatchObject({
+        message: "disk unavailable",
+      });
+      expect(await bytes()).toBe(original);
+      expect(await cleanup()).toBe(true);
+      expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+    }
+  );
 
   it("does not use provisional attachments before their exact boundary commits", async () => {
     const receipt = await prepare("pending");
@@ -551,6 +622,37 @@ describe("unactivated compaction pending-file protocol", () => {
       );
       if (operation === "discard" && changed)
         expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+    }
+  );
+
+  it.each(["tagged after generation", "untagged before summary"] as const)(
+    "preserves ambiguous legacy bytes until fresh compaction (%s)",
+    async (scenario) => {
+      const tagged = scenario === "tagged after generation";
+      if (tagged) {
+        await boundary("summary");
+        await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+      }
+      const raw = JSON.stringify(
+        {
+          version: 1,
+          createdAt: 1,
+          ...attachments("legacy"),
+          boundaryMessageId: tagged ? "summary" : undefined,
+        },
+        null,
+        2
+      );
+      await fs.writeFile(filePath, raw);
+      if (!tagged) await boundary("summary");
+      expect(await store.load(() => true)).toBeUndefined();
+      expect(await bytes()).toBe(raw);
+      expect(await restart().load(() => true)).toBeUndefined();
+      expect(await bytes()).toBe(raw);
+      await prepare("fresh");
+      expect(await restart().load(() => true)).toBeUndefined();
+      await boundary("fresh");
+      expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/fresh.ts"]);
     }
   );
 

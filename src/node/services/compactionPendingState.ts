@@ -151,9 +151,9 @@ function parseState(value: unknown, allowPrevious = true): PersistedState | unde
   };
 }
 
-function decode(raw: string | undefined): PersistedState | undefined {
+function parseJson(raw: string | undefined): unknown {
   try {
-    return raw === undefined ? undefined : parseState(JSON.parse(raw));
+    return raw === undefined ? undefined : JSON.parse(raw);
   } catch {
     return undefined;
   }
@@ -236,8 +236,13 @@ function eligibleState(
 
 /**
  * Inactive pending-file protocol. CompactionHandler owns local caches/preparation; this owns disk.
- * Failures propagate so callers can distinguish best-effort attachment writes from mandatory
- * reset cleanup. Never call these queued operations from inside a held history lock.
+ * Read-side cleanup is best-effort; mutation failures propagate so callers can distinguish
+ * attachment writes from mandatory reset cleanup.
+ *
+ * `prepare` alone does not atomically publish history. Activation requires caller coordination:
+ * enter the store queue, then hold the shared history locks through preparation, boundary
+ * publication, synchronous receipt delivery, and exact failure cleanup before unlocking.
+ * These standalone queued methods acquire their own locks; never call them inside held locks.
  */
 export class CompactionPendingState {
   private pending: Promise<unknown> = Promise.resolve();
@@ -295,18 +300,23 @@ export class CompactionPendingState {
     return this.enqueue(async (view) => {
       const raw = await this.readBytes();
       if (!isCurrent()) return;
-      const persisted = decode(raw);
+      const parsed = parseJson(raw);
+      // A downgraded reader must leave newer schemas intact for the version that owns them.
+      if (parsed !== undefined && record(parsed)?.version !== 1) return;
+      const persisted = parseState(parsed);
       const state = eligibleState(persisted, view);
       if (state) return this.receipt(state, view.generation);
       // A live writer may still be between pending-file publication and boundary commit.
       // Missing boundary proof suppresses injection; it does not authorize deleting its file.
+      // Preserve ambiguous legacy bytes too; fresh compaction must establish usable ownership.
       if (
         raw !== undefined &&
         (!persisted ||
           (persisted.publicationGeneration !== undefined &&
             persisted.publicationGeneration !== (view.generation ?? null)))
       ) {
-        await fs.unlink(this.filePath);
+        // Attachments are already suppressed; inability to prune them must not block a request.
+        await fs.unlink(this.filePath).catch(() => undefined);
       }
     });
   }
@@ -326,7 +336,7 @@ export class CompactionPendingState {
     return this.enqueue(async (view) => {
       if (!isCurrent() || !(await view.isPublicationCurrent(publication))) return;
       await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-      const previous = eligibleState(decode(await this.readBytes()), view);
+      const previous = eligibleState(parseState(parseJson(await this.readBytes())), view);
       if (!isCurrent()) return;
       const startingBoundary = structuredClone(view.boundary);
       const state = parseState({
@@ -355,7 +365,7 @@ export class CompactionPendingState {
     const expected = this.receipts.get(receipt);
     if (!expected) return Promise.resolve(false);
     return this.enqueue(async () => {
-      const state = decode(await this.readBytes());
+      const state = parseState(parseJson(await this.readBytes()));
       if (!state) return false;
       if (identity(state) === expected.identity) {
         await fs.unlink(this.filePath);
@@ -373,7 +383,7 @@ export class CompactionPendingState {
     const expected = this.receipts.get(receipt);
     if (!expected?.prepared) return Promise.resolve(false);
     return this.enqueue(async (view) => {
-      const state = decode(await this.readBytes());
+      const state = parseState(parseJson(await this.readBytes()));
       if (!state || identity(state) !== expected.identity) return false;
       if (isCurrentState(state, view)) return false;
       // Restoring a committed heartbeat also needs the caller's exact history rollback proof.
@@ -406,7 +416,7 @@ export class CompactionPendingState {
     return this.enqueue(async (view) => {
       const raw = await this.readBytes();
       if (raw === undefined) return;
-      const state = decode(raw);
+      const state = parseState(parseJson(raw));
       if (
         state &&
         (isCurrentState(state, view) ||
