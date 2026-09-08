@@ -252,4 +252,72 @@ describe("exact pending snapshot consumption", () => {
       expect(await restart().peekPendingState()).toBeNull();
     }
   );
+
+  it.each(
+    (["failed append", "contention rollback"] as const).flatMap((outcome) =>
+      (["ack", "discard"] as const).flatMap((action) =>
+        [false, true].map((failedRestore) => ({ outcome, action, failedRestore }))
+      )
+    )
+  )(
+    "request A can $action after heartbeat $outcome (failed rewrite=$failedRestore)",
+    async ({ outcome, action, failedRestore }) => {
+      const consumed = await publish("a");
+      await store.historyService.appendToHistory(workspaceId, readMessage("b"));
+      let restore: ReturnType<typeof spyOn<typeof fs, "mkdir">> | undefined;
+      const mkdir = fs.mkdir;
+      function failRestoreIfRequested() {
+        if (!failedRestore) return;
+        restore = spyOn(fs, "mkdir").mockImplementation((async (
+          ...args: Parameters<typeof fs.mkdir>
+        ) => {
+          if (String(args[0]) === sessionDir) throw new Error("heartbeat restore mkdir failed");
+          return mkdir(...args);
+        }) as typeof fs.mkdir);
+      }
+
+      try {
+        if (outcome === "failed append") {
+          spyOn(store.historyService, "appendToHistory").mockImplementationOnce(() => {
+            // B's provisional file already exists; only its restoration write should fail.
+            failRestoreIfRequested();
+            return Promise.resolve(Err("heartbeat B append failed"));
+          });
+          expect(
+            (
+              await handler.appendHeartbeatContextResetBoundary({
+                boundaryText: "B reset",
+                pendingFollowUp: followUp,
+              })
+            ).success
+          ).toBe(false);
+        } else {
+          const boundary = await handler.appendHeartbeatContextResetBoundary({
+            boundaryText: "B reset",
+            pendingFollowUp: followUp,
+          });
+          assert(boundary.success, "Expected durable B before contention rollback");
+          const rows = await store.historyService.getLastMessages(workspaceId, 1);
+          assert(rows.success, "Expected readable heartbeat boundary");
+          const message = rows.data[0];
+          assert(message?.id === boundary.data.summaryMessageId, "Expected B's durable row");
+          failRestoreIfRequested();
+          expect((await handler.rollbackHeartbeatContextResetBoundary(message)).success).toBe(true);
+          const history = await store.historyService.getLastMessages(workspaceId, 10);
+          assert(history.success, "Expected readable history after rollback");
+          expect(history.data.some((row) => row.id === message.id)).toBe(false);
+        }
+        if (failedRestore) {
+          expect(restore?.mock.calls.some(([dir]) => String(dir) === sessionDir)).toBe(true);
+        }
+      } finally {
+        restore?.mockRestore();
+      }
+      expect((await handler.peekPendingState())?.readFiles).toEqual(["/a.ts"]);
+      if (action === "ack") await handler.ackPendingStateConsumed(consumed);
+      else await handler.discardPendingState("context_exceeded", consumed);
+      expect(await handler.peekPendingState()).toBeNull();
+      expect(await restart().peekPendingState()).toBeNull();
+    }
+  );
 });

@@ -98,6 +98,7 @@ interface PersistedPostCompactionStateV1 {
 }
 
 interface HeartbeatResetRollbackState {
+  owner: symbol;
   postCompactionAttachmentsPending: boolean;
   cachedFileDiffs: FileEditDiff[];
   cachedLoadedSkills: LoadedSkillSnapshot[];
@@ -635,6 +636,7 @@ export class CompactionHandler {
 
   private captureHeartbeatResetRollbackState(): void {
     this.heartbeatResetRollbackState = {
+      owner: this.pendingStateOwner,
       postCompactionAttachmentsPending: this.postCompactionAttachmentsPending,
       cachedFileDiffs: [...this.cachedFileDiffs],
       cachedLoadedSkills: [...this.cachedLoadedSkills],
@@ -649,6 +651,8 @@ export class CompactionHandler {
       return;
     }
 
+    // Keep the original request's authority even if the best-effort restoration write fails.
+    this.pendingStateOwner = rollbackState.owner;
     this.postCompactionAttachmentsPending = rollbackState.postCompactionAttachmentsPending;
     this.cachedFileDiffs = [...rollbackState.cachedFileDiffs];
     this.cachedLoadedSkills = [...rollbackState.cachedLoadedSkills];
@@ -659,7 +663,10 @@ export class CompactionHandler {
       await this.persistPendingStateBestEffort(
         this.cachedFileDiffs,
         this.cachedLoadedSkills,
-        this.cachedReadFilePaths
+        this.cachedReadFilePaths,
+        undefined,
+        undefined,
+        rollbackState.owner
       );
     } else {
       await this.deletePersistedPendingStateBestEffort();
