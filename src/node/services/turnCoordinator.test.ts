@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
+import assert from "@/common/utils/assert";
 import { Effect, Exit, Scope } from "effect";
 import { defaultEffectRunner as runner } from "./di/effectRunner";
 import {
@@ -63,6 +64,82 @@ function reduce(events: CoordinatorEvent[]) {
 }
 
 describe("TurnCoordinator", () => {
+  test.each(["continuous", "legacy"] as const)(
+    "%s observation completion cannot change a replacement or release its waiter",
+    async (kind) => {
+      const { coordinator, callbacks } = setup();
+      const first = coordinator.beginCompactionObservation(kind);
+      assert(first != null, "Expected first observation");
+      expect(coordinator.beginCompactionObservation(kind)).toBeUndefined();
+      coordinator.setCompactionStage(first, "stopping");
+      const firstSettled = coordinator.waitForMidStreamCompactionSettled();
+      expect(coordinator.finishCompactionObservation(first)).toBe(true);
+      const replacement = coordinator.beginCompactionObservation(kind);
+      assert(replacement != null, "Expected replacement observation");
+      coordinator.setCompactionStage(replacement, "stopping");
+      let settled = false;
+      const replacementSettled = coordinator.waitForMidStreamCompactionSettled().then(() => {
+        settled = true;
+      });
+      await firstSettled;
+      coordinator.setCompactionStage(first, "stopped");
+      expect(coordinator.finishCompactionObservation(first)).toBe(false);
+      await Promise.resolve();
+      expect(coordinator.compactionIntent.observation?.stage).toBe("stopping");
+      expect(settled).toBe(false);
+      expect(callbacks.phaseChanged).not.toHaveBeenCalled();
+      expect(callbacks.drainQueue).not.toHaveBeenCalled();
+      coordinator.finishCompactionObservation(replacement);
+      await replacementSettled;
+      expect(settled).toBe(true);
+    }
+  );
+
+  test.each(["abandon", "shutdown", "dispose"] as const)(
+    "%s retains the compaction pending window until its owner finishes",
+    async (action) => {
+      const { coordinator } = setup();
+      const token = coordinator.beginCompactionObservation("continuous");
+      assert(token != null, "Expected observation");
+      coordinator.setCompactionStage(token, "stopping");
+      let settled = false;
+      const wait = coordinator.waitForMidStreamCompactionSettled().then(() => {
+        settled = true;
+      });
+      if (action === "abandon") coordinator.abandonCompaction();
+      else if (action === "shutdown") coordinator.beginShutdown();
+      else coordinator.dispose();
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      expect(coordinator.midStreamCompactionPending).toBe(true);
+      expect(coordinator.beginCompactionObservation("legacy")).toBeUndefined();
+      // Stop may resolve after disposal; it still has to release its own pending window.
+      coordinator.setCompactionStage(token, "stopped");
+      expect(coordinator.finishCompactionObservation(token)).toBe(true);
+      await wait;
+      expect(settled).toBe(true);
+      expect(coordinator.midStreamCompactionPending).toBe(false);
+    }
+  );
+
+  test("compaction bookkeeping preserves admission policy and resets abandonment at stream start", () => {
+    const { coordinator } = setup();
+    coordinator.abandonCompaction();
+    using _admission = coordinator.reserve("admission");
+    using _edit = coordinator.reserve("edit");
+    const token = coordinator.beginCompactionObservation("continuous");
+    assert(token != null, "Observation policy remains with the session");
+    expect(coordinator.compactionIntent.abandoned).toBe(true);
+    coordinator.setCompactionStage(token, "stopped");
+    coordinator.recordCompactionSummary("saved-boundary");
+    coordinator.streamStarted(startEvent("resumed"));
+    expect(coordinator.compactionIntent.abandoned).toBe(false);
+    expect(coordinator.compactionIntent.summaryId).toBe("saved-boundary");
+    expect(coordinator.compactionIntent.observation?.token).toBe(token);
+    expect(coordinator.midStreamCompactionPending).toBe(true);
+    coordinator.finishCompactionObservation(token);
+  });
+
   test("observed terminal publishes before idle/drain and cannot retire a reentrant replacement", () => {
     const order: string[] = [];
     const { coordinator, callbacks } = setup({

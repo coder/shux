@@ -48,6 +48,7 @@ import {
   type TurnId,
   type QueueDrainTrigger,
   type OperationId,
+  type CompactionToken,
   type StreamErrorRecoveryOutcome,
 } from "./turnCoordinator";
 export type { StreamErrorRecoveryOutcome } from "./turnCoordinator";
@@ -872,7 +873,6 @@ export class AgentSession {
     [];
   private readonly coordinator = new TurnCoordinator({
     streamStarted: (payload) => {
-      this.continuousCompactionAbandoned = false;
       this.dispatchingQueuedEntry = false;
       this.dispatchingQueuedEntryMuxMetadata = undefined;
       this.preparingWorkspaceTurnMetadata = undefined;
@@ -972,11 +972,15 @@ export class AgentSession {
   private lastSystemMessageTokens?: number;
 
   /** Prevent duplicate mid-stream compaction interrupts while we are already transitioning. */
-  private midStreamCompactionPending = false;
-  private midStreamCompactionSettledWaiters: Array<() => void> = [];
-  private continuousCompactionAbandoned = false;
-  private continuousCompactionStopped = false;
-  private continuousCompactionObserving = false;
+  private get midStreamCompactionPending(): boolean {
+    return this.coordinator.midStreamCompactionPending;
+  }
+  private get continuousCompactionAbandoned(): boolean {
+    return this.coordinator.compactionIntent.abandoned;
+  }
+  private get continuousCompactionObserving(): boolean {
+    return this.coordinator.compactionIntent.observation?.kind === "continuous";
+  }
   private continuousCompactionObservation: Promise<void> | null = null;
 
   /** Tracks file state for detecting external edits. */
@@ -1120,7 +1124,9 @@ export class AgentSession {
    * dispatch must target it by ID; null for default (RLM-off) compactions so
    * their "last message is the summary" staleness guard stays byte-identical.
    */
-  private pendingCompactionFollowUpSummaryId: string | null = null;
+  private get pendingCompactionFollowUpSummaryId(): string | null {
+    return this.coordinator.compactionIntent.summaryId;
+  }
 
   constructor(options: AgentSessionOptions) {
     assert(options, "AgentSession requires options");
@@ -1184,8 +1190,9 @@ export class AgentSession {
         // follow-up dispatch can target it directly.
         // Reset on every completion: a resumeless continuous fold may precede a
         // legacy compaction whose current follow-up is on its final summary row.
-        this.pendingCompactionFollowUpSummaryId =
-          (metadata.preservedTailMessageCount ?? 0) > 0 ? metadata.summaryMessageId : null;
+        this.coordinator.recordCompactionSummary(
+          (metadata.preservedTailMessageCount ?? 0) > 0 ? metadata.summaryMessageId : null
+        );
         onCompactionComplete?.(metadata);
       },
       onIdleCompactionOutcome,
@@ -6269,7 +6276,7 @@ export class AgentSession {
   }
 
   private async runContinuousCompactionObservation<T>(
-    observe: () => Promise<T>
+    observe: (token: CompactionToken) => Promise<T>
   ): Promise<T | undefined> {
     if (this.coordinator.closing) return undefined;
     // Own the actual apply and its continuation; the compactor separately owns detached eager work.
@@ -6278,14 +6285,15 @@ export class AgentSession {
       await this.continuousCompactionObservation;
       return undefined;
     }
+    const token = this.coordinator.beginCompactionObservation("continuous");
+    if (token == null) return undefined;
     let finish!: () => void;
     const observation = new Promise<void>((resolve) => {
       finish = resolve;
     });
     this.continuousCompactionObservation = observation;
-    this.continuousCompactionObserving = true;
     try {
-      return await observe();
+      return await observe(token);
     } catch (error) {
       await this.recoverContinuousCompactionFailure(error, true);
       return undefined;
@@ -6293,9 +6301,7 @@ export class AgentSession {
       // Reserve through dispatch and cleanup, not just the compactor's apply latch.
       // Waiters/duplicate invalidations never own or clear these flags.
       if (this.continuousCompactionObservation === observation) {
-        this.settleMidStreamCompaction();
-        this.continuousCompactionStopped = false;
-        this.continuousCompactionObserving = false;
+        this.coordinator.finishCompactionObservation(token);
         this.continuousCompactionObservation = null;
         try {
           this.drainQueuedMessagesIfIdle();
@@ -6311,7 +6317,9 @@ export class AgentSession {
     apply: (pendingFollowUp?: CompactionFollowUpRequest) => Promise<boolean>
   ): Promise<boolean> {
     const context = this.activeStreamContext;
+    const observation = this.coordinator.compactionIntent.observation;
     if (
+      observation?.kind !== "continuous" ||
       this.midStreamCompactionPending ||
       !context?.options ||
       this.coordinator.disposed ||
@@ -6319,12 +6327,12 @@ export class AgentSession {
     ) {
       return false;
     }
-    this.midStreamCompactionPending = true;
+    this.coordinator.setCompactionStage(observation.token, "stopping");
     const stopped = await this.streamManager.stopStream(this.workspaceId, {
       abortReason: "system",
     });
     if (!stopped.success) return false;
-    this.continuousCompactionStopped = true;
+    this.coordinator.setCompactionStage(observation.token, "stopped");
     await this.waitForIdle();
     if (
       this.coordinator.disposed ||
@@ -6358,13 +6366,15 @@ export class AgentSession {
 
   private async finishContinuousCompaction(
     applied: boolean,
-    context: NonNullable<AgentSession["activeStreamContext"]>
+    context: NonNullable<AgentSession["activeStreamContext"]>,
+    token: CompactionToken
   ): Promise<void> {
     assert(
       !this.continuousCompactor.isApplying(),
       "Continue must dispatch after the apply latch clears"
     );
-    if (!this.continuousCompactionStopped || !context.options) return;
+    const observation = this.coordinator.compactionIntent.observation;
+    if (observation?.token !== token || observation.stage !== "stopped" || !context.options) return;
     // A consumed journal is an outstanding durable obligation, not a failed
     // speculative summary. Leave it retryable instead of resetting into legacy compaction.
     if (!applied && this.continuousCompactor.hasConsumedSwap()) return;
@@ -6428,7 +6438,7 @@ export class AgentSession {
       () => this.continuousCompactionAbandoned
     );
     if (this.pendingCompactionFollowUpSummaryId === summaryId)
-      this.pendingCompactionFollowUpSummaryId = null;
+      this.coordinator.recordCompactionSummary(null);
   }
 
   private async interruptForCompaction(): Promise<void> {
@@ -6445,7 +6455,9 @@ export class AgentSession {
     const interruptedUserMessageId = this.activeStreamUserMessageId;
     this.continuousCompactor.reset("legacy-fallback");
 
-    this.midStreamCompactionPending = true;
+    const token = this.coordinator.beginCompactionObservation("legacy");
+    if (token == null) return;
+    this.coordinator.setCompactionStage(token, "stopping");
     try {
       const stopResult = await this.streamManager.stopStream(this.workspaceId, {
         abortReason: "system",
@@ -6526,7 +6538,7 @@ export class AgentSession {
         }
       }
     } finally {
-      this.settleMidStreamCompaction();
+      this.coordinator.finishCompactionObservation(token);
       // Preflight drains deferred to this pending compaction have no other retry: if the
       // compaction request never became a turn, release the queue now (no-op when it did).
       this.drainQueuedMessagesIfIdle();
@@ -6561,7 +6573,7 @@ export class AgentSession {
     const interruptedPolicy = this.coordinator.captureInterruptSettlement(options?.soft);
     this.clearContextBudgetState();
     if (options?.abandonPartial || this.midStreamCompactionPending) {
-      this.continuousCompactionAbandoned = true;
+      this.coordinator.abandonCompaction();
       this.continuousCompactor.reset("user-interrupt");
     }
 
@@ -8047,7 +8059,7 @@ export class AgentSession {
         // RLM keep-recent floor: when tail copies were appended the summary is
         // not the last row, so target it by ID (stashed in onCompactionComplete).
         const rlmSummaryId = this.pendingCompactionFollowUpSummaryId;
-        this.pendingCompactionFollowUpSummaryId = null;
+        this.coordinator.recordCompactionSummary(null);
         continuedAfterCompaction = await this.dispatchPendingFollowUp(rlmSummaryId ?? undefined);
         if (
           !this.coordinator.isCurrentTurn(turn) ||
@@ -8286,14 +8298,14 @@ export class AgentSession {
           !this.streamManager.isStreaming(this.workspaceId)
         )
           return;
-        await this.runContinuousCompactionObservation(async () => {
+        await this.runContinuousCompactionObservation(async (token) => {
           const result = await this.continuousCompactor.observe(0, {
             ...this.getContinuousCompactionContext(context.modelString, context.options),
             phase: "mid-stream",
           });
           // The observation's finally settles the pending window only after this dispatches the
           // continuation; settling earlier would let an idle waiter race the follow-up send.
-          await this.finishContinuousCompaction(result === "applied", context);
+          await this.finishContinuousCompaction(result === "applied", context, token);
         });
       } catch (error) {
         await this.recoverContinuousCompactionFailure(error);
@@ -8358,13 +8370,13 @@ export class AgentSession {
       if (continuousContext.enabled || consumedSwapPending) {
         // One usage handler owns the eventual resume; observe itself shares its
         // latch result, which must not dispatch the continuation twice.
-        const observed = await this.runContinuousCompactionObservation(async () => {
+        const observed = await this.runContinuousCompactionObservation(async (token) => {
           const result = await this.continuousCompactor.observe(usagePercent, {
             ...continuousContext,
             phase: "mid-stream",
           });
           if (this.midStreamCompactionPending) {
-            await this.finishContinuousCompaction(result === "applied", streamContext);
+            await this.finishContinuousCompaction(result === "applied", streamContext, token);
             return undefined;
           }
           if (result === "applied") this.clearUsageState();
@@ -8550,13 +8562,7 @@ export class AgentSession {
    * signal rather than the stream lifecycle.
    */
   waitForMidStreamCompactionSettled(): Promise<void> {
-    if (!this.midStreamCompactionPending) return Promise.resolve();
-    return new Promise((resolve) => this.midStreamCompactionSettledWaiters.push(resolve));
-  }
-
-  private settleMidStreamCompaction(): void {
-    this.midStreamCompactionPending = false;
-    for (const resolve of this.midStreamCompactionSettledWaiters.splice(0)) resolve();
+    return this.coordinator.waitForMidStreamCompactionSettled();
   }
 
   /**

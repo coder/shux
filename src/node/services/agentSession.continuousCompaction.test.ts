@@ -24,7 +24,7 @@ import {
   type AgentSessionHarness,
 } from "./agentSession.testHarness";
 import type { ContinuousCompactor } from "./continuousCompactor";
-import type { TurnCoordinator } from "./turnCoordinator";
+import type { CompactionToken, TurnCoordinator } from "./turnCoordinator";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
@@ -35,6 +35,10 @@ const sendOptions: SendMessageOptions = {
 };
 
 interface SessionInternals {
+  coordinator: TurnCoordinator;
+  runContinuousCompactionObservation<T>(
+    observe: (token: CompactionToken) => Promise<T>
+  ): Promise<T | undefined>;
   continuousCompactor: ContinuousCompactor;
   activeStreamContext?: {
     modelString: string;
@@ -43,7 +47,8 @@ interface SessionInternals {
   };
   finishContinuousCompaction: (
     applied: boolean,
-    context: NonNullable<SessionInternals["activeStreamContext"]>
+    context: NonNullable<SessionInternals["activeStreamContext"]>,
+    token: CompactionToken
   ) => Promise<void>;
   interruptForContinuousCompaction: (
     apply: (followUp?: CompactionFollowUpRequest) => Promise<boolean>
@@ -61,9 +66,13 @@ async function applyThenFinish(
   const state = internals(session);
   const context = state.activeStreamContext;
   if (!context) throw new Error("Expected active stream context");
-  const applied = await state.interruptForContinuousCompaction(apply);
-  await state.finishContinuousCompaction(applied, context);
-  return applied;
+  const result = await state.runContinuousCompactionObservation(async (token) => {
+    const applied = await state.interruptForContinuousCompaction(apply);
+    await state.finishContinuousCompaction(applied, context, token);
+    return applied;
+  });
+  assert(result != null, "Expected the observation to complete");
+  return result;
 }
 
 function deferred<T>() {
@@ -367,16 +376,19 @@ describe("AgentSession continuous compaction wiring", () => {
     await h.historyService.writePartial(workspaceId, source);
     streaming = false;
     if (mode === "failed-consumed-apply") {
-      Reflect.set(h.session, "continuousCompactionStopped", true);
+      const { coordinator } = internals(h.session);
+      const token = coordinator.beginCompactionObservation("continuous");
+      assert(token != null, "Expected compaction observation");
+      coordinator.setCompactionStage(token, "stopped");
       const reset = spyOn(compactor, "reset");
-      await internals(h.session).finishContinuousCompaction(false, {
-        modelString: model,
-        options: sendOptions,
-        providersConfig: null,
-      });
+      await internals(h.session).finishContinuousCompaction(
+        false,
+        { modelString: model, options: sendOptions, providersConfig: null },
+        token
+      );
       expect(reset).not.toHaveBeenCalled();
       expect(await store.read()).not.toBeNull();
-      Reflect.set(h.session, "continuousCompactionStopped", false);
+      coordinator.finishCompactionObservation(token);
     }
     if (mode !== "startup") {
       const terminal = Reflect.get(h.session, "observeContinuousCompactionAtStreamEnd") as (
@@ -696,11 +708,8 @@ describe("AgentSession continuous compaction wiring", () => {
     const release = deferred<void>();
     const invoked = deferred<void>();
     const drain = spyOn(h.session, "drainQueuedMessagesIfIdle").mockImplementation(() => undefined);
-    const run = Reflect.get(h.session, "runContinuousCompactionObservation") as (
-      observe: () => Promise<void>
-    ) => Promise<void>;
-    const first = run.call(h.session, async () => {
-      Reflect.set(h.session, "midStreamCompactionPending", true);
+    const first = internals(h.session).runContinuousCompactionObservation(async (token) => {
+      internals(h.session).coordinator.setCompactionStage(token, "stopping");
       await release.promise;
     });
     const observe = spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
@@ -924,6 +933,7 @@ describe("AgentSession continuous compaction wiring", () => {
         ).success
       ).toBe(true);
       const observationFinished = deferred<void>();
+      let observationToken: CompactionToken | undefined;
       if (eventType === "prefix-swap-invalidated") {
         spyOn(h.aiService, "isStreaming").mockReturnValue(true);
         spyOn(h.aiService, "getStreamInfo").mockReturnValue({
@@ -934,7 +944,10 @@ describe("AgentSession continuous compaction wiring", () => {
         spyOn(internals(h.session).continuousCompactor, "waitForIdle").mockReturnValueOnce(
           observationFinished.promise
         );
-        Reflect.set(h.session, "continuousCompactionObserving", true);
+        observationToken = internals(h.session).coordinator.beginCompactionObservation(
+          "continuous"
+        );
+        assert(observationToken != null, "Expected compaction observation");
       }
       h.aiEmitter.emit(eventType, {
         type: eventType,
@@ -944,7 +957,8 @@ describe("AgentSession continuous compaction wiring", () => {
       });
       if (eventType === "prefix-swap-invalidated") {
         expect(order).toEqual([]);
-        Reflect.set(h.session, "continuousCompactionObserving", false);
+        assert(observationToken != null, "Expected compaction observation");
+        internals(h.session).coordinator.finishCompactionObservation(observationToken);
         observationFinished.resolve();
       }
       await resumed.promise;
@@ -1024,6 +1038,71 @@ describe("AgentSession continuous compaction wiring", () => {
     });
     return streamMessage;
   }
+
+  test.each(["dispatch", "cleanup"] as const)(
+    "pending compaction waits and queued input outlast held follow-up %s",
+    async (phase) => {
+      const h = await setup();
+      spyOn(internals(h.session).continuousCompactor, "observe").mockResolvedValue("none");
+      const streamMessage = mockAbortableStream(h);
+      expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
+      const entered = deferred<void>();
+      const release = deferred<void>();
+      const dispatchQueue = spyOn(h.session, "sendQueuedMessages").mockImplementation(
+        () => undefined
+      );
+      const work = applyThenFinish(h.session, async (followUp) => {
+        await appendBoundary(h, followUp);
+        if (phase === "dispatch") {
+          const read = h.historyService.getLastMessages.bind(h.historyService);
+          spyOn(h.historyService, "getLastMessages").mockImplementationOnce(async (...args) => {
+            entered.resolve();
+            await release.promise;
+            return read(...args);
+          });
+        } else {
+          const update = h.historyService.updateHistory.bind(h.historyService);
+          spyOn(h.historyService, "updateHistory").mockImplementationOnce(async (...args) => {
+            entered.resolve();
+            await release.promise;
+            return update(...args);
+          });
+          await h.session.interruptStream({ abandonPartial: true });
+        }
+        return true;
+      });
+      try {
+        await entered.promise;
+        h.session.queueMessage("Queued during follow-up", sendOptions);
+        h.session.drainQueuedMessagesIfIdle();
+        let settled = false;
+        const pending = h.session.waitForMidStreamCompactionSettled().then(() => {
+          settled = true;
+        });
+        await Promise.resolve();
+        expect(settled).toBe(false);
+        expect(dispatchQueue).not.toHaveBeenCalled();
+        expect(h.session.hasActiveOrPendingTurnWork()).toBe(true);
+        expect(streamMessage).toHaveBeenCalledTimes(1);
+        release.resolve();
+        expect(await work).toBe(true);
+        await pending;
+        expect(settled).toBe(true);
+        const history = await rows(h);
+        if (phase === "cleanup") {
+          expect(history[0].metadata?.muxMetadata).not.toHaveProperty("pendingFollowUp");
+          expect(streamMessage).toHaveBeenCalledTimes(1);
+          expect(dispatchQueue).toHaveBeenCalledTimes(1);
+        } else {
+          expect(streamMessage).toHaveBeenCalledTimes(2);
+          expect(history.at(-1)?.parts).toMatchObject([{ type: "text", text: "Continue" }]);
+        }
+      } finally {
+        release.resolve();
+        await work;
+      }
+    }
+  );
 
   test("abandon during fast apply cannot resume the abandoned turn", async () => {
     const h = await setup();

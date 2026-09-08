@@ -1880,7 +1880,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       // Between the stopped stream and its compaction request the coordinator is idle and no
       // stream is running; only the session's pending flag marks the turn work.
       const session = service.getOrCreateSession(workspaceId);
-      Reflect.set(session, "midStreamCompactionPending", true);
+      const { coordinator } = session as unknown as { coordinator: TurnCoordinator };
+      const token = coordinator.beginCompactionObservation("legacy");
+      if (token == null) throw new Error("Expected compaction observation");
+      coordinator.setCompactionStage(token, "stopping");
       internal.scheduleBashMonitorWakeReconcileAfterIdle = afterIdle;
       internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
       internal.sendMessage = sendMessage;
@@ -7503,9 +7506,11 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     const { workspaceService, cleanup } = await createServices();
     const workspaceId = "idle-wait-pending-compaction";
     const session = workspaceService.getOrCreateSession(workspaceId);
-    const settle = Reflect.get(session, "settleMidStreamCompaction") as () => void;
+    const { coordinator } = session as unknown as { coordinator: TurnCoordinator };
+    const token = coordinator.beginCompactionObservation("legacy");
+    if (token == null) throw new Error("Expected compaction observation");
     try {
-      Reflect.set(session, "midStreamCompactionPending", true);
+      coordinator.setCompactionStage(token, "stopping");
       let resolved = false;
       const waitPromise = workspaceService.waitForIdleAndNoQueuedMessages(workspaceId).then(() => {
         resolved = true;
@@ -7514,7 +7519,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       expect(resolved).toBe(false);
 
       // The compaction request never became a turn: no stream event fires, only the window closes.
-      settle.call(session);
+      coordinator.finishCompactionObservation(token);
       await waitPromise;
       expect(resolved).toBe(true);
     } finally {

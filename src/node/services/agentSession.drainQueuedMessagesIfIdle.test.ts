@@ -1,4 +1,5 @@
 import type { TurnCoordinator } from "./turnCoordinator";
+import assert from "@/common/utils/assert";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import * as path from "node:path";
@@ -92,7 +93,9 @@ describe("AgentSession.drainQueuedMessagesIfIdle", () => {
     [
       "a pending mid-stream compaction owns the next dispatch",
       (s) => {
-        s.midStreamCompactionPending = true;
+        const token = s.coordinator.beginCompactionObservation("legacy");
+        assert(token != null, "Expected compaction observation");
+        s.coordinator.setCompactionStage(token, "stopping");
       },
       0,
     ],
