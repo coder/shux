@@ -70,7 +70,12 @@ export class DesktopSessionManager {
    * retract exactly the graces its own teardown produced (see noteDetached / close).
    */
   private readonly recentDetachments = new Map<string, Map<string, number>>();
-  private bridgeDetachmentSink: Set<string> | undefined;
+  /**
+   * While a close() teardown runs, detachments that involve the closing workspace (its own
+   * viewers, its bridges as requester, or every borrower bridge when it is the owner) are
+   * recorded here so the finished teardown can retract exactly those graces.
+   */
+  private teardownSink: { workspaceId: string; sources: Set<string> } | undefined;
   private disposed = false;
   private closeAllPromise: Promise<void> | undefined;
 
@@ -421,15 +426,23 @@ export class DesktopSessionManager {
    * owner is only the fallback when the requester can no longer be resolved.
    */
   private viewerTargets(viewer: DesktopViewerRegistration): string[] {
-    let ownerWorkspaceId = viewer.ownerWorkspaceId;
-    try {
-      ownerWorkspaceId = this.inputCoordinator.resolveTarget(viewer.workspaceId).ownerWorkspaceId;
-    } catch {
-      // Requester removed or unresolvable: fall back to the owner captured at registration.
-    }
+    const ownerWorkspaceId = this.currentOwnerOf(viewer.workspaceId, viewer.ownerWorkspaceId);
     return ownerWorkspaceId === viewer.workspaceId
       ? [viewer.workspaceId]
       : [viewer.workspaceId, ownerWorkspaceId];
+  }
+
+  /**
+   * The desktop owner a requester currently resolves to (viewers and Electron popout windows
+   * alike capture the owner at open time, which goes stale when the binding changes); the
+   * captured owner is the fallback when the requester can no longer be resolved.
+   */
+  private currentOwnerOf(requesterId: string, capturedOwnerId: string): string {
+    try {
+      return this.inputCoordinator.resolveTarget(requesterId).ownerWorkspaceId;
+    } catch {
+      return capturedOwnerId;
+    }
   }
 
   /**
@@ -440,8 +453,9 @@ export class DesktopSessionManager {
    * a bounded grace after a KNOWN attachment is the only way an agent-driven archive can tell
    * "reconnecting" from "closed". An idle desktop that never had an attachment gets no grace.
    */
-  noteDetached(workspaceIds: Iterable<string>, source: string): void {
+  noteDetached(detached: Iterable<string>, source: string): void {
     assert(source.length > 0, "noteDetached requires a detachment source key");
+    const workspaceIds = Array.from(detached);
     const expiresAt = this.now() + DESKTOP_ATTACHMENT_GRACE_MS;
     for (const workspaceId of workspaceIds) {
       assert(workspaceId.length > 0, "noteDetached requires non-empty workspace IDs");
@@ -452,7 +466,8 @@ export class DesktopSessionManager {
       }
       sources.set(source, expiresAt);
     }
-    this.bridgeDetachmentSink?.add(source);
+    const sink = this.teardownSink;
+    if (sink && Array.from(workspaceIds).includes(sink.workspaceId)) sink.sources.add(source);
   }
 
   private noteViewerDetached(viewer: DesktopViewerRegistration): void {
@@ -528,7 +543,9 @@ export class DesktopSessionManager {
         (request) => request.workspaceId === workspaceId || request.ownerWorkspaceId === workspaceId
       ) ||
       Array.from(this.windowOwners).some(
-        ([requesterId, ownerId]) => ownerId === workspaceId && this.getWindow(requesterId) !== null
+        ([requesterId, ownerId]) =>
+          this.currentOwnerOf(requesterId, ownerId) === workspaceId &&
+          this.getWindow(requesterId) !== null
       )
     );
   }
@@ -595,7 +612,10 @@ export class DesktopSessionManager {
     );
     const viewers = new Set([workspaceId]);
     for (const [requesterId, ownerId] of this.windowOwners) {
-      if (requesterId === workspaceId || ownerId === workspaceId) {
+      if (
+        requesterId === workspaceId ||
+        this.currentOwnerOf(requesterId, ownerId) === workspaceId
+      ) {
         viewers.add(requesterId);
         this.windowOwners.delete(requesterId);
       }
@@ -605,12 +625,18 @@ export class DesktopSessionManager {
     // transports that may come back; an explicit close is deterministic, so retract exactly the
     // graces produced by this teardown's own sources afterwards — a borrower closing must not
     // leave its owner "attached", while a grace an unrelated viewer stamped meanwhile survives.
-    const teardownSources = new Set(
-      browserViewers.map((viewer) => viewerGraceSource(viewer.viewerId))
-    );
+    // Armed for the whole teardown: released viewers close their RFB (and thus their bridge)
+    // before acknowledging, so bridge detachments arrive while the releases are still awaited,
+    // not only inside the close listeners.
+    const teardownSink = {
+      workspaceId,
+      sources: new Set(browserViewers.map((viewer) => viewerGraceSource(viewer.viewerId))),
+    };
     // Latch before entering the async teardown, but leave established bridges alive long enough
     // for borrower viewers to release held keys/buttons on their owner's still-live desktop.
     const closing = Promise.resolve().then(async () => {
+      const previousSink = this.teardownSink;
+      this.teardownSink = teardownSink;
       try {
         await Promise.allSettled([
           ...Array.from(
@@ -619,16 +645,11 @@ export class DesktopSessionManager {
           ),
           ...browserViewers.map((viewer) => this.releaseViewer(viewer)),
         ]);
-        // Bridge revocation happens synchronously inside these listeners; collect its sources.
-        this.bridgeDetachmentSink = teardownSources;
-        try {
-          for (const listener of this.closeListeners) listener(workspaceId);
-        } finally {
-          this.bridgeDetachmentSink = undefined;
-        }
+        for (const listener of this.closeListeners) listener(workspaceId);
       } finally {
+        if (this.teardownSink === teardownSink) this.teardownSink = previousSink;
         await this.closeSession(workspaceId);
-        this.retractDetachments(teardownSources);
+        this.retractDetachments(teardownSink.sources);
       }
     });
     this.closingWorkspaces.set(workspaceId, closing);

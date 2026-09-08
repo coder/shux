@@ -622,6 +622,21 @@ describe("DesktopSessionManager browser viewer releases", () => {
         now += DESKTOP_ATTACHMENT_GRACE_MS;
         expect(manager.hasAttachedViewers("owner")).toBe(false);
 
+        // A bridge that closes while the teardown is still awaiting the viewer's release
+        // acknowledgment (the renderer closes RFB before it ACKs) belongs to that teardown too.
+        const acked = new AbortController();
+        const ackedWatcher = manager.watchViewer("child", acked.signal);
+        const ackedReady = (await ackedWatcher.next()).value;
+        expect(ackedReady).toMatchObject({ type: "ready" });
+        const closingAcked = manager.close("child");
+        const release = (await ackedWatcher.next()).value;
+        expect(release).toMatchObject({ type: "release" });
+        manager.noteDetached(["child", "owner"], "bridge:child-pair");
+        if (release.type === "release") manager.acknowledgeViewerRelease(release.viewerId);
+        await closingAcked;
+        await ackedWatcher.return(undefined);
+        expect(manager.hasAttachedViewers("owner")).toBe(false);
+
         // A viewer whose bootstrap reported no desktop leaves no grace when it detaches.
         const unavailable = new AbortController();
         const unavailableWatcher = manager.watchViewer("isolated", unavailable.signal);
@@ -630,6 +645,41 @@ describe("DesktopSessionManager browser viewer releases", () => {
         unavailable.abort();
         await unavailableWatcher.return(undefined);
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
+      } finally {
+        await manager.closeAll();
+      }
+    });
+  });
+
+  test("an Electron popout counts against its requester's current owner", async () => {
+    if (process.platform === "win32") return;
+    await withDesktopManagerHarness(async ({ config }) => {
+      await registerSharedWorkspaces(config);
+      const manager = new DesktopSessionManager({
+        config,
+        experimentsService: createExperimentsService(true),
+        workspaceService: createWorkspaceService(() =>
+          Promise.resolve(createWorkspaceMetadata({ type: "local" }))
+        ),
+      });
+      manager.setDesktopWindowManager(createWindowManager());
+      try {
+        await manager.openWindow("child", "instance-1");
+        expect(manager.hasAttachedViewers("owner")).toBe(true);
+        await config.editConfig((current) => {
+          const project = current.projects.get("/tmp/project-1");
+          if (!project) throw new Error("Missing test project");
+          const child = project.workspaces.find((workspace) => workspace.id === "child");
+          if (!child) throw new Error("Missing child workspace");
+          delete child.taskDesktopOwnerWorkspaceId;
+          return current;
+        });
+        // The window's captured owner is stale: it no longer keeps the old owner attached...
+        expect(manager.hasAttachedViewers("owner")).toBe(false);
+        expect(manager.hasAttachedViewers("child")).toBe(true);
+        // ...and closing the old owner leaves the unrelated popout alone.
+        await manager.close("owner");
+        expect(manager.getWindow("child")).not.toBeNull();
       } finally {
         await manager.closeAll();
       }
