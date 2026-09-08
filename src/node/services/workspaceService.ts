@@ -131,7 +131,7 @@ import {
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
   removeSessionDirUnderMemoryLocks,
-  SharedMemoryLockUnavailableError,
+  SharedMemoryRemovalAbortedError,
   refineApplyLockPath,
   rollbackRemovalTombstoneIfOwned,
   startRemovalTombstoneLease,
@@ -4213,26 +4213,44 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * TurnRequestBuilder → session: the agent's workspace-memory write policy
    * for this turn. Also persisted on the workspace config entry (only when it
    * changes) so a harvest completing in a fresh session after a restart can
-   * still be gated; see onCompactionComplete below.
+   * still be gated; see onCompactionComplete. Awaited by the builder and
+   * VERIFIED by reading the config back: Config swallows write failures, and
+   * a stale persisted `true` would let a now read-only agent's transcript
+   * harvest into the shared notebook after a restart. Resolves false when the
+   * new value could not be confirmed durable.
    */
-  recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): void {
+  async recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): Promise<boolean> {
     (
       this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
     )?.recordWorkspaceMemoryWritable(writable);
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-    if (entry === null || entry.workspace.workspaceMemoryWritable === writable) return;
-    this.config
-      .editConfig((cfg) => {
+    if (entry === null) return false;
+    if (entry.workspace.workspaceMemoryWritable === writable) return true;
+    try {
+      await this.config.editConfig((cfg) => {
         const current = findWorkspaceEntry(cfg, workspaceId);
         if (current !== null) current.workspace.workspaceMemoryWritable = writable;
         return cfg;
-      })
-      .catch((error: unknown) => {
-        log.warn("Failed to persist workspace memory write policy", {
-          workspaceId,
-          error: getErrorMessage(error),
-        });
       });
+    } catch (error: unknown) {
+      log.error("Failed to persist workspace memory write policy", {
+        workspaceId,
+        writable,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
+    const persisted = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+      .workspaceMemoryWritable;
+    if (persisted !== writable) {
+      log.error("Workspace memory write policy did not persist (config write swallowed?)", {
+        workspaceId,
+        writable,
+        persisted,
+      });
+      return false;
+    }
+    return true;
   }
 
   /** Transfer destructive cleanup out of a callback that still owns a session lease. */
@@ -5973,14 +5991,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
 
         // Shared workspace memory (sub-agents write into their task-tree
-        // owner's store): the fallible bookkeeping runs HERE, before any
-        // destructive step, so an abort leaves a fully intact, retryable
-        // workspace rather than a config entry whose checkout is gone.
-        //  - pin the owner on surviving descendants (their parent chain is
-        //    about to lose this node);
-        //  - copy this workspace's live shared-memory refinement rows into
-        //    the owner's journal (the only durable inverse once the session
-        //    dir is deleted).
+        // owner's store): pin the owner on surviving descendants HERE, before
+        // any destructive step — their parent chain is about to lose this
+        // node — so an abort leaves a fully intact, retryable workspace. The
+        // refinement-row handover itself happens under the removal locks
+        // below (the point of no return), where no further child write can
+        // slip past the scan. Idempotent on retry.
         const sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
           this.config.loadConfigOrDefault(),
           workspaceId
@@ -6000,19 +6016,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               }
               return cfg;
             });
-            await migrateSharedMemoryRefinementRows({
-              childSessionDir: path.join(this.config.sessionsDir, workspaceId),
-              childWorkspaceId: workspaceId,
-              ownerSessionDir: path.join(this.config.sessionsDir, sharedMemoryOwnerId),
-              ownerWorkspaceId: sharedMemoryOwnerId,
-            });
           } catch (error) {
             if (!force) {
               return Err(
-                `Failed to hand this sub-agent's shared workspace memory over to its owner (${getErrorMessage(error)}); the workspace was left intact — retry the removal`
+                `Failed to pin the shared memory owner on this sub-agent's descendants (${getErrorMessage(error)}); the workspace was left intact — retry the removal`
               );
             }
-            log.warn("Forced removal: shared-memory handover to the owner failed", {
+            log.warn("Forced removal: could not pin the shared memory owner on descendants", {
               workspaceId,
               sharedMemoryOwnerId,
               error: getErrorMessage(error),
@@ -6402,22 +6412,36 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // from under a live commit.
         // A sub-agent's workspace memory lives in its task-tree owner's
         // session dir; hold that store's lock as well so an admitted child
-        // write cannot slip between this tombstone and its commit check.
-        // (Owner pinning and refinement-row migration ran before runtime
-        // deletion, where an abort still leaves an intact workspace.)
+        // write cannot slip between this tombstone and its commit check, and
+        // copy the child's live shared-memory refinement rows to the owner
+        // inside those locks (the only durable inverse once the session dir
+        // is deleted). Resolved from persisted config, so the phantom
+        // (metadata-less) path is covered too.
         const memoryOwnerId = resolveWorkspaceMemoryOwnerId(
           this.config.loadConfigOrDefault(),
           workspaceId
         );
+        const ownerSessionDir =
+          memoryOwnerId === workspaceId
+            ? undefined
+            : path.join(this.config.sessionsDir, memoryOwnerId);
         await removeSessionDirUnderMemoryLocks({
           rootDir: this.config.rootDir,
           sessionDir,
           workspaceId,
           attemptId: removalAttemptId,
-          sharedWorkspaceMemorySessionDir:
-            memoryOwnerId === workspaceId
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+          beforeTombstone:
+            ownerSessionDir === undefined
               ? undefined
-              : path.join(this.config.sessionsDir, memoryOwnerId),
+              : async () => {
+                  await migrateSharedMemoryRefinementRows({
+                    childSessionDir: sessionDir,
+                    childWorkspaceId: workspaceId,
+                    ownerSessionDir,
+                    ownerWorkspaceId: memoryOwnerId,
+                  });
+                },
         });
         // Only once the session (and with it the transcript) is gone are the
         // retryable harvest records truly unrecoverable; an aborted removal
@@ -6430,7 +6454,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // to deregistration below.
         if (
           error instanceof TombstoneNotDurableError ||
-          error instanceof SharedMemoryLockUnavailableError
+          error instanceof SharedMemoryRemovalAbortedError
         ) {
           throw error;
         }

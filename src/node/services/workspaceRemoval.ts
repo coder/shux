@@ -50,18 +50,22 @@ import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
  * Keeping the workspace registered keeps removal retryable instead.
  */
 /**
- * A sub-agent's removal could not take its memory owner's store lock (r61
- * for shared stores). The caller must ABORT the removal — no tombstone, no
- * deregistration — because the orphan fallback would leave an admitted child
- * write free to land in the owner's live notebook after removal.
+ * A sub-agent's removal failed before publishing its tombstone under its
+ * memory owner's store lock (lock unavailable, history lock timeout, or the
+ * in-lock shared-row migration failing). The caller must ABORT the removal —
+ * no tombstone, no deregistration — because the orphan fallback would leave
+ * an admitted child write free to land in the owner's live notebook after
+ * removal, or delete the only copy of a shared-memory refinement row.
  */
-export class SharedMemoryLockUnavailableError extends Error {
+export class SharedMemoryRemovalAbortedError extends Error {
   constructor(workspaceId: string, options?: ErrorOptions) {
     super(
-      `Could not lock the shared workspace-memory store while removing ${workspaceId}; removal aborted`,
+      `Removing ${workspaceId} failed before its tombstone could be published under the shared workspace-memory store lock (${
+        options?.cause instanceof Error ? options.cause.message : String(options?.cause)
+      }); removal aborted and can be retried`,
       options
     );
-    this.name = "SharedMemoryLockUnavailableError";
+    this.name = "SharedMemoryRemovalAbortedError";
   }
 }
 
@@ -165,6 +169,14 @@ export async function removeSessionDirUnderMemoryLocks(args: {
    * either commits before the tombstone or re-checks and refuses.
    */
   sharedWorkspaceMemorySessionDir?: string;
+  /**
+   * Runs INSIDE the target locks, immediately before the tombstone is
+   * published: shared-memory refinement rows are copied to the owner here,
+   * so a child write that landed after any earlier scan (another backend) is
+   * still captured — the locks guarantee no further write can slip in. A
+   * throw aborts the removal (see SharedMemoryRemovalAbortedError).
+   */
+  beforeTombstone?: () => Promise<void>;
 }): Promise<void> {
   assert(args.sessionDir.length > 0, "removeSessionDirUnderMemoryLocks requires a session dir");
   // Crash clearly on a malformed config (test stubs, future refactors): an
@@ -245,6 +257,7 @@ export async function removeSessionDirUnderMemoryLocks(args: {
           timeoutMs: 10_000,
           label: "history write lock (removal)",
         });
+        await args.beforeTombstone?.();
         // Tombstone BEFORE rm: once the locks release, any waiting writer
         // re-checks it pre-commit (inside its own lock) and refuses, so the
         // deleted directory cannot be recreated by a late mutation or
@@ -263,7 +276,7 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     // passed its commit check — or a new writer — finish after removal.
     // Abort instead: the workspace stays registered and removal is retried.
     if (ownerMemoryKeys.length > 0 && !tombstonePublishedUnderLocks) {
-      throw new SharedMemoryLockUnavailableError(args.workspaceId, { cause: error });
+      throw new SharedMemoryRemovalAbortedError(args.workspaceId, { cause: error });
     }
     // Fail-closed orphan path (r62): a wedged writer blocks the deletion,
     // but the caller proceeds to deregister the workspace regardless — so

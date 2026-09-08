@@ -536,9 +536,13 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   workflowResultContinuationSender?: WorkflowResultContinuationSender;
   workspaceHeartbeatService?: ToolConfiguration["workspaceHeartbeatService"];
-  /** Receives each normal turn's workspace-memory write policy (see recordWorkspaceMemoryWritable). */
+  /**
+   * Receives each normal turn's workspace-memory write policy and persists it
+   * (see WorkspaceService.recordWorkspaceMemoryWritable); resolves false when
+   * the value could not be confirmed durable.
+   */
   workspaceMemoryPolicySink?: {
-    recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): void;
+    recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): Promise<boolean>;
   };
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
   desktopSessionManager?: DesktopSessionManager;
@@ -1424,11 +1428,22 @@ export class TurnRequestBuilder {
     // behalf; it must honor the same policy the memory tool enforces. The
     // compaction turn itself runs the "compact" agent, so record only normal
     // turns' policy (the session attaches it to the compaction completion).
-    if (!isCompactionRequest) {
-      this.dependencies.bindings.workspaceMemoryPolicySink?.recordWorkspaceMemoryWritable(
-        workspaceId,
-        memoryAccess.workspace === "readwrite"
-      );
+    if (!isCompactionRequest && this.dependencies.bindings.workspaceMemoryPolicySink) {
+      // Awaited (a config write happens only when the value changes) so the
+      // durable policy is in place before this turn can produce a compaction.
+      const persisted =
+        await this.dependencies.bindings.workspaceMemoryPolicySink.recordWorkspaceMemoryWritable(
+          workspaceId,
+          memoryAccess.workspace === "readwrite"
+        );
+      if (!persisted) {
+        log.warn(
+          "Workspace memory write policy could not be persisted; harvests will fail closed",
+          {
+            workspaceId,
+          }
+        );
+      }
     }
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic

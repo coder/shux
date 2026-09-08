@@ -16,7 +16,7 @@ import {
   refineApplyLockPath,
   REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS,
   removeSessionDirUnderMemoryLocks,
-  SharedMemoryLockUnavailableError,
+  SharedMemoryRemovalAbortedError,
   rollbackRemovalTombstoneIfOwned,
   TombstoneNotDurableError,
   workspaceRemovalTombstonePath,
@@ -138,6 +138,59 @@ describe("workspaceRemoval", () => {
     ).toBe(true);
   });
 
+  test("runs beforeTombstone under the locks and aborts a shared-store removal when it throws", async () => {
+    using tmp = new DisposableTempDir("workspace-removal-test");
+    const rootDir = path.join(tmp.path, "xum-home");
+    const ownerSessionDir = path.join(rootDir, "sessions", "ws-owner");
+    const childId = "ws-child-hook";
+    const childSessionDir = path.join(rootDir, "sessions", childId);
+    await fsPromises.mkdir(path.join(ownerSessionDir, "memory"), { recursive: true });
+    await fsPromises.mkdir(childSessionDir, { recursive: true });
+
+    // The hook observes the locked section: the owner store lock is held, so a
+    // concurrent writer cannot enter while it runs.
+    let writerRanDuringHook = false;
+    let thrown: unknown;
+    try {
+      await removeSessionDirUnderMemoryLocks({
+        rootDir,
+        sessionDir: childSessionDir,
+        workspaceId: childId,
+        attemptId: "test-attempt",
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        beforeTombstone: async () => {
+          const writer = withTargetMutationLock(
+            rootDir,
+            path.join(ownerSessionDir, "memory"),
+            () => {
+              writerRanDuringHook = true;
+              return Promise.resolve();
+            }
+          );
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(writerRanDuringHook).toBe(false);
+          // Let the writer settle later (after the locks release) and abort.
+          void writer;
+          throw new Error("migration failed");
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(SharedMemoryRemovalAbortedError);
+    expect(String(thrown)).toContain("migration failed");
+    expect(await isWorkspaceRemovalTombstoned(rootDir, childId)).toBe(false);
+    expect(
+      await fsPromises.access(childSessionDir).then(
+        () => true,
+        () => false
+      )
+    ).toBe(true);
+    // The queued writer runs once removal released the locks.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(writerRanDuringHook).toBe(true);
+  });
+
   test("sub-agent removal aborts (no tombstone) when the owner store lock cannot be acquired", async () => {
     using tmp = new DisposableTempDir("workspace-removal-test");
     const rootDir = path.join(tmp.path, "xum-home");
@@ -170,7 +223,7 @@ describe("workspaceRemoval", () => {
     } catch (error) {
       thrown = error;
     }
-    expect(thrown).toBeInstanceOf(SharedMemoryLockUnavailableError);
+    expect(thrown).toBeInstanceOf(SharedMemoryRemovalAbortedError);
     // Unlike the own-store orphan path, NO tombstone is published: the
     // wedged holder targets the owner's live notebook, so the child must
     // stay registered and removal be retried.
@@ -213,7 +266,7 @@ describe("workspaceRemoval", () => {
       } catch (error) {
         thrown = error;
       }
-      expect(thrown).toBeInstanceOf(SharedMemoryLockUnavailableError);
+      expect(thrown).toBeInstanceOf(SharedMemoryRemovalAbortedError);
       expect(await isWorkspaceRemovalTombstoned(rootDir, childId)).toBe(false);
     } finally {
       await historyLock[Symbol.asyncDispose]();
