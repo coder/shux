@@ -27,6 +27,7 @@ import { ContextUsage } from "../components/ContextUsage";
 import { getContextMeterData } from "../contextUsage";
 import { getWebComposerKeyAction } from "../composerKeyboard";
 import { useConversation } from "../useConversation";
+import { getVisibleMessages } from "../transcript";
 import { linkedAbortController } from "../useConnection";
 import {
   getModelBlockReason,
@@ -381,7 +382,7 @@ export function ConversationScreen(props: {
       </View>
       <FlatList
         ref={list}
-        data={transcript.messages}
+        data={getVisibleMessages(transcript.messages)}
         keyExtractor={(message) => message.id}
         contentContainerStyle={styles.messages}
         keyboardShouldPersistTaps="handled"

@@ -3,6 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { createORPCClient } from "@orpc/client";
 import type { MobileClient } from "./api";
+import { getVisibleMessages } from "./transcript";
 import type { WorkspaceChatMessage } from "./transcript";
 import { useConversation } from "./useConversation";
 import type { RestoredInput } from "./draft";
@@ -215,7 +216,50 @@ test("restore events use the latest workspace callback once without resubscribin
   expect(replacement).toHaveLength(1);
 });
 
-test("older history is inserted without replacing newer copies and uses the oldest visible row", async () => {
+test("hidden replay and all-hidden pages retain raw cursors and advance pagination", async () => {
+  const view = fixture();
+  await view.ready();
+  const hidden: WorkspaceChatMessage = {
+    type: "message",
+    id: "hidden",
+    role: "user",
+    parts: [],
+    metadata: { historySequence: 8, synthetic: true },
+  };
+  await view.emit(hidden);
+  const nextCursor = { beforeHistorySequence: 4, beforeMessageId: "older-hidden" };
+  await act(async () => {
+    const pending = view.result.current.loadOlder();
+    view.complete({
+      messages: [
+        { ...hidden, id: "older-hidden", metadata: { historySequence: 4, synthetic: true } },
+      ],
+      nextCursor,
+      hasOlder: true,
+    });
+    await pending;
+  });
+  expect(view.requests[0].input).toEqual({
+    workspaceId: "workspace",
+    cursor: { beforeHistorySequence: 8, beforeMessageId: "hidden" },
+  });
+  expect(
+    getVisibleMessages(view.result.current.transcript.messages).map((item) => item.id)
+  ).toEqual(["10"]);
+  expect(view.result.current.transcript.messages.map((item) => item.id)).toEqual([
+    "older-hidden",
+    "hidden",
+    "10",
+  ]);
+  expect(view.result.current.transcript.caughtUp).toBe(true);
+  expect(view.result.current.transcript.hasOlderHistory).toBe(true);
+  await act(async () => view.result.current.loadOlder());
+  expect(view.requests[1].input).toEqual({ workspaceId: "workspace", cursor: nextCursor });
+  await view.emit({ type: "delete", historySequences: [4, 8] });
+  expect(view.result.current.transcript.messages.map((item) => item.id)).toEqual(["10"]);
+});
+
+test("older history is inserted without replacing newer copies and uses the oldest wire row", async () => {
   const view = fixture();
   await view.ready();
   await act(async () => {

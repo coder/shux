@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { applyChatEvent, createTranscriptState, type WorkspaceChatMessage } from "./transcript";
+import {
+  applyChatEvent,
+  createTranscriptState,
+  getVisibleMessages,
+  type WorkspaceChatMessage,
+} from "./transcript";
 
 const start: Extract<WorkspaceChatMessage, { type: "stream-start" }> = {
   type: "stream-start",
@@ -50,6 +55,58 @@ const toolEnd: Extract<WorkspaceChatMessage, { type: "tool-call-end" }> = {
 };
 
 describe("mobile transcript", () => {
+  test("visibility preserves raw hidden tool events, partial recovery and explicit notices", () => {
+    const state = replay(
+      start,
+      tool,
+      {
+        type: "message",
+        id: "a",
+        role: "assistant",
+        parts: [],
+        metadata: { historySequence: 2, synthetic: true, partial: true },
+      },
+      tool,
+      toolEnd,
+      {
+        type: "stream-abort",
+        workspaceId: "w",
+        messageId: "a",
+        abortReason: "system",
+      }
+    );
+    expect(getVisibleMessages(state.messages)).toEqual([]);
+    expect(state.messages[0].parts[0]).toMatchObject({
+      toolCallId: "t",
+      input: tool.args,
+      output: toolEnd.result,
+      state: "output-available",
+    });
+    expect(state.messages[0].metadata).toMatchObject({ partial: true, historySequence: 2 });
+    expect(state.streaming).toBe(false);
+    const notice = applyChatEvent(state, {
+      ...state.messages[0],
+      type: "message",
+      metadata: { ...state.messages[0].metadata, uiVisible: true },
+    });
+    expect(getVisibleMessages(notice.messages)).toEqual(notice.messages);
+    const result = applyChatEvent(notice, {
+      ...notice.messages[0],
+      type: "message",
+      metadata: {
+        ...notice.messages[0].metadata,
+        muxMetadata: { type: "workflow-result", rawCommand: "/run", runId: "wfr_test" },
+      },
+    });
+    expect(getVisibleMessages(result.messages)).toEqual([]);
+    expect(
+      getVisibleMessages(
+        replay(...result.messages.map((message) => ({ ...message, type: "message" as const })))
+          .messages
+      )
+    ).toEqual([]);
+  });
+
   test.each(["user", "system", "startup"] as const)(
     "records %s abort intent without suppressing involuntary recovery",
     (abortReason) => {

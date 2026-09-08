@@ -1,3 +1,4 @@
+import { navigatorUpdates } from "./navigatorTestProfiler";
 import { secureStore, stackState } from "./sessionTestPlatform";
 import { afterEach, describe, expect, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
@@ -234,6 +235,83 @@ function fixture(
     },
   };
 }
+
+test("replay and live model-only rows stay hidden while explicit notices remain visible", async () => {
+  const hidden: WorkspaceChatMessage = {
+    type: "message",
+    id: "hidden",
+    role: "user",
+    parts: [{ type: "text", text: "Internal model instructions" }],
+    metadata: { historySequence: 1, synthetic: true },
+  };
+  const notice: WorkspaceChatMessage = {
+    ...hidden,
+    id: "notice",
+    parts: [{ type: "text", text: "Visible system notice" }],
+    metadata: { historySequence: 2, synthetic: true, uiVisible: true },
+  };
+  const workflow: WorkspaceChatMessage = {
+    ...hidden,
+    id: "workflow",
+    parts: [{ type: "text", text: "Internal workflow payload" }],
+    metadata: {
+      historySequence: 3,
+      muxMetadata: { type: "workflow-result", rawCommand: "/run", runId: "wfr_test" },
+    },
+  };
+  const view = fixture([hidden, notice, workflow]);
+  await view.select("alpha");
+  expect(view.queryByText("Internal model instructions")).toBeNull();
+  expect(view.queryByText("Internal workflow payload")).toBeNull();
+  expect(view.getByText("Visible system notice")).toBeDefined();
+  await view.emit({
+    ...hidden,
+    id: "live",
+    parts: [{ type: "text", text: "Live model instructions" }],
+  });
+  expect(view.queryByText("Live model instructions")).toBeNull();
+  await view.emit({
+    ...workflow,
+    id: "live-workflow",
+    parts: [{ type: "text", text: "Live workflow payload" }],
+  });
+  expect(view.queryByText("Live workflow payload")).toBeNull();
+  await view.emit({ ...notice, id: "live-notice", parts: [{ type: "text", text: "Live notice" }] });
+  expect(view.getByText("Live notice")).toBeDefined();
+});
+
+test("typing in a wide many-workspace session does not update either navigator", async () => {
+  const manyWorkspaces = Array.from({ length: 100 }, (_, i) => ({
+    ...workspaces[0],
+    id: `workspace-${i}`,
+    name: `workspace-${i}`,
+  }));
+  const view = fixture([], true, disabledPolicy, manyWorkspaces);
+  await view.select("workspace-0");
+  expect(view.getByRole("button", { name: "project, 100 workspaces" })).toBeDefined();
+  const before = navigatorUpdates.count;
+  expect(before).toBeGreaterThan(0);
+  const input = view.getByLabelText("Message");
+  for (const value of ["d", "dr", "dra", "draf", "draft"]) {
+    await act(async () => fireEvent.change(input, { target: { value } }));
+    expect(input).toHaveProperty("value", value);
+  }
+  expect(navigatorUpdates.count).toBe(before);
+  await view.select("workspace-1");
+  expect(view.getByLabelText("Message")).toHaveProperty("value", "");
+  await view.select("workspace-0");
+  expect(view.getByLabelText("Message")).toHaveProperty("value", "draft");
+  // A disconnected session must not leak its drafts into the next login.
+  fireEvent.click(view.getAllByRole("button", { name: "Settings" }).at(-1)!);
+  fireEvent.click(view.getByRole("button", { name: "Disconnect" }));
+  await act(async () =>
+    fireEvent.click(view.getByRole("button", { name: "Disconnect & forget credentials" }))
+  );
+  expect(view.disconnected).toBe(1);
+  const next = fixture([], true, disabledPolicy, manyWorkspaces);
+  await next.select("workspace-0");
+  expect(next.getByLabelText("Message")).toHaveProperty("value", "");
+});
 
 test("searched delegated workspaces keep legacy/current identity locked while allowing model changes", async () => {
   for (const [identity, expected, label] of [

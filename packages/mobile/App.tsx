@@ -1,5 +1,5 @@
-import { createContext, useContext, useRef, useState } from "react";
-import type { ReactNode, SetStateAction } from "react";
+import { createContext, useContext, useRef, useState, useSyncExternalStore } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import { StatusBar, Text, useWindowDimensions, View } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { DarkTheme, NavigationContainer } from "@react-navigation/native";
@@ -19,8 +19,7 @@ import { KeyboardProvider } from "./src/components/Keyboard";
 import { useProjects } from "./src/useProjects";
 import { useConnection } from "./src/useConnection";
 import { colors, layout, WIDE_LAYOUT_MIN_WIDTH } from "./src/theme";
-import { EMPTY_DRAFT } from "./src/draft";
-import type { ChatDraft } from "./src/draft";
+import { createSessionDrafts } from "./src/sessionDrafts";
 import type { ChatSettings } from "./src/settings";
 
 export type MobileRoutes = {
@@ -34,10 +33,9 @@ const Stack = createNativeStackNavigator<MobileRoutes>();
 type SessionContext = {
   session: ReturnType<typeof useConnection>;
   data: ReturnType<typeof useProjects>;
-  drafts: Record<string, ChatDraft>;
+  drafts: ReturnType<typeof createSessionDrafts>;
   selections: Record<string, ChatSettings>;
   setSelection: (id: string, value: ChatSettings) => void;
-  setDraft: (id: string, update: SetStateAction<ChatDraft>) => void;
   create: (onCreated: (workspace: FrontendWorkspaceMetadata) => void) => void;
   disconnect: () => Promise<void>;
   disconnectError: string | null;
@@ -72,7 +70,7 @@ export function ConnectedApp(props: { connection: Connection; onDisconnect: () =
   const session = useConnection(props.connection);
   const data = useProjects(session.connection.client, session.signal);
   // Full drafts and unsent model choices survive native back/pop and reconnection.
-  const [drafts, setDrafts] = useState<Record<string, ChatDraft>>({});
+  const [drafts] = useState(createSessionDrafts);
   const [selections, setSelections] = useState<Record<string, ChatSettings>>({});
   const [onCreated, setOnCreated] = useState<
     ((workspace: FrontendWorkspaceMetadata) => void) | null
@@ -95,6 +93,7 @@ export function ConnectedApp(props: { connection: Connection; onDisconnect: () =
       return;
     }
     session.cancel();
+    drafts.clear();
     props.onDisconnect();
   }
   const value: SessionContext = {
@@ -108,12 +107,6 @@ export function ConnectedApp(props: { connection: Connection; onDisconnect: () =
     disconnect,
     disconnectError,
     disconnecting,
-    setDraft(id, update) {
-      setDrafts((current) => {
-        const next = typeof update === "function" ? update(current[id] ?? EMPTY_DRAFT) : update;
-        return current[id] === next ? current : { ...current, [id]: next };
-      });
-    },
     create(callback) {
       if (session.ready) setOnCreated(() => callback);
     },
@@ -247,8 +240,17 @@ function ScreenLayout(props: {
   );
 }
 
+function DraftConversation(
+  props: Omit<ComponentProps<typeof ConversationScreen>, "draft" | "onDraftChange">
+) {
+  const { drafts } = useSession();
+  const store = drafts.get(props.workspace.id);
+  const draft = useSyncExternalStore(store.subscribe, store.getSnapshot);
+  return <ConversationScreen {...props} draft={draft} onDraftChange={store.set} />;
+}
+
 function ConversationRoute(props: NativeStackScreenProps<MobileRoutes, "Conversation">) {
-  const { session, data, drafts, setDraft, selections, setSelection } = useSession();
+  const { session, data, selections, setSelection } = useSession();
   const { workspaceId } = props.route.params;
   const workspace = data.workspaces.find((item) => item.id === workspaceId);
   return (
@@ -256,7 +258,7 @@ function ConversationRoute(props: NativeStackScreenProps<MobileRoutes, "Conversa
       {session.reconnecting && <Loading label="Reconnecting…" />}
       {session.error && <Notice onRetry={session.reconnect}>{session.error}</Notice>}
       {workspace ? (
-        <ConversationScreen
+        <DraftConversation
           key={workspaceId}
           client={session.connection.client}
           serverLabel={new URL(session.connection.endpoint).host}
@@ -269,8 +271,6 @@ function ConversationRoute(props: NativeStackScreenProps<MobileRoutes, "Conversa
           onSettings={() => props.navigation.navigate("Settings")}
           selection={selections[workspaceId] ?? null}
           onSelectionChange={(value) => setSelection(workspaceId, value)}
-          draft={drafts[workspaceId] ?? EMPTY_DRAFT}
-          onDraftChange={(update) => setDraft(workspaceId, update)}
         />
       ) : (
         <>

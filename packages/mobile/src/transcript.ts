@@ -1,3 +1,4 @@
+import { isWorkflowResultMessage } from "../../../src/common/utils/workflowRunMessages";
 import { copyStreamMetadataSnapshot } from "../../../src/common/types/stream";
 import type { WorkspaceChatMessage } from "../../../src/common/orpc/types";
 import type { MuxMessage, MuxToolPart } from "../../../src/common/types/message";
@@ -11,6 +12,16 @@ export interface TranscriptState {
   error: string | null;
   caughtUp: boolean;
   hasOlderHistory: boolean;
+}
+
+// Visibility is only a display projection: hidden rows still own pagination cursors,
+// recovery metadata and tool events in the authoritative wire transcript.
+export function getVisibleMessages(messages: MuxMessage[]): MuxMessage[] {
+  return messages.filter(
+    (message) =>
+      (message.metadata?.synthetic !== true || message.metadata.uiVisible === true) &&
+      !isWorkflowResultMessage(message)
+  );
 }
 
 /** Reset before EVERY onChat({mode: {type: "full"}}), including reconnects. */

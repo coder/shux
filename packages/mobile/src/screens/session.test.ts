@@ -13,6 +13,8 @@ test("mobile session and recovery behavior", async () => {
       "./src/screens/formTestPlatform.ts",
       "--preload",
       "./src/screens/sessionTestPlatform.tsx",
+      "--preload",
+      "./src/screens/navigatorTestProfiler.tsx",
       "./src/screens/session.behavior.tsx",
     ],
     { cwd: fileURLToPath(new URL("../../", import.meta.url)), stdout: "pipe", stderr: "pipe" }
