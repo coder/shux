@@ -1130,6 +1130,56 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(keep, "utf-8")).toBe("v1");
     });
 
+    it("migrated rows keep their real order relative to the owner's own later edits", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      // Child edits first, owner edits the same file later, THEN the child is
+      // removed: the migrated (older) child row is appended after the owner's.
+      await fixture.service.create(fixture.ctx, "/memories/workspace/shared.md", "c1", "agent");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fixture.service.strReplace(
+        ownerCtx,
+        "/memories/workspace/shared.md",
+        "c1",
+        "o2",
+        "agent"
+      );
+      expect(
+        await migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        })
+      ).toBe(1);
+      const ownerRows = await readRefinementEvents(ownerSessionDir);
+      const ownerEdit = ownerRows.find((row) => row.data.migratedFrom === undefined)!;
+      const migrated = ownerRows.find((row) => row.data.migratedFrom !== undefined)!;
+      expect(migrated.seq).toBeGreaterThan(ownerEdit.seq);
+
+      // LIFO unrolling works without force: the owner's edit is the newest
+      // mutation of the file, so it rolls back first...
+      const first = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: ownerEdit.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(first.success).toBe(true);
+      const shared = path.join(ownerSessionDir, "memory", "shared.md");
+      expect(await fsPromises.readFile(shared, "utf-8")).toBe("c1");
+      // ...and then the migrated child create.
+      const second = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: migrated.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(second.success).toBe(true);
+      expect(await pathExists(shared)).toBe(false);
+    });
+
     it("notifyExternalMutation emits one owner-addressed event per touched scope", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

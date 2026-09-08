@@ -93,6 +93,8 @@ export const RefinementDataSchema = z.object({
    * (sharedMemoryRowMigration.ts); lets a retried migration skip it.
    */
   migratedFrom: z.string().optional(),
+  /** Source row's `ts`, so rollback ordering keeps the mutation's real cross-session position. */
+  sourceTs: z.number().optional(),
   /** Expected post-action file hashes (RefinementPostStateSchema in refinement.ts). */
   postState: JsonValueSchema.optional(),
   /**

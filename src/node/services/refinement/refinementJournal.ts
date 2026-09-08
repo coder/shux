@@ -78,6 +78,8 @@ export interface RefinementEmitArgs {
   postState?: RefinementPostState;
   /** Source identity of a row copied from a removed sub-agent's journal (see durableEvent.ts). */
   migratedFrom?: string;
+  /** Source row's `ts` for a migrated row (see durableEvent.ts). */
+  sourceTs?: number;
   /**
    * "remote" when the mutation ran through a non-local runtime (SSH/Docker).
    * Such rows carry runtime-namespace paths and are refused by rollback,
@@ -236,6 +238,23 @@ export async function reclaimExcessRefinementInverseBlobs(
  */
 export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<void> {
   try {
+    await appendRefinementEventOrThrow(args);
+  } catch (error) {
+    log.debug("[refinement] failed to journal refinement event; continuing", {
+      kind: args.kind,
+      workspaceId: args.workspaceId,
+      error,
+    });
+  }
+}
+
+/**
+ * Same as appendRefinementEvent but propagates failures: for callers whose
+ * row is the ONLY durable copy (shared-memory row migration before the
+ * source journal is deleted) a swallowed failure would silently lose it.
+ */
+export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Promise<void> {
+  {
     assert(args.sessionDir.length > 0, "refinement journal requires a session dir");
     assert(args.workspaceId.length > 0, "refinement journal requires a workspace id");
     const journal = sharedDurableEventJournal(args.sessionDir);
@@ -274,6 +293,7 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
           evidence,
           ...(postState !== undefined ? { postState } : {}),
           ...(args.migratedFrom !== undefined ? { migratedFrom: args.migratedFrom } : {}),
+          ...(args.sourceTs !== undefined ? { sourceTs: args.sourceTs } : {}),
           ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
         },
       });
@@ -286,12 +306,6 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
     } catch (error) {
       log.debug("[refinement] inverse blob reclamation failed; continuing", { error });
     }
-  } catch (error) {
-    log.debug("[refinement] failed to journal refinement event; continuing", {
-      kind: args.kind,
-      workspaceId: args.workspaceId,
-      error,
-    });
   }
 }
 

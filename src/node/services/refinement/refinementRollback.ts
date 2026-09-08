@@ -494,6 +494,18 @@ interface InverseContentReader {
  * Collect divergence complaints for rolling back `target` given the current
  * filesystem + journal state. Empty array = safe to apply.
  */
+/**
+ * Journal order for conflict detection. Rows copied from a removed sub-agent's
+ * journal (sharedMemoryRowMigration.ts) were appended later than they
+ * happened; their `sourceTs` restores the mutation's real position relative
+ * to the owner's own rows. Same-instant ties fall back to append sequence.
+ */
+function isAfter(row: RefinementEvent, other: RefinementEvent): boolean {
+  const rowTs = row.data.sourceTs ?? row.ts;
+  const otherTs = other.data.sourceTs ?? other.ts;
+  return rowTs > otherTs || (rowTs === otherTs && row.seq > other.seq);
+}
+
 async function collectDivergence(
   rows: RefinementEvent[],
   target: RefinementEvent,
@@ -513,7 +525,7 @@ async function collectDivergence(
     rows.map((row) => row.data.rollbackOf).filter((id): id is string => id !== undefined)
   );
   for (const row of rows) {
-    if (row.seq <= target.seq) continue;
+    if (!isAfter(row, target)) continue;
     if (rolledBackIds.has(row.id)) continue; // Effect undone by a later rollback row.
     if (!liveRowConflictsWithTarget(rows, row, target)) continue;
     const parsed = RefinementInverseSchema.safeParse(row.data.inverse);
@@ -649,7 +661,7 @@ function liveRowConflictsWithTarget(
   if (rollbackCount % 2 === 0) {
     return true; // Even chain: the root row's edit was re-applied.
   }
-  return current.seq <= target.seq; // Odd chain: rewound to just before root.
+  return !isAfter(current, target); // Odd chain: rewound to just before root.
 }
 
 async function dirExists(target: string): Promise<boolean> {

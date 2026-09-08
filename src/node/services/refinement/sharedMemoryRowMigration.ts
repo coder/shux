@@ -9,8 +9,19 @@ import {
 } from "@/common/types/refinement";
 import { log } from "@/node/services/log";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
-import { appendRefinementEvent, type RefinementInverseDraft } from "./refinementJournal";
+import { appendRefinementEventOrThrow, type RefinementInverseDraft } from "./refinementJournal";
 import { listRefinements } from "./refinementRollback";
+
+/** Removal must abort: a live shared-memory row could not be persisted in the owner's journal. */
+export class SharedMemoryRowMigrationError extends Error {
+  constructor(workspaceId: string, options?: ErrorOptions) {
+    super(
+      `Could not preserve ${workspaceId}'s shared-memory refinement rows in its owner's journal; removal aborted`,
+      options
+    );
+    this.name = "SharedMemoryRowMigrationError";
+  }
+}
 
 function inversePaths(inverse: RefinementInverse): string[] {
   switch (inverse.op) {
@@ -37,9 +48,11 @@ function isInside(root: string, filePath: string): boolean {
  * already rolled back (or rollback rows themselves) and rows targeting other
  * roots (global/project) are left alone — they die with the child as before.
  *
- * Best-effort per row: a row whose payload cannot be reconstructed (evicted
- * blob, unparseable action) is skipped with a log line rather than failing
- * the removal. Returns the number of rows migrated.
+ * A row whose payload cannot be reconstructed (evicted blob, unparseable
+ * action) is skipped with a log line — nothing durable exists to preserve.
+ * A row that CAN be reconstructed but cannot be persisted in the owner's
+ * journal throws: the caller must not delete the source journal, or the
+ * only inverse and rollback ID would be lost. Returns the number migrated.
  */
 export async function migrateSharedMemoryRefinementRows(args: {
   childSessionDir: string;
@@ -135,7 +148,8 @@ export async function migrateSharedMemoryRefinementRows(args: {
     }
     const evidence = RefinementEvidenceSchema.safeParse(row.data.evidence);
     const postState = RefinementPostStateSchema.safeParse(row.data.postState);
-    await appendRefinementEvent({
+    // Throws: this is the only durable copy once the child's journal goes.
+    await appendRefinementEventOrThrow({
       sessionDir: args.ownerSessionDir,
       workspaceId: args.ownerWorkspaceId,
       kind: "memory",
@@ -152,6 +166,7 @@ export async function migrateSharedMemoryRefinementRows(args: {
       },
       ...(postState.success ? { postState: postState.data } : {}),
       migratedFrom,
+      sourceTs: row.data.sourceTs ?? row.ts,
       ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),
     });
     migrated++;

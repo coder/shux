@@ -138,7 +138,10 @@ import {
   TombstoneNotDurableError,
 } from "@/node/services/workspaceRemoval";
 import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
-import { migrateSharedMemoryRefinementRows } from "@/node/services/refinement/sharedMemoryRowMigration";
+import {
+  migrateSharedMemoryRefinementRows,
+  SharedMemoryRowMigrationError,
+} from "@/node/services/refinement/sharedMemoryRowMigration";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
@@ -6333,7 +6336,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               ownerWorkspaceId: memoryOwnerId,
             });
           } catch (error) {
-            log.warn("Failed to migrate shared-memory refinement rows to the owner", {
+            // The child's journal is the only copy of these rows: do not
+            // delete it. Abort (workspace stays registered, retryable) unless
+            // the caller forces removal, in which case the audit trail is
+            // knowingly given up.
+            if (!force) {
+              throw new SharedMemoryRowMigrationError(workspaceId, { cause: error });
+            }
+            log.warn("Forced removal: shared-memory refinement rows could not be migrated", {
               workspaceId,
               memoryOwnerId,
               error: getErrorMessage(error),
@@ -6357,7 +6367,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // to deregistration below.
         if (
           error instanceof TombstoneNotDurableError ||
-          error instanceof SharedMemoryLockUnavailableError
+          error instanceof SharedMemoryLockUnavailableError ||
+          error instanceof SharedMemoryRowMigrationError
         ) {
           throw error;
         }

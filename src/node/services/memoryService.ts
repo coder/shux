@@ -658,9 +658,23 @@ export class MemoryService extends EventEmitter {
     if (shared.length > 0) this.emit("ownersInvalidated", shared);
   }
 
+  /**
+   * Per-context owner cache: a context object is created per command / per
+   * index+hot-set build and reused for every entry within it, so the stamp
+   * stat behind resolveWorkspaceMemoryOwnerId runs once per operation instead
+   * of once per candidate file. Staleness is bounded to that one operation;
+   * writes are still gated by the store-bound tombstone check.
+   */
+  private readonly ownerByContext = new WeakMap<MemoryScopeContext, string>();
+
   /** Owner of the workspace scope for this context ("" when there is no workspace). */
   private ownerWorkspaceIdFor(ctx: MemoryScopeContext): string {
-    return ctx.workspaceId === "" ? "" : this.resolveWorkspaceMemoryOwnerId(ctx.workspaceId);
+    if (ctx.workspaceId === "") return "";
+    const cached = this.ownerByContext.get(ctx);
+    if (cached !== undefined) return cached;
+    const owner = this.resolveWorkspaceMemoryOwnerId(ctx.workspaceId);
+    this.ownerByContext.set(ctx, owner);
+    return owner;
   }
 
   /** Logical sidecar key, or null when the scope has no stable identity. */
@@ -669,8 +683,9 @@ export class MemoryService extends EventEmitter {
     return memoryLogicalKey(scope, relPath, {
       projectPath: ctx.projectPath,
       // Pins/usage stats follow the physical file, so a shared notebook has
-      // one ranking regardless of which tree member touched it.
-      workspaceId: this.ownerWorkspaceIdFor(ctx),
+      // one ranking regardless of which tree member touched it. Only the
+      // workspace key embeds the id; skip the lookup for the other scopes.
+      workspaceId: scope === "workspace" ? this.ownerWorkspaceIdFor(ctx) : ctx.workspaceId,
     });
   }
 
