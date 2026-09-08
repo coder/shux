@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
+import { STAGED_ATTACHMENT_DIRS } from "@/common/constants/stagedAttachments";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { ArchiveLossyUntrackedFilesConfirmation } from "@/common/orpc/schemas/api";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -16,10 +17,15 @@ import { detectDefaultTrunkBranch } from "@/node/git";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { isGitRepository } from "@/node/utils/pathUtils";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
-import type { InitLogger } from "@/node/runtime/Runtime";
+import type { InitLogger, Runtime } from "@/node/runtime/Runtime";
+import { appendSubProjectRelativePath } from "@/node/runtime/runtimeHelpers";
 import { coerceNonEmptyString, findWorkspaceEntry } from "@/node/services/taskUtils";
-import { getWorkspaceProjectRepos } from "@/node/services/workspaceProjectRepos";
+import {
+  getWorkspaceProjectRepos,
+  type WorkspaceProjectRepo,
+} from "@/node/services/workspaceProjectRepos";
 import { log } from "@/node/services/log";
+import { ensureGitInfoExclude } from "@/node/utils/git/ensureGitInfoExclude";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
@@ -371,6 +377,14 @@ export class WorktreeArchiveSnapshotService {
               })
             : undefined;
 
+        const stagedAttachmentDirs = await this.captureStagedAttachments({
+          workspaceMetadata: args.workspaceMetadata,
+          workspaceName,
+          projectRepo,
+          sessionDir,
+          stateDir: tempStateDir,
+        });
+
         projectSnapshots.push({
           projectPath: projectRepo.projectPath,
           projectName: projectRepo.projectName,
@@ -382,6 +396,7 @@ export class WorktreeArchiveSnapshotService {
           committedPatchPath,
           stagedPatchPath,
           unstagedPatchPath,
+          stagedAttachmentDirs,
         });
       }
 
@@ -583,6 +598,13 @@ export class WorktreeArchiveSnapshotService {
             unstagedPatchPath,
           ]);
         }
+
+        await this.restoreStagedAttachments({
+          workspaceId: args.workspaceId,
+          projectSnapshot,
+          workspacePath: restoreResult.workspacePath,
+          runtime,
+        });
       }
 
       if (snapshot.projects.length > 1) {
@@ -689,11 +711,15 @@ export class WorktreeArchiveSnapshotService {
    * Returns a sorted, normalized array of relative paths.
    */
   private async listUnsupportedUntrackedFiles(repoCwd: string): Promise<string[]> {
+    // --no-empty-directory matches `git status`: a directory whose only contents are ignored
+    // (the staged-attachment container `.xum/`, whose exclude targets the child directory) is
+    // not lossy untracked data. Staged attachments are captured by captureStagedAttachments.
     const untrackedOutput = await this.gitStdout(repoCwd, [
       "ls-files",
       "--others",
       "--exclude-standard",
       "--directory",
+      "--no-empty-directory",
     ]);
     return untrackedOutput
       .split("\n")
@@ -902,6 +928,100 @@ export class WorktreeArchiveSnapshotService {
       isPathInsideDir(sessionDir, absolutePath) && absolutePath !== sessionDir;
     assert(isStrictChildPath, `resolveSessionRelativePath: refusing to escape ${sessionDir}`);
     return absolutePath;
+  }
+
+  /**
+   * Chat uploads are staged into git-excluded `.xum/user-attachments` (legacy `.mux/`) under the
+   * workspace execution path, so the tracked-diff artifacts above never see them. Copy them into
+   * the snapshot so persisted chat/draft paths still resolve after the checkout is recreated.
+   */
+  private async captureStagedAttachments(args: {
+    workspaceMetadata: WorkspaceMetadata;
+    workspaceName: string;
+    projectRepo: WorkspaceProjectRepo;
+    sessionDir: string;
+    stateDir: string;
+  }): Promise<WorktreeArchiveSnapshotProject["stagedAttachmentDirs"]> {
+    const runtime = createRuntime(args.workspaceMetadata.runtimeConfig, {
+      projectPath: args.projectRepo.projectPath,
+      workspaceName: args.workspaceName,
+    });
+    const stagingRoot = appendSubProjectRelativePath(
+      args.workspaceMetadata,
+      runtime,
+      args.projectRepo.repoCwd
+    );
+
+    const captured: NonNullable<WorktreeArchiveSnapshotProject["stagedAttachmentDirs"]> = [];
+    for (const relativeDir of STAGED_ATTACHMENT_DIRS) {
+      const sourceDir = path.join(stagingRoot, relativeDir);
+      if (!(await this.isDirectory(sourceDir))) {
+        continue;
+      }
+      const repoRelativeDir = path.relative(args.projectRepo.repoCwd, sourceDir);
+
+      // Written under the temp state dir, recorded under its final name (like writeArtifact).
+      const artifactRelativeDir = path.join(
+        `${args.projectRepo.storageKey}.attachments`,
+        repoRelativeDir
+      );
+      const artifactDir = path.join(args.stateDir, artifactRelativeDir);
+      assert(
+        isPathInsideDir(args.sessionDir, artifactDir),
+        `captureStagedAttachments: artifact path escaped session dir (${artifactDir})`
+      );
+      await fsPromises.cp(sourceDir, artifactDir, { recursive: true });
+      captured.push({
+        repoRelativeDir,
+        artifactPath: path.join(SNAPSHOT_DIR_NAME, artifactRelativeDir),
+      });
+    }
+    return captured.length > 0 ? captured : undefined;
+  }
+
+  private async restoreStagedAttachments(args: {
+    workspaceId: string;
+    projectSnapshot: WorktreeArchiveSnapshotProject;
+    workspacePath: string;
+    runtime: Runtime;
+  }): Promise<void> {
+    const sessionDir = path.join(this.config.sessionsDir, args.workspaceId);
+    for (const entry of args.projectSnapshot.stagedAttachmentDirs ?? []) {
+      const artifactDir = this.resolveSessionRelativePath(sessionDir, entry.artifactPath);
+      if (!(await this.isDirectory(artifactDir))) {
+        throw new Error(
+          `Failed to restore ${args.projectSnapshot.projectName}: staged attachments artifact is unavailable.`
+        );
+      }
+      // repoRelativeDir comes from user-editable config, so keep the copy inside the checkout.
+      const targetDir = path.resolve(args.workspacePath, entry.repoRelativeDir);
+      assert(
+        isPathInsideDir(args.workspacePath, targetDir) && targetDir !== args.workspacePath,
+        `restoreStagedAttachments: refusing to restore outside ${args.workspacePath}`
+      );
+      await fsPromises.cp(artifactDir, targetDir, { recursive: true });
+
+      // The recreated worktree starts with an empty info/exclude, so re-exclude the directory or
+      // the restored uploads would surface as untracked files.
+      const excludeResult = await ensureGitInfoExclude({
+        runtime: args.runtime,
+        workspacePath: args.workspacePath,
+        relativeDir: entry.repoRelativeDir,
+      });
+      if (excludeResult.status === "failed") {
+        throw new Error(
+          `Failed to restore ${args.projectSnapshot.projectName}: could not mark staged attachments as ignored: ${excludeResult.error}`
+        );
+      }
+    }
+  }
+
+  private async isDirectory(targetPath: string): Promise<boolean> {
+    try {
+      return (await fsPromises.stat(targetPath)).isDirectory();
+    } catch {
+      return false;
+    }
   }
 
   private async writeArtifact(args: {

@@ -7,7 +7,9 @@ import * as path from "node:path";
 import { Err } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Config } from "@/node/config";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
+import { stageWorkspaceAttachment } from "@/node/utils/attachments/stageWorkspaceAttachment";
 
 interface TestFixture {
   muxRoot: string;
@@ -258,6 +260,132 @@ describe("WorktreeArchiveSnapshotService", () => {
     expect(
       await pathExists(path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state"))
     ).toBe(false);
+  });
+
+  test.each([
+    { name: "workspace root", subProject: false },
+    { name: "sub-project execution path", subProject: true },
+  ])(
+    "captures git-excluded staged attachments under the $name and restores them",
+    async ({ subProject }) => {
+      // Attachments are staged relative to the workspace execution path, which a sub-project
+      // workspace moves below the repo root.
+      let stagingRoot = fixture.workspacePath;
+      if (subProject) {
+        await fs.mkdir(path.join(fixture.workspacePath, "pkg"));
+        await fs.writeFile(path.join(fixture.workspacePath, "pkg", "README.md"), "pkg\n", "utf-8");
+        runGit(fixture.workspacePath, ["add", "pkg"]);
+        runGit(fixture.workspacePath, ["commit", "-m", "pkg"]);
+        fixture.metadata.subProjectPath = path.join(fixture.projectPath, "pkg");
+        stagingRoot = path.join(fixture.workspacePath, "pkg");
+      }
+      const bytes = Buffer.from("attachment payload");
+      const staged = await stageWorkspaceAttachment({
+        runtime: new LocalRuntime(stagingRoot),
+        workspacePath: stagingRoot,
+        filename: "notes.txt",
+        mediaType: "text/plain",
+        sizeBytes: bytes.byteLength,
+        dataBase64: bytes.toString("base64"),
+      });
+      expect(staged.success).toBe(true);
+      if (!staged.success) {
+        return;
+      }
+      // Staging excludes the directory, so it is invisible to the untracked-file check.
+      expect(runGit(fixture.workspacePath, ["status", "--porcelain"])).toBe("");
+
+      const captureResult = await fixture.service.captureSnapshotForArchive({
+        workspaceId: fixture.workspaceId,
+        workspaceMetadata: fixture.metadata,
+      });
+      expect(captureResult.success).toBe(true);
+      if (!captureResult.success) {
+        return;
+      }
+      await fixture.config.editConfig((cfg) => {
+        const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+        if (!workspace) {
+          throw new Error("Missing workspace entry");
+        }
+        workspace.worktreeArchiveSnapshot = captureResult.data;
+        return cfg;
+      });
+
+      runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
+      expect(await pathExists(fixture.workspacePath)).toBe(false);
+
+      const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
+        workspaceId: fixture.workspaceId,
+        workspaceMetadata: fixture.metadata,
+      });
+      expect(restoreResult).toEqual({ success: true, data: "restored" });
+
+      // The persisted chat notice keeps pointing at the same execution-path-relative path.
+      expect(await fs.readFile(path.join(stagingRoot, staged.data.stagedPath))).toEqual(bytes);
+      // The recreated worktree gets a fresh info/exclude, so the restore must re-exclude the
+      // directory or the attachments would surface as untracked files.
+      expect(runGit(fixture.workspacePath, ["status", "--porcelain"])).toBe("");
+      expect(
+        await pathExists(
+          path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state")
+        )
+      ).toBe(false);
+    }
+  );
+
+  test("fails restore when a referenced staged attachments artifact is missing", async () => {
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    if (!captureResult.success) {
+      return;
+    }
+    const attachmentArtifacts = captureResult.data.projects[0]?.stagedAttachmentDirs ?? [];
+    expect(attachmentArtifacts.length).toBeGreaterThan(0);
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+      if (!workspace) {
+        throw new Error("Missing workspace entry");
+      }
+      workspace.worktreeArchiveSnapshot = captureResult.data;
+      return cfg;
+    });
+    runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
+    for (const artifact of attachmentArtifacts) {
+      await fs.rm(
+        path.join(fixture.config.sessionsDir, fixture.workspaceId, artifact.artifactPath),
+        { recursive: true, force: true }
+      );
+    }
+
+    const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(restoreResult.success).toBe(false);
+    if (restoreResult.success) {
+      return;
+    }
+    expect(restoreResult.error).toContain("staged attachments artifact is unavailable");
+    // Failed restores clean up the partially recreated checkout and keep the snapshot for retry.
+    expect(await pathExists(fixture.workspacePath)).toBe(false);
+    const storedWorkspace = fixture.config.loadConfigOrDefault().projects.get(fixture.projectPath)
+      ?.workspaces[0];
+    expect(storedWorkspace?.worktreeArchiveSnapshot).toEqual(captureResult.data);
   });
 
   test("falls back to base commit + mailbox replay when the archived head commit is gone", async () => {
