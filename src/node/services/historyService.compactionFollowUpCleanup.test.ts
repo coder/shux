@@ -110,6 +110,53 @@ describe("conditional compaction follow-up cleanup", () => {
   });
 
   for (const action of actions) {
+    test.each(["EBUSY", "EACCES"])(
+      `${action} preserves a retired owner's skip when staged-file removal fails with %s`,
+      async (code) => {
+        const expected = summary();
+        await store.historyService.appendToHistory(workspaceId, expected);
+        const sessionDir = path.join(store.config.sessionsDir, workspaceId);
+        const historyPath = path.join(sessionDir, "chat.jsonl");
+        const original = await fs.readFile(historyPath);
+        let current = true;
+        afterNextAtomicWrite(() => {
+          current = false;
+          spyOn(fs, "rm").mockRejectedValueOnce(
+            Object.assign(new Error("staged-file removal failed"), { code })
+          );
+          return Promise.resolve();
+        });
+        expect(
+          await store.historyService.cleanupCompactionFollowUp(
+            workspaceId,
+            expected,
+            action,
+            () => current
+          )
+        ).toEqual(Ok("skipped"));
+        expect(await fs.readFile(historyPath)).toEqual(original);
+        expect(
+          (await fs.readdir(sessionDir)).filter((name) => name.includes(".follow-up-"))
+        ).toHaveLength(1);
+
+        // An unused staging file must not prevent a later owner's healthy cleanup.
+        expect(
+          await store.historyService.cleanupCompactionFollowUp(
+            workspaceId,
+            expected,
+            action,
+            () => true
+          )
+        ).toEqual(Ok("applied"));
+        const history = await store.historyService.getLastMessages(workspaceId, 1);
+        assert(history.success, "Expected history after healthy cleanup");
+        expect(history.data).toHaveLength(action === "clear" ? 1 : 0);
+        if (action === "clear") {
+          expect(history.data[0].metadata?.muxMetadata).not.toHaveProperty("pendingFollowUp");
+        }
+      }
+    );
+
     test(`${action} skips duplicate persisted identities without changing history`, async () => {
       const expected = summary();
       await store.historyService.appendToHistory(workspaceId, expected);

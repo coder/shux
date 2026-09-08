@@ -2902,7 +2902,13 @@ export class HistoryService {
           }
           return Ok("applied");
         } finally {
-          if (!published) await fs.rm(stagedPath, { force: true });
+          if (!published) {
+            // A staging cleanup failure must not replace a retired owner's recoverable skip
+            // or hide the original publication error.
+            await fs.rm(stagedPath, { force: true }).catch((error: unknown) => {
+              log.warn("Failed to remove staged compaction follow-up file", error);
+            });
+          }
         }
       }
     );
