@@ -93,6 +93,7 @@ interface HistoryTruncateTransaction extends HistoryTruncateHashes {
 }
 
 interface HistoryPublicationObserver {
+  assertStillOwned: () => Promise<void>;
   isCurrent: () => boolean;
   // Returning undefined excludes async callbacks: receipt capture must not yield after rename.
   onCommitted: () => undefined;
@@ -2743,14 +2744,14 @@ export class HistoryService {
    */
   private async withCrossProcessWriteLock<T>(
     workspaceId: string,
-    operation: () => Promise<T>
+    operation: (assertStillOwned: () => Promise<void>) => Promise<T>
   ): Promise<T> {
     const sessionDir = this.getSessionDir(workspaceId);
     // Lock BEFORE any directory creation (r63): the lockfile lives outside
     // the session dir, and removal holds this same lock while it tombstones
     // and deletes — so a mutation serializes with removal instead of racing
     // its own ensurePrivateDir against the deletion.
-    return this.withHistoryWriteFileLock(workspaceId, async () => {
+    return this.withHistoryWriteFileLock(workspaceId, async (assertStillOwned) => {
       // Removal gate (r63), checked IN-LOCK: a foreign backend's in-flight
       // stream survives the remover's process-local cancellation entirely; its
       // late append would otherwise recreate the deleted session directory via
@@ -2771,7 +2772,7 @@ export class HistoryService {
         if (await this.truncateRecoveryArtifactsPresent(workspaceId))
           invalidateHistoryAppendProvenance();
         await this.recoverTruncateTransactionUnlocked(workspaceId);
-        return operation();
+        return operation(assertStillOwned);
       });
     });
   }
@@ -2820,15 +2821,15 @@ export class HistoryService {
   private async withRecoveredHistoryWriteResultLock<T>(
     workspaceId: string,
     errorPrefix: string,
-    operation: () => Promise<Result<T>>
+    operation: (assertStillOwned: () => Promise<void>) => Promise<Result<T>>
   ): Promise<Result<T>> {
     // Not composed from withRecoveredHistoryLock: recovery for write paths
     // runs INSIDE withCrossProcessWriteLock (r64); the read-side conditional
     // recovery would redundantly acquire and release the same file lock.
     try {
       return await this.fileLocks.withLock(workspaceId, () =>
-        this.withCrossProcessWriteLock(workspaceId, async () => {
-          const result = await operation();
+        this.withCrossProcessWriteLock(workspaceId, async (assertStillOwned) => {
+          const result = await operation(assertStillOwned);
           if (!result.success) invalidateHistoryAppendProvenance();
           return result;
         })
@@ -3145,6 +3146,8 @@ export class HistoryService {
     let committed = false;
     try {
       await writeFileAtomic(stagedPath, bytes, { mode: 0o600 });
+      // Staging can outlive a filesystem lease even while the logical owner is current.
+      await publication.assertStillOwned();
       // Replacement acceptance must capture its receipt in the same synchronous
       // turn as ownership validation and rename, before any observer can yield.
       if (!publication.isCurrent()) throw new Error("History publication no longer owned");

@@ -2,11 +2,14 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it, spyOn } from
 import * as fs from "node:fs/promises";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
+import * as atomicWrite from "write-file-atomic";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { HistoryAppendProvenance } from "./historyAppendProvenance";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { historyWriteLockPath } from "./workspaceRemoval";
 
 type PublicationObserver = NonNullable<
   Parameters<HistoryService["appendManyToHistoryUnderWriteLock"]>[2]
@@ -36,36 +39,44 @@ describe("HistoryService private publication seam", () => {
 
   // Exercise the inactive seam under its real recovery/provenance/removal locks,
   // without adding a public acceptance option just for tests.
-  function publish(kind: "single" | "batch" | "update", publication: PublicationObserver) {
+  function publish(
+    kind: "single" | "batch" | "update",
+    publication: Omit<PublicationObserver, "assertStillOwned">
+  ) {
     const service = fixture.historyService as unknown as {
       withRecoveredHistoryWriteResultLock(
         workspaceId: string,
         errorPrefix: string,
-        operation: () => Promise<Result<void>>
+        operation: (assertStillOwned: () => Promise<void>) => Promise<Result<void>>
       ): Promise<Result<void>>;
       updateHistoryUnderWriteLock(
         workspaceId: string,
         message: MuxMessage,
-        observer: typeof publication
+        observer: PublicationObserver
       ): Promise<Result<void>>;
       appendManyToHistoryUnderWriteLock(
         workspaceId: string,
         messages: MuxMessage[],
-        observer: typeof publication
+        observer: PublicationObserver
       ): Promise<Result<void>>;
     };
-    return service.withRecoveredHistoryWriteResultLock(workspaceId, "Publication failed", () => {
-      if (kind === "update") {
-        return service.updateHistoryUnderWriteLock(
-          workspaceId,
-          createMuxMessage("assistant", "assistant", "updated", { historySequence: 1 }),
-          publication
-        );
+    return service.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Publication failed",
+      (assertStillOwned) => {
+        const observer = { ...publication, assertStillOwned };
+        if (kind === "update") {
+          return service.updateHistoryUnderWriteLock(
+            workspaceId,
+            createMuxMessage("assistant", "assistant", "updated", { historySequence: 1 }),
+            observer
+          );
+        }
+        const rows = [createMuxMessage("replacement", "user", "next question")];
+        if (kind === "batch") rows.unshift(createMuxMessage("payload", "assistant", "payload"));
+        return service.appendManyToHistoryUnderWriteLock(workspaceId, rows, observer);
       }
-      const rows = [createMuxMessage("replacement", "user", "next question")];
-      if (kind === "batch") rows.unshift(createMuxMessage("payload", "assistant", "payload"));
-      return service.appendManyToHistoryUnderWriteLock(workspaceId, rows, publication);
-    });
+    );
   }
 
   async function readHistory() {
@@ -74,7 +85,106 @@ describe("HistoryService private publication seam", () => {
     return result.success ? result.data : [];
   }
 
+  function afterPublicationStaging(action: () => void | Promise<void>) {
+    const atomic = atomicWrite.default;
+    return spyOn(atomicWrite, "default").mockImplementation(
+      new Proxy(atomic, {
+        async apply(target, _thisArg, args: Parameters<typeof atomic>) {
+          const result = await target(...args);
+          if (String(args[0]).startsWith(`${chatPath}.publication-`)) await action();
+          return result;
+        },
+      })
+    );
+  }
+
   for (const kind of ["single", "batch", "update"] as const) {
+    it(`${kind}: a reclaimed birth-less lock preserves the successor's history`, async () => {
+      const lockPath = historyWriteLockPath(fixture.config.rootDir, workspaceId);
+      const successorBytes = Buffer.concat([
+        await fs.readFile(chatPath),
+        Buffer.from(
+          JSON.stringify({
+            ...createMuxMessage("successor", "user", "foreign row", { historySequence: 2 }),
+            workspaceId,
+          }) + "\n"
+        ),
+      ]);
+      let successor: Awaited<ReturnType<typeof acquireProcessFileLock>> | undefined;
+      let commits = 0;
+      const staging = afterPublicationStaging(async () => {
+        // Model an expired birth-less lease while staging is held, then let
+        // the real lock protocol reclaim it and a successor publish new bytes.
+        const token = await fs.readFile(lockPath, "utf8");
+        await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
+        await fs.utimes(lockPath, new Date(0), new Date(0));
+        successor = await acquireProcessFileLock({
+          lockPath,
+          timeoutMs: 1000,
+          label: "successor history writer",
+        });
+        await fs.writeFile(chatPath, successorBytes);
+      });
+      try {
+        const result = await publish(kind, {
+          isCurrent: () => true,
+          onCommitted: () => {
+            commits++;
+          },
+        });
+        expect(successor).toBeDefined();
+        expect(result.success).toBe(false);
+        expect(commits).toBe(0);
+        expect(await fs.readFile(chatPath)).toEqual(successorBytes);
+        expect(
+          (await fs.readdir(path.dirname(chatPath))).filter((name) =>
+            name.includes(".publication-")
+          )
+        ).toEqual([]);
+      } finally {
+        staging.mockRestore();
+        await successor?.[Symbol.asyncDispose]();
+      }
+    });
+
+    it(`${kind}: rechecks logical ownership after the awaited file-lock check`, async () => {
+      const before = await fs.readFile(chatPath);
+      const lockPath = historyWriteLockPath(fixture.config.rootDir, workspaceId);
+      let staged = false;
+      let current = true;
+      let commits = 0;
+      const staging = afterPublicationStaging(() => {
+        staged = true;
+      });
+      const readFile = fs.readFile;
+      const ownershipRead = spyOn(fs, "readFile").mockImplementation(
+        new Proxy(readFile, {
+          async apply(target, _thisArg, args: Parameters<typeof readFile>) {
+            const bytes = await target(...args);
+            // Retire the logical owner before the awaited ownership read returns.
+            if (staged && args[0] === lockPath) current = false;
+            return bytes;
+          },
+        })
+      );
+      try {
+        const result = await publish(kind, {
+          isCurrent: () => current,
+          onCommitted: () => {
+            commits++;
+          },
+        });
+        expect(staged).toBe(true);
+        expect(current).toBe(false);
+        expect(result.success).toBe(false);
+        expect(commits).toBe(0);
+        expect(await fs.readFile(chatPath)).toEqual(before);
+      } finally {
+        ownershipRead.mockRestore();
+        staging.mockRestore();
+      }
+    });
+
     it(`${kind}: captures the complete publication before ownership can change`, async () => {
       const provenance = new HistoryAppendProvenance(path.dirname(chatPath));
       const before = (await provenance.read()).receipt;
