@@ -23,6 +23,7 @@ import {
   RefinementInverseSchema,
 } from "@/common/types/refinement";
 import { applyRefinementInverse, readRefinementEvents } from "./refinement/refinementTestHelpers";
+import { rollbackRefinement } from "./refinement/refinementRollback";
 import { TestTempDir } from "./tools/testHelpers";
 
 function pathExists(target: string): Promise<boolean> {
@@ -889,25 +890,46 @@ describe("MemoryService", () => {
       ).toBe(false);
     });
 
-    it("journals a sub-agent's workspace-scope mutation into the owner's session (where rollback is confined)", async () => {
+    it("journals a sub-agent's workspace-scope mutation in its own session and rolls it back via the owner root", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
-      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
-      // Global scope stays attributed to the acting child.
-      await fixture.service.create(fixture.ctx, "/memories/global/g.md", "mine", "agent");
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/n.md",
+        "shared",
+        "agent"
+      );
+      expect(created.success).toBe(true);
 
-      const ownerEvents = await readRefinementEvents(
-        path.join(fixture.config.sessionsDir, "ws-owner")
-      );
-      expect(ownerEvents.map((event) => event.data.action)).toEqual([
-        { op: "create", path: "/memories/workspace/n.md" },
-      ]);
-      const childEvents = await readRefinementEvents(
-        path.join(fixture.config.sessionsDir, "ws-child")
-      );
-      expect(childEvents.map((event) => event.data.action)).toEqual([
-        { op: "create", path: "/memories/global/g.md" },
-      ]);
+      // Attribution stays with the acting workspace: the row is in the
+      // child's journal but its inverse points into the owner's memory dir.
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const events = await readRefinementEvents(childSessionDir);
+      expect(events).toHaveLength(1);
+      expect(await readRefinementEvents(ownerSessionDir)).toHaveLength(0);
+      const physical = path.join(ownerSessionDir, "memory", "n.md");
+      expect(events[0].data.inverse).toEqual({ op: "delete-files", paths: [physical] });
+
+      // Confinement: the child's own memory root does not admit the path...
+      const refused = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        id: events[0].id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("outside every memory scope root");
+      expect(await pathExists(physical)).toBe(true);
+
+      // ...the caller-supplied owner session dir does.
+      const rolledBack = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        id: events[0].id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(rolledBack.success).toBe(true);
+      expect(await pathExists(physical)).toBe(false);
     });
   });
 

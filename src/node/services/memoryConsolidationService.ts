@@ -738,7 +738,9 @@ export class MemoryConsolidationService extends EventEmitter {
       // child would consolidate the owner's notebook concurrently with the
       // owner's own runs. Children still harvest into the shared inbox; only
       // the owner sweeps it.
-      if (workspace.parentWorkspaceId) {
+      // Compared by resolved owner, not parentWorkspaceId: a dangling/cyclic
+      // chain falls back to a private store that must stay consolidatable.
+      if (self.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId) !== workspaceId) {
         return Err(
           "sub-agent workspaces share their owner's workspace memory; the owner consolidates it"
         );
@@ -1202,12 +1204,13 @@ export class MemoryConsolidationService extends EventEmitter {
       // covering pass, not one per idle workspace in the same sweep.
       let globalLastRunAt = findNewestWorkspaceRecord(sidecar.workspaces)?.lastRunAt ?? 0;
       const archivedById = new Map<string, boolean>();
-      const subAgentIds = new Set<string>();
       const projectPathByWorkspace = new Map<string, string>();
-      for (const [configProjectPath, project] of self.config.loadConfigOrDefault().projects) {
+      const cfg = self.config.loadConfigOrDefault();
+      const sharesOwnerStore = (workspaceId: string) =>
+        self.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId, () => cfg) !== workspaceId;
+      for (const [configProjectPath, project] of cfg.projects) {
         for (const workspace of project.workspaces) {
           if (workspace.id === undefined) continue;
-          if (workspace.parentWorkspaceId) subAgentIds.add(workspace.id);
           archivedById.set(
             workspace.id,
             isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
@@ -1235,7 +1238,7 @@ export class MemoryConsolidationService extends EventEmitter {
         if (archivedById.get(workspaceId) === true) continue;
         // Shared store: the owner's own sweep covers a child's writes (they
         // are keyed under the owner), and runLockedEffect refuses children.
-        if (subAgentIds.has(workspaceId)) continue;
+        if (sharesOwnerStore(workspaceId)) continue;
         const lastRunAt = sidecar.workspaces[workspaceId]?.lastRunAt ?? 0;
         const projectPath = projectPathByWorkspace.get(workspaceId) ?? "";
         const projectRunAt = projectPath === "" ? 0 : (projectLastRunAt.get(projectPath) ?? 0);

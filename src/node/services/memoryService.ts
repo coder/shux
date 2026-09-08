@@ -47,6 +47,7 @@ import {
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
 import {
   REFINEMENT_CAPTURE_MAX_FILES,
   REFINEMENT_CAPTURE_MAX_TOTAL_BYTES,
@@ -604,55 +605,24 @@ export class MemoryService extends EventEmitter {
   private readonly workspaceMemoryOwnerById = new Map<string, string>();
 
   /**
-   * The workspace whose <sessionDir>/memory backs `/memories/workspace` for
-   * `workspaceId`: the root of its parentWorkspaceId chain. Sub-agents (and
-   * nested sub-agents) thereby share ONE notebook with the workspace that
-   * spawned the task tree, while their transcripts/session artifacts stay
-   * separate. Full `kind: "workspace"` tasks and forks carry no
-   * parentWorkspaceId and own their notes. Unknown IDs, cycles, and depth
-   * overflow resolve to the ID itself so a misconfigured tree degrades to
-   * today's per-workspace behavior instead of failing every memory command.
+   * Memoized resolveWorkspaceMemoryOwnerId (see memoryWorkspaceOwner.ts). The
+   * config is only loaded on a memo miss; callers resolving many workspaces
+   * in one synchronous pass supply a shared `loadConfig` so a cold pass parses
+   * the config once instead of once per workspace.
    */
-  resolveWorkspaceMemoryOwnerId(workspaceId: string): string {
-    assert(workspaceId.length > 0, "resolveWorkspaceMemoryOwnerId requires a workspaceId");
+  resolveWorkspaceMemoryOwnerId(
+    workspaceId: string,
+    loadConfig: () => ReturnType<Config["loadConfigOrDefault"]> = () =>
+      this.config.loadConfigOrDefault()
+  ): string {
     const cached = this.workspaceMemoryOwnerById.get(workspaceId);
     if (cached !== undefined) return cached;
-    const cfg = this.config.loadConfigOrDefault();
-    let current = workspaceId;
-    const visited = new Set<string>();
-    for (let depth = 0; depth < 32; depth++) {
-      if (visited.has(current)) {
-        log.warn(
-          "[MemoryService] parentWorkspaceId cycle; using acting workspace as memory owner",
-          {
-            workspaceId,
-          }
-        );
-        return workspaceId;
-      }
-      visited.add(current);
-      const entry = findWorkspaceEntry(cfg, current);
-      if (entry === null) {
-        // Only the chain root may be unknown without invalidating the walk:
-        // an unregistered starting workspace resolves to itself (not cached).
-        if (current === workspaceId) return workspaceId;
-        log.warn("[MemoryService] parentWorkspaceId points at an unknown workspace", {
-          workspaceId,
-          parentWorkspaceId: current,
-        });
-        return workspaceId;
-      }
-      const parentWorkspaceId = entry.workspace.parentWorkspaceId;
-      if (parentWorkspaceId === undefined || parentWorkspaceId === "") {
-        this.workspaceMemoryOwnerById.set(workspaceId, current);
-        return current;
-      }
-      current = parentWorkspaceId;
+    const cfg = loadConfig();
+    const owner = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
+    if (findWorkspaceEntry(cfg, workspaceId) !== null) {
+      this.workspaceMemoryOwnerById.set(workspaceId, owner);
     }
-    log.warn("[MemoryService] parentWorkspaceId chain too deep; using acting workspace", {
-      workspaceId,
-    });
-    return workspaceId;
+    return owner;
   }
 
   /** Owner of the workspace scope for this context ("" when there is no workspace). */
@@ -823,19 +793,17 @@ export class MemoryService extends EventEmitter {
    * Append the invertible `refinement` row for one memory mutation (RLM r2).
    *
    * Rows land in the ACTING workspace's session journal even though memory
-   * files can be global/project-scoped: the journal is per-session, so
+   * files can be global/project-scoped — or, for a sub-agent's workspace
+   * scope, live in the OWNER's session dir: the journal is per-session, so
    * cross-workspace edits to a shared file are attributed to (and invertible
-   * from) whichever workspace made them — the intended v1 scope. The one
-   * exception is workspace scope written by a sub-agent: the file lives in
-   * the OWNER's <sessionDir>/memory and rollback confinement only admits a
-   * journal's own session memory root, so those rows go to the owner's
-   * journal (where they are actually invertible). When the context has no
-   * workspace, there is no session journal; skip (log-only).
+   * from) whichever workspace made them — the intended v1 scope. Rollback of
+   * a sub-agent's workspace-scope row admits the owner's memory root via
+   * RollbackRefinementOptions.sharedWorkspaceMemorySessionDir. When the
+   * context has no workspace, there is no session journal; skip (log-only).
    * Never throws: journaling failures must not fail the memory command.
    */
   private async journalRefinement(
     ctx: MemoryScopeContext,
-    scope: MemoryScope,
     action: MemoryRefinementAction,
     inverse: RefinementInverseDraft,
     actor: MemoryActor,
@@ -848,11 +816,9 @@ export class MemoryService extends EventEmitter {
       });
       return;
     }
-    const journalWorkspaceId =
-      scope === "workspace" ? this.ownerWorkspaceIdFor(ctx) : ctx.workspaceId;
     await appendRefinementEvent({
-      sessionDir: path.join(this.config.sessionsDir, journalWorkspaceId),
-      workspaceId: journalWorkspaceId,
+      sessionDir: path.join(this.config.sessionsDir, ctx.workspaceId),
+      workspaceId: ctx.workspaceId,
       kind: "memory",
       action,
       inverse,
@@ -1152,7 +1118,6 @@ export class MemoryService extends EventEmitter {
         // Row is written before the create is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
-          scope,
           { op: "create", path: toVirtualPath(scope, parsed.relPath) },
           { op: "delete-files", paths: [store.physicalPath(parsed.relPath)] },
           actor,
@@ -1194,7 +1159,6 @@ export class MemoryService extends EventEmitter {
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
-          scope,
           { op: "str_replace", path: toVirtualPath(scope, parsed.relPath) },
           {
             op: "restore-files",
@@ -1248,7 +1212,6 @@ export class MemoryService extends EventEmitter {
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
-          scope,
           { op: "insert", path: toVirtualPath(scope, parsed.relPath) },
           {
             op: "restore-files",
@@ -1432,7 +1395,6 @@ export class MemoryService extends EventEmitter {
         if (inverse !== null) {
           await this.journalRefinement(
             ctx,
-            scope,
             { op: "delete", path: toVirtualPath(scope, parsed.relPath) },
             inverse,
             actor,
@@ -1495,7 +1457,6 @@ export class MemoryService extends EventEmitter {
         // Row is written before the rename is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
-          scope,
           {
             op: "rename",
             path: toVirtualPath(scope, oldParsed.relPath),

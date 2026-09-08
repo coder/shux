@@ -115,7 +115,13 @@ export interface ApplyToolPolicyAndExperimentsOptions {
    * caller from the workspace cwd/runtime pair the file tools use; only
    * honored in kernel mode with file_read bridged.
    */
-  sandbox?: { workspaceId: string; sessionDir: string; kernelFileLoader?: KernelFileLoader };
+  sandbox?: {
+    workspaceId: string;
+    sessionDir: string;
+    /** Owner session dir when the workspace is a sub-agent sharing its notebook. */
+    sharedWorkspaceMemorySessionDir?: string;
+    kernelFileLoader?: KernelFileLoader;
+  };
   /**
    * Capability grants for this assembly (registry-with-filters posture).
    * Omitted = session-scope full grants (identical to pre-grants behavior).

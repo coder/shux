@@ -547,9 +547,13 @@ export const CoreWiringLive: Layer.Layer<
     // every live session resolving to that owner reads the same notebook.
     memoryService.on("change", (event: MemoryChangeEvent) => {
       if (event.scope !== "workspace" || event.workspaceId === "") return;
+      // One config snapshot for the whole pass: cold owner lookups would
+      // otherwise parse the config once per live session, synchronously.
+      let cfg: ReturnType<typeof config.loadConfigOrDefault> | undefined;
+      const loadConfig = () => (cfg ??= config.loadConfigOrDefault());
       workspaceService.invalidateMemoryContextWhere(
         (workspaceId) =>
-          memoryService.resolveWorkspaceMemoryOwnerId(workspaceId) === event.workspaceId
+          memoryService.resolveWorkspaceMemoryOwnerId(workspaceId, loadConfig) === event.workspaceId
       );
     });
     if (opts.devToolsService) {

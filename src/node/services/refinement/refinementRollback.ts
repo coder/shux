@@ -69,6 +69,12 @@ export interface RollbackRefinementOptions {
   id: string;
   /** Apply despite detected divergence. Confinement is NEVER overridable. */
   force?: boolean;
+  /**
+   * Session dir of the task-tree owner whose <sessionDir>/memory backs this
+   * session's `/memories/workspace` (sub-agents only; omit when the session
+   * owns its store). Admits that one extra memory root for confinement.
+   */
+  sharedWorkspaceMemorySessionDir?: string;
   /** Attribution for the emitted rollback row. */
   evidence: { toolName: string; toolCallId?: string; actor?: string };
   /** Caller-supplied justification, recorded in the rollback row's action. */
@@ -244,7 +250,8 @@ function inferMemoryLayout(sessionDir: string): { muxRoot: string; sessionsDir: 
 function resolveConfinementRoot(
   sessionDir: string,
   kind: "memory" | "skill",
-  filePath: string
+  filePath: string,
+  sharedWorkspaceMemorySessionDir?: string
 ): string {
   if (!path.isAbsolute(filePath)) {
     throw new RollbackError(`Refusing rollback: inverse path is not absolute: '${filePath}'`);
@@ -307,16 +314,30 @@ function resolveConfinementRoot(
   }
   // <sessionDir>/memory/<file...> (workspace scope). Constrained to exactly
   // THIS session's memory subdir so a corrupted inverse can never touch other
-  // workspaces' memory or session artifacts (chat.jsonl, journals).
-  const workspaceMemoryRoot = path.join(path.resolve(sessionDir), "memory");
-  const relToWorkspaceMemory = path.relative(workspaceMemoryRoot, resolved);
-  if (!relToWorkspaceMemory.startsWith("..") && !path.isAbsolute(relToWorkspaceMemory)) {
-    if (relToWorkspaceMemory.length > 0) {
-      return workspaceMemoryRoot;
-    }
-    throw new RollbackError(
-      `Refusing rollback: path targets a memory scope root, not a file inside it: '${filePath}'`
+  // workspaces' memory or session artifacts (chat.jsonl, journals). The one
+  // sanctioned second root is the task-tree owner's memory subdir, supplied
+  // by the CALLER (never read from the row): a sub-agent's workspace-scope
+  // writes physically land there (MemoryService.resolveWorkspaceMemoryOwnerId)
+  // while the row stays in the sub-agent's own journal.
+  const workspaceMemoryRoots = [path.join(path.resolve(sessionDir), "memory")];
+  if (sharedWorkspaceMemorySessionDir !== undefined) {
+    const sharedSessionDir = path.resolve(sharedWorkspaceMemorySessionDir);
+    assert(
+      path.dirname(sharedSessionDir) === layout.sessionsDir,
+      "sharedWorkspaceMemorySessionDir must be a sibling session dir"
     );
+    workspaceMemoryRoots.push(path.join(sharedSessionDir, "memory"));
+  }
+  for (const workspaceMemoryRoot of workspaceMemoryRoots) {
+    const relToWorkspaceMemory = path.relative(workspaceMemoryRoot, resolved);
+    if (!relToWorkspaceMemory.startsWith("..") && !path.isAbsolute(relToWorkspaceMemory)) {
+      if (relToWorkspaceMemory.length > 0) {
+        return workspaceMemoryRoot;
+      }
+      throw new RollbackError(
+        `Refusing rollback: path targets a memory scope root, not a file inside it: '${filePath}'`
+      );
+    }
   }
   throw new RollbackError(
     `Refusing rollback: path is outside every memory scope root: '${filePath}'`
@@ -770,7 +791,10 @@ export async function rollbackRefinement(
     // repo revision to swap a root for a symlink in the meantime.
     const roots = new Map<string, string>();
     for (const p of inversePaths(inverse)) {
-      roots.set(p, resolveConfinementRoot(opts.sessionDir, kind, p));
+      roots.set(
+        p,
+        resolveConfinementRoot(opts.sessionDir, kind, p, opts.sharedWorkspaceMemorySessionDir)
+      );
     }
     const assertConfinement = async (): Promise<void> => {
       for (const [p, root] of roots) {

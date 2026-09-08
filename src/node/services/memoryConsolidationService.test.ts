@@ -1316,6 +1316,13 @@ describe("MemoryConsolidationService", () => {
     expect(fixture.modelCalls).toHaveLength(1);
     expect(await fixture.service.getRecord("ws-sub")).toBeNull();
     expect(await fixture.service.getRecord("ws-dream")).not.toBeNull();
+
+    // A dangling parent chain resolves to a PRIVATE store (owner == self), so
+    // that workspace must remain consolidatable rather than orphaned forever.
+    await fixture.addWorkspace("ws-orphan", { parentWorkspaceId: "ws-gone" });
+    const orphan = await fixture.service.maybeRun("ws-orphan", "manual");
+    expect(orphan.success).toBe(true);
+    expect(fixture.modelCalls).toHaveLength(2);
   });
 
   it("launch sweep skips archived workspaces and caps runs per launch", async () => {

@@ -20,6 +20,8 @@ interface RefinementRollbackToolArgs {
 export function createRefinementRollbackTool(ctx: {
   workspaceId: string;
   sessionDir: string;
+  /** Owner session dir when this workspace is a sub-agent sharing its notebook. */
+  sharedWorkspaceMemorySessionDir?: string;
 }): Tool {
   return tool({
     description: TOOL_DEFINITIONS.refinement_rollback.description,
@@ -30,6 +32,7 @@ export function createRefinementRollbackTool(ctx: {
     ): Promise<RefinementRollbackToolResult> => {
       const result = await rollbackRefinement({
         sessionDir: ctx.sessionDir,
+        sharedWorkspaceMemorySessionDir: ctx.sharedWorkspaceMemorySessionDir,
         id,
         reason,
         evidence: { toolName: "refinement_rollback", toolCallId, actor: "agent" },

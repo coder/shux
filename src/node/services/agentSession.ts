@@ -1043,7 +1043,12 @@ export class AgentSession {
    */
   invalidateMemoryContext(): void {
     this.memoryContextByModelString.clear();
+    // A build already awaiting buildMemorySessionContext read the pre-write
+    // files; bumping the generation stops it from repopulating the cache.
+    this.memoryContextGeneration++;
   }
+
+  private memoryContextGeneration = 0;
 
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
@@ -9829,6 +9834,7 @@ export class AgentSession {
       return cached.context ?? undefined;
     }
 
+    const generation = this.memoryContextGeneration;
     // Guard for test mocks that may not implement buildMemorySessionContext.
     const context =
       typeof this.aiService.buildMemorySessionContext === "function"
@@ -9837,6 +9843,8 @@ export class AgentSession {
             tokenBudgetActive,
           })
         : null;
+    // Invalidated mid-build: serve this snapshot once but do not cache it.
+    if (generation !== this.memoryContextGeneration) return context ?? undefined;
     cache.set(modelString, {
       context,
       includesHotMemories: includeHotMemories,

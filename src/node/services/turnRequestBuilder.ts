@@ -2324,6 +2324,15 @@ export class TurnRequestBuilder {
           recordStartupPhaseTiming("getToolsForModelMs", getToolsStartedAt);
         }
 
+        // A sub-agent's workspace-scope memory rows point into its task-tree
+        // owner's session dir; rollback must admit that root (and only that).
+        const memoryOwnerId =
+          this.dependencies.bindings.memoryService?.resolveWorkspaceMemoryOwnerId(workspaceId) ??
+          workspaceId;
+        const sharedWorkspaceMemorySessionDir =
+          memoryOwnerId === workspaceId
+            ? undefined
+            : path.join(this.dependencies.config.sessionsDir, memoryOwnerId);
         const applyPolicyStartedAt = Date.now();
         let attemptTools = await applyToolPolicyAndExperiments({
           allTools: this.dependencies.wrapToolsForDelegation(
@@ -2338,6 +2347,7 @@ export class TurnRequestBuilder {
           sandbox: {
             workspaceId,
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
+            sharedWorkspaceMemorySessionDir,
             kernelFileLoader,
           },
         });

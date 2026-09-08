@@ -133,6 +133,21 @@ describe("AgentSession memory context", () => {
       session.invalidateMemoryContext();
       expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
+
+      // Invalidation DURING a build: the pre-write snapshot is served once but
+      // must not be cached, so the following resolve rebuilds again.
+      let finishBuild!: () => void;
+      buildMemorySessionContext.mockImplementationOnce(
+        () => new Promise<MemorySessionContext>((resolve) => (finishBuild = () => resolve(context)))
+      );
+      session.invalidateMemoryContext();
+      const inFlight = priv.resolveMemoryContext("test-model");
+      await Promise.resolve();
+      session.invalidateMemoryContext();
+      finishBuild();
+      expect(await inFlight).toEqual(context);
+      expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(4);
     } finally {
       await session.dispose();
     }

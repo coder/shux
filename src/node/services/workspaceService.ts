@@ -136,6 +136,7 @@ import {
   startRemovalTombstoneLease,
   TombstoneNotDurableError,
 } from "@/node/services/workspaceRemoval";
+import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
@@ -6309,11 +6310,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // directory. Fail-closed on a wedged writer: the catch below keeps
         // the directory as a recoverable orphan instead of deleting it out
         // from under a live commit.
+        // A sub-agent's workspace memory lives in its task-tree owner's
+        // session dir; hold that store's lock as well so an admitted child
+        // write cannot slip between this tombstone and its commit check.
+        const memoryOwnerId = resolveWorkspaceMemoryOwnerId(
+          this.config.loadConfigOrDefault(),
+          workspaceId
+        );
         await removeSessionDirUnderMemoryLocks({
           rootDir: this.config.rootDir,
           sessionDir,
           workspaceId,
           attemptId: removalAttemptId,
+          sharedWorkspaceMemorySessionDir:
+            memoryOwnerId === workspaceId
+              ? undefined
+              : path.join(this.config.sessionsDir, memoryOwnerId),
         });
       } catch (error) {
         // r63: without a durable tombstone the retained orphan stays

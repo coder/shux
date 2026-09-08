@@ -80,6 +80,62 @@ describe("workspaceRemoval", () => {
     expect((JSON.parse(raw) as { workspaceId: string }).workspaceId).toBe(workspaceId);
   });
 
+  test("sub-agent removal also waits for a writer holding the OWNER's memory store lock", async () => {
+    using tmp = new DisposableTempDir("workspace-removal-test");
+    const rootDir = path.join(tmp.path, "xum-home");
+    const ownerSessionDir = path.join(rootDir, "sessions", "ws-owner");
+    const childId = "ws-child";
+    const childSessionDir = path.join(rootDir, "sessions", childId);
+    await fsPromises.mkdir(path.join(ownerSessionDir, "memory"), { recursive: true });
+    await fsPromises.mkdir(childSessionDir, { recursive: true });
+
+    // A sub-agent's admitted workspace-memory write holds the OWNER store's
+    // lock (that is where the shared notebook lives), not the child's.
+    let releaseWriter!: () => void;
+    const writerGate = new Promise<void>((resolve) => (releaseWriter = resolve));
+    let writerEntered!: () => void;
+    const entered = new Promise<void>((resolve) => (writerEntered = resolve));
+    const writer = withTargetMutationLock(
+      rootDir,
+      path.join(ownerSessionDir, "memory"),
+      async () => {
+        writerEntered();
+        await writerGate;
+      }
+    );
+    await entered;
+
+    const removal = removeSessionDirUnderMemoryLocks({
+      rootDir,
+      sessionDir: childSessionDir,
+      workspaceId: childId,
+      attemptId: "test-attempt",
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    // Without the owner lock the child tombstone would already be published
+    // here, between the writer's commit check and its durable write.
+    expect(await isWorkspaceRemovalTombstoned(rootDir, childId)).toBe(false);
+
+    releaseWriter();
+    await writer;
+    await removal;
+    expect(await isWorkspaceRemovalTombstoned(rootDir, childId)).toBe(true);
+    // Only the child's session dir is deleted; the owner keeps its notebook.
+    expect(
+      await fsPromises.access(childSessionDir).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+    expect(
+      await fsPromises.access(path.join(ownerSessionDir, "memory")).then(
+        () => true,
+        () => false
+      )
+    ).toBe(true);
+  });
+
   test("waits on the refine lock BEFORE taking the teardown target locks (r67)", async () => {
     using tmp = new DisposableTempDir("workspace-removal-test");
     const rootDir = path.join(tmp.path, "xum-home");
