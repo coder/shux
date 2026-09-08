@@ -1626,37 +1626,50 @@ describe("WorktreeArchiveSnapshotService", () => {
     }
   });
 
-  test("keeps warning about a container that holds ignored files besides staged attachments", async () => {
-    const bytes = Buffer.from("attachment payload");
-    const staged = await stageWorkspaceAttachment({
-      runtime: new LocalRuntime(fixture.workspacePath),
-      workspacePath: fixture.workspacePath,
-      filename: "notes.txt",
-      mediaType: "text/plain",
-      sizeBytes: bytes.byteLength,
-      dataBase64: bytes.toString("base64"),
-    });
-    expect(staged.success).toBe(true);
-    // A workspace MCP override is excluded the same way but is not captured by the snapshot.
-    await fs.writeFile(
-      path.join(fixture.workspacePath, ".xum", "mcp.local.jsonc"),
-      "{}\n",
-      "utf-8"
-    );
-    const excludePath = runGit(fixture.workspacePath, ["rev-parse", "--git-path", "info/exclude"]);
-    await fs.appendFile(
-      path.resolve(fixture.workspacePath, excludePath),
-      "/.xum/mcp.local.jsonc\n",
-      "utf-8"
-    );
-    expect(runGit(fixture.workspacePath, ["status", "--porcelain"])).toBe("");
+  test.each([
+    {
+      name: "an ignored file",
+      // A workspace MCP override is excluded the same way but is not captured by the snapshot.
+      addSibling: async (workspacePath: string) => {
+        await fs.writeFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), "{}\n", "utf-8");
+        const excludePath = runGit(workspacePath, ["rev-parse", "--git-path", "info/exclude"]);
+        await fs.appendFile(
+          path.resolve(workspacePath, excludePath),
+          "/.xum/mcp.local.jsonc\n",
+          "utf-8"
+        );
+      },
+    },
+    {
+      name: "an empty directory",
+      // Git lists neither empty directories nor their parent when everything else is ignored.
+      addSibling: async (workspacePath: string) => {
+        await fs.mkdir(path.join(workspacePath, ".xum", "empty-dir"));
+      },
+    },
+  ])(
+    "keeps warning about a container that holds $name besides staged attachments",
+    async ({ addSibling }) => {
+      const bytes = Buffer.from("attachment payload");
+      const staged = await stageWorkspaceAttachment({
+        runtime: new LocalRuntime(fixture.workspacePath),
+        workspacePath: fixture.workspacePath,
+        filename: "notes.txt",
+        mediaType: "text/plain",
+        sizeBytes: bytes.byteLength,
+        dataBase64: bytes.toString("base64"),
+      });
+      expect(staged.success).toBe(true);
+      await addSibling(fixture.workspacePath);
+      expect(runGit(fixture.workspacePath, ["status", "--porcelain"])).toBe("");
 
-    const result = await fixture.service.getUnsupportedUntrackedPaths({
-      workspaceId: fixture.workspaceId,
-      workspaceMetadata: fixture.metadata,
-    });
-    expect(result).toEqual({ success: true, data: [".xum/"] });
-  });
+      const result = await fixture.service.getUnsupportedUntrackedPaths({
+        workspaceId: fixture.workspaceId,
+        workspaceMetadata: fixture.metadata,
+      });
+      expect(result).toEqual({ success: true, data: [".xum/"] });
+    }
+  );
 
   test("captureSnapshotForArchive succeeds with matching acknowledgedUntrackedPaths", async () => {
     // Make workspace dirty (tracked changes) so snapshot captures something meaningful.

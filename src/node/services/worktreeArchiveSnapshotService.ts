@@ -60,15 +60,14 @@ const STAGED_ATTACHMENT_CONTAINERS = new Map(
 
 /**
  * For a `git ls-files --directory` entry (trailing slash) named like a staged-attachment container,
- * the entry its staged attachment directory would produce in the same listing.
+ * the name of the staged attachment directory it may hold.
  */
-function stagedAttachmentDirInContainer(untrackedPath: string): string | null {
+function stagedAttachmentChildInContainer(untrackedPath: string): string | null {
   const segments = untrackedPath.replace(/\\/gu, "/").split("/");
   if (segments.at(-1) !== "") {
     return null;
   }
-  const child = STAGED_ATTACHMENT_CONTAINERS.get(segments.at(-2) ?? "");
-  return child == null ? null : `${untrackedPath}${child}/`;
+  return STAGED_ATTACHMENT_CONTAINERS.get(segments.at(-2) ?? "") ?? null;
 }
 
 interface CreatedRestoreWorkspace {
@@ -777,9 +776,9 @@ export class WorktreeArchiveSnapshotService {
     const untrackedPaths = await listOthers([]);
     // `--directory` reports a directory whose only contents are ignored, which is exactly what
     // the staged-attachment container (`.xum/`, whose exclude targets the child directory) looks
-    // like. Drop it only when those ignored contents are the uploads captureStagedAttachments
-    // preserves; anything else ignored in there (e.g. a workspace MCP override) is still lost
-    // with the worktree and keeps the warning, as does every other entry.
+    // like. Drop it only when it holds nothing but the uploads captureStagedAttachments
+    // preserves; anything else in there (e.g. an ignored workspace MCP override or an empty
+    // directory) is still lost with the worktree and keeps the warning, as does every other entry.
     const nonEmptyPaths = new Set(await listOthers(["--no-empty-directory"]));
     const lossyPaths: string[] = [];
     for (const untrackedPath of untrackedPaths) {
@@ -794,33 +793,21 @@ export class WorktreeArchiveSnapshotService {
     return lossyPaths.sort();
   }
 
+  /**
+   * True when the container directory holds nothing but the staged attachment directory. Checked
+   * on the filesystem rather than through git so ignored files and empty sibling directories,
+   * which git omits, still keep the container in the lossy warning.
+   */
   private async holdsOnlyStagedAttachments(
     repoCwd: string,
     containerPath: string
   ): Promise<boolean> {
-    const stagedDir = stagedAttachmentDirInContainer(containerPath);
-    if (stagedDir == null) {
+    const stagedChild = stagedAttachmentChildInContainer(containerPath);
+    if (stagedChild == null) {
       return false;
     }
-    const ignoredEntries = (
-      await this.gitStdout(repoCwd, [
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-standard",
-        "--directory",
-        "--",
-        containerPath,
-      ])
-    )
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0 && line !== containerPath);
-    // A symlinked staging directory lists without the trailing slash; it is captured by contents.
-    return (
-      ignoredEntries.length > 0 &&
-      ignoredEntries.every((entry) => entry === stagedDir || `${entry}/` === stagedDir)
-    );
+    const entries = await fsPromises.readdir(path.join(repoCwd, containerPath));
+    return entries.length === 1 && entries[0] === stagedChild;
   }
 
   private async ensureNoUnsupportedUntrackedFiles(repoCwd: string): Promise<void> {
