@@ -95,39 +95,25 @@ describe("ConcurrentLocalWarning", () => {
     subscribers.clear();
   });
 
-  test.each([
-    ["child", undefined, "current-workspace"],
-    ["parent", "other-workspace", undefined],
-    ["sibling with an absent parent row", "parent", "parent"],
-    ["nested child", undefined, "current-child"],
-    ["cousin", "current-child", "other-child"],
-  ])(
-    "does not flash for an active %s in the same task family",
-    (_label, currentParent, otherParent) => {
+  test.each([undefined, "root"])(
+    "does not flash for a same-family stream with archived ancestry (root=%s)",
+    (rootWorkspaceId) => {
       workspaceMetadata.set(currentWorkspaceMetadata.id, {
         ...currentWorkspaceMetadata,
-        parentWorkspaceId: currentParent,
+        rootWorkspaceId,
       });
       workspaceMetadata.set(otherWorkspaceMetadata.id, {
         ...otherWorkspaceMetadata,
-        parentWorkspaceId: otherParent,
+        parentWorkspaceId: "archived-parent",
+        rootWorkspaceId: rootWorkspaceId ?? currentWorkspaceMetadata.id,
       });
-      workspaceMetadata.set("current-child", {
-        ...currentWorkspaceMetadata,
-        id: "current-child",
-        parentWorkspaceId: currentParent ? "root" : currentWorkspaceMetadata.id,
-      });
-      workspaceMetadata.set("other-child", {
-        ...otherWorkspaceMetadata,
-        id: "other-child",
-        parentWorkspaceId: "root",
-      });
-
       const result = render(<WarningNameProbe />);
       expect(result.queryByText(otherWorkspaceMetadata.name)).toBeNull();
       act(() => {
         streamingWorkspaceIds.clear();
         notifyWorkspaceStateChanged();
+      });
+      act(() => {
         streamingWorkspaceIds.add(otherWorkspaceMetadata.id);
         notifyWorkspaceStateChanged();
       });
@@ -139,6 +125,7 @@ describe("ConcurrentLocalWarning", () => {
     workspaceMetadata.set(otherWorkspaceMetadata.id, {
       ...otherWorkspaceMetadata,
       parentWorkspaceId: "unrelated-root",
+      rootWorkspaceId: "unrelated-root",
     });
     const result = render(<WarningNameProbe />);
     expect(result.getByText(otherWorkspaceMetadata.name)).toBeTruthy();
@@ -154,20 +141,12 @@ describe("ConcurrentLocalWarning", () => {
     expect(result.queryByText(otherWorkspaceMetadata.name)).toBeNull();
   });
 
-  test("terminates safely on a malformed parent cycle", () => {
-    workspaceMetadata.set(otherWorkspaceMetadata.id, {
-      ...otherWorkspaceMetadata,
-      parentWorkspaceId: otherWorkspaceMetadata.id,
-    });
-    const result = render(<WarningNameProbe />);
-    expect(result.getByText(otherWorkspaceMetadata.name)).toBeTruthy();
-  });
-
   test("does not carry a warning into the active agent's own sub-agent", () => {
     workspaceMetadata.set("child", {
       ...currentWorkspaceMetadata,
       id: "child",
       parentWorkspaceId: otherWorkspaceMetadata.id,
+      rootWorkspaceId: otherWorkspaceMetadata.id,
     });
     const result = render(<WarningNameProbe />);
     expect(result.getByText(otherWorkspaceMetadata.name)).toBeTruthy();

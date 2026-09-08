@@ -286,6 +286,9 @@ export const WorkspaceMetadataSchema = z.object({
 });
 
 export const FrontendWorkspaceMetadataSchema = WorkspaceMetadataSchema.extend({
+  rootWorkspaceId: z.string().optional().meta({
+    description: "Task-family root derived from complete metadata, including archived ancestors.",
+  }),
   namedWorkspacePath: z
     .string()
     .meta({ description: "Worktree path (uses workspace name as directory)" }),

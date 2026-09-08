@@ -3675,6 +3675,19 @@ export class Config {
       });
     }
 
+    // Derive family identity before archived rows are filtered out for the renderer.
+    const parentById = new Map(workspaceMetadata.map((meta) => [meta.id, meta.parentWorkspaceId]));
+    for (const metadata of workspaceMetadata) {
+      const chain: string[] = [];
+      let root = metadata.id;
+      while (parentById.get(root) && !chain.includes(root)) {
+        chain.push(root);
+        root = parentById.get(root)!;
+      }
+      // A malformed cycle gets one representative, even for descendants entering it.
+      const cycle = chain.indexOf(root);
+      metadata.rootWorkspaceId = cycle < 0 ? root : chain.slice(cycle).sort()[0];
+    }
     return workspaceMetadata;
   }
 

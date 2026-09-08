@@ -2831,6 +2831,57 @@ describe("Config", () => {
   });
 
   describe("getAllWorkspaceMetadata with migration", () => {
+    it.each([false, true])(
+      "derives task-family roots through archived rows and cycles (reversed=%s)",
+      async (reversed) => {
+        const projectPath = path.join(tempDir, "project");
+        const nodes = [
+          { id: "root" },
+          { id: "archived", parentWorkspaceId: "root", archivedAt: "2025-01-01T00:00:00.000Z" },
+          { id: "grandchild", parentWorkspaceId: "archived" },
+          { id: "sibling", parentWorkspaceId: "root" },
+          { id: "other-root" },
+          { id: "other-child", parentWorkspaceId: "other-root" },
+          { id: "orphan", parentWorkspaceId: "missing" },
+          { id: "cycle-a", parentWorkspaceId: "cycle-b" },
+          { id: "cycle-b", parentWorkspaceId: "cycle-a" },
+          { id: "cycle-tail", parentWorkspaceId: "cycle-b" },
+        ];
+        await config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, {
+            workspaces: (reversed ? nodes.toReversed() : nodes).map((node) => ({
+              ...node,
+              name: node.id,
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+            })),
+          });
+          return cfg;
+        });
+
+        const metadata = await new Config(tempDir).getAllWorkspaceMetadata();
+        expect(Object.fromEntries(metadata.map((row) => [row.id, row.rootWorkspaceId]))).toEqual({
+          root: "root",
+          archived: "root",
+          grandchild: "root",
+          sibling: "root",
+          "other-root": "other-root",
+          "other-child": "other-root",
+          orphan: "missing",
+          "cycle-a": "cycle-a",
+          "cycle-b": "cycle-a",
+          "cycle-tail": "cycle-a",
+        });
+        expect(
+          config
+            .loadConfigOrDefault()
+            .projects.get(projectPath)
+            ?.workspaces.every((row) => !("rootWorkspaceId" in row))
+        ).toBe(true);
+      }
+    );
+
     it("should migrate legacy workspace without metadata file", async () => {
       const projectPath = "/fake/project";
       const workspacePath = path.join(config.srcDir, "project", "feature-branch");
