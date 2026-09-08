@@ -277,7 +277,11 @@ export class HistoryAppendProvenance {
   }
 
   /** Low-level append certification; the start must match the whole transaction. */
-  async appendChat(bytes: Buffer, atomic = false): Promise<void> {
+  async appendChat(
+    bytes: Buffer,
+    atomic = false,
+    publishAtomic?: (filePath: string, bytes: Buffer) => Promise<void>
+  ): Promise<void> {
     const transaction = transactions.getStore();
     assert(
       transaction?.active === true && transaction.chatPath === this.chatPath,
@@ -303,7 +307,9 @@ export class HistoryAppendProvenance {
           bytes = Buffer.concat([Buffer.from("\n"), bytes]);
         }
         replacement = Buffer.concat([existing, bytes]);
-        await writeFileAtomic(this.chatPath, replacement);
+        // HistoryService supplies its commit-point observer without duplicating
+        // raw-byte preservation, torn-tail repair, or append certification here.
+        await (publishAtomic ?? writeFileAtomic)(this.chatPath, replacement);
         published = true;
       } else {
         const size = Number(before.chat?.size ?? 0);
