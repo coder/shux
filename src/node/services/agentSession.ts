@@ -5210,7 +5210,12 @@ export class AgentSession {
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return Ok(undefined);
       if (!access.success) return access;
-      const captured = await this.captureRolloverRequestAssembly();
+      // A flush's promised reset was admitted when the flush dispatched; reuse that snapshot
+      // so registry changes during the flush cannot reject the emergency reset either.
+      const captured =
+        wasFlush && this.pendingRolloverSnapshot
+          ? Ok(this.pendingRolloverSnapshot)
+          : await this.captureRolloverRequestAssembly();
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return Ok(undefined);
       if (!captured.success) return captured;
@@ -5667,7 +5672,8 @@ export class AgentSession {
         (await this.checkContextBudgetHistoryAccess(options)).success
           ? await this.captureRolloverRequestAssembly()
           : undefined;
-      if (admitted?.success) {
+      // Re-read the threshold: the slider may have moved during the awaited checks above.
+      if (admitted?.success && this.compactionMonitor.getThreshold() < 1) {
         // Keep pendingRollover and pin this admitted snapshot: the promised reset must not be
         // invalidated by registry changes that happen during the flush turn itself.
         this.pendingRolloverSnapshot = admitted.data;
@@ -5683,7 +5689,7 @@ export class AgentSession {
       userMessage.parts = [{ type: "text", text: "Continue" }];
       const { contextBudgetFlush: _dropped, ...rest } = userMessage.metadata.muxMetadata;
       userMessage.metadata.muxMetadata = rest;
-      if (!rolloverEnabled) {
+      if (this.compactionMonitor.getThreshold() >= 1) {
         // Rollover was disabled after the pair was queued: drop the paired rollover entry and
         // the stale claims so nothing seals the window if rollover is re-enabled later, and a
         // later genuine rollover may offer the flush this turn never delivered.
@@ -5692,6 +5698,14 @@ export class AgentSession {
         if (this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY).removedCount > 0)
           this.emitQueuedMessageChanged();
       }
+    }
+    if (this.pendingRollover != null && this.compactionMonitor.getThreshold() >= 1) {
+      // Rollover was disabled after the intent was recorded (e.g. during a flush turn that
+      // ended without a settled tool step): a stale intent must not seal a later, unrelated
+      // send once rollover is re-enabled.
+      this.pendingRollover = undefined;
+      this.pendingRolloverSnapshot = undefined;
+      this.contextBudgetFlushClaimed = false;
     }
     const shouldRollover =
       this.compactionMonitor.getThreshold() < 1 &&
@@ -5901,7 +5915,11 @@ export class AgentSession {
     }
     // Keep the continuation's delegated-turn/goal attribution; the warning
     // itself is a separate durable prefix row when this entry dispatches.
-    const streamOptions = context.options;
+    // Attachments of the triggering send must not ride along on maintenance continuations
+    // (they would be re-sent, and could consume the flush's reserved headroom).
+    const { fileParts: _fileParts, ...streamOptions } = context.options as SendMessageOptions & {
+      fileParts?: unknown;
+    };
     // SECURITY: the flush turn is a hidden, automatically dispatched step running on a
     // transcript that may already contain injected tool output. The request builder derives
     // its memory-only tool ceiling, pinned notes path, and disabled hooks/PTC from the
@@ -8223,6 +8241,10 @@ export class AgentSession {
     const streamEndPayload = payload;
     const activeStreamGoalKind = this.activeStreamContext?.goalKind;
     const activeStreamOptions = this.activeStreamContext?.options;
+    // A final-flush turn is housekeeping, not the goal's work: its text-only finish must never
+    // count as an implicit complete_goal.
+    const activeStreamWasContextBudgetFlush =
+      this.activeStreamContext?.contextBudgetFlushTurn === true;
 
     let goalContinuationRequest: {
       sendOptions: SendMessageOptions;
@@ -8375,7 +8397,10 @@ export class AgentSession {
           // user's first manual turn answered with text is never
           // mistaken for completion. `requestContinuationAfterStreamEnd`
           // below safely no-ops once the goal flips to `complete`.
-          if (activeStreamGoalKind === GOAL_CONTINUATION_KIND) {
+          if (
+            activeStreamGoalKind === GOAL_CONTINUATION_KIND &&
+            !activeStreamWasContextBudgetFlush
+          ) {
             await this.maybeAutoCompleteGoalFromSilentContinuation(streamEndPayload);
             if (
               !this.coordinator.isCurrentTurn(turn) ||

@@ -1500,6 +1500,49 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
   });
 
+  test("a text-only flush that ends after rollover was disabled leaves no stale reset", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await h.finishAndDispatch();
+    h.session.setAutoCompactionThreshold(1);
+    // No tool step: the settled-step callback never runs; the paired Continue dispatches.
+    h.settleStream(1, { finishReason: "stop" });
+    await h.waitForRequest(3);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    h.settleStream(2, { finishReason: "stop" });
+    await h.session.waitForIdle();
+    h.session.setAutoCompactionThreshold(0.7);
+    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+  });
+
+  test("a flush turn's text-only finish never completes a goal implicitly", async () => {
+    const h = await setup();
+    const completeGoal = spyOn(
+      h.session as unknown as {
+        maybeAutoCompleteGoalFromSilentContinuation: () => Promise<void>;
+      },
+      "maybeAutoCompleteGoalFromSilentContinuation"
+    );
+    expect(
+      (
+        await h.session.sendMessage("Goal work", options, {
+          synthetic: true,
+          agentInitiated: true,
+          goalKind: GOAL_CONTINUATION_KIND,
+          goalId: "goal-budget",
+        })
+      ).success
+    ).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await h.finishAndDispatch();
+    expect((await allRows(h)).at(-1)?.metadata).toMatchObject({ kind: GOAL_CONTINUATION_KIND });
+    h.settleStream(1, { finishReason: "stop" });
+    await h.waitForRequest(3);
+    expect(completeGoal).not.toHaveBeenCalled();
+  });
+
   test("disabling rollover while the flush streams drops the pending reset and its continuation", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);

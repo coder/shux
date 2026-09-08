@@ -365,7 +365,17 @@ describe("memory tool", () => {
       expect(
         (await run(fixture.tool, { command: "rename", old_path: notes, new_path: notes })).success
       ).toBe(false);
-      // Refused destructive commands do not consume the single mutation.
+      // Refused destructive, malformed, or mis-targeted siblings do not consume the slot.
+      expect((await run(fixture.tool, { command: "create", path: notes })).success).toBe(false);
+      expect(
+        (
+          await run(fixture.tool, {
+            command: "create",
+            path: "/memories/workspace/other.md",
+            file_text: "x",
+          })
+        ).success
+      ).toBe(false);
       expect(
         (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success
       ).toBe(true);

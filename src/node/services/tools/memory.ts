@@ -152,13 +152,25 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
             error: `This turn may only create or update ${writePath}; '${input.command}' is unavailable.`,
           });
         }
-        if (pinnedMutationUsed) {
-          return Promise.resolve({
-            success: false,
-            error: `This turn allows a single memory mutation of ${writePath}; it was already used.`,
-          });
+        // Only a well-formed, correctly targeted mutation claims the single slot, so a
+        // malformed or mis-targeted sibling cannot waste the preservation step.
+        const wellFormed =
+          input.path != null &&
+          checkPinnedPath(input.path) == null &&
+          (input.command === "create"
+            ? input.file_text != null
+            : input.command === "str_replace"
+              ? input.old_str != null && input.new_str != null
+              : input.insert_line != null && input.insert_text != null);
+        if (wellFormed) {
+          if (pinnedMutationUsed) {
+            return Promise.resolve({
+              success: false,
+              error: `This turn allows a single memory mutation of ${writePath}; it was already used.`,
+            });
+          }
+          pinnedMutationUsed = true;
         }
-        pinnedMutationUsed = true;
       }
       return executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId, {
         checkReadAccess: checkPinnedPath,
