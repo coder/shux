@@ -107,6 +107,7 @@ export function ConversationScreen(props: {
   }, [transcript]);
   const agentId = resolvePersistedAgentId(props.workspace);
   const modeLocked = props.workspace.parentWorkspaceId != null;
+  // Transcript access survives checkout removal; Git actions do not.
   const transcriptOnly = props.workspace.transcriptOnly === true;
   const options = settings
     ? resolveSettings(
@@ -381,7 +382,7 @@ export function ConversationScreen(props: {
             label="View changes"
             icon={GitCompareArrows}
             onPress={props.onChanges}
-            disabled={props.workspace.kind === "scratch"}
+            disabled={props.workspace.kind === "scratch" || transcriptOnly}
           />
           <IconButton label="Connection settings" icon={Settings} onPress={props.onSettings} />
         </View>

@@ -392,6 +392,11 @@ test("transcript-only workspaces keep history and drafts but expose no send or r
   expect(view.queryByLabelText("Message")).toBeNull();
   expect(view.queryByRole("button", { name: "Send message" })).toBeNull();
   expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+  const changes = view.getByRole("button", { name: "View changes" });
+  expect(changes.getAttribute("aria-disabled")).toBe("true");
+  fireEvent.click(changes);
+  expect(callCount(view, "getProjectDiffs")).toBe(0);
+  expect(stackState.routes.at(-1)?.name).toBe("Conversation");
   fireEvent.click(oldResume);
   fireEvent.keyDown(oldInput, { key: "Enter", ctrlKey: true });
   expect(callCount(view, "sendMessage")).toBe(0);
@@ -400,6 +405,9 @@ test("transcript-only workspaces keep history and drafts but expose no send or r
   fireEvent.click(await view.findByRole("button", { name: "alpha" }));
   expect(await view.findByRole("note")).toBeDefined();
   await view.updateWorkspace(workspaces[0]);
+  expect(view.getByRole("button", { name: "View changes" }).getAttribute("aria-disabled")).not.toBe(
+    "true"
+  );
   expect(await view.findByLabelText("Message")).toHaveProperty("value", "Retained draft");
   await act(async () => fireEvent.click(view.getByRole("button", { name: "Send message" })));
   expect(callCount(view, "sendMessage")).toBe(1);
