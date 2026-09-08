@@ -1176,7 +1176,7 @@ describe("WorkspaceStore", () => {
       const createdAt = new Date().toISOString();
 
       // Setup mock stream
-      mockChatScript([{ type: "caught-up" }, tick(10)]);
+      mockChatScript([{ type: "caught-up" }, tick(10)], { keepOpen: true });
 
       createAndAddWorkspace(store, workspaceId, { name: "test-branch-2", createdAt });
 
@@ -1272,9 +1272,16 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(true);
     });
 
-    it.each(["end", "error", "client reconnect"])(
-      "re-arms hydration on %s without losing cached rows",
-      async (termination) => {
+    it.each([
+      ["end", false],
+      ["end", true],
+      ["error", false],
+      ["error", true],
+      ["client reconnect", false],
+      ["client reconnect", true],
+    ] as const)(
+      "keeps hydration active through %s backoff with cached history %s",
+      async (termination, cached) => {
         const workspaceId = "workspace-retry-hydration";
         const client = getInternal<{ client: Parameters<WorkspaceStore["setClient"]>[0] }>(
           store
@@ -1292,23 +1299,43 @@ describe("WorkspaceStore", () => {
           }
         });
         createAndAddWorkspace(store, workspaceId);
-        attempts[0].push(createHistoryMessageEvent("history-1", 1));
-        attempts[0].push(fullCaughtUpEvent());
-        expect(
-          await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)
-        ).toBe(true);
+        expect(await waitUntil(() => subscriptions === 1)).toBe(true);
+        if (cached) {
+          attempts[0].push(createHistoryMessageEvent("history-1", 1));
+          attempts[0].push(fullCaughtUpEvent());
+          expect(
+            await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)
+          ).toBe(true);
+        }
         const cachedMessages = store.getWorkspaceState(workspaceId).messages;
-        expect(cachedMessages).toHaveLength(1);
+        expect(cachedMessages).toHaveLength(cached ? 1 : 0);
+        const observed: Array<{ isHydratingTranscript: boolean; canInterrupt: boolean }> = [];
+        const unsubscribe = store.subscribeKey(workspaceId, () => {
+          const { isHydratingTranscript, canInterrupt } = store.getWorkspaceState(workspaceId);
+          observed.push({ isHydratingTranscript, canInterrupt });
+        });
 
         for (let attempt = 0; attempt < 2; attempt++) {
-          if (termination === "client reconnect") {
-            store.setClient(null);
-          } else {
-            attempts[attempt].close();
+          if (attempt > 0) {
+            attempts[attempt].push({
+              type: "stream-start",
+              workspaceId,
+              messageId: "buffered-stream",
+              model: "openai:gpt-4o-mini",
+              historySequence: 2,
+              startTime: 1_000,
+            });
+            expect(await waitUntil(() => store.getWorkspaceState(workspaceId).canInterrupt)).toBe(
+              true
+            );
           }
-          expect(
-            await waitUntil(() => !store.getWorkspaceState(workspaceId).isHydratingTranscript)
-          ).toBe(true);
+          const previousUpdates = observed.length;
+          if (termination === "client reconnect") store.setClient(null);
+          else attempts[attempt].close();
+          expect(await waitUntil(() => observed.length > previousUpdates)).toBe(true);
+          expect(subscriptions).toBe(attempt + 1);
+          expect(observed.every((state) => state.isHydratingTranscript)).toBe(true);
+          expect(observed.at(-1)?.canInterrupt).toBe(false);
           if (termination === "client reconnect") store.setClient(client);
           expect(await waitUntil(() => subscriptions === attempt + 2)).toBe(true);
           const replayState = store.getWorkspaceState(workspaceId);
@@ -1316,19 +1343,45 @@ describe("WorkspaceStore", () => {
           expect(replayState.isTranscriptCaughtUp).toBe(false);
           expect(replayState.messages).toEqual(cachedMessages);
         }
+        unsubscribe();
 
-        attempts[2].push(createHistoryMessageEvent("history-1", 1));
-        attempts[2].push(sinceCaughtUpEvent());
+        if (cached) attempts[2].push(createHistoryMessageEvent("history-1", 1));
+        attempts[2].push(cached ? sinceCaughtUpEvent() : fullCaughtUpEvent());
         expect(
           await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)
         ).toBe(true);
         expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
         expect(store.getWorkspaceState(workspaceId).messages).toEqual(cachedMessages);
-        store.setActiveWorkspaceId(null);
-        expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
         mockChatScript([], { keepOpen: true });
       }
     );
+
+    it("waits for a client before hydration and clears it on deactivation during backoff", async () => {
+      const client = getInternal<{ client: Parameters<WorkspaceStore["setClient"]>[0] }>(
+        store
+      ).client;
+      store.setClient(null);
+      const workspaceId = "workspace-pending-client";
+      createAndAddWorkspace(store, workspaceId);
+      expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
+      const events = createControllableAsyncIterable<WorkspaceChatMessage>();
+      mockOnChat.mockImplementation(async function* () {
+        yield* events.iterable;
+      });
+      store.setClient(client);
+      expect(await waitUntil(() => mockOnChat.mock.calls.length > 0)).toBe(true);
+      const updates: boolean[] = [];
+      const unsubscribe = store.subscribeKey(workspaceId, () => {
+        updates.push(store.getWorkspaceState(workspaceId).isHydratingTranscript);
+      });
+      events.close();
+      expect(await waitUntil(() => updates.length > 0)).toBe(true);
+      expect(updates.every(Boolean)).toBe(true);
+      store.setActiveWorkspaceId(null);
+      expect(store.getWorkspaceState(workspaceId).isHydratingTranscript).toBe(false);
+      unsubscribe();
+      mockChatScript([], { keepOpen: true });
+    });
 
     it("preserves optimistic startup across full replay resets", () => {
       const workspaceId = "workspace-full-replay-pending-start";
@@ -4687,13 +4740,16 @@ describe("WorkspaceStore", () => {
         releaseDuplicate = resolve;
       });
 
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorPhaseEvent(workspaceId, "call-advisor-3", "waiting_for_response", 1),
-        waitForDuplicate,
-        advisorPhaseEvent(workspaceId, "call-advisor-3", "waiting_for_response", 2),
-      ]);
+      mockChatScript(
+        [
+          caughtUpEvent(),
+          Promise.resolve(),
+          advisorPhaseEvent(workspaceId, "call-advisor-3", "waiting_for_response", 1),
+          waitForDuplicate,
+          advisorPhaseEvent(workspaceId, "call-advisor-3", "waiting_for_response", 2),
+        ],
+        { keepOpen: true }
+      );
 
       createAndAddWorkspace(store, workspaceId);
 

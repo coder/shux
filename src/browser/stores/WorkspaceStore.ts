@@ -3928,8 +3928,9 @@ export class WorkspaceStore {
         if (!this.isWorkspaceRegistered(workspaceId)) return;
         this.clearReplayBuffers(workspaceId);
         const transient = this.chatTransientState.get(workspaceId);
-        if (transient?.isHydratingTranscript && !transient.caughtUp) {
-          transient.isHydratingTranscript = false;
+        if (transient) {
+          // Backoff is still catch-up; cleared stream buffers must also invalidate cached barriers.
+          transient.isHydratingTranscript = true;
           this.states.bump(workspaceId);
         }
         if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId))
