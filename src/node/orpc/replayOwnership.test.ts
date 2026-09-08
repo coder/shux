@@ -1,7 +1,10 @@
 import { expect, test, spyOn } from "bun:test";
 import type { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
-import { createAgentSessionHarness } from "../services/agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+} from "../services/agentSession.testHarness";
 import { subscribeWorkspaceChat } from "./routerSubscriptions";
 import type { ORPCContext } from "./context";
 import { createMuxMessage } from "@/common/types/message";
@@ -139,12 +142,44 @@ test.each(["stream-end", "stream-abort", "error"])(
   "operationless replay holds manual input until its exact %s",
   async (terminal) => {
     const h = await setup();
-    const send = spyOn(h.session, "sendMessage").mockResolvedValue(Ok(undefined));
+    const order: string[] = [];
+    const readEntered = Promise.withResolvers<void>();
+    const releaseRead = Promise.withResolvers<void>();
+    const read = h.historyService.getLastMessages.bind(h.historyService);
+    // Replay publishes caught-up before startup recovery finishes. Hold its continuation
+    // observation so the terminal event must leave queued input behind that physical owner.
+    let held = false;
+    spyOn(h.historyService, "getLastMessages").mockImplementation(async (...args) => {
+      const result = await read(...args);
+      if (args[1] === 1 && !held) {
+        held = true;
+        readEntered.resolve();
+        await releaseRead.promise;
+        order.push("recovery-read-settled");
+      }
+      return result;
+    });
+    const sent = Promise.withResolvers<void>();
+    const send = spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+      order.push("manual-stream");
+      sent.resolve();
+      return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
+    });
+    h.session.onChatEvent(({ message }) => {
+      if (
+        (message.type === "stream-end" ||
+          message.type === "stream-abort" ||
+          message.type === "stream-error") &&
+        message.messageId === "engine-A"
+      )
+        order.push("exact-terminal");
+    });
     try {
       const client = h.subscribe();
       await client.caught;
+      await readEntered.promise;
       expect(h.session.isBusy()).toBe(true);
-      h.session.queueMessage("manual follow-up");
+      h.session.queueMessage("manual follow-up", { model: "openai:gpt-4o", agentId: "exec" });
       h.session.drainQueuedMessagesIfIdle();
       expect(send).not.toHaveBeenCalled();
       h.emitter.emit(terminal, {
@@ -158,6 +193,7 @@ test.each(["stream-end", "stream-abort", "error"])(
         metadata: {},
       });
       expect(h.session.isBusy()).toBe(true);
+      h.setActive(false);
       h.emitter.emit(terminal, {
         type: terminal === "error" ? "stream-error" : terminal,
         error: "provider failed",
@@ -168,9 +204,23 @@ test.each(["stream-end", "stream-abort", "error"])(
         parts: [],
         metadata: {},
       });
+      expect(h.session.isBusy()).toBe(false);
+      expect(h.session.hasActiveOrPendingTurnWork()).toBe(true);
+      expect(send).not.toHaveBeenCalled();
+      expect(order).toEqual(["exact-terminal"]);
+      releaseRead.resolve();
+      await sent.promise;
       expect(send).toHaveBeenCalledTimes(1);
-      expect(send.mock.calls[0][0]).toBe("manual follow-up");
+      expect(order).toEqual(["exact-terminal", "recovery-read-settled", "manual-stream"]);
+      const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data.filter((message) => message.id !== "seed")).toMatchObject([
+          { role: "user", parts: [{ type: "text", text: "manual follow-up" }] },
+        ]);
+      }
     } finally {
+      releaseRead.resolve();
       await h.close();
     }
   }

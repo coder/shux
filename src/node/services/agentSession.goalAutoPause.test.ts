@@ -532,65 +532,82 @@ describe("AgentSession goal safety hooks", () => {
     await session.dispose();
   });
 
-  test("a recovered budget wrap-up follow-up installs its missing reservation", async () => {
-    // Codex P2 (PRRT_kwDOPxxmWM6cRJEE): a crash between wrap-up send
-    // acceptance and tryMarkBudgetLimitInjected leaves the goal unmarked.
-    // The redispatched follow-up must install the reservation or the
-    // recovered stream's end arms a second wrap-up.
-    const workspaceId = "compaction-followup-wrapup-reservation";
-    const { session, goalService, historyService, cleanup } =
-      await createSessionHarness(workspaceId);
-    cleanups.push(cleanup);
-    const created = await setGoalOk(goalService, {
-      workspaceId,
-      objective: "Recover the owed wrap-up",
-      budgetCents: 100,
-    });
-    await goalService.recordStreamAccounting({
-      workspaceId,
-      costUsd: 1.25,
-      streamStartedAtMs: created.createdAtMs + 1,
-      streamOriginKind: "goal_continuation",
-    });
-    expect(await goalService.getGoal(workspaceId)).toMatchObject({
-      status: "budget_limited",
-      budgetLimitInjectedForGoalId: null,
-    });
-    const summary = createMuxMessage(
-      `summary-${crypto.randomUUID()}`,
-      "assistant",
-      "Compacted conversation.",
-      {
-        muxMetadata: {
-          type: "compaction-summary",
-          pendingFollowUp: {
-            text: "Wrap up the budget-limited goal.",
-            agentId: "exec",
-            model: "openai:gpt-4o",
-            goalKind: GOAL_BUDGET_LIMIT_KIND,
-            goalId: created.goalId,
+  test.each([true, false])(
+    "a recovered budget wrap-up reserves only an accepted send (accepted=%s)",
+    async (accepted) => {
+      // Codex P2 (PRRT_kwDOPxxmWM6cRJEE): a crash between wrap-up send
+      // acceptance and tryMarkBudgetLimitInjected leaves the goal unmarked.
+      // The redispatched follow-up must install the reservation or the
+      // recovered stream's end arms a second wrap-up.
+      const workspaceId = "compaction-followup-wrapup-reservation";
+      const { session, goalService, historyService, cleanup } =
+        await createSessionHarness(workspaceId);
+      cleanups.push(cleanup);
+      const created = await setGoalOk(goalService, {
+        workspaceId,
+        objective: "Recover the owed wrap-up",
+        budgetCents: 100,
+      });
+      await goalService.recordStreamAccounting({
+        workspaceId,
+        costUsd: 1.25,
+        streamStartedAtMs: created.createdAtMs + 1,
+        streamOriginKind: "goal_continuation",
+      });
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({
+        status: "budget_limited",
+        budgetLimitInjectedForGoalId: null,
+      });
+      const summary = createMuxMessage(
+        `summary-${crypto.randomUUID()}`,
+        "assistant",
+        "Compacted conversation.",
+        {
+          muxMetadata: {
+            type: "compaction-summary",
+            pendingFollowUp: {
+              text: "Wrap up the budget-limited goal.",
+              agentId: "exec",
+              model: "openai:gpt-4o",
+              goalKind: GOAL_BUDGET_LIMIT_KIND,
+              goalId: created.goalId,
+            },
           },
-        },
-      }
-    );
-    expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
-    const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
-      Promise.resolve(Ok(undefined))
-    );
+        }
+      );
+      expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+      const sendSpy = spyOn(session, "sendMessage");
+      // Ok alone can be a pre-acceptance no-op; use the real send for the positive
+      // case so reservation is proven against the durable goal-scoped history row.
+      if (!accepted) sendSpy.mockResolvedValueOnce(Ok(undefined));
+      const reserve = goalService.reserveBudgetWrapupForRedispatch.bind(goalService);
+      const reserveSpy = spyOn(goalService, "reserveBudgetWrapupForRedispatch").mockImplementation(
+        async (...args) => {
+          const history = await historyService.getLastMessages(workspaceId, 1);
+          expect(history.success && history.data[0]).toMatchObject({
+            role: "user",
+            metadata: { kind: GOAL_BUDGET_LIMIT_KIND, goalId: created.goalId },
+          });
+          return reserve(...args);
+        }
+      );
 
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+      const dispatched = await (
+        session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
+      ).dispatchPendingFollowUp();
 
-    expect(dispatched).toBe(true);
-    expect(sendSpy).toHaveBeenCalledTimes(1);
-    expect(await goalService.getGoal(workspaceId)).toMatchObject({
-      status: "budget_limited",
-      budgetLimitInjectedForGoalId: created.goalId,
-    });
-    sendSpy.mockRestore();
-    await session.dispose();
-  });
+      expect(dispatched).toBe(accepted);
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(reserveSpy).toHaveBeenCalledTimes(accepted ? 1 : 0);
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({
+        status: "budget_limited",
+        budgetLimitInjectedForGoalId: accepted ? created.goalId : null,
+      });
+      reserveSpy.mockRestore();
+      sendSpy.mockRestore();
+      await session.dispose();
+    }
+  );
 
   test("malformed persisted follow-up goal IDs are discarded during recovery", async () => {
     const workspaceId = "compaction-followup-malformed-goal-id";
