@@ -1103,7 +1103,7 @@ describe("MemoryService", () => {
       await fixture.service.create(fixture.ctx, "/memories/global/g.md", "g", "agent");
       expect(await foreign.workspaceMemoryRevision("ws-owner")).toBe(afterCreate);
       // ...a pin toggle (hot-set input, no store write) advances it...
-      await fixture.service.notifyPinChange(fixture.ctx, "/memories/workspace/shared.md");
+      await fixture.service.setPinned(fixture.ctx, "/memories/workspace/shared.md", true);
       const afterPin = await foreign.workspaceMemoryRevision("ws-owner");
       expect(Number(afterPin)).toBeGreaterThan(Number(afterCreate));
       // ...while every shared-store mutation advances it.
@@ -1169,6 +1169,14 @@ describe("MemoryService", () => {
       const root = await fixture.service.view(fixture.ctx, "/memories");
       expect(root.success).toBe(true);
       if (root.success) expect(root.output).toContain("unavailable");
+      // The prompt-context path is guarded too: the probe reports revocation
+      // (invalidating a cached context) and the index no longer lists the store.
+      expect(await fixture.service.workspaceMemoryRevision("ws-child")).toBe("revoked");
+      expect(
+        (await fixture.service.listIndexEntries(fixture.ctx)).some(
+          (entry) => entry.scope === "workspace"
+        )
+      ).toBe(false);
     });
 
     it("refuses a child's rollback into the shared store once the owner is tombstoned", async () => {

@@ -23,7 +23,7 @@ import {
   resolveMemoryProjectIdentity,
   type MemoryScopeContext,
 } from "./memoryService";
-import { memoryLogicalKey } from "./memoryMeta";
+import { MemoryMetaWriteError, memoryLogicalKey } from "./memoryMeta";
 
 type MemoryContext = Pick<
   ORPCContext,
@@ -234,31 +234,27 @@ export function setMemoryPinnedEffect(
         success: false as const,
         error: "Project memory is unavailable: no project is associated with this session",
       };
-    return yield* context.memoryMetaService.effects
-      .setPinned(
-        memoryLogicalKey(scope, relPath, {
-          projectPath: resolved.projectPath,
-          workspaceId: resolved.ownerWorkspaceId,
-        }),
-        input.pinned
+    // Sidecar write + (workspace scope) store-clock advance + change event,
+    // committed under the store's mutation lock by MemoryService.
+    return yield* Effect.tryPromise({
+      try: () => context.memoryService.setPinned(resolved.scopeCtx, input.path, input.pinned),
+      catch: (error: unknown) => error,
+    }).pipe(
+      Effect.map(() => ({ success: true as const, data: undefined })),
+      // Sidecar write failures (disk full, permissions) arrive as the typed
+      // MemoryMetaWriteError; lock timeouts and command errors map onto the
+      // same legacy string error channel instead of escaping as an untyped
+      // INTERNAL_SERVER_ERROR rejection.
+      Effect.catch((error) =>
+        Effect.succeed({
+          success: false as const,
+          error:
+            error instanceof MemoryMetaWriteError
+              ? `Failed to persist pin state: ${error.reason}`
+              : `Failed to update pin: ${getErrorMessage(error)}`,
+        })
       )
-      .pipe(
-        // Pins live in the sidecar, not the store, so nothing else emits a
-        // change: notify so the other tree members' tabs refetch too.
-        Effect.flatMap(() =>
-          Effect.promise(() => context.memoryService.notifyPinChange(resolved.scopeCtx, input.path))
-        ),
-        Effect.map(() => ({ success: true as const, data: undefined })),
-        // Sidecar write failures (disk full, permissions) arrive as the typed
-        // MemoryMetaWriteError and map onto the legacy string error channel
-        // instead of escaping as an untyped INTERNAL_SERVER_ERROR rejection.
-        Effect.catchTag("MemoryMetaWriteError", (error) =>
-          Effect.succeed({
-            success: false as const,
-            error: `Failed to persist pin state: ${error.reason}`,
-          })
-        )
-      );
+    );
   }).pipe(Effect.catchTag("MemoryWorkspaceNotFoundError", workspaceNotFoundAsStringError));
 }
 

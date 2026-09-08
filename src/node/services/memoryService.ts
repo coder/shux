@@ -1185,9 +1185,14 @@ export class MemoryService extends EventEmitter {
    */
   async workspaceMemoryRevision(workspaceId: string): Promise<string> {
     assert(workspaceId.length > 0, "workspaceMemoryRevision requires a workspaceId");
-    const revision = await readWorkspaceMemoryRevision(
-      path.join(this.config.sessionsDir, this.resolveWorkspaceMemoryOwnerId(workspaceId))
-    );
+    const owner = this.resolveWorkspaceMemoryOwnerId(workspaceId);
+    // Access revoked (acting workspace or owner tombstoned by any backend):
+    // a distinct token so a cached context built from the owner's notes is
+    // invalidated and the rebuild (listIndexEntries) then excludes the store.
+    for (const guarded of new Set([workspaceId, owner])) {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, guarded)) return "revoked";
+    }
+    const revision = await readWorkspaceMemoryRevision(path.join(this.config.sessionsDir, owner));
     return revision === null ? "missing" : String(revision);
   }
 
@@ -1232,22 +1237,32 @@ export class MemoryService extends EventEmitter {
   }
 
   /**
-   * Announces a sidecar-only change (pin toggled from the Memory tab) so other
-   * subscribers of the same store — for the shared workspace notebook, every
-   * task-tree member's tab — refetch their listing.
+   * Toggle a pin (Memory tab). Pins live in the sidecar, not the store, so
+   * nothing else emits a change or moves the store clock: for the workspace
+   * scope the sidecar write AND the clock advance happen under the store's
+   * mutation lock, so a lock timeout fails BEFORE anything is committed (no
+   * durable pin with a stale foreign hot set and a failed route), and the
+   * other tree members' tabs are told afterwards. Sidecar write failures
+   * surface as MemoryMetaWriteError.
    */
-  async notifyPinChange(ctx: MemoryScopeContext, virtualPath: string): Promise<void> {
+  async setPinned(ctx: MemoryScopeContext, virtualPath: string, pinned: boolean): Promise<void> {
     const parsed = parseMemoryPath(virtualPath);
     const scope = this.requireFilePath(parsed, virtualPath);
-    if (scope === "workspace") {
-      // A pin changes the hot set other backends derive from this store, so
-      // the store clock must move — under the same mutation lock writers
-      // hold, or an unlocked read→write could overwrite a concurrent
-      // mutation's higher value and break the clock's monotonicity.
-      const store = this.getStore(ctx, scope);
-      await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), () =>
-        this.advanceStoreRevision(store)
+    const key = this.logicalKeyFor(ctx, scope, parsed.relPath);
+    if (key === null) {
+      throw new MemoryCommandError(
+        "Project memory is unavailable: no project is associated with this session"
       );
+    }
+    if (scope === "workspace") {
+      const store = this.getStore(ctx, scope);
+      await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
+        await this.metaService.setPinned(key, pinned);
+        // A pin changes the hot set other backends derive from this store.
+        await this.advanceStoreRevision(store);
+      });
+    } else {
+      await this.metaService.setPinned(key, pinned);
     }
     this.emitChange(ctx, scope, parsed.relPath, "user");
   }
@@ -1900,6 +1915,11 @@ export class MemoryService extends EventEmitter {
     for (const scope of MEMORY_SCOPES) {
       try {
         const store = this.getStore(ctx, scope);
+        // Prompt context is a read of the (possibly shared) store: a removed
+        // child's stream in another backend must not keep indexing / hot-set
+        // reading its former owner's notes. Refused here (skipped below) like
+        // any other scope failure.
+        if (scope === "workspace") await this.assertWorkspaceStoreReadable(ctx, store);
         // Read-only enumeration (stream startup, Memory tab) must not create
         // scope roots unnecessarily. Missing roots list as empty.
         await store.assertRootSafe();
