@@ -949,8 +949,9 @@ export class CompactionHandler {
     // A replacement retained its boundary, so its cached state and renderer row must survive too.
     if (deleteResult.data === "skipped") return deleteResult;
 
-    if (this.pendingStateOwner === owner && isCurrent())
-      await this.restoreHeartbeatResetRollbackState();
+    // Once deletion commits, a new turn cannot cancel reconciliation of this owner's snapshot.
+    // A replacement pending-state owner still takes precedence over the rollback.
+    if (this.pendingStateOwner === owner) await this.restoreHeartbeatResetRollbackState();
 
     const historySequence = summaryMessage.metadata?.historySequence;
     if (isNonNegativeInteger(historySequence)) {

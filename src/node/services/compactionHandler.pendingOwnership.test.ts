@@ -7,6 +7,7 @@ import { Err } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { CompactionHandler } from "./compactionHandler";
 import { createTestHistoryService } from "./testHistoryService";
+import { historyWriteLockPath } from "./workspaceRemoval";
 
 const workspaceId = "pending-consumers";
 const followUp = { text: "wake", model: "openai:gpt-4o", agentId: "exec" };
@@ -323,6 +324,39 @@ describe("exact pending snapshot consumption", () => {
     }
   );
 
+  it.each([false, true])(
+    "committed heartbeat rollback restores its snapshot after admission changes (prior state=%s)",
+    async (hasPrevious) => {
+      const previous = hasPrevious ? await publish("a") : null;
+      await publish("b");
+      const rows = await store.historyService.getLastMessages(workspaceId, 1);
+      assert(rows.success && rows.data.length === 1, "Expected B boundary");
+      const historyPath = path.join(store.config.sessionsDir, workspaceId, "chat.jsonl");
+      const lockPath = historyWriteLockPath(store.config.rootDir, workspaceId);
+      const unlink = fs.unlink;
+      let current = true;
+      spyOn(fs, "unlink").mockImplementation(async (target) => {
+        if (String(target) === lockPath && current) {
+          // Admission changes during real lock release, after the boundary deletion committed.
+          expect((await fs.readFile(historyPath)).length).toBe(0);
+          current = false;
+        }
+        return unlink(target);
+      });
+      const emitted = spyOn(emitter, "emit");
+      expect(
+        await handler.rollbackHeartbeatContextResetBoundary(rows.data[0], () => current)
+      ).toEqual({ success: true, data: "applied" });
+      expect(current).toBe(false);
+      expect(await handler.peekPendingState()).toEqual(previous);
+      expect(await restart().peekPendingState()).toEqual(previous);
+      expect(emitted).toHaveBeenCalledWith("chat-event", {
+        workspaceId,
+        message: { type: "delete", historySequences: [rows.data[0].metadata?.historySequence] },
+      });
+    }
+  );
+
   it.each(["before-delete", "after-delete"] as const)(
     "held heartbeat cleanup preserves successor pending state (%s)",
     async (phase) => {
@@ -340,12 +374,14 @@ describe("exact pending snapshot consumption", () => {
           return result ?? cleanup(...args);
         }
       );
-      const rollback = handler.rollbackHeartbeatContextResetBoundary(rows.data[0]);
+      let current = true;
+      const rollback = handler.rollbackHeartbeatContextResetBoundary(rows.data[0], () => current);
       try {
         await entered.promise;
         const successor = await publish("b");
         const bytes = await fs.readFile(pendingPath, "utf8");
         const emitted = spyOn(emitter, "emit");
+        current = false;
         release.resolve();
         expect(await rollback).toEqual({
           success: true,
@@ -359,6 +395,7 @@ describe("exact pending snapshot consumption", () => {
           });
         expect(await fs.readFile(pendingPath, "utf8")).toBe(bytes);
         expect(await handler.peekPendingState()).toEqual(successor);
+        expect(await restart().peekPendingState()).toEqual(successor);
       } finally {
         release.resolve();
         await rollback;

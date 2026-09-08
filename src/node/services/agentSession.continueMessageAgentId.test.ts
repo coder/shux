@@ -2,6 +2,7 @@ import type { TurnCoordinator } from "./turnCoordinator";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
 import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/message";
+import assert from "@/common/utils/assert";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import type { Config } from "@/node/config";
 import { AgentSession } from "./agentSession";
@@ -176,9 +177,13 @@ describe("AgentSession continue-message agentId fallback", () => {
     };
   };
 
-  test.each([false, true])(
-    "a new turn during queued follow-up cleanup preserves the summary (heartbeat=%s)",
-    async (heartbeat) => {
+  test.each(
+    [false, true].flatMap((heartbeat) =>
+      [false, true].map((published) => ({ heartbeat, published }))
+    )
+  )(
+    "a new turn respects the follow-up cleanup receipt (heartbeat=$heartbeat, published=$published)",
+    async ({ heartbeat, published }) => {
       const summary = heartbeat
         ? heartbeatBoundaryMessage()
         : compactionSummaryMessage("summary", idleFollowUp());
@@ -187,9 +192,10 @@ describe("AgentSession continue-message agentId fallback", () => {
       const release = Promise.withResolvers<void>();
       const cleanup = historyService.cleanupCompactionFollowUp.bind(historyService);
       spyOn(historyService, "cleanupCompactionFollowUp").mockImplementationOnce(async (...args) => {
+        const result = published ? await cleanup(...args) : undefined;
         entered.resolve();
         await release.promise;
-        return cleanup(...args);
+        return result ?? cleanup(...args);
       });
       const changed = mock(() => undefined);
       internals.onPostCompactionStateChange = changed;
@@ -206,10 +212,15 @@ describe("AgentSession continue-message agentId fallback", () => {
         release.resolve();
         expect(await dispatch).toBe(false);
         const history = await historyService.getLastMessages("ws", 1);
-        expect(history.success && history.data[0].metadata?.muxMetadata).toHaveProperty(
-          "pendingFollowUp"
-        );
-        expect(changed).not.toHaveBeenCalled();
+        assert(history.success, "Expected history after follow-up cleanup");
+        if (!published) {
+          expect(history.data[0].metadata?.muxMetadata).toHaveProperty("pendingFollowUp");
+        } else if (heartbeat) {
+          expect(history.data).toHaveLength(0);
+        } else {
+          expect(history.data[0].metadata?.muxMetadata).not.toHaveProperty("pendingFollowUp");
+        }
+        expect(changed).toHaveBeenCalledTimes(published && heartbeat ? 1 : 0);
       } finally {
         release.resolve();
         await dispatch;
