@@ -6015,9 +6015,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               for (const project of cfg.projects.values()) {
                 for (const workspace of project.workspaces) {
                   if (workspace.parentWorkspaceId === workspaceId) {
-                    if (!workspace.memoryOwnerWorkspaceId) {
-                      workspace.memoryOwnerWorkspaceId = sharedMemoryOwnerId;
-                    }
+                    workspace.memoryOwnerWorkspaceId ??= sharedMemoryOwnerId;
                     if (workspace.id !== undefined) pinned.push(workspace.id);
                   }
                 }
@@ -6032,7 +6030,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             const persisted = this.config.loadConfigOrDefault();
             for (const id of pinnedIds) {
               const entry = findWorkspaceEntry(persisted, id);
-              if (entry === null || !entry.workspace.memoryOwnerWorkspaceId) {
+              if (!entry?.workspace.memoryOwnerWorkspaceId) {
                 throw new Error(`memory owner pin for descendant ${id} did not persist`);
               }
             }
