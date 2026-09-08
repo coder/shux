@@ -7,6 +7,7 @@ import { SESSION_HISTORY_MAX_SCAN_BYTES } from "@/common/constants/contextBudget
 import {
   hasRawResetMarker,
   hasAmbiguousResetKeys,
+  hasUnreadableHistoryResetEvidence,
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
   readProviderHistoryFromLatestBoundary,
@@ -131,6 +132,41 @@ function tailCutChangesProviderContext(removedMessages: MuxMessage[]): boolean {
       preserveReasoningOnly: true,
     })
   );
+}
+
+function deletionCreatesRawReset(
+  rows: readonly HistoryRewriteRow[],
+  deletedIds: ReadonlySet<string>,
+  activeRemoved: ReadonlySet<MuxMessage>
+): boolean {
+  let originalRun: Buffer[] = [];
+  let joinedRun: Buffer[] = [];
+  let existingReset = false;
+  let removedActive = false;
+  const createdReset = () =>
+    removedActive &&
+    !existingReset &&
+    !hasUnreadableHistoryResetEvidence(originalRun) &&
+    hasUnreadableHistoryResetEvidence(joinedRun);
+  // Readable rows break the raw reset probe, even when provider-ineligible.
+  // Removing such a separator can seal captured context without removing it.
+  for (const row of rows) {
+    if (!row.message) {
+      originalRun.push(row.raw);
+      joinedRun.push(row.raw);
+    } else if (deletedIds.has(row.message.id)) {
+      existingReset ||= hasUnreadableHistoryResetEvidence(originalRun);
+      originalRun = [];
+      removedActive ||= activeRemoved.has(row.message);
+    } else {
+      if (createdReset()) return true;
+      originalRun = [];
+      joinedRun = [];
+      existingReset = false;
+      removedActive = false;
+    }
+  }
+  return createdReset();
 }
 
 function stripContextUsage(message: MuxMessage): MuxMessage {
@@ -3384,7 +3420,7 @@ export class HistoryService {
           const historyEntries = this.serializeHistoryRewrite(rows, workspaceId, (row) =>
             ids.has(row.id) ? null : row
           );
-          await this.fenceDeletedMessagesUnderHistoryLock(workspaceId, messages, ids);
+          await this.fenceDeletedMessagesUnderHistoryLock(workspaceId, rows, ids);
           await writeFileAtomic(this.getChatHistoryPath(workspaceId), historyEntries);
 
           const maxSeq = filteredMessages.reduce((max, message) => {
@@ -3436,7 +3472,7 @@ export class HistoryService {
 
   private async fenceDeletedMessagesUnderHistoryLock(
     workspaceId: string,
-    messages: MuxMessage[],
+    rows: HistoryRewriteRow[],
     deletedIds: ReadonlySet<string>,
     newerMessageCount = 0
   ): Promise<void> {
@@ -3453,10 +3489,14 @@ export class HistoryService {
     // Archive fallback excludes all newer chat rows. Matching IDs across files
     // would conflate retained duplicates with occurrences this write removes.
     const activeCount = Math.max(0, providerMessages.length - newerMessageCount);
+    const messages = rows.flatMap((row) => (row.message ? [row.message] : []));
     const removed = messages
       .slice(Math.max(0, messages.length - activeCount))
       .filter((message) => deletedIds.has(message.id));
-    if (tailCutChangesProviderContext(removed)) {
+    if (
+      tailCutChangesProviderContext(removed) ||
+      deletionCreatesRawReset(rows, deletedIds, new Set(removed))
+    ) {
       // Call only after serialization admits the rewrite, immediately before
       // its write. A later disk failure must not restore the old generation.
       await this.getContinuousCompactionJournal(workspaceId).advanceGenerationUnderHistoryLock();
@@ -3493,7 +3533,7 @@ export class HistoryService {
         );
         await this.fenceDeletedMessagesUnderHistoryLock(
           workspaceId,
-          archiveMessages,
+          archiveRows,
           new Set([messageId]),
           messages.length
         );
@@ -3506,7 +3546,7 @@ export class HistoryService {
         row.id === messageId ? null : row
       );
 
-      await this.fenceDeletedMessagesUnderHistoryLock(workspaceId, messages, new Set([messageId]));
+      await this.fenceDeletedMessagesUnderHistoryLock(workspaceId, rows, new Set([messageId]));
       // Atomic write prevents corruption if app crashes mid-write
       await writeFileAtomic(historyPath, historyEntries);
 

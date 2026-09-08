@@ -178,6 +178,19 @@ function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMess
   }
 }
 
+/** Use the provider reader's probe when rewrites join previously separated unreadable rows. */
+export function hasUnreadableHistoryResetEvidence(rows: readonly Buffer[]): boolean {
+  const probe: HistoryResetProbe = { resetProbe: "", resetStage: 0, possibleReset: false };
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const raw = rows[i].at(-1) === 10 ? rows[i].subarray(0, -1) : rows[i];
+    addHistoryResetProbe(probe, raw, true);
+    if (raw.length <= SESSION_HISTORY_MAX_LINE_BYTES)
+      classifyHistoryScanRow(raw.toString("utf8"), probe);
+    if (probe.possibleReset) return true;
+  }
+  return false;
+}
+
 function historyFileStamp(
   stat: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number } | undefined
 ): string {

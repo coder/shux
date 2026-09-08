@@ -1326,6 +1326,122 @@ describe("HistoryService", () => {
       }
     );
 
+    it.each([
+      ...["single", "batch", "partial", "archive"].map((method) => ({ method, variant: "new" })),
+      ...[
+        "retained boundary",
+        "existing reset",
+        "retained separator",
+        "missing token",
+        "escaped junk",
+      ].map((variant) => ({ method: "single", variant })),
+    ])(
+      "$method deletion classifies joining malformed fragments ($variant)",
+      async ({ method, variant }) => {
+        const old = row("old");
+        const separator = createMuxMessage("separator", "assistant", "");
+        const fresh = row("fresh");
+        const retained =
+          variant === "retained separator" ? [createMuxMessage("retained", "assistant", "")] : [];
+        const suffix = variant === "retained boundary" ? [boundary()] : [];
+        const source = [old, separator, ...retained, fresh, ...suffix];
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(
+          method === "archive" ? source : [],
+          method === "archive" ? [] : source
+        );
+        const targetPath = method === "archive" ? archivePath : chatPath;
+        const left = Buffer.from(
+          variant === "existing reset"
+            ? '{"metadata":{"contextBoundaryKind":"reset"},broken\n'
+            : '{"metadata":{"contextBoundaryKind"\n'
+        );
+        const right =
+          variant === "escaped junk"
+            ? Buffer.concat([
+                Buffer.from("?junk"),
+                Buffer.from([0xff]),
+                Buffer.from(':"res\\u0065t"}}\n'),
+              ])
+            : Buffer.from(variant === "missing token" ? ':"other"}}\n' : ':"reset"}}\n');
+        const tail = Buffer.concat([bytes(retained), right, bytes([fresh, ...suffix])]);
+        await fs.writeFile(
+          targetPath,
+          Buffer.concat([bytes([old]), left, bytes([separator]), tail])
+        );
+        const before = await service.getHistoryFromLatestBoundary(ws);
+        assert(before.success);
+        expect(before.data.map((message) => message.id)).toEqual(
+          variant === "retained boundary"
+            ? ["sealed"]
+            : [
+                ...(variant === "existing reset" ? [] : ["old"]),
+                "separator",
+                ...retained.map((message) => message.id),
+                "fresh",
+              ]
+        );
+        const { store, receipt } = await capturePublication();
+        const result =
+          method === "partial"
+            ? await deleteErroredPlaceholder("separator")
+            : method === "batch"
+              ? await service.deleteMessages(ws, ["separator"])
+              : await service.deleteMessage(ws, "separator");
+        expect(result.success).toBe(true);
+        expect(await fs.readFile(targetPath)).toEqual(Buffer.concat([bytes([old]), left, tail]));
+        const after = await service.getHistoryFromLatestBoundary(ws);
+        assert(after.success);
+        const fenced = variant === "new" || variant === "escaped junk";
+        expect(after.data.map((message) => message.id)).toEqual(
+          variant === "retained boundary"
+            ? ["sealed"]
+            : [
+                ...(fenced || variant === "existing reset" ? [] : ["old"]),
+                ...retained.map((message) => message.id),
+                "fresh",
+              ]
+        );
+        expect((await store.captureGeneration()) !== receipt.publicationGeneration).toBe(fenced);
+        if (!fenced) {
+          expect(await store.read()).toEqual(receipt);
+          return;
+        }
+        const foreignHistory = new HistoryService(config);
+        const foreign = foreignHistory.getContinuousCompactionJournal(ws);
+        expect(
+          await foreign.recordFallbackPrefix(
+            receipt,
+            { modelString: "anthropic:next", prefix },
+            () => true
+          )
+        ).toBeNull();
+        expect(
+          (
+            await foreignHistory.persistBoundaryWithTailCopies(
+              ws,
+              structuredClone(receipt.boundary),
+              [],
+              false,
+              () => true,
+              {
+                publication: { generation: receipt.publicationGeneration, journal: receipt },
+                onCommitted: () => undefined,
+              }
+            )
+          ).success
+        ).toBe(false);
+        expect(await foreign.read()).toBeNull();
+        expect(await foreign.write(receipt, prefix, () => true)).toBeNull();
+        expect(
+          await foreign.write(
+            { ...receipt, publicationGeneration: await foreign.captureGeneration() },
+            prefix,
+            () => true
+          )
+        ).not.toBeNull();
+      }
+    );
+
     it.each(
       ["single", "batch", "archive", "partial"].flatMap((method) =>
         ["generation", "history"].map((stage) => ({ method, stage }))
