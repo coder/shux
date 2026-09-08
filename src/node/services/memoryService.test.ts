@@ -1011,6 +1011,32 @@ describe("MemoryService", () => {
       expect(await pathExists(path.join(ownerSessionDir, "memory", "n.md"))).toBe(true);
     });
 
+    it("refuses a rollback from a tombstoned acting workspace (orphaned journal)", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const [row] = await readRefinementEvents(childSessionDir);
+
+      // Removal took the orphan path: the child's journal stays on disk, but
+      // the child is tombstoned and must not mutate the owner's live notebook.
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-child");
+      await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+
+      const refused = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        id: row.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("this workspace was removed");
+      expect(await pathExists(path.join(ownerSessionDir, "memory", "n.md"))).toBe(true);
+      expect(await readRefinementEvents(childSessionDir)).toHaveLength(1);
+    });
+
     it("notifyExternalMutation emits one owner-addressed event per touched scope", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

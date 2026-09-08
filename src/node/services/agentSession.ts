@@ -676,6 +676,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   replayStream?(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
   getProvidersConfig(): ProvidersConfigMap | null;
   isExperimentEnabled(experimentId: ExperimentId): boolean;
+  probeMemoryOwnership?(workspaceId: string): void;
   buildMemorySessionContext?(
     workspaceId: string,
     modelString: string,
@@ -9823,6 +9824,12 @@ export class AgentSession {
       this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
+    // Ownership probe first: a removed owner invalidates this cache
+    // synchronously (see AIService.probeMemoryOwnership), so the lookup below
+    // never serves an index built from a store this workspace no longer reads.
+    if (memoryEnabled && typeof this.aiService.probeMemoryOwnership === "function") {
+      this.aiService.probeMemoryOwnership(this.workspaceId);
+    }
     const cached = cache.get(modelString);
     // Policy changes must not retain a previously injected extra (including index-only lookups).
     if (

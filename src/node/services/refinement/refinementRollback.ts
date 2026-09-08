@@ -852,20 +852,29 @@ export async function rollbackRefinement(
     // targetMutationLocks.ts.
     const targetLockRoot = inferMemoryLayout(opts.sessionDir)?.muxRoot ?? null;
     const applied = await withTargetMutationLocks(targetLockRoot, lockKeys, async () => {
-      // Shared-store owner teardown gate: a delete inverse expects its target
-      // absent, so divergence alone would let a rollback that was waiting on
-      // this lock recreate the removed owner's <sessionDir>/memory. Same
-      // tombstone MemoryService checks pre-commit (r61), same lock.
-      if (opts.sharedWorkspaceMemorySessionDir !== undefined && targetLockRoot !== null) {
-        const ownerSessionDir = path.resolve(opts.sharedWorkspaceMemorySessionDir);
-        const ownerMemoryRoot = path.join(ownerSessionDir, "memory");
-        if (
-          lockKeys.includes(ownerMemoryRoot) &&
-          (await isWorkspaceRemovalTombstoned(targetLockRoot, path.basename(ownerSessionDir)))
-        ) {
-          throw new RollbackError(
-            `Refusing rollback of '${opts.id}': the workspace owning the shared memory store was removed`
-          );
+      // Teardown gates (r61), same tombstone MemoryService checks pre-commit,
+      // same lock. Acting workspace: removal's fail-closed orphan path leaves
+      // the journal on disk but the workspace tombstoned, and a rollback from
+      // it must not mutate anything nor append into the retained session.
+      // Shared-store owner: a delete inverse expects its target absent, so
+      // divergence alone would let a rollback that was waiting on this lock
+      // recreate the removed owner's <sessionDir>/memory.
+      if (targetLockRoot !== null) {
+        const actingSessionDir = path.resolve(opts.sessionDir);
+        if (await isWorkspaceRemovalTombstoned(targetLockRoot, path.basename(actingSessionDir))) {
+          throw new RollbackError(`Refusing rollback of '${opts.id}': this workspace was removed`);
+        }
+        if (opts.sharedWorkspaceMemorySessionDir !== undefined) {
+          const ownerSessionDir = path.resolve(opts.sharedWorkspaceMemorySessionDir);
+          const ownerMemoryRoot = path.join(ownerSessionDir, "memory");
+          if (
+            lockKeys.includes(ownerMemoryRoot) &&
+            (await isWorkspaceRemovalTombstoned(targetLockRoot, path.basename(ownerSessionDir)))
+          ) {
+            throw new RollbackError(
+              `Refusing rollback of '${opts.id}': the workspace owning the shared memory store was removed`
+            );
+          }
         }
       }
       // Re-verify INSIDE the lock, immediately before mutating: a writer that

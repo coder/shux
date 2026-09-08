@@ -247,6 +247,18 @@ export class AIService extends EventEmitter {
   }
 
   /**
+   * Re-check who owns this workspace's `/memories/workspace` store. Memoized
+   * and stamp-validated in MemoryService, so this is one stat per call; when
+   * another backend removed the owner since the last turn, the resulting
+   * `ownersInvalidated` event clears the affected sessions' cached context
+   * synchronously — AgentSession calls this BEFORE consulting its cache so the
+   * current request, not the next one, rebuilds from the right store.
+   */
+  probeMemoryOwnership(workspaceId: string): void {
+    this.turnRequestBuilderBindings.memoryService?.resolveWorkspaceMemoryOwnerId(workspaceId);
+  }
+
+  /**
    * Build the session-segment memory context: the index snapshot advertised
    * in the memory tool description, plus the hot-memories block (pinned +
    * frequently used memory files; memory-hot-set sub-experiment). Returns

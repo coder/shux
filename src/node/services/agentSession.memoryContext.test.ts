@@ -32,6 +32,7 @@ function createSession(args: {
   historyService: HistoryService;
   sessionDir: string;
   buildMemorySessionContext: AIService["buildMemorySessionContext"];
+  probeMemoryOwnership?: AIService["probeMemoryOwnership"];
   isExperimentEnabled?: AIService["isExperimentEnabled"];
 }): AgentSession {
   const aiEmitter = new EventEmitter();
@@ -50,6 +51,7 @@ function createSession(args: {
     ),
     stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
     buildMemorySessionContext: args.buildMemorySessionContext,
+    probeMemoryOwnership: args.probeMemoryOwnership,
     isExperimentEnabled: args.isExperimentEnabled ?? (() => false),
   } as unknown as AIService;
 
@@ -148,6 +150,43 @@ describe("AgentSession memory context", () => {
       expect(await inFlight).toEqual(context);
       expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(4);
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  test("probes memory ownership before consulting the cache so a removed owner rebuilds this request", async () => {
+    using sessionDir = new DisposableTempDir("agent-session-memory-context-probe");
+    const { historyService, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+    const context: MemorySessionContext = { indexEntries: [], hotMemoriesBlock: null };
+    const buildMemorySessionContext = mock(() => Promise.resolve(context));
+    // Simulates MemoryService's stamp check finding a removed owner: the
+    // synchronous ownersInvalidated → core.ts → invalidateMemoryContext chain.
+    let ownerRemoved = false;
+    const sessionRef: { current?: AgentSession } = {};
+    const probeMemoryOwnership = mock(() => {
+      if (ownerRemoved) sessionRef.current?.invalidateMemoryContext();
+    });
+    const session = createSession({
+      historyService,
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      buildMemorySessionContext,
+      probeMemoryOwnership,
+      isExperimentEnabled: (id) => id === EXPERIMENT_IDS.MEMORY,
+    });
+    sessionRef.current = session;
+    const priv = session as unknown as PrivateSessionAccess;
+    try {
+      await priv.resolveMemoryContext("test-model");
+      await priv.resolveMemoryContext("test-model");
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
+      expect(probeMemoryOwnership).toHaveBeenCalledTimes(2);
+
+      ownerRemoved = true;
+      // The probe runs before the cache read, so THIS request rebuilds.
+      await priv.resolveMemoryContext("test-model");
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
       await session.dispose();
     }
