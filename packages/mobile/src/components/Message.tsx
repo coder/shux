@@ -179,6 +179,9 @@ function Tool(props: {
     .replace(/^./, (letter) => letter.toUpperCase());
   const hint = toolHint(props.part.input);
   const status = toolStatus(props.part, props.streaming, props.interrupted);
+  // Live tools execute serially: queued questions are not registered for answers yet.
+  // Recovered partials rely on the parent's eligibility check instead of an execution timestamp.
+  const waitingForExecution = props.streaming && props.part.executionStartedAt == null;
   return (
     <View style={{ gap: spacing.sm }}>
       <Pressable
@@ -220,7 +223,7 @@ function Tool(props: {
       {questionInput && (
         <QuestionForm
           {...questionInput}
-          disabled={!props.canAnswer}
+          disabled={!props.canAnswer || waitingForExecution}
           onSubmit={(answers) => props.onAnswer(props.part.toolCallId, answers)}
         />
       )}

@@ -206,7 +206,7 @@ export function CreateWorkspace(props: {
           editable={!busy}
           autoCapitalize="sentences"
           returnKeyType={project ? "next" : "done"}
-          onSubmitEditing={() => branchInput.current?.focus()}
+          onSubmitEditing={project ? () => branchInput.current?.focus() : create}
         />
         {project && (
           <>
@@ -229,6 +229,7 @@ export function CreateWorkspace(props: {
               placeholder="Select or enter a branch"
               editable={!busy && !loading}
               returnKeyType="done"
+              onSubmitEditing={create}
             />
             {branches.length > 0 && (
               <View style={styles.branches}>

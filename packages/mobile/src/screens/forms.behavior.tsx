@@ -17,6 +17,7 @@ import { ChangesScreen } from "./ChangesScreen";
 import { ModelSettings } from "./ModelSettings";
 import { ConversationScreen } from "./ConversationScreen";
 import type { WorkspaceChatMessage } from "../transcript";
+import { applyChatEvent, createTranscriptState } from "../transcript";
 import { Navigator } from "./Navigator";
 import { SettingsScreen } from "./SettingsScreen";
 import type { ChatSettings, SettingsData } from "../settings";
@@ -342,6 +343,90 @@ test("workspace creation cannot be dismissed or submitted twice while the server
   });
   expect(selected).toBe(workspace);
 });
+
+test.each([false, true])(
+  "workspace final-field Done creates once with validation and IME protection (project=%s)",
+  async (project) => {
+    const calls: Array<{ method: string; input: unknown }> = [];
+    let resolve!: (value: { success: true; metadata: FrontendWorkspaceMetadata }) => void;
+    const created = new Promise<{ success: true; metadata: FrontendWorkspaceMetadata }>((done) => {
+      resolve = done;
+    });
+    const selected: FrontendWorkspaceMetadata[] = [];
+    const client = createORPCClient<MobileClient>({
+      call: async (path, input) => {
+        const method = path.join(".");
+        if (method === "projects.listBranches")
+          return { branches: ["main"], recommendedTrunk: "main" };
+        if (method !== (project ? "workspace.create" : "workspace.createScratch"))
+          throw new Error(`Unexpected procedure ${method}`);
+        calls.push({ method, input });
+        return created;
+      },
+    });
+    const signal = new AbortController().signal;
+    const renderForm = (connected: boolean) => (
+      <CreateWorkspace
+        client={client}
+        signal={signal}
+        connected={connected}
+        projects={[["/project", { workspaces: [], displayName: "Example" }]]}
+        onReconnect={async () => {}}
+        onClose={() => {}}
+        onCreated={(value) => {
+          selected.push(value);
+        }}
+      />
+    );
+    const view = render(renderForm(false));
+    const title = view.getByLabelText("Title (optional)");
+    fireEvent.change(title, { target: { value: "New task" } });
+    let finalInput = title;
+    if (project) {
+      fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+      fireEvent.click(view.getByRole("button", { name: "Example" }));
+      await waitFor(() => expect(view.getByDisplayValue("main")).toBeDefined());
+      title.focus();
+      fireEvent.keyDown(title, { key: "Enter", keyCode: 13 });
+      expect(document.activeElement).toBe(view.getByLabelText("Branch name (optional)"));
+      fireEvent.keyDown(view.getByLabelText("Branch name (optional)"), {
+        key: "Enter",
+        keyCode: 13,
+      });
+      finalInput = view.getByLabelText("Base branch");
+      expect(document.activeElement).toBe(finalInput);
+    }
+    fireEvent.keyDown(finalInput, { key: "Enter", keyCode: 13 });
+    expect(calls).toHaveLength(0);
+    view.rerender(renderForm(true));
+    if (project) {
+      fireEvent.change(finalInput, { target: { value: "   " } });
+      fireEvent.keyDown(finalInput, { key: "Enter", keyCode: 13 });
+      expect(calls).toHaveLength(0);
+      fireEvent.change(finalInput, { target: { value: "main" } });
+    }
+    fireEvent.keyDown(finalInput, { key: "Enter", keyCode: 13, isComposing: true });
+    fireEvent.keyDown(finalInput, { key: "Enter", keyCode: 229 });
+    expect(calls).toHaveLength(0);
+    fireEvent.keyDown(finalInput, { key: "Enter", keyCode: 13 });
+    expect(calls).toHaveLength(1);
+    fireEvent.keyDown(finalInput, { key: "Enter", keyCode: 13 });
+    fireEvent.click(
+      view.getByRole("button", { name: project ? "Create worktree" : "Create scratch chat" })
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0].input).toMatchObject(
+      project
+        ? { projectPath: "/project", title: "New task", trunkBranch: "main" }
+        : { title: "New task" }
+    );
+    await act(async () => {
+      resolve({ success: true, metadata: workspace });
+      await created;
+    });
+    expect(selected).toEqual([workspace]);
+  }
+);
 
 const pickerValue: ChatSettings = {
   agentId: "exec",
@@ -870,6 +955,7 @@ test("question answers remain inline and require complete input before submissio
     toolCallId: "question",
     toolName: "ask_user_question",
     state: "input-available",
+    executionStartedAt: 0,
     input: {
       questions: [
         {
@@ -1020,6 +1106,112 @@ function prefilledQuestionPart(
   };
 }
 
+test("queued live questions cannot answer until their own execution starts, while partial recovery remains available", async () => {
+  const answers: Array<unknown> = [];
+  const client = createORPCClient<MobileClient>({
+    call: async (path, input) => {
+      if (path.join(".") !== "workspace.answerAskUserQuestion")
+        throw new Error("Unexpected procedure");
+      answers.push(input);
+      return { success: true };
+    },
+  });
+  const onAnswer = async (toolCallId: string, value: Record<string, string>) => {
+    await client.workspace.answerAskUserQuestion({
+      workspaceId: "workspace",
+      toolCallId,
+      answers: value,
+    });
+  };
+  let transcript = applyChatEvent(createTranscriptState(), {
+    type: "stream-start",
+    workspaceId: "workspace",
+    messageId: "parallel",
+    historySequence: 1,
+    startTime: 0,
+    model: "local:one",
+  });
+  for (const id of ["first", "second"]) {
+    const part = prefilledQuestionPart({ [id]: "main" }, false, id, id);
+    transcript = applyChatEvent(transcript, {
+      type: "tool-call-start",
+      workspaceId: "workspace",
+      messageId: "parallel",
+      toolCallId: id,
+      toolName: "ask_user_question",
+      args: part.input,
+      tokens: 1,
+      timestamp: 0,
+    });
+  }
+  const renderMessage = (canAnswer = true) => (
+    <Message
+      message={transcript.messages[0]}
+      streaming={transcript.streaming}
+      canAnswer={canAnswer}
+      onAnswer={onAnswer}
+    />
+  );
+  const view = render(renderMessage());
+  const second = within(view.getByRole("radiogroup", { name: "second" }));
+  fireEvent.click(second.getByRole("radio", { name: "next" }));
+  expect(second.getByRole("radio", { name: "main" }).getAttribute("aria-checked")).toBe("true");
+  for (const button of view.getAllByRole("button", { name: "Send answers" }))
+    fireEvent.click(button);
+  expect(answers).toHaveLength(0);
+  transcript = applyChatEvent(transcript, {
+    type: "tool-call-execution-start",
+    workspaceId: "workspace",
+    messageId: "parallel",
+    toolCallId: "first",
+    timestamp: 0,
+  });
+  view.rerender(renderMessage());
+  expect(second.getByRole("radio", { name: "main" }).getAttribute("aria-disabled")).toBe("true");
+  await act(async () => {
+    fireEvent.click(view.getAllByRole("button", { name: "Send answers" })[0]);
+  });
+  expect(answers).toEqual([
+    { workspaceId: "workspace", toolCallId: "first", answers: { first: "main" } },
+  ]);
+  transcript = applyChatEvent(transcript, {
+    type: "tool-call-execution-start",
+    workspaceId: "workspace",
+    messageId: "parallel",
+    toolCallId: "second",
+    timestamp: 1,
+  });
+  view.rerender(renderMessage(false));
+  fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+  expect(answers).toHaveLength(1);
+  view.rerender(renderMessage());
+  await act(async () => {
+    fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+  });
+  expect(answers[1]).toEqual({
+    workspaceId: "workspace",
+    toolCallId: "second",
+    answers: { second: "main" },
+  });
+  view.rerender(
+    <Message
+      message={toolMessage(prefilledQuestionPart({ "Which branch?": "main" }, false, "recovered"), {
+        partial: true,
+      })}
+      canAnswer
+      onAnswer={onAnswer}
+    />
+  );
+  await act(async () => {
+    fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+  });
+  expect(answers[2]).toEqual({
+    workspaceId: "workspace",
+    toolCallId: "recovered",
+    answers: { "Which branch?": "main" },
+  });
+});
+
 test.each([
   { multi: false, answer: "main", choices: ["main"], other: null },
   { multi: false, answer: "feature, urgent", choices: ["Other"], other: "feature, urgent" },
@@ -1080,7 +1272,10 @@ test("prefilled drafts preserve user edits across deltas but reset for a differe
   });
   view.rerender(
     <Message
-      message={toolMessage(prefilledQuestionPart({ "Which branch?": "next" }))}
+      message={toolMessage({
+        ...prefilledQuestionPart({ "Which branch?": "next" }),
+        executionStartedAt: 0,
+      })}
       streaming
       canAnswer
       onAnswer={onAnswer}
