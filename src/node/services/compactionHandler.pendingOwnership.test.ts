@@ -31,13 +31,14 @@ describe("exact pending snapshot consumption", () => {
   let handler: CompactionHandler;
   let sessionDir: string;
   let pendingPath: string;
+  let emitter: EventEmitter;
 
   function restart() {
     return new CompactionHandler({
       workspaceId,
       historyService: store.historyService,
       sessionDir,
-      emitter: new EventEmitter(),
+      emitter,
     });
   }
 
@@ -45,6 +46,7 @@ describe("exact pending snapshot consumption", () => {
     store = await createTestHistoryService();
     sessionDir = path.join(store.tempDir, "pending");
     pendingPath = path.join(sessionDir, "post-compaction.json");
+    emitter = new EventEmitter();
     handler = restart();
   });
 
@@ -318,6 +320,49 @@ describe("exact pending snapshot consumption", () => {
       else await handler.discardPendingState("context_exceeded", consumed);
       expect(await handler.peekPendingState()).toBeNull();
       expect(await restart().peekPendingState()).toBeNull();
+    }
+  );
+
+  it.each(["before-delete", "after-delete"] as const)(
+    "held heartbeat cleanup preserves successor pending state (%s)",
+    async (phase) => {
+      await publish("a");
+      const rows = await store.historyService.getLastMessages(workspaceId, 1);
+      assert(rows.success, "Expected A boundary");
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const cleanup = store.historyService.cleanupCompactionFollowUp.bind(store.historyService);
+      spyOn(store.historyService, "cleanupCompactionFollowUp").mockImplementationOnce(
+        async (...args) => {
+          const result = phase === "after-delete" ? await cleanup(...args) : undefined;
+          entered.resolve();
+          await release.promise;
+          return result ?? cleanup(...args);
+        }
+      );
+      const rollback = handler.rollbackHeartbeatContextResetBoundary(rows.data[0]);
+      try {
+        await entered.promise;
+        const successor = await publish("b");
+        const bytes = await fs.readFile(pendingPath, "utf8");
+        const emitted = spyOn(emitter, "emit");
+        release.resolve();
+        expect(await rollback).toEqual({
+          success: true,
+          data: phase === "before-delete" ? "skipped" : "applied",
+        });
+        if (phase === "before-delete") expect(emitted).not.toHaveBeenCalled();
+        else
+          expect(emitted).toHaveBeenCalledWith("chat-event", {
+            workspaceId,
+            message: { type: "delete", historySequences: [rows.data[0].metadata?.historySequence] },
+          });
+        expect(await fs.readFile(pendingPath, "utf8")).toBe(bytes);
+        expect(await handler.peekPendingState()).toEqual(successor);
+      } finally {
+        release.resolve();
+        await rollback;
+      }
     }
   );
 });

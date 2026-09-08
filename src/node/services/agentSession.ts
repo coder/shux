@@ -9670,12 +9670,15 @@ export class AgentSession {
       hasUserContention &&
       !hasActiveNonCompletingTurn
     ) {
-      const rollbackResult =
-        await this.compactionHandler.rollbackHeartbeatContextResetBoundary(summaryMessage);
+      const turn = this.coordinator.turnId;
+      const rollbackResult = await this.compactionHandler.rollbackHeartbeatContextResetBoundary(
+        summaryMessage,
+        () => this.coordinator.turnId === turn
+      );
       if (!rollbackResult.success) {
         throw new Error(`Failed to rollback heartbeat reset boundary: ${rollbackResult.error}`);
       }
-      this.onPostCompactionStateChange?.();
+      if (rollbackResult.data === "applied") this.onPostCompactionStateChange?.();
     } else {
       await this.clearPendingFollowUpFromSummary(summaryMessage);
     }
@@ -9697,14 +9700,13 @@ export class AgentSession {
       return;
     }
 
-    const { pendingFollowUp: _pendingFollowUp, ...muxMetadataWithoutFollowUp } = muxMeta;
-    const updateResult = await this.historyService.updateHistory(this.workspaceId, {
-      ...summaryMessage,
-      metadata: {
-        ...(summaryMessage.metadata ?? {}),
-        muxMetadata: muxMetadataWithoutFollowUp,
-      },
-    });
+    const turn = this.coordinator.turnId;
+    const updateResult = await this.historyService.cleanupCompactionFollowUp(
+      this.workspaceId,
+      summaryMessage,
+      "clear",
+      () => this.coordinator.turnId === turn
+    );
     if (!updateResult.success) {
       throw new Error(`Failed to clear skipped pending follow-up: ${updateResult.error}`);
     }

@@ -1,5 +1,5 @@
 import type { TurnCoordinator } from "./turnCoordinator";
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
 import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/message";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
@@ -34,6 +34,8 @@ interface SessionInternals {
   ) => Promise<SendMessageResult>;
   runStartupRecovery: () => Promise<void>;
   lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+  coordinator: TurnCoordinator;
+  onPostCompactionStateChange?: () => void;
 }
 
 const idleFollowUp = (): CompactionFollowUpRequest => ({
@@ -147,6 +149,7 @@ describe("AgentSession continue-message agentId fallback", () => {
     }
     await historyCleanup?.();
     historyCleanup = undefined;
+    mock.restore();
   });
 
   const createSession = async (messages: MuxMessage[] = [], config = createConfig()) => {
@@ -172,6 +175,47 @@ describe("AgentSession continue-message agentId fallback", () => {
       internals: session as unknown as SessionInternals,
     };
   };
+
+  test.each([false, true])(
+    "a new turn during queued follow-up cleanup preserves the summary (heartbeat=%s)",
+    async (heartbeat) => {
+      const summary = heartbeat
+        ? heartbeatBoundaryMessage()
+        : compactionSummaryMessage("summary", idleFollowUp());
+      const { session, internals, historyService } = await createSession([summary]);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const cleanup = historyService.cleanupCompactionFollowUp.bind(historyService);
+      spyOn(historyService, "cleanupCompactionFollowUp").mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return cleanup(...args);
+      });
+      const changed = mock(() => undefined);
+      internals.onPostCompactionStateChange = changed;
+      session.queueMessage("manual work", { model: "openai:gpt-4o", agentId: "exec" });
+      const dispatch = internals.dispatchPendingFollowUp();
+      try {
+        await entered.promise;
+        const admission = internals.coordinator.prepare({
+          kind: "fresh",
+          intent: "direct",
+          expectedTurnId: internals.coordinator.turnId,
+        });
+        expect(admission.status).toBe("admitted");
+        release.resolve();
+        expect(await dispatch).toBe(false);
+        const history = await historyService.getLastMessages("ws", 1);
+        expect(history.success && history.data[0].metadata?.muxMetadata).toHaveProperty(
+          "pendingFollowUp"
+        );
+        expect(changed).not.toHaveBeenCalled();
+      } finally {
+        release.resolve();
+        await dispatch;
+      }
+    }
+  );
 
   test("legacy continueMessage.mode does not fall back to compact agent", async () => {
     let dispatchedMessage: string | undefined;

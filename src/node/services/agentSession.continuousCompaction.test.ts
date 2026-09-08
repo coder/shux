@@ -1098,12 +1098,14 @@ describe("AgentSession continuous compaction wiring", () => {
             return read(...args);
           });
         } else {
-          const update = h.historyService.updateHistory.bind(h.historyService);
-          spyOn(h.historyService, "updateHistory").mockImplementationOnce(async (...args) => {
-            entered.resolve();
-            await release.promise;
-            return update(...args);
-          });
+          const update = h.historyService.cleanupCompactionFollowUp.bind(h.historyService);
+          spyOn(h.historyService, "cleanupCompactionFollowUp").mockImplementationOnce(
+            async (...args) => {
+              entered.resolve();
+              await release.promise;
+              return update(...args);
+            }
+          );
           await h.session.interruptStream({ abandonPartial: true });
         }
         return true;

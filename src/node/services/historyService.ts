@@ -17,7 +17,9 @@ import {
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import * as path from "path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { renameSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 import * as fs from "fs/promises";
 import {
   ContinuousCompactionJournalStore,
@@ -79,6 +81,8 @@ import {
  * workspace removal can hold it across its tombstone+delete critical section.
  */
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
+
+export type CompactionFollowUpCleanupOutcome = "applied" | "skipped";
 
 interface HistoryTruncateHashes {
   finalArchiveHash: string | null;
@@ -2818,6 +2822,84 @@ export class HistoryService {
   async updateHistory(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to update history", () =>
       this.updateHistoryUnderWriteLock(workspaceId, message)
+    );
+  }
+
+  /**
+   * Cleanup owns the captured handoff, not the whole summary row. Revalidate under the
+   * history lock so queued cleanup cannot overwrite a replacement or late finalization.
+   * The pure ownership probe also runs immediately before publication, after staged I/O.
+   */
+  async cleanupCompactionFollowUp(
+    workspaceId: string,
+    summary: MuxMessage,
+    action: "clear" | "rollback-heartbeat",
+    isCurrent: () => boolean
+  ): Promise<Result<CompactionFollowUpCleanupOutcome>> {
+    const expected = summary.metadata?.muxMetadata;
+    const sequence = summary.metadata?.historySequence;
+    assert(summary.role === "assistant", "Follow-up cleanup requires an assistant summary");
+    assert(isNonNegativeInteger(sequence), "Follow-up cleanup requires a persisted summary");
+    assert(isCompactionSummaryMetadata(expected), "Follow-up cleanup requires summary metadata");
+    assert(
+      action !== "rollback-heartbeat" || summary.metadata?.compacted === "heartbeat",
+      "Heartbeat rollback requires a heartbeat boundary"
+    );
+    return this.withRecoveredHistoryWriteResultLock<CompactionFollowUpCleanupOutcome>(
+      workspaceId,
+      "Failed to clean up compaction follow-up",
+      async () => {
+        if (!isCurrent() || !expected.pendingFollowUp) return Ok("skipped");
+        const historyPath = this.getChatHistoryPath(workspaceId);
+        const { rows, messages } = await this.readHistoryForRewrite(historyPath);
+        // Archived summaries no longer own an active continuation or reset rollback.
+        const current = messages.find(
+          (row) => row.id === summary.id && row.metadata?.historySequence === sequence
+        );
+        const metadata = current?.metadata?.muxMetadata;
+        if (
+          !current ||
+          current.role !== "assistant" ||
+          !isCompactionSummaryMetadata(metadata) ||
+          !isDeepStrictEqual(metadata.pendingFollowUp, expected.pendingFollowUp) ||
+          (action === "rollback-heartbeat" && current.metadata?.compacted !== "heartbeat") ||
+          !isCurrent()
+        )
+          return Ok("skipped");
+
+        const { pendingFollowUp: _pending, ...remainingMetadata } = metadata;
+        const replacement =
+          action === "rollback-heartbeat"
+            ? null
+            : {
+                ...current,
+                metadata: { ...current.metadata, muxMetadata: remainingMetadata },
+              };
+        const serialized = this.serializeHistoryRewrite(rows, workspaceId, (row) =>
+          row === current ? replacement : row
+        );
+        const stagedPath = `${historyPath}.follow-up-${randomUUID()}`;
+        let published = false;
+        try {
+          await writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
+          // Admission may change while the file is staged. The final check and rename
+          // are synchronous, so the retired owner cannot publish in that gap.
+          if (!isCurrent()) return Ok("skipped");
+          invalidateHistoryAppendProvenance();
+          renameSync(stagedPath, historyPath);
+          published = true;
+          if (action === "rollback-heartbeat") {
+            // Do not reuse the removed row's sequence within this process.
+            this.sequenceCounters.set(
+              workspaceId,
+              Math.max(this.sequenceCounters.get(workspaceId) ?? 0, sequence + 1)
+            );
+          }
+          return Ok("applied");
+        } finally {
+          if (!published) await fs.rm(stagedPath, { force: true });
+        }
+      }
     );
   }
 
