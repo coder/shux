@@ -1831,10 +1831,19 @@ describe("HistoryService", () => {
               ? archivePath
               : chatPath;
         const atomic = atomicWrite.default;
+        let injected = false;
         const failure = spyOn(atomicWrite, "default").mockImplementation(
           new Proxy(atomic, {
             apply(target, _thisArg, args: Parameters<typeof atomic>) {
-              if (args[0] === failedPath) return Promise.reject(new Error("disk unavailable"));
+              // Generation publication writes a staging sibling before renaming it into place.
+              const matches =
+                stage === "generation"
+                  ? typeof args[0] === "string" && args[0].startsWith(`${failedPath}.continuous-`)
+                  : args[0] === failedPath;
+              if (matches) {
+                injected = true;
+                return Promise.reject(new Error("disk unavailable"));
+              }
               return target(...args);
             },
           })
@@ -1846,6 +1855,7 @@ describe("HistoryService", () => {
               : method === "batch"
                 ? await service.deleteMessages(ws, [target.id])
                 : await service.deleteMessage(ws, target.id);
+          expect(injected).toBe(true);
           expect(result.success).toBe(false);
           expect(await fs.readFile(chatPath)).toEqual(beforeChat);
           expect(await fs.readFile(archivePath)).toEqual(beforeArchive);
