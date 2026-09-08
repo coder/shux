@@ -6,3 +6,4 @@ export const MIN_HEAD_TOKENS = 8_000;
 export const SUMMARIZER_INPUT_FRACTION = 0.7;
 export const CONTINUOUS_COMPACTION_JOURNAL_FILE = "continuous-compaction.json";
 export const CONTINUOUS_COMPACTION_GENERATION_FILE = "continuous-compaction-generation";
+export const COMPACTION_CANCELLATION_FILE = "compaction-cancellation.json";

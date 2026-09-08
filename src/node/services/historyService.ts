@@ -349,6 +349,98 @@ export class HistoryService {
       : path.join(this.config.sessionsDir, workspaceId);
   }
 
+  /** Inactive sidecar seam: Stop must remain publishable when transcript recovery fails. */
+  withCompactionStorageLock<T>(
+    workspaceId: string,
+    operation: (sessionDir: string) => Promise<T>
+  ): Promise<T> {
+    return this.fileLocks.withLock(workspaceId, () =>
+      this.withHistoryWriteFileLock(workspaceId, async () => {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
+          throw new Error(`workspace ${workspaceId} was removed; refusing compaction mutation`);
+        const sessionDir = this.getSessionDir(workspaceId);
+        await ensurePrivateDir(sessionDir);
+        return operation(sessionDir);
+      })
+    );
+  }
+
+  /** Caller holds both history locks and has already fenced obsolete journal publication. */
+  async neutralizeCompactionRecoveryUnderHistoryLock(
+    workspaceId: string,
+    isCurrent: () => boolean
+  ): Promise<boolean> {
+    if (!isCurrent()) return false;
+    return this.getAppendProvenance(workspaceId).runMutation(async () => {
+      if (!isCurrent()) return false;
+      invalidateHistoryAppendProvenance();
+      await this.recoverTruncateTransactionUnlocked(workspaceId);
+      const clearFollowUp = (row: MuxMessage): MuxMessage => {
+        const metadata = row.metadata?.muxMetadata;
+        if (!isCompactionSummaryMetadata(metadata) || metadata.pendingFollowUp === undefined)
+          return row;
+        const { pendingFollowUp: _followUp, ...rest } = metadata;
+        return { ...row, metadata: { ...row.metadata, muxMetadata: rest } };
+      };
+      // A partial summary can later be committed into history. Capture it under
+      // the same locks as partial writers and preserve its other recovery fields.
+      const partialPath = this.getPartialPath(workspaceId);
+      const partialBytes = await this.readExistingFileBytes(partialPath);
+      if (partialBytes !== null) {
+        const text = partialBytes.toString("utf8");
+        let partial: MuxMessage | null;
+        try {
+          partial = this.normalizeTranscriptMessage(JSON.parse(text));
+        } catch {
+          throw new Error("Cannot safely neutralize malformed partial summary");
+        }
+        if (
+          !isReadableHistoryMessage(partial) ||
+          !Buffer.from(text).equals(partialBytes) ||
+          (hasRawResetMarker(text) && hasAmbiguousResetKeys(text))
+        )
+          throw new Error("Cannot safely neutralize malformed partial summary");
+        const cleared = clearFollowUp(partial);
+        if (
+          cleared !== partial &&
+          !(await publishCompactionFile(partialPath, JSON.stringify(cleared), isCurrent))
+        )
+          return false;
+      }
+      // Repair every recoverable epoch, including summaries restored by truncate
+      // recovery. Raw rewrite helpers retain malformed/ambiguous privacy floors.
+      for (const filePath of [
+        this.getChatArchivePath(workspaceId),
+        this.getChatHistoryPath(workspaceId),
+      ]) {
+        if (!isCurrent()) return false;
+        const { rows } = await this.readHistoryForRewrite(filePath);
+        for (const row of rows) {
+          if (row.message) continue;
+          let damaged: MuxMessage | null;
+          try {
+            damaged = this.normalizeTranscriptMessage(JSON.parse(row.raw.toString("utf8")));
+          } catch {
+            continue;
+          }
+          const metadata = damaged?.metadata?.muxMetadata;
+          // Legacy recovery reads more permissively than rewrite. Keep the
+          // cancellation fence if clearing that intent could erase a raw floor.
+          if (isCompactionSummaryMetadata(metadata) && metadata.pendingFollowUp !== undefined)
+            throw new Error("Cannot safely neutralize malformed compaction summary");
+        }
+        let changed = false;
+        const contents = this.serializeHistoryRewrite(rows, workspaceId, (row) => {
+          const cleared = clearFollowUp(row);
+          changed ||= cleared !== row;
+          return cleared;
+        });
+        if (changed && !(await publishCompactionFile(filePath, contents, isCurrent))) return false;
+      }
+      return isCurrent();
+    });
+  }
+
   async getSubagentTranscript(
     input: { taskId: string; requestingWorkspaceId?: string | null },
     dependencies: SubagentTranscriptDependencies

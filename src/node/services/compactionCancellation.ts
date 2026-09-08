@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { promises as fs, rmSync } from "node:fs";
+import * as path from "node:path";
+import { z } from "zod";
+import { COMPACTION_CANCELLATION_FILE } from "@/constants/continuousCompaction";
+import type { HistoryService } from "./historyService";
+import { publishCompactionFile } from "./continuousCompactionJournal";
 
 export interface CompactionCancellationSummary {
   id: string;
@@ -73,6 +79,163 @@ export interface CompactionCancellationStorage {
     isCurrent: () => boolean,
     onCommitted: () => void
   ): Promise<CompactionCancellationRecord | null>;
+}
+
+const CancellationRecordSchema = z.strictObject({
+  version: z.literal(1),
+  nonce: z.string().min(1),
+  retainUntilReplacement: z.boolean().optional(),
+  scope: z.discriminatedUnion("kind", [
+    z.strictObject({ kind: z.literal("unresolved") }),
+    z.strictObject({
+      kind: z.literal("summary"),
+      id: z.string().min(1),
+      sequence: z.number().int().nonnegative().optional(),
+      pendingFollowUp: z.record(z.string(), z.unknown()),
+    }),
+  ]),
+});
+
+/** Inactive real adapter. H2b supplies accepted-row verification; H2c wires runtime consumers. */
+export class FileCompactionCancellationStorage implements CompactionCancellationStorage {
+  readonly path: string;
+
+  constructor(
+    private readonly history: HistoryService,
+    private readonly workspaceId: string,
+    // This verifier runs under both history locks and must not re-enter them.
+    // No default authority: a caller-provided nonce alone cannot retire retention.
+    private readonly verifyReplacementUnderHistoryLock?: (
+      witness: CompactionCancellationReplacementWitness
+    ) => Promise<boolean>
+  ) {
+    this.path = path.join(
+      path.dirname(history.getContinuousCompactionJournal(workspaceId).path),
+      COMPACTION_CANCELLATION_FILE
+    );
+  }
+
+  async read(): Promise<CompactionCancellationRecord | null> {
+    let contents: string;
+    try {
+      contents = await fs.readFile(this.path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+    try {
+      return CancellationRecordSchema.parse(JSON.parse(contents));
+    } catch {
+      // Do not include the bytes: pending requests can contain private user content.
+      throw new MalformedCompactionCancellationError("Invalid compaction cancellation record");
+    }
+  }
+
+  mutate(
+    mutation: CompactionCancellationMutation,
+    isCurrent: () => boolean
+  ): Promise<CompactionCancellationMutationOutcome> {
+    return this.history.withCompactionStorageLock(this.workspaceId, async () => {
+      if (!isCurrent()) return "superseded";
+      if (
+        mutation.kind === "publish" &&
+        mutation.publication.attempts > 1 &&
+        !mutation.publication.predecessor
+      )
+        throw new Error("Cancellation frontier was not captured; a new Stop is required");
+      const current = await this.read().catch((error: unknown) => {
+        if (mutation.kind !== "publish") throw error;
+        // Explicit Stop may overwrite unreadable state, inheriting its unknown
+        // full-clear obligation. Reads and automatic repair never gain this authority.
+        return undefined;
+      });
+      if (mutation.kind === "publish") {
+        const journal = this.history.getContinuousCompactionJournal(this.workspaceId);
+        const generation = await journal.captureGenerationUnderHistoryLock();
+        const nonce = current === undefined ? undefined : (current?.nonce ?? null);
+        const publication = mutation.publication;
+        if (
+          publication.attempts > 1 &&
+          (!publication.predecessor ||
+            publication.predecessor.nonce !== nonce ||
+            publication.predecessor.generation !== generation)
+        )
+          return "superseded";
+        const frontier = (publication.predecessor = { nonce, generation });
+        if (current === undefined || current?.retainUntilReplacement)
+          mutation.record.retainUntilReplacement = true;
+        if (!isCurrent()) return "superseded";
+        // Record admission before advancing, and advancement at its commit point.
+        // Unobserved failures remain blocking until a new explicit Stop captures a frontier.
+        await journal.advanceGenerationUnderHistoryLock((advanced) => {
+          frontier.generation = advanced;
+        });
+        return (await publishCompactionFile(
+          this.path,
+          JSON.stringify(mutation.record),
+          isCurrent,
+          () => {
+            frontier.nonce = mutation.record.nonce;
+          }
+        ))
+          ? "applied"
+          : "superseded";
+      }
+      const nonce = mutation.kind === "retire" ? mutation.nonce : mutation.record.nonce;
+      if (current?.nonce !== nonce) return "superseded";
+      if (mutation.kind === "narrow") {
+        if (current.retainUntilReplacement) return "superseded";
+        if (current.scope.kind !== "unresolved")
+          return isCurrent() && isDeepStrictEqual(current, mutation.record)
+            ? "applied"
+            : "superseded";
+        return (await publishCompactionFile(this.path, JSON.stringify(mutation.record), isCurrent))
+          ? "applied"
+          : "superseded";
+      }
+      const witness = mutation.replacementWitness;
+      if (witness) {
+        if (!this.verifyReplacementUnderHistoryLock)
+          throw new Error("Replacement witness verification is not configured");
+        if (witness.nonce !== nonce || !(await this.verifyReplacementUnderHistoryLock(witness)))
+          throw new Error("Replacement witness was not verified");
+      } else if (current.retainUntilReplacement) return "superseded";
+      if (!isCurrent()) return "superseded";
+      rmSync(this.path, { force: true });
+      return "applied";
+    });
+  }
+
+  repair(
+    isCurrent: () => boolean,
+    onCommitted: () => void
+  ): Promise<CompactionCancellationRecord | null> {
+    return this.history.withCompactionStorageLock(this.workspaceId, async () => {
+      if (!isCurrent()) return null;
+      try {
+        return await this.read();
+      } catch (error) {
+        if (!(error instanceof MalformedCompactionCancellationError)) throw error;
+      }
+      if (!isCurrent()) return null;
+      await this.history
+        .getContinuousCompactionJournal(this.workspaceId)
+        .advanceGenerationUnderHistoryLock();
+      if (
+        !(await this.history.neutralizeCompactionRecoveryUnderHistoryLock(
+          this.workspaceId,
+          isCurrent
+        )) ||
+        !isCurrent()
+      )
+        return null;
+      // Keep malformed bytes until all obsolete recovery has been neutralized.
+      // No await separates removal from the repair receipt or its final guard.
+      rmSync(this.path, { force: true });
+      onCommitted();
+      return null;
+    });
+  }
 }
 
 /**
