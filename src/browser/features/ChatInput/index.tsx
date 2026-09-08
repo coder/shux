@@ -2158,7 +2158,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         }
 
         // Keep the message visible in the transcript tail until the backend echoes it back;
-        // otherwise it vanishes for the whole round-trip on a slow connection.
+        // otherwise it vanishes for the whole round-trip on a slow connection. A successful
+        // response must not clear it: the acknowledgement event can land a frame later.
         pendingSendId = `pending-send-${Date.now()}`;
         store.beginPendingSend(props.workspaceId, {
           id: pendingSendId,
@@ -2181,6 +2182,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // Show error using enhanced toast
           setToast(createErrorToast(result.error));
           // Restore draft on error so user can try again
+          store.clearPendingSend(props.workspaceId, pendingSendId);
           setOptimisticallyDismissedEditId(null);
           setDraft(preSendDraft);
           setDraftReviews(preSendReviews);
@@ -2234,13 +2236,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           })
         );
         // Restore draft on error
+        if (pendingSendId !== null) {
+          store.clearPendingSend(props.workspaceId, pendingSendId);
+        }
         setOptimisticallyDismissedEditId(null);
         setDraft(preSendDraft);
         setDraftReviews(preSendReviews);
       } finally {
-        if (pendingSendId !== null) {
-          store.clearPendingSend(props.workspaceId, pendingSendId);
-        }
         setSendingCount((c) => c - 1);
         setHideReviewsDuringSend(false);
       }

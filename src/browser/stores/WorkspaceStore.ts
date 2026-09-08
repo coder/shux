@@ -1170,11 +1170,7 @@ export class WorkspaceStore {
       aggregator.setActiveQueuedFollowUp(data.hasQueuedMessages ?? queuedMessage !== null);
       const transient = this.assertChatTransientState(workspaceId);
       transient.queuedMessage = queuedMessage;
-      if (
-        queuedMessage &&
-        transient.pendingSend &&
-        queuedMessage.content.includes(transient.pendingSend.content)
-      ) {
+      if (queuedMessage) {
         // The send landed in the backend queue; the queued card takes over from the pending row.
         transient.pendingSend = null;
       }
@@ -4043,7 +4039,8 @@ export class WorkspaceStore {
 
   /**
    * Show the composer content in the transcript tail while the send request is in flight.
-   * Cleared when the backend echoes a user message or queues it, or via clearPendingSend.
+   * Cleared when the backend echoes a user message or queues it, when replay catches up, or
+   * via clearPendingSend after a failed send.
    */
   beginPendingSend(workspaceId: string, message: PendingSendMessage): void {
     const transient = this.chatTransientState.get(workspaceId);
@@ -4537,6 +4534,8 @@ export class WorkspaceStore {
       // Mark as caught up
       transient.caughtUp = true;
       transient.isHydratingTranscript = false;
+      // Replayed history is authoritative: a send acknowledged while disconnected is in it now.
+      transient.pendingSend = null;
       this.lastUserPromptStore.bump(workspaceId);
       this.states.bump(workspaceId);
       this.checkAndBumpRecencyIfChanged(); // Messages loaded, update recency

@@ -4860,31 +4860,27 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
     });
 
-    it("keeps the pending row when a queue update does not contain the sent text", async () => {
-      const workspaceId = "pending-send-queued-other";
-      let releaseQueue!: () => void;
-      const queueGate = new Promise<void>((resolve) => {
-        releaseQueue = resolve;
+    it("clears the pending row when a replay catches up", async () => {
+      const workspaceId = "pending-send-caught-up";
+      let releaseCaughtUp!: () => void;
+      const caughtUpGate = new Promise<void>((resolve) => {
+        releaseCaughtUp = resolve;
       });
-      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
-        await queueGate;
-        yield {
-          type: "queued-message-changed",
-          workspaceId,
-          hasQueuedMessages: true,
-          queuedMessages: ["earlier follow-up"],
-          displayText: "earlier follow-up",
-        };
+      mockChatStreamFor(workspaceId, async function* (signal) {
+        await caughtUpGate;
+        yield { type: "caught-up", hasOlderHistory: false };
         await waitForAbortSignal(signal);
       });
+      createAndAddWorkspace(store, workspaceId);
 
       store.beginPendingSend(workspaceId, pendingSend);
-      releaseQueue();
-
-      expect(
-        await waitUntil(() => store.getWorkspaceState(workspaceId).queuedMessage !== null)
-      ).toBe(true);
       expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+      releaseCaughtUp();
+
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
     });
   });
 
