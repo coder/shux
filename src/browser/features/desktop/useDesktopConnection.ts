@@ -23,7 +23,13 @@ export interface UseDesktopConnectionResult {
   containerRef: RefObject<HTMLDivElement>;
   connect: () => void;
   disconnect: () => void;
-  disconnectAndWait: () => Promise<void>;
+  /**
+   * Disconnect and resolve once the transport closed. Giving the registration up is definitive
+   * (no attachment grace) unless `keepGrace` is set: a popout closing on its own — titlebar,
+   * pagehide, its own Bring back — may be handing the desktop to an inline pane whose lease is
+   * still in flight, so only a close the parent requested after leasing is definitive.
+   */
+  disconnectAndWait: (options?: DesktopDisconnectOptions) => Promise<void>;
   /**
    * Close the RFB connection and stop reconnecting, but keep the viewer registration: used by
    * the inline pane while its desktop is shown in a popout, so the pane stays attached (the
@@ -123,6 +129,10 @@ function buildDesktopBridgeUrl(
   wsUrl.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   wsUrl.searchParams.set("token", token);
   return wsUrl.toString();
+}
+
+export interface DesktopDisconnectOptions {
+  keepGrace?: boolean;
 }
 
 export interface UseDesktopConnectionOptions {
@@ -234,15 +244,17 @@ export function useDesktopConnection(
   };
 
   const connectImplRef = useRef<() => void>(() => undefined);
-  const disconnectImplRef = useRef<() => void>(() => undefined);
+  const disconnectImplRef = useRef<(options?: DesktopDisconnectOptions) => void>(() => undefined);
   const connectHandleRef = useRef<() => void>(() => connectImplRef.current());
-  const disconnectHandleRef = useRef<() => void>(() => disconnectImplRef.current());
+  const disconnectHandleRef = useRef<(options?: DesktopDisconnectOptions) => void>((options) =>
+    disconnectImplRef.current(options)
+  );
   const scheduleReconnectRef = useRef<() => void>(() => undefined);
 
-  const disconnectAndWait = (): Promise<void> => {
+  const disconnectAndWait = (options?: DesktopDisconnectOptions): Promise<void> => {
     const rfb = rfbRef.current;
     if (!rfb) {
-      disconnectHandleRef.current();
+      disconnectHandleRef.current(options);
       return Promise.resolve();
     }
     return new Promise((resolve) => {
@@ -254,7 +266,7 @@ export function useDesktopConnection(
       const timeout = setTimeout(onDisconnect, DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS);
       rfb.addEventListener("disconnect", onDisconnect);
       // Release synchronously, but let the WebSocket drain before the popout disappears.
-      disconnectHandleRef.current();
+      disconnectHandleRef.current(options);
     });
   };
 
@@ -272,14 +284,24 @@ export function useDesktopConnection(
     }
   };
 
-  const disconnectCurrentRfb = (options?: { keepViewerRegistration?: boolean }) => {
+  const disconnectCurrentRfb = (options?: {
+    keepViewerRegistration?: boolean;
+    keepGrace?: boolean;
+  }) => {
     setSharedDesktop(null);
     const currentRfb = rfbRef.current;
     const keepRegistration = options?.keepViewerRegistration === true;
     const registration = keepRegistration ? null : viewerRegistrationRef.current;
     if (!keepRegistration) {
       clearReregisterTimer();
-      detachViewerDefinitively();
+      if (options?.keepGrace === true) {
+        // The bounded grace the abort/bridge close leave behind is wanted here; forget the ids
+        // so nothing retracts it later.
+        supersededViewerIdsRef.current = [];
+        anonymousBridgeIdRef.current = null;
+      } else {
+        detachViewerDefinitively();
+      }
       viewerRegistrationRef.current = null;
       viewerReadyRef.current = false;
       viewerIdRef.current = null;
@@ -318,11 +340,11 @@ export function useDesktopConnection(
     }, delay);
   };
 
-  disconnectImplRef.current = () => {
+  disconnectImplRef.current = (options) => {
     isDisposedRef.current = true;
     generationRef.current += 1;
     clearReconnectTimer();
-    disconnectCurrentRfb();
+    disconnectCurrentRfb({ keepGrace: options?.keepGrace });
     setState("idle");
     setReason(null);
   };

@@ -172,13 +172,14 @@ export class DesktopPopout {
   }
 
   /**
-   * Bounded wait for the inline lease; false when it could not be established in time. With no
-   * inline pane attached there is no handoff — nothing takes the desktop over, so nothing needs
-   * protecting while the child closes — and the close proceeds.
+   * Bounded wait for the inline lease; false when it could not be established in time. No
+   * attached inline pane is no lease either: after an Electron reload the panel is still
+   * `checking` (its viewer not yet mounted) while Bring back is already clickable, and the viewer
+   * that mounts moments later must find the child still open rather than a desktop nobody holds.
    */
   private leaseInline(): Promise<boolean> {
     const register = this.registerInline;
-    if (!register) return Promise.resolve(true);
+    if (!register) return Promise.resolve(false);
     return new Promise((resolve) => {
       const timer = setTimeout(() => resolve(false), DESKTOP_POPOUT_READY_TIMEOUT_MS);
       register().then(
@@ -358,9 +359,15 @@ export class DesktopPopout {
    * "released": the child acknowledged and inline was restored; "unresponsive": it was asked to
    * close but never answered; "kept": it was never asked (no inline lease), so it must stay.
    */
-  private waitForRelease(instanceId: string): Promise<"released" | "unresponsive" | "kept"> {
+  private async waitForRelease(instanceId: string): Promise<"released" | "unresponsive" | "kept"> {
+    // The acknowledgment deadline starts only once the child has actually been asked to close:
+    // armed earlier it would expire while the (equally bounded) lease is still pending and
+    // report a child that was never asked as unresponsive — and get it force-closed.
+    const requested = await this.bringBack();
+    if (this.instanceId !== instanceId) return "released";
+    if (!requested) return "kept";
     return new Promise((resolve) => {
-      const finish = (outcome: "released" | "unresponsive" | "kept") => {
+      const finish = (outcome: "released" | "unresponsive") => {
         clearTimeout(timer);
         unsubscribe();
         resolve(outcome);
@@ -369,12 +376,6 @@ export class DesktopPopout {
         if (this.instanceId !== instanceId) finish("released");
       });
       const timer = setTimeout(() => finish("unresponsive"), DESKTOP_POPOUT_READY_TIMEOUT_MS);
-      this.bringBack().then(
-        (requested) => {
-          if (!requested && this.instanceId === instanceId) finish("kept");
-        },
-        () => finish("kept")
-      );
     });
   }
 

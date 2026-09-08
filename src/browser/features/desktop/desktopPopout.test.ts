@@ -36,6 +36,9 @@ class TestChannel {
   }
 }
 
+/** An inline pane whose lease always succeeds: handoffs need one before a child may close. */
+const leasable = () => Promise.resolve(true);
+
 /** Flush the microtask chain behind an awaited lease/confirmation without real timers. */
 async function settle() {
   for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -274,6 +277,44 @@ describe("DesktopPopout handoff", () => {
     expect(channel().sent.at(-1)).toEqual({ type: "bring-back", instanceId: instanceId() });
   });
 
+  test("bring-back with no inline pane attached keeps the child open", async () => {
+    // After an Electron reload the panel is still `checking` and its viewer not yet mounted,
+    // while Bring back is already clickable: the child must stay until a viewer can lease.
+    const popout = new DesktopPopout(workspaceId, false);
+    await popout.open(api);
+    message("ready");
+    expect(await popout.bringBack()).toBe(false);
+    expect(
+      channel().sent.filter((sent) => (sent as { type: string }).type === "bring-back")
+    ).toEqual([]);
+    expect(popout.getSnapshot().state).toBe("detached");
+  });
+
+  test("Electron recovery does not force-close while the inline lease is still pending", async () => {
+    const popout = new DesktopPopout(workspaceId, true);
+    // A lease that never settles: only its bounded timer can end it.
+    popout.attach(
+      () => undefined,
+      undefined,
+      false,
+      () => new Promise<boolean>(() => undefined)
+    );
+    api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));
+    await popout.reconcile(api);
+    const recovering = popout.recover(api);
+    await settle();
+    // The only armed deadline is the lease's; the acknowledgment deadline does not exist yet.
+    expect(deadlines).toHaveLength(1);
+    deadlines[0]?.run();
+    await recovering;
+    expect(api.closeWindow).not.toHaveBeenCalled();
+    expect(
+      channel().sent.filter((sent) => (sent as { type: string }).type === "bring-back")
+    ).toEqual([]);
+    expect(popout.getSnapshot().state).toBe("detached");
+    expect(popout.getSnapshot().error).not.toBeNull();
+  });
+
   test("Electron recovery never force-closes a child kept open for want of an inline lease", async () => {
     const popout = new DesktopPopout(workspaceId, true);
     api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));
@@ -350,6 +391,7 @@ describe("DesktopPopout handoff", () => {
 
   test("bring-back waits for the child's closed acknowledgment before inline restoration", async () => {
     const popout = new DesktopPopout(workspaceId, false);
+    popout.attach(() => undefined, undefined, false, leasable);
     await popout.open(api);
     message("ready");
     message("opened");
@@ -394,6 +436,7 @@ describe("DesktopPopout handoff", () => {
   test("recovery after browser reload still waits for a live child's release", async () => {
     updatePersistedState(`desktop-popout:${workspaceId}`, "old-window");
     const popout = new DesktopPopout(workspaceId, false);
+    popout.attach(() => undefined, undefined, false, leasable);
     await popout.reconcile(api);
     popup.addEventListener(DESKTOP_POPOUT_CLOSE_EVENT, (event) => {
       (event as CustomEvent<DesktopPopoutCloseRequest>).detail.handled = true;
@@ -414,6 +457,7 @@ describe("DesktopPopout handoff", () => {
   test("a stale browser hint can recover by closing a newly acquired empty window", async () => {
     updatePersistedState(`desktop-popout:${workspaceId}`, "missing-window");
     const popout = new DesktopPopout(workspaceId, false);
+    popout.attach(() => undefined, undefined, false, leasable);
     await popout.reconcile(api);
     const close = spyOn(popup, "close").mockImplementation(() => {
       Object.defineProperty(popup, "closed", { value: true });
@@ -448,6 +492,7 @@ describe("DesktopPopout handoff", () => {
 
   test("a retained closed browser handle restores without opening another window", async () => {
     const popout = new DesktopPopout(workspaceId, false);
+    popout.attach(() => undefined, undefined, false, leasable);
     await popout.open(api);
     message("ready");
     message("opened");
@@ -461,6 +506,7 @@ describe("DesktopPopout handoff", () => {
   test("direct recovery releases the child before restoring and does not force-close a handled request", async () => {
     updatePersistedState(`desktop-popout:${workspaceId}`, "live-child");
     const popout = new DesktopPopout(workspaceId, false);
+    popout.attach(() => undefined, undefined, false, leasable);
     await popout.reconcile(api);
     const order: string[] = [];
     const close = spyOn(popup, "close");
@@ -484,6 +530,7 @@ describe("DesktopPopout handoff", () => {
   test("a missed closed message is recovered only after the actual window closes", async () => {
     updatePersistedState(`desktop-popout:${workspaceId}`, "live-child");
     const popout = new DesktopPopout(workspaceId, false);
+    popout.attach(() => undefined, undefined, false, leasable);
     await popout.reconcile(api);
     popup.addEventListener(DESKTOP_POPOUT_CLOSE_EVENT, (event) => {
       (event as CustomEvent<DesktopPopoutCloseRequest>).detail.handled = true;
@@ -504,6 +551,7 @@ describe("DesktopPopout handoff", () => {
   test("close polling times out without granting inline ownership while the child remains open", async () => {
     updatePersistedState(`desktop-popout:${workspaceId}`, "live-child");
     const popout = new DesktopPopout(workspaceId, false);
+    popout.attach(() => undefined, undefined, false, leasable);
     await popout.reconcile(api);
     popup.addEventListener(DESKTOP_POPOUT_CLOSE_EVENT, (event) => {
       (event as CustomEvent<DesktopPopoutCloseRequest>).detail.handled = true;
@@ -529,7 +577,7 @@ describe("DesktopPopout handoff", () => {
   test("readiness timeout closes the unready browser window before restoring", async () => {
     const popout = new DesktopPopout(workspaceId, false);
     const disconnect = mock(() => undefined);
-    popout.attach(disconnect);
+    popout.attach(disconnect, undefined, false, leasable);
     await popout.open(api);
     const deadline = deadlines[0];
     assert(deadline);
@@ -586,6 +634,7 @@ describe("DesktopPopout handoff", () => {
 
   test("Electron recovery waits for responsive child cleanup without force destruction", async () => {
     const popout = new DesktopPopout(workspaceId, true);
+    popout.attach(() => undefined, undefined, false, leasable);
     api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));
     await popout.reconcile(api);
     const recovering = popout.recover(api);
@@ -604,17 +653,20 @@ describe("DesktopPopout handoff", () => {
 
   test("Electron recovery force-closes only after an unresponsive child misses its cleanup deadline", async () => {
     const popout = new DesktopPopout(workspaceId, true);
+    popout.attach(() => undefined, undefined, false, leasable);
     api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));
     await popout.reconcile(api);
     const closed = deferred<void>();
     api.closeWindow = mock(() => closed.promise);
     const recovering = popout.recover(api);
-    await Promise.resolve();
+    // The acknowledgment deadline is armed only once the (leased) child was asked to close.
+    await settle();
+    expect(channel().sent.at(-1)).toEqual({ type: "bring-back", instanceId: "existing" });
     expect(api.closeWindow).not.toHaveBeenCalled();
     const deadline = deadlines.at(-1);
     assert(deadline);
     deadline.run();
-    await Promise.resolve();
+    await settle();
     expect(api.closeWindow).toHaveBeenCalledWith({ workspaceId, instanceId: "existing" });
     expect(popout.getSnapshot().state).toBe("detached");
     closed.resolve();

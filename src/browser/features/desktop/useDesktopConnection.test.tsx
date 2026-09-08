@@ -679,6 +679,17 @@ describe("useDesktopConnection control ownership", () => {
     expect(registration.signal.aborted).toBe(true);
   });
 
+  test("a close that keeps the grace aborts the registration without a definitive detach", async () => {
+    const view = mountConnection();
+    await connect(view);
+    const registration = registrations[0];
+    // A popout closing on its own may be handing off to an inline pane whose lease is still in
+    // flight: the bounded grace the abort leaves behind is wanted, so nothing retracts it.
+    await act(() => view.desktop.disconnectAndWait({ keepGrace: true }));
+    expect(detachViewer).not.toHaveBeenCalled();
+    expect(registration.signal.aborted).toBe(true);
+  });
+
   test("normal unmount unregisters after releasing held input", async () => {
     const view = mountConnection();
     const rfb = await connect(view);
