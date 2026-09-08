@@ -81,6 +81,8 @@ export class CompactionCancellation {
     Promise.resolve(undefined);
   private unsettled = false;
   private inFlight = false;
+  private readGeneration = 0;
+  private acceptedReadGeneration = 0;
   private repairedHistoryRevision = 0;
 
   constructor(private readonly storage: CompactionCancellationStorage) {}
@@ -115,7 +117,13 @@ export class CompactionCancellation {
     if (this.blocksRecovery) return this.effectiveRecord();
     const mutation = this.mutation;
     const pending = this.pending;
-    const isCurrent = () => mutation === this.mutation && pending === this.pending;
+    // Only an accepted newer read displaces an earlier snapshot/error/repair.
+    // A pending successor is not evidence of absence and cannot hide a valid Stop.
+    const generation = ++this.readGeneration;
+    const isCurrent = () =>
+      generation >= this.acceptedReadGeneration &&
+      mutation === this.mutation &&
+      pending === this.pending;
     try {
       const record = await this.storage.read().catch((error: unknown) => {
         if (!(error instanceof MalformedCompactionCancellationError) || !isCurrent()) throw error;
@@ -123,7 +131,10 @@ export class CompactionCancellation {
           this.repairedHistoryRevision++;
         });
       });
-      if (isCurrent()) this.current = structuredClone(record);
+      if (isCurrent()) {
+        this.current = structuredClone(record);
+        this.acceptedReadGeneration = generation;
+      }
     } catch (error) {
       // A stale read/repair cannot hide a newer local Stop or trigger its replacement.
       if (isCurrent()) throw error;
@@ -168,13 +179,20 @@ export class CompactionCancellation {
       }
       const mutation = this.mutation;
       const pending = this.pending;
+      const reading = this.read();
+      const generation = this.readGeneration;
       try {
-        const record = await this.read();
+        const record = await reading;
         if (!this.blocksRecovery) return record;
       } catch {
-        // read() checks before rejecting, but a newer Stop/retry can enter before
+        // read() checks before rejecting, but a newer Stop/retry/read can enter before
         // this rejection resumes. Fallback must still own that exact failed read.
-        if (this.mutation !== mutation || this.pending !== pending) continue;
+        if (
+          this.acceptedReadGeneration > generation ||
+          this.mutation !== mutation ||
+          this.pending !== pending
+        )
+          continue;
         // Explicit intervention may replace unreadable state, but cannot lose an unknown
         // full-clear obligation. Failed publication remains blocking and visible.
         await this.cancel({ retainUntilReplacement: true });

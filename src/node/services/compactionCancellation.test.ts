@@ -385,6 +385,144 @@ describe("inactive cancellation state core", () => {
     }
   );
 
+  it.each(["read", "replacement"] as const)(
+    "a pending newer read cannot hide an earlier durable cancellation (%s)",
+    async (reader) => {
+      const { state, storage } = harness();
+      const older = cancellation("older-a");
+      const newer = cancellation("newer-b");
+      const firstRead = Promise.withResolvers<CompactionCancellationRecord | null>();
+      const secondRead = Promise.withResolvers<CompactionCancellationRecord | null>();
+      storage.read.mockReturnValueOnce(firstRead.promise).mockReturnValueOnce(secondRead.promise);
+      const earlier = reader === "read" ? state.read() : state.readForReplacement();
+      const later = state.read();
+      firstRead.resolve(older);
+      try {
+        expect(await earlier).toEqual(older);
+        expect(storage.mutate).not.toHaveBeenCalled();
+      } finally {
+        secondRead.resolve(newer);
+        expect(await later).toEqual(newer);
+      }
+    }
+  );
+
+  it.each([false, true])(
+    "a pending newer read does not suppress repair or its failure (repair failure=%s)",
+    async (failed) => {
+      const { state, storage } = harness();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const secondRead = Promise.withResolvers<CompactionCancellationRecord | null>();
+      storage.read
+        .mockRejectedValueOnce(new MalformedCompactionCancellationError())
+        .mockReturnValueOnce(secondRead.promise);
+      storage.repair.mockImplementationOnce(async (current, committed) => {
+        entered.resolve();
+        await release.promise;
+        if (failed) throw new Error("repair failed");
+        if (current()) committed();
+        return null;
+      });
+      const earlier = state.read();
+      await entered.promise;
+      const later = state.read();
+      release.resolve();
+      try {
+        if (failed) await assert.rejects(earlier, /repair failed/);
+        else expect(await earlier).toBeNull();
+        expect(state.repairRevision).toBe(failed ? 0 : 1);
+      } finally {
+        secondRead.resolve(null);
+        await later;
+      }
+    }
+  );
+
+  it.each(["old record", "absence", "malformed", "I/O"] as const)(
+    "a late read cannot replace a newer accepted read (%s)",
+    async (result) => {
+      const { state, storage, shared } = harness();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      storage.read.mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        if (result === "malformed") throw new MalformedCompactionCancellationError();
+        if (result === "I/O") throw new Error("obsolete read failure");
+        return result === "absence" ? null : cancellation("older-a");
+      });
+      const earlier = state.read();
+      await entered.promise;
+      shared.record = cancellation("newer-b");
+      expect(await state.read()).toEqual(shared.record);
+      release.resolve();
+      expect(await earlier).toEqual(shared.record);
+      expect(storage.repair).not.toHaveBeenCalled();
+      expect(storage.mutate).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([false, true])(
+    "a newer read invalidates an in-flight repair (repair failure=%s)",
+    async (failed) => {
+      const { state, storage, shared } = harness();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      storage.read.mockRejectedValueOnce(new MalformedCompactionCancellationError());
+      storage.repair.mockImplementationOnce(async (current, committed) => {
+        entered.resolve();
+        await release.promise;
+        if (failed) throw new Error("obsolete repair failure");
+        if (current()) {
+          shared.record = null;
+          committed();
+        }
+        return null;
+      });
+      const earlier = state.read();
+      await entered.promise;
+      const newer = cancellation("newer-b");
+      shared.record = newer;
+      expect(await state.read()).toEqual(newer);
+      release.resolve();
+      expect(await earlier).toEqual(newer);
+      expect(shared.record).toEqual(newer);
+      expect(state.repairRevision).toBe(0);
+    }
+  );
+
+  it("out-of-order reads preserve the original witnessed retirement retry", async () => {
+    const { state, storage, shared } = harness();
+    await state.cancel();
+    const first = (await state.read())!;
+    storage.mutate.mockRejectedValueOnce(new Error("unlink failed"));
+    await assert.rejects(state.retireReplacement({ nonce: first.nonce }), /unlink failed/);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    storage.read.mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      return first;
+    });
+    const earlier = state.read();
+    await entered.promise;
+    shared.record = cancellation("newer-b");
+    expect(await state.readForReplacement()).toEqual(shared.record);
+    release.resolve();
+    expect(await earlier).toEqual(shared.record);
+    expect(state.needsPersistence).toBe(true);
+    expect(state.blocksRecovery).toBe(false);
+    storage.mutate.mockResolvedValueOnce("superseded");
+    await state.retry();
+    expect(storage.mutate.mock.calls.at(-1)?.[0]).toMatchObject({
+      kind: "retire",
+      nonce: first.nonce,
+    });
+    expect(shared.record).toEqual(cancellation("newer-b"));
+    expect(state.needsPersistence).toBe(false);
+  });
+
   it.each(["old record", "malformed", "I/O"] as const)(
     "ignores an obsolete read after Stop (%s)",
     async (result) => {
@@ -502,6 +640,26 @@ describe("inactive cancellation state core", () => {
         "retire",
         "retire",
       ]);
+    } finally {
+      checkedRead.mockRestore();
+    }
+  });
+
+  it("fallback cannot replace a newer read accepted after the checked read fails", async () => {
+    const { state, storage, shared } = harness();
+    storage.read.mockRejectedValueOnce(new Error("read unavailable"));
+    const newer = cancellation("newer-b");
+    const read = state.read.bind(state);
+    const checkedRead = spyOn(state, "read").mockImplementationOnce(() =>
+      read().catch(async (error: unknown) => {
+        shared.record = newer;
+        expect(await read()).toEqual(newer);
+        throw error;
+      })
+    );
+    try {
+      expect(await state.readForReplacement()).toEqual(newer);
+      expect(storage.mutate).not.toHaveBeenCalled();
     } finally {
       checkedRead.mockRestore();
     }
