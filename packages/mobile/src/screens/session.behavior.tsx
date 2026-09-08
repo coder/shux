@@ -343,6 +343,13 @@ test("transcript-only pending questions are read-only while live Stop remains av
             startTime: 1,
           },
           question(),
+          {
+            type: "tool-call-execution-start",
+            workspaceId: "alpha",
+            messageId: "question",
+            toolCallId: "question",
+            timestamp: 1,
+          },
         ]
       : [question()];
     const view = fixture(messages);
@@ -579,6 +586,7 @@ test.each(["ready", "route-lost", "policy-blocked", "settings-failed"] as const)
         tokens: 1,
         args: questionInput("live"),
         timestamp: 1,
+        executionStartedAt: 1,
       },
     ]);
     await view.select("alpha");
@@ -1307,6 +1315,7 @@ test("live interruption remains available during pending and failed settings ref
       tokens: 1,
       args: questionInput("live"),
       timestamp: 1,
+      executionStartedAt: 1,
     },
   ]);
   await view.select("alpha");

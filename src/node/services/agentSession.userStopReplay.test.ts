@@ -70,6 +70,22 @@ for (const partialFile of [false, true]) {
         expect(
           (await historyService.readPartial(workspaceId))?.metadata?.userStopped
         ).toBeUndefined();
+        // The same durable marker must not suppress a later user turn's crash recovery.
+        expect((await historyService.deletePartial(workspaceId)).success).toBe(true);
+        expect(
+          (
+            await historyService.appendToHistory(
+              workspaceId,
+              createMuxMessage("next-user", "user", "Continue differently")
+            )
+          ).success
+        ).toBe(true);
+        const nextPartial = { ...partial, id: "next-answer", metadata: { partial: true } };
+        expect((await historyService.appendToHistory(workspaceId, nextPartial)).success).toBe(true);
+        const nextRows: WorkspaceChatMessage[] = [];
+        await restarted.session.replayHistory(({ message }) => nextRows.push(message));
+        const next = nextRows.find((row) => row.type === "message" && row.id === nextPartial.id);
+        expect(ChatMuxMessageSchema.parse(next).metadata?.userStopped).toBeUndefined();
       } finally {
         await restarted.session.dispose();
       }
