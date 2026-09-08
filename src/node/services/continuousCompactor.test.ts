@@ -779,6 +779,69 @@ describe("ContinuousCompactor", () => {
     expect((await rows())[0].id).toBe(journal.boundary.id);
   });
 
+  for (const phase of ["new-fold", "already-folded", "mismatched-source"] as const) {
+    it.each(["same-generation", "reset-during-cleanup"] as const)(
+      `${phase} preserves its recovery result after cleanup times out (%s)`,
+      async (race) => {
+        const resetDuringCleanup = race === "reset-during-cleanup";
+        const applied = phase !== "mismatched-source";
+        const { journalStore, journal, dependencies } = await activateJournaledSwap();
+        streaming = false;
+        live = undefined;
+        if (phase === "already-folded") {
+          expect(await compactor.recover()).toBe(true);
+          // Recreate the crash window between durable history publication and journal unlink.
+          await writeFile(journalStore.path, JSON.stringify(journal));
+        }
+        if (phase === "mismatched-source")
+          await seed(createMuxMessage("new-user", "user", "New work after the journal"));
+        const before = await rows();
+        const clearPrefix = spyOn(dependencies.streamManager, "clearPrefixSwap");
+        const clear = journalStore.clear.bind(journalStore);
+        const failure = spyOn(journalStore, "clear").mockImplementation(async (expected) => {
+          await using held = await fileLock.acquireProcessFileLock({
+            lockPath: historyWriteLockPath(store.config.rootDir, workspaceId),
+            timeoutMs: 1000,
+            label: "foreign history writer during journal cleanup",
+          });
+          if (resetDuringCleanup) compactor.reset("shutdown");
+          const acquire = fileLock.acquireProcessFileLock;
+          const timeout = spyOn(fileLock, "acquireProcessFileLock").mockImplementation((options) =>
+            acquire({ ...options, timeoutMs: 1 })
+          );
+          try {
+            await clear(expected);
+          } finally {
+            timeout.mockRestore();
+            await held.assertStillOwned();
+          }
+        });
+        expect(await compactor.recover().catch((error: unknown) => error)).toBe(applied);
+        expect(compactor.hasConsumedSwap()).toBe(false);
+        // A reset during cleanup owns stream retirement; the old apply must not clear it again.
+        expect(clearPrefix).toHaveBeenCalledTimes(
+          resetDuringCleanup || phase === "new-fold" ? 1 : 0
+        );
+        expect(await journalStore.read()).toEqual(journal);
+        const once = await rows();
+        if (applied) {
+          expect(once[0].id).toBe(journal.boundary.id);
+          expect(once.at(-1)?.id).toBe(journal.liveTailCopySpec.copyId);
+        } else expect(once).toEqual(before);
+        expect(completed).toHaveBeenCalledTimes(applied ? 1 : 0);
+        expect(await compactor.recover()).toBe(applied);
+        expect(await journalStore.read()).toEqual(journal);
+        expect(await rows()).toEqual(once);
+        failure.mockRestore();
+        expect(await compactor.recover()).toBe(applied);
+        expect(await rows()).toEqual(once);
+        expect(completed).toHaveBeenCalledTimes(applied ? 1 : 0);
+        expect(await journalStore.read()).toBeNull();
+        expect(await compactor.recover()).toBe(false);
+      }
+    );
+  }
+
   it("clears explicit reset intent despite contention on the history lock", async () => {
     const { dependencies, journalStore } = await activateJournaledSwap();
     streaming = false;

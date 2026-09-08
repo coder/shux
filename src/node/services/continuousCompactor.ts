@@ -159,7 +159,7 @@ export class ContinuousCompactor {
     this.activeSwap = null;
     this.ownedJournal = undefined;
     this.deps.streamManager.clearPrefixSwap?.(this.deps.workspaceId);
-    // Shutdown retains recovery. Successful apply already performed exact cleanup;
+    // Shutdown retains recovery. Successful apply already attempted exact cleanup;
     // clearing again here could erase a successor published after that lock released.
     if (discardJournal && reason !== "shutdown" && reason !== "applied") {
       const store = this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId);
@@ -588,6 +588,14 @@ export class ContinuousCompactor {
     }
   }
 
+  private async clearJournalBestEffort(journal: ContinuousCompactionJournal): Promise<void> {
+    const store = this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId);
+    // Rejected or durably folded journals must not block recovery; exact cleanup can retry later.
+    await store.clear(journal).catch((error: unknown) => {
+      log.warn("[continuous-compaction] journal cleanup failed", error);
+    });
+  }
+
   private async finalizeJournal(pendingFollowUp?: CompactionFollowUpRequest): Promise<boolean> {
     const generation = this.generation;
     const store = this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId);
@@ -611,10 +619,11 @@ export class ContinuousCompactor {
       journal.staticCopies.every((copy) => rows.some((row) => row.id === copy.id)) &&
       rows.some((row) => row.id === journal.liveTailCopySpec.copyId);
     if (rows.some((row) => row.id === journal.boundary.id) && copiesPresent) {
-      await store.clear(journal);
-      if (generation !== this.generation) return false;
-      this.ownedJournal = undefined;
-      this.activeSwap = null;
+      await this.clearJournalBestEffort(journal);
+      if (generation === this.generation) {
+        this.ownedJournal = undefined;
+        this.activeSwap = null;
+      }
       return true;
     }
     const spec = journal.liveTailCopySpec;
@@ -649,7 +658,7 @@ export class ContinuousCompactor {
       log.warn("[continuous-compaction] discarded mismatched journal", {
         workspaceId: this.deps.workspaceId,
       });
-      await store.clear(journal);
+      await this.clearJournalBestEffort(journal);
       if (generation !== this.generation) return false;
       this.ownedJournal = undefined;
       this.activeSwap = null;
@@ -706,7 +715,7 @@ export class ContinuousCompactor {
       boundary.id
     );
     if (applied && generation === this.generation) {
-      await store.clear(journal);
+      await this.clearJournalBestEffort(journal);
       if (generation === this.generation) {
         this.ownedJournal = undefined;
         this.reset("applied");

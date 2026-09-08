@@ -222,6 +222,14 @@ export class ContinuousCompactionJournalStore {
     }, "local");
   }
 
+  private async discardUnusableUnderHistoryLock(): Promise<null> {
+    // An unusable journal must not block recovery just because unlink is unavailable.
+    await fs.rm(this.path, { force: true }).catch((error: unknown) => {
+      log.warn("[continuous-compaction] unusable journal cleanup failed", error);
+    });
+    return null;
+  }
+
   read(
     isCurrent: () => boolean = () => true,
     onRead?: (journal: ContinuousCompactionJournal) => void
@@ -244,15 +252,10 @@ export class ContinuousCompactionJournalStore {
         journal = ContinuousCompactionJournalSchema.parse(JSON.parse(contents));
       } catch (error) {
         log.warn("[continuous-compaction] discarded invalid journal", error);
-        await fs.rm(this.path, { force: true }).catch((cleanupError: unknown) => {
-          // An unusable journal must not block recovery just because unlink is unavailable.
-          log.warn("[continuous-compaction] invalid journal cleanup failed", cleanupError);
-        });
-        return null;
+        return this.discardUnusableUnderHistoryLock();
       }
       if (journal.publicationGeneration !== (await this.captureGenerationUnderHistoryLock())) {
-        await fs.rm(this.path, { force: true });
-        return null;
+        return this.discardUnusableUnderHistoryLock();
       }
       if (!current()) return null;
       onRead?.(journal);

@@ -1203,19 +1203,40 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(await store.read()).toBeNull();
   });
 
-  it("keeps corrupt-journal cleanup failure from blocking recovery", async () => {
-    const { store } = await setup();
-    await writeFile(store.path, "{");
-    const remove = journalFs.rm;
-    const failure = spyOn(journalFs, "rm").mockImplementation((...args) =>
-      args[0] === store.path ? Promise.reject(new Error("cleanup unavailable")) : remove(...args)
-    );
-    expect(await store.read().catch((error: unknown) => error)).toBeNull();
-    const rows = await history.historyService.getLastMessages(workspaceId, 10);
-    assert(rows.success, "Expected source history");
-    expect(rows.data.map((row) => row.id)).toEqual(["live"]);
-    failure.mockRestore();
-    expect(await store.read()).toBeNull();
-    expect(await store.exists()).toBe(false);
-  });
+  it.each(["corrupt", "stale-generation"] as const)(
+    "keeps %s journal cleanup failure from blocking recovery",
+    async (kind) => {
+      const { store, swap } = await setup();
+      if (kind === "corrupt") await writeFile(store.path, "{");
+      else {
+        const original = await store.write(swap.journal, swap.prefix, () => true);
+        assert(original, "Expected valid journal before generation change");
+        const foreign = new HistoryService(history.config).getContinuousCompactionJournal(
+          workspaceId
+        );
+        await foreign.advanceGeneration();
+        expect(await store.captureGeneration()).not.toBe(original.publicationGeneration);
+      }
+      const bytes = await readFile(store.path, "utf8");
+      const remove = journalFs.rm;
+      const failure = spyOn(journalFs, "rm").mockImplementation((...args) =>
+        args[0] === store.path ? Promise.reject(new Error("cleanup unavailable")) : remove(...args)
+      );
+      expect(await store.read().catch((error: unknown) => error)).toBeNull();
+      expect(await readFile(store.path, "utf8")).toBe(bytes);
+      const rows = await history.historyService.getLastMessages(workspaceId, 10);
+      assert(rows.success, "Expected source history");
+      expect(rows.data.map((row) => row.id)).toEqual(["live"]);
+      failure.mockRestore();
+      expect(await store.read()).toBeNull();
+      expect(await store.exists()).toBe(false);
+      const fresh = await store.write(
+        { ...swap.journal, publicationGeneration: await store.captureGeneration() },
+        swap.prefix,
+        () => true
+      );
+      expect(fresh).not.toBeNull();
+      expect(await store.read()).toEqual(fresh);
+    }
+  );
 });
