@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import { parse as jsoncParse } from "jsonc-parser";
 import * as os from "os";
@@ -413,6 +413,58 @@ describe("WorkspaceMcpOverridesService", () => {
     // workspace-local files).
     await fs.rm(filePath);
     await service.prunePluginOverrideKeys(workspaceId, "plugin:0123456789abcdef:");
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces sweeps many workspaces with one metadata load", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const pruned = await registerWorkspace("pruned");
+    const untouched = await registerWorkspace("untouched");
+    const broken = await registerWorkspace("broken");
+    const write = (workspacePath: string, content: string) =>
+      fs
+        .mkdir(path.join(workspacePath, ".xum"), { recursive: true })
+        .then(() => fs.writeFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), content));
+    await write(
+      pruned.workspacePath,
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+    );
+    await write(broken.workspacePath, "{ not json");
+
+    // Warm-up: getAllWorkspaceMetadata persists read-time migrations
+    // (createdAt backfill) on first load, which would skew the call counts.
+    await config.getAllWorkspaceMetadata();
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata");
+    const configSpy = spyOn(config, "loadConfigOrDefault");
+
+    const published: Array<[string, unknown]> = [];
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [pruned.workspaceId, untouched.workspaceId, broken.workspaceId, "ws-missing"],
+      "plugin:0123456789abcdef:",
+      {
+        publish: (workspaceId, persisted) => {
+          published.push([workspaceId, persisted]);
+          return Promise.resolve();
+        },
+      }
+    );
+
+    // One failure per broken workspace; the healthy ones still completed.
+    expect(failures.map((failure) => failure.workspaceId).sort()).toEqual([
+      broken.workspaceId,
+      "ws-missing",
+    ]);
+    expect(String(failures.find((f) => f.workspaceId === broken.workspaceId)?.error)).toMatch(
+      /parse errors/
+    );
+    expect(published).toEqual([
+      [pruned.workspaceId, { enabledServers: ["other"] }],
+      [untouched.workspaceId, {}],
+    ]);
+    // The sweep cost must not scale with a full config parse per workspace:
+    // getAllWorkspaceMetadata itself loads config once, plus the batch's
+    // single legacy-config snapshot.
+    expect(metadataSpy).toHaveBeenCalledTimes(1);
+    expect(configSpy).toHaveBeenCalledTimes(2);
   });
 
   it("prunePluginOverrideKeys refuses symlinked override files", async () => {

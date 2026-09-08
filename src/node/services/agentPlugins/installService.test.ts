@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { Config } from "@/node/config";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
@@ -32,6 +33,38 @@ import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 async function git(cwd: string, ...args: string[]): Promise<string> {
   using proc = execFileAsync("git", ["-C", cwd, ...args]);
   return (await proc.result).stdout;
+}
+
+/**
+ * WorkspaceMcpOverridesService stub built from a per-workspace prune
+ * function: mirrors the real batch contract (per-workspace failures are
+ * collected, publish runs with the pruned overrides inside the same step).
+ */
+function overridesServiceStub(
+  prune: (
+    workspaceId: string,
+    keyPrefix: string,
+    options?: { publish?: (persisted: unknown) => Promise<void> }
+  ) => Promise<void>
+): WorkspaceMcpOverridesService {
+  const stub: Pick<WorkspaceMcpOverridesService, "prunePluginOverrideKeysForWorkspaces"> = {
+    prunePluginOverrideKeysForWorkspaces: async (workspaceIds, keyPrefix, options) => {
+      const failures: Array<{ workspaceId: string; error: unknown }> = [];
+      for (const workspaceId of workspaceIds) {
+        try {
+          await prune(workspaceId, keyPrefix, {
+            publish: (persisted) =>
+              options?.publish?.(workspaceId, persisted as WorkspaceMCPOverrides) ??
+              Promise.resolve(),
+          });
+        } catch (error) {
+          failures.push({ workspaceId, error });
+        }
+      }
+      return failures;
+    },
+  };
+  return stub as WorkspaceMcpOverridesService;
 }
 
 async function initRemote(dir: string): Promise<void> {
@@ -1182,10 +1215,10 @@ describe("AgentPluginInstallService", () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
     const serverKey = `plugin:${instanceId}:echo`;
     let storedOverrides: { enabledServers: string[] } = { enabledServers: [serverKey] };
-    const overridesStub = {
-      // Mirrors the real service's contract: publish runs with the pruned
-      // persisted overrides inside the same (stubbed) write step.
-      prunePluginOverrideKeys: async (
+    // Mirrors the real service's contract: publish runs with the pruned
+    // persisted overrides inside the same (stubbed) write step.
+    const overridesStub = overridesServiceStub(
+      async (
         _id: string,
         keyPrefix: string,
         options?: { publish?: (persisted: unknown) => Promise<void> }
@@ -1196,8 +1229,8 @@ describe("AgentPluginInstallService", () => {
           ),
         };
         await options?.publish?.(storedOverrides);
-      },
-    };
+      }
+    );
     const applied: Array<{ workspaceId: string; overrides: unknown }> = [];
     const mcpStub = {
       stopServersWithKeyPrefix: () => Promise.resolve(),
@@ -1208,7 +1241,7 @@ describe("AgentPluginInstallService", () => {
     };
     const serviceWithDeps = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
       mcpServerManager: mcpStub as unknown as MCPServerManager,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
@@ -1622,15 +1655,13 @@ describe("AgentPluginInstallService", () => {
     // then-present server). The post-commit re-enumeration must fold it in,
     // or a same-name reinstall would silently reactivate the server there.
     const prunedIds: string[] = [];
-    const overridesStub = {
-      prunePluginOverrideKeys: (workspaceId: string) => {
-        prunedIds.push(workspaceId);
-        return Promise.resolve();
-      },
-    };
+    const overridesStub = overridesServiceStub((workspaceId: string) => {
+      prunedIds.push(workspaceId);
+      return Promise.resolve();
+    });
     const serviceWithDeps = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
     const preview = await serviceWithDeps.preview({ input: remoteDir });
     await serviceWithDeps.install({ source: preview.source, expectedSha: preview.lockedSha });
@@ -1766,15 +1797,13 @@ describe("AgentPluginInstallService", () => {
     // when the sweep cannot run.
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
     const pruned: Array<{ workspaceId: string; prefix: string }> = [];
-    const overridesStub = {
-      prunePluginOverrideKeys: (workspaceId: string, prefix: string) => {
-        pruned.push({ workspaceId, prefix });
-        return Promise.resolve();
-      },
-    };
+    const overridesStub = overridesServiceStub((workspaceId: string, prefix: string) => {
+      pruned.push({ workspaceId, prefix });
+      return Promise.resolve();
+    });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
       Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
@@ -2307,13 +2336,11 @@ describe("AgentPluginInstallService", () => {
     // post-commit failure would strand stale enabled-server overrides with
     // no Settings row left to retry from, and a reinstall (same instance ID)
     // would silently re-enable those servers.
-    const overridesStub = {
-      prunePluginOverrideKeys: () => Promise.resolve(),
-    };
+    const overridesStub = overridesServiceStub(() => Promise.resolve());
     const serviceWithMcp = new AgentPluginInstallService(config, {
       isEnabled: () => true,
       mcpServerManager: mcpStub,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
 
     const preview = await serviceWithMcp.preview({ input: remoteDir });
@@ -2352,22 +2379,20 @@ describe("AgentPluginInstallService", () => {
     // hygiene sweep must succeed for the install to complete).
     let overridesBroken = false;
     let storedOverrides: Record<string, unknown> = { enabledServers: [serverKey] };
-    const overridesStub = {
-      prunePluginOverrideKeys: (_id: string, keyPrefix: string) => {
-        if (overridesBroken) {
-          return Promise.reject(new Error("checkout unavailable"));
-        }
-        storedOverrides = {
-          enabledServers: (storedOverrides.enabledServers as string[]).filter(
-            (key) => !key.startsWith(keyPrefix)
-          ),
-        };
-        return Promise.resolve();
-      },
-    };
+    const overridesStub = overridesServiceStub((_id: string, keyPrefix: string) => {
+      if (overridesBroken) {
+        return Promise.reject(new Error("checkout unavailable"));
+      }
+      storedOverrides = {
+        enabledServers: (storedOverrides.enabledServers as string[]).filter(
+          (key) => !key.startsWith(keyPrefix)
+        ),
+      };
+      return Promise.resolve();
+    });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
       Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
@@ -2425,13 +2450,12 @@ describe("AgentPluginInstallService", () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
     // Healthy during install (its hygiene sweep must pass); broken afterwards.
     let overridesBroken = false;
-    const overridesStub = {
-      prunePluginOverrideKeys: () =>
-        overridesBroken ? Promise.reject(new Error("checkout unavailable")) : Promise.resolve(),
-    };
+    const overridesStub = overridesServiceStub(() =>
+      overridesBroken ? Promise.reject(new Error("checkout unavailable")) : Promise.resolve()
+    );
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
       Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
@@ -2490,12 +2514,12 @@ describe("AgentPluginInstallService", () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
     // Overrides service that permanently throws (as it would for a workspace
     // that no longer exists in config).
-    const overridesStub = {
-      prunePluginOverrideKeys: () => Promise.reject(new Error("Workspace metadata not found")),
-    };
+    const overridesStub = overridesServiceStub(() =>
+      Promise.reject(new Error("Workspace metadata not found"))
+    );
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
 
     // Seed a tombstone naming a workspace that is not in config anymore.
@@ -2529,15 +2553,13 @@ describe("AgentPluginInstallService", () => {
     // live workspaces and only clear after the full sweep succeeded.
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
     const prunedIds: string[] = [];
-    const overridesStub = {
-      prunePluginOverrideKeys: (workspaceId: string) => {
-        prunedIds.push(workspaceId);
-        return Promise.resolve();
-      },
-    };
+    const overridesStub = overridesServiceStub((workspaceId: string) => {
+      prunedIds.push(workspaceId);
+      return Promise.resolve();
+    });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
     // Live workspaces: the recorded ws-1 plus a delta workspace the record
     // never held.
@@ -2578,15 +2600,14 @@ describe("AgentPluginInstallService", () => {
     // and the next successful ws-1-only retry would clear the record while
     // ws-delta still holds the stale enable.
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
-    const overridesStub = {
-      prunePluginOverrideKeys: (workspaceId: string) =>
-        workspaceId === "ws-delta"
-          ? Promise.reject(new Error("checkout unavailable"))
-          : Promise.resolve(),
-    };
+    const overridesStub = overridesServiceStub((workspaceId: string) =>
+      workspaceId === "ws-delta"
+        ? Promise.reject(new Error("checkout unavailable"))
+        : Promise.resolve()
+    );
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
       Promise.resolve([
@@ -2625,15 +2646,13 @@ describe("AgentPluginInstallService", () => {
     // reinstall gate must clear it only after a full live sweep.
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
     const prunedIds: string[] = [];
-    const overridesStub = {
-      prunePluginOverrideKeys: (workspaceId: string) => {
-        prunedIds.push(workspaceId);
-        return Promise.resolve();
-      },
-    };
+    const overridesStub = overridesServiceStub((workspaceId: string) => {
+      prunedIds.push(workspaceId);
+      return Promise.resolve();
+    });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
     const preview = await serviceWithOverrides.preview({ input: remoteDir });
     await serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha });
@@ -2689,9 +2708,7 @@ describe("AgentPluginInstallService", () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: {
-        prunePluginOverrideKeys: () => Promise.resolve(),
-      } as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesServiceStub(() => Promise.resolve()),
     });
     await fsPromises.mkdir(path.dirname(registryFile()), { recursive: true });
     await fsPromises.writeFile(
@@ -2764,15 +2781,13 @@ describe("AgentPluginInstallService", () => {
     // enabled/disabled/tool-allowlist key from workspace overrides. Such a
     // tombstone must be treated as unrecognized: preserved, never retried.
     const pruneCalls: string[] = [];
-    const overridesStub = {
-      prunePluginOverrideKeys: (_workspaceId: string, prefix: string) => {
-        pruneCalls.push(prefix);
-        return Promise.resolve();
-      },
-    };
+    const overridesStub = overridesServiceStub((_workspaceId: string, prefix: string) => {
+      pruneCalls.push(prefix);
+      return Promise.resolve();
+    });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
     // The named workspace exists, so a recognized tombstone WOULD be retried
     // (and its prefix executed) on section open.
@@ -2808,18 +2823,16 @@ describe("AgentPluginInstallService", () => {
     // the per-prefix rewrite (which replaces every matching item) as one
     // merged tombstone instead of being silently discarded.
     const pruned: string[] = [];
-    const overridesStub = {
-      prunePluginOverrideKeys: (workspaceId: string) => {
-        if (workspaceId === "ws-2") {
-          return Promise.reject(new Error("checkout unavailable"));
-        }
-        pruned.push(workspaceId);
-        return Promise.resolve();
-      },
-    };
+    const overridesStub = overridesServiceStub((workspaceId: string) => {
+      if (workspaceId === "ws-2") {
+        return Promise.reject(new Error("checkout unavailable"));
+      }
+      pruned.push(workspaceId);
+      return Promise.resolve();
+    });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
       Promise.resolve([
@@ -2915,12 +2928,10 @@ describe("AgentPluginInstallService", () => {
   });
 
   test("uninstall refuses to clobber an opaque pendingOverridePrunes shape when cleanup must be recorded", async () => {
-    const overridesStub = {
-      prunePluginOverrideKeys: () => Promise.resolve(),
-    };
+    const overridesStub = overridesServiceStub(() => Promise.resolve());
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
       Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
@@ -2968,14 +2979,12 @@ describe("AgentPluginInstallService", () => {
     const pruneGate = new Promise<void>((resolve) => {
       releasePrune = resolve;
     });
-    const overridesStub = {
-      prunePluginOverrideKeys: async () => {
-        await pruneGate;
-      },
-    };
+    const overridesStub = overridesServiceStub(async () => {
+      await pruneGate;
+    });
     const serviceWithOverrides = new AgentPluginInstallService(config, {
       isEnabled: () => true,
-      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub,
     });
     const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
       Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<

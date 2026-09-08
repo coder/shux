@@ -10,7 +10,7 @@ import assert from "@/common/utils/assert";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { Config } from "@/node/config";
+import type { Config, ProjectsConfig } from "@/node/config";
 import { type createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
@@ -185,6 +185,13 @@ async function statIsFile(
   }
 }
 
+/** A workspace's metadata with its runtime and checkout path resolved. */
+interface ResolvedWorkspace {
+  metadata: FrontendWorkspaceMetadata;
+  runtime: ReturnType<typeof createRuntime>;
+  workspacePath: string;
+}
+
 export class WorkspaceMcpOverridesService {
   constructor(private readonly config: Config) {
     assert(config, "WorkspaceMcpOverridesService requires a Config instance");
@@ -204,9 +211,10 @@ export class WorkspaceMcpOverridesService {
     return metadata;
   }
 
-  private getLegacyOverridesFromConfig(workspaceId: string): WorkspaceMCPOverrides | undefined {
-    const config = this.config.loadConfigOrDefault();
-
+  private getLegacyOverridesFromConfig(
+    workspaceId: string,
+    config: ProjectsConfig = this.config.loadConfigOrDefault()
+  ): WorkspaceMCPOverrides | undefined {
     for (const [_projectPath, projectConfig] of config.projects) {
       const workspace = projectConfig.workspaces.find((w) => w.id === workspaceId);
       if (workspace) {
@@ -232,13 +240,11 @@ export class WorkspaceMcpOverridesService {
     });
   }
 
-  private async getRuntimeAndWorkspacePath(workspaceId: string): Promise<{
-    metadata: FrontendWorkspaceMetadata;
-    runtime: ReturnType<typeof createRuntime>;
-    workspacePath: string;
-  }> {
-    const metadata = await this.getWorkspaceMetadata(workspaceId);
+  private async getRuntimeAndWorkspacePath(workspaceId: string): Promise<ResolvedWorkspace> {
+    return this.resolveWorkspace(await this.getWorkspaceMetadata(workspaceId));
+  }
 
+  private resolveWorkspace(metadata: FrontendWorkspaceMetadata): ResolvedWorkspace {
     const runtime = createRuntimeForWorkspace(metadata);
 
     // In-place workspaces (CLI/benchmarks) store the workspace path directly by setting
@@ -427,7 +433,21 @@ export class WorkspaceMcpOverridesService {
     workspaceId: string,
     mode: "lenient" | "strict" = "lenient"
   ): Promise<WorkspaceMCPOverrides> {
-    const { metadata, runtime, workspacePath } = await this.getRuntimeAndWorkspacePath(workspaceId);
+    return this.loadOverridesForResolved(await this.getRuntimeAndWorkspacePath(workspaceId), mode);
+  }
+
+  /**
+   * `legacyConfig` lets batch callers reuse one config snapshot: loading
+   * config.json is a synchronous full parse, so re-reading it per workspace
+   * made a 2000-workspace sweep take tens of minutes.
+   */
+  private async loadOverridesForResolved(
+    resolved: ResolvedWorkspace,
+    mode: "lenient" | "strict",
+    legacyConfig?: ProjectsConfig
+  ): Promise<WorkspaceMCPOverrides> {
+    const { metadata, runtime, workspacePath } = resolved;
+    const workspaceId = metadata.id;
     const filePaths = this.getOverridesFilePaths(workspacePath, metadata.runtimeConfig);
     const canonicalPath = filePaths[0];
 
@@ -440,7 +460,7 @@ export class WorkspaceMcpOverridesService {
     }
 
     // No workspace-local file => try migrating legacy config.json storage.
-    const legacy = this.getLegacyOverridesFromConfig(workspaceId);
+    const legacy = this.getLegacyOverridesFromConfig(workspaceId, legacyConfig);
     if (!legacy || isEmptyOverrides(legacy)) {
       return {};
     }
@@ -617,142 +637,193 @@ export class WorkspaceMcpOverridesService {
       publish?: (persisted: WorkspaceMCPOverrides) => Promise<void>;
     }
   ): Promise<void> {
+    const failures = await this.prunePluginOverrideKeysForWorkspaces([workspaceId], keyPrefix, {
+      publish: (_workspaceId, persisted) => options?.publish?.(persisted) ?? Promise.resolve(),
+    });
+    if (failures.length > 0) {
+      throw failures[0].error;
+    }
+  }
+
+  /**
+   * prunePluginOverrideKeys across many workspaces under ONE lock acquisition
+   * and ONE workspace-metadata/config load. The Agent Plugin installer sweeps
+   * every local/worktree workspace (thousands in long-lived setups); resolving
+   * each workspace via getAllWorkspaceMetadata() — an uncached synchronous
+   * parse of the whole config.json — made that sweep take ~1s per workspace
+   * and the install appear hung. Per-workspace failures are collected (the
+   * caller persists a retry tombstone for them) instead of aborting the sweep;
+   * only wholesale failures (lock timeout, unreadable config) throw.
+   */
+  async prunePluginOverrideKeysForWorkspaces(
+    workspaceIds: readonly string[],
+    keyPrefix: string,
+    options?: {
+      publish?: (workspaceId: string, persisted: WorkspaceMCPOverrides) => Promise<void>;
+    }
+  ): Promise<Array<{ workspaceId: string; error: unknown }>> {
     assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
 
     return this.runExclusive(async () => {
-      const { metadata, runtime, workspacePath } =
-        await this.getRuntimeAndWorkspacePath(workspaceId);
-      // Prune canonical AND legacy-named files: a stale plugin key in an old
-      // .mux/mcp.local.jsonc would otherwise survive uninstall and reactivate
-      // on a later canonical migration.
-      const filePaths = this.getOverridesFilePaths(workspacePath, metadata.runtimeConfig);
-
-      for (const filePath of filePaths) {
-        if (!(await statIsFile(runtime, filePath, "strict"))) {
-          continue;
-        }
-        // SECURITY: refuse to prune through a symlinked override file. A
-        // contributor-controlled branch can track `.mux/mcp.local.jsonc` as
-        // a symlink (or symlink a parent segment); the write below resolves
-        // links (LocalBaseRuntime.writeFile writes the TARGET), so following
-        // one would let repo content redirect this rewrite into another
-        // predictable file — e.g. silently stripping a sibling workspace's
-        // plugin enables. Pruning only ever targets host-local (local/
-        // worktree) workspaces, so node fs semantics apply directly. Throwing
-        // keeps the caller's retry semantics (creation aborts / tombstone
-        // survives) until the link is removed.
-        await assertPruneTargetNotSymlinked(filePath, workspacePath);
-        // Strict read: unreadable/unparseable content must throw so the
-        // caller keeps its retry tombstone (mirrors readOverridesFile).
-        const original = await readFileString(runtime, filePath);
-        const parseErrors: jsonc.ParseError[] = [];
-        const parsed: unknown = jsonc.parse(original, parseErrors) as unknown;
-        if (parseErrors.length > 0) {
-          throw new Error(`Workspace MCP overrides file has JSONC parse errors: ${filePath}`);
-        }
-        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-          // A newer build may store the whole document in a non-object shape
-          // this build cannot inspect; "successfully pruning" it would retire
-          // the caller's tombstone while plugin keys embedded in that shape
-          // survive. Same doctrine as opaque owned-field shapes below.
-          throw new Error(
-            `Workspace MCP overrides file has an unrecognized root shape (written by a newer version?): ${filePath}`
-          );
-        }
-
-        // Duplicate properties make jsonc.parse (last value wins) and
-        // jsonc.modify (first matching path wins) disagree: the edit loop
-        // below could spin forever on an entry it can never remove, or
-        // declare success while a stale plugin key survives in the shadowed
-        // property. Reject up front — the caller keeps its retry tombstone
-        // until the malformed file is repaired.
-        const duplicateName = findDuplicateOverrideProperty(jsonc.parseTree(original));
-        if (duplicateName !== undefined) {
-          throw new Error(
-            `Workspace MCP overrides file has duplicate "${duplicateName}" properties: ${filePath}`
-          );
-        }
-
-        // Targeted jsonc edits, NOT JSON.stringify of the parsed object: the
-        // .jsonc file is user-maintained and may carry comments/formatting a
-        // wholesale rewrite would erase.
-        let text = original;
-        const removeAt = (jsonPath: jsonc.JSONPath): void => {
-          const next = jsonc.applyEdits(
-            text,
-            jsonc.modify(text, jsonPath, undefined, {
-              formattingOptions: { insertSpaces: true, tabSize: 2 },
-            })
-          );
-          // A no-op edit means parse and modify disagreed about the path;
-          // looping on it would never terminate.
-          assert(next !== text, "prunePluginOverrideKeys: targeted edit produced no change");
-          text = next;
-        };
-
-        // A newer release may represent an owned field with a shape this
-        // build cannot inspect. Declaring success would retire the caller's
-        // tombstone while plugin keys embedded in that shape survive —
-        // reactivating the server on reinstall. Throw instead: the tombstone
-        // stays retryable (same doctrine as unreadable files).
-        const opaqueShape = (field: string): Error =>
-          new Error(
-            `Workspace MCP overrides file has an unrecognized "${field}" shape (written by a newer version?): ${filePath}`
-          );
-
-        // Match only canonical `plugin:<16-hex>:<server>` keys under the
-        // requested prefix: MCP server names are otherwise arbitrary strings
-        // and user configuration may legitimately name a server "plugin:…" —
-        // pruning must never strip such an ordinary server's overrides.
-        // Canonical keys themselves are additionally RESERVED in ordinary
-        // config (MCPConfigService ignores them in global/project layers and
-        // addServer rejects them), so a key this shape can only belong to an
-        // Agent Plugin server — shape-based pruning cannot hit a user server.
-        const isPrunableKey = (key: unknown): boolean =>
-          typeof key === "string" && key.startsWith(keyPrefix) && isCanonicalPluginServerKey(key);
-
-        for (const field of ["enabledServers", "disabledServers"] as const) {
-          // Re-parse after each removal: array indices shift as items go.
-          for (;;) {
-            const current = jsonc.parse(text) as Record<string, unknown>;
-            const value = current[field];
-            if (value === undefined) {
-              break;
-            }
-            if (!Array.isArray(value)) {
-              throw opaqueShape(field);
-            }
-            const index = value.findIndex(isPrunableKey);
-            if (index === -1) {
-              break;
-            }
-            removeAt([field, index]);
+      const allMetadata = await this.config.getAllWorkspaceMetadata();
+      const metadataById = new Map(allMetadata.map((metadata) => [metadata.id, metadata]));
+      const legacyConfig = this.config.loadConfigOrDefault();
+      const failures: Array<{ workspaceId: string; error: unknown }> = [];
+      for (const workspaceId of workspaceIds) {
+        try {
+          const metadata = metadataById.get(workspaceId.trim());
+          if (!metadata) {
+            throw new Error(`Workspace metadata not found for ${workspaceId.trim()}`);
           }
-        }
-
-        const allowlist = (jsonc.parse(text) as Record<string, unknown>).toolAllowlist;
-        if (allowlist !== undefined) {
-          if (allowlist === null || typeof allowlist !== "object" || Array.isArray(allowlist)) {
-            throw opaqueShape("toolAllowlist");
+          const resolved = this.resolveWorkspace(metadata);
+          await this.pruneResolvedWorkspace(resolved, keyPrefix);
+          if (options?.publish) {
+            // Strict re-read: the prune above already threw on anything
+            // unreadable, so a failure here is a real regression and must keep
+            // the caller's retry tombstone rather than publish a guess.
+            await options.publish(
+              workspaceId,
+              await this.loadOverridesForResolved(resolved, "strict", legacyConfig)
+            );
           }
-          for (const key of Object.keys(allowlist)) {
-            if (isPrunableKey(key)) {
-              removeAt(["toolAllowlist", key]);
-            }
-          }
-        }
-
-        if (text !== original) {
-          await writeFileString(runtime, filePath, text);
+        } catch (error) {
+          failures.push({ workspaceId, error });
         }
       }
-      if (options?.publish) {
-        // Strict re-read: the prune above already threw on anything
-        // unreadable, so a failure here is a real regression and must keep
-        // the caller's retry tombstone rather than publish a guess.
-        await options.publish(await this.loadOverrides(workspaceId, "strict"));
-      }
+      return failures;
     });
+  }
+
+  /** One workspace's prune; see prunePluginOverrideKeys for the contract. */
+  private async pruneResolvedWorkspace(
+    resolved: ResolvedWorkspace,
+    keyPrefix: string
+  ): Promise<void> {
+    const { metadata, runtime, workspacePath } = resolved;
+    // Prune canonical AND legacy-named files: a stale plugin key in an old
+    // .mux/mcp.local.jsonc would otherwise survive uninstall and reactivate
+    // on a later canonical migration.
+    const filePaths = this.getOverridesFilePaths(workspacePath, metadata.runtimeConfig);
+
+    for (const filePath of filePaths) {
+      if (!(await statIsFile(runtime, filePath, "strict"))) {
+        continue;
+      }
+      // SECURITY: refuse to prune through a symlinked override file. A
+      // contributor-controlled branch can track `.mux/mcp.local.jsonc` as
+      // a symlink (or symlink a parent segment); the write below resolves
+      // links (LocalBaseRuntime.writeFile writes the TARGET), so following
+      // one would let repo content redirect this rewrite into another
+      // predictable file — e.g. silently stripping a sibling workspace's
+      // plugin enables. Pruning only ever targets host-local (local/
+      // worktree) workspaces, so node fs semantics apply directly. Throwing
+      // keeps the caller's retry semantics (creation aborts / tombstone
+      // survives) until the link is removed.
+      await assertPruneTargetNotSymlinked(filePath, workspacePath);
+      // Strict read: unreadable/unparseable content must throw so the
+      // caller keeps its retry tombstone (mirrors readOverridesFile).
+      const original = await readFileString(runtime, filePath);
+      const parseErrors: jsonc.ParseError[] = [];
+      const parsed: unknown = jsonc.parse(original, parseErrors) as unknown;
+      if (parseErrors.length > 0) {
+        throw new Error(`Workspace MCP overrides file has JSONC parse errors: ${filePath}`);
+      }
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        // A newer build may store the whole document in a non-object shape
+        // this build cannot inspect; "successfully pruning" it would retire
+        // the caller's tombstone while plugin keys embedded in that shape
+        // survive. Same doctrine as opaque owned-field shapes below.
+        throw new Error(
+          `Workspace MCP overrides file has an unrecognized root shape (written by a newer version?): ${filePath}`
+        );
+      }
+
+      // Duplicate properties make jsonc.parse (last value wins) and
+      // jsonc.modify (first matching path wins) disagree: the edit loop
+      // below could spin forever on an entry it can never remove, or
+      // declare success while a stale plugin key survives in the shadowed
+      // property. Reject up front — the caller keeps its retry tombstone
+      // until the malformed file is repaired.
+      const duplicateName = findDuplicateOverrideProperty(jsonc.parseTree(original));
+      if (duplicateName !== undefined) {
+        throw new Error(
+          `Workspace MCP overrides file has duplicate "${duplicateName}" properties: ${filePath}`
+        );
+      }
+
+      // Targeted jsonc edits, NOT JSON.stringify of the parsed object: the
+      // .jsonc file is user-maintained and may carry comments/formatting a
+      // wholesale rewrite would erase.
+      let text = original;
+      const removeAt = (jsonPath: jsonc.JSONPath): void => {
+        const next = jsonc.applyEdits(
+          text,
+          jsonc.modify(text, jsonPath, undefined, {
+            formattingOptions: { insertSpaces: true, tabSize: 2 },
+          })
+        );
+        // A no-op edit means parse and modify disagreed about the path;
+        // looping on it would never terminate.
+        assert(next !== text, "prunePluginOverrideKeys: targeted edit produced no change");
+        text = next;
+      };
+
+      // A newer release may represent an owned field with a shape this
+      // build cannot inspect. Declaring success would retire the caller's
+      // tombstone while plugin keys embedded in that shape survive —
+      // reactivating the server on reinstall. Throw instead: the tombstone
+      // stays retryable (same doctrine as unreadable files).
+      const opaqueShape = (field: string): Error =>
+        new Error(
+          `Workspace MCP overrides file has an unrecognized "${field}" shape (written by a newer version?): ${filePath}`
+        );
+
+      // Match only canonical `plugin:<16-hex>:<server>` keys under the
+      // requested prefix: MCP server names are otherwise arbitrary strings
+      // and user configuration may legitimately name a server "plugin:…" —
+      // pruning must never strip such an ordinary server's overrides.
+      // Canonical keys themselves are additionally RESERVED in ordinary
+      // config (MCPConfigService ignores them in global/project layers and
+      // addServer rejects them), so a key this shape can only belong to an
+      // Agent Plugin server — shape-based pruning cannot hit a user server.
+      const isPrunableKey = (key: unknown): boolean =>
+        typeof key === "string" && key.startsWith(keyPrefix) && isCanonicalPluginServerKey(key);
+
+      for (const field of ["enabledServers", "disabledServers"] as const) {
+        // Re-parse after each removal: array indices shift as items go.
+        for (;;) {
+          const current = jsonc.parse(text) as Record<string, unknown>;
+          const value = current[field];
+          if (value === undefined) {
+            break;
+          }
+          if (!Array.isArray(value)) {
+            throw opaqueShape(field);
+          }
+          const index = value.findIndex(isPrunableKey);
+          if (index === -1) {
+            break;
+          }
+          removeAt([field, index]);
+        }
+      }
+
+      const allowlist = (jsonc.parse(text) as Record<string, unknown>).toolAllowlist;
+      if (allowlist !== undefined) {
+        if (allowlist === null || typeof allowlist !== "object" || Array.isArray(allowlist)) {
+          throw opaqueShape("toolAllowlist");
+        }
+        for (const key of Object.keys(allowlist)) {
+          if (isPrunableKey(key)) {
+            removeAt(["toolAllowlist", key]);
+          }
+        }
+      }
+
+      if (text !== original) {
+        await writeFileString(runtime, filePath, text);
+      }
+    }
   }
 }
 

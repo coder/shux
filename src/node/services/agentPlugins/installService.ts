@@ -3149,42 +3149,53 @@ export class AgentPluginInstallService {
     if (!overridesService) {
       return [];
     }
-    const failedWorkspaceIds: string[] = [];
-    for (const workspaceId of workspaceIds) {
-      try {
-        // Raw in-queue patch: preserves unknown fields written by newer
-        // builds, throws on unreadable files (tombstone retry), and cannot
-        // interleave with a dialog save (shared exclusive write queue).
-        //
-        // The publish hook repairs MCPServerManager's in-memory override
-        // cache INSIDE that same write queue: latestWorkspaceOverrides wins
-        // over freshly read overrides, so a workspace that once enabled this
-        // plugin's server would otherwise keep serving the stale enable — and
-        // a same-name reinstall's default-disabled server could start without
-        // a fresh user action. In-queue publication also keeps the ordering
-        // consistent with concurrent dialog saves (whichever writes disk last
-        // publishes last). A failure keeps the tombstone so cache repair is
-        // retried too.
-        const mcpServerManager = this.deps.mcpServerManager;
-        await overridesService.prunePluginOverrideKeys(
-          workspaceId,
-          serverKeyPrefix,
-          mcpServerManager
-            ? {
-                publish: (persisted) =>
-                  mcpServerManager.applyWorkspaceOverrides(workspaceId, persisted),
-              }
-            : undefined
-        );
-      } catch (error) {
-        failedWorkspaceIds.push(workspaceId);
-        log.warn("Failed to prune plugin MCP overrides for workspace", {
-          workspaceId,
-          error: getErrorMessage(error),
-        });
-      }
+    if (workspaceIds.length === 0) {
+      return [];
     }
-    return failedWorkspaceIds;
+    // Raw in-queue patch: preserves unknown fields written by newer
+    // builds, throws on unreadable files (tombstone retry), and cannot
+    // interleave with a dialog save (shared exclusive write queue).
+    //
+    // The publish hook repairs MCPServerManager's in-memory override
+    // cache INSIDE that same write queue: latestWorkspaceOverrides wins
+    // over freshly read overrides, so a workspace that once enabled this
+    // plugin's server would otherwise keep serving the stale enable — and
+    // a same-name reinstall's default-disabled server could start without
+    // a fresh user action. In-queue publication also keeps the ordering
+    // consistent with concurrent dialog saves (whichever writes disk last
+    // publishes last). A failure keeps the tombstone so cache repair is
+    // retried too.
+    //
+    // One batched call, not one prune per workspace: every workspace in
+    // config is swept here, and the per-workspace variant re-resolves
+    // metadata from a full config.json parse each time — with thousands of
+    // workspaces that made installs sit on "Installing…" for half an hour.
+    const mcpServerManager = this.deps.mcpServerManager;
+    let failures: Array<{ workspaceId: string; error: unknown }>;
+    try {
+      failures = await overridesService.prunePluginOverrideKeysForWorkspaces(
+        workspaceIds,
+        serverKeyPrefix,
+        mcpServerManager
+          ? {
+              publish: (workspaceId, persisted) =>
+                mcpServerManager.applyWorkspaceOverrides(workspaceId, persisted),
+            }
+          : undefined
+      );
+    } catch (error) {
+      // Wholesale failure (lock timeout, unreadable config): no workspace was
+      // verified, so every one keeps its tombstone.
+      log.warn("Failed to prune plugin MCP overrides", { error: getErrorMessage(error) });
+      return [...workspaceIds];
+    }
+    for (const failure of failures) {
+      log.warn("Failed to prune plugin MCP overrides for workspace", {
+        workspaceId: failure.workspaceId,
+        error: getErrorMessage(failure.error),
+      });
+    }
+    return failures.map((failure) => failure.workspaceId);
   }
 
   /**
