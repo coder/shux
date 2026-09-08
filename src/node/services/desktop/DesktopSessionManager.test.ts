@@ -603,6 +603,11 @@ describe("DesktopSessionManager browser viewer releases", () => {
         expect(manager.hasAttachedViewers("isolated")).toBe(true);
         now += DESKTOP_ATTACHMENT_GRACE_MS;
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
+
+        // An explicit close is definitive: it clears the grace it would otherwise leave behind.
+        manager.noteDetached(["isolated"]);
+        await manager.close("isolated");
+        expect(manager.hasAttachedViewers("isolated")).toBe(false);
       } finally {
         await manager.closeAll();
       }
@@ -639,6 +644,16 @@ describe("DesktopSessionManager browser viewer releases", () => {
         now += DESKTOP_ATTACHMENT_GRACE_MS;
         expect(manager.hasAttachedViewers("owner")).toBe(false);
         expect(manager.hasAttachedViewers("child")).toBe(true);
+        // Closing the old owner must not release the viewer that no longer targets it.
+        const released: DesktopViewerEvent[] = [];
+        const drain = (async () => {
+          for await (const event of watcher) released.push(event);
+        })();
+        await manager.close("owner");
+        expect(released).toEqual([]);
+        expect(manager.hasAttachedViewers("child")).toBe(true);
+        controller.abort();
+        await drain;
       } finally {
         controller.abort();
         await manager.closeAll();

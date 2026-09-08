@@ -538,8 +538,11 @@ export class DesktopSessionManager {
         this.pendingWindowOpens.delete(request);
       }
     }
-    const browserViewers = Array.from(this.viewers.values()).filter(
-      (viewer) => viewer.workspaceId === workspaceId || viewer.ownerWorkspaceId === workspaceId
+    // Same current-target classification as hasAttachedViewers(): a borrower whose binding
+    // moved away from this workspace must not be released (and its unrelated desktop yanked)
+    // when this workspace closes.
+    const browserViewers = Array.from(this.viewers.values()).filter((viewer) =>
+      this.viewerTargets(viewer).includes(workspaceId)
     );
     const viewers = new Set([workspaceId]);
     for (const [requesterId, ownerId] of this.windowOwners) {
@@ -590,6 +593,9 @@ export class DesktopSessionManager {
       this.sessions.delete(workspaceId);
       this.startupPromises.delete(workspaceId);
       this.closingWorkspaces.delete(workspaceId);
+      // An explicit close is definitive proof that nothing is attached any more: the grace is
+      // for transports that may come back, not for a teardown that already released them.
+      this.recentDetachments.delete(workspaceId);
     }
   }
 
