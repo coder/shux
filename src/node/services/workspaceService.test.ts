@@ -7385,17 +7385,21 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
 
   test.each(
     ["legacy", "heartbeat"].flatMap((producer) =>
-      [
-        "absent",
-        "unresolved",
-        "narrowed",
-        "manual before publication",
-        "newer Stop during clear",
-      ].map((initial) => ({ producer, initial }))
+      ["absent", "unresolved", "narrowed", "manual before publication", "newer Stop during clear"]
+        .map((initial) => ({ producer, initial, operation: "full clear" }))
+        .concat(
+          ["reset", "destructive replacement", "active prefix trim", "sealed prefix trim"].map(
+            (operation) => ({
+              producer,
+              initial: "absent",
+              operation,
+            })
+          )
+        )
     )
   )(
-    "full clear fences captured foreign $producer publication ($initial Stop)",
-    async ({ producer, initial }) => {
+    "$operation checks captured foreign $producer publication ($initial Stop)",
+    async ({ producer, initial, operation }) => {
       const { config, historyService, workspaceService, cleanup } = await createServices();
       const workspaceId = "clear-foreign-compaction";
       const options = { model: "openai:gpt-4o", agentId: "exec" };
@@ -7407,6 +7411,20 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         runtimeConfig: { type: "local" },
       });
       const followUp = { text: "Continue discarded work", ...options };
+      if (operation === "sealed prefix trim") {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("sealed", "user", "Sealed context")
+        );
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("sealed-boundary", "assistant", "Preserved summary", {
+            compacted: "user",
+            compactionBoundary: true,
+            compactionEpoch: 1,
+          })
+        );
+      }
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage("old-request", "user", "Compact", {
@@ -7418,6 +7436,13 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         })
       );
       const cancellation = new CompactionCancellation(historyService, workspaceId);
+      if (operation === "active prefix trim") {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("survivor", "assistant", "Surviving context")
+        );
+        expect(await historyService.classifyTruncationRemoval(workspaceId, 0.25)).toBe("partial");
+      }
       const foreignHistory = new HistoryService(config);
       const foreign = await createAgentSessionHarness({
         workspaceId,
@@ -7465,7 +7490,34 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
             );
           }
         }
-        expect((await workspaceService.truncateHistory(workspaceId)).success).toBe(true);
+        const mutation =
+          operation === "reset"
+            ? await workspaceService.resetContext(workspaceId)
+            : operation === "destructive replacement"
+              ? await workspaceService.replaceHistory(
+                  workspaceId,
+                  createMuxMessage("replacement", "assistant", "Fresh context")
+                )
+              : await workspaceService.truncateHistory(
+                  workspaceId,
+                  operation === "active prefix trim"
+                    ? 0.25
+                    : operation === "sealed prefix trim"
+                      ? 0.01
+                      : undefined
+                );
+        expect(mutation.success).toBe(true);
+        if (operation === "active prefix trim") {
+          const trimmed = await historyService.getHistoryFromLatestBoundary(workspaceId);
+          expect(trimmed.success && trimmed.data.map((row) => row.id)).toEqual(["survivor"]);
+        }
+        if (operation === "sealed prefix trim") {
+          const retainedIds: string[] = [];
+          await historyService.iterateFullHistory(workspaceId, "forward", (rows) => {
+            retainedIds.push(...rows.map((row) => row.id));
+          });
+          expect(retainedIds).toEqual(["sealed-boundary", "old-request"]);
+        }
         if (initial === "newer Stop during clear")
           await new CompactionCancellation(new HistoryService(config), workspaceId).cancel();
         if (initial === "manual before publication") {
@@ -7488,7 +7540,8 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         expect(
           published.success &&
             published.data.some((row) => row.metadata?.muxMetadata?.type === "compaction-summary")
-        ).toBe(false);
+        ).toBe(operation === "sealed prefix trim");
+        if (operation === "sealed prefix trim") return;
         fresh = await createAgentSessionHarness({
           workspaceId,
           config,
@@ -7519,6 +7572,74 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         await foreign.session.dispose();
         await workspaceService.disposeSession(workspaceId);
         await clock.dispose();
+        await cleanup();
+      }
+    }
+  );
+
+  test.each(
+    ["reset", "replace", "active prefix trim"].flatMap((operation) =>
+      [false, true].map((afterAdvance) => ({ operation, afterAdvance }))
+    )
+  )(
+    "$operation refuses history mutation when publication fencing fails (after advance=$afterAdvance)",
+    async ({ operation, afterAdvance }) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "context-publication-failure";
+      await config.addWorkspace("/tmp/context-publication-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "context-publication-project",
+        projectPath: "/tmp/context-publication-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("old-user", "user", "Original context")
+      );
+      if (operation === "active prefix trim") {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("survivor", "assistant", "Surviving context")
+        );
+      }
+      const journal = historyService.getContinuousCompactionJournal(workspaceId);
+      const generation = await journal.captureGeneration();
+      const invalidate = journal.invalidateUnderHistoryLock.bind(journal);
+      const failure = spyOn(journal, "invalidateUnderHistoryLock").mockImplementationOnce(
+        async (...args) => {
+          if (afterAdvance) await invalidate(...args);
+          throw new Error("context publication unavailable");
+        }
+      );
+      const mutate = () =>
+        operation === "reset"
+          ? workspaceService.resetContext(workspaceId)
+          : operation === "active prefix trim"
+            ? workspaceService.truncateHistory(workspaceId, 0.25)
+            : workspaceService.replaceHistory(
+                workspaceId,
+                createMuxMessage("replacement", "assistant", "Fresh context")
+              );
+      try {
+        const result = await mutate();
+        expect(!result.success && result.error).toContain("context publication unavailable");
+        const freshHistory = new HistoryService(config);
+        const rows = await freshHistory.getHistoryFromLatestBoundary(workspaceId);
+        expect(rows.success && rows.data.map((row) => row.id)).toEqual(
+          operation === "active prefix trim" ? ["old-user", "survivor"] : ["old-user"]
+        );
+        const failedGeneration = await freshHistory
+          .getContinuousCompactionJournal(workspaceId)
+          .captureGeneration();
+        expect(failedGeneration === generation).toBe(!afterAdvance);
+        // A partial epoch advance stays retired. Retry publishes a fresh epoch rather
+        // than restoring an old producer's authority after storage becomes writable.
+        expect((await mutate()).success).toBe(true);
+        expect(await journal.captureGeneration()).not.toBe(failedGeneration);
+      } finally {
+        failure.mockRestore();
+        await workspaceService.disposeSession(workspaceId);
         await cleanup();
       }
     }

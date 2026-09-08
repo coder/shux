@@ -2712,6 +2712,7 @@ export class HistoryService {
         `[HISTORY APPEND] Assigned historySequence=${message.metadata.historySequence ?? "unknown"} role=${message.role}`
       );
 
+      await this.fenceContextResetUnderHistoryLock(workspaceId, [message]);
       await this.getAppendProvenance(workspaceId).appendChat(
         Buffer.from(JSON.stringify(historyEntry) + "\n")
       );
@@ -2719,6 +2720,20 @@ export class HistoryService {
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to append to history: ${message}`);
+    }
+  }
+
+  private async fenceContextResetUnderHistoryLock(
+    workspaceId: string,
+    messages: readonly MuxMessage[]
+  ): Promise<void> {
+    if (
+      messages.some((message) => getContextBoundaryKind(message) === CONTEXT_BOUNDARY_KINDS.RESET)
+    ) {
+      // A reset discards foreign producers' captured context even without a Stop.
+      // Fence after admission checks and before the write, under this same lock;
+      // a failed epoch write must never leave a committed reset unfenced.
+      await this.getContinuousCompactionJournal(workspaceId).invalidateUnderHistoryLock();
     }
   }
 
@@ -3114,6 +3129,7 @@ export class HistoryService {
           // temp-and-rename helper the other history mutations use, under the
           // cross-process append lock (r50) so a foreign backend's row cannot
           // land between this read and the replace and be silently deleted.
+          await this.fenceContextResetUnderHistoryLock(workspaceId, messages);
           await this.getAppendProvenance(workspaceId).appendChat(
             Buffer.from(this.serializeHistoryEntries(messages, workspaceId)),
             true
@@ -4100,6 +4116,11 @@ export class HistoryService {
             .filter((s): s is number => isNonNegativeInteger(s));
 
           if (percentage >= 1.0) {
+            // Full deletion also retires captured publications when no Stop exists.
+            // Keep the epoch advance and destructive rewrite in one locked operation.
+            if (archiveRows.length > 0 || chatRows.length > 0) {
+              await this.getContinuousCompactionJournal(workspaceId).invalidateUnderHistoryLock();
+            }
             await this.rewriteHistoryFilesUnlocked(workspaceId, null, null);
             this.sequenceCounters.set(workspaceId, 0);
             return Ok(allSequences);
@@ -4156,6 +4177,7 @@ export class HistoryService {
                 "Truncation would remove every remaining message; retry to run it as a full clear."
               );
             }
+            await this.getContinuousCompactionJournal(workspaceId).invalidateUnderHistoryLock();
             await this.rewriteHistoryFilesUnlocked(workspaceId, null, null);
             this.sequenceCounters.set(workspaceId, 0);
             return Ok(allSequences);
@@ -4183,6 +4205,11 @@ export class HistoryService {
             retainedMessages,
             sanitize
           );
+          // A prefix cut retires captured publications only when it removes active
+          // provider context; trimming sealed or display-only rows preserves them.
+          if (activeContextChanged) {
+            await this.getContinuousCompactionJournal(workspaceId).invalidateUnderHistoryLock();
+          }
           await this.rewriteHistoryFilesUnlocked(
             workspaceId,
             remainingArchive.length > 0 ? remainingArchive : null,

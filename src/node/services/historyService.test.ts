@@ -991,6 +991,112 @@ describe("HistoryService", () => {
     });
   });
 
+  describe("context publication fencing", () => {
+    it.each([false, true])(
+      "reset batches validate their original publication before advancing it (admitted=%s)",
+      async (admitted) => {
+        const workspaceId = "reset-batch-publication";
+        await service.appendToHistory(workspaceId, createMuxMessage("old", "user", "Old context"));
+        const journal = service.getContinuousCompactionJournal(workspaceId);
+        const publication = { generation: await journal.captureGeneration() };
+        await fs.writeFile(journal.path, "existing journal");
+        let skipped = false;
+        const result = await service.appendManyToHistory(
+          workspaceId,
+          [
+            createMuxMessage("reset", "assistant", "", {
+              contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+            }),
+            createMuxMessage("replacement", "user", "Fresh request"),
+          ],
+          {
+            publication,
+            allowedTailMessageIds: [],
+            isCurrent: () => admitted,
+            onSkipped: () => {
+              skipped = true;
+            },
+          }
+        );
+        expect(result.success).toBe(true);
+        expect(skipped).toBe(!admitted);
+        expect((await journal.captureGeneration()) === publication.generation).toBe(!admitted);
+        expect((await collectFullHistory(service, workspaceId)).map((row) => row.id)).toEqual(
+          admitted ? ["old", "reset", "replacement"] : ["old"]
+        );
+        if (admitted) {
+          // The admitted batch succeeds with its old receipt; subsequent foreign
+          // handoffs carrying that same receipt must now be refused.
+          let foreignSkipped = false;
+          await new HistoryService(config).appendToHistory(
+            workspaceId,
+            createMuxMessage("stale", "user", "Discarded follow-up"),
+            {
+              publication,
+              allowedTailMessageIds: [],
+              isCurrent: () => true,
+              onSkipped: () => {
+                foreignSkipped = true;
+              },
+            }
+          );
+          expect(foreignSkipped).toBe(true);
+        } else {
+          expect(await fs.readFile(journal.path, "utf8")).toBe("existing journal");
+        }
+      }
+    );
+
+    it("refuses a reset batch when its publication generation cannot be written", async () => {
+      const workspaceId = "reset-batch-generation-failure";
+      await service.appendToHistory(workspaceId, createMuxMessage("old", "user", "Old context"));
+      const failure = spyOn(
+        service.getContinuousCompactionJournal(workspaceId),
+        "invalidateUnderHistoryLock"
+      ).mockRejectedValueOnce(new Error("generation unavailable"));
+      try {
+        const result = await service.appendManyToHistory(workspaceId, [
+          createMuxMessage("reset", "assistant", "", {
+            contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+          }),
+          createMuxMessage("replacement", "user", "Fresh request"),
+        ]);
+        expect(!result.success && result.error).toContain("generation unavailable");
+        expect((await collectFullHistory(service, workspaceId)).map((row) => row.id)).toEqual([
+          "old",
+        ]);
+      } finally {
+        failure.mockRestore();
+      }
+    });
+
+    it.each(["full", "rounded full", "refused full", "no rows", "zero"])(
+      "only actual full deletions retire the publication generation (%s)",
+      async (operation) => {
+        const workspaceId = "full-delete-publication";
+        await fs.mkdir(path.join(config.sessionsDir, workspaceId), { recursive: true });
+        if (operation !== "no rows") {
+          await service.appendToHistory(
+            workspaceId,
+            createMuxMessage("old", "user", "Old context")
+          );
+        }
+        const journal = service.getContinuousCompactionJournal(workspaceId);
+        await fs.writeFile(journal.path, "existing journal");
+        const generation = await journal.captureGeneration();
+        const result = await service.truncateHistory(
+          workspaceId,
+          operation === "zero" ? 0 : operation === "full" || operation === "no rows" ? 1 : 0.5,
+          { refuseFullDelete: operation === "refused full" }
+        );
+        const removed = operation === "full" || operation === "rounded full";
+        expect(result.success).toBe(operation !== "refused full");
+        expect((await journal.captureGeneration()) === generation).toBe(!removed);
+        if (!removed) expect(await fs.readFile(journal.path, "utf8")).toBe("existing journal");
+      }
+    );
+  });
+
   describe("clearHistory", () => {
     it("should delete chat.jsonl file", async () => {
       const workspaceId = "workspace1";
@@ -2577,7 +2683,12 @@ describe("HistoryService", () => {
         })
       );
 
+      const journal = service.getContinuousCompactionJournal(wsId);
+      const generation = await journal.captureGeneration();
+      await fs.writeFile(journal.path, "active publication journal");
       expect((await service.truncateHistory(wsId, 0.5)).success).toBe(true);
+      expect(await journal.captureGeneration()).toBe(generation);
+      expect(await fs.readFile(journal.path, "utf8")).toBe("active publication journal");
 
       const active = await service.getHistoryFromLatestBoundary(wsId);
       expect(active.success).toBe(true);
@@ -2606,7 +2717,12 @@ describe("HistoryService", () => {
         })
       );
 
+      const journal = service.getContinuousCompactionJournal(wsId);
+      const generation = await journal.captureGeneration();
+      await fs.writeFile(journal.path, "active publication journal");
       expect((await service.truncateHistory(wsId, 0.2)).success).toBe(true);
+      expect(await journal.captureGeneration()).toBe(generation);
+      expect(await fs.readFile(journal.path, "utf8")).toBe("active publication journal");
 
       const active = await service.getHistoryFromLatestBoundary(wsId);
       expect(active.success).toBe(true);
