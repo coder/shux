@@ -4422,6 +4422,14 @@ export class AgentSession {
         )
       );
     }
+    // The shutdown latch was checked before the snapshot materialization and history I/O above,
+    // and isCurrentTurn stays true while merely closing. Refuse while the rows are still
+    // rollback-eligible: retained, they read as a dispatched turn to the next startup.
+    if (this.coordinator.closing) {
+      return refuseBeforeAcceptance(
+        createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE)
+      );
+    }
 
     if (contextRollover) {
       // Branch summaries must remain discoverable if the append/rollback failed. Only

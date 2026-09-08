@@ -16,7 +16,11 @@ import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import type { InitStateManager } from "./initStateManager";
 import type { WorkspaceChatMessage, SendMessageOptions } from "@/common/orpc/types";
-import { createMuxMessage, pickStartupRetrySendOptions } from "@/common/types/message";
+import {
+  createMuxMessage,
+  pickStartupRetrySendOptions,
+  type MuxMessage,
+} from "@/common/types/message";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Ok } from "@/common/types/result";
@@ -268,6 +272,61 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     await session.dispose();
   });
+
+  test.each(["materialize", "append"] as const)(
+    "beginShutdown inside the %s await rolls the unaccepted turn back instead of leaving a row",
+    async (window) => {
+      const workspaceId = `startup-retry-shutdown-mid-${window}`;
+      const streamMessage = mock(() =>
+        Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal, "assistant-1")))
+      );
+      const { session, historyService, cleanup } = await createSessionBundle(workspaceId, {
+        streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
+      });
+      cleanups.push(cleanup);
+      const seeded = [
+        createMuxMessage("user-0", "user", "earlier turn", { timestamp: Date.now() }),
+        createMuxMessage("assistant-0", "assistant", "earlier answer", { timestamp: Date.now() }),
+      ];
+      for (const row of seeded) {
+        expect((await historyService.appendToHistory(workspaceId, row)).success).toBe(true);
+      }
+
+      // Shutdown lands after the pre-persist latch check passed, inside a later pre-acceptance
+      // await: snapshot materialization, or the user row's own append (already durable then).
+      if (window === "materialize") {
+        const internals = session as unknown as {
+          materializeAgentSkillSnapshots: (...args: unknown[]) => Promise<MuxMessage[]>;
+        };
+        const materialize = internals.materializeAgentSkillSnapshots.bind(session);
+        internals.materializeAgentSkillSnapshots = async (...args: unknown[]) => {
+          const snapshots = await materialize(...args);
+          session.beginShutdown();
+          return snapshots;
+        };
+      } else {
+        const append = historyService.appendToHistory.bind(historyService);
+        spyOn(historyService, "appendToHistory").mockImplementation(async (id, message) => {
+          const result = await append(id, message);
+          session.beginShutdown();
+          return result;
+        });
+      }
+
+      const sendResult = await session.sendMessage("hello", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+      });
+      expect(sendResult.success).toBe(false);
+      expect(streamMessage).not.toHaveBeenCalled();
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success ? history.data.map((row) => row.id) : ["unexpected"]).toEqual(
+        seeded.map((row) => row.id)
+      );
+
+      await session.dispose();
+    }
+  );
 
   test("beginShutdown during pre-stream awaits stops the stream before the provider", async () => {
     const workspaceId = "startup-retry-shutdown-mid-prepare";
