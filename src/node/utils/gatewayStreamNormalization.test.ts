@@ -1,4 +1,14 @@
 import { describe, expect, it } from "bun:test";
+import { generateText } from "ai";
+import { MockLanguageModelV3 } from "ai/test";
+import type { LanguageModelV2Usage, LanguageModelV3Usage } from "@ai-sdk/provider";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import {
+  accumulateProviderMetadata,
+  addUsage,
+  normalizeUsage,
+  withCacheWriteMetadata,
+} from "@/common/utils/tokens/usageHelpers";
 import {
   isV3Usage,
   flatUsageToV3,
@@ -156,6 +166,115 @@ describe("normalizeFinishReason", () => {
 });
 
 describe("normalizeGatewayGenerateResult", () => {
+  it.each(["flat", "nested"])("recovers metadata cache writes from %s usage", (format) => {
+    const usage =
+      format === "flat"
+        ? { inputTokens: 1000, outputTokens: 50, cachedInputTokens: 700 }
+        : {
+            inputTokens: { total: 1000, cacheRead: 700, noCache: 300 },
+            outputTokens: { total: 50 },
+          };
+    const originalUsage = structuredClone(usage);
+    const providerMetadata = { openai: { usage: { cacheWriteTokens: 200 } } };
+    const result = normalizeGatewayGenerateResult<Record<string, unknown>>({
+      usage,
+      providerMetadata,
+    });
+
+    expect((result.usage as V3Usage).inputTokens).toEqual({
+      total: 1000,
+      noCache: 100,
+      cacheRead: 700,
+      cacheWrite: 200,
+    });
+    expect(result.providerMetadata).toBe(providerMetadata);
+    expect(usage).toEqual(originalUsage);
+  });
+
+  it.each([0, 50])("preserves an explicit normalized cache-write count of %i", (cacheWrite) => {
+    const usage: V3Usage = {
+      inputTokens: { total: 1000, cacheRead: 700, cacheWrite, noCache: 300 - cacheWrite },
+      outputTokens: { total: 50 },
+    };
+    const result = normalizeGatewayGenerateResult<Record<string, unknown>>({
+      usage,
+      providerMetadata: { openai: { usage: { cacheWriteTokens: 200 } } },
+    });
+
+    expect(result.usage).toBe(usage);
+  });
+
+  it.each([undefined, null, "200", -1, NaN, Infinity])(
+    "ignores invalid metadata cache-write counts: %p",
+    (cacheWriteTokens) => {
+      const result = normalizeGatewayGenerateResult<Record<string, unknown>>({
+        usage: { inputTokens: 1000, cachedInputTokens: 700 },
+        providerMetadata: { openai: { usage: { cacheWriteTokens } } },
+      });
+
+      const usage = result.usage as V3Usage;
+      expect(usage.inputTokens.cacheWrite).toBeUndefined();
+      expect(usage.inputTokens.noCache).toBe(300);
+    }
+  );
+
+  it.each([null, "invalid", { openai: null }, { openai: { usage: null } }])(
+    "ignores malformed provider metadata: %p",
+    (providerMetadata) => {
+      const result = normalizeGatewayGenerateResult<Record<string, unknown>>({
+        usage: { inputTokens: 1000, cachedInputTokens: 700 },
+        providerMetadata,
+      });
+
+      expect((result.usage as V3Usage).inputTokens.noCache).toBe(300);
+      expect((result.usage as V3Usage).inputTokens.cacheWrite).toBeUndefined();
+    }
+  );
+
+  it("keeps uncached input nonnegative when cache counts exceed total input", () => {
+    const result = normalizeGatewayGenerateResult<Record<string, unknown>>({
+      usage: { inputTokens: 100, cachedInputTokens: 80 },
+      providerMetadata: { openai: { usage: { cacheWriteTokens: 30 } } },
+    });
+
+    expect((result.usage as V3Usage).inputTokens.noCache).toBe(0);
+  });
+
+  it("accumulates recovered cache writes through SDK usage and display accounting", async () => {
+    let cumulativeUsage: LanguageModelV2Usage | undefined;
+    let cumulativeMetadata: Record<string, unknown> | undefined;
+
+    for (const cacheWriteTokens of [200, 50]) {
+      const model = new MockLanguageModelV3({
+        doGenerate: () => {
+          const result = normalizeGatewayGenerateResult<Record<string, unknown>>({
+            usage: { inputTokens: 1000, outputTokens: 10, cachedInputTokens: 700 },
+            providerMetadata: { openai: { usage: { cacheWriteTokens } } },
+          });
+          return Promise.resolve({
+            ...result,
+            usage: result.usage as LanguageModelV3Usage,
+            content: [{ type: "text", text: "Done" }],
+            finishReason: { unified: "stop", raw: "stop" },
+            warnings: [],
+          });
+        },
+      });
+      const result = await generateText({ model, prompt: "Test usage accounting" });
+      cumulativeUsage = addUsage(cumulativeUsage, normalizeUsage(result.usage));
+      cumulativeMetadata = accumulateProviderMetadata(
+        cumulativeMetadata,
+        withCacheWriteMetadata(result.providerMetadata, result.usage)
+      );
+    }
+
+    const display = createDisplayUsage(cumulativeUsage, "openai:gpt-6-astra", cumulativeMetadata);
+    expect(display?.cacheCreate.tokens).toBe(250);
+    expect(display?.cached.tokens).toBe(1400);
+    expect(display?.input.tokens).toBe(350);
+    expect(display?.output.tokens).toBe(20);
+  });
+
   it("converts flat usage in generate result", () => {
     const result = normalizeGatewayGenerateResult({
       content: [{ type: "text", text: "hello" }],
@@ -257,6 +376,23 @@ describe("normalizeGatewayStreamUsage", () => {
 
     // finishReason should be v3 object
     expect(finish.finishReason).toEqual({ unified: "stop", raw: "stop" });
+  });
+
+  it("recovers cache writes from each finish event", async () => {
+    const chunks = [200, 50].map((cacheWriteTokens) => ({
+      type: "finish",
+      finishReason: "stop",
+      usage: { inputTokens: 1000, outputTokens: 50, cachedInputTokens: 700 },
+      providerMetadata: { openai: { usage: { cacheWriteTokens } } },
+    }));
+    const result = await collectStream(chunks);
+
+    expect(
+      result.map((chunk) => ((chunk as Record<string, unknown>).usage as V3Usage).inputTokens)
+    ).toEqual([
+      { total: 1000, noCache: 100, cacheRead: 700, cacheWrite: 200 },
+      { total: 1000, noCache: 250, cacheRead: 700, cacheWrite: 50 },
+    ]);
   });
 
   it("preserves already-v3 finish events", async () => {
