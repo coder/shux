@@ -251,6 +251,12 @@ describe("absolute warning advance floor", () => {
     ).toBe("warn");
   });
 
+  test("a low threshold still keeps the first half of the usable window warning-free", () => {
+    // 10% threshold: the percent rule would warn at 0; rolloverAt = forceAt = 15_000.
+    expect(evaluate({ threshold: 0.1, contextTokens: 7_499 }).decision).toBe("continue");
+    expect(evaluate({ threshold: 0.1, contextTokens: 7_500 }).decision).toBe("warn");
+  });
+
   test("a tiny window keeps its first half usable and then rolls over without a flush", () => {
     // hardCeiling = 3_000 < WARNING_ADVANCE_MIN_TOKENS: the floor is clamped to half the
     // rollover point (1_500), where the reserve no longer fits, so the outcome is rollover.

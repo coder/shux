@@ -119,12 +119,15 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     return { ...result, decision: "rollover", flushOpportunity: safeFlush };
   }
   // On small windows or high thresholds the hard ceiling, not the force buffer, is where the
-  // window really ends; anchor the absolute advance floor there. Tiny windows keep at least
-  // half of the usable window before the warning instead of warning on the first request.
+  // window really ends; anchor the absolute advance floor there. Whatever the threshold, at
+  // least half of the usable window stays warning-free instead of warning on the first request.
   const rolloverAt = Math.min(forceAt, hardCeiling);
-  const warnAt = Math.min(
-    limit * ((input.threshold * 100 - WARNING_ADVANCE_PERCENT) / 100),
-    Math.max(rolloverAt - WARNING_ADVANCE_MIN_TOKENS, rolloverAt / 2)
+  const warnAt = Math.max(
+    rolloverAt / 2,
+    Math.min(
+      limit * ((input.threshold * 100 - WARNING_ADVANCE_PERCENT) / 100),
+      rolloverAt - WARNING_ADVANCE_MIN_TOKENS
+    )
   );
   if (!input.warningEmitted && projected >= warnAt) {
     // Never spend the last usable context tokens telling the agent to flush notes.

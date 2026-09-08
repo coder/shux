@@ -5632,8 +5632,10 @@ export class AgentSession {
       const flushStillSafe =
         decision.hardCeiling !== undefined &&
         decision.projected + WARNING_RESERVE_TOKENS < decision.hardCeiling;
+      // Threshold 100% disables automatic rollover: a flush promising a sealed window would lie.
       if (
         this.pendingRollover != null &&
+        this.compactionMonitor.getThreshold() < 1 &&
         flushStillSafe &&
         this.contextBudgetMemoryWritable === true &&
         recoveryAvailable

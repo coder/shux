@@ -1453,6 +1453,20 @@ describe("AgentSession token-budget lifecycle", () => {
     );
   });
 
+  test("disabling automatic rollover before the flush dispatches degrades it to a normal turn", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    h.session.setAutoCompactionThreshold(1);
+    await h.finishAndDispatch();
+    const rows = await allRows(h);
+    expect(warningRows(rows)).toHaveLength(0);
+    expect(rolloverRows(rows)).toHaveLength(0);
+    const trigger = rows.at(-1)!;
+    expect(text(trigger)).toBe("Continue");
+    expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
+  });
+
   test("the final flush is offered once per window, including after a restart", async () => {
     const first = await setup();
     expect((await first.session.sendMessage("Work", options)).success).toBe(true);
