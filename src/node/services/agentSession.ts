@@ -3427,6 +3427,12 @@ export class AgentSession {
       internal?.admissionStale?.() === true ||
       !this.coordinator.isCurrentTurn(attempt.owner ?? attempt.expectedTurn) ||
       this.coordinator.editBlocked(attempt.editReservation?.id);
+    // An edit's truncation is irreversible: past it, only the replacement row records the user's
+    // input, so shutdown must let that row land (the PREPARING gate then refuses with rows
+    // retained and startup recovery resumes the edit) rather than lose both versions.
+    let editTailTruncated = false;
+    const shutdownRefusesBeforePersist = (): boolean =>
+      this.coordinator.closing && !editTailTruncated;
 
     const cancelSignal = internal?.cancelSignal;
     const persistedCancelableMessageIds: string[] = [];
@@ -3837,6 +3843,7 @@ export class AgentSession {
           return Err(createUnknownSendMessageError(truncateResult.error));
         }
       } else {
+        editTailTruncated = true;
         // RLM mode: summarize the truncated tail into a durable labeled row
         // BEFORE the edited user message is appended and this turn's request is
         // built (log purity by construction). Best-effort with a hard deadline —
@@ -4171,7 +4178,7 @@ export class AgentSession {
     }
     // Still pre-persist: a row appended now would read as a dispatched turn on the next startup
     // while streamWithHistory's own latch check keeps its stream from ever running.
-    if (this.coordinator.closing) {
+    if (shutdownRefusesBeforePersist()) {
       return refuseBeforeAcceptance(
         createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE)
       );
@@ -4285,7 +4292,11 @@ export class AgentSession {
           [...contextBudgetPrefix, ...requestPrelude]
         );
         if (await cancelBeforeAcceptance()) return Ok(undefined);
-        if (isAdmissionStale() || this.coordinator.admissionBlocked || this.coordinator.closing) {
+        if (
+          isAdmissionStale() ||
+          this.coordinator.admissionBlocked ||
+          shutdownRefusesBeforePersist()
+        ) {
           return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
         }
         if (!freshBudget.success) return await rejectBudgetSend(freshBudget.error);
@@ -4331,7 +4342,11 @@ export class AgentSession {
           await this.applyContextResetSideEffects();
         }
         if (await cancelBeforeAcceptance()) return Ok(undefined);
-        if (isAdmissionStale() || this.coordinator.admissionBlocked || this.coordinator.closing) {
+        if (
+          isAdmissionStale() ||
+          this.coordinator.admissionBlocked ||
+          shutdownRefusesBeforePersist()
+        ) {
           return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
         }
         // Ordinary sends stay append-only; only coupled snapshots/boundaries need an atomic batch.
@@ -4425,7 +4440,7 @@ export class AgentSession {
     // The shutdown latch was checked before the snapshot materialization and history I/O above,
     // and isCurrentTurn stays true while merely closing. Refuse while the rows are still
     // rollback-eligible: retained, they read as a dispatched turn to the next startup.
-    if (this.coordinator.closing) {
+    if (shutdownRefusesBeforePersist()) {
       return refuseBeforeAcceptance(
         createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE)
       );

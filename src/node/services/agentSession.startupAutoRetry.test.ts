@@ -328,6 +328,66 @@ describe("AgentSession startup auto-retry recovery", () => {
     }
   );
 
+  test.each(["materialize", "append"] as const)(
+    "beginShutdown inside an edit's %s await keeps the replacement row after truncation",
+    async (window) => {
+      const workspaceId = `startup-retry-shutdown-edit-${window}`;
+      const streamMessage = mock(() =>
+        Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal, "assistant-1")))
+      );
+      const { session, historyService, cleanup } = await createSessionBundle(workspaceId, {
+        streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
+      });
+      cleanups.push(cleanup);
+      for (const [id, role, text] of [
+        ["u0", "user", "first turn"],
+        ["a0", "assistant", "first answer"],
+        ["u1", "user", "original wording"],
+        ["a1", "assistant", "answer to the original"],
+      ] as const) {
+        const row = createMuxMessage(id, role, text, { timestamp: Date.now() });
+        expect((await historyService.appendToHistory(workspaceId, row)).success).toBe(true);
+      }
+
+      // The edit has already truncated u1 and a1 when shutdown lands; only the replacement row
+      // records the user's input now, so it must survive instead of being rolled back.
+      if (window === "materialize") {
+        const internals = session as unknown as {
+          materializeAgentSkillSnapshots: (...args: unknown[]) => Promise<MuxMessage[]>;
+        };
+        const materialize = internals.materializeAgentSkillSnapshots.bind(session);
+        internals.materializeAgentSkillSnapshots = async (...args: unknown[]) => {
+          const snapshots = await materialize(...args);
+          session.beginShutdown();
+          return snapshots;
+        };
+      } else {
+        const append = historyService.appendToHistory.bind(historyService);
+        spyOn(historyService, "appendToHistory").mockImplementation(async (id, message) => {
+          const result = await append(id, message);
+          session.beginShutdown();
+          return result;
+        });
+      }
+
+      const sendResult = await session.sendMessage("edited wording", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+        editMessageId: "u1",
+      });
+      expect(sendResult.success).toBe(false);
+      expect(streamMessage).not.toHaveBeenCalled();
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success ? history.data : ["unexpected"]).toMatchObject([
+        { id: "u0" },
+        { id: "a0" },
+        { role: "user", parts: [{ type: "text", text: "edited wording" }] },
+      ]);
+
+      await session.dispose();
+    }
+  );
+
   test("beginShutdown during pre-stream awaits stops the stream before the provider", async () => {
     const workspaceId = "startup-retry-shutdown-mid-prepare";
     const streamMessage = mock(() =>
