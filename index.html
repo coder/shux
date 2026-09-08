@@ -52,7 +52,7 @@
 
       #root {
         height: 100vh; /* fallback for older browsers */
-        height: 100dvh;
+        height: var(--app-viewport-height, 100dvh);
         overflow: hidden;
         background: var(--color-surface-primary, #0a0a0b);
       }
@@ -217,6 +217,8 @@
     </script>
   </head>
   <body>
+    <!-- Solid fill for the iOS standalone status-bar band; see .ios-status-bar-band. -->
+    <div class="ios-status-bar-band" aria-hidden="true"></div>
     <div id="root">
       <div class="boot-loader" role="status" aria-live="polite" aria-busy="true">
         <div class="boot-loader__inner">

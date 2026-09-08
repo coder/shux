@@ -5,14 +5,7 @@
  * sheet ("Save Image" / "Save to Files") there.
  */
 
-/**
- * `navigator.standalone` exists only on iOS WebKit and is true only when
- * launched from a Home Screen icon, so this never matches desktop PWAs or
- * Android, where anchor downloads work.
- */
-export function isIosStandaloneWebApp(): boolean {
-  return (navigator as Navigator & { standalone?: unknown }).standalone === true;
-}
+import { isIosStandaloneWebApp } from "@/browser/utils/env";
 
 function canShareFile(file: File): boolean {
   return typeof navigator.share === "function" && navigator.canShare?.({ files: [file] }) === true;

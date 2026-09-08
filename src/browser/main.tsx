@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { installBrowserLogCapture } from "@/browser/utils/browserLog";
 import { installWindowOpenLocalhostProxyNormalization } from "@/browser/utils/windowOpenLocalhostProxy";
 import { installInactiveAnimationPause } from "@/browser/utils/inactiveAnimations";
+import { installViewportHeightSync } from "@/browser/utils/viewportHeight";
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
 import { initTelemetry, trackAppStarted } from "@/common/telemetry";
 import { initTitlebarInsets } from "@/browser/hooks/useDesktopTitlebar";
@@ -22,6 +23,7 @@ try {
 }
 
 installWindowOpenLocalhostProxyNormalization();
+installViewportHeightSync();
 
 initTelemetry();
 trackAppStarted();
