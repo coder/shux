@@ -1170,7 +1170,11 @@ export class WorkspaceStore {
       aggregator.setActiveQueuedFollowUp(data.hasQueuedMessages ?? queuedMessage !== null);
       const transient = this.assertChatTransientState(workspaceId);
       transient.queuedMessage = queuedMessage;
-      if (queuedMessage) {
+      if (
+        queuedMessage &&
+        transient.pendingSend &&
+        queuedMessage.content.includes(transient.pendingSend.content)
+      ) {
         // The send landed in the backend queue; the queued card takes over from the pending row.
         transient.pendingSend = null;
       }

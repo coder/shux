@@ -4859,6 +4859,33 @@ describe("WorkspaceStore", () => {
       ).toBe(true);
       expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
     });
+
+    it("keeps the pending row when a queue update does not contain the sent text", async () => {
+      const workspaceId = "pending-send-queued-other";
+      let releaseQueue!: () => void;
+      const queueGate = new Promise<void>((resolve) => {
+        releaseQueue = resolve;
+      });
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        await queueGate;
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: true,
+          queuedMessages: ["earlier follow-up"],
+          displayText: "earlier follow-up",
+        };
+        await waitForAbortSignal(signal);
+      });
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      releaseQueue();
+
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).queuedMessage !== null)
+      ).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+    });
   });
 
   describe("bash-output events", () => {
