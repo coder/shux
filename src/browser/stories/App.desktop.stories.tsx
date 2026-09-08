@@ -53,6 +53,7 @@ function setupDesktopStory(phone = false): APIClient {
   client.desktop = {
     watchViewer: watchDesktopViewerFixture,
     acknowledgeViewerRelease: () => Promise.resolve(),
+    detachViewer: () => Promise.resolve(),
     openWindow: ({ instanceId }) => Promise.resolve({ instanceId }),
     closeWindow: () => Promise.resolve(),
     getWindow: () => Promise.resolve(null),

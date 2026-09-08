@@ -2084,6 +2084,12 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.desktopSessionManager.acknowledgeViewerRelease(input.viewerId)
         ),
+      detachViewer: t
+        .input(schemas.desktop.detachViewer.input)
+        .output(schemas.desktop.detachViewer.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.detachViewer(input.viewerId)
+        ),
       openWindow: t
         .input(schemas.desktop.openWindow.input)
         .output(schemas.desktop.openWindow.output)

@@ -73,6 +73,7 @@ describe("useDesktopConnection control ownership", () => {
 
   const watchViewer = mock<APIClient["desktop"]["watchViewer"]>();
   const acknowledgeViewerRelease = mock<APIClient["desktop"]["acknowledgeViewerRelease"]>();
+  const detachViewer = mock<APIClient["desktop"]["detachViewer"]>();
   let autoReady = true;
   const registrations: Array<{
     queue: ReturnType<typeof createAsyncMessageQueue<DesktopViewerEvent>>;
@@ -97,6 +98,8 @@ describe("useDesktopConnection control ownership", () => {
     autoReady = true;
     acknowledgeViewerRelease.mockReset();
     acknowledgeViewerRelease.mockResolvedValue(undefined);
+    detachViewer.mockReset();
+    detachViewer.mockResolvedValue(undefined);
     watchViewer.mockReset();
     watchViewer.mockImplementation((_input, { signal } = {}) => {
       if (!signal) throw new Error("Viewer registration must be abortable");
@@ -129,7 +132,7 @@ describe("useDesktopConnection control ownership", () => {
       return <div ref={desktop.containerRef} />;
     }
     const client: RecursivePartial<APIClient> = {
-      desktop: { getBootstrap, watchViewer, acknowledgeViewerRelease },
+      desktop: { getBootstrap, watchViewer, acknowledgeViewerRelease, detachViewer },
     };
     const view = render(
       <APIContext.Provider
@@ -571,7 +574,7 @@ describe("useDesktopConnection control ownership", () => {
     expect(watchViewer).toHaveBeenCalledTimes(1);
   });
 
-  test("a terminal unavailable bootstrap unregisters the viewer", async () => {
+  test("a terminal unavailable bootstrap gives the viewer up definitively", async () => {
     getBootstrap.mockImplementationOnce(() =>
       Promise.resolve({ ...bootstrap, capability: { available: false, reason: "disabled" } })
     );
@@ -579,38 +582,27 @@ describe("useDesktopConnection control ownership", () => {
     act(() => view.desktop.connect());
     await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
     expect(registrations).toHaveLength(1);
+    // Definitive detach first (no attachment grace on the backend), then the abort.
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registrations[0].viewerId });
     expect(registrations[0].signal.aborted).toBe(true);
   });
 
-  test("a terminal bootstrap failure stops background re-registration for good", async () => {
-    let resolveBootstrap!: (value: typeof bootstrap) => void;
-    getBootstrap = mock(
-      () =>
-        new Promise<typeof bootstrap>((done) => {
-          resolveBootstrap = done;
-        })
-    );
+  test("a security failure before the first connect is terminal and gives the viewer up", async () => {
     const view = mountConnection();
     act(() => view.desktop.connect());
-    await waitFor(() => expect(getBootstrap).toHaveBeenCalledTimes(1));
-    // The subscription drops after ready while bootstrap is still pending: a replacement
-    // registration is requested in the background.
-    autoReady = false;
-    registrations[0].queue.end();
-    await waitFor(() => expect(registrations).toHaveLength(2));
-    // Bootstrap then settles terminally unavailable: the replacement is aborted...
-    await act(async () => {
-      resolveBootstrap({
-        ...bootstrap,
-        capability: { available: false, reason: "disabled" },
-      } as unknown as typeof bootstrap);
-      await Promise.resolve();
+    await waitFor(() => expect(DesktopRfbFixture.instances).toHaveLength(1));
+    const rfb = DesktopRfbFixture.instances[0];
+    act(() => {
+      rfb.events.dispatchEvent(
+        new window.CustomEvent("securityfailure", { detail: { status: 1, reason: "expired" } })
+      );
     });
-    await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
-    expect(registrations[1].signal.aborted).toBe(true);
-    // ...and no further registration is scheduled, even after the backoff would have fired.
-    await new Promise<void>((resolve) => setTimeout(resolve, 1_200));
-    expect(registrations).toHaveLength(2);
+    await waitFor(() => expect(view.desktop.state).toBe("error"));
+    // Definitive detach (no backend grace) precedes the abort, and nothing re-registers.
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registrations[0].viewerId });
+    expect(registrations[0].signal.aborted).toBe(true);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(registrations).toHaveLength(1);
   });
 
   test("normal unmount unregisters after releasing held input", async () => {

@@ -186,12 +186,24 @@ export function useDesktopConnection(
   // attached viewer (its archive gate would otherwise see nobody attached between the socket
   // close and the reconnect). Ready is remembered so reconnects skip re-registering.
   const viewerReadyRef = useRef(false);
+  const viewerIdRef = useRef<string | null>(null);
   const viewerReleasedRef = useRef(false);
   const reregisterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reregisterAttemptRef = useRef(0);
   // Set when the pane settles in a terminal unavailable/error state with no retry pending: a
   // background re-registration must not outlive that and re-attach a pane showing nothing.
   const terminalRef = useRef(false);
+
+  // A terminal outcome gives the registration up definitively: tell the backend before the
+  // abort so the detachment leaves no attachment grace (nothing will reconnect), then tear down.
+  const settleTerminal = () => {
+    terminalRef.current = true;
+    const viewerId = viewerIdRef.current;
+    const client = apiRef.current;
+    if (viewerId !== null && client && viewerRegistrationRef.current !== null) {
+      void client.desktop.detachViewer({ viewerId }).catch(() => undefined);
+    }
+  };
 
   const connectImplRef = useRef<() => void>(() => undefined);
   const disconnectImplRef = useRef<() => void>(() => undefined);
@@ -241,6 +253,7 @@ export function useDesktopConnection(
       clearReregisterTimer();
       viewerRegistrationRef.current = null;
       viewerReadyRef.current = false;
+      viewerIdRef.current = null;
     }
     setControlling(false);
     inputRef.current?.dispose();
@@ -337,6 +350,7 @@ export function useDesktopConnection(
       if (isCurrent()) {
         viewerRegistrationRef.current = null;
         viewerReadyRef.current = false;
+        viewerIdRef.current = null;
       }
       registration.abort();
     };
@@ -358,6 +372,7 @@ export function useDesktopConnection(
               assertDesktop(viewerId === null, "Desktop viewer registered more than once.");
               viewerId = event.viewerId;
               viewerReadyRef.current = true;
+              if (isCurrent()) viewerIdRef.current = viewerId;
               reregisterAttemptRef.current = 0;
               resolve();
               continue;
@@ -371,6 +386,7 @@ export function useDesktopConnection(
             // so the server can still associate that acknowledgment with this viewer.
             viewerRegistrationRef.current = null;
             viewerReadyRef.current = false;
+            viewerIdRef.current = null;
             const disconnected = disconnectAndWait();
             const stoppedGeneration = generationRef.current;
             try {
@@ -517,7 +533,7 @@ export function useDesktopConnection(
           }
           // Terminal: nothing to view, so stop counting this pane as an attached viewer (and
           // keep any in-flight re-registration from attaching it again).
-          terminalRef.current = true;
+          settleTerminal();
           disconnectCurrentRfb();
           setState("unavailable");
           setReason(UNAVAILABLE_REASONS[result.capability.reason]);
@@ -574,7 +590,9 @@ export function useDesktopConnection(
               return;
             }
             // A transport drop is not the pane going away: keep the viewer registered while
-            // the reconnect backoff runs; the reconnect reuses it once ready.
+            // the reconnect backoff runs; the reconnect reuses it once ready. A drop before the
+            // first connect is terminal (no retry follows), so the registration is given up.
+            if (!hasEverConnectedRef.current) settleTerminal();
             disconnectCurrentRfb({ keepViewerRegistration: hasEverConnectedRef.current });
             if (hasEverConnectedRef.current) {
               setState("disconnected");
@@ -593,7 +611,7 @@ export function useDesktopConnection(
             if (generationRef.current !== generation || isDisposedRef.current) {
               return;
             }
-            terminalRef.current = true;
+            settleTerminal();
             disconnectCurrentRfb();
             setState("error");
             const securityReason = event.detail.reason.trim();
@@ -620,7 +638,7 @@ export function useDesktopConnection(
         // background re-registration can re-attach the pane); a failed attempt inside the
         // reconnect loop keeps a ready registration instead: the pane is still mounted and
         // about to retry, so it must stay attached through the backoff.
-        if (!hasEverConnectedRef.current) terminalRef.current = true;
+        if (!hasEverConnectedRef.current) settleTerminal();
         disconnectCurrentRfb({
           keepViewerRegistration: hasEverConnectedRef.current && viewerReadyRef.current,
         });

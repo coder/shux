@@ -583,7 +583,8 @@ describe("DesktopSessionManager browser viewer releases", () => {
         const first: IteratorResult<DesktopViewerEvent> = await watcher.next();
         expect(first.done).toBe(false);
         expect(first.value).toMatchObject({ type: "ready" });
-        return { controller, watcher };
+        const viewerId = !first.done && first.value.type === "ready" ? first.value.viewerId : "";
+        return { controller, watcher, viewerId };
       };
       try {
         // Never attached: no grace, so an idle process stays archivable.
@@ -634,9 +635,8 @@ describe("DesktopSessionManager browser viewer releases", () => {
         expect(manager.hasAttachedViewers("owner")).toBe(false);
 
         // Closing the OWNER retracts the graces of the borrowers it releases (their viewers and
-        // bridges), not only its own — while an unrelated requester's grace on the owner stays.
+        // bridges), not only its own; its desktop is gone, so nothing can reattach to it.
         const borrowerViewer = await registerViewer("child");
-        manager.noteDetached("former-borrower", "owner");
         const ownerClosing = manager.close("owner");
         const ownerRelease: IteratorResult<DesktopViewerEvent> =
           await borrowerViewer.watcher.next();
@@ -649,9 +649,15 @@ describe("DesktopSessionManager browser viewer releases", () => {
         await ownerClosing;
         await borrowerViewer.watcher.return(undefined);
         expect(manager.hasAttachedViewers("child")).toBe(false);
-        expect(manager.hasAttachedViewers("owner")).toBe(true);
-        now += DESKTOP_ATTACHMENT_GRACE_MS;
         expect(manager.hasAttachedViewers("owner")).toBe(false);
+
+        // A pane that gives its registration up definitively leaves no grace either.
+        const definitive = await registerViewer("isolated");
+        manager.detachViewer(definitive.viewerId);
+        expect(manager.hasAttachedViewers("isolated")).toBe(false);
+        definitive.controller.abort();
+        await definitive.watcher.return(undefined);
+        expect(manager.hasAttachedViewers("isolated")).toBe(false);
 
         // A viewer whose bootstrap reported no desktop leaves no grace when it detaches.
         const unavailable = await registerViewer("isolated");

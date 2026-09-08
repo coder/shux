@@ -3222,6 +3222,15 @@ export const desktop = {
     input: z.object({ viewerId: z.string().min(1) }),
     output: z.void(),
   },
+  /**
+   * A pane settling in a terminal state (unavailable desktop, first connection failed) gives up
+   * its viewer registration definitively: unlike a dropped subscription, no attachment grace
+   * should keep the workspace counted as attached afterwards.
+   */
+  detachViewer: {
+    input: z.object({ viewerId: z.string().min(1) }),
+    output: z.void(),
+  },
   openWindow: {
     input: DesktopWindowInputSchema,
     output: DesktopWindowStateSchema,

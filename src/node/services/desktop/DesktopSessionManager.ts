@@ -111,6 +111,18 @@ export class DesktopSessionManager {
     this.viewers.get(viewerId)?.acknowledge?.();
   }
 
+  /**
+   * The pane behind this registration settled in a terminal state (no desktop, or its first
+   * connection failed with no retry pending) and is giving the registration up for good. Drop
+   * it without the attachment grace: that grace is for transports that may come back.
+   */
+  detachViewer(viewerId: string): void {
+    const viewer = this.viewers.get(viewerId);
+    if (!viewer) return;
+    viewer.desktopUnavailable = true;
+    this.viewers.delete(viewerId);
+  }
+
   private releaseViewer(viewer: DesktopViewerRegistration): Promise<void> {
     viewer.release ??= new Promise<void>((resolve) => {
       const complete = () => {

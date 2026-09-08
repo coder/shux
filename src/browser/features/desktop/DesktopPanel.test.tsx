@@ -14,6 +14,7 @@ const api = {
     getWindow,
     watchViewer: watchDesktopViewerFixture,
     acknowledgeViewerRelease: () => Promise.resolve(),
+    detachViewer: () => Promise.resolve(),
   },
 };
 void mock.module("@/browser/contexts/API", () => ({
