@@ -1065,10 +1065,21 @@ export const router = (authToken?: string) => {
         .input(schemas.agentPlugins.checkUpdates.input)
         .output(schemas.agentPlugins.checkUpdates.output)
         .handler(({ context }) => context.agentPluginInstallService.checkUpdatesResult()),
+      previewUpdate: t
+        .input(schemas.agentPlugins.previewUpdate.input)
+        .output(schemas.agentPlugins.previewUpdate.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.previewUpdateResult(input)
+        ),
       update: t
         .input(schemas.agentPlugins.update.input)
         .output(schemas.agentPlugins.update.output)
-        .handler(({ context, input }) => context.agentPluginInstallService.updateResult(input)),
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.updateResult({
+            name: input.name,
+            consent: input.consent ?? undefined,
+          })
+        ),
     },
     mcpOauth: {
       startDesktopFlow: t

@@ -1,3 +1,5 @@
+import type { AgentPluginUpdateReview } from "@/common/orpc/schemas/agentPlugins";
+
 /**
  * Intents for the Settings → Plugins section, published by command-palette
  * actions that run outside the section's React tree.
@@ -17,6 +19,8 @@ export type PluginsSectionIntent =
   | { type: "open-add-panel" }
   /** Open the uninstall confirmation for a managed plugin. */
   | { type: "confirm-uninstall"; name: string }
+  /** Show the in-place update review for a capability-changing update the palette previewed. */
+  | { type: "review-update"; review: AgentPluginUpdateReview }
   /** Backend plugin state changed outside the section (e.g. palette Update All); re-query. */
   | { type: "refresh" };
 

@@ -1951,6 +1951,21 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 onSubmit: async (values) => {
                   const api = p.api;
                   if (!api) return;
+                  // Review before applying: an update that changes the
+                  // plugin's capability surface needs the user's consent,
+                  // which only the section's inline review can collect.
+                  const preview = await api.agentPlugins.previewUpdate({
+                    name: values.pluginName,
+                  });
+                  if (!preview.success) {
+                    showCommandFeedbackToast({ type: "error", message: preview.error });
+                    return;
+                  }
+                  if (preview.data.changes.length > 0) {
+                    publishPluginsSectionIntent({ type: "review-update", review: preview.data });
+                    openSettings("plugins");
+                    return;
+                  }
                   const result = await api.agentPlugins.update({ name: values.pluginName });
                   // A mounted section keeps its own stale updateChecks map;
                   // tell it to re-query so badges match the toast.

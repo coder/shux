@@ -46,6 +46,7 @@ import type {
   AgentPluginInstallPreview,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
+  AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { ChatStats } from "@/common/types/chatStats";
@@ -142,6 +143,8 @@ export interface MockORPCClientOptions {
     updateChecks?: AgentPluginUpdateCheck[];
     /** Returned by agentPlugins.preview; omit to make preview fail. */
     preview?: AgentPluginInstallPreview;
+    /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
+    updateReview?: AgentPluginUpdateReview;
   };
   projects?: Map<string, ProjectConfig>;
   workspaces?: FrontendWorkspaceMetadata[];
@@ -1155,6 +1158,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           },
         }),
       uninstall: () => Promise.resolve({ success: true, data: undefined }),
+      previewUpdate: (input: { name: string }) =>
+        agentPluginsMock?.updateReview && agentPluginsMock.updateReview.name === input.name
+          ? Promise.resolve({ success: true, data: agentPluginsMock.updateReview })
+          : Promise.resolve({ success: false, error: `No update review mock for '${input.name}'` }),
       update: (input: { name: string }) =>
         Promise.resolve({ success: false, error: `No update mock for '${input.name}'` }),
     },

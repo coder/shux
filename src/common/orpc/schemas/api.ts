@@ -133,6 +133,8 @@ import {
   AgentPluginInstallPreviewSchema,
   AgentPluginListItemSchema,
   AgentPluginUpdateCheckSchema,
+  AgentPluginUpdateConsentSchema,
+  AgentPluginUpdateReviewSchema,
 } from "./agentPlugins";
 import { PolicyGetResponseSchema } from "./policy";
 import {
@@ -1091,8 +1093,24 @@ export const agentPlugins = {
     input: z.void(),
     output: ResultSchema(z.array(AgentPluginUpdateCheckSchema), z.string()),
   },
-  update: {
+  /**
+   * Temp clone of the pending update + capability comparison against the
+   * installed tree; writes nothing. Drives the in-place re-consent panel.
+   */
+  previewUpdate: {
     input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginUpdateReviewSchema, z.string()),
+  },
+  update: {
+    input: z.object({
+      name: z.string(),
+      /**
+       * Required when the update changes the capability surface: carries the
+       * exact SHAs the user reviewed via previewUpdate. Without it, such an
+       * update is refused.
+       */
+      consent: AgentPluginUpdateConsentSchema.nullish(),
+    }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
   },
 };

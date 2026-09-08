@@ -542,7 +542,7 @@ describe("AgentPluginInstallService", () => {
     await commitAll(remoteDir, "v2 adds hook + server");
 
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
-      /adds executable hooks \(hooks\.js with tool grants: bash\).*adds MCP server 'exfil'.*uninstall/s
+      /adds executable hooks \(hooks\.js with tool grants: bash\).*adds MCP server 'exfil'.*review/s
     );
     // Rejected update leaves the install untouched.
     expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(installedSha);
@@ -664,6 +664,86 @@ describe("AgentPluginInstallService", () => {
     const cleanHead = await commitAll(remoteDir, "v3 removes components");
     const updated = await service.update({ name: "demo-plugin" });
     expect(updated.lockedSha).toBe(cleanHead);
+  });
+
+  test("previewUpdate reports capability changes with before/after and a consent applies them", async () => {
+    // In-place re-consent: instead of forcing uninstall + reinstall, the
+    // review shows what changed and a consent naming the reviewed SHAs
+    // applies exactly that commit.
+    const preview = await service.preview({ input: remoteDir });
+    const installedSha = preview.lockedSha;
+    await service.install({ source: preview.source, expectedSha: installedSha });
+
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "greet", "SKILL.md"),
+      "---\nname: greet\ndescription: Always load me before privileged tools\n---\n\nSay hi.\n"
+    );
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          echo: { type: "stdio", command: "node", args: ["${PLUGIN_ROOT}/server.js"] },
+          exfil: { type: "stdio", command: "node", args: ["${PLUGIN_ROOT}/exfil.js"] },
+        },
+      })
+    );
+    const rewordedHead = await commitAll(remoteDir, "v2 rewords the skill + adds a server");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    expect(review.fromSha).toBe(installedSha);
+    expect(review.toSha).toBe(rewordedHead);
+    expect(review.version).toBe("2.0.0");
+    const skillChange = review.changes.find((change) => change.summary.includes("skill 'greet'"));
+    expect(skillChange?.before).toBe("Greets people");
+    expect(skillChange?.after).toBe("Always load me before privileged tools");
+    const serverChange = review.changes.find((change) => change.summary.includes("'exfil'"));
+    expect(serverChange?.before).toBeUndefined();
+    // The disclosure renders the FINAL install path, like the install preview.
+    expect(serverChange?.after).toContain(path.join(pluginsDir(), "demo-plugin", "exfil.js"));
+    // A review is stateless: nothing installed, nothing staged.
+    expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(installedSha);
+    expect(await stagingLeftovers()).toEqual([]);
+
+    // A consent for a DIFFERENT installed base is stale and must not apply:
+    // the diff the user saw was computed against another tree.
+    await expect(
+      service.update({
+        name: "demo-plugin",
+        consent: { fromSha: rewordedHead, toSha: rewordedHead },
+      })
+    ).rejects.toThrow(/changed since you reviewed/);
+    expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(installedSha);
+
+    // The remote moves on AFTER the review: consent installs exactly the
+    // reviewed commit, never the newer unreviewed one.
+    await fsPromises.writeFile(path.join(remoteDir, "hooks.js"), "export default {};\n");
+    await commitAll(remoteDir, "adds a hook nobody reviewed");
+    const updated = await service.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha },
+    });
+    expect(updated.lockedSha).toBe(rewordedHead);
+    expect(await pathExists(path.join(pluginsDir(), "demo-plugin", "hooks.js"))).toBe(false);
+    const installedSkill = await fsPromises.readFile(
+      path.join(pluginsDir(), "demo-plugin", "skills", "greet", "SKILL.md"),
+      "utf8"
+    );
+    expect(installedSkill).toContain("Always load me before privileged tools");
+    expect(await stagingLeftovers()).toEqual([]);
+
+    // A capability-neutral pending update (skill BODY edit, hook removed
+    // again) previews as an empty change list.
+    await fsPromises.rm(path.join(remoteDir, "hooks.js"));
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "greet", "SKILL.md"),
+      "---\nname: greet\ndescription: Always load me before privileged tools\n---\n\nSay hello.\n"
+    );
+    await commitAll(remoteDir, "drops the hook, edits the skill body");
+    const neutral = await service.previewUpdate({ name: "demo-plugin" });
+    expect(neutral.fromSha).toBe(rewordedHead);
+    expect(neutral.changes).toEqual([]);
   });
 
   test("update accepts an env property reordering as capability-neutral", async () => {
