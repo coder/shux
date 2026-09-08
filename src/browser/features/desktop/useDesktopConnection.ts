@@ -164,6 +164,8 @@ export function useDesktopConnection(
   // close and the reconnect). Ready is remembered so reconnects skip re-registering.
   const viewerReadyRef = useRef(false);
   const viewerReleasedRef = useRef(false);
+  const reregisterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reregisterAttemptRef = useRef(0);
 
   const connectImplRef = useRef<() => void>(() => undefined);
   const disconnectImplRef = useRef<() => void>(() => undefined);
@@ -197,12 +199,20 @@ export function useDesktopConnection(
     }
   };
 
+  const clearReregisterTimer = () => {
+    if (reregisterTimerRef.current) {
+      clearTimeout(reregisterTimerRef.current);
+      reregisterTimerRef.current = null;
+    }
+  };
+
   const disconnectCurrentRfb = (options?: { keepViewerRegistration?: boolean }) => {
     setSharedDesktop(null);
     const currentRfb = rfbRef.current;
     const keepRegistration = options?.keepViewerRegistration === true;
     const registration = keepRegistration ? null : viewerRegistrationRef.current;
     if (!keepRegistration) {
+      clearReregisterTimer();
       viewerRegistrationRef.current = null;
       viewerReadyRef.current = false;
     }
@@ -249,6 +259,121 @@ export function useDesktopConnection(
     setReason(null);
   };
 
+  /**
+   * Register this pane as a desktop viewer and resolve once the backend reports ready. The
+   * subscription keeps running afterwards to receive the cooperative release; it is scoped to
+   * the pane (viewerRegistrationRef), not to one RFB connection, so transient transport drops,
+   * failed reconnect attempts, and the reconnect backoff all leave it live and the backend keeps
+   * treating the mounted pane as attached (its archive gate would otherwise see nobody).
+   */
+  const registerViewerRegistration = (client: NonNullable<typeof api>): Promise<void> => {
+    const registration = new AbortController();
+    viewerRegistrationRef.current = registration;
+    viewerReadyRef.current = false;
+    const isCurrent = () => viewerRegistrationRef.current === registration;
+    const retire = () => {
+      if (isCurrent()) {
+        viewerRegistrationRef.current = null;
+        viewerReadyRef.current = false;
+      }
+      registration.abort();
+    };
+    return new Promise<void>((resolve, reject) => {
+      void (async () => {
+        let viewerId: string | null = null;
+        try {
+          const events = await client.desktop.watchViewer(
+            { workspaceId },
+            { signal: registration.signal }
+          );
+          if (registration.signal.aborted || isDisposedRef.current) {
+            await events.return?.();
+            throw new Error("Desktop viewer registration was cancelled.");
+          }
+          for await (const event of events) {
+            if (registration.signal.aborted || isDisposedRef.current) break;
+            if (event.type === "ready") {
+              assertDesktop(viewerId === null, "Desktop viewer registered more than once.");
+              viewerId = event.viewerId;
+              viewerReadyRef.current = true;
+              reregisterAttemptRef.current = 0;
+              resolve();
+              continue;
+            }
+            assertDesktop(
+              viewerId === event.viewerId,
+              "Desktop release has no matching registration."
+            );
+            viewerReleasedRef.current = true;
+            // disconnectAndWait normally unregisters. Keep this subscription alive until ACK
+            // so the server can still associate that acknowledgment with this viewer.
+            viewerRegistrationRef.current = null;
+            viewerReadyRef.current = false;
+            const disconnected = disconnectAndWait();
+            const stoppedGeneration = generationRef.current;
+            try {
+              await disconnected;
+              await client.desktop.acknowledgeViewerRelease({ viewerId });
+            } finally {
+              registration.abort();
+              if (generationRef.current === stoppedGeneration) {
+                setState("unavailable");
+                setReason("The desktop session was closed.");
+              }
+            }
+            return;
+          }
+          if (!registration.signal.aborted) throw new Error("Desktop release subscription ended.");
+        } catch (error) {
+          if (viewerId === null) {
+            // Never ready: the connection attempt awaiting us fails and owns the recovery.
+            retire();
+            reject(error instanceof Error ? error : new Error(getErrorMessage(error)));
+            return;
+          }
+          if (!isCurrent() || isDisposedRef.current) {
+            retire();
+            return;
+          }
+          // Lost the release channel after ready. The server can no longer ask this pane to
+          // release input, so drop control now, but keep the healthy VNC bridge (it still
+          // marks the pane as attached) and re-register in the background.
+          retire();
+          setControlling(false);
+          scheduleViewerReregistration();
+          return;
+        }
+        retire();
+      })();
+    });
+  };
+
+  const scheduleViewerReregistration = () => {
+    clearReregisterTimer();
+    const delay = Math.min(
+      DESKTOP_DEFAULTS.RECONNECT_BASE_DELAY_MS * 2 ** reregisterAttemptRef.current,
+      DESKTOP_DEFAULTS.RECONNECT_MAX_DELAY_MS
+    );
+    reregisterAttemptRef.current += 1;
+    reregisterTimerRef.current = setTimeout(() => {
+      reregisterTimerRef.current = null;
+      // A connection attempt started meanwhile registers on its own; do not race it.
+      if (
+        isDisposedRef.current ||
+        viewerReleasedRef.current ||
+        viewerRegistrationRef.current !== null ||
+        !api
+      ) {
+        return;
+      }
+      registerViewerRegistration(api).catch(() => {
+        if (!isDisposedRef.current && viewerRegistrationRef.current === null) {
+          scheduleViewerReregistration();
+        }
+      });
+    }, delay);
+  };
+
   connectImplRef.current = () => {
     if (viewerReleasedRef.current) return;
     void (async () => {
@@ -281,11 +406,135 @@ export function useDesktopConnection(
 
       setState("checking");
 
-      const failConnection = (error: unknown) => {
+      try {
+        // Register before bootstrap: getBootstrap clears the backend's startup reservation, so
+        // a registration made after it would leave a window in which nothing marks this pane
+        // as attached and an agent-driven archive could close the desktop the pane is about to
+        // show. A ready registration from before a transient drop is reused as is.
+        if (registerViewer && !reuseViewerRegistration) {
+          await registerViewerRegistration(api);
+          if (generationRef.current !== generation || isDisposedRef.current) {
+            return;
+          }
+        }
+
+        // Shared-target metadata is display-only: the caller's bootstrap/token preserves the
+        // backend's authorization and binding checks; never bootstrap the owner directly.
+        const result = await api.desktop.getBootstrap({ workspaceId });
         if (generationRef.current !== generation || isDisposedRef.current) {
           return;
         }
-        disconnectCurrentRfb();
+
+        if (!result.capability.available) {
+          if (hasEverConnectedRef.current) {
+            // A prior successful session means bootstrap unavailability is part of the reconnect
+            // loop, so keep retrying instead of wedging the panel in a permanent unavailable state.
+            setState("disconnected");
+            setReason(null);
+            scheduleReconnectRef.current();
+            return;
+          }
+          setState("unavailable");
+          setReason(UNAVAILABLE_REASONS[result.capability.reason]);
+          return;
+        }
+
+        const bridgePath = result.bridgePath;
+        assertDesktop(
+          typeof bridgePath === "string" && bridgePath.length > 0,
+          "Desktop bootstrap response is missing a valid bridgePath."
+        );
+        const token = result.token;
+        assertDesktop(
+          typeof token === "string" && token.length > 0,
+          "Desktop bootstrap response is missing a valid token."
+        );
+        const wsUrl = buildDesktopBridgeUrl(bridgePath, token, result.localBridgeBaseUrl);
+        setWidth(result.capability.width);
+        setHeight(result.capability.height);
+
+        const container = containerRef.current;
+        assertDesktop(container, "Desktop panel container is not mounted.");
+
+        // noVNC's CommonJS entry reaches a transitive dependency with top-level await,
+        // so Vite dev mode must load it lazily instead of pre-bundling a static import.
+        const { default: RFB } = await import("@novnc/novnc/lib/rfb");
+        // Guard against stale connection after async import
+        if (isDisposedRef.current || generation !== generationRef.current) {
+          return;
+        }
+        const sharedTarget = result.capability.sharedDesktop ?? null;
+        const connectRfb = () => {
+          const rfb = new RFB(container, wsUrl);
+          rfb.background = "var(--color-background)";
+          rfb.viewOnly = true;
+          rfb.scaleViewport = scaleToFitRef.current;
+          rfb.resizeSession = false;
+
+          const handleConnect = () => {
+            if (generationRef.current !== generation || isDisposedRef.current) {
+              return;
+            }
+            const canvas = container.querySelector("canvas");
+            assertDesktop(canvas, "Connected desktop is missing its canvas.");
+            inputRef.current = trackDesktopInput(canvas, () => !rfb.viewOnly);
+            hasEverConnectedRef.current = true;
+            attemptRef.current = 0;
+            setState("connected");
+            setReason(null);
+          };
+
+          const handleDisconnect = (event: CustomEvent<{ clean: boolean }>) => {
+            if (generationRef.current !== generation || isDisposedRef.current) {
+              return;
+            }
+            // A transport drop is not the pane going away: keep the viewer registered while
+            // the reconnect backoff runs; the reconnect reuses it once ready.
+            disconnectCurrentRfb({ keepViewerRegistration: hasEverConnectedRef.current });
+            if (hasEverConnectedRef.current) {
+              setState("disconnected");
+              setReason(null);
+              scheduleReconnectRef.current();
+              return;
+            }
+            const cleanSuffix = event.detail.clean ? " cleanly" : " unexpectedly";
+            setState("error");
+            setReason(`Desktop session disconnected${cleanSuffix} before it finished connecting.`);
+          };
+
+          const handleSecurityFailure = (
+            event: CustomEvent<{ status: number; reason: string }>
+          ) => {
+            if (generationRef.current !== generation || isDisposedRef.current) {
+              return;
+            }
+            disconnectCurrentRfb();
+            setState("error");
+            const securityReason = event.detail.reason.trim();
+            setReason(
+              securityReason.length > 0
+                ? `Desktop connection failed security checks: ${securityReason}`
+                : "Desktop connection failed security checks."
+            );
+          };
+
+          rfb.addEventListener("connect", handleConnect);
+          rfb.addEventListener("disconnect", handleDisconnect);
+          rfb.addEventListener("securityfailure", handleSecurityFailure);
+          rfbRef.current = rfb;
+          setSharedDesktop(sharedTarget);
+          setState("connecting");
+        };
+        connectRfb();
+      } catch (error) {
+        if (generationRef.current !== generation || isDisposedRef.current) {
+          return;
+        }
+        // A failed attempt inside the reconnect loop keeps a ready registration: the pane is
+        // still mounted and about to retry, so it must stay attached through the backoff.
+        disconnectCurrentRfb({
+          keepViewerRegistration: hasEverConnectedRef.current && viewerReadyRef.current,
+        });
         if (hasEverConnectedRef.current) {
           // A prior successful session means this is part of the reconnect loop, so keep the
           // exponential backoff running instead of wedging the panel in a permanent error state.
@@ -296,197 +545,6 @@ export function useDesktopConnection(
         }
         setState("error");
         setReason(getErrorMessage(error));
-      };
-
-      // Bootstrap (which starts the desktop), load noVNC, and open this attempt's connection.
-      // Runs only once the viewer is registered (or a ready registration is being reused):
-      // getBootstrap clears the backend's startup reservation, so a registration made after it
-      // would leave a window in which nothing marks this pane as attached and an agent-driven
-      // archive could close the desktop the pane is about to show.
-      const openConnection = async () => {
-        try {
-          // Shared-target metadata is display-only: the caller's bootstrap/token preserves the
-          // backend's authorization and binding checks; never bootstrap the owner directly.
-          const result = await api.desktop.getBootstrap({ workspaceId });
-          if (generationRef.current !== generation || isDisposedRef.current) {
-            return;
-          }
-
-          if (!result.capability.available) {
-            if (hasEverConnectedRef.current) {
-              // A prior successful session means bootstrap unavailability is part of the reconnect
-              // loop, so keep retrying instead of wedging the panel in a permanent unavailable state.
-              setState("disconnected");
-              setReason(null);
-              scheduleReconnectRef.current();
-              return;
-            }
-            setState("unavailable");
-            setReason(UNAVAILABLE_REASONS[result.capability.reason]);
-            return;
-          }
-
-          const bridgePath = result.bridgePath;
-          assertDesktop(
-            typeof bridgePath === "string" && bridgePath.length > 0,
-            "Desktop bootstrap response is missing a valid bridgePath."
-          );
-          const token = result.token;
-          assertDesktop(
-            typeof token === "string" && token.length > 0,
-            "Desktop bootstrap response is missing a valid token."
-          );
-          const wsUrl = buildDesktopBridgeUrl(bridgePath, token, result.localBridgeBaseUrl);
-          setWidth(result.capability.width);
-          setHeight(result.capability.height);
-
-          const container = containerRef.current;
-          assertDesktop(container, "Desktop panel container is not mounted.");
-
-          // noVNC's CommonJS entry reaches a transitive dependency with top-level await,
-          // so Vite dev mode must load it lazily instead of pre-bundling a static import.
-          const { default: RFB } = await import("@novnc/novnc/lib/rfb");
-          // Guard against stale connection after async import
-          if (isDisposedRef.current || generation !== generationRef.current) {
-            return;
-          }
-          const sharedTarget = result.capability.sharedDesktop ?? null;
-          const connectRfb = () => {
-            const rfb = new RFB(container, wsUrl);
-            rfb.background = "var(--color-background)";
-            rfb.viewOnly = true;
-            rfb.scaleViewport = scaleToFitRef.current;
-            rfb.resizeSession = false;
-
-            const handleConnect = () => {
-              if (generationRef.current !== generation || isDisposedRef.current) {
-                return;
-              }
-              const canvas = container.querySelector("canvas");
-              assertDesktop(canvas, "Connected desktop is missing its canvas.");
-              inputRef.current = trackDesktopInput(canvas, () => !rfb.viewOnly);
-              hasEverConnectedRef.current = true;
-              attemptRef.current = 0;
-              setState("connected");
-              setReason(null);
-            };
-
-            const handleDisconnect = (event: CustomEvent<{ clean: boolean }>) => {
-              if (generationRef.current !== generation || isDisposedRef.current) {
-                return;
-              }
-              // A transport drop is not the pane going away: keep the viewer registered while
-              // the reconnect backoff runs; the reconnect reuses it once ready.
-              disconnectCurrentRfb({ keepViewerRegistration: hasEverConnectedRef.current });
-              if (hasEverConnectedRef.current) {
-                setState("disconnected");
-                setReason(null);
-                scheduleReconnectRef.current();
-                return;
-              }
-              const cleanSuffix = event.detail.clean ? " cleanly" : " unexpectedly";
-              setState("error");
-              setReason(
-                `Desktop session disconnected${cleanSuffix} before it finished connecting.`
-              );
-            };
-
-            const handleSecurityFailure = (
-              event: CustomEvent<{ status: number; reason: string }>
-            ) => {
-              if (generationRef.current !== generation || isDisposedRef.current) {
-                return;
-              }
-              disconnectCurrentRfb();
-              setState("error");
-              const securityReason = event.detail.reason.trim();
-              setReason(
-                securityReason.length > 0
-                  ? `Desktop connection failed security checks: ${securityReason}`
-                  : "Desktop connection failed security checks."
-              );
-            };
-
-            rfb.addEventListener("connect", handleConnect);
-            rfb.addEventListener("disconnect", handleDisconnect);
-            rfb.addEventListener("securityfailure", handleSecurityFailure);
-            rfbRef.current = rfb;
-            setSharedDesktop(sharedTarget);
-            setState("connecting");
-          };
-          connectRfb();
-        } catch (error) {
-          failConnection(error);
-        }
-      };
-
-      if (!registerViewer || reuseViewerRegistration) {
-        await openConnection();
-        return;
-      }
-
-      // The viewer must be registered for cooperative release before opening VNC. The loop
-      // below is scoped to the registration, not to this connection attempt: reconnects
-      // after a transient drop keep it (see reuseViewerRegistration), so a release arriving
-      // during a later generation must still be honored here.
-      const registration = new AbortController();
-      viewerRegistrationRef.current = registration;
-      try {
-        const events = await api.desktop.watchViewer(
-          { workspaceId },
-          { signal: registration.signal }
-        );
-        if (registration.signal.aborted || isDisposedRef.current) {
-          await events.return?.();
-          return;
-        }
-        let viewerId: string | null = null;
-        for await (const event of events) {
-          if (registration.signal.aborted || isDisposedRef.current) return;
-          if (event.type === "ready") {
-            assertDesktop(viewerId === null, "Desktop viewer registered more than once.");
-            viewerId = event.viewerId;
-            viewerReadyRef.current = true;
-            // Ready only opens this attempt's connection; a superseding attempt already
-            // aborted a not-yet-ready registration, so this generation is still current.
-            assertDesktop(
-              generationRef.current === generation,
-              "Desktop viewer became ready for a superseded connection attempt."
-            );
-            // Not awaited: a release must be processed even while bootstrap is still
-            // starting the desktop; openConnection reports its own failures.
-            void openConnection();
-            continue;
-          }
-          assertDesktop(
-            viewerId === event.viewerId,
-            "Desktop release has no matching registration."
-          );
-          viewerReleasedRef.current = true;
-          // disconnectAndWait normally unregisters. Keep this subscription alive until ACK
-          // so the server can still associate that acknowledgment with this viewer.
-          viewerRegistrationRef.current = null;
-          viewerReadyRef.current = false;
-          const disconnected = disconnectAndWait();
-          const stoppedGeneration = generationRef.current;
-          try {
-            await disconnected;
-            await api.desktop.acknowledgeViewerRelease({ viewerId });
-          } finally {
-            registration.abort();
-            if (generationRef.current === stoppedGeneration) {
-              setState("unavailable");
-              setReason("The desktop session was closed.");
-            }
-          }
-          return;
-        }
-        if (!registration.signal.aborted) throw new Error("Desktop release subscription ended.");
-      } catch (error) {
-        failConnection(error);
-      } finally {
-        if (viewerRegistrationRef.current === registration) disconnectCurrentRfb();
-        else registration.abort();
       }
     })();
   };

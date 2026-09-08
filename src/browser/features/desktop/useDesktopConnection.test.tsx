@@ -455,34 +455,71 @@ describe("useDesktopConnection control ownership", () => {
     expect(getBootstrap).toHaveBeenCalledTimes(1);
   });
 
-  test.each([
-    [false, "end"],
-    [false, "error"],
-    [true, "end"],
-    [true, "error"],
-  ] as const)("subscription loss releases any socket (ready=%s, %s)", async (ready, failure) => {
-    autoReady = ready;
-    const view = mountConnection();
-    act(() => view.desktop.connect());
-    await waitFor(() => expect(registrations).toHaveLength(1));
-    if (ready) {
-      await waitFor(() => expect(view.desktop.state).toBe("connected"));
-      act(() => view.desktop.setControlling(true));
-      holdKeysAndDrag(DesktopRfbFixture.instances[0]);
+  test.each(["end", "error"])(
+    "subscription loss before ready fails the connection and releases the registration (%s)",
+    async (failure) => {
+      autoReady = false;
+      const view = mountConnection();
+      act(() => view.desktop.connect());
+      await waitFor(() => expect(registrations).toHaveLength(1));
+      const registration = registrations[0];
+      if (failure === "error") registration.failure = new Error("Stream failed");
+      registration.queue.end();
+      await waitFor(() => expect(view.desktop.state).toBe("error"));
+      expect(registration.signal.aborted).toBe(true);
+      expect(DesktopRfbFixture.instances).toHaveLength(0);
+      expect(getBootstrap).not.toHaveBeenCalled();
+      expect(acknowledgeViewerRelease).not.toHaveBeenCalled();
     }
-    const registration = registrations[0];
-    if (failure === "error") registration.failure = new Error("Stream failed");
-    registration.queue.end();
-    await waitFor(() => expect(view.desktop.state).toBe(ready ? "disconnected" : "error"));
-    expect(registration.signal.aborted).toBe(true);
-    if (ready) {
-      const rfb = DesktopRfbFixture.instances[0];
-      expect(rfb.disconnectCount).toBe(1);
-      expect(rfb.viewOnly).toBe(true);
+  );
+
+  test.each(["end", "error"])(
+    "subscription loss after ready drops control, keeps the bridge, and re-registers (%s)",
+    async (failure) => {
+      const view = mountConnection();
+      const rfb = await connect(view);
+      act(() => view.desktop.setControlling(true));
+      holdKeysAndDrag(rfb);
+      const registration = registrations[0];
+      if (failure === "error") registration.failure = new Error("Stream failed");
+      registration.queue.end();
+      // The server can no longer ask for a release, so held input is released proactively...
+      await waitFor(() => expect(rfb.viewOnly).toBe(true));
       expect(rfb.input.filter((event) => event.type === "keyup")).toHaveLength(2);
       expect(rfb.input.filter((event) => event.type === "mouseup")).toHaveLength(1);
-    } else expect(DesktopRfbFixture.instances).toHaveLength(0);
-    expect(acknowledgeViewerRelease).not.toHaveBeenCalled();
+      expect(registration.signal.aborted).toBe(true);
+      // ...but the healthy VNC bridge stays up (it still marks the pane as attached) and the
+      // pane re-registers in the background instead of tearing the connection down.
+      expect(rfb.disconnectCount).toBe(0);
+      expect(view.desktop.state).toBe("connected");
+      await waitFor(() => expect(registrations).toHaveLength(2), { timeout: 5_000 });
+      expect(rfb.disconnectCount).toBe(0);
+      expect(DesktopRfbFixture.instances).toHaveLength(1);
+      // The replacement registration still delivers cooperative release.
+      const replacement = registrations[1];
+      replacement.queue.push({ type: "release", viewerId: replacement.viewerId });
+      await waitFor(() =>
+        expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: replacement.viewerId })
+      );
+      expect(rfb.disconnectCount).toBe(1);
+    }
+  );
+
+  test("a failed reconnect attempt keeps the ready registration through the backoff", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    const registration = registrations[0];
+    getBootstrap.mockImplementationOnce(() => Promise.reject(new Error("backend hiccup")));
+    rfb.events.dispatchEvent(new Event("disconnect"));
+    // First retry fails at bootstrap; the pane is still mounted and must stay attached.
+    await waitFor(() => expect(getBootstrap).toHaveBeenCalledTimes(2), { timeout: 5_000 });
+    await waitFor(() => expect(view.desktop.state).toBe("disconnected"));
+    expect(registration.signal.aborted).toBe(false);
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+    // The next retry reuses it and reconnects.
+    await waitFor(() => expect(view.desktop.state).toBe("connected"), { timeout: 10_000 });
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+    expect(registration.signal.aborted).toBe(false);
   });
 
   test("normal unmount unregisters after releasing held input", async () => {
