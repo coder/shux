@@ -1187,6 +1187,29 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         expect(headers.get("authorization")).toBe("Bearer test-access-token");
         expect(headers.get("chatgpt-account-id")).toBe("test-account-id");
         expect(headers.get("content-type")).toBe("application/json");
+        expect(headers.get("session-id")).toBeNull();
+
+        for (const sessionId of [undefined, "explicit-session"]) {
+          const promptCacheKey = "mux-v1-project-scope";
+          const cacheHeaders = new Headers(request.headers);
+          if (sessionId) cacheHeaders.set("session-id", sessionId);
+          for (let turn = 0; turn < 2; turn++) {
+            await capturedFetch(request.url, {
+              method: "POST",
+              headers: cacheHeaders,
+              body: JSON.stringify({
+                model: "gpt-5.3-codex",
+                input: [{ role: "user", content: `Turn ${turn}` }],
+                prompt_cache_key: promptCacheKey,
+              }),
+            });
+            const outgoing = requests.at(-1);
+            expect(outgoing?.input).toBe(CODEX_ENDPOINT);
+            expect(new Headers(outgoing?.init?.headers).get("session-id")).toBe(
+              sessionId ?? promptCacheKey
+            );
+          }
+        }
       } finally {
         PROVIDER_REGISTRY.openai = originalOpenAIRegistry;
       }

@@ -1728,6 +1728,18 @@ export class ProviderModelFactory {
                   try {
                     const headers = new Headers(init?.headers);
                     headers.delete("content-length");
+                    // Codex derives its cache routing key from session-id, not the body key.
+                    // Reuse Xum's stable scope so successive OAuth turns reach the same cache.
+                    const { prompt_cache_key: promptCacheKey } = JSON.parse(body) as {
+                      prompt_cache_key?: unknown;
+                    };
+                    if (
+                      !headers.has("session-id") &&
+                      typeof promptCacheKey === "string" &&
+                      promptCacheKey.length > 0
+                    ) {
+                      headers.set("session-id", promptCacheKey);
+                    }
                     nextInit = {
                       ...init,
                       headers,
