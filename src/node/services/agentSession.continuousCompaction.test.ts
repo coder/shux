@@ -24,6 +24,7 @@ import {
   type AgentSessionHarness,
 } from "./agentSession.testHarness";
 import type { ContinuousCompactor } from "./continuousCompactor";
+import type { TurnCoordinator } from "./turnCoordinator";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
@@ -126,6 +127,128 @@ describe("AgentSession continuous compaction wiring", () => {
     );
     expect(result.success).toBe(true);
   }
+
+  describe("eager compaction physical lifetime", () => {
+    async function setupEager() {
+      const h = await setup();
+      for (const row of [
+        createMuxMessage("old-user", "user", "Investigate the regression"),
+        createMuxMessage("old-answer", "assistant", "earlier investigation ".repeat(4_000)),
+        createMuxMessage("recent-user", "user", "Implement the fix"),
+        createMuxMessage("recent-answer", "assistant", "The fix is ready for review."),
+      ]) {
+        expect((await h.historyService.appendToHistory(workspaceId, row)).success).toBe(true);
+      }
+      const compactor = internals(h.session).continuousCompactor;
+      const deps = Reflect.get(compactor, "deps") as ConstructorParameters<
+        typeof ContinuousCompactor
+      >[0];
+      const { coordinator } = h.session as unknown as { coordinator: TurnCoordinator };
+      const enterExecution = coordinator.enterExecution.bind(coordinator);
+      const releases: Array<ReturnType<typeof mock<() => void>>> = [];
+      // Track disposal while retaining the real coordinator leases and shutdown drain.
+      spyOn(coordinator, "enterExecution").mockImplementation(() => {
+        const execution = enterExecution();
+        const release = mock(() => execution[Symbol.dispose]());
+        releases.push(release);
+        return { [Symbol.dispose]: release };
+      });
+      deps.prepare = () => Promise.resolve();
+      deps.estimateAttachmentTokens = () => Promise.resolve(0);
+      deps.summarize = () => Promise.resolve({ text: "Earlier work summarized", model });
+      async function start() {
+        await compactor.observe(60, {
+          enabled: true,
+          model,
+          contextWindowTokens: 100_000,
+          thresholdPercent: 70,
+          phase: "stream-end",
+        });
+        const job = Reflect.get(compactor, "job") as { done: Promise<void> };
+        return { done: job.done };
+      }
+      return { h, compactor, deps, coordinator, releases, start };
+    }
+
+    for (const phase of ["prepare", "summarize"] as const) {
+      test.each(["complete", "reject", "reset", "shutdown"] as const)(
+        `retains eager ${phase} execution until the original Promise settles: %s`,
+        async (outcome) => {
+          const { h, compactor, deps, coordinator, releases, start } = await setupEager();
+          const entered = deferred<void>();
+          const release = deferred<void>();
+          async function work() {
+            entered.resolve();
+            await release.promise;
+            if (outcome === "reject") throw new Error("eager work failed");
+          }
+          if (phase === "prepare") deps.prepare = work;
+          else
+            deps.summarize = async () => {
+              await work();
+              return { text: "Earlier work summarized", model };
+            };
+          const job = await start();
+          let shutdown: Promise<void> | undefined;
+          try {
+            await entered.promise;
+            expect(releases).toHaveLength(1);
+            const eagerRelease = releases[0];
+            expect(eagerRelease).not.toHaveBeenCalled();
+            // Physical ownership must leave normal turn admission and semantic idle intact.
+            expect(coordinator.phase).toBe("idle");
+            expect(coordinator.admissionBlocked).toBe(false);
+            if (outcome === "reset") h.session.setAutoCompactionThreshold(0.8);
+            if (outcome === "shutdown") {
+              h.session.beginShutdown();
+              shutdown = h.session.finishShutdown();
+              expect(coordinator.closing).toBe(true);
+            }
+            await compactor.waitForIdle();
+            expect(eagerRelease).not.toHaveBeenCalled();
+            release.resolve();
+            await job.done;
+            expect(eagerRelease).toHaveBeenCalledTimes(1);
+            // A settled eager job must never strand the real shutdown drain.
+            await (shutdown ?? h.session.finishShutdown());
+            expect(eagerRelease).toHaveBeenCalledTimes(1);
+          } finally {
+            release.resolve();
+            await job.done;
+            await shutdown;
+          }
+        }
+      );
+    }
+
+    test("reset permits replacement work without releasing either job's physical ownership", async () => {
+      const { h, deps, releases, start } = await setupEager();
+      const first = deferred<void>();
+      const second = deferred<void>();
+      let preparations = 0;
+      deps.prepare = () => (preparations++ === 0 ? first.promise : second.promise);
+      const original = await start();
+      h.session.setAutoCompactionThreshold(0.8);
+      const replacement = await start();
+      try {
+        expect(releases).toHaveLength(2);
+        expect(releases[0]).not.toHaveBeenCalled();
+        expect(releases[1]).not.toHaveBeenCalled();
+        first.resolve();
+        await original.done;
+        expect(releases[0]).toHaveBeenCalledTimes(1);
+        expect(releases[1]).not.toHaveBeenCalled();
+        second.resolve();
+        await replacement.done;
+        expect(releases[1]).toHaveBeenCalledTimes(1);
+        await h.session.finishShutdown();
+      } finally {
+        first.resolve();
+        second.resolve();
+        await Promise.all([original.done, replacement.done]);
+      }
+    });
+  });
 
   test.each([
     "startup",

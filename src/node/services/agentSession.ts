@@ -1198,6 +1198,7 @@ export class AgentSession {
 
     this.continuousCompactor = new ContinuousCompactor({
       workspaceId: this.workspaceId,
+      enterExecution: () => this.coordinator.enterExecution(),
       historyService: this.historyService,
       compactionHandler: this.compactionHandler,
       streamManager: {
@@ -6271,8 +6272,7 @@ export class AgentSession {
     observe: () => Promise<T>
   ): Promise<T | undefined> {
     if (this.coordinator.closing) return undefined;
-    // Own the actual apply and its continuation; the compactor's detached eager summary job
-    // retains its existing cancellation contract until the later compaction migration.
+    // Own the actual apply and its continuation; the compactor separately owns detached eager work.
     using _execution = this.coordinator.enterExecution();
     if (this.continuousCompactionObservation) {
       await this.continuousCompactionObservation;

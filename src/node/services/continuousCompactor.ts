@@ -46,6 +46,7 @@ interface StreamSnapshot {
 }
 interface Dependencies {
   workspaceId: string;
+  enterExecution?(): Disposable;
   historyService: HistoryService;
   compactionHandler: CompactionHandler;
   streamManager: {
@@ -263,6 +264,9 @@ export class ContinuousCompactor {
         done: Promise.resolve(),
       };
       this.job = job;
+      // Reset may retire this job before non-cooperative preparation or summary I/O settles.
+      // Keep physical ownership on the original Promise, independent of semantic job identity.
+      const execution = this.deps.enterExecution?.();
       job.done = this.startEagerJob(job, context)
         .catch((error: unknown) => {
           if (!job.abort.signal.aborted)
@@ -270,6 +274,7 @@ export class ContinuousCompactor {
         })
         .finally(() => {
           if (this.job === job) this.job = null;
+          execution?.[Symbol.dispose]();
         });
     }
     return usagePercent >= context.thresholdPercent + FORCE_COMPACTION_BUFFER_PERCENT
