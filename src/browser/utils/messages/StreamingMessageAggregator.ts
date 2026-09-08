@@ -251,6 +251,7 @@ interface StreamingContext {
    * stream is active.
    */
   metadataModel?: string;
+  contextWindowTokens?: number | null;
   routedThroughGateway?: boolean;
   routeProvider?: string;
 
@@ -1935,6 +1936,10 @@ export class StreamingMessageAggregator {
     return this.getActiveStreamEntry()?.[1].metadataModel;
   }
 
+  getActiveStreamContextWindowTokens(): number | null | undefined {
+    return this.getActiveStreamEntry()?.[1].contextWindowTokens;
+  }
+
   getCurrentModel(): string | undefined {
     const activeStream = this.getActiveStreamEntry();
     if (activeStream) {
@@ -2107,6 +2112,7 @@ export class StreamingMessageAggregator {
       isReplay: data.replay === true,
       model: data.model,
       metadataModel: data.metadataModel,
+      contextWindowTokens: data.contextWindowTokens,
       routedThroughGateway: data.routedThroughGateway,
       routeProvider,
       serverFirstTokenTime: null,
@@ -2190,6 +2196,7 @@ export class StreamingMessageAggregator {
     const metadata = copyStreamMetadataSnapshot(data.metadata);
     context.model = metadata.model;
     context.metadataModel = metadata.metadataModel;
+    context.contextWindowTokens = metadata.contextWindowTokens;
     context.thinkingLevel = metadata.thinkingLevel;
     context.routedThroughGateway = metadata.routedThroughGateway;
     context.routeProvider = metadata.routeProvider;

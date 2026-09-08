@@ -28,7 +28,12 @@ import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMe
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream";
-import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
+import type {
+  ProvidersConfigMap,
+  WorkspaceActivitySnapshot,
+  WorkspaceChatMessage,
+} from "@/common/orpc/types";
+import { calculateTokenMeterData } from "@/common/utils/tokens/tokenMeterUtils";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT } from "@/common/constants/ui";
 import {
@@ -1502,6 +1507,126 @@ describe("WorkspaceStore", () => {
   });
 
   describe("live usage identity pinning", () => {
+    it("pins desktop meter capacity across settings, replay and fallback attempts, but not idle history", async () => {
+      const workspaceId = "desktop-pinned-capacity";
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+      const aggregator = store.getAggregator(workspaceId);
+      if (!aggregator) throw new Error("Expected workspace aggregator");
+      const internal = getInternal<{
+        processStreamEvent: (
+          id: string,
+          target: typeof aggregator,
+          event: WorkspaceChatMessage
+        ) => void;
+      }>(store);
+      const dispatch = (event: WorkspaceChatMessage) =>
+        internal.processStreamEvent(workspaceId, aggregator, event);
+      const model = "anthropic:claude-sonnet-4-20250514";
+      const reportedUsage = { inputTokens: 50_000, outputTokens: 0, totalTokens: 50_000 };
+      const providers: ProvidersConfigMap = {
+        anthropic: {
+          isConfigured: true,
+          isEnabled: true,
+          apiKeySet: true,
+          models: [{ id: "claude-sonnet-4-20250514", contextWindowTokens: 200_000 }],
+        },
+      };
+      let use1M = false;
+      const meter = () => {
+        const usage = store.getWorkspaceUsage(workspaceId);
+        return calculateTokenMeterData(
+          usage.liveUsage ?? usage.lastContextUsage,
+          usage.liveUsage?.model ?? model,
+          use1M,
+          false,
+          providers,
+          usage.liveUsage ? usage.liveContextWindowTokens : undefined
+        );
+      };
+      const start: StreamStartEvent = {
+        type: "stream-start",
+        workspaceId,
+        messageId: "active",
+        model,
+        metadataModel: model,
+        historySequence: 1,
+        startTime: 1,
+        contextWindowTokens: 500_000,
+      };
+      const delta: WorkspaceChatMessage = {
+        type: "usage-delta",
+        workspaceId,
+        messageId: "active",
+        usage: reportedUsage,
+        cumulativeUsage: reportedUsage,
+      };
+      dispatch(start);
+      dispatch(delta);
+      expect(store.getWorkspaceUsage(workspaceId).liveContextWindowTokens).toBe(500_000);
+      expect(meter().totalPercentage).toBe(10);
+      providers.anthropic.models = [
+        { id: "claude-sonnet-4-20250514", contextWindowTokens: 100_000 },
+      ];
+      use1M = true;
+      expect(meter().totalPercentage).toBe(10);
+      dispatch({
+        type: "stream-delta",
+        workspaceId,
+        messageId: "active",
+        delta: "preserved",
+        timestamp: 2,
+        tokens: 1,
+      });
+      dispatch({ ...start, replay: true });
+      expect(meter().totalPercentage).toBe(10);
+      const fallbackModel = "openai:gpt-4o";
+      const fallback: WorkspaceChatMessage = {
+        type: "stream-metadata",
+        workspaceId,
+        messageId: "active",
+        metadata: {
+          model: fallbackModel,
+          metadataModel: fallbackModel,
+          contextWindowTokens: 250_000,
+          routedThroughGateway: false,
+          routeProvider: null,
+        },
+      };
+      dispatch(fallback);
+      expect(store.getWorkspaceUsage(workspaceId).liveUsage).toBeUndefined();
+      expect(store.getWorkspaceUsage(workspaceId).liveCostUsage).toBeUndefined();
+      expect(store.getWorkspaceUsage(workspaceId).liveContextWindowTokens).toBe(250_000);
+      dispatch(delta);
+      expect(meter().totalPercentage).toBe(20);
+      dispatch({ ...fallback, metadata: { ...fallback.metadata, contextWindowTokens: null } });
+      dispatch(delta);
+      expect(store.getWorkspaceUsage(workspaceId).liveContextWindowTokens).toBeNull();
+      expect(meter().maxTokens).toBeUndefined();
+      dispatch({
+        ...start,
+        model: fallbackModel,
+        metadataModel: fallbackModel,
+        replay: true,
+        contextWindowTokens: null,
+      });
+      expect(meter().maxTokens).toBeUndefined();
+      dispatch({
+        type: "stream-end",
+        workspaceId,
+        messageId: "active",
+        parts: [{ type: "text", text: "preserved" }],
+        metadata: { model, contextWindowTokens: 500_000, contextUsage: reportedUsage },
+      });
+      expect(store.getWorkspaceUsage(workspaceId).liveContextWindowTokens).toBeUndefined();
+      use1M = false;
+      expect(meter().totalPercentage).toBe(50);
+      // Legacy active starts lack a pin and retain the existing configured-limit fallback.
+      dispatch({ ...start, messageId: "legacy", contextWindowTokens: undefined });
+      dispatch({ ...delta, messageId: "legacy" });
+      expect(meter().totalPercentage).toBe(50);
+    });
+
     it("prices live Coder usage via the stream's pinned metadataModel", async () => {
       const workspaceId = "live-coder-usage-pinned";
       createAndAddWorkspace(store, workspaceId);

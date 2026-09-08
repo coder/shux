@@ -326,6 +326,8 @@ export interface WorkspaceUsageState {
    * it over re-resolving the raw model against a refreshed providers config.
    */
   liveMetadataModel?: string;
+  /** Backend-pinned active request capacity: null is unknown; undefined is legacy or idle. */
+  liveContextWindowTokens?: number | null;
 }
 
 /**
@@ -2872,6 +2874,7 @@ export class WorkspaceStore {
       // re-resolving the raw model against the refreshed config would price
       // and bucket live usage differently from the backend ledger.
       const liveMetadataModel = aggregator.getActiveStreamMetadataModel();
+      const liveContextWindowTokens = aggregator.getActiveStreamContextWindowTokens();
       const rawContextUsage = activeStreamId
         ? aggregator.getActiveStreamUsage(activeStreamId)
         : undefined;
@@ -2913,6 +2916,7 @@ export class WorkspaceStore {
         liveUsage,
         liveCostUsage,
         liveMetadataModel,
+        liveContextWindowTokens,
       };
     });
   }

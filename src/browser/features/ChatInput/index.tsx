@@ -604,11 +604,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const activeUsageModel = usage?.liveUsage?.model ?? null;
   const contextDisplayModel = activeUsageModel ?? baseModel;
   const use1M = has1MContext(contextDisplayModel);
+  // A live pin belongs to live tokens, not the historical estimate shown between attempts.
+  const liveContextWindowTokens = usage?.liveUsage ? usage.liveContextWindowTokens : undefined;
   const contextUsageData = useMemo(() => {
     return lastUsage
-      ? calculateTokenMeterData(lastUsage, contextDisplayModel, use1M, false, providersConfig)
+      ? calculateTokenMeterData(
+          lastUsage,
+          contextDisplayModel,
+          use1M,
+          false,
+          providersConfig,
+          liveContextWindowTokens
+        )
       : { segments: [], totalTokens: 0, totalPercentage: 0 };
-  }, [lastUsage, contextDisplayModel, use1M, providersConfig]);
+  }, [lastUsage, contextDisplayModel, use1M, providersConfig, liveContextWindowTokens]);
   const autoCompactionProps = useAutoCompactionSettings(workspaceIdForUsage, contextDisplayModel);
 
   // Idle compaction settings (per-project, persisted to backend for idleCompactionService)

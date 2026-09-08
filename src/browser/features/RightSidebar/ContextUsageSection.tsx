@@ -58,7 +58,8 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
     contextDisplayModel,
     has1MContext(contextDisplayModel),
     false,
-    providersConfig
+    providersConfig,
+    usage.liveUsage ? usage.liveContextWindowTokens : undefined
   );
 
   // Warn when the compaction model can't fit the auto-compact threshold to avoid failures.
