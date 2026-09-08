@@ -41,7 +41,7 @@ def codex_comment_is_informational($bot):
               or test("^\\| [^[:alnum:]|]*\\*\\*(Code|Security) Review\\*\\* \\| "
                 + "[^[:alnum:]|]*\\*\\*(Completed|Running|In progress|Queued|Pending)\\*\\*"
                 + "( (since )?<relative-time datetime=\"[0-9TZ:.+-]+\">[0-9TZ:.+-]+</relative-time>)? "
-                + "\\| `[0-9a-f]+` \\| (Manual request|New commits|Draft marked ready|Pull request opened) \\|$")
+                + "\\| `[0-9a-f]+` \\| (Manual request|New commits|Draft marked ready|PR opened) \\|$")
             ))
         ) catch false) // false
       else
