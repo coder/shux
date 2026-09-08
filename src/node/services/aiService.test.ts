@@ -2261,6 +2261,61 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(await fs.readFile(file, "utf8")).toBe("Unused but important handoff facts");
   });
 
+  it("narrows a flush turn's memory context to the context notes only", async () => {
+    using root = new DisposableTempDir("ai-service-flush-only-notes");
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(root.path),
+      xumHome: root.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.MEMORY || id === EXPERIMENT_IDS.MEMORY_HOT_SET
+    );
+    const { config, service } = createBasicAIService(root.path, { experimentsService });
+    const memoryService = new MemoryService(config, new MemoryMetaService(root.path));
+    service.turnRequestBuilderBindings.memoryService = memoryService;
+    const workspaceId = "flush-only-notes";
+    spyOn(service, "getWorkspaceMetadata").mockResolvedValue({
+      success: true,
+      data: {
+        ...createLocalWorkspaceMetadata(workspaceId, root.path),
+        runtimeConfig: { type: "local" },
+      },
+    });
+    const directory = path.join(config.sessionsDir, workspaceId, "memory");
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(path.join(directory, "context-notes.md"), "resume here");
+    await fs.writeFile(path.join(directory, "private.md"), "secret detail");
+    // Ranking is not under test: stub the hot set so a private memory is definitely selected.
+    spyOn(memoryService, "listHotMemories").mockResolvedValue([
+      {
+        path: "/memories/workspace/private.md",
+        pinned: true,
+        truncated: false,
+        content: "secret detail",
+      },
+      {
+        path: "/memories/workspace/context-notes.md",
+        pinned: false,
+        truncated: false,
+        content: "resume here",
+      },
+    ]);
+    const build = (options?: Parameters<AIService["buildMemorySessionContext"]>[2]) =>
+      service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2", options);
+    const full = await build({ tokenBudgetActive: true });
+    expect(full?.indexEntries.map((entry) => entry.path).sort()).toEqual([
+      "/memories/workspace/context-notes.md",
+      "/memories/workspace/private.md",
+    ]);
+    expect(full?.hotMemoriesBlock).toContain("secret detail");
+    const narrowed = await build({ tokenBudgetActive: true, onlyContextNotes: true });
+    expect(narrowed?.indexEntries.map((entry) => entry.path)).toEqual([
+      "/memories/workspace/context-notes.md",
+    ]);
+    expect(narrowed?.hotMemoriesBlock).toContain("resume here");
+    expect(narrowed?.hotMemoriesBlock).not.toContain("secret detail");
+  });
+
   it("preserves the memory index when hot-memory selection fails", async () => {
     using xumHome = new DisposableTempDir("ai-service-memory-hot-failure");
     const projectPath = path.join(xumHome.path, "project");

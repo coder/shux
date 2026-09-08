@@ -285,7 +285,7 @@ export interface StreamMessageOptions {
    */
   resolveMemoryContext?: (
     modelString: string,
-    options?: { includeHotMemories?: boolean }
+    options?: { includeHotMemories?: boolean; onlyContextNotes?: boolean }
   ) => Promise<MemorySessionContext | undefined>;
   experiments?: SendMessageOptions["experiments"];
   allowAgentSetGoal?: boolean;
@@ -1310,8 +1310,13 @@ export class TurnRequestBuilder {
     // project-scope listing sees a running runtime (a stopped Docker/remote
     // workspace would yield an empty/partial context, and AgentSession caches
     // the result per model/session segment).
+    // Flush turns only ever see the context notes (index and preload): other memories must
+    // not be disclosed to, or laundered through, the hidden prompt-influenced turn.
     const memoryContext = resolveMemoryContext
-      ? await resolveMemoryContext(modelString, { includeHotMemories: false })
+      ? await resolveMemoryContext(modelString, {
+          includeHotMemories: false,
+          onlyContextNotes: contextBudgetFlushTurn,
+        })
       : undefined;
 
     const cfg = this.dependencies.config.loadConfigOrDefault();
@@ -1366,7 +1371,10 @@ export class TurnRequestBuilder {
       memoryToolAvailableForModel &&
       memoryHotSetExperimentEnabled &&
       resolveMemoryContext !== undefined
-        ? await resolveMemoryContext(modelStringForContext, { includeHotMemories: true })
+        ? await resolveMemoryContext(modelStringForContext, {
+            includeHotMemories: true,
+            onlyContextNotes: contextBudgetFlushTurn,
+          })
         : memoryContext;
     emitStartupBreadcrumb("loading_workspace_context");
     const resolveAgentForStreamStartedAt = Date.now();

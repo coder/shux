@@ -680,7 +680,11 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   buildMemorySessionContext?(
     workspaceId: string,
     modelString: string,
-    options?: { includeHotMemories?: boolean; tokenBudgetActive?: boolean }
+    options?: {
+      includeHotMemories?: boolean;
+      tokenBudgetActive?: boolean;
+      onlyContextNotes?: boolean;
+    }
   ): Promise<MemorySessionContext | null>;
   isClaudeSkillsCompatEnabled?(): boolean;
   isAgentPluginsEnabled?(): boolean;
@@ -5672,16 +5676,15 @@ export class AgentSession {
         (await this.checkContextBudgetHistoryAccess(options)).success
           ? await this.captureRolloverRequestAssembly()
           : undefined;
-      // Re-read the threshold: the slider may have moved during the awaited checks above.
+      const notesExist = admitted?.success ? await this.workspaceContextNotesExist() : false;
+      // Re-read the threshold after the last await: the slider may have moved meanwhile.
       if (admitted?.success && this.compactionMonitor.getThreshold() < 1) {
         // Keep pendingRollover and pin this admitted snapshot: the promised reset must not be
         // invalidated by registry changes that happen during the flush turn itself.
         this.pendingRolloverSnapshot = admitted.data;
         return Ok({
           prefix: [
-            createContextBudgetWarning(decision.projected, maxTokens, true, true, {
-              notesExist: await this.workspaceContextNotesExist(),
-            }),
+            createContextBudgetWarning(decision.projected, maxTokens, true, true, { notesExist }),
           ],
         });
       }
@@ -10054,12 +10057,29 @@ export class AgentSession {
    */
   private async resolveMemoryContext(
     modelString: string,
-    options?: { includeHotMemories?: boolean; tokenBudgetActive?: boolean },
+    options?: {
+      includeHotMemories?: boolean;
+      tokenBudgetActive?: boolean;
+      onlyContextNotes?: boolean;
+    },
     cache = this.memoryContextByModelString
   ): Promise<MemorySessionContext | undefined> {
     assert(modelString.length > 0, "resolveMemoryContext requires a model string");
     const includeHotMemories = options?.includeHotMemories !== false;
     const tokenBudgetActive = options?.tokenBudgetActive === true;
+    if (options?.onlyContextNotes === true) {
+      // SECURITY: a final-flush turn must not see other memories (index or preloaded
+      // contents); this narrowed context is never cached for ordinary turns.
+      const narrowed =
+        typeof this.aiService.buildMemorySessionContext === "function"
+          ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
+              includeHotMemories,
+              tokenBudgetActive,
+              onlyContextNotes: true,
+            })
+          : null;
+      return narrowed ?? undefined;
+    }
     const enabled = (id: ExperimentId) =>
       typeof this.aiService.isExperimentEnabled === "function" &&
       this.aiService.isExperimentEnabled(id);
