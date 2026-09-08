@@ -1195,7 +1195,9 @@ function buildWorkflowTimeoutFinalizationPrompt(
 
 export class TaskService implements AgentTaskIntegration {
   // Serialize stream-end processing per workspace to avoid races when
-  // finalizing reported tasks and cleanup state transitions.
+  // finalizing reported tasks and cleanup state transitions. Lock order: acquired BEFORE the
+  // task-tree lifecycle lock. Stream-end finalization and cleanup rechecks hold this lock while
+  // remove() takes the tree lock, so any path needing both nests event -> task-tree.
   private readonly workspaceEventLocks = new MutexMap<string>();
   // Separate parent-scoped lock for deferred best-of fallback/finalization. This path can run
   // concurrently from multiple child stream-end handlers for the same parent, and it must remain
@@ -4552,8 +4554,10 @@ export class TaskService implements AgentTaskIntegration {
       return Ok(queuedUpdateResult.data);
     }
 
-    return this.withTaskTreeLifecycleLock(taskId, async () =>
-      this.workspaceEventLocks.withLock(taskId, async () => {
+    // Event lock first, then the task-tree lock: the order every path holding both follows (see
+    // workspaceEventLocks). The reverse nesting deadlocked against reported-task cleanup.
+    return this.workspaceEventLocks.withLock(taskId, async () =>
+      this.withTaskTreeLifecycleLock(taskId, async () => {
         const cfg = this.config.loadConfigOrDefault();
         const entry = findWorkspaceEntry(cfg, taskId);
         if (!entry) {
@@ -13715,8 +13719,8 @@ export class TaskService implements AgentTaskIntegration {
       // holds: reactivation, re-parenting, and task_stop all mutate under that lock, so a task
       // confirmed eligible there cannot change underneath the removal. remove() is the only lock
       // acquisition on this path: runtime callers reach it under the workspace event lock
-      // (stream-end finalization, cleanup rechecks), nesting event -> task-tree, the inverse of
-      // the send path's task-tree -> event. That nesting predates the live recheck.
+      // (stream-end finalization, cleanup rechecks), nesting event -> task-tree, the order every
+      // path holding both locks follows (see workspaceEventLocks).
       let confirmed: { ok: true; parentWorkspaceId: string } | undefined;
       const removeResult = await this.workspaceService.remove(targetWorkspaceId, true, {
         beforeRemove: async () => {

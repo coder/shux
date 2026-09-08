@@ -3730,6 +3730,90 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, oldParentId)).toBeDefined();
   });
 
+  test("reported-task cleanup and task_send_message never deadlock on the event and task-tree locks", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-cleanup-send-lock-order";
+    const childTaskId = "child-cleanup-send-lock-order";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "reported",
+          reportedAt: "2026-08-10T00:00:00.000Z",
+          taskModelString: "openai:gpt-5.2",
+          workflowTask: { runId: "wfr_cleanup_send_lock_order", stepId: "explore" },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // Mirror WorkspaceService.remove(): confirm and delete under the task-tree lifecycle lock.
+    // Hold the call open between cleanup taking the child's event lock and remove() taking the
+    // tree lock, so the send can be parked on its own lock acquisition inside that window.
+    let releaseRemove!: () => void;
+    const removeGate = new Promise<void>((resolve) => {
+      releaseRemove = resolve;
+    });
+    let removeEntered!: () => void;
+    const removeStarted = new Promise<void>((resolve) => {
+      removeEntered = resolve;
+    });
+    const remove = mock(
+      async (
+        workspaceId: string,
+        _force?: boolean,
+        options?: { beforeRemove?: () => Promise<boolean> }
+      ): Promise<Result<void>> => {
+        removeEntered();
+        await removeGate;
+        return await taskService.withTaskTreeLifecycleLock(workspaceId, async () => {
+          if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+            return Ok(undefined);
+          }
+          await removeWorkspaceFromTestConfig(config, workspaceId);
+          return Ok(undefined);
+        });
+      }
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const internals = taskService as unknown as {
+      requestReportedTaskCleanupRecheck: (workspaceId: string) => Promise<void>;
+    };
+
+    const cleanup = internals.requestReportedTaskCleanupRecheck(childTaskId);
+    await removeStarted;
+    const send = taskService.sendMessageToDescendantAgentTask(
+      parentWorkspaceId,
+      childTaskId,
+      "steer the reported child",
+      "tool-end"
+    );
+    // One macrotask turn: the send's pre-lock section is microtask-only, so by now it is parked
+    // on its first lock acquisition while cleanup still holds the child's event lock.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseRemove();
+
+    let deadlockTimer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      Promise.all([cleanup, send]).then(() => "settled" as const),
+      new Promise<"deadlocked">((resolve) => {
+        deadlockTimer = setTimeout(() => resolve("deadlocked"), 5_000);
+      }),
+    ]);
+    clearTimeout(deadlockTimer);
+    expect(outcome).toBe("settled");
+    expect(await send).toEqual(Err({ code: "not_found" }));
+    expect(findWorkspaceInConfig(config, childTaskId)).toBeUndefined();
+  }, 10_000);
+
   test("bare compaction stream-end resumes the pre-compaction parent identity", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
