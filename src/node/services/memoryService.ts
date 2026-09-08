@@ -1651,6 +1651,10 @@ export class MemoryService extends EventEmitter {
             actor,
             toolCallId
           );
+        } else {
+          // Unjournaled delete (unrepresentable subtree): the store still
+          // changed, so other backends' cached views must still see it.
+          await this.advanceStoreRevision(store);
         }
         await this.recordDelete(ctx, scope, parsed.relPath);
         this.emitChange(ctx, scope, parsed.relPath, actor);

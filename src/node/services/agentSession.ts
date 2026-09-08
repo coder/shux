@@ -1055,20 +1055,40 @@ export class AgentSession {
 
   /**
    * Workspace-memory write policy accumulated over the current compaction
-   * epoch (TurnRequestBuilder via WorkspaceService). Attached to compaction
-   * completions so the memory harvest — which writes to the (possibly shared)
-   * workspace store on this agent's behalf — can honor a read-only agent's
-   * policy. Fail-closed across turns: the harvest reads EVERY message of the
-   * epoch, so one read-only turn denies the whole epoch even if a writable
-   * turn follows; the accumulator restarts at the compaction boundary
-   * (unless a preserved tail carries the epoch's messages forward).
+   * epoch, mirrored from the DURABLE accumulator in config.json
+   * (WorkspaceService.recordWorkspaceMemoryWritable performs the fail-closed
+   * AND against the persisted value, so backends sharing one chat.jsonl —
+   * XUM_ALLOW_MULTIPLE_INSTANCES — and a restarted process all contribute to
+   * one conjunction). Attached to compaction completions so the memory
+   * harvest — which writes to the (possibly shared) workspace store on this
+   * agent's behalf — honors a read-only turn anywhere in the epoch: the
+   * harvest reads EVERY message of the epoch. Both copies restart at a
+   * context boundary (compaction without a preserved tail, /clear, context
+   * reset, destructive history replace) via resetWorkspaceMemoryWritable.
    */
   private workspaceMemoryWritable: boolean | undefined;
 
-  /** Returns the effective (accumulated) value, which is what gets persisted. */
-  recordWorkspaceMemoryWritable(writable: boolean): boolean {
-    this.workspaceMemoryWritable = (this.workspaceMemoryWritable ?? true) && writable;
-    return this.workspaceMemoryWritable;
+  recordWorkspaceMemoryWritable(effective: boolean): void {
+    this.workspaceMemoryWritable = effective;
+  }
+
+  /**
+   * Start a fresh policy epoch: the in-memory mirror and the durable
+   * accumulator both forget the previous epoch's turns. Durable-or-throw like
+   * the other boundary invalidations: a stale persisted deny would refuse
+   * harvests of the new, possibly all-writable epoch forever (and a stale
+   * grant is never left behind by this path — grants are re-recorded per
+   * turn). Nothing to do when the field is already absent.
+   */
+  private async resetWorkspaceMemoryWritable(): Promise<void> {
+    this.workspaceMemoryWritable = undefined;
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
+    if (entry?.workspace.workspaceMemoryWritable === undefined) return;
+    await this.config.editConfig((cfg) => {
+      const current = findWorkspaceEntry(cfg, this.workspaceId);
+      if (current !== null) delete current.workspace.workspaceMemoryWritable;
+      return cfg;
+    });
   }
 
   /**
@@ -1242,8 +1262,17 @@ export class AgentSession {
         // New epoch. A preserved tail copies messages produced under this
         // epoch's policy into the next one, so the fail-closed accumulator
         // carries over with them; otherwise the next normal turn restarts it.
+        // The completion callback is synchronous; the durable reset runs
+        // detached and is logged on failure (the next turn re-records the
+        // policy anyway, so a failed reset can only delay a grant, never
+        // widen one).
         if ((metadata.preservedTailMessageCount ?? 0) === 0) {
-          this.workspaceMemoryWritable = undefined;
+          this.resetWorkspaceMemoryWritable().catch((error: unknown) => {
+            log.warn("Failed to reset the workspace memory policy epoch", {
+              workspaceId: this.workspaceId,
+              error,
+            });
+          });
         }
       },
       onIdleCompactionOutcome,
@@ -9821,6 +9850,10 @@ export class AgentSession {
     this.postCompactionLoadedSkills = [];
     this.postCompactionReadFilePaths = [];
     this.pendingPostCompactionStateToAcknowledge = null;
+    // A destructive context boundary (/clear, reset, history replace) starts
+    // a new harvest epoch: the fail-closed policy of the discarded transcript
+    // must not keep denying the new one.
+    await this.resetWorkspaceMemoryWritable();
     // Durable-or-throw: a swallowed unlink failure would leave the stale
     // post-compaction.json to re-inject pre-boundary carryover after a
     // restart while the boundary caller reports success — the same

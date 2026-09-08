@@ -1,3 +1,4 @@
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -9269,6 +9270,56 @@ describe("WorkspaceService initialize", () => {
     try {
       await service.initialize();
       expect(await fsPromises.stat(scratchPath).then(() => true)).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("accumulates the workspace memory write policy fail-closed in config across an epoch", async () => {
+    const { config: realConfig, historyService, cleanup } = await createTestHistoryService();
+    const scratchDir = path.join(realConfig.rootDir, "scratch", "policy-scratch");
+    await fsPromises.mkdir(scratchDir, { recursive: true });
+    await realConfig.editConfig((cfg) => {
+      cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+        workspaces: [
+          {
+            kind: "scratch",
+            path: scratchDir,
+            id: "policy-scratch",
+            name: "scratch-policy-scratch",
+            runtimeConfig: { type: "local" },
+          },
+        ],
+        projectKind: "system",
+        trusted: true,
+      });
+      return cfg;
+    });
+    const aiService = {
+      ...createStreamLifecycleMocks(),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+    const service = createWorkspaceServiceForTest({
+      config: realConfig,
+      historyService,
+      aiService,
+      initStateManager: mockInitStateManager as InitStateManager,
+    });
+    const persisted = () =>
+      findWorkspaceEntry(realConfig.loadConfigOrDefault(), "policy-scratch")?.workspace
+        .workspaceMemoryWritable;
+    try {
+      // The durable bit is the epoch accumulator: the harvest reads every
+      // message of the epoch, so a read-only turn denies the epoch even when
+      // a writable turn follows — across restarts and backends, since the
+      // conjunction lives in config.json rather than in one process.
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(persisted()).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false)).toBe(true);
+      expect(persisted()).toBe(false);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(persisted()).toBe(false);
     } finally {
       await cleanup();
     }

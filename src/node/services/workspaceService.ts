@@ -4220,14 +4220,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * new value could not be confirmed durable.
    */
   async recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): Promise<boolean> {
-    // The session accumulates the policy over the compaction epoch
-    // (fail-closed); the durable copy mirrors that effective value so a
-    // restart-time fallback cannot be more permissive than the live session.
-    const effective =
-      (
-        this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
-      )?.recordWorkspaceMemoryWritable(writable) ?? writable;
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    // The persisted bit is the epoch accumulator, fail-closed: the harvest
+    // reads every message of the compaction epoch, so one read-only turn
+    // denies the whole epoch even if writable turns follow. Durable so it
+    // survives a restart mid-epoch AND so backends sharing one chat.jsonl
+    // (multi-instance) contribute to the same conjunction; it restarts at
+    // context boundaries (AgentSession.resetWorkspaceMemoryWritable).
+    const effective = (entry?.workspace.workspaceMemoryWritable ?? true) && writable;
+    (
+      this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
+    )?.recordWorkspaceMemoryWritable(effective);
     // Unregistered workspace: nothing durable to update and no stale
     // permission to invalidate (harvests fail closed on the missing value).
     if (entry === null) return true;

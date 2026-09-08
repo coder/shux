@@ -226,26 +226,6 @@ describe("AgentSession memory context", () => {
     }
   });
 
-  test("accumulates the workspace memory write policy fail-closed across an epoch", async () => {
-    using sessionDir = new DisposableTempDir("agent-session-memory-policy");
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-    const session = createSession({
-      historyService,
-      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
-      buildMemorySessionContext: () => Promise.resolve(null),
-    });
-    try {
-      // The harvest reads every message of the epoch: a read-only turn denies
-      // the epoch even when a writable turn follows.
-      expect(session.recordWorkspaceMemoryWritable(true)).toBe(true);
-      expect(session.recordWorkspaceMemoryWritable(false)).toBe(false);
-      expect(session.recordWorkspaceMemoryWritable(true)).toBe(false);
-    } finally {
-      await session.dispose();
-    }
-  });
-
   test("upgrades an index-only memory context when hot memories are requested", async () => {
     using sessionDir = new DisposableTempDir("agent-session-memory-context-upgrade");
     const { historyService, cleanup } = await createTestHistoryService();
