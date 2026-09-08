@@ -400,7 +400,8 @@ jobs:
         timeout-minutes: 10
       - name: Run tests
         if: matrix.os == 'linux'
-        run: xvfb-run -a make test-e2e
+        # Native focus and clipboard are shared by every Electron app on this display.
+        run: xvfb-run -a make test-e2e PLAYWRIGHT_ARGS="--workers=1"
         env:
           ELECTRON_DISABLE_SANDBOX: 1
       - name: Run tests
