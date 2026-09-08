@@ -917,6 +917,23 @@ describe("WorkspaceContext", () => {
     expect(result.error).toBe("Failed");
   });
 
+  test("removeWorkspace forwards descendant consent and preserves blockers", async () => {
+    const { workspace: workspaceApi } = createMockAPI();
+    const ctx = await setup();
+    const failure = {
+      success: false,
+      error: "A descendant is active",
+      descendants: [{ workspaceId: "child", title: "Reviewer", active: true }],
+    };
+    workspaceApi.remove.mockResolvedValue(failure);
+    const options = { force: true, acknowledgedDescendantIds: ["child"] };
+
+    const result = await ctx().removeWorkspace("parent", options);
+
+    expect(workspaceApi.remove).toHaveBeenCalledWith({ workspaceId: "parent", options });
+    expect(result).toEqual(failure);
+  });
+
   describe("archiveWorkspace", () => {
     test("succeeds even when persisted layout is invalid JSON shape", async () => {
       const workspaceId = "ws-archive-invalid-layout";
