@@ -1385,6 +1385,73 @@ test("nested rows stay at the supported child depth instead of recursively consu
   expect(view.queryByRole("button", { name: /Bash/ })).toBeNull();
 });
 
+test("legacy toolCalls replay renders inspectable children without overriding explicit nestedCalls", () => {
+  const part: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "legacy",
+    toolName: "code_execution",
+    input: { code: "legacy execution" },
+    state: "output-available",
+    output: {
+      success: true,
+      toolCalls: [
+        {
+          toolName: "file_read",
+          args: { path: "legacy.txt" },
+          result: "Retained result",
+          duration_ms: 1,
+        },
+        { toolName: "bash", error: "Legacy command failed", duration_ms: 2 },
+        { toolName: "web_fetch", ok: false, duration_ms: 3 },
+        {
+          toolName: "ask_user_question",
+          args: prefilledQuestionPart({ "Which branch?": "main" }).input,
+          duration_ms: 4,
+        },
+      ],
+    },
+  };
+  const renderMessage = (value: MuxToolPart) => (
+    <Message
+      message={toolMessage(value)}
+      canAnswer
+      onAnswer={async () => {
+        throw new Error("Legacy child actions must not run");
+      }}
+    />
+  );
+  const view = render(renderMessage(part));
+  fireEvent.click(view.getByRole("button", { name: "File read: Done. legacy.txt" }));
+  expect(view.getByText("Retained result")).toBeDefined();
+  fireEvent.click(view.getByRole("button", { name: "Close" }));
+  fireEvent.click(view.getByRole("button", { name: "Bash: Failed" }));
+  expect(view.getByText(/Legacy command failed/)).toBeDefined();
+  fireEvent.click(view.getByRole("button", { name: "Close" }));
+  expect(view.getByRole("button", { name: "Web fetch: Failed" })).toBeDefined();
+  expect(view.getByRole("button", { name: "Ask user question: Done" })).toBeDefined();
+  expect(view.queryByRole("button", { name: "Send answers" })).toBeNull();
+  view.rerender(renderMessage({ ...part, nestedCalls: [] }));
+  expect(view.queryByRole("group", { name: "Nested tool calls" })).toBeNull();
+  expect(view.getAllByRole("button")).toHaveLength(1);
+  view.rerender(
+    renderMessage({
+      ...part,
+      nestedCalls: [
+        {
+          toolCallId: "explicit",
+          toolName: "file_read",
+          input: { path: "current.txt" },
+          output: "Current result",
+          state: "output-available",
+        },
+      ],
+    })
+  );
+  expect(view.queryByRole("button", { name: "File read: Done. legacy.txt" })).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "File read: Done. current.txt" }));
+  expect(view.getByText("Current result")).toBeDefined();
+});
+
 test("tool headers distinguish execution, completion, failure, redaction, and interrupted replay", () => {
   const part: MuxToolPart = {
     type: "dynamic-tool",

@@ -13,6 +13,7 @@ import { Button, Field, Notice, Sheet } from "./Controls";
 import { Markdown } from "./Markdown";
 import { ToolIcon } from "./ToolIcon";
 import { mergeAdjacentParts } from "../../../../src/common/utils/messages/mergeAdjacentParts";
+import { getNestedCallsForDisplay } from "../../../../src/common/utils/messages/nestedToolCalls";
 import { colors, layout, mono, radii, spacing, typography } from "../theme";
 
 export function Message(props: {
@@ -201,7 +202,7 @@ function Tool(props: {
     (!("executionStartedAt" in props.part) || props.part.executionStartedAt == null);
   // The bridge schema has one flat child level and excludes interactive questions.
   const nestedCalls =
-    !props.nested && "nestedCalls" in props.part ? props.part.nestedCalls : undefined;
+    !props.nested && "type" in props.part ? getNestedCallsForDisplay(props.part) : undefined;
   return (
     <View style={{ gap: spacing.sm, minWidth: 0 }}>
       <Pressable
