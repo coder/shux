@@ -1378,6 +1378,21 @@ describe("AgentSession token-budget lifecycle", () => {
     ).toBe(false);
   });
 
+  test("a top-level workspace (no delegated correlation) still flags the flush request", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await h.finishAndDispatch();
+    // resolveStreamMuxMetadata drops plain attribution; the flush flag must survive anyway so
+    // the request builder applies the memory-only ceiling.
+    expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    expect(h.requests[0].muxMetadata?.contextBudgetFlush).toBeUndefined();
+    expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
+    h.settleStream(1);
+    await h.waitForRequest(3);
+    expect(h.requests[2].muxMetadata?.contextBudgetFlush).toBeUndefined();
+  });
+
   test("a text-only flush turn still rolls over at stream end", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
