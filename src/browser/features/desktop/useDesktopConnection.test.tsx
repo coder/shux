@@ -325,6 +325,44 @@ describe("useDesktopConnection control ownership", () => {
     expect(registration.signal.aborted).toBe(false);
   });
 
+  test("registers the viewer before bootstrap so the pane is attached before the desktop starts", async () => {
+    autoReady = false;
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(registrations).toHaveLength(1));
+    // Bootstrap clears the backend's startup reservation; it must not run until the pane is
+    // registered, or an agent-driven archive could close the desktop in between.
+    expect(getBootstrap).not.toHaveBeenCalled();
+    const registration = registrations[0];
+    registration.queue.push({ type: "ready", viewerId: registration.viewerId });
+    await waitFor(() => expect(view.desktop.state).toBe("connected"));
+    expect(getBootstrap).toHaveBeenCalledTimes(1);
+  });
+
+  test("a release during bootstrap ACKs and prevents the pending bootstrap from connecting", async () => {
+    let resolveBootstrap!: (value: typeof bootstrap) => void;
+    getBootstrap = mock(
+      () =>
+        new Promise<typeof bootstrap>((done) => {
+          resolveBootstrap = done;
+        })
+    );
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(getBootstrap).toHaveBeenCalledTimes(1));
+    const registration = registrations[0];
+    registration.queue.push({ type: "release", viewerId: registration.viewerId });
+    await waitFor(() =>
+      expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: registration.viewerId })
+    );
+    await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
+    await act(async () => {
+      resolveBootstrap(bootstrap);
+      await Promise.resolve();
+    });
+    expect(DesktopRfbFixture.instances).toHaveLength(0);
+  });
+
   test.each(["disconnect", "unmount"])("%s cancels registration before ready", async (action) => {
     autoReady = false;
     const view = mountConnection();
@@ -534,6 +572,7 @@ describe("useDesktopConnection control ownership", () => {
     const view = mountConnection();
     act(() => view.desktop.connect());
     expect(view.desktop.state).toBe("checking");
+    await waitFor(() => expect(getBootstrap).toHaveBeenCalledTimes(1));
     view.unmount();
     await act(async () => {
       resolve(bootstrap);

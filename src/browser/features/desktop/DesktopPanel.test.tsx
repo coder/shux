@@ -211,6 +211,9 @@ describe("DesktopPanel binding", () => {
     const pending = Promise.withResolvers<Bootstrap>();
     getBootstrap.mockReturnValueOnce(pending.promise);
     const view = render(<DesktopPanel workspaceId="caller" />);
+    // Bootstrap follows the viewer registration, so wait for the caller's request to be in
+    // flight before switching workspaces underneath it.
+    await waitFor(() => expect(getBootstrap).toHaveBeenCalledWith({ workspaceId: "caller" }));
     getBootstrap.mockResolvedValue({ ...sharedBootstrap, capability: ownCapability });
     view.rerender(<DesktopPanel workspaceId="isolated" />);
     await connectedViewer();
