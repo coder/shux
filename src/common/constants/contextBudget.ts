@@ -8,6 +8,10 @@ export const OUTPUT_RESERVE_TOKENS = 8_192;
 export const MAX_OUTPUT_RESERVE_CONTEXT_RATIO = 0.25;
 export const MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO = 0.5;
 export const WARNING_RESERVE_TOKENS = 2_048;
+// Absolute floor on how far ahead of the rollover point the advance warning fires. The
+// percent-based advance shrinks with the window (a 15% gap is under 5k tokens at 32k), so
+// reserve three WARNING_RESERVE_TOKENS: one notes flush plus roughly two working steps.
+export const WARNING_ADVANCE_MIN_TOKENS = 3 * WARNING_RESERVE_TOKENS;
 export const IMAGE_TOKEN_ESTIMATE = 1_024;
 export const SYSTEM_FLOOR_TOKENS_ESTIMATE = 8_192;
 export const SESSION_HISTORY_MAX_RESULT_BYTES = 16 * 1024;

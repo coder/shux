@@ -9,6 +9,7 @@ import {
   MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO,
   OUTPUT_RESERVE_TOKENS,
   SYSTEM_FLOOR_TOKENS_ESTIMATE,
+  WARNING_ADVANCE_MIN_TOKENS,
   WARNING_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
@@ -113,13 +114,19 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   // A flush opportunity means one more notes-writing step fits below the hard ceiling.
   // Use the real-encoding projection where available: it can exceed the chars/4 heuristic.
   const safeFlush = hardProjected + WARNING_RESERVE_TOKENS < hardCeiling;
-  if (projected >= limit * ((input.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT) / 100)) {
+  const forceAt = limit * ((input.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT) / 100);
+  if (projected >= forceAt) {
     return { ...result, decision: "rollover", flushOpportunity: safeFlush };
   }
-  if (
-    !input.warningEmitted &&
-    projected >= limit * ((input.threshold * 100 - WARNING_ADVANCE_PERCENT) / 100)
-  ) {
+  // On small windows or high thresholds the hard ceiling, not the force buffer, is where the
+  // window really ends; anchor the absolute advance floor there. Tiny windows keep at least
+  // half of the usable window before the warning instead of warning on the first request.
+  const rolloverAt = Math.min(forceAt, hardCeiling);
+  const warnAt = Math.min(
+    limit * ((input.threshold * 100 - WARNING_ADVANCE_PERCENT) / 100),
+    Math.max(rolloverAt - WARNING_ADVANCE_MIN_TOKENS, rolloverAt / 2)
+  );
+  if (!input.warningEmitted && projected >= warnAt) {
     // Never spend the last usable context tokens telling the agent to flush notes.
     return safeFlush
       ? { ...result, decision: "warn", flushOpportunity: true }

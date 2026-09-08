@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   IMAGE_TOKEN_ESTIMATE,
   OUTPUT_RESERVE_TOKENS,
+  WARNING_ADVANCE_MIN_TOKENS,
   WARNING_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
@@ -217,6 +218,48 @@ describe("small-model context budgets", () => {
       });
     }
   );
+});
+
+describe("absolute warning advance floor", () => {
+  test("large windows keep the percent-based warning point", () => {
+    expect(evaluate({ modelContextLimit: 128_000, contextTokens: 76_799 }).decision).toBe(
+      "continue"
+    );
+    expect(evaluate({ modelContextLimit: 128_000, contextTokens: 76_800 }).decision).toBe("warn");
+  });
+
+  test("small windows warn at least the floor ahead of the ceiling-anchored rollover", () => {
+    // hardCeiling = 32_768 - min(8_192, 8_192) = 24_576 = forceAt at 75%; percent rule ~19_661.
+    const warnAt = 24_576 - WARNING_ADVANCE_MIN_TOKENS;
+    expect(evaluate({ modelContextLimit: 32_768, contextTokens: warnAt - 1 }).decision).toBe(
+      "continue"
+    );
+    expect(evaluate({ modelContextLimit: 32_768, contextTokens: warnAt })).toMatchObject({
+      decision: "warn",
+      flushOpportunity: true,
+    });
+  });
+
+  test("the hard ceiling anchors the floor when it precedes the force point", () => {
+    // forceAt = 64_000 at 100%, hardCeiling = 55_808; percent rule would warn at 54_400.
+    const warnAt = 55_808 - WARNING_ADVANCE_MIN_TOKENS;
+    expect(
+      evaluate({ modelContextLimit: 64_000, threshold: 0.95, contextTokens: warnAt - 1 }).decision
+    ).toBe("continue");
+    expect(
+      evaluate({ modelContextLimit: 64_000, threshold: 0.95, contextTokens: warnAt }).decision
+    ).toBe("warn");
+  });
+
+  test("a tiny window keeps its first half usable and then rolls over without a flush", () => {
+    // hardCeiling = 3_000 < WARNING_ADVANCE_MIN_TOKENS: the floor is clamped to half the
+    // rollover point (1_500), where the reserve no longer fits, so the outcome is rollover.
+    expect(evaluate({ modelContextLimit: 4_000, contextTokens: 1_499 }).decision).toBe("continue");
+    expect(evaluate({ modelContextLimit: 4_000, contextTokens: 1_500 })).toMatchObject({
+      decision: "rollover",
+      flushOpportunity: false,
+    });
+  });
 });
 
 test("measured dense tool tokens enforce the hard ceiling while ordinary proactive estimates remain conservative", () => {
