@@ -155,6 +155,21 @@ describe("unactivated compaction pending-file protocol", () => {
     }
   );
 
+  it.each(
+    ["null", "[]", JSON.stringify("invalid pending state")].flatMap((raw) =>
+      [false, true].map((loadFirst) => ({ raw, loadFirst }))
+    )
+  )("recovers non-object JSON roots before fresh publication (%j)", async ({ raw, loadFirst }) => {
+    await fs.writeFile(filePath, raw);
+    if (loadFirst) {
+      expect(await store.load(() => true)).toBeUndefined();
+      expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+    }
+    const receipt = await prepare("fresh");
+    await boundary("fresh");
+    expect((await restart().load(() => true))?.attachments).toEqual(receipt.attachments);
+  });
+
   it.each([
     { version: 2, publicationGeneration: "future-generation", ...attachments("future") },
     { schema: "future", data: { attachments: ["keep"] } },

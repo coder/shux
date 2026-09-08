@@ -153,7 +153,8 @@ function parseState(value: unknown, allowPrevious = true): PersistedState | unde
 
 function parseJson(raw: string | undefined): unknown {
   try {
-    return raw === undefined ? undefined : JSON.parse(raw);
+    // Only object roots can represent an unsupported pending-state schema.
+    return raw === undefined ? undefined : record(JSON.parse(raw));
   } catch {
     return undefined;
   }
