@@ -13586,6 +13586,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
     const pruned: string[] = [];
     service.setWorkspaceMcpOverridesService({
+      acquireExclusiveLock: () => Promise.resolve(() => Promise.resolve()),
       prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
         pruned.push(`${workspaceId}:${keyPrefix}`);
         return Promise.resolve();
@@ -13608,6 +13609,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
     const pruned: string[] = [];
     service.setWorkspaceMcpOverridesService({
+      acquireExclusiveLock: () => Promise.resolve(() => Promise.resolve()),
       prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
         pruned.push(`${workspaceId}:${keyPrefix}`);
         return Promise.resolve();
@@ -13652,6 +13654,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
     const pruned: string[] = [];
     service.setWorkspaceMcpOverridesService({
+      acquireExclusiveLock: () => Promise.resolve(() => Promise.resolve()),
       prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
         pruned.push(`${workspaceId}:${keyPrefix}`);
         return Promise.resolve();
@@ -13682,6 +13685,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     ]);
     const pruned: string[] = [];
     service.setWorkspaceMcpOverridesService({
+      acquireExclusiveLock: () => Promise.resolve(() => Promise.resolve()),
       prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
         pruned.push(`${workspaceId}:${keyPrefix}`);
         return Promise.resolve();
@@ -13697,6 +13701,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
   test("a failed sanitize surfaces an error so creation aborts", async () => {
     const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
     service.setWorkspaceMcpOverridesService({
+      acquireExclusiveLock: () => Promise.resolve(() => Promise.resolve()),
       prunePluginOverrideKeys: () =>
         Promise.reject(new Error('duplicate "enabledServers" properties')),
     });
@@ -13717,6 +13722,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     ]);
     const pruned: string[] = [];
     service.setWorkspaceMcpOverridesService({
+      acquireExclusiveLock: () => Promise.resolve(() => Promise.resolve()),
       prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
         pruned.push(`${workspaceId}:${keyPrefix}`);
         return Promise.resolve();
@@ -13742,6 +13748,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
       ]);
       const pruned: string[] = [];
       service.setWorkspaceMcpOverridesService({
+        acquireExclusiveLock: () => Promise.resolve(() => Promise.resolve()),
         prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
           pruned.push(`${workspaceId}:${keyPrefix}`);
           return Promise.resolve();
@@ -13769,6 +13776,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     (service as unknown as SanitizeAccess).pendingPluginSanitizations.add("ws-concurrent");
     const pruned: string[] = [];
     service.setWorkspaceMcpOverridesService({
+      acquireExclusiveLock: () => Promise.resolve(() => Promise.resolve()),
       prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
         pruned.push(`${workspaceId}:${keyPrefix}`);
         return Promise.resolve();

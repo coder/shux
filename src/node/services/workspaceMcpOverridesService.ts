@@ -534,6 +534,34 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
+   * Hold the exclusive override lock imperatively (same in-process queue and
+   * cross-process lock as every write here). For workspace lifecycle
+   * mutations that move a checkout and then rewrite config — a rename racing
+   * prunePluginOverrideKeysForWorkspaces would otherwise let the prune stat
+   * the vacated old path, find nothing, and retire a tombstone while the moved
+   * file still holds the plugin key. Resolves once the lock is held with a
+   * release function; the returned promise rejects if acquisition times out.
+   */
+  acquireExclusiveLock(): Promise<() => Promise<void>> {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return new Promise((resolveAcquired, rejectAcquired) => {
+      const done = this.runExclusive(() => {
+        resolveAcquired(() => {
+          release();
+          return done;
+        });
+        return held;
+      });
+      // Only acquisition can fail here: once the callback above runs, `done`
+      // settles solely through the release function.
+      done.catch(rejectAcquired);
+    });
+  }
+
+  /**
    * Persist workspace MCP overrides to <workspace>/.xum/mcp.local.jsonc.
    *
    * Empty overrides remove the workspace-local file.

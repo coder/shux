@@ -2736,6 +2736,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
   private workspaceMcpOverridesService?: {
     prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
+    acquireExclusiveLock(): Promise<() => Promise<void>>;
   };
 
   setTimelineRecorder(recorder: TimelineRecorder): void {
@@ -2752,6 +2753,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   setWorkspaceMcpOverridesService(service: {
     prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
+    acquireExclusiveLock(): Promise<() => Promise<void>>;
   }): void {
     this.workspaceMcpOverridesService = service;
   }
@@ -7057,6 +7059,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   async rename(workspaceId: string, newName: string): Promise<Result<{ newWorkspaceId: string }>> {
+    let releaseOverridesLock: (() => Promise<void>) | undefined;
     try {
       if (this.shuttingDown) return Err("Server is shutting down");
       if (this.aiService.isStreaming(workspaceId)) {
@@ -7098,6 +7101,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       const { projectPath: configProjectPath } = workspace;
       const configSnapshot = this.config.loadConfigOrDefault();
+
+      // Hold the workspace MCP-overrides lock across the checkout move AND the
+      // config rewrite below. The Agent Plugin override prune resolves
+      // checkouts from config under that lock; a rename interleaving between
+      // its filesystem move and its config write would let the prune stat the
+      // vacated old path, find nothing, and retire a cleanup tombstone while
+      // the moved .xum/mcp.local.jsonc still holds the plugin key.
+      releaseOverridesLock = await this.workspaceMcpOverridesService?.acquireExclusiveLock();
 
       let oldPath: string;
       let newPath: string;
@@ -7350,6 +7361,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to rename workspace: ${message}`);
     } finally {
+      await releaseOverridesLock?.();
       // Always clear renaming flag, even on error
       this.renamingWorkspaces.delete(workspaceId);
     }

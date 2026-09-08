@@ -504,6 +504,27 @@ describe("WorkspaceMcpOverridesService", () => {
     }
   });
 
+  it("acquireExclusiveLock holds the prune sweep until released", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const { workspaceId } = await registerWorkspace("locked");
+
+    const release = await service.acquireExclusiveLock();
+    let sweepDone = false;
+    const sweep = service
+      .prunePluginOverrideKeysForWorkspaces([workspaceId], "plugin:0123456789abcdef:")
+      .then((failures) => {
+        sweepDone = true;
+        return failures;
+      });
+    // Give the sweep every chance to run if the lock were not honored.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sweepDone).toBe(false);
+
+    await release();
+    expect(await sweep).toEqual([]);
+    expect(sweepDone).toBe(true);
+  });
+
   it("prunePluginOverrideKeysForWorkspaces fails a workspace renamed during the sweep", async () => {
     const service = new WorkspaceMcpOverridesService(config);
     const stable = await registerWorkspace("stable");
