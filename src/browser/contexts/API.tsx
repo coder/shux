@@ -10,6 +10,8 @@ import {
   useMemo,
 } from "react";
 import { createClient } from "@/common/orpc/client";
+import { requestWebSocketTicket, WebSocketTicketError } from "@/common/orpc/webSocketTicket";
+import { ORPC_WS_PROTOCOL, ORPC_WS_TICKET_PREFIX } from "@/common/constants/webSocketAuth";
 import { RPCLink as WebSocketLink } from "@orpc/client/websocket";
 import { RPCLink as MessagePortLink } from "@orpc/client/message-port";
 import {
@@ -59,6 +61,8 @@ const MAX_DELAY_MS = 10000;
 // browsers often hide the underlying HTTP status (401/403). We fetch /api/spec.json to
 // infer whether auth is required, but the probe must never block reconnect progress.
 const AUTH_PROBE_TIMEOUT_MS = 2000;
+// Token attempts include ticket acquisition, upgrade and the authenticated ping.
+const TOKEN_CONNECTION_TIMEOUT_MS = 10_000;
 
 // Liveness check constants. The probe measures backend round-trip time: a connection whose
 // transport is alive but whose server answers slowly must still surface as degraded.
@@ -94,7 +98,7 @@ interface APIProviderProps {
   /** Optional pre-created client. If provided, skips internal connection setup. */
   client?: APIClient;
   /** WebSocket factory for testing. Defaults to native WebSocket constructor. */
-  createWebSocket?: (url: string) => WebSocket;
+  createWebSocket?: (url: string, protocols?: string[]) => WebSocket;
 }
 
 const noopConnectionControl = (_token?: string) => undefined;
@@ -124,8 +128,8 @@ function createElectronClient(): { client: APIClient; cleanup: () => void } {
 }
 
 function createBrowserClient(
-  authToken: string | null,
-  createWebSocket: (url: string) => WebSocket
+  protocols: string[] | undefined,
+  createWebSocket: (url: string, protocols?: string[]) => WebSocket
 ): {
   client: APIClient;
   cleanup: () => void;
@@ -135,11 +139,7 @@ function createBrowserClient(
 
   const wsUrl = new URL(`${apiBaseUrl}/orpc/ws`);
   wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
-  if (authToken) {
-    wsUrl.searchParams.set("token", authToken);
-  }
-
-  const ws = createWebSocket(wsUrl.toString());
+  const ws = createWebSocket(wsUrl.toString(), protocols);
   // oRPC >=1.14 replaced the `websocket` option with a `connect` factory.
   const link = new WebSocketLink({ connect: () => ws });
 
@@ -219,7 +219,9 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
 
   const authProbeAttemptedRef = useRef(false);
   const wsFactory = useMemo(
-    () => props.createWebSocket ?? ((url: string) => new WebSocket(url)),
+    () =>
+      props.createWebSocket ??
+      ((url: string, protocols?: string[]) => new WebSocket(url, protocols)),
     [props.createWebSocket]
   );
 
@@ -263,203 +265,260 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
           ? { status: "reconnecting", attempt: Math.max(1, reconnectAttemptRef.current) }
           : { status: "connecting" }
       );
-      const { client, cleanup, ws } = createBrowserClient(token, wsFactory);
-      ws.addEventListener("message", () => {
-        // Inbound frames prove the transport is alive, not that the backend is responsive:
-        // they only suppress the total-silence reconnect and never skip or satisfy a probe.
-        if (connectionId !== connectionIdRef.current) {
-          return;
-        }
-
-        lastInboundBrowserFrameAtRef.current = performance.now();
-      });
-
-      ws.addEventListener("open", () => {
-        // Ignore stale connections (can happen if we force reconnect while the old socket is mid-flight).
-        if (connectionId !== connectionIdRef.current) {
-          cleanup();
-          return;
-        }
-
-        client.general
-          .ping("auth-check")
-          .then(() => {
-            // Ignore stale connections (e.g., auth-check returned after a new connect()).
-            if (connectionId !== connectionIdRef.current) {
-              cleanup();
-              return;
-            }
-
-            const reconnected = hasConnectedRef.current;
-            authRequiredRef.current = false;
-            hasConnectedRef.current = true;
-            reconnectAttemptRef.current = 0;
-            consecutiveSlowProbesRef.current = 0;
-            forceReconnectInProgressRef.current = false;
-            window.__ORPC_CLIENT__ = client;
-            cleanupRef.current = cleanup;
-            setState({ status: "connected", client, cleanup });
-            // A reconnected socket may belong to a newer server than this loaded bundle. The probe
-            // runs after the client is published so a slow /version never delays reconnection, and
-            // only a bundle served by that server can be refreshed by reloading, so split-origin
-            // setups (VITE_BACKEND_URL, extension webviews) skip it.
-            const backendBaseUrl = getBrowserBackendBaseUrl();
-            if (reconnected && new URL(backendBaseUrl).origin === window.location.origin) {
-              void reloadIfServerBuildChanged(
-                backendBaseUrl,
-                () => connectionId === connectionIdRef.current
-              );
-            }
-          })
-          .catch((err: unknown) => {
-            if (connectionId !== connectionIdRef.current) {
-              cleanup();
-              return;
-            }
-
-            forceReconnectInProgressRef.current = false;
-            const errMsg = getErrorMessage(err);
-            const errMsgLower = errMsg.toLowerCase();
-            const isAuthError =
-              errMsgLower.includes("unauthorized") ||
-              errMsgLower.includes("401") ||
-              errMsgLower.includes("auth token") ||
-              errMsgLower.includes("authentication");
-
-            if (isAuthError) {
-              authRequiredRef.current = true;
-              clearStoredAuthToken();
-              hasConnectedRef.current = false; // Reset - need fresh auth
-              setState({ status: "auth_required", error: token ? "Invalid token" : undefined });
-              cleanup();
-              return;
-            }
-
-            cleanup();
-            setState({ status: "error", error: errMsg });
-          });
-      });
-
-      // Note: Browser fires 'error' before 'close', so we handle reconnection
-      // only in 'close' to avoid double-scheduling. The 'error' event just
-      // signals that something went wrong; 'close' provides the final state.
-      ws.addEventListener("error", () => {
-        // Error occurred - close event will follow and handle reconnection
-        // We don't call cleanup() here since close handler will do it
-      });
-
-      ws.addEventListener("close", (event) => {
+      const controller = new AbortController();
+      let retired = false;
+      let socketCleanup: () => void = () => undefined;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const isCurrent = () => !retired && connectionId === connectionIdRef.current;
+      const cleanup = () => {
+        if (retired) return;
+        retired = true;
+        clearTimeout(timeout);
+        controller.abort();
+        socketCleanup();
+      };
+      // Own pending HTTP/upgrade work before the first await, not only an authenticated socket.
+      cleanupRef.current = cleanup;
+      const failAttempt = (error: unknown) => {
+        if (!isCurrent()) return;
         cleanup();
-
-        // Ignore stale connections (can happen if we force reconnect while the old socket is mid-flight).
-        if (connectionId !== connectionIdRef.current) {
-          return;
-        }
-
         forceReconnectInProgressRef.current = false;
-
-        // If we've already decided auth is required (e.g. via ping error), don't immediately
-        // overwrite the modal with a reconnect attempt.
-        // Auth-specific close codes
-        if (event.code === 1008 || event.code === 4401) {
+        if (error instanceof WebSocketTicketError && error.reason === "authentication") {
           authRequiredRef.current = true;
           clearStoredAuthToken();
-          hasConnectedRef.current = false; // Reset - need fresh auth
-          setState({ status: "auth_required", error: "Authentication required" });
-          return;
+          hasConnectedRef.current = false;
+          setState({ status: "auth_required", error: error.message });
+        } else if (error instanceof WebSocketTicketError && error.reason === "unsupported") {
+          setState({ status: "error", error: error.message });
+        } else {
+          scheduleReconnectRef.current?.();
         }
+      };
+      const openBrowserConnection = (protocols?: string[]) => {
+        const { client, cleanup: closeSocket, ws } = createBrowserClient(protocols, wsFactory);
+        socketCleanup = closeSocket;
+        ws.addEventListener("message", () => {
+          // Inbound frames prove the transport is alive, not that the backend is responsive:
+          // they only suppress the total-silence reconnect and never skip or satisfy a probe.
+          if (!isCurrent()) {
+            return;
+          }
 
-        if (authRequiredRef.current) {
-          return;
-        }
+          lastInboundBrowserFrameAtRef.current = performance.now();
+        });
 
-        // If this is the initial connection attempt and the WS handshake failed, browsers often
-        // collapse HTTP auth errors (401/403) into an abnormal closure (1006) with no status.
-        //
-        // If the backend is reachable over HTTP, we can use the OpenAPI spec to disambiguate:
-        // the server includes a `security` stanza when a bearer token is required.
-        if (
-          !hasConnectedRef.current &&
-          !token &&
-          event.code === 1006 &&
-          !authProbeAttemptedRef.current
-        ) {
-          authProbeAttemptedRef.current = true;
+        ws.addEventListener("open", () => {
+          // Ignore stale connections (can happen if we force reconnect while the old socket is mid-flight).
+          if (!isCurrent()) {
+            cleanup();
+            return;
+          }
 
-          const apiBaseUrl = getBrowserBackendBaseUrl();
-          const specUrl = new URL(`${apiBaseUrl}/api/spec.json`);
+          if (token && ws.protocol !== ORPC_WS_PROTOCOL) {
+            failAttempt(new WebSocketTicketError("transient"));
+            return;
+          }
 
-          type AuthProbeResult = "requires_auth" | "no_auth" | "unknown";
-
-          const controller = new AbortController();
-          let timeoutId: ReturnType<typeof setTimeout> | null = null;
-
-          // `fetch` has no builtin timeout, and some environments don't reliably reject on abort.
-          // Use a race so the probe cannot hang the connection loop.
-          const timeoutPromise = new Promise<AuthProbeResult>((resolve) => {
-            timeoutId = setTimeout(() => {
-              controller.abort();
-              resolve("unknown");
-            }, AUTH_PROBE_TIMEOUT_MS);
-          });
-
-          const fetchPromise: Promise<AuthProbeResult> = fetch(specUrl, {
-            signal: controller.signal,
-          })
-            .then(async (res): Promise<AuthProbeResult> => {
-              if (!res.ok) return "unknown";
-
-              try {
-                const spec = (await res.json()) as { security?: unknown };
-                const requiresAuth = Array.isArray(spec.security) && spec.security.length > 0;
-                return requiresAuth ? "requires_auth" : "no_auth";
-              } catch {
-                return "unknown";
-              }
-            })
-            .catch((): AuthProbeResult => "unknown");
-
-          void Promise.race([fetchPromise, timeoutPromise])
-            .then((result) => {
-              if (connectionId !== connectionIdRef.current) {
+          client.general
+            .ping("auth-check", { signal: controller.signal })
+            .then(() => {
+              // Ignore stale connections (e.g., auth-check returned after a new connect()).
+              if (!isCurrent()) {
+                cleanup();
                 return;
               }
 
-              if (result === "requires_auth") {
+              clearTimeout(timeout);
+              const reconnected = hasConnectedRef.current;
+              authRequiredRef.current = false;
+              hasConnectedRef.current = true;
+              reconnectAttemptRef.current = 0;
+              consecutiveSlowProbesRef.current = 0;
+              forceReconnectInProgressRef.current = false;
+              window.__ORPC_CLIENT__ = client;
+              cleanupRef.current = cleanup;
+              setState({ status: "connected", client, cleanup });
+              // A reconnected socket may belong to a newer server than this loaded bundle. The probe
+              // runs after the client is published so a slow /version never delays reconnection, and
+              // only a bundle served by that server can be refreshed by reloading, so split-origin
+              // setups (VITE_BACKEND_URL, extension webviews) skip it.
+              const backendBaseUrl = getBrowserBackendBaseUrl();
+              if (reconnected && new URL(backendBaseUrl).origin === window.location.origin) {
+                void reloadIfServerBuildChanged(
+                  backendBaseUrl,
+                  () => connectionId === connectionIdRef.current
+                );
+              }
+            })
+            .catch((err: unknown) => {
+              if (!isCurrent()) {
+                cleanup();
+                return;
+              }
+
+              forceReconnectInProgressRef.current = false;
+              const errMsg = getErrorMessage(err);
+              const errMsgLower = errMsg.toLowerCase();
+              const isAuthError =
+                errMsgLower.includes("unauthorized") ||
+                errMsgLower.includes("401") ||
+                errMsgLower.includes("auth token") ||
+                errMsgLower.includes("authentication");
+
+              if (isAuthError && !token) {
                 authRequiredRef.current = true;
                 clearStoredAuthToken();
                 hasConnectedRef.current = false; // Reset - need fresh auth
-                setState({ status: "auth_required", error: "Authentication required" });
+                setState({ status: "auth_required", error: token ? "Invalid token" : undefined });
+                cleanup();
                 return;
               }
 
-              if (result === "unknown") {
-                // Probe was inconclusive (timeout, network error, non-OK, invalid JSON). Allow re-probe
-                // on a later initial-handshake failure.
-                authProbeAttemptedRef.current = false;
-              }
+              cleanup();
+              if (token) scheduleReconnectRef.current?.();
+              else setState({ status: "error", error: errMsg });
+            });
+        });
 
-              scheduleReconnectRef.current?.();
-            })
-            .finally(() => {
-              if (timeoutId) {
-                clearTimeout(timeoutId);
-              }
+        // Note: Browser fires 'error' before 'close', so we handle reconnection
+        // only in 'close' to avoid double-scheduling. The 'error' event just
+        // signals that something went wrong; 'close' provides the final state.
+        ws.addEventListener("error", () => {
+          // Error occurred - close event will follow and handle reconnection
+          // We don't call cleanup() here since close handler will do it
+        });
+
+        ws.addEventListener("close", (event) => {
+          const wasCurrent = isCurrent();
+          cleanup();
+
+          // Cleanup retires this attempt before a synchronous close callback can reconnect it.
+          if (!wasCurrent) return;
+
+          forceReconnectInProgressRef.current = false;
+
+          // If we've already decided auth is required (e.g. via ping error), don't immediately
+          // overwrite the modal with a reconnect attempt.
+          // Auth-specific close codes
+          if (!token && (event.code === 1008 || event.code === 4401)) {
+            authRequiredRef.current = true;
+            clearStoredAuthToken();
+            hasConnectedRef.current = false; // Reset - need fresh auth
+            setState({ status: "auth_required", error: "Authentication required" });
+            return;
+          }
+
+          if (authRequiredRef.current) {
+            return;
+          }
+
+          // If this is the initial connection attempt and the WS handshake failed, browsers often
+          // collapse HTTP auth errors (401/403) into an abnormal closure (1006) with no status.
+          //
+          // If the backend is reachable over HTTP, we can use the OpenAPI spec to disambiguate:
+          // the server includes a `security` stanza when a bearer token is required.
+          if (
+            !hasConnectedRef.current &&
+            !token &&
+            event.code === 1006 &&
+            !authProbeAttemptedRef.current
+          ) {
+            authProbeAttemptedRef.current = true;
+
+            const apiBaseUrl = getBrowserBackendBaseUrl();
+            const specUrl = new URL(`${apiBaseUrl}/api/spec.json`);
+
+            type AuthProbeResult = "requires_auth" | "no_auth" | "unknown";
+
+            const controller = new AbortController();
+            let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+            // `fetch` has no builtin timeout, and some environments don't reliably reject on abort.
+            // Use a race so the probe cannot hang the connection loop.
+            const timeoutPromise = new Promise<AuthProbeResult>((resolve) => {
+              timeoutId = setTimeout(() => {
+                controller.abort();
+                resolve("unknown");
+              }, AUTH_PROBE_TIMEOUT_MS);
             });
 
-          return;
-        }
-        // If we were previously connected, try to reconnect
-        if (hasConnectedRef.current) {
-          scheduleReconnectRef.current?.();
-          return;
-        }
+            const fetchPromise: Promise<AuthProbeResult> = fetch(specUrl, {
+              signal: controller.signal,
+            })
+              .then(async (res): Promise<AuthProbeResult> => {
+                if (!res.ok) return "unknown";
 
-        // First connection failed.
-        // This can happen in dev-server mode if the UI boots before the backend is ready.
-        // Prefer retry/backoff over forcing the auth modal (auth will be detected via ping/close codes).
-        scheduleReconnectRef.current?.();
-      });
+                try {
+                  const spec = (await res.json()) as { security?: unknown };
+                  const requiresAuth = Array.isArray(spec.security) && spec.security.length > 0;
+                  return requiresAuth ? "requires_auth" : "no_auth";
+                } catch {
+                  return "unknown";
+                }
+              })
+              .catch((): AuthProbeResult => "unknown");
+
+            void Promise.race([fetchPromise, timeoutPromise])
+              .then((result) => {
+                if (connectionId !== connectionIdRef.current) {
+                  return;
+                }
+
+                if (result === "requires_auth") {
+                  authRequiredRef.current = true;
+                  clearStoredAuthToken();
+                  hasConnectedRef.current = false; // Reset - need fresh auth
+                  setState({ status: "auth_required", error: "Authentication required" });
+                  return;
+                }
+
+                if (result === "unknown") {
+                  // Probe was inconclusive (timeout, network error, non-OK, invalid JSON). Allow re-probe
+                  // on a later initial-handshake failure.
+                  authProbeAttemptedRef.current = false;
+                }
+
+                scheduleReconnectRef.current?.();
+              })
+              .finally(() => {
+                if (timeoutId) {
+                  clearTimeout(timeoutId);
+                }
+              });
+
+            return;
+          }
+          // If we were previously connected, try to reconnect
+          if (hasConnectedRef.current) {
+            scheduleReconnectRef.current?.();
+            return;
+          }
+
+          // First connection failed.
+          // This can happen in dev-server mode if the UI boots before the backend is ready.
+          // Prefer retry/backoff over forcing the auth modal (auth will be detected via ping/close codes).
+          scheduleReconnectRef.current?.();
+        });
+      };
+      if (token) {
+        timeout = setTimeout(
+          () => failAttempt(new WebSocketTicketError("transient")),
+          TOKEN_CONNECTION_TIMEOUT_MS
+        );
+        requestWebSocketTicket(getBrowserBackendBaseUrl(), token, controller.signal)
+          .then(({ ticket }) => {
+            if (isCurrent())
+              openBrowserConnection([ORPC_WS_PROTOCOL, `${ORPC_WS_TICKET_PREFIX}${ticket}`]);
+          })
+          .catch(failAttempt);
+      } else {
+        // Cookie-only browser sessions keep their existing handshake and auth probe.
+        try {
+          openBrowserConnection();
+        } catch (error) {
+          failAttempt(error);
+        }
+      }
     },
     [props.createWebSocket, wsFactory]
   );
@@ -494,6 +553,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
   useEffect(() => {
     connect(authToken);
     return () => {
+      connectionIdRef.current += 1;
       cleanupRef.current?.();
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);

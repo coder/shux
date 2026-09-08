@@ -1,3 +1,4 @@
+import { ORPC_WS_PROTOCOL, ORPC_WS_TICKET_PREFIX } from "@/common/constants/webSocketAuth";
 import { VERSION } from "@/version";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
@@ -8,11 +9,14 @@ import type { RecursivePartial } from "@/browser/testUtils";
 class MockWebSocket {
   static instances: MockWebSocket[] = [];
   url: string;
+  protocols?: string[];
+  protocol = "";
   readyState = 0; // CONNECTING
   eventListeners = new Map<string, Array<(event?: unknown) => void>>();
 
-  constructor(url: string) {
+  constructor(url: string, protocols?: string[]) {
     this.url = url;
+    this.protocols = protocols;
     MockWebSocket.instances.push(this);
   }
 
@@ -27,7 +31,8 @@ class MockWebSocket {
   }
 
   // Test helpers
-  simulateOpen() {
+  simulateOpen(protocol = this.protocols?.[0] ?? "") {
+    this.protocol = protocol;
     this.readyState = 1; // OPEN
     this.eventListeners.get("open")?.forEach((h) => h());
   }
@@ -134,7 +139,10 @@ function APIStateObserver(props: { onState: (state: ObservedState) => void }) {
 }
 
 // Factory that creates MockWebSocket instances (injected via prop)
-const createMockWebSocket = (url: string) => new MockWebSocket(url) as unknown as WebSocket;
+const createMockWebSocket = (url: string, protocols?: string[]) =>
+  new MockWebSocket(url, protocols) as unknown as WebSocket;
+const testTicket = "a".repeat(64);
+const ticketResponse = (ticket = testTicket) => Response.json({ json: { ticket, expiresAtMs: 1 } });
 
 describe("API reconnection", () => {
   beforeEach(() => {
@@ -169,8 +177,13 @@ describe("API reconnection", () => {
     globalThis.document = undefined as unknown as Document;
   });
 
-  test("constructs WebSocket URL with app proxy prefix", () => {
+  test("mints a ticket over prefixed HTTP and constructs a clean WebSocket URL", async () => {
     window.location.href = "https://coder.example.com/@u/ws/apps/mux/?token=abc";
+    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    fetchImpl = (input, init) => {
+      requests.push({ input, init });
+      return Promise.resolve(ticketResponse());
+    };
 
     render(
       <APIProvider createWebSocket={createMockWebSocket}>
@@ -178,9 +191,221 @@ describe("API reconnection", () => {
       </APIProvider>
     );
 
-    const ws1 = MockWebSocket.lastInstance();
-    expect(ws1).toBeDefined();
-    expect(ws1!.url).toBe("wss://coder.example.com/@u/ws/apps/mux/orpc/ws?token=abc");
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const ws1 = MockWebSocket.lastInstance()!;
+    expect(requests).toHaveLength(1);
+    expect(requests[0].input).toBe(
+      "https://coder.example.com/@u/ws/apps/mux/orpc/serverAuth/issueWebSocketTicket"
+    );
+    expect(new Headers(requests[0].init?.headers).get("Authorization")).toBe("Bearer abc");
+    expect(window.location.search).toBe("");
+    expect(ws1.url).toBe("wss://coder.example.com/@u/ws/apps/mux/orpc/ws");
+    expect(ws1.protocols).toEqual([ORPC_WS_PROTOCOL, `${ORPC_WS_TICKET_PREFIX}${testTicket}`]);
+  });
+
+  test("cookie-only browser connections do not mint tickets or offer auth protocols", async () => {
+    document.cookie = "mux-session=cookie-only-session";
+    let requests = 0;
+    fetchImpl = () => {
+      requests++;
+      return Promise.resolve(ticketResponse());
+    };
+    const states: ObservedState[] = [];
+    render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <APIStateObserver onState={(value) => states.push(value)} />
+      </APIProvider>
+    );
+    const socket = MockWebSocket.lastInstance()!;
+    expect(socket.url).toBe("wss://mux.example.com/orpc/ws");
+    expect(socket.protocols).toBeUndefined();
+    await act(async () => {
+      socket.simulateOpen();
+      await Promise.resolve();
+    });
+    expect(states.at(-1)?.status).toBe("connected");
+    expect(requests).toBe(0);
+  });
+
+  test("token reconnects mint fresh tickets, and upgrade rejection does not erase the bearer", async () => {
+    storedAuthToken = "master-secret";
+    let mints = 0;
+    const tickets = ["b".repeat(64), "c".repeat(64)];
+    fetchImpl = () => Promise.resolve(ticketResponse(tickets[mints++]));
+    render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <APIStateObserver onState={() => undefined} />
+      </APIProvider>
+    );
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const first = MockWebSocket.lastInstance()!;
+    act(() => first.simulateClose(4401));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2));
+    expect(MockWebSocket.lastInstance()!.protocols).toEqual([
+      ORPC_WS_PROTOCOL,
+      `${ORPC_WS_TICKET_PREFIX}${tickets[1]}`,
+    ]);
+    expect(first.url).not.toContain("master-secret");
+    expect(mints).toBe(2);
+    expect(clearStoredAuthTokenMock).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    [401, "auth_required"],
+    [404, "error"],
+  ] as const)(
+    "ticket HTTP %s produces %s without a socket or secret fallback",
+    async (status, expected) => {
+      storedAuthToken = "master-secret";
+      fetchImpl = () => Promise.resolve(new Response("master-secret", { status }));
+      let state: UseAPIResult | undefined;
+      render(
+        <APIProvider createWebSocket={createMockWebSocket}>
+          <APIStateObserver
+            onState={(value) => {
+              state = value.apiState;
+            }}
+          />
+        </APIProvider>
+      );
+      await waitFor(() => expect(state?.status).toBe(expected));
+      expect(MockWebSocket.instances).toHaveLength(0);
+      expect(state?.error).not.toContain("master-secret");
+      expect(clearStoredAuthTokenMock).toHaveBeenCalledTimes(status === 401 ? 1 : 0);
+    }
+  );
+
+  test("superseding token and unmount cancel pending ticket requests and discard late responses", async () => {
+    storedAuthToken = "old-secret";
+    const first = Promise.withResolvers<Response>();
+    const second = Promise.withResolvers<Response>();
+    const signals: AbortSignal[] = [];
+    fetchImpl = (_input, init) => {
+      signals.push(init!.signal!);
+      return signals.length === 1 ? first.promise : second.promise;
+    };
+    let state: UseAPIResult | undefined;
+    const view = render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <APIStateObserver
+          onState={(value) => {
+            state = value.apiState;
+          }}
+        />
+      </APIProvider>
+    );
+    await waitFor(() => expect(signals).toHaveLength(1));
+    act(() => state!.authenticate("new-secret"));
+    await waitFor(() => expect(signals).toHaveLength(2));
+    expect(signals[0].aborted).toBe(true);
+    await act(async () => {
+      first.resolve(ticketResponse());
+      await Promise.resolve();
+    });
+    expect(MockWebSocket.instances).toHaveLength(0);
+    view.unmount();
+    expect(signals[1].aborted).toBe(true);
+    await act(async () => {
+      second.resolve(ticketResponse());
+      await Promise.resolve();
+    });
+    expect(MockWebSocket.instances).toHaveLength(0);
+  });
+
+  test("unmount closes a ticket-authenticated socket before its open or auth-check can publish", async () => {
+    storedAuthToken = "master-secret";
+    fetchImpl = () => Promise.resolve(ticketResponse());
+    const ping = Promise.withResolvers<string>();
+    pingImpl = () => ping.promise;
+    const observed: ObservedState[] = [];
+    const view = render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <APIStateObserver onState={(value) => observed.push(value)} />
+      </APIProvider>
+    );
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const socket = MockWebSocket.lastInstance()!;
+    act(() => socket.simulateOpen());
+    view.unmount();
+    expect(socket.readyState).toBe(3);
+    await act(async () => {
+      ping.resolve("pong");
+      await Promise.resolve();
+    });
+    expect(observed.some((value) => value.status === "connected")).toBe(false);
+  });
+
+  test(
+    "a stalled ticket request times out into reconnect without opening a socket or clearing auth",
+    async () => {
+      storedAuthToken = "master-secret";
+      const requests: AbortSignal[] = [];
+      fetchImpl = (_input, init) => {
+        requests.push(init!.signal!);
+        return new Promise(() => undefined);
+      };
+      render(
+        <APIProvider createWebSocket={createMockWebSocket}>
+          <APIStateObserver onState={() => undefined} />
+        </APIProvider>
+      );
+      await waitFor(() => expect(requests).toHaveLength(1));
+      await waitFor(() => expect(requests).toHaveLength(2), { timeout: 12_000 });
+      expect(requests[0].aborted).toBe(true);
+      expect(MockWebSocket.instances).toHaveLength(0);
+      expect(clearStoredAuthTokenMock).not.toHaveBeenCalled();
+    },
+    { timeout: 15_000 }
+  );
+
+  test("ticket sockets must negotiate the stable protocol before authenticated RPC", async () => {
+    storedAuthToken = "master-secret";
+    let mints = 0;
+    let pings = 0;
+    fetchImpl = () => {
+      mints++;
+      return Promise.resolve(ticketResponse());
+    };
+    pingImpl = () => {
+      pings++;
+      return Promise.resolve("pong");
+    };
+    render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <APIStateObserver onState={() => undefined} />
+      </APIProvider>
+    );
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const wrongProtocol = MockWebSocket.lastInstance()!;
+    act(() => wrongProtocol.simulateOpen(`${ORPC_WS_TICKET_PREFIX}${testTicket}`));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2));
+    expect(wrongProtocol.readyState).toBe(3);
+    expect(pings).toBe(0);
+    expect(mints).toBe(2);
+    expect(clearStoredAuthTokenMock).not.toHaveBeenCalled();
+  });
+
+  test("HTTP authentication failures after reconnect stop the loop instead of reusing an expired ticket", async () => {
+    storedAuthToken = "master-secret";
+    fetchImpl = () => Promise.resolve(ticketResponse());
+    const states: ObservedState[] = [];
+    render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <APIStateObserver onState={(value) => states.push(value)} />
+      </APIProvider>
+    );
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const first = MockWebSocket.lastInstance()!;
+    await act(async () => {
+      first.simulateOpen();
+      await Promise.resolve();
+    });
+    expect(states.at(-1)?.status).toBe("connected");
+    fetchImpl = () => Promise.resolve(new Response("Unauthorized", { status: 401 }));
+    act(() => first.simulateClose(1006));
+    await waitFor(() => expect(states.at(-1)?.status).toBe("auth_required"));
+    expect(MockWebSocket.instances).toHaveLength(1);
+    expect(clearStoredAuthTokenMock).toHaveBeenCalledTimes(1);
   });
 
   test("injected clients skip internal auth token setup", async () => {
