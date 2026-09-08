@@ -50,19 +50,25 @@ const NOOP_INIT_LOGGER: InitLogger = {
 
 type CaptureSnapshotForArchiveError = string | ArchiveLossyUntrackedFilesConfirmation;
 
-const STAGED_ATTACHMENT_CONTAINERS = new Set(
-  STAGED_ATTACHMENT_DIRS.map((dir) => dir.split("/")[0])
+// Container directory name to the staged attachment directory inside it (".xum" -> "user-attachments").
+const STAGED_ATTACHMENT_CONTAINERS = new Map(
+  STAGED_ATTACHMENT_DIRS.map((dir) => {
+    const [container, ...rest] = dir.split("/");
+    return [container, rest.join("/")] as const;
+  })
 );
 
-/** Matches `--directory` entries (trailing slash) named like a staged-attachment container. */
-function isStagedAttachmentContainer(untrackedPath: string): boolean {
+/**
+ * For a `git ls-files --directory` entry (trailing slash) named like a staged-attachment container,
+ * the entry its staged attachment directory would produce in the same listing.
+ */
+function stagedAttachmentDirInContainer(untrackedPath: string): string | null {
   const segments = untrackedPath.replace(/\\/gu, "/").split("/");
-  const directoryName = segments.at(-2);
-  return (
-    segments.at(-1) === "" &&
-    directoryName != null &&
-    STAGED_ATTACHMENT_CONTAINERS.has(directoryName)
-  );
+  if (segments.at(-1) !== "") {
+    return null;
+  }
+  const child = STAGED_ATTACHMENT_CONTAINERS.get(segments.at(-2) ?? "");
+  return child == null ? null : `${untrackedPath}${child}/`;
 }
 
 interface CreatedRestoreWorkspace {
@@ -771,12 +777,50 @@ export class WorktreeArchiveSnapshotService {
     const untrackedPaths = await listOthers([]);
     // `--directory` reports a directory whose only contents are ignored, which is exactly what
     // the staged-attachment container (`.xum/`, whose exclude targets the child directory) looks
-    // like. Those uploads are captured by captureStagedAttachments, so drop the container when
-    // it holds nothing else; every other entry keeps the existing lossy-data warning.
+    // like. Drop it only when those ignored contents are the uploads captureStagedAttachments
+    // preserves; anything else ignored in there (e.g. a workspace MCP override) is still lost
+    // with the worktree and keeps the warning, as does every other entry.
     const nonEmptyPaths = new Set(await listOthers(["--no-empty-directory"]));
-    return untrackedPaths
-      .filter((line) => nonEmptyPaths.has(line) || !isStagedAttachmentContainer(line))
-      .sort();
+    const lossyPaths: string[] = [];
+    for (const untrackedPath of untrackedPaths) {
+      if (
+        !nonEmptyPaths.has(untrackedPath) &&
+        (await this.holdsOnlyStagedAttachments(repoCwd, untrackedPath))
+      ) {
+        continue;
+      }
+      lossyPaths.push(untrackedPath);
+    }
+    return lossyPaths.sort();
+  }
+
+  private async holdsOnlyStagedAttachments(
+    repoCwd: string,
+    containerPath: string
+  ): Promise<boolean> {
+    const stagedDir = stagedAttachmentDirInContainer(containerPath);
+    if (stagedDir == null) {
+      return false;
+    }
+    const ignoredEntries = (
+      await this.gitStdout(repoCwd, [
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "--",
+        containerPath,
+      ])
+    )
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && line !== containerPath);
+    // A symlinked staging directory lists without the trailing slash; it is captured by contents.
+    return (
+      ignoredEntries.length > 0 &&
+      ignoredEntries.every((entry) => entry === stagedDir || `${entry}/` === stagedDir)
+    );
   }
 
   private async ensureNoUnsupportedUntrackedFiles(repoCwd: string): Promise<void> {
