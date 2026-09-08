@@ -13718,7 +13718,7 @@ export class TaskService implements AgentTaskIntegration {
       // Deletion is decided on live state inside the task-tree lifecycle lock that remove()
       // holds: reactivation, re-parenting, and task_stop all mutate under that lock, so a task
       // confirmed eligible there cannot change underneath the removal. remove() is the only lock
-      // acquisition on this path: runtime callers reach it under the workspace event lock
+      // acquisition on this path; callers that already hold a lock hold the workspace event lock
       // (stream-end finalization, cleanup rechecks), nesting event -> task-tree, the order every
       // path holding both locks follows (see workspaceEventLocks).
       let confirmed: { ok: true; parentWorkspaceId: string } | undefined;
