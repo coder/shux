@@ -992,6 +992,85 @@ describe("HistoryService", () => {
   });
 
   describe("context publication fencing", () => {
+    it.each(
+      ["active", "archived"].flatMap((target) =>
+        [false, true].map((afterAdvance) => ({ target, afterAdvance }))
+      )
+    )(
+      "edit truncation refuses unfenced writes ($target, after advance=$afterAdvance)",
+      async ({ target, afterAdvance }) => {
+        const workspaceId = "edit-generation-failure";
+        await service.appendToHistory(
+          workspaceId,
+          createMuxMessage("target", "user", "Original context")
+        );
+        if (target === "archived") {
+          await service.appendToHistory(
+            workspaceId,
+            createMuxMessage("boundary", "assistant", "Summary", {
+              compacted: "user",
+              compactionBoundary: true,
+              compactionEpoch: 1,
+            })
+          );
+        }
+        await service.appendToHistory(
+          workspaceId,
+          createMuxMessage("tail", "assistant", "Original answer")
+        );
+        const before = await collectFullHistory(service, workspaceId);
+        const journal = service.getContinuousCompactionJournal(workspaceId);
+        const generation = await journal.captureGeneration();
+        const invalidate = journal.invalidateUnderHistoryLock.bind(journal);
+        const failure = spyOn(journal, "invalidateUnderHistoryLock").mockImplementationOnce(
+          async (...args) => {
+            if (afterAdvance) await invalidate(...args);
+            throw new Error("edit generation unavailable");
+          }
+        );
+        try {
+          const result = await service.truncateAfterMessage(workspaceId, "target");
+          expect(!result.success && result.error).toContain("edit generation unavailable");
+          expect(await collectFullHistory(new HistoryService(config), workspaceId)).toEqual(before);
+          expect((await journal.captureGeneration()) === generation).toBe(!afterAdvance);
+          expect((await service.truncateAfterMessage(workspaceId, "target")).success).toBe(true);
+          expect(await collectFullHistory(service, workspaceId)).toEqual([]);
+        } finally {
+          failure.mockRestore();
+        }
+      }
+    );
+
+    it.each(["missing", "keep tail", "display tail"])(
+      "edit truncation preserves publication for %s",
+      async (cut) => {
+        const workspaceId = "edit-no-context-cut";
+        await service.appendToHistory(
+          workspaceId,
+          createMuxMessage("target", "user", "Current context")
+        );
+        if (cut === "display tail") {
+          await service.appendToHistory(
+            workspaceId,
+            createMuxMessage("display", "user", "Display only", {
+              muxMetadata: { type: "workflow-trigger-display", rawCommand: "/wf", runId: "run" },
+            })
+          );
+        }
+        const journal = service.getContinuousCompactionJournal(workspaceId);
+        const generation = await journal.captureGeneration();
+        await fs.writeFile(journal.path, "current journal");
+        const result = await service.truncateAfterMessage(
+          workspaceId,
+          cut === "missing" ? "missing" : "target",
+          { keepTargetMessage: true }
+        );
+        expect(result.success).toBe(cut !== "missing");
+        expect(await journal.captureGeneration()).toBe(generation);
+        expect(await fs.readFile(journal.path, "utf8")).toBe("current journal");
+      }
+    );
+
     it.each([false, true])(
       "reset batches validate their original publication before advancing it (admitted=%s)",
       async (admitted) => {

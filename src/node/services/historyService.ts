@@ -2400,16 +2400,26 @@ export class HistoryService {
     publication: ContinuousCompactionPublication,
     write: () => Promise<void>
   ): Promise<void> {
+    return this.withCompactionPublicationLock(workspaceId, publication, async (current) => {
+      if (current) await write();
+    });
+  }
+
+  /** Exact pending-write cleanup may run after invalidation, but may restore only current state. */
+  async withCompactionPublicationLock(
+    workspaceId: string,
+    publication: ContinuousCompactionPublication | undefined,
+    operation: (current: boolean) => Promise<void>
+  ): Promise<void> {
     await this.fileLocks.withLock(workspaceId, () =>
       this.withHistoryWriteFileLock(workspaceId, async () => {
         if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return;
-        if (
-          await this.getContinuousCompactionJournal(
-            workspaceId
-          ).isPublicationCurrentUnderHistoryLock(publication)
-        ) {
-          await write();
-        }
+        await operation(
+          !publication ||
+            (await this.getContinuousCompactionJournal(
+              workspaceId
+            ).isPublicationCurrentUnderHistoryLock(publication))
+        );
       })
     );
   }
@@ -3899,6 +3909,11 @@ export class HistoryService {
 
           const archiveMaxSeq = await this.getArchiveTailMaxSequence(workspaceId);
 
+          // Edit/fork cuts discard captured provider context across backend instances.
+          // A declined target or keep-target-at-tail no-op must retain its publication.
+          if (hasProviderEligibleMessages(filterWorkflowDisplayOnlyMessages(removedMessages))) {
+            await this.getContinuousCompactionJournal(workspaceId).invalidateUnderHistoryLock();
+          }
           // Atomic write prevents corruption if app crashes mid-write
           await writeFileAtomic(historyPath, historyEntries);
 
@@ -3978,6 +3993,9 @@ export class HistoryService {
       const lastArchiveRow = archiveRows.at(-1);
       if (lastArchiveRow && lastArchiveRow.raw.at(-1) !== 10 && activeEpochRows.length > 0) {
         archiveRows.push({ raw: Buffer.from("\n"), message: undefined });
+      }
+      if (hasProviderEligibleMessages(filterWorkflowDisplayOnlyMessages(removedMessages))) {
+        await this.getContinuousCompactionJournal(workspaceId).invalidateUnderHistoryLock();
       }
       await this.rewriteHistoryFilesUnlocked(
         workspaceId,

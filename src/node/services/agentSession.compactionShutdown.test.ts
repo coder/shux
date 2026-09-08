@@ -3239,3 +3239,437 @@ test.each(
     }
   }
 );
+
+test.each(
+  ["heartbeat", "legacy append", "legacy update"].flatMap((producer) =>
+    ["restart before cleanup", "cleanup", "reset", "edit", "successor"].map((stage) => ({
+      producer,
+      stage,
+    }))
+  )
+)("uncommitted $producer pending state is owned across $stage", async ({ producer, stage }) => {
+  const h = await setup();
+  const readMessage = createMuxMessage("read", "assistant", "");
+  readMessage.parts = [
+    {
+      type: "dynamic-tool",
+      toolCallId: "read-call",
+      toolName: "file_read",
+      state: "output-available",
+      input: { path: "/same-logical-read.ts" },
+      output: { success: true },
+    },
+  ];
+  await h.historyService.appendToHistory(workspaceId, readMessage);
+  await h.historyService.appendToHistory(
+    workspaceId,
+    createMuxMessage("old-request", "user", "Compact", {
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact",
+        parsed: { followUpContent: { text: "Continue", ...options } },
+      },
+    })
+  );
+  if (producer === "legacy update")
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("old-stream", "assistant", "Uncommitted summary")
+    );
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  if (producer === "legacy update") {
+    const update = h.historyService.updateHistory.bind(h.historyService);
+    spyOn(h.historyService, "updateHistory").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return update(...args);
+    });
+  } else {
+    const append = h.historyService.appendToHistory.bind(h.historyService);
+    spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return append(...args);
+    });
+  }
+  const handler = h.internals.compactionHandler;
+  const pending =
+    producer === "heartbeat"
+      ? handler.appendHeartbeatContextResetBoundary({
+          boundaryText: "Captured context",
+          pendingFollowUp: { text: "Continue", ...options },
+        })
+      : handler.handleCompletion(
+          {
+            type: "stream-end",
+            workspaceId,
+            messageId: "old-stream",
+            parts: [{ type: "text", text: "Captured context" }],
+            metadata: { model: options.model, duration: 1 },
+          },
+          "old-request"
+        );
+  const foreign = await createAgentSessionHarness({
+    workspaceId,
+    config: h.config,
+    historyService: new HistoryService(h.config),
+  });
+  const foreignHandler = (foreign.session as unknown as { compactionHandler: CompactionHandler })
+    .compactionHandler;
+  const pendingPath = `${h.config.sessionsDir}/${workspaceId}/post-compaction.json`;
+  try {
+    await entered.promise;
+    expect(JSON.parse(await readFile(pendingPath, "utf8"))).toHaveProperty("readFiles", [
+      "/same-logical-read.ts",
+    ]);
+    if (stage === "reset") {
+      await foreign.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("reset", "assistant", "", { contextBoundaryKind: "reset" })
+      );
+    } else if (stage === "edit") {
+      await foreign.historyService.truncateAfterMessage(workspaceId, "read");
+    } else {
+      await foreign.session.interruptStream({ abandonPartial: true });
+    }
+    if (stage === "restart before cleanup")
+      expect(await foreignHandler.peekPendingState()).toBeNull();
+    let successor: string | undefined;
+    if (stage === "successor") {
+      await foreignHandler.preparePendingStateFromMessages([readMessage]);
+      successor = await readFile(pendingPath, "utf8");
+    }
+    release.resolve();
+    await pending;
+    if (successor !== undefined) {
+      expect(await readFile(pendingPath, "utf8")).toBe(successor);
+    } else {
+      expect(await foreignHandler.peekPendingState()).toBeNull();
+      expect(await readFile(pendingPath, "utf8").catch(() => null)).toBeNull();
+    }
+  } finally {
+    release.resolve();
+    await pending.catch(() => undefined);
+    await foreign.session.dispose();
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test.each([
+  "same-generation successor",
+  "new-generation successor",
+  "write rejected",
+  "write acknowledgement lost",
+  "cleanup failure",
+  "current prior state",
+])("provisional pending receipt handles %s without claiming successor bytes", async (scenario) => {
+  const h = await setup();
+  const handler = h.internals.compactionHandler;
+  const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
+  const publication = { generation: await journal.captureGeneration() };
+  const pendingPath = `${h.config.sessionsDir}/${workspaceId}/post-compaction.json`;
+  const cleanup = (
+    handler as unknown as {
+      cleanupProvisionalPendingState(
+        receipt: Awaited<ReturnType<CompactionHandler["preparePendingStateFromMessages"]>>,
+        capturedPublication: typeof publication
+      ): Promise<void>;
+    }
+  ).cleanupProvisionalPendingState.bind(handler);
+  let prior: string | undefined;
+  if (scenario === "write rejected" || scenario === "current prior state") {
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("committed", "assistant", "Prior context", {
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      })
+    );
+    prior = JSON.stringify({
+      version: 1,
+      createdAt: 1,
+      diffs: [],
+      loadedSkills: [],
+      readFiles: ["/prior.ts"],
+      boundaryMessageId: "committed",
+    });
+    await writeFile(pendingPath, prior);
+  }
+  if (scenario === "write rejected" || scenario === "write acknowledgement lost") {
+    const write = h.historyService.withCompactionPublicationWrite.bind(h.historyService);
+    spyOn(h.historyService, "withCompactionPublicationWrite").mockImplementationOnce(
+      async (...args) => {
+        if (scenario === "write acknowledgement lost") await write(...args);
+        throw new Error("pending write unavailable");
+      }
+    );
+  }
+  const now = spyOn(Date, "now").mockReturnValue(1234);
+  try {
+    const read = createMuxMessage("a-read", "assistant", "");
+    read.parts = [
+      {
+        type: "dynamic-tool",
+        toolCallId: "a-read",
+        toolName: "file_read",
+        state: "output-available",
+        input: { path: "/provisional.ts" },
+        output: { success: true },
+      },
+    ];
+    const receipt = await handler.preparePendingStateFromMessages(
+      [read],
+      "provisional",
+      undefined,
+      publication
+    );
+    if (scenario === "write rejected") expect(receipt.write).toBeUndefined();
+    else expect(receipt.write).toBeDefined();
+    if (
+      scenario === "new-generation successor" ||
+      scenario === "write acknowledgement lost" ||
+      scenario === "cleanup failure"
+    ) {
+      await new CompactionCancellation(new HistoryService(h.config), workspaceId).cancel();
+    }
+    if (scenario === "new-generation successor") {
+      expect((await h.session.sendMessage("Fresh successor", options)).success).toBe(true);
+    }
+    let successor: string | undefined;
+    if (scenario === "same-generation successor" || scenario === "new-generation successor") {
+      await handler.preparePendingStateFromMessages([read], "provisional", undefined, {
+        generation: await journal.captureGeneration(),
+      });
+      successor = await readFile(pendingPath, "utf8");
+      expect(successor).not.toBe(receipt.write?.serialized);
+    }
+    if (scenario === "cleanup failure") {
+      const unlink = fs.unlink;
+      let failed = false;
+      spyOn(fs, "unlink").mockImplementation(async (...args) => {
+        if (!failed && args[0] === pendingPath) {
+          failed = true;
+          throw new Error("cleanup unavailable");
+        }
+        return unlink(...args);
+      });
+    }
+    await cleanup(receipt, publication);
+    const expected = successor ?? prior;
+    if (expected !== undefined) {
+      expect(await readFile(pendingPath, "utf8")).toBe(expected);
+      if (prior !== undefined)
+        expect(await handler.peekPendingState()).toHaveProperty("readFiles", ["/prior.ts"]);
+    } else {
+      const fresh = await createAgentSessionHarness({
+        workspaceId,
+        config: h.config,
+        historyService: new HistoryService(h.config),
+      });
+      try {
+        expect(
+          await (
+            fresh.session as unknown as { compactionHandler: CompactionHandler }
+          ).compactionHandler.peekPendingState()
+        ).toBeNull();
+        expect(await readFile(pendingPath, "utf8").catch(() => null)).toBeNull();
+      } finally {
+        await fresh.session.dispose();
+      }
+    }
+  } finally {
+    now.mockRestore();
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test("provisional cleanup cannot clear memory prepared by a successor waiting for its lock", async () => {
+  const h = await setup();
+  const handler = h.internals.compactionHandler;
+  const publication = {
+    generation: await h.historyService
+      .getContinuousCompactionJournal(workspaceId)
+      .captureGeneration(),
+  };
+  const receipt = await handler.preparePendingStateFromMessages(
+    [],
+    "a-boundary",
+    undefined,
+    publication
+  );
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const locked = h.historyService.withCompactionPublicationLock.bind(h.historyService);
+  spyOn(h.historyService, "withCompactionPublicationLock").mockImplementationOnce(
+    (id, captured, operation) =>
+      locked(id, captured, async (current) => {
+        entered.resolve();
+        await release.promise;
+        await operation(current);
+      })
+  );
+  const cleanup = (
+    handler as unknown as {
+      cleanupProvisionalPendingState(
+        capturedReceipt: typeof receipt,
+        captured: typeof publication
+      ): Promise<void>;
+    }
+  ).cleanupProvisionalPendingState(receipt, publication);
+  await entered.promise;
+  const queued = Promise.withResolvers<void>();
+  const writes = handler as unknown as {
+    enqueuePendingStateWrite(write: () => Promise<void>): Promise<void>;
+  };
+  const enqueue = writes.enqueuePendingStateWrite.bind(writes);
+  spyOn(writes, "enqueuePendingStateWrite").mockImplementationOnce((...args) => {
+    queued.resolve();
+    return enqueue(...args);
+  });
+  const read = createMuxMessage("b-read", "assistant", "");
+  read.parts = [
+    {
+      type: "dynamic-tool",
+      toolCallId: "b-read-call",
+      toolName: "file_read",
+      state: "output-available",
+      input: { path: "/b.ts" },
+      output: { success: true },
+    },
+  ];
+  const preparation = handler.preparePendingStateFromMessages(
+    [read],
+    "b-boundary",
+    undefined,
+    publication
+  );
+  try {
+    await queued.promise;
+    release.resolve();
+    await cleanup;
+    await preparation;
+    expect(
+      await handler.persistContinuousCompaction({
+        boundaryMessageId: "b-boundary",
+        messages: [read],
+        text: "B summary",
+        model: options.model,
+        tail: [],
+        systemMessageTokens: 0,
+        attachmentTokens: 0,
+        shouldPersist: () => true,
+        publication,
+      })
+    ).toBe(true);
+    expect(await handler.peekPendingState()).toHaveProperty("readFiles", ["/b.ts"]);
+    expect(handler as unknown as { pendingStateBoundaryMessageId: string }).toHaveProperty(
+      "pendingStateBoundaryMessageId",
+      "b-boundary"
+    );
+  } finally {
+    release.resolve();
+    await cleanup;
+    await preparation;
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+test("held pending-state load cannot overwrite a newer preparation", async () => {
+  const h = await setup();
+  const handler = h.internals.compactionHandler;
+  await h.historyService.appendToHistory(
+    workspaceId,
+    createMuxMessage("prior", "assistant", "Prior context", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    })
+  );
+  const pendingPath = `${h.config.sessionsDir}/${workspaceId}/post-compaction.json`;
+  await writeFile(
+    pendingPath,
+    JSON.stringify({
+      version: 1,
+      createdAt: 1,
+      diffs: [],
+      loadedSkills: [],
+      readFiles: ["/old.ts"],
+      boundaryMessageId: "prior",
+    })
+  );
+  const publication = {
+    generation: await h.historyService
+      .getContinuousCompactionJournal(workspaceId)
+      .captureGeneration(),
+  };
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const readHistory = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);
+  spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(
+    async (...args) => {
+      const history = await readHistory(...args);
+      entered.resolve();
+      await release.promise;
+      return history;
+    }
+  );
+  const oldPreparation = handler.preparePendingStateFromMessages(
+    [],
+    "a-boundary",
+    undefined,
+    publication
+  );
+  try {
+    await entered.promise;
+    const read = createMuxMessage("b-read", "assistant", "");
+    read.parts = [
+      {
+        type: "dynamic-tool",
+        toolCallId: "b-read-call",
+        toolName: "file_read",
+        state: "output-available",
+        input: { path: "/b.ts" },
+        output: { success: true },
+      },
+    ];
+    const successor = await handler.preparePendingStateFromMessages(
+      [read],
+      "b-boundary",
+      undefined,
+      publication
+    );
+    const serialized = successor.write?.serialized;
+    if (serialized === undefined) throw new Error("Expected successor pending write");
+    release.resolve();
+    expect((await oldPreparation).write).toBeUndefined();
+    expect(await fs.readFile(pendingPath, "utf8")).toBe(serialized);
+    expect(
+      await handler.persistContinuousCompaction({
+        boundaryMessageId: "b-boundary",
+        messages: [read],
+        text: "B summary",
+        model: options.model,
+        tail: [],
+        systemMessageTokens: 0,
+        attachmentTokens: 0,
+        shouldPersist: () => true,
+        publication,
+      })
+    ).toBe(true);
+    expect(await handler.peekPendingState()).toHaveProperty("readFiles", ["/b.ts"]);
+    expect(handler as unknown as { pendingStateBoundaryMessageId: string }).toHaveProperty(
+      "pendingStateBoundaryMessageId",
+      "b-boundary"
+    );
+  } finally {
+    release.resolve();
+    await oldPreparation;
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});

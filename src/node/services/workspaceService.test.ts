@@ -7388,13 +7388,18 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       ["absent", "unresolved", "narrowed", "manual before publication", "newer Stop during clear"]
         .map((initial) => ({ producer, initial, operation: "full clear" }))
         .concat(
-          ["reset", "destructive replacement", "active prefix trim", "sealed prefix trim"].map(
-            (operation) => ({
-              producer,
-              initial: "absent",
-              operation,
-            })
-          )
+          [
+            "reset",
+            "destructive replacement",
+            "active prefix trim",
+            "sealed prefix trim",
+            "active edit",
+            "archived edit",
+          ].map((operation) => ({
+            producer,
+            initial: "absent",
+            operation,
+          }))
         )
     )
   )(
@@ -7411,7 +7416,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         runtimeConfig: { type: "local" },
       });
       const followUp = { text: "Continue discarded work", ...options };
-      if (operation === "sealed prefix trim") {
+      if (operation === "sealed prefix trim" || operation === "archived edit") {
         await historyService.appendToHistory(
           workspaceId,
           createMuxMessage("sealed", "user", "Sealed context")
@@ -7491,21 +7496,37 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
           }
         }
         const mutation =
-          operation === "reset"
-            ? await workspaceService.resetContext(workspaceId)
-            : operation === "destructive replacement"
-              ? await workspaceService.replaceHistory(
+          operation === "active edit" || operation === "archived edit"
+            ? await (async () => {
+                const editor = await createAgentSessionHarness({
                   workspaceId,
-                  createMuxMessage("replacement", "assistant", "Fresh context")
-                )
-              : await workspaceService.truncateHistory(
-                  workspaceId,
-                  operation === "active prefix trim"
-                    ? 0.25
-                    : operation === "sealed prefix trim"
-                      ? 0.01
-                      : undefined
-                );
+                  config,
+                  historyService: new HistoryService(config),
+                });
+                try {
+                  return await editor.session.sendMessage("Edited context", {
+                    ...options,
+                    editMessageId: operation === "active edit" ? "old-request" : "sealed",
+                  });
+                } finally {
+                  await editor.session.dispose();
+                }
+              })()
+            : operation === "reset"
+              ? await workspaceService.resetContext(workspaceId)
+              : operation === "destructive replacement"
+                ? await workspaceService.replaceHistory(
+                    workspaceId,
+                    createMuxMessage("replacement", "assistant", "Fresh context")
+                  )
+                : await workspaceService.truncateHistory(
+                    workspaceId,
+                    operation === "active prefix trim"
+                      ? 0.25
+                      : operation === "sealed prefix trim"
+                        ? 0.01
+                        : undefined
+                  );
         expect(mutation.success).toBe(true);
         if (operation === "active prefix trim") {
           const trimmed = await historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -7541,7 +7562,12 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
           published.success &&
             published.data.some((row) => row.metadata?.muxMetadata?.type === "compaction-summary")
         ).toBe(operation === "sealed prefix trim");
-        if (operation === "sealed prefix trim") return;
+        if (
+          operation === "sealed prefix trim" ||
+          operation === "active edit" ||
+          operation === "archived edit"
+        )
+          return;
         fresh = await createAgentSessionHarness({
           workspaceId,
           config,

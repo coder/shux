@@ -4,6 +4,8 @@ import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
 import * as path from "path";
+import { randomUUID } from "node:crypto";
+import writeFileAtomic from "write-file-atomic";
 
 import type { HistoryService } from "./historyService";
 
@@ -92,9 +94,20 @@ interface PersistedPostCompactionStateV1 {
    * model when RLM mode is on. Absent in files written by older builds.
    */
   readFiles: string[];
-  /** Only continuous preparation is provisional until this boundary is durable. */
+  /** Provisional preparation is usable only after this exact boundary is durable. */
   boundaryMessageId?: string;
   previousState?: PersistedPostCompactionStateV1;
+  /** Unique per actual write, so equal attachment contents cannot cause ABA cleanup. */
+  writeId?: string;
+}
+
+interface PendingStateWriteReceipt {
+  serialized: string;
+  previous?: string;
+}
+
+interface PendingStatePreparation {
+  write?: PendingStateWriteReceipt;
 }
 
 interface HeartbeatResetRollbackState {
@@ -427,6 +440,7 @@ export class CompactionHandler {
   /** Rollback snapshot for synthetic heartbeat reset boundaries that get skipped before dispatch. */
   private heartbeatResetRollbackState: HeartbeatResetRollbackState | null = null;
   private pendingStateWrites: Promise<unknown> = Promise.resolve();
+  private pendingStatePreparation?: PendingStatePreparation;
 
   private enqueuePendingStateWrite(
     write: () => Promise<void>,
@@ -470,6 +484,7 @@ export class CompactionHandler {
       return;
     }
 
+    const preparation = this.pendingStatePreparation;
     this.persistedPendingStateLoaded = true;
 
     let raw: string;
@@ -484,21 +499,21 @@ export class CompactionHandler {
       parsed = JSON.parse(raw);
     } catch {
       log.warn("Invalid post-compaction state JSON; ignoring", { workspaceId: this.workspaceId });
-      await this.deletePersistedPendingStateBestEffort(publication);
+      await this.deletePersistedPendingStateBestEffort(publication, raw);
       return;
     }
 
     let state = coercePersistedPostCompactionState(parsed);
     if (!state) {
       log.warn("Invalid post-compaction state schema; ignoring", { workspaceId: this.workspaceId });
-      await this.deletePersistedPendingStateBestEffort(publication);
+      await this.deletePersistedPendingStateBestEffort(publication, raw);
       return;
     }
 
     if (state.boundaryMessageId) {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) {
-        this.persistedPendingStateLoaded = false;
+        if (this.pendingStatePreparation === preparation) this.persistedPendingStateLoaded = false;
         return;
       }
       const boundaryId = history.data.findLast(isDurableContextBoundaryMarker)?.id;
@@ -507,11 +522,12 @@ export class CompactionHandler {
         // nor lose an older, still-pending attachment snapshot.
         state = state.previousState ?? null;
         if (!state || (state.boundaryMessageId && state.boundaryMessageId !== boundaryId)) {
-          await this.deletePersistedPendingStateBestEffort(publication);
+          await this.deletePersistedPendingStateBestEffort(publication, raw);
           return;
         }
       }
     }
+    if (this.pendingStatePreparation !== preparation) return;
     this.pendingStateBoundaryMessageId = state.boundaryMessageId;
     this.cachedFileDiffs = state.diffs;
     this.cachedLoadedSkills = state.loadedSkills;
@@ -625,9 +641,26 @@ export class CompactionHandler {
   }
 
   private async deletePersistedPendingStateBestEffort(
-    publication?: ContinuousCompactionPublication
+    publication?: ContinuousCompactionPublication,
+    expectedBytes?: string
   ): Promise<void> {
     try {
+      if (expectedBytes !== undefined) {
+        await this.enqueuePendingStateWrite(() =>
+          this.historyService.withCompactionPublicationLock(
+            this.workspaceId,
+            publication,
+            async () => {
+              if (
+                (await fsPromises.readFile(this.postCompactionStatePath, "utf8")) === expectedBytes
+              ) {
+                await fsPromises.unlink(this.postCompactionStatePath);
+              }
+            }
+          )
+        );
+        return;
+      }
       await this.enqueuePendingStateWrite(
         () => fsPromises.unlink(this.postCompactionStatePath),
         publication
@@ -651,7 +684,8 @@ export class CompactionHandler {
 
   private restoreHeartbeatResetRollbackState(
     publication?: ContinuousCompactionPublication,
-    rollbackState = this.heartbeatResetRollbackState
+    rollbackState = this.heartbeatResetRollbackState,
+    persist = true
   ): Promise<void> {
     if (!rollbackState || rollbackState !== this.heartbeatResetRollbackState) {
       return Promise.resolve();
@@ -667,6 +701,8 @@ export class CompactionHandler {
     this.cachedReadFilePaths = [...rollbackState.cachedReadFilePaths];
     this.persistedPendingStateLoaded = rollbackState.persistedPendingStateLoaded;
 
+    if (!persist) return Promise.resolve();
+
     if (rollbackState.postCompactionAttachmentsPending) {
       return this.persistPendingStateBestEffort(
         this.cachedFileDiffs,
@@ -675,7 +711,7 @@ export class CompactionHandler {
         undefined,
         undefined,
         publication
-      );
+      ).then(() => undefined);
     } else {
       return this.deletePersistedPendingStateBestEffort(publication);
     }
@@ -688,7 +724,8 @@ export class CompactionHandler {
     boundaryMessageId?: string,
     previousState?: PersistedPostCompactionStateV1,
     publication?: ContinuousCompactionPublication
-  ): Promise<void> {
+  ): Promise<PendingStateWriteReceipt | undefined> {
+    let receipt: PendingStateWriteReceipt | undefined;
     try {
       for (const snapshot of loadedSkills) {
         assert(snapshot.name.trim().length > 0, "loaded skill snapshot name must not be empty");
@@ -705,13 +742,75 @@ export class CompactionHandler {
 
       // Freeze the admitted snapshot, then order writes AND unlinks. A held rollback
       // must not erase a newer compaction's pending state after that compaction completes.
-      const serialized = JSON.stringify(persisted);
+      const serialized = JSON.stringify({ ...persisted, writeId: randomUUID() });
       await this.enqueuePendingStateWrite(async () => {
         await fsPromises.mkdir(this.sessionDir, { recursive: true });
-        await fsPromises.writeFile(this.postCompactionStatePath, serialized);
+        const previous = await fsPromises
+          .readFile(this.postCompactionStatePath, "utf8")
+          .catch((error: unknown) => {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+            throw error;
+          });
+        receipt = { serialized, previous };
+        await writeFileAtomic(this.postCompactionStatePath, serialized);
       }, publication);
     } catch (error) {
       log.warn("Failed to persist post-compaction state", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    return receipt;
+  }
+
+  private async cleanupProvisionalPendingState(
+    preparation: PendingStatePreparation | undefined,
+    publication: ContinuousCompactionPublication | undefined,
+    rollbackState?: HeartbeatResetRollbackState
+  ): Promise<void> {
+    if (!preparation) return;
+    const receipt = preparation.write;
+    try {
+      await this.enqueuePendingStateWrite(() =>
+        this.historyService.withCompactionPublicationLock(
+          this.workspaceId,
+          publication,
+          async (current) => {
+            const exactWrite =
+              receipt !== undefined &&
+              (await fsPromises.readFile(this.postCompactionStatePath, "utf8").then(
+                (raw) => raw === receipt.serialized,
+                () => false
+              ));
+            if (this.pendingStatePreparation === preparation) {
+              this.pendingStatePreparation = undefined;
+              if ((!receipt || exactWrite) && current && rollbackState) {
+                // This variant restores memory only; no nested pending/history lock.
+                await this.restoreHeartbeatResetRollbackState(publication, rollbackState, false);
+              } else {
+                this.postCompactionAttachmentsPending = false;
+                this.cachedFileDiffs = [];
+                this.cachedLoadedSkills = [];
+                this.cachedReadFilePaths = [];
+                this.pendingStateBoundaryMessageId = undefined;
+                this.persistedPendingStateLoaded = false;
+                if (this.heartbeatResetRollbackState === rollbackState)
+                  this.heartbeatResetRollbackState = null;
+              }
+            }
+            if (!receipt || !exactWrite) return;
+            // Cleanup owns the exact write even after Stop. Only a still-current
+            // epoch may restore prior context; reset/edit must never resurrect it.
+            if (current && receipt.previous !== undefined) {
+              await writeFileAtomic(this.postCompactionStatePath, receipt.previous);
+            } else {
+              await fsPromises.unlink(this.postCompactionStatePath);
+            }
+          }
+        )
+      );
+    } catch (error) {
+      log.warn("Failed to clean provisional post-compaction state", {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),
       });
@@ -723,8 +822,13 @@ export class CompactionHandler {
     boundaryMessageId?: string,
     previousState?: PersistedPostCompactionStateV1,
     publication?: ContinuousCompactionPublication
-  ): Promise<void> {
+  ): Promise<PendingStatePreparation> {
+    // Memory ownership starts before the queued write: B may prepare while A's
+    // exact-file cleanup still holds the lock that B's write is waiting for.
+    const preparation: PendingStatePreparation = {};
+    this.pendingStatePreparation = preparation;
     await this.loadPersistedPendingStateIfNeeded(publication);
+    if (this.pendingStatePreparation !== preparation) return preparation;
     this.pendingStateBoundaryMessageId = boundaryMessageId;
 
     const latestCompactionEpochMessages = sliceMessagesFromLatestCompactionBoundary(messages);
@@ -746,7 +850,7 @@ export class CompactionHandler {
 
     // Persist pending state before append so pre-boundary diffs survive crashes/restarts.
     // Best-effort: boundary creation must not fail just because persistence fails.
-    await this.persistPendingStateBestEffort(
+    preparation.write = await this.persistPendingStateBestEffort(
       this.cachedFileDiffs,
       this.cachedLoadedSkills,
       this.cachedReadFilePaths,
@@ -754,6 +858,7 @@ export class CompactionHandler {
       previousState,
       publication
     );
+    return preparation;
   }
 
   async withContinuousPendingState(
@@ -863,7 +968,13 @@ export class CompactionHandler {
     const messages = historyResult.data;
     await this.loadPersistedPendingStateIfNeeded(publication);
     const rollbackState = this.captureHeartbeatResetRollbackState(messages);
-    await this.preparePendingStateFromMessages(messages, undefined, undefined, publication);
+    const summaryMessageId = createCompactionSummaryMessageId();
+    const pendingStateReceipt = await this.preparePendingStateFromMessages(
+      messages,
+      summaryMessageId,
+      undefined,
+      publication
+    );
 
     const nextCompactionEpoch = getNextCompactionEpoch(messages);
     assert(
@@ -871,23 +982,18 @@ export class CompactionHandler {
       "heartbeat reset boundary must compute a positive compaction epoch"
     );
 
-    const summaryMessage = createMuxMessage(
-      createCompactionSummaryMessageId(),
-      "assistant",
-      params.boundaryText,
-      {
-        timestamp: Date.now(),
-        synthetic: true,
-        uiVisible: true,
-        compacted: "heartbeat",
-        compactionEpoch: nextCompactionEpoch,
-        compactionBoundary: true,
-        muxMetadata: {
-          type: "compaction-summary",
-          pendingFollowUp: params.pendingFollowUp,
-        },
-      }
-    );
+    const summaryMessage = createMuxMessage(summaryMessageId, "assistant", params.boundaryText, {
+      timestamp: Date.now(),
+      synthetic: true,
+      uiVisible: true,
+      compacted: "heartbeat",
+      compactionEpoch: nextCompactionEpoch,
+      compactionBoundary: true,
+      muxMetadata: {
+        type: "compaction-summary",
+        pendingFollowUp: params.pendingFollowUp,
+      },
+    });
 
     assert(
       summaryMessage.metadata?.compacted === "heartbeat",
@@ -916,9 +1022,9 @@ export class CompactionHandler {
         },
       }
     );
-    if (skipped) return Err("Heartbeat publication was invalidated");
-    if (!persistenceResult.success) {
-      await this.restoreHeartbeatResetRollbackState(publication, rollbackState);
+    if (skipped || !persistenceResult.success) {
+      await this.cleanupProvisionalPendingState(pendingStateReceipt, publication, rollbackState);
+      if (skipped || persistenceResult.success) return Err("Heartbeat publication was invalidated");
       return Err(`Failed to append heartbeat reset boundary: ${persistenceResult.error}`);
     }
 
@@ -1447,8 +1553,6 @@ export class CompactionHandler {
     // does not re-inject stale pre-boundary edits after subsequent compactions.
     // If boundary markers are malformed, slicing self-heals by falling back to
     // full history instead of crashing or dropping all diffs.
-    await this.preparePendingStateFromMessages(messages, undefined, undefined, publication);
-
     const nextCompactionEpoch = getNextCompactionEpoch(messages);
     assert(Number.isInteger(nextCompactionEpoch), "next compaction epoch must be an integer");
 
@@ -1524,6 +1628,12 @@ export class CompactionHandler {
         muxMetadata: summaryMuxMetadata,
       }
     );
+    const pendingStateReceipt = await this.preparePendingStateFromMessages(
+      messages,
+      summaryMessage.id,
+      undefined,
+      publication
+    );
     if (persistedSummaryHistorySequence !== undefined) {
       summaryMessage.metadata = {
         ...(summaryMessage.metadata ?? {}),
@@ -1591,11 +1701,10 @@ export class CompactionHandler {
                 skipped = true;
               },
             });
-    if (skipped) return Err("Compaction publication was invalidated");
-    if (!persistenceResult.success) {
-      this.cachedFileDiffs = [];
-      this.cachedLoadedSkills = [];
-      await this.deletePersistedPendingStateBestEffort(publication);
+    if (skipped || !persistenceResult.success) {
+      await this.cleanupProvisionalPendingState(pendingStateReceipt, publication);
+      if (skipped || persistenceResult.success)
+        return Err("Compaction publication was invalidated");
       const operation =
         preservedTailCopies.length > 0
           ? "commit boundary with preserved tail"

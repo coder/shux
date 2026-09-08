@@ -424,9 +424,10 @@ describe("ContinuousCompactor", () => {
     const release = deferred();
     const original = handler.preparePendingStateFromMessages.bind(handler);
     spyOn(handler, "preparePendingStateFromMessages").mockImplementation(async (...args) => {
-      await original(...args);
+      const preparation = await original(...args);
       entered.resolve();
       await release.promise;
+      return preparation;
     });
     const applying = compactor.observe(context.thresholdPercent, context);
     await entered.promise;
