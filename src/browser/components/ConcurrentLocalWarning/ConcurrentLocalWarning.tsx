@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useSyncExternalStore } from "react";
+import React, { useRef, useSyncExternalStore } from "react";
 import { AlertTriangle } from "lucide-react";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
@@ -26,60 +26,57 @@ export function useConcurrentLocalStreamingWorkspaceName(
   const { workspaceMetadata } = useWorkspaceContext();
   const store = useWorkspaceStoreRaw();
 
-  const otherLocalWorkspaceIds = useMemo(() => {
-    if (!isLocalProject) {
-      return [];
+  // Sub-agents share their family's checkout intentionally, not as competing local agents.
+  const getRootWorkspaceId = (id: string): string => {
+    const visited = new Set<string>();
+    while (!visited.has(id)) {
+      visited.add(id);
+      const parentId = workspaceMetadata.get(id)?.parentWorkspaceId;
+      if (!parentId) break;
+      id = parentId;
     }
+    return id;
+  };
+  const rootWorkspaceId = getRootWorkspaceId(props.workspaceId);
+  const otherLocalWorkspaces = Array.from(workspaceMetadata.values()).filter(
+    (meta) =>
+      isLocalProject &&
+      meta.projectPath === props.projectPath &&
+      isLocalProjectRuntime(meta.runtimeConfig) &&
+      getRootWorkspaceId(meta.id) !== rootWorkspaceId
+  );
 
-    const result: string[] = [];
-    for (const [id, meta] of workspaceMetadata) {
-      if (id === props.workspaceId) {
-        continue;
-      }
-      if (meta.projectPath !== props.projectPath) {
-        continue;
-      }
-      if (!isLocalProjectRuntime(meta.runtimeConfig)) {
-        continue;
-      }
-      result.push(id);
-    }
-    return result;
-  }, [isLocalProject, props.projectPath, props.workspaceId, workspaceMetadata]);
-
-  const streamingWorkspaceName = useSyncExternalStore(
+  const streamingWorkspaceId = useSyncExternalStore(
     (listener) => {
-      const unsubscribers = otherLocalWorkspaceIds.map((id) => store.subscribeKey(id, listener));
+      const unsubscribers = otherLocalWorkspaces.map((meta) =>
+        store.subscribeKey(meta.id, listener)
+      );
       return () => unsubscribers.forEach((unsubscribe) => unsubscribe());
     },
-    () => {
-      for (const id of otherLocalWorkspaceIds) {
+    () =>
+      otherLocalWorkspaces.find((meta) => {
         try {
-          const state = store.getWorkspaceSidebarState(id);
-          if (state.canInterrupt) {
-            const meta = workspaceMetadata.get(id);
-            return meta?.name ?? id;
-          }
+          return store.getWorkspaceSidebarState(meta.id).canInterrupt;
         } catch {
           // Workspace may not be registered yet, skip.
+          return false;
         }
-      }
-      return null;
-    },
+      })?.id ?? null,
     () => null
   );
-  const lastStreamingWorkspaceNameRef = useRef(streamingWorkspaceName);
-  if (streamingWorkspaceName !== null) {
-    lastStreamingWorkspaceNameRef.current = streamingWorkspaceName;
+  const lastStreamingIdRef = useRef(streamingWorkspaceId);
+  if (streamingWorkspaceId !== null) {
+    lastStreamingIdRef.current = streamingWorkspaceId;
   }
   const { displayPhase } = useWorkspaceStreamingStatusPhase(
-    streamingWorkspaceName === null ? null : "streaming"
+    streamingWorkspaceId === null ? null : "streaming"
   );
 
-  // Activity snapshots can hand off through a brief idle frame between adjacent stream phases.
-  // Hold the last concrete workspace name for the same transition window used by sidebar status,
-  // so the warning does not blink while the underlying agent is still visibly working elsewhere.
-  return displayPhase === null ? null : lastStreamingWorkspaceNameRef.current;
+  // Hold brief activity handoffs only while the workspace is still a potential conflict.
+  // Resolve the held identity against current candidates rather than retaining a stale name.
+  return displayPhase === null
+    ? null
+    : (otherLocalWorkspaces.find((meta) => meta.id === lastStreamingIdRef.current)?.name ?? null);
 }
 
 interface ConcurrentLocalWarningViewProps {
