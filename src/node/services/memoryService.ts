@@ -46,7 +46,10 @@ import {
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
-import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
+import {
+  resolveWorkspaceMemoryOwnerId,
+  workspaceMemoryOwnerResolver,
+} from "@/node/services/memoryWorkspaceOwner";
 import {
   advanceWorkspaceMemoryRevision,
   readWorkspaceMemoryRevision,
@@ -667,10 +670,11 @@ export class MemoryService extends EventEmitter {
    */
   private invalidateWorkspaceMemoryOwnerMemo(): void {
     if (this.workspaceMemoryOwnerById.size === 0) return;
-    const cfg = this.config.loadConfigOrDefault();
+    // One parse and one ID index for the whole pass (O(n), not O(n²)).
+    const resolve = workspaceMemoryOwnerResolver(this.config.loadConfigOrDefault());
     const changed: string[] = [];
     for (const [workspaceId, previousOwner] of this.workspaceMemoryOwnerById) {
-      const owner = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
+      const owner = resolve(workspaceId);
       this.workspaceMemoryOwnerById.set(workspaceId, owner);
       if (owner !== previousOwner) changed.push(workspaceId);
     }
@@ -1362,7 +1366,10 @@ export class MemoryService extends EventEmitter {
         }
         await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, fileText);
-        // Row is written before the create is acknowledged (mutation → row → ack).
+        // Usage stats land BEFORE the row advances the store clock: a foreign
+        // backend rebuilding its hot set on the new revision must already see
+        // them (see workspaceMemoryRevision.ts). Row before ack.
+        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         await this.journalRefinement(
           ctx,
           store,
@@ -1372,7 +1379,6 @@ export class MemoryService extends EventEmitter {
           toolCallId,
           [{ path: store.physicalPath(parsed.relPath), content: fileText }]
         );
-        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
@@ -1404,7 +1410,8 @@ export class MemoryService extends EventEmitter {
         assertWithinFileSizeCap(updated);
         await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
-        // Row is written before the edit is acknowledged (mutation → row → ack).
+        // Usage stats before the row (store clock); row before ack.
+        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         await this.journalRefinement(
           ctx,
           store,
@@ -1417,7 +1424,6 @@ export class MemoryService extends EventEmitter {
           toolCallId,
           [{ path: store.physicalPath(parsed.relPath), content: updated }]
         );
-        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return { success: true as const, output: `Edited ${toVirtualPath(scope, parsed.relPath)}` };
       });
@@ -1458,7 +1464,8 @@ export class MemoryService extends EventEmitter {
         assertWithinFileSizeCap(updated);
         await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
-        // Row is written before the edit is acknowledged (mutation → row → ack).
+        // Usage stats before the row (store clock); row before ack.
+        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         await this.journalRefinement(
           ctx,
           store,
@@ -1471,7 +1478,6 @@ export class MemoryService extends EventEmitter {
           toolCallId,
           [{ path: store.physicalPath(parsed.relPath), content: updated }]
         );
-        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
@@ -1642,6 +1648,8 @@ export class MemoryService extends EventEmitter {
         const inverse = await this.captureDeleteInverse(store, parsed.relPath, kind);
         await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.remove(parsed.relPath);
+        // Sidecar first, then the row advances the store clock (see create).
+        await this.recordDelete(ctx, scope, parsed.relPath);
         if (inverse !== null) {
           await this.journalRefinement(
             ctx,
@@ -1656,7 +1664,6 @@ export class MemoryService extends EventEmitter {
           // changed, so other backends' cached views must still see it.
           await this.advanceStoreRevision(store);
         }
-        await this.recordDelete(ctx, scope, parsed.relPath);
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
@@ -1709,6 +1716,8 @@ export class MemoryService extends EventEmitter {
         }
         await this.assertMutationCommittable(ctx, store, abortSignal, oldVirtualPath);
         await store.rename(oldParsed.relPath, newParsed.relPath);
+        // Sidecar first, then the row advances the store clock (see create).
+        await this.recordRename(ctx, scope, oldParsed.relPath, newParsed.relPath);
         // Row is written before the rename is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
@@ -1726,7 +1735,6 @@ export class MemoryService extends EventEmitter {
           actor,
           toolCallId
         );
-        await this.recordRename(ctx, scope, oldParsed.relPath, newParsed.relPath);
         this.emitChange(ctx, scope, oldParsed.relPath, actor);
         this.emitChange(ctx, scope, newParsed.relPath, actor);
         return {
@@ -1861,9 +1869,10 @@ export class MemoryService extends EventEmitter {
           }
           await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
           await store.writeFile(parsed.relPath, content);
-          // UI saves are not journaled, so advance the store clock here (in-lock).
-          await this.advanceStoreRevision(store);
           await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
+          // UI saves are not journaled, so advance the store clock here
+          // (in-lock, after the sidecar so foreign rebuilds see the stats).
+          await this.advanceStoreRevision(store);
           this.emitChange(ctx, scope, parsed.relPath, actor);
           return { success: true as const, data: { sha256: sha256Hex(content) } };
         }

@@ -9320,6 +9320,23 @@ describe("WorkspaceService initialize", () => {
       expect(persisted()).toBe(false);
       expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
       expect(persisted()).toBe(false);
+
+      // New epoch (field cleared at the boundary), then ANOTHER backend records
+      // a read-only turn straight into config: this backend's next grant must
+      // not publish false→true.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritable;
+        return cfg;
+      });
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(persisted()).toBe(true);
+      await realConfig.editConfig((cfg) => {
+        findWorkspaceEntry(cfg, "policy-scratch")!.workspace.workspaceMemoryWritable = false;
+        return cfg;
+      });
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(persisted()).toBe(false);
     } finally {
       await cleanup();
     }

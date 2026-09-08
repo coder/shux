@@ -1072,6 +1072,11 @@ export class AgentSession {
     this.workspaceMemoryWritable = effective;
   }
 
+  /** The mirror, for WorkspaceService's conjunction (undefined until a turn recorded). */
+  workspaceMemoryWritableMirror(): boolean | undefined {
+    return this.workspaceMemoryWritable;
+  }
+
   /**
    * Start a fresh policy epoch: the in-memory mirror and the durable
    * accumulator both forget the previous epoch's turns. Durable-or-throw like
@@ -1080,13 +1085,24 @@ export class AgentSession {
    * grant is never left behind by this path — grants are re-recorded per
    * turn). Nothing to do when the field is already absent.
    */
-  private async resetWorkspaceMemoryWritable(): Promise<void> {
+  private async resetWorkspaceMemoryWritable(options?: {
+    closing: boolean | undefined;
+  }): Promise<void> {
     this.workspaceMemoryWritable = undefined;
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
     if (entry?.workspace.workspaceMemoryWritable === undefined) return;
     await this.config.editConfig((cfg) => {
       const current = findWorkspaceEntry(cfg, this.workspaceId);
-      if (current !== null) delete current.workspace.workspaceMemoryWritable;
+      if (current === null) return cfg;
+      // Fenced to the epoch being closed: another backend may already have
+      // recorded the first turn of the NEW epoch between the completion and
+      // this locked write; a value different from the one this session
+      // observed at the boundary is that newer epoch's and must survive
+      // (a same-valued newer deny survives through that backend's mirror).
+      if (options !== undefined && current.workspace.workspaceMemoryWritable !== options.closing) {
+        return cfg;
+      }
+      delete current.workspace.workspaceMemoryWritable;
       return cfg;
     });
   }
@@ -1267,12 +1283,14 @@ export class AgentSession {
         // policy anyway, so a failed reset can only delay a grant, never
         // widen one).
         if ((metadata.preservedTailMessageCount ?? 0) === 0) {
-          this.resetWorkspaceMemoryWritable().catch((error: unknown) => {
-            log.warn("Failed to reset the workspace memory policy epoch", {
-              workspaceId: this.workspaceId,
-              error,
-            });
-          });
+          this.resetWorkspaceMemoryWritable({ closing: this.workspaceMemoryWritable }).catch(
+            (error: unknown) => {
+              log.warn("Failed to reset the workspace memory policy epoch", {
+                workspaceId: this.workspaceId,
+                error,
+              });
+            }
+          );
         }
       },
       onIdleCompactionOutcome,

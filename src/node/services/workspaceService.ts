@@ -4220,25 +4220,45 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * new value could not be confirmed durable.
    */
   async recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): Promise<boolean> {
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    const session =
+      this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId);
+    const mirror = session?.workspaceMemoryWritableMirror();
+    const before = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    // Unregistered workspace: nothing durable to update and no stale
+    // permission to invalidate (harvests fail closed on the missing value).
+    if (before === null) {
+      session?.recordWorkspaceMemoryWritable((mirror ?? true) && writable);
+      return true;
+    }
     // The persisted bit is the epoch accumulator, fail-closed: the harvest
     // reads every message of the compaction epoch, so one read-only turn
     // denies the whole epoch even if writable turns follow. Durable so it
     // survives a restart mid-epoch AND so backends sharing one chat.jsonl
     // (multi-instance) contribute to the same conjunction; it restarts at
-    // context boundaries (AgentSession.resetWorkspaceMemoryWritable).
-    const effective = (entry?.workspace.workspaceMemoryWritable ?? true) && writable;
-    (
-      this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
-    )?.recordWorkspaceMemoryWritable(effective);
-    // Unregistered workspace: nothing durable to update and no stale
-    // permission to invalidate (harvests fail closed on the missing value).
-    if (entry === null) return true;
-    if (entry.workspace.workspaceMemoryWritable === effective) return true;
+    // context boundaries (AgentSession.resetWorkspaceMemoryWritable). The
+    // conjunction is computed INSIDE the config transaction (registration
+    // lock, cross-process) from the value current at write time — two
+    // backends reading an absent bit concurrently could otherwise publish
+    // false→true. The session additionally contributes its own mirror: a
+    // deny it observed survives even if another backend's boundary reset
+    // removed the durable field underneath it.
+    const conjunction = (durable: boolean | undefined): boolean =>
+      (durable ?? true) && (mirror ?? true) && writable;
+    // Fast path (no write): the outcome cannot differ from the stored value —
+    // it is already false, or already true and this turn grants.
+    const stored = before.workspace.workspaceMemoryWritable;
+    if (stored === false || (stored === true && conjunction(stored))) {
+      session?.recordWorkspaceMemoryWritable(stored);
+      return true;
+    }
+    let effective = conjunction(stored);
     try {
       await this.config.editConfig((cfg) => {
         const current = findWorkspaceEntry(cfg, workspaceId);
-        if (current !== null) current.workspace.workspaceMemoryWritable = effective;
+        if (current !== null) {
+          effective = conjunction(current.workspace.workspaceMemoryWritable);
+          current.workspace.workspaceMemoryWritable = effective;
+        }
         return cfg;
       });
     } catch (error: unknown) {
@@ -4249,6 +4269,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       });
       return false;
     }
+    session?.recordWorkspaceMemoryWritable(effective);
     const persisted = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
       .workspaceMemoryWritable;
     if (persisted !== effective) {
@@ -4355,14 +4376,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
         // Compaction marks a long session with accumulated learnings: harvest
         // the compacted epoch first, then let Dream sweep/merge the candidates.
-        // The session knows the policy only if it built a normal turn; after a
-        // restart/recovery fall back to the persisted value. Still unknown →
+        // Two observations of the epoch policy — the session's mirror (attached
+        // to the completion) and the durable accumulator (which other backends
+        // sharing this chat.jsonl also write) — and either deny is
+        // authoritative; both unknown (fresh recovery session, field absent) →
         // the harvest fails closed.
         const persistedWritable = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)
           ?.workspace.workspaceMemoryWritable;
+        const observed = [metadata.workspaceMemoryWritable, persistedWritable].filter(
+          (value): value is boolean => value !== undefined
+        );
         this.memoryConsolidationService?.triggerHarvestThenSweepInBackground({
           ...metadata,
-          workspaceMemoryWritable: metadata.workspaceMemoryWritable ?? persistedWritable,
+          ...(observed.length > 0
+            ? { workspaceMemoryWritable: observed.every((value) => value) }
+            : {}),
         });
       },
       onIdleCompactionOutcome: (success) => {
