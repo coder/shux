@@ -83,9 +83,11 @@ compute_codex_sets_from_arrays() {
   # JSON goes through stdin, never argv: a long review history exceeds Linux's
   # per-argument limit (MAX_ARG_STRLEN, ~128KB) and made --argjson fail with
   # "Argument list too long". printf is a shell builtin, so it has no such limit.
+  # The bot's live status summary is metadata; its findings are gated by review threads below.
   REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c --arg bot "$BOT_LOGIN_GRAPHQL" '[
     .[]
     | select(.author.login == $bot and .isMinimized == false and (.body | test("Didn.t find any major issues|usage limits have been reached|create a Codex account") | not))
+    | select(.body | startswith("<!-- codex-pull-request-review-summary -->") | not)
   ]')
 
   UNRESOLVED_THREADS=$(printf '%s' "$threads_json" | jq -c --arg bot "$BOT_LOGIN_GRAPHQL" '[

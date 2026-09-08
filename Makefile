@@ -470,6 +470,8 @@ test-e2e-perf: ## Run automated performance profiling scenarios
 	@XUM_E2E_RUN_PERF=1 XUM_PROFILE_REACT=1 XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron tests/e2e/scenarios/perf*.spec.ts $(PLAYWRIGHT_ARGS)
 
 ## Distribution
+MAC_FORCE_CODE_SIGNING ?= false
+
 dist: build ## Build distributable packages
 	@bun x electron-builder --publish never
 
@@ -494,13 +496,14 @@ ensure-mac-sharp-runtime-deps: node_modules/.installed
 
 dist-mac: build ## Build macOS distributables (x64 + arm64)
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
-	@if [ -n "$$CSC_LINK" ]; then \
+	@# Local builds may omit signing credentials; keep the check safe under bash -u.
+	@if [ -n "$${CSC_LINK:-}" ]; then \
 		echo "🔐 Code signing enabled - using unified build for correct yml..."; \
-		bun x electron-builder --mac --x64 --arm64 --publish never; \
+		bun x electron-builder --mac --x64 --arm64 --publish never --config.forceCodeSigning=$(MAC_FORCE_CODE_SIGNING); \
 	else \
 		echo "Building macOS architectures in parallel..."; \
-		bun x electron-builder --mac --x64 --publish never & pid1=$$! ; \
-		bun x electron-builder --mac --arm64 --publish never & pid2=$$! ; \
+		bun x electron-builder --mac --x64 --publish never --config.forceCodeSigning=$(MAC_FORCE_CODE_SIGNING) & pid1=$$! ; \
+		bun x electron-builder --mac --arm64 --publish never --config.forceCodeSigning=$(MAC_FORCE_CODE_SIGNING) & pid2=$$! ; \
 		wait $$pid1 && wait $$pid2; \
 	fi
 	@echo "✅ Both architectures built successfully"

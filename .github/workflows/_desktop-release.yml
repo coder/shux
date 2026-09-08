@@ -59,6 +59,9 @@ jobs:
       - name: Package for macOS
         # Retry for transient Apple timestamp-server failures during code signing.
         run: ./scripts/retry.sh 3 30 make dist-mac
+        env:
+          # Local/PR builds may be unsigned, but official releases must fail without signing.
+          MAC_FORCE_CODE_SIGNING: "true"
 
       - name: Create legacy mux artifact aliases
         run: ./scripts/create-legacy-mux-artifact-aliases.sh
