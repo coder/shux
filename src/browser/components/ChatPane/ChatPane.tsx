@@ -1689,18 +1689,23 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       </span>
                     </button>
                   )}
-                  {/* Read-only transcripts need replay feedback without an editable composer. */}
-                  {isHydratingTranscript && !shouldMountStreamingBarrier && (
-                    <ChatDockSurface>
-                      <div
-                        role={showTranscriptHydrationPlaceholder ? undefined : "status"}
-                        data-testid="transcript-loading-status"
-                        className="text-muted flex items-center gap-2 px-3 py-1 text-xs"
-                      >
-                        <Loader2 aria-hidden="true" className="size-3 shrink-0 animate-spin" />
-                        <span>Loading messages...</span>
-                      </div>
-                    </ChatDockSurface>
+                  {/* Replay feedback must not resize the in-flow dock: even a brief
+                      catch-up would otherwise shift cached transcript rows on workspace switches.
+                      Keep it above the dock for both editable and read-only transcripts,
+                      yielding to Jump to bottom while scrolled up so they cannot overlap on phones. */}
+                  {isHydratingTranscript && !shouldMountStreamingBarrier && autoScroll && (
+                    <div className="pointer-events-none absolute inset-x-0 bottom-full">
+                      <ChatDockSurface>
+                        <div
+                          role={showTranscriptHydrationPlaceholder ? undefined : "status"}
+                          data-testid="transcript-loading-status"
+                          className="text-muted bg-surface-primary flex w-fit items-center gap-2 rounded px-3 py-1 text-xs"
+                        >
+                          <Loader2 aria-hidden="true" className="size-3 shrink-0 animate-spin" />
+                          <span>Loading messages...</span>
+                        </div>
+                      </ChatDockSurface>
+                    </div>
                   )}
                   {transcriptOnly ? (
                     // Transcript-only workspaces keep their historical transcript, but the whole
