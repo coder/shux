@@ -1125,6 +1125,21 @@ describe("HistoryService", () => {
         mutate: () => service.truncateAfterMessage(ws, "old", { keepTargetMessage: true }),
         expected: ["old"],
       },
+      ...[
+        { name: "reset", message: reset() },
+        { name: "rollover", message: reset(true) },
+        { name: "empty compaction", message: { ...boundary(), parts: [] } },
+      ].flatMap(({ name, message }) =>
+        ["active", "archived"].map((target) => ({
+          name: `${target} edit removing only ${name} boundary`,
+          rows: [row("old"), message],
+          mutate: () =>
+            target === "active"
+              ? service.truncateAfterMessage(ws, message.id)
+              : service.truncateAfterMessage(ws, "old", { keepTargetMessage: true }),
+          expected: ["old"],
+        }))
+      ),
       {
         name: "context-budget rejection",
         rows: [
@@ -1321,6 +1336,27 @@ describe("HistoryService", () => {
         expected: ["old"],
         success: true,
       },
+      ...[reset(), { ...boundary(), parts: [] }].map((message) => ({
+        name: `retained ${message.id} boundary`,
+        rows: [row("old"), message],
+        mutate: () => service.truncateAfterMessage(ws, message.id, { keepTargetMessage: true }),
+        expected: ["old", message.id],
+        success: true,
+      })),
+      {
+        name: "invalid empty compaction marker",
+        rows: [
+          row("old"),
+          createMuxMessage("invalid", "assistant", "", {
+            compactionBoundary: true,
+            compacted: "user",
+            compactionEpoch: 0,
+          }),
+        ],
+        mutate: () => service.truncateAfterMessage(ws, "invalid"),
+        expected: ["old"],
+        success: true,
+      },
       {
         name: "display edit",
         rows: [row("old"), display()],
@@ -1407,6 +1443,43 @@ describe("HistoryService", () => {
       expect(active.data.map((message) => message.id)).toEqual([receipt.boundary.id]);
       expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
     });
+
+    it.each(["active", "archived"])(
+      "%s display-only edit retains raw reset evidence and publication",
+      async (target) => {
+        assert((await service.appendManyToHistory(ws, [row("old"), display()])).success);
+        assert((await service.getHistoryFromLatestBoundary(ws)).success);
+        const chatPath = path.join(config.sessionsDir, ws, "chat.jsonl");
+        const archivePath = path.join(config.sessionsDir, ws, "chat-archive.jsonl");
+        const [oldLine, displayLine] = (await fs.readFile(chatPath, "utf8")).trimEnd().split("\n");
+        const raw = ' {\n"contextBoundaryKind"\n:\n"reset"\n}\n';
+        if (target === "archived") await fs.writeFile(archivePath, oldLine + "\n");
+        await fs.writeFile(
+          chatPath,
+          (target === "active" ? oldLine + "\n" : "") + raw + displayLine + "\n"
+        );
+        const { store, receipt } = await capturePublication();
+        const cut = await service.truncateAfterMessage(
+          ws,
+          target === "active" ? "display" : "old",
+          {
+            keepTargetMessage: target === "archived",
+          }
+        );
+        assert(cut.success);
+        expect(cut.data.removedMessages.map((message) => message.id)).toEqual(["display"]);
+        expect(await fs.readFile(chatPath, "utf8")).toContain(raw);
+        const restarted = new HistoryService(config);
+        const active = await restarted.getHistoryFromLatestBoundary(ws);
+        assert(active.success);
+        expect(active.data).toEqual([]);
+        expect((await collectFullHistory(restarted, ws)).map((message) => message.id)).toEqual([
+          "old",
+        ]);
+        expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+        expect(await store.read()).toEqual(receipt);
+      }
+    );
 
     it.each(
       [

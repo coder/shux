@@ -117,6 +117,15 @@ function hasDurableCompactionBoundary(metadata: MuxMetadata | undefined): boolea
   return isPositiveInteger(metadata.compactionEpoch);
 }
 
+function tailCutChangesProviderContext(removedMessages: MuxMessage[]): boolean {
+  // Even an empty boundary can hide older context. Removing it changes the
+  // provider view; unreadable reset evidence is preserved outside this parsed tail.
+  return (
+    removedMessages.some(isDurableContextBoundaryMarker) ||
+    hasProviderEligibleMessages(filterWorkflowDisplayOnlyMessages(removedMessages))
+  );
+}
+
 function stripContextUsage(message: MuxMessage): MuxMessage {
   if (!message.metadata) {
     return message;
@@ -3349,7 +3358,7 @@ export class HistoryService {
 
           // A real edit must retire captured provider context; missing targets,
           // keep-target-at-tail no-ops and display-only cuts retain publication.
-          if (hasProviderEligibleMessages(filterWorkflowDisplayOnlyMessages(removedMessages))) {
+          if (tailCutChangesProviderContext(removedMessages)) {
             await this.getContinuousCompactionJournal(
               workspaceId
             ).advanceGenerationUnderHistoryLock();
@@ -3434,7 +3443,7 @@ export class HistoryService {
       if (lastArchiveRow && lastArchiveRow.raw.at(-1) !== 10 && activeEpochRows.length > 0) {
         archiveRows.push({ raw: Buffer.from("\n"), message: undefined });
       }
-      if (hasProviderEligibleMessages(filterWorkflowDisplayOnlyMessages(removedMessages))) {
+      if (tailCutChangesProviderContext(removedMessages)) {
         await this.getContinuousCompactionJournal(workspaceId).advanceGenerationUnderHistoryLock();
       }
       await this.rewriteHistoryFilesUnlocked(
