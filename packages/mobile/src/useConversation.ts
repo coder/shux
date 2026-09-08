@@ -138,9 +138,12 @@ export function useConversation(
         else if (event.type === "config" || event.type === "providers") refreshSettings();
       },
       onLost: () => {
+        // Withdraw the snapshots (they may be stale) but raise no error: the stream
+        // heals itself, and "Reconnecting…" already says why sending is paused.
         policyRequest?.abort();
+        settingsRequest?.abort();
         setPolicy(null);
-        settingsUnavailable();
+        setSettings(null);
       },
     }).catch(() => {
       if (controller.signal.aborted) return;

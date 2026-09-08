@@ -576,10 +576,13 @@ test("a failed policy read stays unavailable without hiding settings and a chang
   fail = false;
   await act(async () => view.policySubscriptions[0].events.enqueue());
   await waitFor(() => expect(view.result.current.settings?.policy).toEqual(disabledPolicy));
-  // Losing the shared change stream withdraws every snapshot it guards until it reopens.
+  // Losing the shared change stream withdraws every snapshot it guards until it
+  // reopens, without raising an error: the stream heals on its own.
   await act(async () => view.policySubscriptions[0].fail(new Error("subscription lost")));
   await waitFor(() => expect(view.result.current.settings).toBeNull());
-  expect(view.result.current.settingsError).not.toBeNull();
+  expect(view.result.current.settingsError).toBeNull();
+  act(() => wakeStreams());
+  await waitFor(() => expect(view.result.current.settings?.policy).toEqual(disabledPolicy));
 });
 
 test("a late policy response cannot update an aborted connection lifetime", async () => {
@@ -766,7 +769,7 @@ test.each(["config", "providers", "agents"] as const)(
     expect(view.result.current.settingsError).toBeNull();
     await act(async () => subscription.fail(new Error("disconnected")));
     await waitFor(() => expect(view.result.current.settings).toBeNull());
-    expect(view.result.current.settingsError).not.toBeNull();
+    expect(view.result.current.settingsError).toBeNull();
     expect(view.result.current.error).toBeNull();
   }
 );
