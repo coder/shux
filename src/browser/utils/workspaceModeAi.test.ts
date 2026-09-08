@@ -40,7 +40,7 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("uses workspace-by-agent fallback when explicitly enabled", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",
-      agentAiDefaults: {},
+      agentAiDefaults: { exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "high" } },
       workspaceByAgent: {
         exec: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
       },
@@ -60,7 +60,7 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("ignores workspace-by-agent fallback when disabled", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",
-      agentAiDefaults: {},
+      agentAiDefaults: { exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "high" } },
       workspaceByAgent: {
         exec: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
       },
@@ -369,6 +369,28 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
       resolvedReasoningMode: "standard",
     });
   });
+
+  test.each([undefined, "", "bogus", 42, "openai:gpt-5.2"])(
+    "invalid cached fields use configured defaults (%s)",
+    (model) => {
+      const result = resolveWorkspaceAiSettingsForAgent({
+        agentId: "exec",
+        agentAiDefaults: { exec: { modelString: "openai:gpt-5.2", thinkingLevel: "high" } },
+        workspaceByAgent: {
+          exec: {
+            model: model as string,
+            thinkingLevel: "invalid" as ThinkingLevel,
+          },
+        },
+        useWorkspaceByAgentFallback: true,
+        fallbackModel: "openai:gpt-5.2-mini",
+        existingModel: "anthropic:claude-opus-4-6",
+        existingThinking: "off",
+      });
+      expect(result.resolvedModel).toBe("openai:gpt-5.2");
+      expect(result.resolvedThinking).toBe("high");
+    }
+  );
 
   test("guards non-string persisted model values", () => {
     const result = resolveWorkspaceAiSettingsForAgent({

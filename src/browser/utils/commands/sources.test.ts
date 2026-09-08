@@ -1414,3 +1414,33 @@ test("toggle hide sub-agents command flips the persisted sidebar setting", () =>
     globalThis.document = originalDocument;
   }
 });
+
+test.each(["coder", "mux-gateway", "direct"])(
+  "Pro palette uses the effective %s route instead of stale settings routing",
+  async (route) =>
+    withTestWindow(() => {
+      const model = "coder:prod-openai/gpt-6-astra";
+      const resolveEffectiveRoute = mock((selection: string) => {
+        expect(selection).toBe(model);
+        return route;
+      });
+      const actions = getActions({
+        getEffectiveComposerModel: () => model,
+        providersConfig: {
+          openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          coder: {
+            apiKeySet: false,
+            isEnabled: true,
+            isConfigured: true,
+            discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+          },
+        },
+        getRouteForModel: () => "direct",
+        getEffectiveRouteForModel: resolveEffectiveRoute,
+      });
+      expect(actions.some((action) => action.id === "thinking:toggle-pro-reasoning")).toBe(
+        route !== "mux-gateway"
+      );
+      expect(resolveEffectiveRoute).toHaveBeenCalled();
+    })
+);

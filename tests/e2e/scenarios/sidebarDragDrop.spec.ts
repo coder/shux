@@ -154,7 +154,7 @@ test.describe("sidebar drag and drop", () => {
     // Get workspaceId from context for per-workspace layout key
     const workspaceId = ui.context.workspaceId;
 
-    // Set up a split layout via localStorage (simulating persistence)
+    // Seed Goal so its asynchronous restoration cannot race the tab-count check.
     // Layout key is per-workspace: "right-sidebar:layout:{workspaceId}"
     await page.evaluate(
       ({ wsId }) => {
@@ -171,7 +171,7 @@ test.describe("sidebar drag and drop", () => {
               {
                 type: "tabset",
                 id: "tabset-1",
-                tabs: ["costs", "review"],
+                tabs: ["costs", "review", "goal"],
                 activeTab: "costs",
               },
               {
@@ -201,9 +201,8 @@ test.describe("sidebar drag and drop", () => {
     const tablists = await sidebar.getByRole("tablist").all();
     expect(tablists.length).toBe(2);
 
-    // Verify each tablist has expected tabs. The first tabset receives
-    // default-layout tabs injected by the migration (Stats, Review, Instructions).
-    await expect(tablists[0].getByRole("tab")).toHaveCount(3);
+    // The migration adds Instructions alongside the persisted Stats, Review, and Goal tabs.
+    await expect(tablists[0].getByRole("tab")).toHaveCount(4);
     await expect(tablists[1].getByRole("tab")).toHaveCount(1); // Stats (duplicate costs in split)
   });
 

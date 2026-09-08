@@ -356,13 +356,9 @@ export interface ToolConfiguration {
     /** Returns the frozen same-step capture snapshot for a specific advisor tool call, if available. */
     takeToolCallSnapshot: (toolCallId: string) => AdvisorToolCallSnapshot | undefined;
     /**
-     * Creates a LanguageModel from a model string (delegates to
-     * providerModelFactory). Also returns the wire-resolved identity for
-     * provider option construction, derived from the SAME config snapshot
-     * that created the model: a raw coder:<instance>/<model> string carries
-     * no wire information on its own, so building options from it would emit
-     * the wrong (or no) provider namespace for custom-named or cross-typed
-     * instances.
+     * Creates a model and pins its request identity, route, and config together.
+     * Coder identities retain their actual instance and scoped aliases; option
+     * construction resolves their wire from this snapshot, never live config.
      */
     createModel: (modelString: string) => Promise<{
       model: LanguageModel;
@@ -375,7 +371,7 @@ export interface ToolConfiguration {
        * alias metadata from the raw custom identity.
        */
       optionsProvidersConfig: ProvidersConfigMap | null;
-      /** Pinned wire/route options keep Pro restricted to supported direct Responses requests. */
+      /** Pinned wire/route options keep Pro restricted to supported Responses routes. */
       optionsMuxProviderOptions?: MuxProviderOptions;
       optionsRouteProvider?: ProviderName;
     }>;

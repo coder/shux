@@ -323,6 +323,7 @@ describe("ThinkingContext", () => {
 
   test("setting thinking uses metadata model before global default", async () => {
     const workspaceId = "ws-set-thinking-metadata-model";
+    updatePersistedState(getReasoningModeKey(workspaceId), "pro");
     const updateAgentAISettings = mock<
       (args: WorkspaceUpdateAgentAISettingsArgs) => Promise<WorkspaceUpdateAgentAISettingsResult>
     >(() =>
@@ -357,24 +358,16 @@ describe("ThinkingContext", () => {
       button.click();
     });
 
-    // setThinkingLevel persists the full settings payload including the current
-    // reasoningMode (default "standard") so partial writes cannot clobber it.
     const expectedSettings = {
       model: "metadataModel:abc",
       thinkingLevel: "medium" as const,
-      reasoningMode: "standard" as const,
+      reasoningMode: "pro" as const,
     };
     await waitFor(() => {
       expect(readWorkspaceAISettingsCache(workspaceId).exec).toEqual(expectedSettings);
     }, METADATA_WAIT_OPTIONS);
 
-    if (updateAgentAISettings.mock.calls.length > 0) {
-      expect(updateAgentAISettings).toHaveBeenCalledWith({
-        workspaceId,
-        agentId: "exec",
-        aiSettings: expectedSettings,
-      });
-    }
+    expect(updateAgentAISettings).not.toHaveBeenCalled();
   });
 
   test("setting thinking preserves an explicit Coder gateway model identity", async () => {
@@ -427,6 +420,7 @@ describe("ThinkingContext", () => {
     await waitFor(() => {
       expect(readWorkspaceAISettingsCache(workspaceId).exec).toEqual(expectedSettings);
     }, METADATA_WAIT_OPTIONS);
+    expect(updateAgentAISettings).not.toHaveBeenCalled();
   });
 
   test("self-heals corrupt persisted reasoningMode to standard but keeps valid pro", async () => {
@@ -634,13 +628,7 @@ describe("ThinkingContext", () => {
       expect(readWorkspaceAISettingsCache(workspaceId).exec).toEqual(expectedSettings);
     }, METADATA_WAIT_OPTIONS);
 
-    if (updateAgentAISettings.mock.calls.length > 0) {
-      expect(updateAgentAISettings).toHaveBeenCalledWith({
-        workspaceId,
-        agentId: "exec",
-        aiSettings: expectedSettings,
-      });
-    }
+    expect(updateAgentAISettings).not.toHaveBeenCalled();
   });
 
   test("requests a mid-turn override for the active workspace turn on slider changes", async () => {

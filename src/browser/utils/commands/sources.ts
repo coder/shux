@@ -114,6 +114,7 @@ export interface BuildSourcesParams {
   providersConfig?: ProvidersConfigMap | null;
   /** Settings-resolved route for a canonical model ("direct" = no gateway). */
   getRouteForModel?: (canonicalModel: string) => string;
+  getEffectiveRouteForModel?: (modelString: string) => string;
   /**
    * Explicit per-model minimum thinking override (undefined → built-in default floor).
    * Used to hide off/low from the "Set Thinking Effort" picker, matching the selector.
@@ -1406,8 +1407,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       }
 
       // Pro reasoning mode is only meaningful for models that support it
-      // (GPT-5.6 family) on routes that deliver the native provider option
-      // (direct OpenAI) with the Responses wire format; hide the action
+      // on routes that deliver the native provider option (direct OpenAI or
+      // Coder OpenAI instances) with the Responses wire format; hide the action
       // elsewhere to avoid inert toggles. Gate on the chat input's persisted selection —
       // that is the model the NEXT send will use — and only fall back to the
       // activity snapshot's currentModel (last streamed model, stale after a
@@ -1420,6 +1421,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         openaiProModeAvailable(proGateModelString ?? "", {
           providersConfig: p.providersConfig,
           resolvedRouteProvider: currentModelRoute,
+          effectiveRouteProvider: proGateModelString
+            ? p.getEffectiveRouteForModel?.(proGateModelString)
+            : undefined,
         })
       ) {
         const proActive = p.getReasoningMode(workspaceId) === "pro";

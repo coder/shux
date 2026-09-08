@@ -12,7 +12,10 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { CODEX_ENDPOINT, CODEX_OAUTH_ROUTED_HEADER } from "@/common/constants/codexOAuth";
 import { PROVIDER_REGISTRY } from "@/common/constants/providers";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
-import { resolveProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
+import {
+  buildProviderOptions,
+  resolveProviderOptionsNamespaceKey,
+} from "@/common/utils/ai/providerOptions";
 import { Ok } from "@/common/types/result";
 import {
   ProviderModelFactory,
@@ -2387,6 +2390,215 @@ describe("ProviderModelFactory Coder", () => {
         ),
     } as unknown as CoderOauthService;
   }
+
+  it.each([
+    {
+      available: true,
+      excluded: false,
+      fallback: "mux-gateway",
+      wire: "chatCompletions",
+      alias: true,
+      pro: true,
+    },
+    {
+      available: false,
+      excluded: false,
+      fallback: "mux-gateway",
+      wire: "responses",
+      alias: false,
+      pro: false,
+    },
+    {
+      available: true,
+      excluded: true,
+      fallback: "mux-gateway",
+      wire: "responses",
+      alias: false,
+      pro: false,
+    },
+    {
+      available: false,
+      excluded: false,
+      fallback: "direct",
+      wire: "responses",
+      alias: false,
+      pro: true,
+    },
+    {
+      available: true,
+      excluded: true,
+      fallback: "direct",
+      wire: "responses",
+      alias: false,
+      pro: true,
+    },
+    {
+      available: false,
+      excluded: false,
+      fallback: "direct",
+      wire: "chatCompletions",
+      alias: false,
+      pro: false,
+    },
+  ] as const)("pins request options to the created Coder/fallback route: %j", async (testCase) => {
+    await withTempConfig(async (config, factory, oauth) => {
+      const modelId = testCase.alias ? "team-astra" : "gpt-6-astra";
+      saveCoderConfig(config, {
+        enabled: testCase.available,
+        discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+        ...(testCase.excluded ? { discoveredModels: [] } : {}),
+        models: testCase.alias
+          ? [{ id: "prod-openai/team-astra", mappedToModel: "openai:gpt-6-astra" }]
+          : [],
+      });
+      const store = new ProvidersConfigStore(config.rootDir);
+      store.saveProvidersConfig({
+        ...store.loadProvidersConfig(),
+        openai: { apiKey: "test-key", wireFormat: testCase.wire },
+        "mux-gateway": { couponCode: "test" },
+      });
+      oauth.coderOauthService = stubCoderOauthService();
+      await saveRoutePriority(config, [testCase.fallback], { muxGatewayEnabled: true });
+      const result = await factory.createModelWithPinnedOptions(`coder:prod-openai/${modelId}`, {
+        thinkingLevel: "high",
+        agentInitiated: true,
+        providerOptions: { openai: { wireFormat: "chatCompletions" } },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error(result.error.type);
+      expect(result.data.optionsRouteProvider).toBe(
+        testCase.available && !testCase.excluded
+          ? "coder"
+          : testCase.fallback === "direct"
+            ? "openai"
+            : "mux-gateway"
+      );
+      expect(result.data.metadataModel).toBe("openai:gpt-6-astra");
+      const options = buildProviderOptions(
+        result.data.optionsModelString,
+        "high",
+        undefined,
+        undefined,
+        result.data.optionsMuxProviderOptions,
+        undefined,
+        undefined,
+        result.data.optionsProvidersConfig,
+        result.data.optionsRouteProvider,
+        undefined,
+        "pro"
+      );
+      if (!("openai" in options)) throw new Error("Expected OpenAI request options");
+      expect(options.openai.reasoningMode).toBe(testCase.pro ? "pro" : undefined);
+    });
+  });
+
+  it("pins compatible Coder instances to Chat Completions despite a Responses override", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "compat", type: "openai-compat" }],
+        models: [{ id: "compat/team-astra", mappedToModel: "openai:gpt-6-astra" }],
+      });
+      oauth.coderOauthService = stubCoderOauthService();
+      const result = await factory.createModelWithPinnedOptions("coder:compat/team-astra", {
+        providerOptions: { openai: { wireFormat: "responses" } },
+      });
+      if (!result.success) throw new Error(result.error.type);
+      const options = buildProviderOptions(
+        result.data.optionsModelString,
+        "high",
+        undefined,
+        undefined,
+        result.data.optionsMuxProviderOptions,
+        undefined,
+        undefined,
+        result.data.optionsProvidersConfig,
+        result.data.optionsRouteProvider,
+        undefined,
+        "pro"
+      );
+      if (!("openai" in options)) throw new Error("Expected OpenAI request options");
+      expect(options.openai.reasoningMode).toBeUndefined();
+      expect(options.openai.truncation).toBeUndefined();
+    });
+  });
+
+  it.each(["openai:gpt-6-astra", "coder:prod-openai/team-astra"])(
+    "does not rebuild the receipt from changed route/config state after creating %s",
+    async (modelString) => {
+      await withTempConfig(async (config, factory, oauth) => {
+        saveCoderConfig(config, {
+          discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+          models: [{ id: "prod-openai/team-astra", mappedToModel: "openai:gpt-6-astra" }],
+        });
+        const store = new ProvidersConfigStore(config.rootDir);
+        store.saveProvidersConfig({
+          ...store.loadProvidersConfig(),
+          openai: { apiKey: "test-key" },
+          "mux-gateway": { couponCode: "test" },
+        });
+        await saveRoutePriority(config, ["direct"], { muxGatewayEnabled: true });
+        oauth.coderOauthService = stubCoderOauthService();
+        const resolve = factory.resolveAndCreateModel.bind(factory);
+        spyOn(factory, "resolveAndCreateModel").mockImplementation(async (...args) => {
+          const created = await resolve(...args);
+          store.saveProvidersConfig({
+            openai: { apiKey: "test-key" },
+            "mux-gateway": { couponCode: "test" },
+            coder: {
+              discoveredProviders: [{ name: "prod-openai", type: "anthropic" }],
+              models: [],
+            },
+          });
+          await saveRoutePriority(config, ["mux-gateway"]);
+          return created;
+        });
+        const result = await factory.createModelWithPinnedOptions(modelString, {
+          thinkingLevel: "high",
+        });
+        if (!result.success) throw new Error(result.error.type);
+        expect(result.data.optionsRouteProvider).toBe(
+          modelString.startsWith("coder:") ? "coder" : "openai"
+        );
+        expect(result.data.wireProviderName).toBe("openai");
+        expect(result.data.metadataModel).toBe("openai:gpt-6-astra");
+        const options = buildProviderOptions(
+          result.data.optionsModelString,
+          "high",
+          undefined,
+          undefined,
+          result.data.optionsMuxProviderOptions,
+          undefined,
+          undefined,
+          result.data.optionsProvidersConfig,
+          result.data.optionsRouteProvider,
+          undefined,
+          "pro"
+        );
+        expect(options).toMatchObject({ openai: { reasoningMode: "pro" } });
+      });
+    }
+  );
+
+  it.each([
+    { thinkingLevel: undefined, expected: "grok-4-1-fast" },
+    { thinkingLevel: "off", expected: "grok-4-1-fast-non-reasoning" },
+    { thinkingLevel: "high", expected: "grok-4-1-fast-reasoning" },
+  ] as const)(
+    "preserves unset-thinking variant semantics in pinned receipts: %j",
+    async (testCase) => {
+      await withTempConfig(async (config, factory) => {
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+          xai: { apiKey: "test-key" },
+        });
+        const created = await factory.createModelWithPinnedOptions("xai:grok-4-1-fast", {
+          thinkingLevel: testCase.thinkingLevel,
+        });
+        if (!created.success) throw new Error(created.error.type);
+        expect(created.data.effectiveModelString).toBe(`xai:${testCase.expected}`);
+        expect(created.data.metadataModel).toBe(`xai:${testCase.expected}`);
+      });
+    }
+  );
 
   it("creates Anthropic-origin models against the deployment's AI Bridge", async () => {
     await withTempConfig(async (config, factory, oauth) => {

@@ -124,6 +124,11 @@ function createMockAiService(args: {
         Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
       )
     ),
+    createModelWithPinnedOptions: mock(() =>
+      Promise.resolve(
+        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+      )
+    ),
     getWorkspaceMetadata: mock(() =>
       Promise.resolve(Err("Test AI service has no workspace metadata"))
     ),

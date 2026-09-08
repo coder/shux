@@ -39,6 +39,7 @@ import {
   isGeminiFlashThinkingLevelModelName,
 } from "@/common/utils/thinking/policy";
 import { openaiExplicitPromptCachingAvailable } from "@/common/utils/ai/cacheStrategy";
+import { openaiProModeAvailable } from "./proMode";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
@@ -480,9 +481,16 @@ export function buildProviderOptions(
     const routeIsDirect = routeProvider == null || routeProvider === origin;
     const shouldUseProMode =
       isResponses &&
-      routeIsDirect &&
       reasoningMode === "pro" &&
-      openaiSupportsProMode(capabilityModel);
+      (routeIsDirect
+        ? openaiSupportsProMode(capabilityModel)
+        : routeProvider === "coder" &&
+          // The route-aware gate preserves scoped aliases without treating an
+          // alias's capability identity as the Coder instance's wire type.
+          openaiProModeAvailable(modelString, {
+            providersConfig,
+            resolvedRouteProvider: routeProvider,
+          }));
     const truncationMode = openaiTruncationMode ?? "disabled";
     const shouldSendReasoningSummary = supportsOpenAIReasoningSummary(capModelName);
 
@@ -506,8 +514,8 @@ export function buildProviderOptions(
           // Default to disabled; allow auto truncation for compaction to avoid context errors
           truncation: truncationMode,
           // Pro mode is a native Responses option in @ai-sdk/openai 4.0.11.
-          // Keep the existing direct-route capability gate because mux-gateway
-          // currently drops this provider option and Codex OAuth strips it.
+          // Direct OpenAI and Coder Responses forward it; mux-gateway drops
+          // this provider option and Codex OAuth strips it.
           ...(shouldUseProMode && { reasoningMode: "pro" as const }),
           // Stable prompt cache key to improve OpenAI cache hit rates
           // See: https://sdk.vercel.ai/providers/ai-sdk-providers/openai#responses-models

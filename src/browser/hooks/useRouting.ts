@@ -11,6 +11,8 @@ import {
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { isGatewayModelAccessibleForUi } from "@/browser/utils/policyUi";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 
 import { useProvidersConfig } from "./useProvidersConfig";
 
@@ -42,6 +44,9 @@ export interface RoutingState {
     isAuto: boolean;
     displayName: string;
   };
+
+  /** Actual route for a raw selection, including policy-aware explicit gateway fallback. */
+  resolveEffectiveRoute: (modelString: string) => string;
 
   /** What route would be used if all per-model overrides were cleared? */
   resolveAutoRoute(canonicalModel: string): {
@@ -172,6 +177,32 @@ export function useRouting(): RoutingState {
     [isConfigured, isGatewayModelAccessible, routeOverrides, routePriority]
   );
 
+  const resolveEffectiveRoute = (modelString: string): string => {
+    const [prefix] = modelString.split(":", 1);
+    if (isCustomProviderConfig(providersConfig?.[prefix])) return "direct";
+
+    let routeModel = modelString;
+    if (modelString.startsWith("coder:")) {
+      if (
+        isConfigured("coder") &&
+        isGatewayModelAccessible("coder", modelString.slice("coder:".length))
+      ) {
+        return "coder";
+      }
+      // Mirror the backend's type-derived fallback. Treat-as aliases describe
+      // capabilities only; they must never redirect a request to another provider.
+      routeModel = resolveCoderGatewayMetadataModel(modelString, providersConfig) ?? modelString;
+    }
+    const resolved = resolveRouteForModel(
+      routeModel,
+      routePriority,
+      routeOverrides,
+      isConfigured,
+      isGatewayModelAccessible
+    );
+    return resolved.routeProvider === resolved.origin ? "direct" : resolved.routeProvider;
+  };
+
   // Resolve ignoring per-model overrides — answers "what would Auto pick?"
   const resolveAutoRoute = useCallback(
     (canonicalModel: string) => {
@@ -204,6 +235,7 @@ export function useRouting(): RoutingState {
     routePriority,
     routeOverrides,
     resolveRoute,
+    resolveEffectiveRoute,
     resolveAutoRoute,
     availableRoutes,
     setRoutePreferences,

@@ -1167,7 +1167,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   );
 
-  test.each(["options", "settings"] as const)(
+  test.each(["options", "pricing"] as const)(
     "wake yields when a turn starts during %s admission",
     async (gate) => {
       const h = await createActiveWakeHarness();
@@ -1184,11 +1184,12 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         );
       } else {
         const internal = h.service as unknown as {
-          maybePersistAISettingsFromOptions(): Promise<void>;
+          assertPricedModelForBudgetedGoal(): Promise<Result<void, SendMessageError>>;
         };
-        spyOn(internal, "maybePersistAISettingsFromOptions").mockImplementationOnce(async () => {
+        spyOn(internal, "assertPricedModelForBudgetedGoal").mockImplementationOnce(async () => {
           entered.resolve();
           await release.promise;
+          return Ok(undefined);
         });
       }
       try {
@@ -10514,11 +10515,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     (
       workspaceService as unknown as {
-        maybePersistAISettingsFromOptions: (
-          workspaceId: string,
-          options: unknown,
-          source: "send" | "resume"
-        ) => Promise<void>;
+        maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
       }
     ).maybePersistAISettingsFromOptions = mock(() => Promise.resolve());
   });
@@ -10526,6 +10523,27 @@ describe("WorkspaceService sendMessage status clearing", () => {
   afterEach(async () => {
     await cleanupHistory();
   });
+
+  test.each(["send", "synthetic", "resume"] as const)(
+    "only a user message updates remembered settings (%s)",
+    async (kind) => {
+      const persist = mock(() => Promise.resolve());
+      (
+        workspaceService as unknown as {
+          maybePersistAISettingsFromOptions: typeof persist;
+        }
+      ).maybePersistAISettingsFromOptions = persist;
+      const options = { model: "openai:gpt-5.2", agentId: "plan", thinkingLevel: "high" as const };
+      const result =
+        kind === "resume"
+          ? await workspaceService.resumeStream("test-workspace", options)
+          : await workspaceService.sendMessage("test-workspace", "hello", options, {
+              synthetic: kind === "synthetic",
+            });
+      expect(result.success).toBe(true);
+      expect(persist).toHaveBeenCalledTimes(kind === "send" ? 1 : 0);
+    }
+  );
 
   test("delegates manual pricing rejections to AgentSession so user input is preserved", async () => {
     fakeSession.isBusy.mockReturnValue(false);
@@ -10647,11 +10665,12 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // send is supersedable: the manual send goes direct and the heartbeat's own
     // preflight-count skip refuses it.
     fakeSession.isBusy.mockReturnValue(false);
-    const persistSettings = (
-      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
-    ).maybePersistAISettingsFromOptions;
+    const pricingGate = mock(() => Promise.resolve(Ok(undefined)));
+    workspaceService.setWorkspaceGoalService({
+      assertPricedModelForBudgetedGoal: pricingGate,
+    } as unknown as WorkspaceGoalService);
     const heartbeatPreflight = createDeferred<void>();
-    persistSettings.mockImplementationOnce(() => heartbeatPreflight.promise);
+    pricingGate.mockImplementationOnce(() => heartbeatPreflight.promise.then(() => Ok(undefined)));
     const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
 
     const heartbeatResult = workspaceService.sendMessage(
@@ -10664,7 +10683,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
         requireIdle: true,
       }
     );
-    await waitForCondition(() => persistSettings.mock.calls.length === 1);
+    await waitForCondition(() => pricingGate.mock.calls.length === 1);
 
     const manualSend = createDeferred<Result<void, SendMessageError>>();
     fakeSession.sendMessage.mockImplementationOnce(() => manualSend.promise);
@@ -10691,19 +10710,22 @@ describe("WorkspaceService sendMessage status clearing", () => {
       "test-workspace",
       fakeSession as unknown as AgentSession
     );
-    const persistSettings = (
-      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
-    ).maybePersistAISettingsFromOptions;
+    const pricingGate = mock(() => Promise.resolve(Ok(undefined)));
+    workspaceService.setWorkspaceGoalService({
+      assertPricedModelForBudgetedGoal: pricingGate,
+    } as unknown as WorkspaceGoalService);
     const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
     const maintenancePreflight = createDeferred<void>();
-    persistSettings.mockImplementationOnce(() => maintenancePreflight.promise);
+    pricingGate.mockImplementationOnce(() =>
+      maintenancePreflight.promise.then(() => Ok(undefined))
+    );
     const maintenanceResult = workspaceService.sendMessage(
       "test-workspace",
       "check in",
       sendOptions,
       { synthetic: true, agentInitiated: true, requireIdle: true }
     );
-    await waitForCondition(() => persistSettings.mock.calls.length === 1);
+    await waitForCondition(() => pricingGate.mock.calls.length === 1);
 
     const firstManual = createDeferred<Result<void, SendMessageError>>();
     fakeSession.sendMessage.mockImplementationOnce(() => firstManual.promise);
@@ -10766,11 +10788,12 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // requireIdle. The manual send must not queue behind the heartbeat, and the heartbeat
     // must not start once that input is in preflight; its next slot fires anyway.
     fakeSession.isBusy.mockReturnValue(false);
-    const persistSettings = (
-      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
-    ).maybePersistAISettingsFromOptions;
+    const pricingGate = mock(() => Promise.resolve(Ok(undefined)));
+    workspaceService.setWorkspaceGoalService({
+      assertPricedModelForBudgetedGoal: pricingGate,
+    } as unknown as WorkspaceGoalService);
     const heartbeatPreflight = createDeferred<void>();
-    persistSettings.mockImplementationOnce(() => heartbeatPreflight.promise);
+    pricingGate.mockImplementationOnce(() => heartbeatPreflight.promise.then(() => Ok(undefined)));
     const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
 
     const heartbeatResult = workspaceService.sendMessage(
@@ -10785,7 +10808,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
         yieldToQueuedMessages: true,
       }
     );
-    await waitForCondition(() => persistSettings.mock.calls.length === 1);
+    await waitForCondition(() => pricingGate.mock.calls.length === 1);
 
     const manualSend = createDeferred<Result<void, SendMessageError>>();
     fakeSession.sendMessage.mockImplementationOnce(() => manualSend.promise);
@@ -11696,11 +11719,7 @@ describe("WorkspaceService pending auto-title", () => {
 
     (
       workspaceService as unknown as {
-        maybePersistAISettingsFromOptions: (
-          workspaceId: string,
-          options: unknown,
-          source: "send" | "resume"
-        ) => Promise<void>;
+        maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
       }
     ).maybePersistAISettingsFromOptions = mock(() => Promise.resolve());
   });
@@ -13880,26 +13899,18 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
 
     interface WorkspaceServiceTestAccess {
-      maybePersistAISettingsFromOptions: (
-        workspaceId: string,
-        options: unknown,
-        context: "send" | "resume"
-      ) => Promise<void>;
+      maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
       persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
     }
 
     const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
     svc.persistWorkspaceAISettingsForAgent = persistSpy;
 
-    await svc.maybePersistAISettingsFromOptions(
-      "ws",
-      {
-        agentId: "reviewer",
-        model: "openai:gpt-4o-mini",
-        thinkingLevel: "off",
-      },
-      "send"
-    );
+    await svc.maybePersistAISettingsFromOptions("ws", {
+      agentId: "reviewer",
+      model: "openai:gpt-4o-mini",
+      thinkingLevel: "off",
+    });
 
     expect(persistSpy).toHaveBeenCalledTimes(1);
   });
@@ -13908,26 +13919,18 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
 
     interface WorkspaceServiceTestAccess {
-      maybePersistAISettingsFromOptions: (
-        workspaceId: string,
-        options: unknown,
-        context: "send" | "resume"
-      ) => Promise<void>;
+      maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
       persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
     }
 
     const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
     svc.persistWorkspaceAISettingsForAgent = persistSpy;
 
-    await svc.maybePersistAISettingsFromOptions(
-      "ws",
-      {
-        agentId: "exec",
-        model: "openai:gpt-4o-mini",
-        thinkingLevel: "off",
-      },
-      "send"
-    );
+    await svc.maybePersistAISettingsFromOptions("ws", {
+      agentId: "exec",
+      model: "openai:gpt-4o-mini",
+      thinkingLevel: "off",
+    });
 
     expect(persistSpy).toHaveBeenCalledTimes(1);
   });
@@ -13936,11 +13939,7 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
 
     interface WorkspaceServiceTestAccess {
-      maybePersistAISettingsFromOptions: (
-        workspaceId: string,
-        options: unknown,
-        context: "send" | "resume"
-      ) => Promise<void>;
+      maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
       persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
       config: {
         findWorkspace: (
@@ -13978,15 +13977,11 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
       ]),
     }));
 
-    await svc.maybePersistAISettingsFromOptions(
-      "ws",
-      {
-        agentId: "exec",
-        model: "openai:gpt-4o-mini",
-        thinkingLevel: "off",
-      },
-      "send"
-    );
+    await svc.maybePersistAISettingsFromOptions("ws", {
+      agentId: "exec",
+      model: "openai:gpt-4o-mini",
+      thinkingLevel: "off",
+    });
 
     expect(persistSpy).toHaveBeenCalledTimes(1);
     expect(persistSpy).toHaveBeenCalledWith(

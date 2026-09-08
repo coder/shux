@@ -1,4 +1,5 @@
 import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
+import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { PreparedStreamMessage } from "./turnRequestBuilder";
@@ -667,6 +668,7 @@ export interface AgentSessionStreamManager {
 
 /** Keeps AgentSession coupled only to the AI operations and events it consumes. */
 export interface AgentSessionAIService extends BranchSummaryAiService {
+  createModelWithPinnedOptions: AIService["createModelWithPinnedOptions"];
   on(event: string, listener: (...args: unknown[]) => void): void;
   off(event: string, listener: (...args: unknown[]) => void): void;
   streamMessage(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;

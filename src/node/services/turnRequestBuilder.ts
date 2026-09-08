@@ -582,11 +582,6 @@ interface TurnRequestBuilderDependencies {
   shouldAllowLegacyInvalidWorkflowAgentOutputSchema: (
     metadata: WorkspaceMetadata
   ) => Promise<boolean>;
-  createModel: (
-    modelString: string,
-    muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string; providersConfig?: ProvidersConfig }
-  ) => Promise<Result<LanguageModel, SendMessageError>>;
   isStreaming: (workspaceId: string) => boolean;
   trackPendingDevToolsRunMetadata: (
     messageId: string,
@@ -2034,107 +2029,14 @@ export class TurnRequestBuilder {
         toolModelString.length > 0,
         "tool model string must be non-empty when creating a tool model"
       );
-      // ONE config snapshot for both SDK model creation and the
-      // pinned pricing identity: two independent reads would let
-      // a catalog refresh land between them, running the request
-      // on one wire while recording usage under another type.
-      const toolProvidersConfig =
-        this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
-      // View snapshot captured at creation time for option
-      // building (buildProviderOptions takes the oRPC view, not
-      // the raw config shape).
-      const toolOptionsProvidersConfig = this.dependencies.providerService.getConfig();
-      // Let the factory pin provider-level defaults (especially the OpenAI wire
-      // format) without inheriting any options from the parent chat.
-      const toolMuxProviderOptions: MuxProviderOptions = {};
-      const creationOptions = {
-        workspaceId,
-        providersConfig: toolProvidersConfig,
-        agentInitiated: true,
-      };
-      // Intuition's effort can select a different model variant, not just provider
-      // options. Preserve the same provider snapshot for resolution and creation.
-      const toolModel =
-        toolThinkingLevel === undefined
-          ? await this.dependencies
-              .createModel(toolModelString, toolMuxProviderOptions, creationOptions)
-              .then((result) =>
-                result.success
-                  ? Ok({ model: result.data, effectiveModelString: undefined })
-                  : result
-              )
-          : await this.dependencies.providerModelFactory.resolveAndCreateModel(
-              toolModelString,
-              toolThinkingLevel,
-              toolMuxProviderOptions,
-              creationOptions
-            );
-      if (!toolModel.success) {
-        throw new Error(`Failed to create tool model: ${getErrorMessage(toolModel.error)}`);
-      }
-      // Same effective-route rule as createModelWithPinnedMetadata:
-      // a coder: selection whose gateway is unavailable falls away
-      // to a direct provider inside createModel, and identity or
-      // options derived from the raw selection (instance type)
-      // would diverge from the model actually created.
-      const toolEffectiveModelString =
-        toolModel.data.effectiveModelString ??
-        this.dependencies.providerModelFactory.resolveEffectiveModelString(
-          toolModelString,
-          undefined,
-          toolProvidersConfig
-        );
-      const toolOnCoderRoute = toolEffectiveModelString.startsWith("coder:");
-      // Carry pricing with each creation: parallel tools can select different
-      // variants or provider snapshots for the same raw model string.
-      const metadataModel = resolveModelForMetadata(
-        toolOnCoderRoute ? toolModelString : normalizeToCanonical(toolEffectiveModelString),
-        toolProvidersConfig
+      const created = await this.dependencies.providerModelFactory.createModelWithPinnedOptions(
+        toolModelString,
+        { thinkingLevel: toolThinkingLevel, workspaceId, agentInitiated: true }
       );
-      // Wire-resolved identity for option construction, same
-      // snapshot: a raw coder: string carries no wire info, so
-      // buildProviderOptions would emit the wrong (or no)
-      // namespace for custom-named/cross-typed instances. Mirrors
-      // resolveOptionsCanonicalModel's shadow + wire rules.
-      const toolOptionsModelString = (() => {
-        // Custom providers keep their RAW identity: with the
-        // pinned snapshot below, buildProviderOptions remaps the
-        // wire namespace itself while still resolving
-        // mappedToModel alias metadata from the custom entry.
-        if (!toolModelString.startsWith("coder:")) {
-          return toolModelString;
-        }
-        const coderSection = toolProvidersConfig.coder;
-        if (isCustomProviderConfig(coderSection)) {
-          return toolModelString;
-        }
-        if (!toolOnCoderRoute) {
-          // Fallback-away: options must target the route that
-          // actually serves the request, not the instance's wire.
-          return normalizeToCanonical(toolEffectiveModelString);
-        }
-        const wire = resolveCoderWireCanonicalModel(
-          toolModelString.slice("coder:".length),
-          coderSection as
-            | { discoveredProviders?: unknown; additionalProviders?: unknown }
-            | undefined
-        );
-        return wire ? `${wire.origin}:${wire.modelId}` : toolModelString;
-      })();
-      return {
-        model: toolModel.data.model,
-        metadataModel,
-        optionsModelString: toolOptionsModelString,
-        optionsProvidersConfig: toolOptionsProvidersConfig,
-        optionsMuxProviderOptions: toolMuxProviderOptions,
-        optionsRouteProvider: (() => {
-          const provider = toolEffectiveModelString.split(":", 1)[0];
-          return !isCustomProviderConfig(toolProvidersConfig[provider]) &&
-            Object.hasOwn(PROVIDER_DEFINITIONS, provider)
-            ? (provider as ProviderName)
-            : undefined;
-        })(),
-      };
+      if (!created.success) {
+        throw new Error(`Failed to create tool model: ${getErrorMessage(created.error)}`);
+      }
+      return created.data;
     };
     // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {

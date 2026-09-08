@@ -260,10 +260,9 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
           optionsMuxProviderOptions,
           optionsRouteProvider,
         } = await runtime.createModel(advisorModelString);
-        // Provider options from the wire-resolved identity captured at model
-        // creation (same snapshot): a raw coder: string would resolve to the
-        // wrong (or no) provider namespace for custom-named or cross-typed
-        // instances. buildProviderOptions returns provider SDK option types;
+        // Keep the creation-time identity, including the actual Coder instance
+        // and scoped aliases. buildProviderOptions resolves its wire namespace
+        // from the same captured config and returns provider SDK option types;
         // streamText accepts the same JSON-shaped values through its shared
         // providerOptions slot.
         // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
