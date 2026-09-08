@@ -122,7 +122,7 @@ describe("inactive real cancellation storage", () => {
           : phase === "retire"
             ? { kind: "retire", nonce: existing.nonce }
             : { kind: "narrow", record: narrowed };
-      const expected =
+      const expected: CompactionCancellationRecord | null =
         phase === "publish"
           ? { ...record("replacement"), retainUntilReplacement: true }
           : phase === "retire"
