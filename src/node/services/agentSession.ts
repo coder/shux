@@ -5854,11 +5854,23 @@ export class AgentSession {
       warningEmitted: this.contextBudgetWarningClaimed,
     });
     if (decision.decision === "block") return "block";
-    // A flush turn is bounded to one provider step even when the step no longer crosses the
-    // threshold (larger model after a restart) or rollover was disabled meanwhile: stopping
-    // here lets the queued rollover continuation, if any, seal the window.
-    if (decision.decision === "continue")
-      return context.contextBudgetFlushTurn === true ? "rollover" : "continue";
+    if (context.contextBudgetFlushTurn === true) {
+      if (this.compactionMonitor.getThreshold() >= 1) {
+        // Rollover was disabled while the flush ran: nothing may seal this window, so drop the
+        // stale intent and the paired continuation (mirrors the pre-dispatch degrade path).
+        this.pendingRollover = undefined;
+        this.pendingRolloverSnapshot = undefined;
+        this.contextBudgetFlushClaimed = false;
+        if (this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY).removedCount > 0)
+          this.emitQueuedMessageChanged();
+        return "rollover";
+      }
+      // A flush turn is bounded to one provider step even when the step no longer crosses the
+      // threshold (larger model after a restart): stopping here lets the queued rollover
+      // continuation seal the window.
+      if (decision.decision === "continue") return "rollover";
+    }
+    if (decision.decision === "continue") return "continue";
     let offerFlush = false;
     if (decision.decision === "rollover") {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
@@ -6993,6 +7005,15 @@ export class AgentSession {
           this.pendingRollover == null &&
           this.compactionMonitor.getThreshold() < 1
         ) {
+          // The promised reset needs the same admission as any rollover; surface a failure
+          // now (as the reset itself would) instead of resuming a flush that cannot be sealed.
+          const access = await this.checkContextBudgetHistoryAccess(options);
+          if (isStreamStartAborted()) return Ok(undefined);
+          if (!access.success) return await fail(access.error);
+          const captured = await this.captureRolloverRequestAssembly();
+          if (isStreamStartAborted()) return Ok(undefined);
+          if (!captured.success) return await fail(captured.error);
+          this.pendingRolloverSnapshot = captured.data;
           this.pendingRollover = {
             type: "context-window-rollover",
             rolloverId: randomUUID(),

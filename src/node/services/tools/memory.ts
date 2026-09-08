@@ -137,13 +137,33 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
     return checkPinnedPath(virtualPath);
   }
 
+  // Pinned mode is a preservation turn: exactly one create/update of the pinned file per
+  // tool instance (one provider request); deletes, renames, and sibling mutations are refused
+  // so injected content cannot erase the recovery notes or run several mutations.
+  let pinnedMutationUsed = false;
   return tool({
     description: buildMemoryDescription(config),
     inputSchema: TOOL_DEFINITIONS.memory.schema,
-    execute: (input, { toolCallId }): Promise<MemoryToolResult> =>
-      executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId, {
+    execute: (input, { toolCallId }): Promise<MemoryToolResult> => {
+      if (writePath != null && writePin && input.command !== "view") {
+        if (input.command === "delete" || input.command === "rename") {
+          return Promise.resolve({
+            success: false,
+            error: `This turn may only create or update ${writePath}; '${input.command}' is unavailable.`,
+          });
+        }
+        if (pinnedMutationUsed) {
+          return Promise.resolve({
+            success: false,
+            error: `This turn allows a single memory mutation of ${writePath}; it was already used.`,
+          });
+        }
+        pinnedMutationUsed = true;
+      }
+      return executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId, {
         checkReadAccess: checkPinnedPath,
-      }),
+      });
+    },
   });
 };
 

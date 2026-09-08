@@ -1500,6 +1500,48 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
   });
 
+  test("disabling rollover while the flush streams drops the pending reset and its continuation", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await h.finishAndDispatch();
+    h.session.setAutoCompactionThreshold(1);
+    expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    h.settleStream(1, { finishReason: "stop" });
+    await h.session.waitForIdle();
+    expect(h.requests).toHaveLength(2);
+    h.session.setAutoCompactionThreshold(0.7);
+    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+  });
+
+  test("resuming a persisted flush re-validates rollover admission first", async () => {
+    const first = await setup();
+    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await first.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await first.finishAndDispatch();
+    await first.session.dispose();
+    const h = await setup({ previous: first });
+    const unregister = eventSpine.useBefore(
+      "request.assemble",
+      (ctx) => {
+        delete ctx.tools.session_history;
+      },
+      { workspaceId }
+    );
+    try {
+      expect(await h.session.resumeStream(options)).toMatchObject({
+        success: false,
+        error: { type: "context_budget_blocked" },
+      });
+      expect(h.requests).toHaveLength(0);
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    } finally {
+      unregister();
+    }
+  });
+
   test("toolset-changing middleware blocks the flush dispatch like the rollover it promises", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);

@@ -320,9 +320,10 @@ describe("memory tool", () => {
       expect(
         (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success
       ).toBe(true);
+      // Each tool instance allows one mutation; a later request (fresh instance) may update.
       expect(
         (
-          await run(fixture.tool, {
+          await run(createMemoryTool(fixture.config), {
             command: "str_replace",
             path: ` ${notes}/`,
             old_str: "state",
@@ -351,11 +352,38 @@ describe("memory tool", () => {
         { command: "rename", old_path: notes, new_path: "/memories/global/context-notes.md" },
         { command: "rename", old_path: notes, new_path: "/memories/workspace/moved.md" },
       ] as const) {
-        const result = await run(fixture.tool, input);
+        const result = await run(createMemoryTool(fixture.config), input);
         expect(result.success).toBe(false);
-        if (!result.success) expect(result.error).toContain("may only access");
+        if (!result.success) expect(result.error).toMatch(/may only (access|create or update)/);
       }
       expect((await run(fixture.tool, { command: "view", path: notes })).success).toBe(true);
+    });
+
+    it("allows exactly one non-destructive mutation per tool instance", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      expect((await run(fixture.tool, { command: "delete", path: notes })).success).toBe(false);
+      expect(
+        (await run(fixture.tool, { command: "rename", old_path: notes, new_path: notes })).success
+      ).toBe(false);
+      // Refused destructive commands do not consume the single mutation.
+      expect(
+        (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success
+      ).toBe(true);
+      const second = await run(fixture.tool, {
+        command: "insert",
+        path: notes,
+        insert_line: 0,
+        insert_text: "more",
+      });
+      expect(second.success).toBe(false);
+      if (!second.success) expect(second.error).toContain("single memory mutation");
+      // Reads remain available and a fresh instance (next request) may mutate again.
+      expect((await run(fixture.tool, { command: "view", path: notes })).success).toBe(true);
+      const fresh = createMemoryTool(fixture.config);
+      expect(
+        (await run(fresh, { command: "insert", path: notes, insert_line: 0, insert_text: "x" }))
+          .success
+      ).toBe(true);
     });
 
     it("rejects a pin that is not a file inside a scope", async () => {
