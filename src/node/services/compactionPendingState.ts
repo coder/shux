@@ -24,6 +24,11 @@ export interface CompactionPendingAttachments {
   readFiles: string[];
 }
 
+export type CompactionPendingBoundary =
+  | { kind: "none" }
+  | { kind: "identified"; messageId: string }
+  | { kind: "unreadable-reset" };
+
 interface PersistedState extends CompactionPendingAttachments {
   version: 1;
   createdAt: number;
@@ -32,12 +37,16 @@ interface PersistedState extends CompactionPendingAttachments {
   publicationGeneration?: string | null;
   previousState?: PersistedState;
   previousStateGeneration?: string | null;
+  previousStateBoundary?: CompactionPendingBoundary;
 }
 
 export interface CompactionPendingHistoryView {
   generation: string | undefined;
-  /** Latest durable context boundary, read under the same lock as the generation. */
-  boundaryMessageId: string | undefined;
+  /**
+   * Provenance from the same verified chat/archive scan as the history rows. `none` requires
+   * exhausting both files without a boundary or raw reset floor; unreadable is never absence.
+   */
+  boundary: CompactionPendingBoundary;
   isPublicationCurrent(publication: ContinuousCompactionPublication): Promise<boolean>;
 }
 
@@ -59,6 +68,13 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function parseBoundary(value: unknown): CompactionPendingBoundary | undefined {
+  const input = record(value);
+  if (input?.kind === "none" || input?.kind === "unreadable-reset") return { kind: input.kind };
+  if (input?.kind === "identified" && typeof input.messageId === "string" && input.messageId)
+    return { kind: "identified", messageId: input.messageId };
 }
 
 function parseState(value: unknown, allowPrevious = true): PersistedState | undefined {
@@ -130,6 +146,7 @@ function parseState(value: unknown, allowPrevious = true): PersistedState | unde
     writeId: input.writeId as string | undefined,
     publicationGeneration: input.publicationGeneration as string | null | undefined,
     previousStateGeneration: input.previousStateGeneration as string | null | undefined,
+    previousStateBoundary: parseBoundary(input.previousStateBoundary),
     previousState: allowPrevious ? parseState(input.previousState, false) : undefined,
   };
 }
@@ -144,7 +161,12 @@ function decode(raw: string | undefined): PersistedState | undefined {
 
 /** A fallback is mutable bookkeeping; the immutable head is the receipt's identity. */
 function head(state: PersistedState): PersistedState {
-  return { ...state, previousState: undefined, previousStateGeneration: undefined };
+  return {
+    ...state,
+    previousState: undefined,
+    previousStateGeneration: undefined,
+    previousStateBoundary: undefined,
+  };
 }
 
 function identity(state: PersistedState): string {
@@ -159,23 +181,57 @@ function identity(state: PersistedState): string {
   ]);
 }
 
+function sameBoundary(
+  expected: CompactionPendingBoundary | undefined,
+  current: CompactionPendingBoundary
+): boolean {
+  return (
+    (expected?.kind === "none" && current.kind === "none") ||
+    (expected?.kind === "identified" &&
+      current.kind === "identified" &&
+      expected.messageId === current.messageId)
+  );
+}
+
+function isCurrentState(state: PersistedState, view: CompactionPendingHistoryView): boolean {
+  return (
+    sameBoundary(
+      state.boundaryMessageId
+        ? { kind: "identified", messageId: state.boundaryMessageId }
+        : { kind: "none" },
+      view.boundary
+    ) &&
+    // Untagged V1 files predate generation tracking; only proven initial history qualifies.
+    (state.boundaryMessageId !== undefined || view.generation === undefined) &&
+    // A destructive edit can preserve the boundary ID, so even tagged legacy state
+    // without generation proof must stop qualifying once a generation exists.
+    (state.publicationGeneration === undefined
+      ? view.generation === undefined
+      : state.publicationGeneration === (view.generation ?? null))
+  );
+}
+
+function eligiblePrevious(
+  state: PersistedState,
+  view: CompactionPendingHistoryView
+): PersistedState | undefined {
+  const previous = state.previousState;
+  // Restart and rollback require the same captured proof. Missing V1 proof may drop
+  // enrichments, but must not resurrect context across a reset or a same-generation boundary.
+  if (
+    previous &&
+    state.previousStateGeneration === (view.generation ?? null) &&
+    sameBoundary(state.previousStateBoundary, view.boundary) &&
+    isCurrentState(previous, view)
+  )
+    return previous;
+}
+
 function eligibleState(
   state: PersistedState | undefined,
   view: CompactionPendingHistoryView
 ): PersistedState | undefined {
-  if (!state) return;
-  if (!state.boundaryMessageId || state.boundaryMessageId === view.boundaryMessageId) return state;
-  const previous = state.previousState;
-  // Old standalone V1 files remain readable. An untagged legacy fallback needs positive
-  // boundary proof; absence alone must not restore pre-reset context after a crash.
-  if (
-    previous &&
-    (state.previousStateGeneration !== undefined
-      ? state.previousStateGeneration === (view.generation ?? null)
-      : previous.boundaryMessageId !== undefined) &&
-    (!previous.boundaryMessageId || previous.boundaryMessageId === view.boundaryMessageId)
-  )
-    return previous;
+  if (state) return isCurrentState(state, view) ? state : eligiblePrevious(state, view);
 }
 
 /**
@@ -191,6 +247,7 @@ export class CompactionPendingState {
       identity: string;
       generation: string | undefined;
       prepared: boolean;
+      startingBoundary?: CompactionPendingBoundary;
     }
   >();
 
@@ -215,7 +272,8 @@ export class CompactionPendingState {
   private receipt(
     state: PersistedState,
     generation: string | undefined,
-    prepared = false
+    prepared = false,
+    startingBoundary?: CompactionPendingBoundary
   ): CompactionPendingReceipt {
     const receipt = {
       attachments: {
@@ -224,7 +282,12 @@ export class CompactionPendingState {
         readFiles: state.readFiles,
       },
     };
-    this.receipts.set(receipt, { identity: identity(state), generation, prepared });
+    this.receipts.set(receipt, {
+      identity: identity(state),
+      generation,
+      prepared,
+      startingBoundary,
+    });
     return receipt;
   }
 
@@ -265,6 +328,7 @@ export class CompactionPendingState {
       await fs.mkdir(path.dirname(this.filePath), { recursive: true });
       const previous = eligibleState(decode(await this.readBytes()), view);
       if (!isCurrent()) return;
+      const startingBoundary = structuredClone(view.boundary);
       const state = parseState({
         ...captured,
         version: 1,
@@ -274,13 +338,14 @@ export class CompactionPendingState {
         publicationGeneration: publication.generation ?? null,
         previousState: previous && head(previous),
         previousStateGeneration: previous ? (view.generation ?? null) : undefined,
+        previousStateBoundary: previous ? startingBoundary : undefined,
       });
       if (!state) throw new Error("Invalid pending state");
       let receipt: CompactionPendingReceipt | undefined;
       // Staging also awaits I/O. The helper checks local ownership immediately before rename
       // and publishes the receipt before cleanup/lock release can admit a successor.
       await publishCompactionFile(this.filePath, JSON.stringify(state), isCurrent, () => {
-        receipt = this.receipt(state, publication.generation, true);
+        receipt = this.receipt(state, publication.generation, true, startingBoundary);
       });
       return receipt;
     });
@@ -310,15 +375,17 @@ export class CompactionPendingState {
     return this.enqueue(async (view) => {
       const state = decode(await this.readBytes());
       if (!state || identity(state) !== expected.identity) return false;
-      if (state.boundaryMessageId === view.boundaryMessageId) return false;
+      if (isCurrentState(state, view)) return false;
       // Restoring a committed heartbeat also needs the caller's exact history rollback proof.
       // A generation change permits exact cleanup, never restoration of the prior context.
-      const previous = state.previousState;
+      // A newer compaction can keep the generation unchanged; even an untagged legacy
+      // predecessor may only return to the boundary at which preparation began.
+      const previous = eligiblePrevious(state, view);
       if (
         previous &&
         expected.generation === view.generation &&
-        canRestorePrevious() &&
-        (!previous.boundaryMessageId || previous.boundaryMessageId === view.boundaryMessageId)
+        sameBoundary(expected.startingBoundary, view.boundary) &&
+        canRestorePrevious()
       ) {
         if (
           await publishCompactionFile(
@@ -342,9 +409,9 @@ export class CompactionPendingState {
       const state = decode(raw);
       if (
         state &&
-        ((state.boundaryMessageId !== undefined &&
-          state.boundaryMessageId === view.boundaryMessageId) ||
-          (state.publicationGeneration !== undefined &&
+        (isCurrentState(state, view) ||
+          (state.boundaryMessageId !== undefined &&
+            state.publicationGeneration !== undefined &&
             state.publicationGeneration === (view.generation ?? null)))
       )
         return;

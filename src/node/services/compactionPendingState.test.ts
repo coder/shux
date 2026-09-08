@@ -11,6 +11,7 @@ import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks"
 import {
   CompactionPendingState,
   type CompactionPendingAttachments,
+  type CompactionPendingBoundary,
   type CompactionPendingHistory,
   type CompactionPendingReceipt,
 } from "./compactionPendingState";
@@ -24,9 +25,11 @@ describe("unactivated compaction pending-file protocol", () => {
   let h: Awaited<ReturnType<typeof createTestHistoryService>>;
   let filePath: string;
   let store: CompactionPendingState;
+  let boundaryOverride: CompactionPendingBoundary | undefined;
 
   // This test adapter uses the existing locks and real history/journal readers. Production
   // activation must expose the equivalent transaction on HistoryService; it must not nest locks.
+  // Unsafe-floor cases supply scanner provenance explicitly; the real adapter tests the scan.
   function historyAdapter(history = h.historyService): CompactionPendingHistory {
     return {
       withLock: (operation) =>
@@ -46,9 +49,12 @@ describe("unactivated compaction pending-file protocol", () => {
             },
             0
           );
+          const boundaryId = rows.findLast(isDurableContextBoundaryMarker)?.id;
           return await operation({
             generation: await journal.captureGenerationUnderHistoryLock(),
-            boundaryMessageId: rows.findLast(isDurableContextBoundaryMarker)?.id,
+            boundary:
+              boundaryOverride ??
+              (boundaryId ? { kind: "identified", messageId: boundaryId } : { kind: "none" }),
             isPublicationCurrent: (publication) =>
               journal.isPublicationCurrentUnderHistoryLock(publication),
           });
@@ -102,6 +108,7 @@ describe("unactivated compaction pending-file protocol", () => {
   }
 
   beforeEach(async () => {
+    boundaryOverride = undefined;
     h = await createTestHistoryService();
     await h.historyService.appendToHistory(
       workspaceId,
@@ -239,6 +246,72 @@ describe("unactivated compaction pending-file protocol", () => {
     }
   );
 
+  it.each(
+    [false, true].flatMap((startingBoundary) =>
+      ["none", "identified", "unreadable-reset"].map((replacement) => ({
+        startingBoundary,
+        replacement,
+      }))
+    )
+  )(
+    "heartbeat rollback and restart qualify fallback by the starting boundary ($startingBoundary, replacement=$replacement)",
+    async ({ startingBoundary, replacement }) => {
+      if (startingBoundary) await boundary("start");
+      await fs.writeFile(
+        filePath,
+        JSON.stringify({
+          version: 1,
+          createdAt: 1,
+          ...attachments("legacy"),
+          boundaryMessageId: startingBoundary ? "start" : undefined,
+        })
+      );
+      const generation = await h.historyService
+        .getContinuousCompactionJournal(workspaceId)
+        .captureGeneration();
+      const b = await prepare("b");
+      expect(
+        (
+          await h.historyService.appendToHistory(
+            workspaceId,
+            createMuxMessage("b", "assistant", "Heartbeat", {
+              compacted: "heartbeat",
+              compactionBoundary: true,
+              compactionEpoch: 2,
+            })
+          )
+        ).success
+      ).toBe(true);
+      // The ordered fixture supplies an already-completed deletion; the real adapter's
+      // exact-delete proof is tested separately. A later boundary cannot revoke that fact.
+      const deleted = await h.historyService.deleteMessage(workspaceId, "b");
+      expect(deleted.success).toBe(true);
+      const foreign = new HistoryService(h.config);
+      if (replacement === "unreadable-reset") boundaryOverride = { kind: "unreadable-reset" };
+      if (replacement === "identified") {
+        expect(
+          (
+            await foreign.appendToHistory(
+              workspaceId,
+              createMuxMessage("c", "assistant", "Replacement", {
+                compacted: "user",
+                compactionBoundary: true,
+                compactionEpoch: 3,
+              })
+            )
+          ).success
+        ).toBe(true);
+      }
+      expect(await foreign.getContinuousCompactionJournal(workspaceId).captureGeneration()).toBe(
+        generation
+      );
+      const expected = replacement === "none" ? ["/legacy.ts"] : undefined;
+      expect((await restart().load(() => true))?.attachments.readFiles).toEqual(expected);
+      expect(await store.rollback(b, () => deleted.success)).toBe(true);
+      expect((await restart().load(() => true))?.attachments.readFiles).toEqual(expected);
+    }
+  );
+
   it("rejects a stale publication but accepts a newly captured one", async () => {
     const generation = await h.historyService
       .getContinuousCompactionJournal(workspaceId)
@@ -296,9 +369,14 @@ describe("unactivated compaction pending-file protocol", () => {
     expect(await restart().load(() => true)).toBeUndefined();
   });
 
-  it.each([false, true])(
-    "legacy fallback without a generation needs boundary proof (linked=%s)",
-    async (linked) => {
+  it.each([
+    { generation: undefined, proof: { kind: "identified", messageId: "a" } },
+    { generation: null, proof: undefined },
+    { generation: null, proof: { kind: "identified", messageId: 3 } },
+    { generation: null, proof: { kind: "unreadable-reset" } },
+  ])(
+    "incomplete legacy fallback proof suppresses inheritance but preserves the head (%j)",
+    async ({ generation, proof }) => {
       await boundary("a");
       await fs.writeFile(
         filePath,
@@ -307,17 +385,24 @@ describe("unactivated compaction pending-file protocol", () => {
           createdAt: 2,
           ...attachments("uncommitted"),
           boundaryMessageId: "b",
+          publicationGeneration: null,
+          previousStateGeneration: generation,
+          previousStateBoundary: proof,
           previousState: {
             version: 1,
             createdAt: 1,
             ...attachments("a"),
-            ...(linked && { boundaryMessageId: "a" }),
+            boundaryMessageId: "a",
           },
         })
       );
-      expect((await store.load(() => true))?.attachments.readFiles).toEqual(
-        linked ? ["/a.ts"] : undefined
-      );
+      const original = await bytes();
+      expect(await store.load(() => true)).toBeUndefined();
+      expect(await bytes()).toBe(original);
+      await boundary("b");
+      expect((await restart().load(() => true))?.attachments.readFiles).toEqual([
+        "/uncommitted.ts",
+      ]);
     }
   );
 
@@ -423,8 +508,97 @@ describe("unactivated compaction pending-file protocol", () => {
     await store.discardAfterBoundary();
     expect(await bytes()).toBe(current);
     await boundary("new");
-    await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
     await store.discardAfterBoundary();
     expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/new.ts"]);
   });
+
+  it.each(["load", "rollback", "discard"] as const)(
+    "a matching boundary cannot qualify a stale generation (%s)",
+    async (operation) => {
+      const receipt = await prepare("a");
+      await boundary("a");
+      await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+      if (operation === "load") expect(await restart().load(() => true)).toBeUndefined();
+      else if (operation === "rollback")
+        expect(await store.rollback(receipt, () => true)).toBe(true);
+      else await store.discardAfterBoundary();
+      expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+    }
+  );
+
+  it.each(
+    (["load", "discard"] as const).flatMap((operation) =>
+      [false, true].map((changed) => ({ operation, changed }))
+    )
+  )(
+    "tagged legacy without generation proof only qualifies initial history (%j)",
+    async ({ operation, changed }) => {
+      await boundary("a");
+      await fs.writeFile(
+        filePath,
+        JSON.stringify({
+          version: 1,
+          createdAt: 1,
+          boundaryMessageId: "a",
+          ...attachments("legacy"),
+        })
+      );
+      if (changed)
+        await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+      if (operation === "discard") await store.discardAfterBoundary();
+      expect((await restart().load(() => true))?.attachments.readFiles).toEqual(
+        changed ? undefined : ["/legacy.ts"]
+      );
+      if (operation === "discard" && changed)
+        expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+    }
+  );
+
+  it.each(
+    (
+      [
+        { kind: "none" },
+        { kind: "identified", messageId: "a" },
+        { kind: "unreadable-reset" },
+      ] as const
+    ).flatMap((startingBoundary) => [false, true].map((changed) => ({ startingBoundary, changed })))
+  )(
+    "untagged legacy requires proven initial history (%j)",
+    async ({ startingBoundary, changed }) => {
+      boundaryOverride = startingBoundary;
+      await fs.writeFile(
+        filePath,
+        JSON.stringify({ version: 1, createdAt: 1, ...attachments("legacy") })
+      );
+      if (changed)
+        await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+      expect((await restart().load(() => true))?.attachments.readFiles).toEqual(
+        startingBoundary.kind === "none" && !changed ? ["/legacy.ts"] : undefined
+      );
+    }
+  );
+
+  it.each([false, true])(
+    "an unreadable floor permits fresh preparation without inheritance (commit=%s)",
+    async (commit) => {
+      boundaryOverride = { kind: "unreadable-reset" };
+      await fs.writeFile(
+        filePath,
+        JSON.stringify({ version: 1, createdAt: 1, ...attachments("legacy") })
+      );
+      const receipt = await prepare("fresh");
+      const provisional = await bytes();
+      expect(await restart().load(() => true)).toBeUndefined();
+      await store.discardAfterBoundary();
+      expect(await bytes()).toBe(provisional);
+      if (commit) {
+        await boundary("fresh");
+        boundaryOverride = undefined;
+        expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/fresh.ts"]);
+      } else {
+        expect(await store.rollback(receipt, () => true)).toBe(true);
+        expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+      }
+    }
+  );
 });
