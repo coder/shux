@@ -164,6 +164,46 @@ describe("unactivated compaction pending-file protocol", () => {
     expect(await store.load(() => true)).toBeUndefined();
     expect(await restart().load(() => true)).toBeUndefined();
     expect(await bytes()).toBe(raw);
+    const publication = {
+      generation: await h.historyService
+        .getContinuousCompactionJournal(workspaceId)
+        .captureGeneration(),
+    };
+    expect(
+      await store.prepare({
+        attachments: attachments("fresh"),
+        boundaryMessageId: "fresh",
+        publication,
+        isCurrent: () => true,
+      })
+    ).toBeUndefined();
+    expect(await bytes()).toBe(raw);
+    spyOn(h.historyService, "appendToHistory").mockRejectedValueOnce(
+      new Error("boundary write failed")
+    );
+    expect(await boundary("fresh").catch((error: unknown) => error)).toMatchObject({
+      message: "boundary write failed",
+    });
+    expect(await bytes()).toBe(raw);
+    await boundary("fresh");
+    expect(await restart().load(() => true)).toBeUndefined();
+    expect(await bytes()).toBe(raw);
+  });
+
+  it("treats a directory sidecar as absent across repeated recovery loads", async () => {
+    await fs.mkdir(filePath);
+    expect(await store.load(() => true)).toBeUndefined();
+    expect(await restart().load(() => true)).toBeUndefined();
+    expect((await fs.stat(filePath)).isDirectory()).toBe(true);
+    expect(
+      (
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("continued", "user", "Continue")
+        )
+      ).success
+    ).toBe(true);
+    await fs.rmdir(filePath);
     await prepare("fresh");
     await boundary("fresh");
     expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/fresh.ts"]);

@@ -298,7 +298,8 @@ export class CompactionPendingState {
 
   load(isCurrent: () => boolean): Promise<CompactionPendingReceipt | undefined> {
     return this.enqueue(async (view) => {
-      const raw = await this.readBytes();
+      // Optional enrichment must not brick recovery when its sidecar is unreadable.
+      const raw = await this.readBytes().catch(() => undefined);
       if (!isCurrent()) return;
       const parsed = parseJson(raw);
       // A downgraded reader must leave newer schemas intact for the version that owns them.
@@ -336,7 +337,11 @@ export class CompactionPendingState {
     return this.enqueue(async (view) => {
       if (!isCurrent() || !(await view.isPublicationCurrent(publication))) return;
       await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-      const previous = eligibleState(parseState(parseJson(await this.readBytes())), view);
+      const parsed = parseJson(await this.readBytes());
+      // Unknown bytes require atomic history publication before replacement. This standalone
+      // preparation must decline enrichment; callers still own the mandatory history write.
+      if (parsed !== undefined && record(parsed)?.version !== 1) return;
+      const previous = eligibleState(parseState(parsed), view);
       if (!isCurrent()) return;
       const startingBoundary = structuredClone(view.boundary);
       const state = parseState({
