@@ -387,15 +387,6 @@ export function transition(
       next = {
         ...state,
         reservations: [...state.reservations, { id: event.id, kind: event.kind }],
-        // An edit can replace history before PREPARING and then fail back to the same idle turn.
-        ...(event.kind === "edit" && state.compaction.followUp
-          ? {
-              compaction: {
-                ...state.compaction,
-                followUp: { ...state.compaction.followUp, retired: true },
-              },
-            }
-          : {}),
       };
       break;
     case "release":
@@ -459,7 +450,12 @@ export function transition(
       };
       break;
     case "compaction-follow-up":
-      if (state.lifetime === "open" && !state.compaction.followUp && !hasConflictingEdit(state))
+      if (
+        state.lifetime === "open" &&
+        !state.compaction.followUp &&
+        !hasConflictingEdit(state) &&
+        !state.reservations.some((entry) => entry.kind === "admission")
+      )
         next = {
           ...state,
           compaction: {
@@ -468,7 +464,8 @@ export function transition(
               token: event.token,
               turnId: state.turn.id,
               retired: false,
-              canceled: state.compaction.abandoned,
+              // Stop cancels its existing owner, not work created after that Stop.
+              canceled: false,
             },
           },
         };
@@ -699,6 +696,8 @@ export class TurnCoordinator {
     return true;
   }
 
+  // Intentionally not wired into AgentSession yet: activation must handle targeted dispatch
+  // contention, failed-recovery queue ordering, and retirement after committed history changes.
   claimCompactionFollowUp(): CompactionFollowUpToken | undefined {
     const token = Symbol("compaction follow-up");
     this.dispatch({ type: "compaction-follow-up", token });
@@ -725,6 +724,7 @@ export class TurnCoordinator {
   }
 
   retireCompactionFollowUp(): void {
+    // A reservation may fail without changing history; only a committed mutation retires intent.
     this.dispatch({ type: "compaction-follow-up-retire" });
   }
 

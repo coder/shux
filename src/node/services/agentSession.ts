@@ -49,7 +49,6 @@ import {
   type QueueDrainTrigger,
   type OperationId,
   type CompactionToken,
-  type CompactionFollowUpToken,
   type StreamErrorRecoveryOutcome,
 } from "./turnCoordinator";
 export type { StreamErrorRecoveryOutcome } from "./turnCoordinator";
@@ -260,17 +259,10 @@ type SessionCompactionContext = ContinuousCompactionContext & {
  * Result shape for turn-starting session methods. failureHandled marks errors
  * whose retry/abandon bookkeeping already ran inside streamWithHistory, so
  * callers must not re-handle them (would double-increment backoff attempts).
- * superseded distinguishes lost admission after durability from an actual startup
- * failure: a continuation's accepted history row survives that refusal.
  */
 type AgentSessionResult<T> =
   | { success: true; data: T }
-  | { success: false; error: SendMessageError; failureHandled?: true; superseded?: true };
-
-interface CompactionFollowUpDispatch {
-  token: CompactionFollowUpToken;
-  accepted: boolean;
-}
+  | { success: false; error: SendMessageError; failureHandled?: true };
 
 /**
  * Tracked file state for detecting external edits.
@@ -759,7 +751,6 @@ interface SendMessageInternalOptions {
   preparation?: PreparationAttempt;
   /** A dequeued send keeps its admission owner through acceptance and startup failure. */
   turnReservation?: TurnId;
-  compactionHandoff?: CompactionFollowUpToken;
   synthetic?: boolean;
   agentInitiated?: boolean;
   goalContinuation?: boolean;
@@ -768,8 +759,6 @@ interface SendMessageInternalOptions {
   goalId?: string;
   startStreamInBackground?: boolean;
   onAccepted?: () => Promise<void> | void;
-  /** Runs at the rollback horizon, before goal sync or message observers can retire the send. */
-  onRowsDurable?: () => void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
   onCanceled?: (reason: string) => Promise<void> | void;
   cancelState?: { canceledBeforeAcceptance: boolean };
@@ -3475,7 +3464,6 @@ export class AgentSession {
     const markRowsDurable = (): void => {
       if (attempt.durability !== "rollback-eligible") return;
       attempt.durability = "durable";
-      internal?.onRowsDurable?.();
       if ((internal?.preTurnMessages?.length ?? 0) > 0) internal?.onPreTurnRowsPersisted?.();
     };
     const accept = async (): Promise<void> => {
@@ -4491,11 +4479,7 @@ export class AgentSession {
     // turn that made the admission stale consumes as context.
     const refuseStaleDurableSend = async (): Promise<AgentSessionResult<void>> => {
       await abandonWithdrawnSend();
-      return {
-        success: false,
-        error: createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE),
-        superseded: true,
-      };
+      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
     };
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
@@ -4641,7 +4625,7 @@ export class AgentSession {
       // that bookkeeping (r41).
       await this.settlePreparationFailure(attempt, error);
       await abandonWithdrawnSend();
-      return { success: false, error, superseded: true };
+      return Err(error);
     }
     // A withdrawn send must not claim PREPARING (see abandonWithdrawnSend); it resolves Ok without
     // a stream, like cancelBeforeAcceptance and the disposed path above.
@@ -4662,7 +4646,6 @@ export class AgentSession {
             intent: "direct",
             expectedTurnId: attempt.expectedTurn,
             editReservation: attempt.editReservation?.id,
-            compactionHandoff: internal?.compactionHandoff,
           },
       preparedTurnAbortController,
       (turnId) => {
@@ -4673,15 +4656,13 @@ export class AgentSession {
       }
     );
     if (admission.status !== "admitted") {
-      return {
-        success: false,
-        superseded: true,
-        error: createUnknownSendMessageError(
+      return Err(
+        createUnknownSendMessageError(
           admission.status === "rejected" && admission.reason === "closing"
             ? SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE
             : CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
-        ),
-      };
+        )
+      );
     }
     const preparedTurn = admission.turnId;
 
@@ -8614,7 +8595,6 @@ export class AgentSession {
    * deleting the partial removes the discarded transcript's tail durably.
    */
   async discardAutoRetryForContextMutation(): Promise<Result<void>> {
-    this.coordinator.retireCompactionFollowUp();
     this.clearContextBudgetState();
     this.continuousCompactor.reset("context-mutation");
     this.retryManager.cancel();
@@ -9299,26 +9279,6 @@ export class AgentSession {
     }
     using _execution = this.coordinator.enterExecution();
 
-    // Observe before history I/O: a replacement may start and finish while that read is pending.
-    const token = this.coordinator.claimCompactionFollowUp();
-    if (!token) return false;
-    try {
-      return await this.dispatchOwnedCompactionFollowUp(
-        { token, accepted: false },
-        summaryMessageId,
-        cancelResume
-      );
-    } finally {
-      this.coordinator.finishCompactionFollowUp(token);
-      this.drainQueuedMessagesIfIdle();
-    }
-  }
-
-  private async dispatchOwnedCompactionFollowUp(
-    dispatch: CompactionFollowUpDispatch,
-    summaryMessageId?: string,
-    cancelResume?: () => boolean
-  ): Promise<boolean> {
     let summaryMessage: MuxMessage | undefined;
     if (summaryMessageId) {
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(
@@ -9397,15 +9357,10 @@ export class AgentSession {
       return false;
     }
 
-    if (!this.coordinator.isCurrentCompactionFollowUp(dispatch.token)) {
-      await this.clearPendingFollowUpFromSummary(lastMessage, dispatch);
-      return false;
-    }
-
     // A user can abandon after the boundary commits but before its continuation
     // dispatches. Keep the fold, but remove the crash-recoverable resume intent.
     if (cancelResume?.()) {
-      await this.clearPendingFollowUpFromSummary(lastMessage, dispatch);
+      await this.clearPendingFollowUpFromSummary(lastMessage);
       return false;
     }
 
@@ -9429,7 +9384,7 @@ export class AgentSession {
         workspaceId: this.workspaceId,
         summaryMessageId: lastMessage.id,
       });
-      await this.clearPendingFollowUpFromSummary(lastMessage, dispatch);
+      await this.clearPendingFollowUpFromSummary(lastMessage);
       return false;
     }
 
@@ -9446,7 +9401,7 @@ export class AgentSession {
         summaryMessageId: lastMessage.id,
         goalKind: persistedGoalKind,
       });
-      await this.clearPendingFollowUpFromSummary(lastMessage, dispatch);
+      await this.clearPendingFollowUpFromSummary(lastMessage);
       return false;
     }
 
@@ -9475,8 +9430,7 @@ export class AgentSession {
       await this.skipIdleRuleFollowUp(
         lastMessage,
         hasQueuedMessages || hasExternalPreflightSend,
-        hasActiveNonCompletingTurn,
-        dispatch
+        hasActiveNonCompletingTurn
       );
       return false;
     }
@@ -9511,7 +9465,7 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           goalKind: persistedGoalKind,
         });
-        await this.clearPendingFollowUpFromSummary(lastMessage, dispatch);
+        await this.clearPendingFollowUpFromSummary(lastMessage);
         return false;
       }
       goalAdmissionStale = admission.admissionStale;
@@ -9529,11 +9483,13 @@ export class AgentSession {
           this.hasExternalSendPreflight?.() === true ||
           (this.isBusy() && this.coordinator.phase !== "completing")
       : undefined;
-    const followUpAdmissionStale = () =>
-      !this.coordinator.isCurrentCompactionFollowUp(dispatch.token) ||
-      idleRuleStale?.() === true ||
-      goalAdmissionStale?.() === true ||
-      cancelResume?.() === true;
+    const followUpAdmissionStale =
+      idleRuleStale != null || goalAdmissionStale != null || cancelResume != null
+        ? () =>
+            idleRuleStale?.() === true ||
+            goalAdmissionStale?.() === true ||
+            cancelResume?.() === true
+        : undefined;
 
     log.debug("Dispatching pending follow-up from compaction summary", {
       workspaceId: this.workspaceId,
@@ -9613,13 +9569,8 @@ export class AgentSession {
       return false;
     }
 
-    if (followUpAdmissionStale()) {
-      await this.skipIdleRuleFollowUp(
-        lastMessage,
-        this.hasPendingManualFollowUp() || this.hasExternalSendPreflight?.() === true,
-        this.isBusy() && this.coordinator.phase !== "completing",
-        dispatch
-      );
+    if (cancelResume?.()) {
+      await this.clearPendingFollowUpFromSummary(lastMessage);
       return false;
     }
 
@@ -9640,15 +9591,6 @@ export class AgentSession {
     // re-enable auto-retry after a user explicitly opted out.
     const sendResult = await this.sendMessage(finalText, options, {
       synthetic: true,
-      compactionHandoff: dispatch.token,
-      // Goal sync and message observers run after rollback is forbidden, before onAccepted.
-      // Even a later refusal must retain this accepted handoff's recovery metadata.
-      onRowsDurable: () => {
-        dispatch.accepted = true;
-      },
-      onAccepted: () => {
-        dispatch.accepted = true;
-      },
       agentInitiated: followUp.agentInitiated,
       goalKind: persistedGoalKind,
       // Keep the re-dispatched continuation row goal-scoped so a replaced
@@ -9660,15 +9602,15 @@ export class AgentSession {
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
       admissionStale: followUpAdmissionStale,
     });
-    if (!sendResult.success && !(dispatch.accepted && sendResult.superseded)) {
-      if (!dispatch.accepted && cancelResume?.()) {
-        await this.clearPendingFollowUpFromSummary(lastMessage, dispatch);
+    if (!sendResult.success) {
+      if (cancelResume?.()) {
+        await this.clearPendingFollowUpFromSummary(lastMessage);
         return false;
       }
       // A stale-admission refusal is the idle rule (or a goal transition)
       // working as intended, not a recovery failure: route it through the
       // same skip path as the pre-send check instead of throwing.
-      if (!dispatch.accepted && followUpAdmissionStale()) {
+      if (followUpAdmissionStale?.() === true) {
         log.info("Pending follow-up refused at send admission; skipping it", {
           workspaceId: this.workspaceId,
           summaryMessageId: lastMessage.id,
@@ -9676,17 +9618,13 @@ export class AgentSession {
         await this.skipIdleRuleFollowUp(
           lastMessage,
           this.hasPendingManualFollowUp() || this.hasExternalSendPreflight?.() === true,
-          this.isBusy() && this.coordinator.phase !== "completing",
-          dispatch
+          this.isBusy() && this.coordinator.phase !== "completing"
         );
         return false;
       }
       const message = this.extractRetryFailureMessage(sendResult.error) ?? sendResult.error.type;
       throw new Error(`Failed to dispatch pending follow-up: ${message}`);
     }
-
-    // Ok can also mean a pre-acceptance no-op; it must not claim a continued turn.
-    if (!dispatch.accepted) return false;
 
     // Codex P2 (PRRT_kwDOPxxmWM6cRJEE): if the original wrap-up dispatcher
     // crashed between send acceptance and its tryMarkBudgetLimitInjected
@@ -9725,31 +9663,28 @@ export class AgentSession {
   private async skipIdleRuleFollowUp(
     summaryMessage: MuxMessage,
     hasUserContention: boolean,
-    hasActiveNonCompletingTurn: boolean,
-    dispatch: CompactionFollowUpDispatch
+    hasActiveNonCompletingTurn: boolean
   ): Promise<void> {
     if (
       summaryMessage.metadata?.compacted === "heartbeat" &&
       hasUserContention &&
       !hasActiveNonCompletingTurn
     ) {
+      const turn = this.coordinator.turnId;
       const rollbackResult = await this.compactionHandler.rollbackHeartbeatContextResetBoundary(
         summaryMessage,
-        () => !dispatch.accepted && this.coordinator.canClearCompactionFollowUp(dispatch.token)
+        () => this.coordinator.turnId === turn
       );
       if (!rollbackResult.success) {
         throw new Error(`Failed to rollback heartbeat reset boundary: ${rollbackResult.error}`);
       }
       if (rollbackResult.data === "applied") this.onPostCompactionStateChange?.();
     } else {
-      await this.clearPendingFollowUpFromSummary(summaryMessage, dispatch);
+      await this.clearPendingFollowUpFromSummary(summaryMessage);
     }
   }
 
-  private async clearPendingFollowUpFromSummary(
-    summaryMessage: MuxMessage,
-    dispatch: CompactionFollowUpDispatch
-  ): Promise<void> {
+  private async clearPendingFollowUpFromSummary(summaryMessage: MuxMessage): Promise<void> {
     assert(
       summaryMessage.role === "assistant",
       "clearPendingFollowUpFromSummary requires an assistant summary message"
@@ -9765,11 +9700,12 @@ export class AgentSession {
       return;
     }
 
+    const turn = this.coordinator.turnId;
     const updateResult = await this.historyService.cleanupCompactionFollowUp(
       this.workspaceId,
       summaryMessage,
       "clear",
-      () => !dispatch.accepted && this.coordinator.canClearCompactionFollowUp(dispatch.token)
+      () => this.coordinator.turnId === turn
     );
     if (!updateResult.success) {
       throw new Error(`Failed to clear skipped pending follow-up: ${updateResult.error}`);
