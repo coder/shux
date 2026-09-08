@@ -190,11 +190,13 @@ describe("unactivated compaction pending-file protocol", () => {
     expect(await bytes()).toBe(raw);
   });
 
-  it("treats a directory sidecar as absent across repeated recovery loads", async () => {
+  it("repairs an empty directory sidecar across repeated recovery loads", async () => {
     await fs.mkdir(filePath);
     expect(await store.load(() => true)).toBeUndefined();
     expect(await restart().load(() => true)).toBeUndefined();
-    expect((await fs.stat(filePath)).isDirectory()).toBe(true);
+    expect(await fs.stat(filePath).catch((error: unknown) => error)).toMatchObject({
+      code: "ENOENT",
+    });
     expect(
       (
         await h.historyService.appendToHistory(
@@ -203,10 +205,46 @@ describe("unactivated compaction pending-file protocol", () => {
         )
       ).success
     ).toBe(true);
-    await fs.rmdir(filePath);
     await prepare("fresh");
     await boundary("fresh");
     expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/fresh.ts"]);
+  });
+
+  it.each(["prepare", "discard"] as const)(
+    "repairs an empty directory sidecar without an earlier load (%s)",
+    async (operation) => {
+      await fs.mkdir(filePath);
+      if (operation === "discard") {
+        await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+        await store.discardAfterBoundary();
+        await store.discardAfterBoundary();
+        expect(await fs.stat(filePath).catch((error: unknown) => error)).toMatchObject({
+          code: "ENOENT",
+        });
+      }
+      const receipt = await prepare("fresh");
+      await boundary("fresh");
+      expect((await restart().load(() => true))?.attachments).toEqual(receipt.attachments);
+      expect(await store.consume(receipt)).toBe(true);
+      await prepare("next");
+      await boundary("next");
+      expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/next.ts"]);
+    }
+  );
+
+  it("preserves unrelated contents in a nonempty directory sidecar", async () => {
+    await fs.mkdir(filePath);
+    const unrelated = path.join(filePath, "keep.txt");
+    await fs.writeFile(unrelated, "unrelated content");
+    expect(await store.load(() => true)).toBeUndefined();
+    expect(await restart().load(() => true)).toBeUndefined();
+    expect(await prepare("refused").catch((error: unknown) => error)).toBeInstanceOf(Error);
+    await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+    expect(await store.discardAfterBoundary().catch((error: unknown) => error)).toBeInstanceOf(
+      Error
+    );
+    expect(await fs.readFile(unrelated, "utf8")).toBe("unrelated content");
+    expect((await fs.stat(filePath)).isDirectory()).toBe(true);
   });
 
   it.each(["corrupt JSON", "invalid V1", "stale generation"] as const)(

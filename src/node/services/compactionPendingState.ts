@@ -268,7 +268,12 @@ export class CompactionPendingState {
   }
 
   private async readBytes(): Promise<string | undefined> {
-    return fs.readFile(this.filePath, "utf8").catch((error: NodeJS.ErrnoException) => {
+    return fs.readFile(this.filePath, "utf8").catch(async (error: NodeJS.ErrnoException) => {
+      if (error.code === "EISDIR") {
+        // Only empty directories are safe to remove; preserve unrelated contents and errors.
+        await fs.rmdir(this.filePath);
+        return undefined;
+      }
       if (error.code !== "ENOENT") throw error;
       return undefined;
     });
