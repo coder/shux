@@ -2839,7 +2839,9 @@ export class HistoryService {
     const expected = summary.metadata?.muxMetadata;
     const sequence = summary.metadata?.historySequence;
     assert(summary.role === "assistant", "Follow-up cleanup requires an assistant summary");
-    assert(isNonNegativeInteger(sequence), "Follow-up cleanup requires a persisted summary");
+    // Corrupt persisted sequences cannot prove ownership; skip without blocking recovery
+    // or falling back to an ID-only mutation that could target a different summary.
+    if (!isNonNegativeInteger(sequence)) return Ok("skipped");
     assert(isCompactionSummaryMetadata(expected), "Follow-up cleanup requires summary metadata");
     assert(
       action !== "rollback-heartbeat" || summary.metadata?.compacted === "heartbeat",

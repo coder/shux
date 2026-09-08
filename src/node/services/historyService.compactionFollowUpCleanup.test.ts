@@ -110,6 +110,58 @@ describe("conditional compaction follow-up cleanup", () => {
   });
 
   for (const action of actions) {
+    test.each([undefined, null, -1, 0.5, "0"])(
+      `${action} skips invalid persisted sequence %p and permits later healthy cleanup`,
+      async (sequence) => {
+        const expected = summary();
+        await store.historyService.appendToHistory(workspaceId, expected);
+        const historyPath = path.join(store.config.sessionsDir, workspaceId, "chat.jsonl");
+        // Corrupt the persisted identity, then use the same reader as resumed cleanup.
+        const corrupted =
+          JSON.stringify({
+            ...expected,
+            workspaceId,
+            metadata: { ...expected.metadata, historySequence: sequence },
+          }) + "\n";
+        await fs.writeFile(historyPath, corrupted);
+        const loaded = await store.historyService.getLastMessages(workspaceId, 1);
+        assert(loaded.success && loaded.data.length === 1, "Expected persisted summary");
+        const invalid = loaded.data[0];
+        const persistedSequence: unknown = invalid.metadata?.historySequence;
+        expect(persistedSequence).toBe(sequence);
+        expect(
+          await store.historyService.cleanupCompactionFollowUp(
+            workspaceId,
+            invalid,
+            action,
+            () => true
+          )
+        ).toEqual(Ok("skipped"));
+        expect(await fs.readFile(historyPath, "utf8")).toBe(corrupted);
+
+        // Reusing the ID must not let a later healthy cleanup touch the unproven row.
+        const healthy = summary();
+        expect(await store.historyService.appendToHistory(workspaceId, healthy)).toEqual(
+          Ok(undefined)
+        );
+        expect(
+          await store.historyService.cleanupCompactionFollowUp(
+            workspaceId,
+            healthy,
+            action,
+            () => true
+          )
+        ).toEqual(Ok("applied"));
+        const history = await store.historyService.getLastMessages(workspaceId, 10);
+        assert(history.success, "Expected history after healthy cleanup");
+        expect(history.data[0]).toEqual(invalid);
+        expect(history.data).toHaveLength(action === "clear" ? 2 : 1);
+        if (action === "clear") {
+          expect(history.data[1].metadata?.muxMetadata).not.toHaveProperty("pendingFollowUp");
+        }
+      }
+    );
+
     test.each(["id", "sequence", "request"] as const)(
       `${action} skips a replaced %s after waiting for the history lock`,
       async (changed) => {
