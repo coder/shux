@@ -1738,8 +1738,11 @@ export class ProviderModelFactory {
                       typeof promptCacheKey === "string" &&
                       promptCacheKey.length > 0
                     ) {
-                      // Project names may contain Unicode or control characters invalid in headers.
-                      headers.set("session-id", encodeURIComponent(promptCacheKey));
+                      // UTF-8 replaces lone surrogates before encoding project names for HTTP headers.
+                      headers.set(
+                        "session-id",
+                        encodeURIComponent(Buffer.from(promptCacheKey).toString())
+                      );
                     }
                     nextInit = {
                       ...init,
