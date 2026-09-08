@@ -934,6 +934,21 @@ export class Config {
   readonly sessionsDir: string;
   readonly srcDir: string;
   private readonly configFile: string;
+  /**
+   * Cheap durable change signal for config.json: one stat, no parse. Any
+   * backend's rewrite changes size/mtime (atomic replace also changes the
+   * inode), so a memo built against a previous stamp knows to rebuild —
+   * unlike onConfigChanged, which only fires for THIS process's edits. A
+   * missing/unreadable file yields a distinct stamp.
+   */
+  configFileStamp(): string {
+    try {
+      const st = fs.statSync(this.configFile, { bigint: true });
+      return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
+    } catch {
+      return "missing";
+    }
+  }
   private readonly providersConfigStore: ProvidersConfigStore;
   private readonly emitter = new EventEmitter();
   /**

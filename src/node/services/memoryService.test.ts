@@ -958,6 +958,32 @@ describe("MemoryService", () => {
       ).toBe(true);
     });
 
+    it("re-resolves the owner after an EXTERNAL config rewrite (another backend removed it)", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+
+      // Rewrite config.json directly: no local onConfigChanged fires, only the
+      // file's stamp changes — as when a second backend deregisters the owner.
+      const configFile = path.join(fixture.xumHome, "config.json");
+      // On disk, projects are [path, project] tuples.
+      const raw = JSON.parse(await fsPromises.readFile(configFile, "utf-8")) as {
+        projects: Array<[string, { workspaces: Array<{ id: string }> }]>;
+      };
+      const project = raw.projects.find(([projectPath]) => projectPath === FIXTURE_PROJECT_PATH);
+      expect(project).toBeDefined();
+      project![1].workspaces = project![1].workspaces.filter((ws) => ws.id !== "ws-owner");
+      await fsPromises.writeFile(configFile, JSON.stringify(raw, null, 2));
+      // Same-tick same-size rewrites can leave mtime unchanged; force a distinct stamp.
+      await fsPromises.utimes(
+        configFile,
+        new Date(Date.now() + 5_000),
+        new Date(Date.now() + 5_000)
+      );
+
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+    });
+
     it("refuses a child's rollback into the shared store once the owner is tombstoned", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

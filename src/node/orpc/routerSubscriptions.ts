@@ -208,15 +208,21 @@ export function subscribeMemoryChanges(
     const metadata = workspaceId ? await context.workspaceService.getInfo(workspaceId) : null;
     const projectPath = metadata ? resolveMemoryProjectIdentity(metadata) : null;
     // Workspace-scope events carry the memory OWNER (task-tree root), which is
-    // also the store this subscriber's workspace displays.
-    const ownerWorkspaceId = workspaceId
-      ? context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId)
-      : null;
+    // also the store this subscriber's workspace displays. Resolved per event
+    // (memoized, cheap): the owner can change while the tab stays open — a
+    // removed owner makes the child fall back to its own store.
     yield* runtimeSubscription(context, {
       signal,
       subscribe: (emit) => {
         const onChange = (event: MemoryChangeEvent) => {
-          if (event.scope === "workspace" && event.workspaceId !== ownerWorkspaceId) return;
+          if (
+            event.scope === "workspace" &&
+            event.workspaceId !==
+              (workspaceId
+                ? context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId)
+                : null)
+          )
+            return;
           if (event.scope === "project" && event.projectPath !== projectPath) return;
           emit.push(event);
         };

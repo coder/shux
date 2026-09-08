@@ -591,6 +591,8 @@ export class MemoryService extends EventEmitter {
     // shared-checkout descendant keeps running; its deregistration lands as a
     // config change, after which the child must re-resolve (and fall back to
     // its own store) instead of writing into the tombstoned owner forever.
+    // Local edits notify here; edits by ANOTHER backend (multi-instance) are
+    // caught by the config-file stamp check in resolveWorkspaceMemoryOwnerId.
     this.config.onConfigChanged(() => this.workspaceMemoryOwnerById.clear());
   }
 
@@ -608,6 +610,8 @@ export class MemoryService extends EventEmitter {
    * cached — the workspace may simply not be registered yet.
    */
   private readonly workspaceMemoryOwnerById = new Map<string, string>();
+  /** Config-file stamp (Config.configFileStamp) the memo was built against. */
+  private workspaceMemoryOwnerConfigStamp: string | null = null;
 
   /**
    * Memoized resolveWorkspaceMemoryOwnerId (see memoryWorkspaceOwner.ts). The
@@ -620,6 +624,11 @@ export class MemoryService extends EventEmitter {
     loadConfig: () => ReturnType<Config["loadConfigOrDefault"]> = () =>
       this.config.loadConfigOrDefault()
   ): string {
+    const stamp = this.config.configFileStamp();
+    if (stamp !== this.workspaceMemoryOwnerConfigStamp) {
+      this.workspaceMemoryOwnerById.clear();
+      this.workspaceMemoryOwnerConfigStamp = stamp;
+    }
     const cached = this.workspaceMemoryOwnerById.get(workspaceId);
     if (cached !== undefined) return cached;
     const cfg = loadConfig();
@@ -1008,14 +1017,6 @@ export class MemoryService extends EventEmitter {
   }
 
   /**
-   * Announces that a project's memory was mutated outside this service. The settings-backup
-   * restore writes memory files directly (under the shared memory mutation lock), and
-   * subscribers only refresh from disk on change events, so without this an open memory
-   * browser keeps showing pre-restore contents. One event per project, addressed to the
-   * scope root: subscribers refetch the whole scope per event, so per-file events for a
-   * bulk restore would only multiply identical refreshes.
-   */
-  /**
    * Announces memory files mutated outside this service by a refinement
    * rollback (which applies inverses straight to disk). Physical paths are
    * classified against this context's scope roots and one root-addressed
@@ -1041,6 +1042,25 @@ export class MemoryService extends EventEmitter {
     for (const scope of touched) this.emitChange(ctx, scope, "", "agent");
   }
 
+  /**
+   * Announces a sidecar-only change (pin toggled from the Memory tab) so other
+   * subscribers of the same store — for the shared workspace notebook, every
+   * task-tree member's tab — refetch their listing.
+   */
+  notifyPinChange(ctx: MemoryScopeContext, virtualPath: string): void {
+    const parsed = parseMemoryPath(virtualPath);
+    const scope = this.requireFilePath(parsed, virtualPath);
+    this.emitChange(ctx, scope, parsed.relPath, "user");
+  }
+
+  /**
+   * Announces that a project's memory was mutated outside this service. The settings-backup
+   * restore writes memory files directly (under the shared memory mutation lock), and
+   * subscribers only refresh from disk on change events, so without this an open memory
+   * browser keeps showing pre-restore contents. One event per project, addressed to the
+   * scope root: subscribers refetch the whole scope per event, so per-file events for a
+   * bulk restore would only multiply identical refreshes.
+   */
   notifyExternalProjectChange(projectPath: string): void {
     const event: MemoryChangeEvent = {
       scope: "project",
