@@ -16,6 +16,7 @@ import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
@@ -1347,6 +1348,18 @@ describe("AgentSession token-budget lifecycle", () => {
       uiVisible: false,
       muxMetadata: { ...correlation, contextBudgetContinuation: true, contextBudgetFlush: true },
     });
+    // The hidden flush turn keeps only the memory write it exists for (plus read-only history).
+    const toolNames = [
+      "memory",
+      "session_history",
+      "bash",
+      "file_edit_replace_string",
+      "mcp__x__y",
+    ];
+    expect(applyToolPolicyToNames(toolNames, h.requests[1].toolPolicy)).toEqual([
+      "memory",
+      "session_history",
+    ]);
     // The flush turn's own settlement re-evaluates as rollover without queuing a second flush.
     expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
@@ -1367,6 +1380,8 @@ describe("AgentSession token-budget lifecycle", () => {
       muxMetadata: { ...correlation, contextBudgetContinuation: true },
     });
     expect(text(rows.at(-1)!)).toBe("Continue");
+    // The rollover continuation runs with the inherited (unrestricted) policy again.
+    expect(applyToolPolicyToNames(toolNames, h.requests[2].toolPolicy)).toEqual(toolNames);
     expect(
       sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages).some((row) =>
         text(row).startsWith("Flush context notes")

@@ -9,7 +9,7 @@ import { createContextBudgetRejectedMessage } from "@/common/utils/messages/cont
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
-import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
+import { isSessionHistoryDisabled, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
@@ -5804,6 +5804,16 @@ export class AgentSession {
     // Keep the continuation's delegated-turn/goal attribution; the warning
     // itself is a separate durable prefix row when this entry dispatches.
     const streamOptions = context.options;
+    // SECURITY: the flush turn is a hidden, automatically dispatched step running on a
+    // transcript that may already contain injected tool output. Prose asking for a single
+    // memory call is not a capability boundary, so its tool policy keeps only `memory` (the
+    // write it exists for) and read-only `session_history`; every other tool is disabled.
+    // Leaving those two names untouched keeps the inherited policy's session_history verdict
+    // intact for the rollover admission re-check at dispatch.
+    const flushToolPolicy: ToolPolicy = [
+      ...(streamOptions.toolPolicy ?? []),
+      { regex_match: "(?!memory$|session_history$).*", action: "disable" },
+    ];
     const enqueue = (text: string, dedupeKey: string, flush: boolean) =>
       this.messageQueue.addOnce(
         text,
@@ -5811,6 +5821,7 @@ export class AgentSession {
           ...streamOptions,
           model: step.model,
           queueDispatchMode: "tool-end",
+          ...(flush ? { toolPolicy: flushToolPolicy } : {}),
           muxMetadata: {
             ...(context.workspaceTurnMetadata ?? { type: "normal" }),
             contextBudgetContinuation: true,
