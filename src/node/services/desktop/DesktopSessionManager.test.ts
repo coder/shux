@@ -651,13 +651,25 @@ describe("DesktopSessionManager browser viewer releases", () => {
         expect(manager.hasAttachedViewers("child")).toBe(false);
         expect(manager.hasAttachedViewers("owner")).toBe(false);
 
-        // A pane that gives its registration up definitively leaves no grace either.
+        // A pane that gives its registration up definitively leaves no grace either...
         const definitive = await registerViewer("isolated");
         manager.detachViewer(definitive.viewerId);
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
         definitive.controller.abort();
         await definitive.watcher.return(undefined);
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
+        // ...and retracts the grace its superseded registration stamped: a ready registration
+        // that dropped while the bootstrap was pending is replaced at once, and the terminal
+        // outcome arrives through the replacement.
+        const superseded = await registerViewer("isolated");
+        superseded.controller.abort();
+        await superseded.watcher.return(undefined);
+        expect(manager.hasAttachedViewers("isolated")).toBe(true);
+        const replacement = await registerViewer("isolated");
+        manager.detachViewer(replacement.viewerId);
+        expect(manager.hasAttachedViewers("isolated")).toBe(false);
+        replacement.controller.abort();
+        await replacement.watcher.return(undefined);
 
         // A viewer that simply loses its subscription keeps the grace regardless of what its
         // bootstrap reported: only the client knows whether it will retry (a previously
@@ -763,6 +775,40 @@ describe("DesktopSessionManager browser viewer releases", () => {
         await drain;
       } finally {
         controller.abort();
+        await manager.closeAll();
+      }
+    });
+  });
+
+  test("a borrower's detachment grace follows it to the owner it currently resolves to", async () => {
+    if (process.platform === "win32") return;
+    await withDesktopManagerHarness(async ({ config }) => {
+      await registerSharedWorkspaces(config);
+      const now = 1_000_000;
+      const manager = new DesktopSessionManager({
+        config,
+        experimentsService: createExperimentsService(true),
+        workspaceService: createWorkspaceService(() => Promise.resolve(null)),
+        now: () => now,
+      });
+      try {
+        // The borrower lost both transports while bound to the owner.
+        manager.noteDetached("child", "owner");
+        expect(manager.hasAttachedViewers("owner")).toBe(true);
+        expect(manager.hasAttachedViewers("child")).toBe(true);
+        // Its binding is removed before it reconnects: the old owner is no longer protected by
+        // that grace, while the borrower itself (which its reconnect now targets) still is.
+        await config.editConfig((current) => {
+          const project = current.projects.get("/tmp/project-1");
+          if (!project) throw new Error("Missing test project");
+          const child = project.workspaces.find((workspace) => workspace.id === "child");
+          if (!child) throw new Error("Missing child workspace");
+          delete child.taskDesktopOwnerWorkspaceId;
+          return current;
+        });
+        expect(manager.hasAttachedViewers("owner")).toBe(false);
+        expect(manager.hasAttachedViewers("child")).toBe(true);
+      } finally {
         await manager.closeAll();
       }
     });

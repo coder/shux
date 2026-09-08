@@ -37,6 +37,14 @@ interface DesktopViewerRegistration {
   acknowledge?: () => void;
 }
 
+interface DetachmentGrace {
+  expiresAt: number;
+  /** Owner captured at stamp time: the fallback when the requester can no longer be resolved. */
+  capturedOwnerWorkspaceId: string;
+  /** False once the owner this grace covered closed explicitly: its desktop is gone for good. */
+  coversOwner: boolean;
+}
+
 export class DesktopSessionManager {
   private readonly viewers = new Map<string, DesktopViewerRegistration>();
   private readonly sessions = new Map<string, PortableDesktopSession>();
@@ -57,12 +65,14 @@ export class DesktopSessionManager {
   private readonly windowOwners = new Map<string, string>();
   private readonly closingWorkspaces = new Map<string, Promise<void>>();
   /**
-   * workspaceId → (requester whose attachment detached → grace expiry). Keyed by requester so an
-   * explicit close of a workspace can retract exactly the graces its own attachments produced —
-   * on itself and on the owner it borrowed — whenever they were stamped, without touching graces
-   * other requesters left on the same owner (see noteDetached / retractDetachments).
+   * Requester whose attachment detached → its grace. Keyed by requester (not by the workspaces
+   * it keeps attached) so an explicit close or a definitive detach can retract exactly the grace
+   * that requester's attachments produced without touching graces other requesters left on the
+   * same owner, and so the owner it covers is re-resolved at query time: a grace stamped while the
+   * borrower targeted owner A must follow the borrower to owner B when the binding changes before
+   * it reconnects (see noteDetached / hasRecentDetachment).
    */
-  private readonly recentDetachments = new Map<string, Map<string, number>>();
+  private readonly recentDetachments = new Map<string, DetachmentGrace>();
   /**
    * Closes in flight, keyed by the closing workspace → requesters whose attachments to it
    * detached during the teardown (borrowers' viewers and bridges when an owner closes). One
@@ -115,7 +125,15 @@ export class DesktopSessionManager {
    * backend never infers "will not reconnect" from a bootstrap outcome.
    */
   detachViewer(viewerId: string): void {
+    const viewer = this.viewers.get(viewerId);
+    if (!viewer) return;
     this.viewers.delete(viewerId);
+    // The pane may already have stamped a grace under this requester: a ready registration
+    // that dropped while its bootstrap was pending is replaced immediately, and the terminal
+    // outcome then arrives through the replacement. That grace is stale too; retracting the
+    // requester's grace cannot un-attach another pane of the same requester, because a pane
+    // that will reconnect keeps its own live registration through the whole reconnect loop.
+    this.recentDetachments.delete(viewer.workspaceId);
   }
 
   private releaseViewer(viewer: DesktopViewerRegistration): Promise<void> {
@@ -461,23 +479,16 @@ export class DesktopSessionManager {
   noteDetached(requesterWorkspaceId: string, capturedOwnerWorkspaceId: string): void {
     assert(requesterWorkspaceId.length > 0, "noteDetached requires the detached requester");
     assert(capturedOwnerWorkspaceId.length > 0, "noteDetached requires the attachment's owner");
+    this.recentDetachments.set(requesterWorkspaceId, {
+      expiresAt: this.now() + DESKTOP_ATTACHMENT_GRACE_MS,
+      capturedOwnerWorkspaceId,
+      coversOwner: true,
+    });
     // Classify against the requester's CURRENT owner: a bridge revoked because the borrower was
-    // rebound will reconnect to the new owner, so the old one gets no grace from it.
+    // rebound will reconnect to the new owner, so a teardown of the old one does not own it.
     const ownerWorkspaceId = this.currentOwnerOf(requesterWorkspaceId, capturedOwnerWorkspaceId);
-    const targets =
-      ownerWorkspaceId === requesterWorkspaceId
-        ? [requesterWorkspaceId]
-        : [requesterWorkspaceId, ownerWorkspaceId];
-    const expiresAt = this.now() + DESKTOP_ATTACHMENT_GRACE_MS;
-    for (const workspaceId of targets) {
-      let byRequester = this.recentDetachments.get(workspaceId);
-      if (!byRequester) {
-        byRequester = new Map();
-        this.recentDetachments.set(workspaceId, byRequester);
-      }
-      byRequester.set(requesterWorkspaceId, expiresAt);
-      this.teardownRequesters.get(workspaceId)?.add(requesterWorkspaceId);
-    }
+    this.teardownRequesters.get(requesterWorkspaceId)?.add(requesterWorkspaceId);
+    this.teardownRequesters.get(ownerWorkspaceId)?.add(requesterWorkspaceId);
   }
 
   private noteViewerDetached(viewer: DesktopViewerRegistration): void {
@@ -485,15 +496,17 @@ export class DesktopSessionManager {
   }
 
   /**
-   * A finished explicit close of `workspaceId` is definitive: nothing of its own is attached
-   * any more, and every attachment it held as a requester on some owner is gone too. Retract
-   * those graces (whenever they were stamped); graces other requesters left stay untouched.
+   * A finished explicit close of `closedWorkspaceId` is definitive: nothing of its own is
+   * attached any more, every attachment its released requesters held is gone too, and its
+   * desktop is gone, so a grace a borrower stamped earlier no longer covers it (that borrower's
+   * own workspace stays covered). Graces other requesters left on other owners stay untouched.
    */
-  private retractDetachments(requesterWorkspaceId: string): void {
-    this.recentDetachments.delete(requesterWorkspaceId);
-    for (const [target, byRequester] of this.recentDetachments) {
-      byRequester.delete(requesterWorkspaceId);
-      if (byRequester.size === 0) this.recentDetachments.delete(target);
+  private retractDetachments(closedWorkspaceId: string, releasedRequesters: Set<string>): void {
+    for (const requester of releasedRequesters) this.recentDetachments.delete(requester);
+    for (const [requester, grace] of this.recentDetachments) {
+      if (this.currentOwnerOf(requester, grace.capturedOwnerWorkspaceId) === closedWorkspaceId) {
+        grace.coversOwner = false;
+      }
     }
   }
 
@@ -501,18 +514,30 @@ export class DesktopSessionManager {
     return this.deps.now?.() ?? Date.now();
   }
 
+  /**
+   * Whether an unexpired grace covers `workspaceId`: the detached requester itself, or the owner
+   * that requester CURRENTLY resolves to. Resolving at query time (like viewerTargets) keeps a
+   * borrower rebound mid-reconnect from protecting its old owner while leaving the new one open
+   * to an agent-driven archive; the captured owner is only the fallback for a requester that can
+   * no longer be resolved.
+   */
   private hasRecentDetachment(workspaceId: string): boolean {
-    const byRequester = this.recentDetachments.get(workspaceId);
-    if (!byRequester) return false;
     const now = this.now();
-    for (const [requester, expiresAt] of byRequester) {
-      if (expiresAt <= now) byRequester.delete(requester);
+    let covered = false;
+    for (const [requester, grace] of this.recentDetachments) {
+      if (grace.expiresAt <= now) {
+        this.recentDetachments.delete(requester);
+        continue;
+      }
+      if (requester === workspaceId) covered = true;
+      else if (
+        grace.coversOwner &&
+        this.currentOwnerOf(requester, grace.capturedOwnerWorkspaceId) === workspaceId
+      ) {
+        covered = true;
+      }
     }
-    if (byRequester.size === 0) {
-      this.recentDetachments.delete(workspaceId);
-      return false;
-    }
-    return true;
+    return covered;
   }
 
   /**
@@ -652,7 +677,7 @@ export class DesktopSessionManager {
         await this.closeSession(workspaceId);
         this.teardownRequesters.delete(workspaceId);
         // The teardown's detachments (and any these requesters left earlier) are definitive.
-        for (const requester of releasedRequesters) this.retractDetachments(requester);
+        this.retractDetachments(workspaceId, releasedRequesters);
       }
     });
     this.closingWorkspaces.set(workspaceId, closing);
