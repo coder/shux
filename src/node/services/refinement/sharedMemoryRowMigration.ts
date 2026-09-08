@@ -43,6 +43,7 @@ function isInside(root: string, filePath: string): boolean {
  */
 export async function migrateSharedMemoryRefinementRows(args: {
   childSessionDir: string;
+  childWorkspaceId: string;
   ownerSessionDir: string;
   ownerWorkspaceId: string;
 }): Promise<number> {
@@ -58,17 +59,47 @@ export async function migrateSharedMemoryRefinementRows(args: {
     args.ownerWorkspaceId.length > 0,
     "migrateSharedMemoryRefinementRows requires ownerWorkspaceId"
   );
+  assert(
+    args.childWorkspaceId.length > 0,
+    "migrateSharedMemoryRefinementRows requires childWorkspaceId"
+  );
   const ownerMemoryRoot = path.join(path.resolve(args.ownerSessionDir), "memory");
   const rows = await listRefinements(args.childSessionDir);
-  const rolledBack = new Set(
-    rows.map((row) => row.data.rollbackOf).filter((id): id is string => id !== undefined)
+  // Liveness follows the whole rollback chain (rollback → rollback of the
+  // rollback re-applies): an original row is live when it has been rolled
+  // back an even number of times. Rollback rows themselves are never copied.
+  const rollbackByTarget = new Map(
+    rows
+      .filter((row) => row.data.rollbackOf !== undefined)
+      .map((row) => [row.data.rollbackOf as string, row] as const)
+  );
+  const isLive = (rowId: string): boolean => {
+    let depth = 0;
+    for (
+      let next = rollbackByTarget.get(rowId);
+      next !== undefined;
+      next = rollbackByTarget.get(next.id)
+    ) {
+      depth++;
+    }
+    return depth % 2 === 0;
+  };
+  // Idempotent across retried removals (the child journal survives a
+  // retryable removal failure or a crash before deletion): rows already
+  // copied are identified by their source identity on the owner side.
+  const alreadyMigrated = new Set(
+    (await listRefinements(args.ownerSessionDir))
+      .map((row) => row.data.migratedFrom)
+      .filter((id): id is string => id !== undefined)
   );
   const childJournal = sharedDurableEventJournal(args.childSessionDir);
   let migrated = 0;
   for (const row of rows) {
-    if (row.data.kind !== "memory" || row.data.rollbackOf !== undefined || rolledBack.has(row.id)) {
+    if (row.data.kind !== "memory" || row.data.rollbackOf !== undefined || !isLive(row.id)) {
       continue;
     }
+    const migratedFrom = `${args.childWorkspaceId}:${row.id}`;
+    if (alreadyMigrated.has(migratedFrom)) continue;
     const inverse = RefinementInverseSchema.safeParse(row.data.inverse);
     const action = MemoryRefinementActionSchema.safeParse(row.data.action);
     if (!inverse.success || !action.success) continue;
@@ -120,6 +151,7 @@ export async function migrateSharedMemoryRefinementRows(args: {
           : {}),
       },
       ...(postState.success ? { postState: postState.data } : {}),
+      migratedFrom,
       ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),
     });
     migrated++;

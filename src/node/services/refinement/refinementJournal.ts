@@ -76,6 +76,8 @@ export interface RefinementEmitArgs {
    * when `postFiles` is given.
    */
   postState?: RefinementPostState;
+  /** Source identity of a row copied from a removed sub-agent's journal (see durableEvent.ts). */
+  migratedFrom?: string;
   /**
    * "remote" when the mutation ran through a non-local runtime (SSH/Docker).
    * Such rows carry runtime-namespace paths and are refused by rollback,
@@ -271,6 +273,7 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
           inverse,
           evidence,
           ...(postState !== undefined ? { postState } : {}),
+          ...(args.migratedFrom !== undefined ? { migratedFrom: args.migratedFrom } : {}),
           ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
         },
       });

@@ -1067,13 +1067,42 @@ describe("MemoryService", () => {
       });
       expect(rolledBack.success).toBe(true);
 
+      // A rollback of the rollback re-applies "redone.md": it is live again.
+      await fixture.service.create(fixture.ctx, "/memories/workspace/redone.md", "r", "agent");
+      const redone = (await readRefinementEvents(childSessionDir)).find(
+        (row) =>
+          (row.data.action as { path?: string }).path === "/memories/workspace/redone.md" &&
+          row.data.rollbackOf === undefined
+      )!;
+      const undoRedone = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        id: redone.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(undoRedone.success).toBe(true);
+      if (!undoRedone.success) return;
       expect(
-        await migrateSharedMemoryRefinementRows({
+        (
+          await rollbackRefinement({
+            sessionDir: childSessionDir,
+            sharedWorkspaceMemorySessionDir: ownerSessionDir,
+            id: undoRedone.data.rollbackRowId ?? "",
+            evidence: { toolName: "test", actor: "user" },
+          })
+        ).success
+      ).toBe(true);
+
+      const migrate = () =>
+        migrateSharedMemoryRefinementRows({
           childSessionDir,
+          childWorkspaceId: "ws-child",
           ownerSessionDir,
           ownerWorkspaceId: "ws-owner",
-        })
-      ).toBe(2);
+        });
+      expect(await migrate()).toBe(3);
+      // Idempotent: a retried removal migrates nothing twice.
+      expect(await migrate()).toBe(0);
       const ownerRows = await readRefinementEvents(ownerSessionDir);
       expect(
         ownerRows.map((row) => [
@@ -1084,7 +1113,9 @@ describe("MemoryService", () => {
       ).toEqual([
         ["create", "/memories/workspace/keep.md", "ws-owner"],
         ["str_replace", "/memories/workspace/keep.md", "ws-owner"],
+        ["create", "/memories/workspace/redone.md", "ws-owner"],
       ]);
+      expect(ownerRows.every((row) => row.data.migratedFrom?.startsWith("ws-child:"))).toBe(true);
 
       // The child is gone; the owner rolls the edit back from its own journal
       // (payload blobs were copied, postState hashes preserved).

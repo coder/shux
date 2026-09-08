@@ -884,13 +884,17 @@ export class MemoryService extends EventEmitter {
    *   removal here at commit time and refuses instead of recreating the
    *   deleted session directory via its write or journal append.
    *
-   * Both the acting workspace and the workspace-memory owner are checked: a
-   * removed sub-agent must not keep writing into its parent's notebook, and
-   * a removed owner must not have its session directory recreated by a
-   * lingering child's write.
+   * Both the acting workspace and the workspace that physically owns the
+   * RESOLVED store are checked: a removed sub-agent must not keep writing
+   * into its parent's notebook, and a removed owner must not have its session
+   * directory recreated by a lingering child's write. The owner is derived
+   * from the store the command already bound to — not re-resolved — so an
+   * ownership change between resolution and lock acquisition cannot make the
+   * check pass for the new owner while the write lands in the old one.
    */
   private async assertMutationCommittable(
     ctx: MemoryScopeContext,
+    store: MemoryStore,
     signal: AbortSignal | undefined,
     virtualPath: string
   ): Promise<void> {
@@ -900,7 +904,13 @@ export class MemoryService extends EventEmitter {
       );
     }
     if (ctx.workspaceId === "") return;
-    for (const workspaceId of new Set([ctx.workspaceId, this.ownerWorkspaceIdFor(ctx)])) {
+    const guarded = new Set([ctx.workspaceId]);
+    // <sessionsDir>/<owner>/memory → owner; global/project roots live elsewhere.
+    const rel = path.relative(this.config.sessionsDir, store.physicalRoot);
+    if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+      guarded.add(rel.split(path.sep)[0]);
+    }
+    for (const workspaceId of guarded) {
       if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
         throw new MemoryCommandError(
           `Workspace ${workspaceId} was removed; refusing to commit the mutation of ${virtualPath}`
@@ -1169,7 +1179,7 @@ export class MemoryService extends EventEmitter {
         // only INSIDE the lock and after the removal check (r62), so the
         // mkdir serializes with removal's locked deletion and cannot
         // recreate a removed session directory.
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.ensureRoot();
         const existing = await store.kind(parsed.relPath);
         if (existing !== null) {
@@ -1183,7 +1193,7 @@ export class MemoryService extends EventEmitter {
             `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
           );
         }
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, fileText);
         // Row is written before the create is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1224,7 +1234,7 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const updated = computeStrReplaceUpdate(content, oldStr, newStr, virtualPath);
         assertWithinFileSizeCap(updated);
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1277,7 +1287,7 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
         assertWithinFileSizeCap(updated);
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1460,7 +1470,7 @@ export class MemoryService extends EventEmitter {
         // Prior contents must be captured before removal; the row itself is
         // written after the mutation succeeds and before it is acknowledged.
         const inverse = await this.captureDeleteInverse(store, parsed.relPath, kind);
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.remove(parsed.relPath);
         if (inverse !== null) {
           await this.journalRefinement(
@@ -1522,7 +1532,7 @@ export class MemoryService extends EventEmitter {
         if (newKind !== null) {
           throw new MemoryCommandError(`Destination ${newVirtualPath} already exists`);
         }
-        await this.assertMutationCommittable(ctx, abortSignal, oldVirtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, oldVirtualPath);
         await store.rename(oldParsed.relPath, newParsed.relPath);
         // Row is written before the rename is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1646,7 +1656,7 @@ export class MemoryService extends EventEmitter {
         async () => {
           // UI save can create new files: materialize the scope root on
           // first use — in-lock, after the removal check (r62; see create).
-          await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+          await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
           await store.ensureRoot();
           const kind = await store.kind(parsed.relPath);
           if (kind === "dir") {
@@ -1673,7 +1683,7 @@ export class MemoryService extends EventEmitter {
               );
             }
           }
-          await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+          await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
           await store.writeFile(parsed.relPath, content);
           await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
           this.emitChange(ctx, scope, parsed.relPath, actor);

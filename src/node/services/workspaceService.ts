@@ -6328,6 +6328,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           try {
             await migrateSharedMemoryRefinementRows({
               childSessionDir: sessionDir,
+              childWorkspaceId: workspaceId,
               ownerSessionDir: path.join(this.config.sessionsDir, memoryOwnerId),
               ownerWorkspaceId: memoryOwnerId,
             });

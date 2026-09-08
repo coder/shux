@@ -87,6 +87,12 @@ export const RefinementDataSchema = z.object({
   evidence: JsonValueSchema.optional(),
   /** Envelope `id` of the entry this one rolls back. */
   rollbackOf: z.string().optional(),
+  /**
+   * Stable source identity (`<workspaceId>:<row id>`) when this row was
+   * copied from a removed sub-agent's journal into its memory owner's
+   * (sharedMemoryRowMigration.ts); lets a retried migration skip it.
+   */
+  migratedFrom: z.string().optional(),
   /** Expected post-action file hashes (RefinementPostStateSchema in refinement.ts). */
   postState: JsonValueSchema.optional(),
   /**
