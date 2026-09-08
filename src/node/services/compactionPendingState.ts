@@ -1,0 +1,354 @@
+import { randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import {
+  MAX_EDITED_FILES,
+  MAX_FILE_CONTENT_SIZE,
+  MAX_POST_COMPACTION_LOADED_SKILLS,
+} from "@/common/constants/attachments";
+import type { LoadedSkillSnapshot } from "@/common/types/attachment";
+import type { FileEditDiff } from "@/common/utils/messages/extractEditedFiles";
+import { mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
+import {
+  createLoadedSkillSnapshot,
+  mergeLoadedSkillSnapshots,
+} from "./agentSkills/loadedSkillSnapshots";
+import {
+  publishCompactionFile,
+  type ContinuousCompactionPublication,
+} from "./continuousCompactionJournal";
+
+export interface CompactionPendingAttachments {
+  diffs: FileEditDiff[];
+  loadedSkills: LoadedSkillSnapshot[];
+  readFiles: string[];
+}
+
+interface PersistedState extends CompactionPendingAttachments {
+  version: 1;
+  createdAt: number;
+  boundaryMessageId?: string;
+  writeId?: string;
+  publicationGeneration?: string | null;
+  previousState?: PersistedState;
+  previousStateGeneration?: string | null;
+}
+
+export interface CompactionPendingHistoryView {
+  generation: string | undefined;
+  /** Latest durable context boundary, read under the same lock as the generation. */
+  boundaryMessageId: string | undefined;
+  isPublicationCurrent(publication: ContinuousCompactionPublication): Promise<boolean>;
+}
+
+export interface CompactionPendingHistory {
+  /**
+   * Hold BOTH existing history locks throughout the callback, reject removed workspaces,
+   * and provide a stable view without reacquiring history/journal queues inside the lock.
+   * Deliberately has no runtime adapter yet: every producer/consumer must activate together.
+   */
+  withLock<T>(operation: (view: CompactionPendingHistoryView) => Promise<T>): Promise<T>;
+}
+
+/** Only receipts returned by this store authorize consumption or rollback. */
+export interface CompactionPendingReceipt {
+  readonly attachments: CompactionPendingAttachments;
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function parseState(value: unknown, allowPrevious = true): PersistedState | undefined {
+  const input = record(value);
+  if (input?.version !== 1 || typeof input.createdAt !== "number") return;
+  for (const key of ["boundaryMessageId", "writeId"] as const) {
+    if (input[key] !== undefined && (typeof input[key] !== "string" || !input[key])) return;
+  }
+  for (const key of ["publicationGeneration", "previousStateGeneration"] as const) {
+    if (input[key] !== undefined && input[key] !== null && typeof input[key] !== "string") return;
+  }
+  const diffs: FileEditDiff[] = [];
+  for (const item of Array.isArray(input.diffs) ? input.diffs : []) {
+    const diff = record(item);
+    if (
+      !diff ||
+      typeof diff.path !== "string" ||
+      !diff.path.trim() ||
+      typeof diff.diff !== "string" ||
+      typeof diff.truncated !== "boolean"
+    )
+      continue;
+    diffs.push({
+      path: diff.path.trim(),
+      diff: diff.diff.slice(0, MAX_FILE_CONTENT_SIZE),
+      truncated: diff.truncated || diff.diff.length > MAX_FILE_CONTENT_SIZE,
+    });
+    if (diffs.length >= MAX_EDITED_FILES) break;
+  }
+  const skills: LoadedSkillSnapshot[] = [];
+  for (const item of Array.isArray(input.loadedSkills) ? input.loadedSkills : []) {
+    const skill = record(item);
+    if (
+      !skill ||
+      typeof skill.name !== "string" ||
+      !skill.name.trim() ||
+      typeof skill.body !== "string"
+    )
+      continue;
+    try {
+      skills.push(
+        createLoadedSkillSnapshot({
+          name: skill.name,
+          scope: skill.scope,
+          body: skill.body,
+          frontmatterYaml:
+            typeof skill.frontmatterYaml === "string" ? skill.frontmatterYaml : undefined,
+          alreadyNormalized: true,
+          truncated: skill.truncated === true,
+        })
+      );
+    } catch {
+      continue;
+    }
+    if (skills.length >= MAX_POST_COMPACTION_LOADED_SKILLS) break;
+  }
+  return {
+    version: 1,
+    createdAt: input.createdAt,
+    diffs,
+    loadedSkills: mergeLoadedSkillSnapshots(skills),
+    readFiles: mergeReadFilePaths(
+      [],
+      (Array.isArray(input.readFiles) ? input.readFiles : []).filter(
+        (item): item is string => typeof item === "string"
+      )
+    ),
+    boundaryMessageId: input.boundaryMessageId as string | undefined,
+    writeId: input.writeId as string | undefined,
+    publicationGeneration: input.publicationGeneration as string | null | undefined,
+    previousStateGeneration: input.previousStateGeneration as string | null | undefined,
+    previousState: allowPrevious ? parseState(input.previousState, false) : undefined,
+  };
+}
+
+function decode(raw: string | undefined): PersistedState | undefined {
+  try {
+    return raw === undefined ? undefined : parseState(JSON.parse(raw));
+  } catch {
+    return undefined;
+  }
+}
+
+/** A fallback is mutable bookkeeping; the immutable head is the receipt's identity. */
+function head(state: PersistedState): PersistedState {
+  return { ...state, previousState: undefined, previousStateGeneration: undefined };
+}
+
+function identity(state: PersistedState): string {
+  return JSON.stringify([
+    state.writeId,
+    state.createdAt,
+    state.boundaryMessageId,
+    state.publicationGeneration,
+    state.diffs,
+    state.loadedSkills,
+    state.readFiles,
+  ]);
+}
+
+function eligibleState(
+  state: PersistedState | undefined,
+  view: CompactionPendingHistoryView
+): PersistedState | undefined {
+  if (!state) return;
+  if (!state.boundaryMessageId || state.boundaryMessageId === view.boundaryMessageId) return state;
+  const previous = state.previousState;
+  // Old standalone V1 files remain readable. An untagged legacy fallback needs positive
+  // boundary proof; absence alone must not restore pre-reset context after a crash.
+  if (
+    previous &&
+    (state.previousStateGeneration !== undefined
+      ? state.previousStateGeneration === (view.generation ?? null)
+      : previous.boundaryMessageId !== undefined) &&
+    (!previous.boundaryMessageId || previous.boundaryMessageId === view.boundaryMessageId)
+  )
+    return previous;
+}
+
+/**
+ * Inactive pending-file protocol. CompactionHandler owns local caches/preparation; this owns disk.
+ * Failures propagate so callers can distinguish best-effort attachment writes from mandatory
+ * reset cleanup. Never call these queued operations from inside a held history lock.
+ */
+export class CompactionPendingState {
+  private pending: Promise<unknown> = Promise.resolve();
+  private readonly receipts = new WeakMap<
+    CompactionPendingReceipt,
+    {
+      identity: string;
+      generation: string | undefined;
+      prepared: boolean;
+    }
+  >();
+
+  constructor(
+    private readonly filePath: string,
+    private readonly history: CompactionPendingHistory
+  ) {}
+
+  private enqueue<T>(operation: (view: CompactionPendingHistoryView) => Promise<T>): Promise<T> {
+    const result = this.pending.then(() => this.history.withLock(operation));
+    this.pending = result.catch(() => undefined);
+    return result;
+  }
+
+  private async readBytes(): Promise<string | undefined> {
+    return fs.readFile(this.filePath, "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+      return undefined;
+    });
+  }
+
+  private receipt(
+    state: PersistedState,
+    generation: string | undefined,
+    prepared = false
+  ): CompactionPendingReceipt {
+    const receipt = {
+      attachments: {
+        diffs: state.diffs,
+        loadedSkills: state.loadedSkills,
+        readFiles: state.readFiles,
+      },
+    };
+    this.receipts.set(receipt, { identity: identity(state), generation, prepared });
+    return receipt;
+  }
+
+  load(isCurrent: () => boolean): Promise<CompactionPendingReceipt | undefined> {
+    return this.enqueue(async (view) => {
+      const raw = await this.readBytes();
+      if (!isCurrent()) return;
+      const persisted = decode(raw);
+      const state = eligibleState(persisted, view);
+      if (state) return this.receipt(state, view.generation);
+      // A live writer may still be between pending-file publication and boundary commit.
+      // Missing boundary proof suppresses injection; it does not authorize deleting its file.
+      if (
+        raw !== undefined &&
+        (!persisted ||
+          (persisted.publicationGeneration !== undefined &&
+            persisted.publicationGeneration !== (view.generation ?? null)))
+      ) {
+        await fs.unlink(this.filePath);
+      }
+    });
+  }
+
+  prepare(input: {
+    attachments: CompactionPendingAttachments;
+    boundaryMessageId: string;
+    publication: ContinuousCompactionPublication;
+    isCurrent: () => boolean;
+  }): Promise<CompactionPendingReceipt | undefined> {
+    // Freeze before enqueueing: a caller may reuse its arrays while another write holds the lock.
+    const captured = structuredClone(input.attachments);
+    const publication = structuredClone(input.publication);
+    const boundaryMessageId = input.boundaryMessageId;
+    const isCurrent = input.isCurrent;
+    if (!boundaryMessageId.trim()) throw new Error("Pending state requires a boundary message ID");
+    return this.enqueue(async (view) => {
+      if (!isCurrent() || !(await view.isPublicationCurrent(publication))) return;
+      await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+      const previous = eligibleState(decode(await this.readBytes()), view);
+      if (!isCurrent()) return;
+      const state = parseState({
+        ...captured,
+        version: 1,
+        createdAt: Date.now(),
+        boundaryMessageId,
+        writeId: randomUUID(),
+        publicationGeneration: publication.generation ?? null,
+        previousState: previous && head(previous),
+        previousStateGeneration: previous ? (view.generation ?? null) : undefined,
+      });
+      if (!state) throw new Error("Invalid pending state");
+      let receipt: CompactionPendingReceipt | undefined;
+      // Staging also awaits I/O. The helper checks local ownership immediately before rename
+      // and publishes the receipt before cleanup/lock release can admit a successor.
+      await publishCompactionFile(this.filePath, JSON.stringify(state), isCurrent, () => {
+        receipt = this.receipt(state, publication.generation, true);
+      });
+      return receipt;
+    });
+  }
+
+  consume(receipt: CompactionPendingReceipt): Promise<boolean> {
+    const expected = this.receipts.get(receipt);
+    if (!expected) return Promise.resolve(false);
+    return this.enqueue(async () => {
+      const state = decode(await this.readBytes());
+      if (!state) return false;
+      if (identity(state) === expected.identity) {
+        await fs.unlink(this.filePath);
+        return true;
+      }
+      if (!state.previousState || identity(state.previousState) !== expected.identity) return false;
+      // A may be consumed while B is provisional. Remove only A's fallback, durably, so
+      // B's later rollback/restart cannot resurrect it. B retains its immutable write identity.
+      await publishCompactionFile(this.filePath, JSON.stringify(head(state)), () => true);
+      return true;
+    });
+  }
+
+  rollback(receipt: CompactionPendingReceipt, canRestorePrevious: () => boolean): Promise<boolean> {
+    const expected = this.receipts.get(receipt);
+    if (!expected?.prepared) return Promise.resolve(false);
+    return this.enqueue(async (view) => {
+      const state = decode(await this.readBytes());
+      if (!state || identity(state) !== expected.identity) return false;
+      if (state.boundaryMessageId === view.boundaryMessageId) return false;
+      // Restoring a committed heartbeat also needs the caller's exact history rollback proof.
+      // A generation change permits exact cleanup, never restoration of the prior context.
+      const previous = state.previousState;
+      if (
+        previous &&
+        expected.generation === view.generation &&
+        canRestorePrevious() &&
+        (!previous.boundaryMessageId || previous.boundaryMessageId === view.boundaryMessageId)
+      ) {
+        if (
+          await publishCompactionFile(
+            this.filePath,
+            JSON.stringify(head(previous)),
+            canRestorePrevious
+          )
+        )
+          return true;
+      }
+      await fs.unlink(this.filePath);
+      return true;
+    });
+  }
+
+  /** Call only after the destructive boundary/generation change committed under the history lock. */
+  discardAfterBoundary(): Promise<void> {
+    return this.enqueue(async (view) => {
+      const raw = await this.readBytes();
+      if (raw === undefined) return;
+      const state = decode(raw);
+      if (
+        state &&
+        ((state.boundaryMessageId !== undefined &&
+          state.boundaryMessageId === view.boundaryMessageId) ||
+          (state.publicationGeneration !== undefined &&
+            state.publicationGeneration === (view.generation ?? null)))
+      )
+        return;
+      await fs.unlink(this.filePath);
+    });
+  }
+}

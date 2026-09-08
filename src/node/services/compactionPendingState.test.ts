@@ -1,0 +1,430 @@
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
+import { createMuxMessage } from "@/common/types/message";
+import { isDurableContextBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import {
+  CompactionPendingState,
+  type CompactionPendingAttachments,
+  type CompactionPendingHistory,
+  type CompactionPendingReceipt,
+} from "./compactionPendingState";
+import { HistoryService } from "./historyService";
+import { readProviderHistoryFromLatestBoundary } from "./historyScanner";
+import { createTestHistoryService } from "./testHistoryService";
+import { historyWriteLockPath, isWorkspaceRemovalTombstoned } from "./workspaceRemoval";
+
+describe("unactivated compaction pending-file protocol", () => {
+  const workspaceId = "pending-protocol";
+  let h: Awaited<ReturnType<typeof createTestHistoryService>>;
+  let filePath: string;
+  let store: CompactionPendingState;
+
+  // This test adapter uses the existing locks and real history/journal readers. Production
+  // activation must expose the equivalent transaction on HistoryService; it must not nest locks.
+  function historyAdapter(history = h.historyService): CompactionPendingHistory {
+    return {
+      withLock: (operation) =>
+        workspaceFileLocks.withLock(workspaceId, async () => {
+          await using _lock = await acquireProcessFileLock({
+            lockPath: historyWriteLockPath(h.config.rootDir, workspaceId),
+            timeoutMs: 5000,
+            label: "pending protocol test",
+          });
+          if (await isWorkspaceRemovalTombstoned(h.config.rootDir, workspaceId))
+            throw new Error("Removed workspace");
+          const journal = history.getContinuousCompactionJournal(workspaceId);
+          const rows = await readProviderHistoryFromLatestBoundary(
+            {
+              chat: path.join(h.config.sessionsDir, workspaceId, CHAT_FILE_NAME),
+              archive: path.join(h.config.sessionsDir, workspaceId, CHAT_ARCHIVE_FILE_NAME),
+            },
+            0
+          );
+          return await operation({
+            generation: await journal.captureGenerationUnderHistoryLock(),
+            boundaryMessageId: rows.findLast(isDurableContextBoundaryMarker)?.id,
+            isPublicationCurrent: (publication) =>
+              journal.isPublicationCurrentUnderHistoryLock(publication),
+          });
+        }),
+    };
+  }
+
+  function attachments(name: string): CompactionPendingAttachments {
+    return {
+      diffs: [{ path: `/${name}.ts`, diff: `+${name}`, truncated: false }],
+      loadedSkills: [],
+      readFiles: [`/${name}.ts`],
+    };
+  }
+
+  async function prepare(name: string, target = store): Promise<CompactionPendingReceipt> {
+    const receipt = await target.prepare({
+      attachments: attachments(name),
+      boundaryMessageId: name,
+      publication: {
+        generation: await h.historyService
+          .getContinuousCompactionJournal(workspaceId)
+          .captureGeneration(),
+      },
+      isCurrent: () => true,
+    });
+    assert(receipt);
+    return receipt;
+  }
+
+  async function boundary(id: string) {
+    expect(
+      (
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage(id, "assistant", id, {
+            compacted: "user",
+            compactionBoundary: true,
+            compactionEpoch: 1,
+          })
+        )
+      ).success
+    ).toBe(true);
+  }
+
+  async function bytes() {
+    return fs.readFile(filePath, "utf8");
+  }
+  function restart() {
+    return new CompactionPendingState(filePath, historyAdapter(new HistoryService(h.config)));
+  }
+
+  beforeEach(async () => {
+    h = await createTestHistoryService();
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("seed", "user", "Context")
+    );
+    filePath = path.join(h.config.sessionsDir, workspaceId, "post-compaction.json");
+    store = new CompactionPendingState(filePath, historyAdapter());
+  });
+  afterEach(async () => {
+    mock.restore();
+    await h.cleanup();
+  });
+
+  it("loads old V1 files, sanitizes individual attachments, and consumes across reload", async () => {
+    await fs.writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        createdAt: 1,
+        diffs: [null, { path: " /valid.ts ", diff: "+valid", truncated: false }, { path: 3 }],
+        loadedSkills: [null, { name: " guide ", scope: "project", body: "Keep context" }],
+      })
+    );
+    const loaded = await store.load(() => true);
+    assert(loaded);
+    expect(loaded.attachments.diffs).toEqual([
+      { path: "/valid.ts", diff: "+valid", truncated: false },
+    ]);
+    expect(loaded.attachments.loadedSkills.map((skill) => skill.name)).toEqual(["guide"]);
+    expect(loaded.attachments.readFiles).toEqual([]);
+    expect(await store.consume(loaded)).toBe(true);
+    expect(await restart().load(() => true)).toBeUndefined();
+  });
+
+  it.each([
+    "{",
+    JSON.stringify({ version: 2 }),
+    JSON.stringify({ version: 1, createdAt: 1, publicationGeneration: false }),
+  ])("heals unusable persisted state (%s)", async (raw) => {
+    await fs.writeFile(filePath, raw);
+    expect(await store.load(() => true)).toBeUndefined();
+    expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+    await prepare("fresh");
+    await boundary("fresh");
+    expect((await store.load(() => true))?.attachments.readFiles).toEqual(["/fresh.ts"]);
+  });
+
+  it("does not use provisional attachments before their exact boundary commits", async () => {
+    const receipt = await prepare("pending");
+    const raw = await bytes();
+    expect(await restart().load(() => true)).toBeUndefined();
+    expect(await bytes()).toBe(raw);
+    await boundary("pending");
+    expect((await restart().load(() => true))?.attachments).toEqual(receipt.attachments);
+    expect(await store.rollback(receipt, () => true)).toBe(false);
+  });
+
+  it.each([false, true])(
+    "equal payloads and timestamps have distinct ownership (foreign=%s)",
+    async (foreign) => {
+      spyOn(Date, "now").mockReturnValue(1000);
+      const first = await prepare("same");
+      const secondStore = foreign ? restart() : store;
+      const second = await prepare("same", secondStore);
+      const latest = await bytes();
+      expect(await store.consume(first)).toBe(false);
+      expect(await store.rollback(first, () => true)).toBe(false);
+      expect(await bytes()).toBe(latest);
+      expect(await secondStore.consume(second)).toBe(true);
+      expect(await store.consume(first)).toBe(false);
+    }
+  );
+
+  it.each([false, true])(
+    "consuming A removes only B's crash fallback (foreign=%s)",
+    async (foreign) => {
+      const a = await prepare("a");
+      await boundary("a");
+      const bStore = foreign ? restart() : store;
+      const b = await prepare("b", bStore);
+      expect((await restart().load(() => true))?.attachments).toEqual(a.attachments);
+      expect(await store.consume(a)).toBe(true);
+      // B remains intact and its receipt still owns rollback, but A cannot be resurrected.
+      expect(JSON.parse(await bytes())).toMatchObject({
+        boundaryMessageId: "b",
+        readFiles: ["/b.ts"],
+      });
+      expect(await bStore.rollback(b, () => true)).toBe(true);
+      expect(await restart().load(() => true)).toBeUndefined();
+    }
+  );
+
+  it("consuming a loaded fallback preserves a provisional successor that later commits", async () => {
+    await prepare("a");
+    await boundary("a");
+    await prepare("b");
+    const other = restart();
+    const fallback = await other.load(() => true);
+    assert(fallback);
+    expect(await other.consume(fallback)).toBe(true);
+    await boundary("b");
+    expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/b.ts"]);
+  });
+
+  it.each(["current", "generation changed", "local owner consumed"] as const)(
+    "qualifies rollback of legacy predecessor (%s)",
+    async (scenario) => {
+      await fs.writeFile(
+        filePath,
+        JSON.stringify({ version: 1, createdAt: 1, ...attachments("legacy") })
+      );
+      const b = await prepare("b");
+      if (scenario === "generation changed")
+        await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+      expect(await store.rollback(b, () => scenario !== "local owner consumed")).toBe(true);
+      expect((await restart().load(() => true))?.attachments.readFiles).toEqual(
+        scenario === "current" ? ["/legacy.ts"] : undefined
+      );
+    }
+  );
+
+  it.each([false, true])(
+    "crash fallback requires its captured generation (changed=%s)",
+    async (changed) => {
+      await fs.writeFile(
+        filePath,
+        JSON.stringify({ version: 1, createdAt: 1, ...attachments("legacy") })
+      );
+      await prepare("b");
+      if (changed)
+        await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+      expect((await restart().load(() => true))?.attachments.readFiles).toEqual(
+        changed ? undefined : ["/legacy.ts"]
+      );
+    }
+  );
+
+  it("rejects a stale publication but accepts a newly captured one", async () => {
+    const generation = await h.historyService
+      .getContinuousCompactionJournal(workspaceId)
+      .captureGeneration();
+    await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+    expect(
+      await store.prepare({
+        attachments: attachments("stale"),
+        boundaryMessageId: "stale",
+        publication: { generation },
+        isCurrent: () => true,
+      })
+    ).toBeUndefined();
+    expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+    await prepare("fresh");
+    await boundary("fresh");
+    expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/fresh.ts"]);
+  });
+
+  it("checks ownership again after staging, before the pending file changes", async () => {
+    await prepare("a");
+    await boundary("a");
+    const original = await bytes();
+    const existingFiles = new Set(readdirSync(path.dirname(filePath)));
+    // Revoke as soon as preparatory file I/O occurs. A guard checked only before staging
+    // would publish B; the current file must still contain A when preparation settles.
+    const isCurrent = () =>
+      readdirSync(path.dirname(filePath)).every((name) => existingFiles.has(name));
+    expect(
+      await store.prepare({
+        attachments: attachments("b"),
+        boundaryMessageId: "b",
+        publication: {
+          generation: await h.historyService
+            .getContinuousCompactionJournal(workspaceId)
+            .captureGeneration(),
+        },
+        isCurrent,
+      })
+    ).toBeUndefined();
+    expect(await bytes()).toBe(original);
+    expect(new Set(readdirSync(path.dirname(filePath)))).toEqual(existingFiles);
+    await prepare("successor");
+    await boundary("successor");
+    expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/successor.ts"]);
+  });
+
+  it("restoration retains the predecessor's consumption authority", async () => {
+    const a = await prepare("a");
+    await boundary("a");
+    const b = await prepare("b");
+    expect(await store.rollback(b, () => true)).toBe(true);
+    expect((await restart().load(() => true))?.attachments).toEqual(a.attachments);
+    expect(await store.consume(a)).toBe(true);
+    expect(await restart().load(() => true)).toBeUndefined();
+  });
+
+  it.each([false, true])(
+    "legacy fallback without a generation needs boundary proof (linked=%s)",
+    async (linked) => {
+      await boundary("a");
+      await fs.writeFile(
+        filePath,
+        JSON.stringify({
+          version: 1,
+          createdAt: 2,
+          ...attachments("uncommitted"),
+          boundaryMessageId: "b",
+          previousState: {
+            version: 1,
+            createdAt: 1,
+            ...attachments("a"),
+            ...(linked && { boundaryMessageId: "a" }),
+          },
+        })
+      );
+      expect((await store.load(() => true))?.attachments.readFiles).toEqual(
+        linked ? ["/a.ts"] : undefined
+      );
+    }
+  );
+
+  it.each(["prepare", "load"] as const)(
+    "rechecks local ownership after a held file read (%s)",
+    async (operation) => {
+      await prepare("a");
+      await boundary("a");
+      const original = await bytes();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const readFile = fs.readFile;
+      let held = false;
+      // Preserve every readFile overload: the wrapper only delays the delegated result.
+      spyOn(fs, "readFile").mockImplementation((async (...args: Parameters<typeof fs.readFile>) => {
+        const result = await readFile(...args);
+        if (args[0] === filePath && !held) {
+          held = true;
+          entered.resolve();
+          await release.promise;
+        }
+        return result;
+      }) as typeof fs.readFile);
+      let current = true;
+      const publication = {
+        generation: await h.historyService
+          .getContinuousCompactionJournal(workspaceId)
+          .captureGeneration(),
+      };
+      const pending =
+        operation === "load"
+          ? store.load(() => current)
+          : store.prepare({
+              attachments: attachments("retired"),
+              boundaryMessageId: "retired",
+              publication,
+              isCurrent: () => current,
+            });
+      try {
+        await entered.promise;
+        current = false;
+        release.resolve();
+        expect(await pending).toBeUndefined();
+        expect(await bytes()).toBe(original);
+      } finally {
+        release.resolve();
+        await pending;
+      }
+      await prepare("successor");
+      await boundary("successor");
+      expect((await store.load(() => true))?.attachments.readFiles).toEqual(["/successor.ts"]);
+    }
+  );
+
+  it("serializes a held unlink before a successor publication", async () => {
+    const a = await prepare("a");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const unlink = fs.unlink;
+    spyOn(fs, "unlink").mockImplementation(async (file) => {
+      if (file === filePath) {
+        entered.resolve();
+        await release.promise;
+      }
+      return unlink(file);
+    });
+    const consuming = store.consume(a);
+    let successor: Promise<CompactionPendingReceipt> | undefined;
+    try {
+      await entered.promise;
+      successor = prepare("b", restart());
+      release.resolve();
+      expect(await consuming).toBe(true);
+      await successor;
+      await boundary("b");
+      expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/b.ts"]);
+    } finally {
+      release.resolve();
+      await consuming;
+      await successor;
+    }
+  });
+
+  it("durable reset cleanup preserves later publications and retries real unlink failures", async () => {
+    await prepare("old");
+    await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+    const unlink = fs.unlink;
+    let failed = false;
+    spyOn(fs, "unlink").mockImplementation((file) => {
+      if (file === filePath && !failed) {
+        failed = true;
+        return Promise.reject(new Error("disk unavailable"));
+      }
+      return unlink(file);
+    });
+    expect(await store.discardAfterBoundary().catch((error: unknown) => error)).toMatchObject({
+      message: "disk unavailable",
+    });
+    await store.discardAfterBoundary();
+    expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+    await prepare("new");
+    const current = await bytes();
+    await store.discardAfterBoundary();
+    expect(await bytes()).toBe(current);
+    await boundary("new");
+    await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+    await store.discardAfterBoundary();
+    expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/new.ts"]);
+  });
+});
