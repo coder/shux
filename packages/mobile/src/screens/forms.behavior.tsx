@@ -301,6 +301,46 @@ test("sheet contents and footer do not dismiss it; the backdrop does, unless dis
   expect(dismissals).toBe(1);
 });
 
+type CreationPolicy = Awaited<ReturnType<MobileClient["policy"]["get"]>>;
+const unrestrictedCreationPolicy: CreationPolicy = {
+  source: "none",
+  status: { state: "disabled" },
+  policy: null,
+};
+
+function creationRuntimePolicy(
+  runtimes: NonNullable<CreationPolicy["policy"]>["runtimes"]
+): CreationPolicy {
+  return {
+    source: "env",
+    status: { state: "enforced" },
+    policy: {
+      policyFormatVersion: "0.1",
+      providerAccess: null,
+      runtimes,
+      mcp: { allowUserDefined: { stdio: true, remote: true } },
+    },
+  };
+}
+
+// Existing creation tests exercise trust, branches, and form submission under an unrestricted policy.
+function createFormClient(
+  link: Parameters<typeof createORPCClient<MobileClient>>[0]
+): MobileClient {
+  return createORPCClient<MobileClient>({
+    call: async (path, input, options) => {
+      if (path.join(".") === "policy.get") return unrestrictedCreationPolicy;
+      if (path.join(".") === "policy.onChanged")
+        return new ReadableStream<void>({
+          start(controller) {
+            options.signal?.addEventListener("abort", () => controller.close(), { once: true });
+          },
+        }).values();
+      return link.call(path, input, options);
+    },
+  });
+}
+
 test("workspace creation cannot be dismissed or submitted twice while the server is creating it", async () => {
   let resolve!: (value: { success: true; metadata: FrontendWorkspaceMetadata }) => void;
   const created = new Promise<{ success: true; metadata: FrontendWorkspaceMetadata }>((done) => {
@@ -309,7 +349,7 @@ test("workspace creation cannot be dismissed or submitted twice while the server
   let calls = 0;
   let dismissals = 0;
   let selected: FrontendWorkspaceMetadata | undefined;
-  const client = createORPCClient<MobileClient>({
+  const client = createFormClient({
     call: async (path) => {
       if (path.join(".") !== "workspace.createScratch") throw new Error("Unexpected procedure");
       calls++;
@@ -330,6 +370,11 @@ test("workspace creation cannot be dismissed or submitted twice while the server
         selected = value;
       }}
     />
+  );
+  await waitFor(() =>
+    expect(
+      view.getByRole("button", { name: "Create scratch chat" }).getAttribute("aria-disabled")
+    ).not.toBe("true")
   );
   fireEvent.click(view.getByRole("button", { name: "Create scratch chat" }));
   fireEvent.click(view.getByRole("button", { name: "Create scratch chat" }));
@@ -353,7 +398,7 @@ test.each([false, true])(
       resolve = done;
     });
     const selected: FrontendWorkspaceMetadata[] = [];
-    const client = createORPCClient<MobileClient>({
+    const client = createFormClient({
       call: async (path, input) => {
         const method = path.join(".");
         if (method === "projects.listBranches")
@@ -399,6 +444,13 @@ test.each([false, true])(
     fireEvent.keyDown(finalInput, { key: "Enter", keyCode: 13 });
     expect(calls).toHaveLength(0);
     view.rerender(renderForm(true));
+    await waitFor(() =>
+      expect(
+        view
+          .getByRole("button", { name: project ? "Create worktree" : "Create scratch chat" })
+          .getAttribute("aria-disabled")
+      ).not.toBe("true")
+    );
     if (project) {
       fireEvent.change(finalInput, { target: { value: "   " } });
       fireEvent.keyDown(finalInput, { key: "Enter", keyCode: 13 });
@@ -432,7 +484,7 @@ test.each(["restore", "reselect"])(
   "removed project blocks creation without losing drafts, then %s recovers",
   async (recovery) => {
     const calls: unknown[] = [];
-    const client = createORPCClient<MobileClient>({
+    const client = createFormClient({
       call: async (path, input) => {
         if (path.join(".") === "projects.listBranches")
           return { branches: ["main"], recommendedTrunk: "main" };
@@ -511,7 +563,7 @@ test.each(["root", "subproject"])(
   async (kind) => {
     const calls: unknown[] = [];
     let branchReads = 0;
-    const client = createORPCClient<MobileClient>({
+    const client = createFormClient({
       call: async (path, input) => {
         if (path.join(".") === "projects.listBranches") {
           branchReads++;
@@ -620,7 +672,7 @@ test.each(["empty", "error"])(
       reject = no;
     });
     const calls: string[] = [];
-    const client = createORPCClient<MobileClient>({
+    const client = createFormClient({
       call: async (path) => {
         const method = path.join(".");
         if (method === "projects.listBranches") return result;
@@ -676,7 +728,7 @@ test("late branch results cannot change a newly selected project's eligibility",
   });
   const reads: Array<AbortSignal | undefined> = [];
   const calls: unknown[] = [];
-  const client = createORPCClient<MobileClient>({
+  const client = createFormClient({
     call: async (path, input, options) => {
       if (path.join(".") === "projects.listBranches") {
         reads.push(options.signal);
@@ -726,6 +778,271 @@ test("late branch results cannot change a newly selected project's eligibility",
   });
   expect(calls).toHaveLength(1);
   expect(calls[0]).toMatchObject({ projectPath: "/new", trunkBranch: "main" });
+});
+
+function creationPolicyClient() {
+  const order: string[] = [];
+  const reads: AbortSignal[] = [];
+  const calls: Array<{ method: string; input: unknown }> = [];
+  const subscriptions: Array<{ signal?: AbortSignal; emit: () => void; close: () => void }> = [];
+  let read = async (): Promise<CreationPolicy> => unrestrictedCreationPolicy;
+  let create = async (): Promise<unknown> => ({ success: true, metadata: workspace });
+  const client = createORPCClient<MobileClient>({
+    call: async (path, input, options) => {
+      const method = path.join(".");
+      if (method === "policy.onChanged") {
+        order.push(method);
+        return new ReadableStream<void>({
+          start(controller) {
+            let closed = false;
+            const close = () => {
+              if (!closed) {
+                closed = true;
+                controller.close();
+              }
+            };
+            subscriptions.push({ signal: options.signal, emit: () => controller.enqueue(), close });
+            options.signal?.addEventListener("abort", close, { once: true });
+          },
+        }).values();
+      }
+      if (method === "policy.get") {
+        if (!options.signal) throw new Error("Policy reads must be cancellable");
+        order.push(method);
+        reads.push(options.signal);
+        return read();
+      }
+      if (method === "projects.listBranches")
+        return { branches: ["main"], recommendedTrunk: "main" };
+      calls.push({ method, input });
+      return create();
+    },
+  });
+  return {
+    client,
+    calls,
+    reads,
+    order,
+    subscriptions,
+    setRead: (value: typeof read) => {
+      read = value;
+    },
+    setCreate: (value: typeof create) => {
+      create = value;
+    },
+  };
+}
+
+function policyCreationForm(
+  client: MobileClient,
+  signal: AbortSignal,
+  onCreated: (value: FrontendWorkspaceMetadata) => void = () => {}
+) {
+  return (
+    <CreateWorkspace
+      client={client}
+      signal={signal}
+      connected
+      projects={[["/project", { workspaces: [], displayName: "Example", trusted: true }]]}
+      onReconnect={async () => {}}
+      onClose={() => {}}
+      onCreated={onCreated}
+    />
+  );
+}
+
+test("creation policy subscribes before reading, fails closed, cancels stale reads, and heals on change", async () => {
+  const fixture = creationPolicyClient();
+  let resolveOld!: (value: CreationPolicy) => void;
+  fixture.setRead(
+    () =>
+      new Promise((resolve) => {
+        resolveOld = resolve;
+      })
+  );
+  const view = render(policyCreationForm(fixture.client, new AbortController().signal));
+  const title = view.getByLabelText("Title (optional)");
+  fireEvent.change(title, { target: { value: "Keep policy draft" } });
+  const button = view.getByRole("button", { name: "Create scratch chat" });
+  expect(button.getAttribute("aria-disabled")).toBe("true");
+  fireEvent.keyDown(title, { key: "Enter", keyCode: 13 });
+  expect(fixture.calls).toHaveLength(0);
+  await waitFor(() => expect(fixture.reads).toHaveLength(1));
+  expect(fixture.order).toEqual(["policy.onChanged", "policy.get"]);
+  fixture.setRead(() => Promise.reject(new Error("policy unavailable")));
+  await act(async () => {
+    fixture.subscriptions[0].emit();
+  });
+  await waitFor(() => expect(fixture.reads).toHaveLength(2));
+  expect(fixture.reads[0].aborted).toBe(true);
+  await waitFor(() => expect(view.getByRole("alert")).toBeDefined());
+  await act(async () => {
+    resolveOld(unrestrictedCreationPolicy);
+  });
+  fireEvent.click(button);
+  fireEvent.keyDown(title, { key: "Enter", keyCode: 13 });
+  expect(fixture.calls).toHaveLength(0);
+  fixture.setRead(async () => unrestrictedCreationPolicy);
+  await act(async () => {
+    fixture.subscriptions[0].emit();
+  });
+  await waitFor(() => expect(button.getAttribute("aria-disabled")).not.toBe("true"));
+  expect(view.getByDisplayValue("Keep policy draft")).toBeDefined();
+  expect(view.queryByRole("alert")).toBeNull();
+  await act(async () => {
+    fixture.subscriptions[0].close();
+  });
+  await waitFor(() => expect(button.getAttribute("aria-disabled")).toBe("true"));
+  expect(view.getByRole("alert")).toBeDefined();
+});
+
+test("live runtime policies gate only the selected creation path and version blocks gate both", async () => {
+  const fixture = creationPolicyClient();
+  fixture.setRead(async () => creationRuntimePolicy(["worktree"]));
+  const view = render(policyCreationForm(fixture.client, new AbortController().signal));
+  await waitFor(() => expect(fixture.reads).toHaveLength(1));
+  await waitFor(() => expect(view.getByRole("alert")).toBeDefined());
+  fireEvent.keyDown(view.getByLabelText("Title (optional)"), { key: "Enter", keyCode: 13 });
+  expect(fixture.calls).toHaveLength(0);
+  fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+  fireEvent.click(view.getByRole("button", { name: "Example" }));
+  await waitFor(() =>
+    expect(
+      view.getByRole("button", { name: "Create worktree" }).getAttribute("aria-disabled")
+    ).not.toBe("true")
+  );
+  fireEvent.change(view.getByLabelText("Title (optional)"), { target: { value: "Policy draft" } });
+  fireEvent.change(view.getByLabelText("Branch name (optional)"), {
+    target: { value: "keep-branch" },
+  });
+  fixture.setRead(async () => creationRuntimePolicy(["local"]));
+  await act(async () => {
+    fixture.subscriptions[0].emit();
+  });
+  await waitFor(() =>
+    expect(
+      view.getByRole("button", { name: "Create worktree" }).getAttribute("aria-disabled")
+    ).toBe("true")
+  );
+  fireEvent.keyDown(view.getByLabelText("Base branch"), { key: "Enter", keyCode: 13 });
+  expect(fixture.calls).toHaveLength(0);
+  expect(view.getByDisplayValue("keep-branch")).toBeDefined();
+  fixture.setRead(async () => ({
+    source: "env",
+    status: { state: "blocked", reason: "minimum_client_version requires an update" },
+    policy: null,
+  }));
+  await act(async () => {
+    fixture.subscriptions[0].emit();
+  });
+  await waitFor(() =>
+    expect(view.getByRole("alert").textContent).toContain("minimum_client_version")
+  );
+  fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+  fireEvent.click(view.getByRole("button", { name: "Scratch chat" }));
+  fireEvent.keyDown(view.getByLabelText("Title (optional)"), { key: "Enter", keyCode: 13 });
+  expect(fixture.calls).toHaveLength(0);
+  fixture.setRead(async () => creationRuntimePolicy(["local"]));
+  await act(async () => {
+    fixture.subscriptions[0].emit();
+  });
+  await waitFor(() =>
+    expect(
+      view.getByRole("button", { name: "Create scratch chat" }).getAttribute("aria-disabled")
+    ).not.toBe("true")
+  );
+  expect(view.getByDisplayValue("Policy draft")).toBeDefined();
+  await act(async () => {
+    fireEvent.keyDown(view.getByLabelText("Title (optional)"), { key: "Enter", keyCode: 13 });
+  });
+  expect(fixture.calls).toEqual([
+    { method: "workspace.createScratch", input: { title: "Policy draft" } },
+  ]);
+});
+
+test.each([
+  { source: "env", status: { state: "enforced" }, policy: null },
+  { source: "env", status: { state: "blocked", reason: "" }, policy: null },
+] satisfies CreationPolicy[])(
+  "incomplete or blocked policy keeps creation disabled with an explanation: %j",
+  async (policy) => {
+    const fixture = creationPolicyClient();
+    fixture.setRead(async () => policy);
+    const view = render(policyCreationForm(fixture.client, new AbortController().signal));
+    await waitFor(() => expect(view.getByRole("alert")).toBeDefined());
+    expect(view.getByRole("alert").textContent?.trim().length).toBeGreaterThan(0);
+    fireEvent.click(view.getByRole("button", { name: "Create scratch chat" }));
+    fireEvent.keyDown(view.getByLabelText("Title (optional)"), { key: "Enter", keyCode: 13 });
+    expect(fixture.calls).toHaveLength(0);
+  }
+);
+
+test("policy changes cannot reset an in-flight creation or misattribute its response", async () => {
+  const fixture = creationPolicyClient();
+  let resolveCreate!: (value: unknown) => void;
+  fixture.setCreate(
+    () =>
+      new Promise((resolve) => {
+        resolveCreate = resolve;
+      })
+  );
+  const created: FrontendWorkspaceMetadata[] = [];
+  const view = render(
+    policyCreationForm(fixture.client, new AbortController().signal, (value) => {
+      created.push(value);
+    })
+  );
+  const button = view.getByRole("button", { name: "Create scratch chat" });
+  await waitFor(() => expect(button.getAttribute("aria-disabled")).not.toBe("true"));
+  fireEvent.change(view.getByLabelText("Title (optional)"), {
+    target: { value: "Original intent" },
+  });
+  fireEvent.click(button);
+  expect(fixture.calls).toHaveLength(1);
+  fixture.setRead(async () => creationRuntimePolicy(["worktree"]));
+  await act(async () => {
+    fixture.subscriptions[0].emit();
+  });
+  await waitFor(() => expect(view.getByRole("alert")).toBeDefined());
+  fireEvent.click(button);
+  fireEvent.click(view.getByRole("button", { name: "Choose project" }));
+  fireEvent.keyDown(view.getByLabelText("Title (optional)"), { key: "Enter", keyCode: 13 });
+  expect(fixture.calls).toHaveLength(1);
+  await act(async () => {
+    resolveCreate({ success: true, metadata: workspace });
+  });
+  expect(created).toEqual([workspace]);
+  expect(fixture.calls[0].input).toEqual({ title: "Original intent" });
+});
+
+test("replacing a creation connection cancels policy work and rejects the old snapshot", async () => {
+  const old = creationPolicyClient();
+  let resolveOld!: (value: CreationPolicy) => void;
+  old.setRead(
+    () =>
+      new Promise((resolve) => {
+        resolveOld = resolve;
+      })
+  );
+  const first = new AbortController();
+  const view = render(policyCreationForm(old.client, first.signal));
+  await waitFor(() => expect(old.reads).toHaveLength(1));
+  const next = creationPolicyClient();
+  next.setRead(async () => creationRuntimePolicy([]));
+  view.rerender(policyCreationForm(next.client, new AbortController().signal));
+  await waitFor(() => expect(next.reads).toHaveLength(1));
+  expect(old.subscriptions[0].signal?.aborted).toBe(true);
+  expect(old.reads[0].aborted).toBe(true);
+  await act(async () => {
+    resolveOld(unrestrictedCreationPolicy);
+  });
+  expect(
+    view.getByRole("button", { name: "Create scratch chat" }).getAttribute("aria-disabled")
+  ).toBe("true");
+  fireEvent.keyDown(view.getByLabelText("Title (optional)"), { key: "Enter", keyCode: 13 });
+  expect(next.calls).toHaveLength(0);
+  view.unmount();
+  expect(next.subscriptions[0].signal?.aborted).toBe(true);
 });
 
 const pickerValue: ChatSettings = {

@@ -9,6 +9,12 @@ import { Button, Field, Loading, Notice, Sheet } from "../components/Controls";
 import { colors, layout, radii, spacing, typography } from "../theme";
 import { linkedAbortController } from "../useConnection";
 import { resolveWorkspaceCreationScope } from "../../../../src/common/utils/subProjects";
+import type { PolicyGetResponse } from "../../../../src/common/orpc/types";
+import { RUNTIME_MODE } from "../../../../src/common/types/runtime";
+import { isParsedRuntimeAllowedByPolicy } from "../../../../src/browser/utils/policyUi";
+
+const POLICY_UNAVAILABLE_MESSAGE =
+  "Server policy is unavailable. Retry to reconnect before creating a workspace.";
 
 export function CreateWorkspace(props: {
   client: MobileClient;
@@ -29,6 +35,12 @@ export function CreateWorkspace(props: {
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [policySnapshot, setPolicySnapshot] = useState<{
+    client: MobileClient;
+    signal: AbortSignal;
+    response: PolicyGetResponse | null;
+    error: string | null;
+  } | null>(null);
   const pending = useRef(false);
   const controller = useRef(new AbortController());
   const branchInput = useRef<TextInput>(null);
@@ -63,6 +75,60 @@ export function CreateWorkspace(props: {
     return () => abort.abort();
   }, [props.client, project, props.signal]);
 
+  useEffect(() => {
+    // Policy lifetime is separate from branch/create ownership: policy changes must not
+    // reset drafts or misattribute an already-started server mutation.
+    const lifetime = linkedAbortController(props.signal);
+    let request: AbortController | null = null;
+    function publish(response: PolicyGetResponse | null, error: string | null = null) {
+      if (!lifetime.signal.aborted)
+        setPolicySnapshot({ client: props.client, signal: props.signal, response, error });
+    }
+    function unavailable() {
+      request?.abort();
+      publish(null, POLICY_UNAVAILABLE_MESSAGE);
+    }
+    publish(null);
+    async function watch() {
+      const events = await props.client.policy.onChanged(undefined, { signal: lifetime.signal });
+      if (lifetime.signal.aborted) {
+        await events.return?.();
+        return;
+      }
+      function refresh() {
+        if (lifetime.signal.aborted) return;
+        request?.abort();
+        const next = linkedAbortController(lifetime.signal);
+        request = next;
+        publish(null);
+        props.client.policy
+          .get(undefined, { signal: next.signal })
+          .then(
+            (response) => {
+              if (!next.signal.aborted) publish(response);
+            },
+            () => {
+              if (!next.signal.aborted) unavailable();
+            }
+          )
+          .finally(() => next.abort());
+      }
+      // Listen first, and keep consuming invalidations while a read is pending.
+      refresh();
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Notifications have no payload.
+      for await (const _ of events) {
+        if (lifetime.signal.aborted) return;
+        refresh();
+      }
+      unavailable();
+    }
+    if (!props.signal.aborted) watch().catch(unavailable);
+    return () => {
+      lifetime.abort();
+      request?.abort();
+    };
+  }, [props.client, props.signal]);
+
   function selectProject(path: string | null) {
     if (pending.current) return;
     setChoosingProject(false);
@@ -84,9 +150,30 @@ export function CreateWorkspace(props: {
     projectsByPath.get(resolveWorkspaceCreationScope(project, projectsByPath).projectPath)
       ?.trusted === true;
   const repositoryUnsupported = project !== null && branches?.length === 0;
+  const policy =
+    policySnapshot?.client === props.client && policySnapshot.signal === props.signal
+      ? policySnapshot
+      : null;
+  const response = policy?.response;
+  const policyMessage = !response
+    ? (policy?.error ?? "Checking server policy before creating a workspace…")
+    : response.status.state === "blocked"
+      ? response.status.reason ||
+        "Workspace creation is blocked by server policy. Contact your administrator."
+      : response.status.state === "enforced" && !response.policy
+        ? POLICY_UNAVAILABLE_MESSAGE
+        : !isParsedRuntimeAllowedByPolicy(
+              response.status.state === "enforced" ? response.policy : null,
+              { mode: project === null ? RUNTIME_MODE.LOCAL : RUNTIME_MODE.WORKTREE }
+            )
+          ? project === null
+            ? "Scratch chats require the local runtime, which server policy blocks. Choose an allowed project or contact your administrator."
+            : "Server policy blocks project worktrees. Choose an allowed scratch chat or contact your administrator."
+          : null;
   const creationDisabled =
     !props.connected ||
     props.signal.aborted ||
+    policyMessage !== null ||
     loading ||
     (project !== null &&
       (projectUnavailable || !projectTrusted || !branches?.length || !trunk.trim()));
@@ -201,6 +288,18 @@ export function CreateWorkspace(props: {
           </View>
         )}
       </View>
+      {policyMessage && (
+        <Notice
+          severity={!response && !policy?.error ? "info" : "error"}
+          onRetry={
+            policy?.error || (response?.status.state === "enforced" && !response.policy)
+              ? props.onReconnect
+              : undefined
+          }
+        >
+          {policyMessage}
+        </Notice>
+      )}
       {projectUnavailable && (
         <Notice severity="warning">
           The selected project is no longer available. Choose another project to continue.
