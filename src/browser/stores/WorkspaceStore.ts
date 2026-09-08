@@ -1,6 +1,11 @@
 import assert from "@/common/utils/assert";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
-import type { MuxMessage, DisplayedMessage, QueuedMessage } from "@/common/types/message";
+import type {
+  MuxMessage,
+  DisplayedMessage,
+  PendingSendMessage,
+  QueuedMessage,
+} from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal";
 import type {
@@ -187,6 +192,7 @@ export interface WorkspaceState {
   name: string; // User-facing workspace name (e.g., "feature-branch")
   messages: DisplayedMessage[];
   queuedMessage: QueuedMessage | null;
+  pendingSend: PendingSendMessage | null;
   canInterrupt: boolean;
   isCompacting: boolean;
   isStreamStarting: boolean;
@@ -365,6 +371,7 @@ interface WorkspaceChatTransientState {
   pendingStreamEvents: WorkspaceChatMessage[];
   replayingHistory: boolean;
   queuedMessage: QueuedMessage | null;
+  pendingSend: PendingSendMessage | null;
   liveBashOutput: Map<string, LiveBashOutputInternal>;
   liveAdvisorOutput: Map<string, AdvisorLiveOutputState>;
   liveAdvisorReasoning: Map<string, AdvisorLiveReasoningState>;
@@ -476,6 +483,7 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     pendingStreamEvents: [],
     replayingHistory: false,
     queuedMessage: null,
+    pendingSend: null,
     liveBashOutput: new Map(),
     liveAdvisorOutput: new Map(),
     liveAdvisorReasoning: new Map(),
@@ -1160,7 +1168,12 @@ export class WorkspaceStore {
       // Mirror the queue signal onto active streams so response notifications follow
       // user-visible terminal turns instead of every intermediate handoff.
       aggregator.setActiveQueuedFollowUp(data.hasQueuedMessages ?? queuedMessage !== null);
-      this.assertChatTransientState(workspaceId).queuedMessage = queuedMessage;
+      const transient = this.assertChatTransientState(workspaceId);
+      transient.queuedMessage = queuedMessage;
+      if (queuedMessage) {
+        // The send landed in the backend queue; the queued card takes over from the pending row.
+        transient.pendingSend = null;
+      }
       this.states.bump(workspaceId);
     },
     "restore-to-input": (_workspaceId, _aggregator, data) => {
@@ -2301,6 +2314,7 @@ export class WorkspaceStore {
         name: metadata?.name ?? workspaceId, // Fall back to ID if metadata missing
         messages: displayedMessages,
         queuedMessage: transient.queuedMessage,
+        pendingSend: transient.pendingSend,
         canInterrupt,
         isCompacting: aggregator.isCompacting(),
         isStreamStarting,
@@ -4024,6 +4038,31 @@ export class WorkspaceStore {
   }
 
   /**
+   * Show the composer content in the transcript tail while the send request is in flight.
+   * Cleared when the backend echoes a user message or queues it, or via clearPendingSend.
+   */
+  beginPendingSend(workspaceId: string, message: PendingSendMessage): void {
+    const transient = this.chatTransientState.get(workspaceId);
+    if (!transient) {
+      return;
+    }
+
+    transient.pendingSend = message;
+    this.states.bump(workspaceId);
+  }
+
+  /** Remove the pending send row; a mismatched id means a newer send already replaced it. */
+  clearPendingSend(workspaceId: string, id: string): void {
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient?.pendingSend?.id !== id) {
+      return;
+    }
+
+    transient.pendingSend = null;
+    this.states.bump(workspaceId);
+  }
+
+  /**
    * Remove a workspace and clean up subscriptions.
    */
   removeWorkspace(workspaceId: string): void {
@@ -4749,6 +4788,11 @@ export class WorkspaceStore {
       } else {
         // Process live events immediately (after history loaded)
         applyWorkspaceChatEventToAggregator(aggregator, data);
+
+        if (data.role === "user") {
+          // The backend echoed the send; the persisted row replaces the pending one.
+          transient.pendingSend = null;
+        }
 
         const muxMeta = data.metadata?.muxMetadata as { type?: string } | undefined;
         const isCompactionBoundarySummary =

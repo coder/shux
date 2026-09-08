@@ -1411,6 +1411,9 @@ export interface QueuedMessage {
   hasCompactionRequest?: boolean;
 }
 
+/** Composer content shown in the transcript tail until the backend acknowledges the send. */
+export type PendingSendMessage = Pick<QueuedMessage, "id" | "content" | "fileParts" | "reviews">;
+
 /** Keep every snapshot kind here so history scans and edits retain it with its user message. */
 export function isSyntheticSnapshotUserMessage(message: MuxMessage): boolean {
   return (

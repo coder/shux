@@ -4776,6 +4776,91 @@ describe("WorkspaceStore", () => {
     ).toBe(true);
   });
 
+  describe("pending send", () => {
+    const pendingSend = { id: "pending-1", content: "hello" };
+
+    async function createCaughtUpWorkspace(
+      workspaceId: string,
+      liveEvents: (signal: AbortSignal | undefined) => AsyncIterable<WorkspaceChatMessage>
+    ): Promise<void> {
+      mockChatStreamFor(workspaceId, async function* (signal) {
+        yield { type: "caught-up", hasOlderHistory: false };
+        yield* liveEvents(signal);
+      });
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+    }
+
+    it("exposes the pending row until it is cleared by id", async () => {
+      const workspaceId = "pending-send-clear";
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        await waitForAbortSignal(signal);
+        yield* [];
+      });
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+
+      store.clearPendingSend(workspaceId, "other-send");
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+
+      store.clearPendingSend(workspaceId, pendingSend.id);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
+    });
+
+    it("clears the pending row when the backend echoes a user message", async () => {
+      const workspaceId = "pending-send-user-echo";
+      let releaseEcho!: () => void;
+      const echoGate = new Promise<void>((resolve) => {
+        releaseEcho = resolve;
+      });
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        await echoGate;
+        yield createUserMessageEvent("user-1", "hello", 1, 1);
+        await waitForAbortSignal(signal);
+      });
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      releaseEcho();
+
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).pendingSend === null)).toBe(
+        true
+      );
+      expect(store.getWorkspaceState(workspaceId).messages.some((m) => m.id === "user-1")).toBe(
+        true
+      );
+    });
+
+    it("clears the pending row when the send lands in the backend queue", async () => {
+      const workspaceId = "pending-send-queued";
+      let releaseQueue!: () => void;
+      const queueGate = new Promise<void>((resolve) => {
+        releaseQueue = resolve;
+      });
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        await queueGate;
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: true,
+          queuedMessages: ["hello"],
+          displayText: "hello",
+        };
+        await waitForAbortSignal(signal);
+      });
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      releaseQueue();
+
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).queuedMessage !== null)
+      ).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
+    });
+  });
+
   describe("bash-output events", () => {
     it("retains live output when bash tool result has no output", async () => {
       const workspaceId = "bash-output-workspace-1";

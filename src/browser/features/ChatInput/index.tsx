@@ -2043,6 +2043,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const preSendDraft = { ...getDraft(), attachments: sendAttachments };
       const preSendReviews = draftReviews;
       const editMessageForSend = editingMessageForUi;
+      let pendingSendId: string | null = null;
 
       try {
         // Prepare file parts if any
@@ -2151,6 +2152,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           inputRef.current.style.height = "";
         }
 
+        // Keep the message visible in the transcript tail until the backend echoes it back;
+        // otherwise it vanishes for the whole round-trip on a slow connection.
+        pendingSendId = `pending-send-${Date.now()}`;
+        store.beginPendingSend(props.workspaceId, {
+          id: pendingSendId,
+          content: messageText,
+          fileParts: sendFileParts,
+          reviews: reviewsData,
+        });
+
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 
         const result = await api.workspace.sendMessage({
@@ -2222,6 +2233,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         setDraft(preSendDraft);
         setDraftReviews(preSendReviews);
       } finally {
+        if (pendingSendId !== null) {
+          store.clearPendingSend(props.workspaceId, pendingSendId);
+        }
         setSendingCount((c) => c - 1);
         setHideReviewsDuringSend(false);
       }

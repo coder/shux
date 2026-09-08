@@ -69,6 +69,7 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
+import { PendingSendMessage } from "@/browser/features/Messages/PendingSendMessage";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import {
@@ -466,6 +467,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     hasOlderHistory,
     loadingOlderHistory,
     activeBashMonitorCount,
+    pendingSend,
   } = workspaceState;
   const shouldShowPinnedTodoList = workspaceState.todos.length > 0;
   const shouldShowReviewsBanner = reviews.reviews.length > 0;
@@ -1113,9 +1115,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const showEmptyTranscriptPlaceholder =
     deferredMessages.length === 0 &&
     !showTranscriptHydrationPlaceholder &&
-    !shouldMountStreamingBarrier;
+    !shouldMountStreamingBarrier &&
+    pendingSend === null;
   const showRetryBarrier =
-    !isHydratingTranscript && !shouldShowStreamingBarrier && hasInterruptedStream;
+    !isHydratingTranscript &&
+    !shouldShowStreamingBarrier &&
+    hasInterruptedStream &&
+    pendingSend === null;
   const isAutoRetryActive =
     workspaceState.autoRetryStatus?.type === "auto-retry-scheduled" ||
     workspaceState.autoRetryStatus?.type === "auto-retry-starting";
@@ -1170,6 +1176,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     lastRetryCandidateMessage != null &&
     interruptedBarrierMessageIds.has(lastRetryCandidateMessage.id);
   const transcriptTailItems: TranscriptTailStackItem[] = [];
+  if (pendingSend) {
+    transcriptTailItems.push(
+      createTranscriptTailStackItem({
+        key: "pending-send",
+        node: <PendingSendMessage message={pendingSend} />,
+      })
+    );
+  }
   if (shouldMountRetryBarrier) {
     transcriptTailItems.push(
       createTranscriptTailStackItem({
