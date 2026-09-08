@@ -481,6 +481,9 @@ describe("useDesktopConnection control ownership", () => {
       act(() => view.desktop.setControlling(true));
       holdKeysAndDrag(rfb);
       const registration = registrations[0];
+      // The replacement registers immediately; hold its ready so the unregistered window is
+      // observable.
+      autoReady = false;
       if (failure === "error") registration.failure = new Error("Stream failed");
       registration.queue.end();
       // The server can no longer ask for a release, so held input is released proactively...
@@ -492,11 +495,21 @@ describe("useDesktopConnection control ownership", () => {
       // pane re-registers in the background instead of tearing the connection down.
       expect(rfb.disconnectCount).toBe(0);
       expect(view.desktop.state).toBe("connected");
-      await waitFor(() => expect(registrations).toHaveLength(2), { timeout: 5_000 });
+      await waitFor(() => expect(registrations).toHaveLength(2));
       expect(rfb.disconnectCount).toBe(0);
       expect(DesktopRfbFixture.instances).toHaveLength(1);
-      // The replacement registration still delivers cooperative release.
+      // Control cannot be re-taken without a release channel.
+      act(() => view.desktop.setControlling(true));
+      expect(view.desktop.controlling).toBe(false);
+      expect(rfb.viewOnly).toBe(true);
+      // Once the replacement is ready, control is available again...
       const replacement = registrations[1];
+      replacement.queue.push({ type: "ready", viewerId: replacement.viewerId });
+      await waitFor(() => {
+        act(() => view.desktop.setControlling(true));
+        expect(view.desktop.controlling).toBe(true);
+      });
+      // ...and the replacement registration still delivers cooperative release.
       replacement.queue.push({ type: "release", viewerId: replacement.viewerId });
       await waitFor(() =>
         expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: replacement.viewerId })

@@ -125,9 +125,15 @@ export function useDesktopConnection(
   options?: UseDesktopConnectionOptions
 ): UseDesktopConnectionResult {
   const { api } = useAPI();
+  // Background re-registration outlives the render that scheduled it and must talk to the
+  // client the provider currently publishes, not the one captured when the timer was armed.
+  const apiRef = useRef(api);
+  apiRef.current = api;
   const registerViewer = !(
     options?.nativeWindowCleanup === true && typeof window.api !== "undefined"
   );
+  const registerViewerRef = useRef(registerViewer);
+  registerViewerRef.current = registerViewer;
   const [state, setState] = useState<DesktopConnectionState>("idle");
   const [reason, setReason] = useState<string | null>(null);
   const [width, setWidth] = useState<number>(DESKTOP_DEFAULTS.WIDTH);
@@ -142,9 +148,13 @@ export function useDesktopConnection(
   const rfbRef = useRef<RFB | null>(null);
   const setControlling = (value: boolean) => {
     const rfb = rfbRef.current;
-    if (!value) inputRef.current?.release();
-    if (rfb) rfb.viewOnly = !value;
-    setControllingState(value && rfb !== null);
+    // Human control needs a live release channel: without a ready viewer registration the
+    // server cannot ask this pane to release held keys/buttons before closing the desktop, so
+    // control stays off until re-registration succeeds.
+    const allowed = value && rfb !== null && (!registerViewerRef.current || viewerReadyRef.current);
+    if (!allowed) inputRef.current?.release();
+    if (rfb) rfb.viewOnly = !allowed;
+    setControllingState(allowed);
   };
   const setScaleToFit = (value: boolean) => {
     scaleToFitRef.current = value;
@@ -350,23 +360,31 @@ export function useDesktopConnection(
 
   const scheduleViewerReregistration = () => {
     clearReregisterTimer();
-    const delay = Math.min(
-      DESKTOP_DEFAULTS.RECONNECT_BASE_DELAY_MS * 2 ** reregisterAttemptRef.current,
-      DESKTOP_DEFAULTS.RECONNECT_MAX_DELAY_MS
-    );
+    // The first replacement is attempted immediately: while the pane has no bridge yet (ready
+    // resolves before bootstrap opens the socket) the registration is its only attachment
+    // signal, so the gap must be one round-trip, not a backoff. Only repeated failures back off.
+    const attempt = reregisterAttemptRef.current;
+    const delay =
+      attempt === 0
+        ? 0
+        : Math.min(
+            DESKTOP_DEFAULTS.RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1),
+            DESKTOP_DEFAULTS.RECONNECT_MAX_DELAY_MS
+          );
     reregisterAttemptRef.current += 1;
     reregisterTimerRef.current = setTimeout(() => {
       reregisterTimerRef.current = null;
+      const client = apiRef.current;
       // A connection attempt started meanwhile registers on its own; do not race it.
       if (
         isDisposedRef.current ||
         viewerReleasedRef.current ||
         viewerRegistrationRef.current !== null ||
-        !api
+        !client
       ) {
         return;
       }
-      registerViewerRegistration(api).catch(() => {
+      registerViewerRegistration(client).catch(() => {
         if (!isDisposedRef.current && viewerRegistrationRef.current === null) {
           scheduleViewerReregistration();
         }
