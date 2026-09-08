@@ -42,6 +42,8 @@ export interface ChatInputWorkspaceVariant {
   isTranscriptCaughtUp?: boolean;
   isCompacting?: boolean;
   isStreamStarting?: boolean;
+  /** A send is still waiting for the backend to acknowledge it (pending transcript row). */
+  hasPendingSend?: boolean;
   editingMessage?: EditingMessageState;
   onCancelEdit?: () => void;
   onEditLastUserMessage?: () => void;

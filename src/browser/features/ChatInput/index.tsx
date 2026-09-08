@@ -289,6 +289,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isTranscriptCaughtUp =
     variant === "workspace" ? (props.isTranscriptCaughtUp ?? false) : false;
   const isStreamStarting = variant === "workspace" ? (props.isStreamStarting ?? false) : false;
+  const hasPendingSend = variant === "workspace" ? (props.hasPendingSend ?? false) : false;
   const isCompacting = variant === "workspace" ? (props.isCompacting ?? false) : false;
   const [isMobileTouch, setIsMobileTouch] = useState(
     () =>
@@ -765,8 +766,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Creation sends also pass through the async resolution phase guarded by
   // sendingCount, so include it alongside the creation-specific flag.
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
+  // Stream startup lets follow-ups queue behind a slow turn, but never before the current
+  // send has been acknowledged: a second send would replace the pending row.
   const sendInFlightBlocksInput =
-    variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
+    variant === "workspace"
+      ? isSendInFlight && (!isStreamStarting || hasPendingSend)
+      : isSendInFlight;
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;

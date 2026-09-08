@@ -9,6 +9,8 @@ import { waitFor } from "@testing-library/react";
 
 import { preloadTestModules, type TestEnvironment } from "../../ipc/setup";
 
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+
 import { createAppHarness, type AppHarness } from "../harness";
 
 type WorkspaceServiceSendMessage = TestEnvironment["services"]["workspaceService"]["sendMessage"];
@@ -159,4 +161,68 @@ describe("Optimistic pending send row", () => {
       await app.dispose();
     }
   }, 60_000);
+
+  test("keeps the composer locked while a send awaits the queue during stream startup", async () => {
+    let releaseSend: () => void = () => {};
+    const sendGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    let gateNextSend = false;
+    let restoreSendMessage: () => void = () => {};
+    const app = await createAppHarness({
+      branchPrefix: "pending-send-queue",
+      beforeRenderEnvironment: (env) => {
+        restoreSendMessage = overrideServiceSendMessage(
+          env,
+          (original) =>
+            (async (...args) => {
+              if (gateNextSend) {
+                gateNextSend = false;
+                await sendGate;
+              }
+              return original(...args);
+            }) as WorkspaceServiceSendMessage
+        );
+      },
+    });
+
+    try {
+      // Hold the first turn before stream-start so the composer is in its "starting" phase,
+      // which normally re-enables input for queued follow-ups.
+      await app.chat.send("[mock:wait-start] first turn");
+      await waitFor(
+        () => {
+          expect(workspaceStore.getWorkspaceSidebarState(app.workspaceId).isStarting).toBe(true);
+          expect(getComposerTextarea(app.view.container).disabled).toBe(false);
+        },
+        { timeout: 10_000 }
+      );
+
+      gateNextSend = true;
+      const text = "Follow-up that must stay locked until acknowledged";
+      await app.chat.send(text);
+      await expectPendingSendRow(app, text);
+
+      releaseSend();
+
+      await waitFor(
+        () => {
+          expect(getPendingSendRow(app.view.container)).toBeNull();
+          const queued = app.view.container.querySelector('[data-component="QueuedMessageBanner"]');
+          expect(queued?.textContent).toContain(text);
+          expect(getComposerTextarea(app.view.container).disabled).toBe(false);
+        },
+        { timeout: 10_000 }
+      );
+
+      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+      await app.chat.expectTranscriptContains(`Mock response: ${text}`, 30_000);
+      await app.chat.expectStreamComplete();
+    } finally {
+      restoreSendMessage();
+      releaseSend();
+      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+      await app.dispose();
+    }
+  }, 90_000);
 });

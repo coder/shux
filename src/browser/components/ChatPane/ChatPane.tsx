@@ -1733,6 +1733,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       workspaceName={workspaceName}
                       revealDecorations={revealDecorations}
                       isStreamStarting={isStreamStarting}
+                      hasPendingSend={pendingSend !== null}
                       isTranscriptCaughtUp={isTranscriptCaughtUp}
                       runtimeConfig={runtimeConfig}
                       isPreStreamAgentTask={isPreStreamAgentTask}
@@ -1815,6 +1816,7 @@ interface ChatInputPaneProps {
   preStreamAgentTaskStatus: "queued" | "starting";
   isCompacting: boolean;
   isStreamStarting: boolean;
+  hasPendingSend: boolean;
   isTranscriptCaughtUp: boolean;
   shouldShowPinnedTodoList: boolean;
   shouldShowReviewsBanner: boolean;
@@ -1998,6 +2000,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         }
         isTranscriptCaughtUp={props.isTranscriptCaughtUp}
         isStreamStarting={props.isStreamStarting}
+        hasPendingSend={props.hasPendingSend}
         isCompacting={props.isCompacting}
         editingMessage={props.editingMessage}
         onCancelEdit={props.onCancelEdit}
