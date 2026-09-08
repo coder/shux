@@ -85,7 +85,7 @@ compute_codex_sets_from_arrays() {
   # "Argument list too long". printf is a shell builtin, so it has no such limit.
   REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c --arg bot "$BOT_LOGIN_GRAPHQL" '[
     .[]
-    | select(.author.login == $bot and .isMinimized == false and (.body | test("Didn.t find any major issues|usage limits have been reached|create a Codex account") | not))
+    | select(.author.login == $bot and .isMinimized == false and (.body | test("Didn.t find any major issues|usage limits have been reached|create a Codex account|^<!-- codex-pull-request-review-summary -->|^Security review completed[.] No security issues were found in this pull request[.]") | not))
   ]')
 
   UNRESOLVED_THREADS=$(printf '%s' "$threads_json" | jq -c --arg bot "$BOT_LOGIN_GRAPHQL" '[
