@@ -577,16 +577,22 @@ describe("DesktopSessionManager browser viewer releases", () => {
         workspaceService: createWorkspaceService(() => Promise.resolve(null)),
         now: () => now,
       });
+      const registerViewer = async (workspaceId: string) => {
+        const controller = new AbortController();
+        const watcher = manager.watchViewer(workspaceId, controller.signal);
+        const first: IteratorResult<DesktopViewerEvent> = await watcher.next();
+        expect(first.done).toBe(false);
+        expect(first.value).toMatchObject({ type: "ready" });
+        return { controller, watcher };
+      };
       try {
         // Never attached: no grace, so an idle process stays archivable.
         expect(manager.hasAttachedViewers("owner")).toBe(false);
 
         // A borrower viewer that unregisters (transport loss) protects requester and owner...
-        const controller = new AbortController();
-        const watcher = manager.watchViewer("child", controller.signal);
-        expect((await watcher.next()).value).toMatchObject({ type: "ready" });
-        controller.abort();
-        await watcher.return(undefined);
+        const lost = await registerViewer("child");
+        lost.controller.abort();
+        await lost.watcher.return(undefined);
         expect(manager.has("child")).toBe(false);
         expect(manager.hasAttachedViewers("child")).toBe(true);
         expect(manager.hasAttachedViewers("owner")).toBe(true);
@@ -599,51 +605,38 @@ describe("DesktopSessionManager browser viewer releases", () => {
         expect(manager.hasAttachedViewers("child")).toBe(false);
 
         // A closed VNC bridge reports through noteDetached the same way.
-        manager.noteDetached(["isolated"], "bridge:1");
+        manager.noteDetached(["isolated"], "isolated");
         expect(manager.hasAttachedViewers("isolated")).toBe(true);
         now += DESKTOP_ATTACHMENT_GRACE_MS;
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
 
-        // An explicit close is definitive: it clears the grace it would otherwise leave behind,
-        // but a grace another detachment stamped on a related workspace survives — even one
-        // stamped while the close was in flight.
-        manager.noteDetached(["isolated"], "bridge:2");
-        await manager.close("isolated");
-        expect(manager.hasAttachedViewers("isolated")).toBe(false);
-        const borrower = new AbortController();
-        const borrowerWatcher = manager.watchViewer("child", borrower.signal);
-        expect((await borrowerWatcher.next()).value).toMatchObject({ type: "ready" });
-        const closingChild = manager.close("child");
-        manager.noteDetached(["owner"], "bridge:unrelated");
-        await closingChild;
-        await borrowerWatcher.return(undefined);
+        // An explicit close is definitive for everything its requester ever attached: it clears
+        // the graces that requester left on itself AND on its owner — whether stamped before
+        // the close (an earlier drop) or during it (the bridge closes before the release ACK) —
+        // while a grace another requester left on the same owner survives.
+        manager.noteDetached(["child", "owner"], "child");
+        manager.noteDetached(["owner"], "isolated");
+        const closed = await registerViewer("child");
+        const closing = manager.close("child");
+        const release: IteratorResult<DesktopViewerEvent> = await closed.watcher.next();
+        expect(release.done).toBe(false);
+        expect(release.value).toMatchObject({ type: "release" });
+        manager.noteDetached(["child", "owner"], "child");
+        if (!release.done && release.value.type === "release") {
+          manager.acknowledgeViewerRelease(release.value.viewerId);
+        }
+        await closing;
+        await closed.watcher.return(undefined);
         expect(manager.hasAttachedViewers("child")).toBe(false);
         expect(manager.hasAttachedViewers("owner")).toBe(true);
         now += DESKTOP_ATTACHMENT_GRACE_MS;
         expect(manager.hasAttachedViewers("owner")).toBe(false);
 
-        // A bridge that closes while the teardown is still awaiting the viewer's release
-        // acknowledgment (the renderer closes RFB before it ACKs) belongs to that teardown too.
-        const acked = new AbortController();
-        const ackedWatcher = manager.watchViewer("child", acked.signal);
-        const ackedReady = (await ackedWatcher.next()).value;
-        expect(ackedReady).toMatchObject({ type: "ready" });
-        const closingAcked = manager.close("child");
-        const release = (await ackedWatcher.next()).value;
-        expect(release).toMatchObject({ type: "release" });
-        manager.noteDetached(["child", "owner"], "bridge:child-pair");
-        if (release.type === "release") manager.acknowledgeViewerRelease(release.viewerId);
-        await closingAcked;
-        await ackedWatcher.return(undefined);
-        expect(manager.hasAttachedViewers("owner")).toBe(false);
-
         // A viewer whose bootstrap reported no desktop leaves no grace when it detaches.
-        const unavailable = new AbortController();
-        const unavailableWatcher = manager.watchViewer("isolated", unavailable.signal);
-        expect((await unavailableWatcher.next()).value).toMatchObject({ type: "ready" });
+        const unavailable = await registerViewer("isolated");
         manager.noteBootstrapOutcome("isolated", false);
-        unavailable.abort();
-        await unavailableWatcher.return(undefined);
+        unavailable.controller.abort();
+        await unavailable.watcher.return(undefined);
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
       } finally {
         await manager.closeAll();
@@ -700,7 +693,8 @@ describe("DesktopSessionManager browser viewer releases", () => {
       const controller = new AbortController();
       try {
         const watcher = manager.watchViewer("child", controller.signal);
-        expect((await watcher.next()).value).toMatchObject({ type: "ready" });
+        const ready: IteratorResult<DesktopViewerEvent> = await watcher.next();
+        expect(ready.value).toMatchObject({ type: "ready" });
         expect(manager.hasAttachedViewers("owner")).toBe(true);
         // The borrower's binding is removed (its task settled) while the pane stays mounted, so
         // its desktop target is now itself.

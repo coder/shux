@@ -42,10 +42,6 @@ interface DesktopViewerRegistration {
   desktopUnavailable?: boolean;
 }
 
-function viewerGraceSource(viewerId: string): string {
-  return `viewer:${viewerId}`;
-}
-
 export class DesktopSessionManager {
   private readonly viewers = new Map<string, DesktopViewerRegistration>();
   private readonly sessions = new Map<string, PortableDesktopSession>();
@@ -66,16 +62,12 @@ export class DesktopSessionManager {
   private readonly windowOwners = new Map<string, string>();
   private readonly closingWorkspaces = new Map<string, Promise<void>>();
   /**
-   * workspaceId → (detachment source → grace expiry). Keyed by source so an explicit close can
-   * retract exactly the graces its own teardown produced (see noteDetached / close).
+   * workspaceId → (requester whose attachment detached → grace expiry). Keyed by requester so an
+   * explicit close of a workspace can retract exactly the graces its own attachments produced —
+   * on itself and on the owner it borrowed — whenever they were stamped, without touching graces
+   * other requesters left on the same owner (see noteDetached / retractDetachments).
    */
   private readonly recentDetachments = new Map<string, Map<string, number>>();
-  /**
-   * While a close() teardown runs, detachments that involve the closing workspace (its own
-   * viewers, its bridges as requester, or every borrower bridge when it is the owner) are
-   * recorded here so the finished teardown can retract exactly those graces.
-   */
-  private teardownSink: { workspaceId: string; sources: Set<string> } | undefined;
   private disposed = false;
   private closeAllPromise: Promise<void> | undefined;
 
@@ -453,34 +445,35 @@ export class DesktopSessionManager {
    * a bounded grace after a KNOWN attachment is the only way an agent-driven archive can tell
    * "reconnecting" from "closed". An idle desktop that never had an attachment gets no grace.
    */
-  noteDetached(detached: Iterable<string>, source: string): void {
-    assert(source.length > 0, "noteDetached requires a detachment source key");
-    const workspaceIds = Array.from(detached);
+  noteDetached(detached: Iterable<string>, requesterWorkspaceId: string): void {
+    assert(requesterWorkspaceId.length > 0, "noteDetached requires the detached requester");
     const expiresAt = this.now() + DESKTOP_ATTACHMENT_GRACE_MS;
-    for (const workspaceId of workspaceIds) {
+    for (const workspaceId of detached) {
       assert(workspaceId.length > 0, "noteDetached requires non-empty workspace IDs");
-      let sources = this.recentDetachments.get(workspaceId);
-      if (!sources) {
-        sources = new Map();
-        this.recentDetachments.set(workspaceId, sources);
+      let byRequester = this.recentDetachments.get(workspaceId);
+      if (!byRequester) {
+        byRequester = new Map();
+        this.recentDetachments.set(workspaceId, byRequester);
       }
-      sources.set(source, expiresAt);
+      byRequester.set(requesterWorkspaceId, expiresAt);
     }
-    const sink = this.teardownSink;
-    if (sink && Array.from(workspaceIds).includes(sink.workspaceId)) sink.sources.add(source);
   }
 
   private noteViewerDetached(viewer: DesktopViewerRegistration): void {
     if (viewer.desktopUnavailable === true) return;
-    this.noteDetached(this.viewerTargets(viewer), viewerGraceSource(viewer.viewerId));
+    this.noteDetached(this.viewerTargets(viewer), viewer.workspaceId);
   }
 
-  /** Retract every grace stamped by the given detachment sources (a finished teardown). */
-  private retractDetachments(sources: Iterable<string>): void {
-    const retract = new Set(sources);
-    for (const [workspaceId, bySource] of this.recentDetachments) {
-      for (const source of retract) bySource.delete(source);
-      if (bySource.size === 0) this.recentDetachments.delete(workspaceId);
+  /**
+   * A finished explicit close of `workspaceId` is definitive: nothing of its own is attached
+   * any more, and every attachment it held as a requester on some owner is gone too. Retract
+   * those graces (whenever they were stamped); graces other requesters left stay untouched.
+   */
+  private retractDetachments(workspaceId: string): void {
+    this.recentDetachments.delete(workspaceId);
+    for (const [target, byRequester] of this.recentDetachments) {
+      byRequester.delete(workspaceId);
+      if (byRequester.size === 0) this.recentDetachments.delete(target);
     }
   }
 
@@ -500,13 +493,13 @@ export class DesktopSessionManager {
   }
 
   private hasRecentDetachment(workspaceId: string): boolean {
-    const bySource = this.recentDetachments.get(workspaceId);
-    if (!bySource) return false;
+    const byRequester = this.recentDetachments.get(workspaceId);
+    if (!byRequester) return false;
     const now = this.now();
-    for (const [source, expiresAt] of bySource) {
-      if (expiresAt <= now) bySource.delete(source);
+    for (const [requester, expiresAt] of byRequester) {
+      if (expiresAt <= now) byRequester.delete(requester);
     }
-    if (bySource.size === 0) {
+    if (byRequester.size === 0) {
       this.recentDetachments.delete(workspaceId);
       return false;
     }
@@ -625,18 +618,9 @@ export class DesktopSessionManager {
     // transports that may come back; an explicit close is deterministic, so retract exactly the
     // graces produced by this teardown's own sources afterwards — a borrower closing must not
     // leave its owner "attached", while a grace an unrelated viewer stamped meanwhile survives.
-    // Armed for the whole teardown: released viewers close their RFB (and thus their bridge)
-    // before acknowledging, so bridge detachments arrive while the releases are still awaited,
-    // not only inside the close listeners.
-    const teardownSink = {
-      workspaceId,
-      sources: new Set(browserViewers.map((viewer) => viewerGraceSource(viewer.viewerId))),
-    };
     // Latch before entering the async teardown, but leave established bridges alive long enough
     // for borrower viewers to release held keys/buttons on their owner's still-live desktop.
     const closing = Promise.resolve().then(async () => {
-      const previousSink = this.teardownSink;
-      this.teardownSink = teardownSink;
       try {
         await Promise.allSettled([
           ...Array.from(
@@ -647,9 +631,9 @@ export class DesktopSessionManager {
         ]);
         for (const listener of this.closeListeners) listener(workspaceId);
       } finally {
-        if (this.teardownSink === teardownSink) this.teardownSink = previousSink;
         await this.closeSession(workspaceId);
-        this.retractDetachments(teardownSink.sources);
+        // The teardown's own detachments (and any this requester left earlier) are definitive.
+        this.retractDetachments(workspaceId);
       }
     });
     this.closingWorkspaces.set(workspaceId, closing);
@@ -678,9 +662,6 @@ export class DesktopSessionManager {
       this.sessions.delete(workspaceId);
       this.startupPromises.delete(workspaceId);
       this.closingWorkspaces.delete(workspaceId);
-      // An explicit close is definitive proof that nothing is attached to THIS workspace any
-      // more: the grace is for transports that may come back, not for a finished teardown.
-      this.recentDetachments.delete(workspaceId);
     }
   }
 

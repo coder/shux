@@ -784,7 +784,7 @@ describe("DesktopBridgeServer", () => {
         ? { ownerWorkspaceId: "owner", sessionId: "owner-session", vncPort: tcpHarness.port }
         : null
     );
-    const noteDetached = mock((_workspaceIds: Iterable<string>, _source: string) => undefined);
+    const noteDetached = mock((_workspaceIds: Iterable<string>, _requester: string) => undefined);
     const bridgeServer = new DesktopBridgeServer({
       desktopTokenManager: tokens,
       desktopSessionManager: {
@@ -817,10 +817,7 @@ describe("DesktopBridgeServer", () => {
       expect(bridgeServer.hasActiveBridge("child")).toBe(false);
       expect(bridgeServer.hasActiveBridge("owner")).toBe(false);
       // The closed bridge hands requester and owner to the manager's bounded attachment grace.
-      expect(noteDetached).toHaveBeenCalledWith(
-        ["child", "owner"],
-        expect.stringMatching(/^bridge:/)
-      );
+      expect(noteDetached).toHaveBeenCalledWith(["child", "owner"], "child");
       expect(getLiveSessionConnection.mock.calls.map((call) => call[0])).toEqual([
         "child",
         "child",
@@ -991,6 +988,35 @@ describe("DesktopBridgeServer", () => {
         await upgradeHarness.close();
         await bridgeServer.stop();
       }
+    }
+  });
+
+  test("a bridge that never reached VNC leaves no attachment grace", async () => {
+    const noteDetached = mock((_workspaceIds: Iterable<string>, _requester: string) => undefined);
+    const bridgeServer = new DesktopBridgeServer({
+      desktopTokenManager: {
+        validate: () => ({ workspaceId: VALID_WORKSPACE_ID, sessionId: VALID_SESSION_ID }),
+      },
+      desktopSessionManager: {
+        // An unreachable VNC port: the upgrade is admitted but TCP never connects.
+        getLiveSessionConnection: () => ({
+          ownerWorkspaceId: VALID_WORKSPACE_ID,
+          sessionId: VALID_SESSION_ID,
+          vncPort: 1,
+        }),
+        onWorkspaceClose: () => () => undefined,
+        watchWorkspaceConfig: () => () => undefined,
+        noteDetached,
+      },
+    });
+    const upgradeHarness = await listenUpgradeServer(bridgeServer);
+    try {
+      const ws = new WebSocket(`ws://127.0.0.1:${upgradeHarness.port}/?token=${VALID_TOKEN}`);
+      expect((await waitForWebSocketClose(ws)).code).toBe(4003);
+      expect(noteDetached).not.toHaveBeenCalled();
+    } finally {
+      await upgradeHarness.close();
+      await bridgeServer.stop();
     }
   });
 
