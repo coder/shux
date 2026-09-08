@@ -23,7 +23,10 @@ async function expectFailure(promise: Promise<unknown>, message?: string): Promi
   if (message) expect(String(error)).toContain(message);
 }
 
-async function serverFixture(stallProbe = false) {
+async function serverFixture(
+  stallProbe = false,
+  selectProtocol: (protocols: Set<string>) => string | false = () => ORPC_WS_PROTOCOL
+) {
   const token = "private token/+?";
   let calls = 0;
   let upgrades = 0;
@@ -101,7 +104,7 @@ async function serverFixture(stallProbe = false) {
   const server = new WebSocketServer({
     server: httpServer,
     path: "/proxy/orpc/ws",
-    handleProtocols: () => ORPC_WS_PROTOCOL,
+    handleProtocols: selectProtocol,
     verifyClient: ({ req }: { req: IncomingMessage }) => {
       const protocols = req.headers["sec-websocket-protocol"]?.split(/,\s*/);
       const ticket = protocols
@@ -200,6 +203,42 @@ describe("mobile WebSocket connection", () => {
     await expectFailure(connection.client.workspace.list());
     expect(server.upgrades()).toBe(1);
     expect(server.calls()).toBe(1);
+  });
+
+  test("rejects a ticket-echo protocol even when the server answers the auth probe", async () => {
+    await using server = await serverFixture(
+      false,
+      (protocols) =>
+        [...protocols].find((protocol) => protocol.startsWith(ORPC_WS_TICKET_PREFIX)) ?? false
+    );
+    const OriginalWebSocket = globalThis.WebSocket;
+    // Bun's ws fixture always selects the first offer on the wire, even when
+    // handleProtocols selects another. Offer the same protocols ticket-first to
+    // exercise a real ticket-echo handshake and probe rather than mock its result.
+    class TicketFirstSocket extends OriginalWebSocket {
+      constructor(url: string, protocols?: string | string[]) {
+        assert(Array.isArray(protocols));
+        super(url, [...protocols].reverse());
+      }
+    }
+    Object.assign(globalThis, { WebSocket: TicketFirstSocket });
+    try {
+      const result = await connect(server.endpoint, server.token).catch((cause: unknown) => cause);
+      expect(result).toBeInstanceOf(Error);
+      expect(server.calls()).toBe(1);
+      expect(server.upgrades()).toBe(1);
+      const ticket = server.handshakes[0].protocols
+        ?.split(/,\s*/)
+        .find((protocol) => protocol.startsWith(ORPC_WS_TICKET_PREFIX))
+        ?.slice(ORPC_WS_TICKET_PREFIX.length);
+      expect(ticket).toBeDefined();
+      expect(String(result)).not.toContain(ticket!);
+      expect(String(result)).not.toContain(server.token);
+      expect(String(result)).not.toContain(server.endpoint);
+      await server.closed;
+    } finally {
+      Object.assign(globalThis, { WebSocket: OriginalWebSocket });
+    }
   });
 
   test("does not retry a failed mutation or dispatch mutations after close", async () => {

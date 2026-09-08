@@ -111,6 +111,8 @@ export async function connect(
     // An open handshake alone does not prove RPC authentication succeeded.
     await client.workspace.list(undefined, { signal: probe.signal });
     if (closed) throw new Error("Connection closed.");
+    // A ticket is an upgrade credential, never the negotiated application protocol.
+    if (socket.protocol !== ORPC_WS_PROTOCOL) throw new Error("Connection protocol rejected.");
     return {
       client,
       close,
