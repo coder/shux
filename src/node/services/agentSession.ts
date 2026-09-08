@@ -12,6 +12,7 @@ import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { isSessionHistoryDisabled, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
+  CONTEXT_FLUSH_TOOL_POLICY_RULE,
   CONTEXT_WARNING_DEDUPE_KEY,
   WARNING_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
@@ -366,6 +367,24 @@ function coerceGoalId(value: unknown): string | undefined {
 const PDF_MEDIA_TYPE = "application/pdf";
 const ACP_PROMPT_ID_METADATA_KEY = "acpPromptId";
 const ACP_DELEGATED_TOOLS_METADATA_KEY = "acpDelegatedTools";
+
+/**
+ * Undo the memory-only restriction appended to a final-flush turn's tool policy so a
+ * continuation derived from that turn runs with the inherited policy again. Tolerant of
+ * persisted rows that never carried the rule (nothing to strip).
+ */
+function withoutFlushToolPolicyRule(policy: ToolPolicy | undefined): ToolPolicy | undefined {
+  const last = policy?.at(-1);
+  if (
+    !policy ||
+    !last ||
+    last.regex_match !== CONTEXT_FLUSH_TOOL_POLICY_RULE.regex_match ||
+    last.action !== CONTEXT_FLUSH_TOOL_POLICY_RULE.action
+  )
+    return policy;
+  const rest = policy.slice(0, -1);
+  return rest.length > 0 ? rest : undefined;
+}
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
   if (!metadata) return [];
@@ -5134,7 +5153,13 @@ export class AgentSession {
     estimate?: number
   ): Promise<
     Result<
-      { snapshot: RequestAssemblySnapshot; request: PreparedStreamMessage } | undefined,
+      | {
+          snapshot: RequestAssemblySnapshot;
+          request: PreparedStreamMessage;
+          /** Send options for the retry (a flush turn's memory-only policy is undone). */
+          options: SendMessageOptions | undefined;
+        }
+      | undefined,
       SendMessageError
     >
   > {
@@ -5183,7 +5208,18 @@ export class AgentSession {
         { openaiWireFormat: context.options?.providerOptions?.openai?.wireFormat }
       );
       if (maxTokens == null || maxTokens <= 0) return Ok(undefined);
-      const access = await this.checkContextBudgetHistoryAccess(context.options);
+      // An admitted final-flush trigger that overflowed at assembly must not carry its
+      // internal text, flag, or memory-only tool policy into the fresh window; it continues
+      // as an ordinary turn with the pre-flush policy.
+      const wasFlush = user.metadata?.muxMetadata?.contextBudgetFlush === true;
+      const retryOptions =
+        wasFlush && context.options
+          ? {
+              ...context.options,
+              toolPolicy: withoutFlushToolPolicyRule(context.options.toolPolicy),
+            }
+          : context.options;
+      const access = await this.checkContextBudgetHistoryAccess(retryOptions);
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return Ok(undefined);
       if (!access.success) return access;
@@ -5201,9 +5237,7 @@ export class AgentSession {
         maxTokens,
       };
       const { historySequence: _sequence, ...metadata } = user.metadata ?? {};
-      // An admitted final-flush trigger that overflowed at assembly must not carry its
-      // internal text or flag into the fresh window; it continues as an ordinary turn.
-      const { contextBudgetFlush: wasFlush, ...muxMetadata } = metadata.muxMetadata ?? {
+      const { contextBudgetFlush: _flushFlag, ...muxMetadata } = metadata.muxMetadata ?? {
         type: "context-window-continuation" as const,
       };
       const continuation: MuxMessage = {
@@ -5212,6 +5246,7 @@ export class AgentSession {
         ...(wasFlush ? { parts: [{ type: "text", text: "Continue" }] } : {}),
         metadata: {
           ...metadata,
+          ...(wasFlush ? { toolPolicy: withoutFlushToolPolicyRule(metadata.toolPolicy) } : {}),
           timestamp: Date.now(),
           muxMetadata: { ...muxMetadata, rolloverId: rollover.rolloverId },
         },
@@ -5290,7 +5325,7 @@ export class AgentSession {
       const freshBudget = await this.checkFreshContextBudget(
         continuation,
         model,
-        context.options,
+        retryOptions,
         retryPrelude,
         context.providersConfig
       );
@@ -5310,7 +5345,7 @@ export class AgentSession {
       const candidate = await this.prepareRolloverRequest(
         rows,
         model,
-        context.options,
+        retryOptions,
         captured.data,
         context.agentInitiated
       );
@@ -5360,7 +5395,7 @@ export class AgentSession {
         return Ok(undefined);
       for (const row of rows) this.emitChatEvent({ ...row, type: "message" });
       transferred = true;
-      return Ok({ snapshot: captured.data, request: candidate.data });
+      return Ok({ snapshot: captured.data, request: candidate.data, options: retryOptions });
     } catch (error) {
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
@@ -5657,8 +5692,10 @@ export class AgentSession {
       userMessage.metadata.muxMetadata = rest;
       if (!rolloverEnabled) {
         // Rollover was disabled after the pair was queued: drop the paired rollover entry and
-        // the stale claim so nothing seals the window if rollover is re-enabled later.
+        // the stale claims so nothing seals the window if rollover is re-enabled later, and a
+        // later genuine rollover may offer the flush this turn never delivered.
         this.pendingRollover = undefined;
+        this.contextBudgetFlushClaimed = false;
         if (this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY).removedCount > 0)
           this.emitQueuedMessageChanged();
       }
@@ -5812,7 +5849,7 @@ export class AgentSession {
     // intact for the rollover admission re-check at dispatch.
     const flushToolPolicy: ToolPolicy = [
       ...(streamOptions.toolPolicy ?? []),
-      { regex_match: "(?!memory$|session_history$).*", action: "disable" },
+      CONTEXT_FLUSH_TOOL_POLICY_RULE,
     ];
     const enqueue = (text: string, dedupeKey: string, flush: boolean) =>
       this.messageQueue.addOnce(
@@ -6900,6 +6937,12 @@ export class AgentSession {
         this.contextBudgetWarningClaimed ||= historyResult.data.some(
           (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
         );
+        // A resumed final-flush turn must not offer a second flush in the same window.
+        this.contextBudgetFlushClaimed ||= historyResult.data.some(
+          (row) =>
+            row.metadata?.muxMetadata?.type === "context-budget-warning" &&
+            row.metadata.muxMetadata.final === true
+        );
       }
 
       // A crash between snapshot and user-row appends can leave orphaned prompt
@@ -7113,7 +7156,7 @@ export class AgentSession {
             return await this.streamWithHistory(
               turn,
               streamResult.error.model,
-              options,
+              rolled.data.options ?? options,
               openaiTruncationModeOverride,
               true,
               agentInitiated,
@@ -7777,7 +7820,7 @@ export class AgentSession {
           retry = await this.streamWithHistory(
             preparedTurn,
             model,
-            context.options,
+            rolled.data.options ?? context.options,
             context.openaiTruncationModeOverride,
             true,
             context.agentInitiated,

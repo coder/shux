@@ -4,6 +4,15 @@ export const CONTEXT_NOTES_RESERVED_BYTES = 8 * 1024;
 export const CONTEXT_NOTES_RESERVED_TOKENS = 2_000;
 export const CONTEXT_CONTINUE_DEDUPE_KEY = "context-budget-continue";
 export const CONTEXT_WARNING_DEDUPE_KEY = "context-budget-warning";
+/**
+ * Appended to the inherited tool policy for the hidden final-flush turn: only `memory` (the
+ * write it exists for) and read-only `session_history` stay enabled. Leaving those two names
+ * untouched keeps the inherited policy's session_history verdict intact for rollover admission.
+ */
+export const CONTEXT_FLUSH_TOOL_POLICY_RULE = {
+  regex_match: "(?!memory$|session_history$).*",
+  action: "disable",
+} as const;
 export const OUTPUT_RESERVE_TOKENS = 8_192;
 export const MAX_OUTPUT_RESERVE_CONTEXT_RATIO = 0.25;
 export const MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO = 0.5;

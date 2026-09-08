@@ -1492,6 +1492,9 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.requests).toHaveLength(2);
     expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    // The undelivered flush did not consume this window's single offer.
+    expect(await h.requests[2].onStepSettled?.(step(110_000))).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
   });
 
   test("toolset-changing middleware blocks the flush dispatch like the rollover it promises", async () => {
@@ -1560,6 +1563,25 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.requests[2].messages.some((row) => text(row).startsWith("Flush context notes"))).toBe(
       false
     );
+    // The retry continues the task with the inherited policy, not the memory-only flush policy.
+    const toolNames = ["memory", "session_history", "bash", "file_edit_replace_string"];
+    expect(applyToolPolicyToNames(toolNames, h.requests[2].toolPolicy)).toEqual(toolNames);
+    expect(applyToolPolicyToNames(toolNames, trigger.metadata?.toolPolicy)).toEqual(toolNames);
+  });
+
+  test("a resumed final-flush turn keeps the once-per-window flush claim", async () => {
+    const first = await setup();
+    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await first.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await first.finishAndDispatch();
+    await first.session.dispose();
+    // Startup retry resumes the persisted flush turn through history, not a fresh send.
+    const h = await setup({ previous: first });
+    expect((await h.session.resumeStream(options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(112_000))).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    expect(warningRows(await allRows(h)).filter(isFinalFlushRow)).toHaveLength(1);
   });
 
   test("the final flush is offered once per window, including after a restart", async () => {

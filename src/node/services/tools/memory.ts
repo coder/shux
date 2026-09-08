@@ -87,7 +87,8 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
 
   const ctx = memoryScopeContextFromToolConfig(config);
   // Normalized once so trailing slashes or whitespace in a call cannot bypass the pin.
-  const writePin = config.memoryWritePath != null ? parseMemoryPath(config.memoryWritePath) : null;
+  const writePath = config.memoryWritePath;
+  const writePin = writePath != null ? parseMemoryPath(writePath) : null;
   assert(
     writePin == null || (writePin.scope !== null && writePin.relPath !== ""),
     "memoryWritePath must name a file inside a memory scope"
@@ -115,10 +116,14 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
     }
     // SECURITY: a hidden flush turn runs on a transcript that may carry injected tool
     // output; pinning writes to one file keeps it from reaching other memory stores.
-    if (writePin && (scope !== writePin.scope || parsed.relPath !== writePin.relPath)) {
+    if (
+      writePath != null &&
+      writePin &&
+      (scope !== writePin.scope || parsed.relPath !== writePin.relPath)
+    ) {
       return {
         success: false,
-        error: `This turn may only modify ${config.memoryWritePath}; other memory paths are view-only.`,
+        error: `This turn may only modify ${writePath}; other memory paths are view-only.`,
       };
     }
     return null;
