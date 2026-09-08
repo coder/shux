@@ -109,8 +109,25 @@ function buildDesktopBridgeUrl(
   return wsUrl.toString();
 }
 
-export function useDesktopConnection(workspaceId: string): UseDesktopConnectionResult {
+export interface UseDesktopConnectionOptions {
+  /**
+   * Set by the Electron popout window: its lifetime is owned by DesktopWindowManager, whose
+   * native cleanup handshake already releases held input before destruction, and a concurrent
+   * cooperative-release registration would only race that handshake. Every other viewer
+   * (browser inline/popout, Electron inline pane) registers with watchViewer so the backend
+   * knows the pane is attached and can ask it to release input before closing the desktop.
+   */
+  nativeWindowCleanup?: boolean;
+}
+
+export function useDesktopConnection(
+  workspaceId: string,
+  options?: UseDesktopConnectionOptions
+): UseDesktopConnectionResult {
   const { api } = useAPI();
+  const registerViewer = !(
+    options?.nativeWindowCleanup === true && typeof window.api !== "undefined"
+  );
   const [state, setState] = useState<DesktopConnectionState>("idle");
   const [reason, setReason] = useState<string | null>(null);
   const [width, setWidth] = useState<number>(DESKTOP_DEFAULTS.WIDTH);
@@ -141,6 +158,11 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
   const generationRef = useRef(0);
   const isDisposedRef = useRef(false);
   const viewerRegistrationRef = useRef<AbortController | null>(null);
+  // The registration is pane-scoped, not connection-scoped: it stays live through transient
+  // RFB drops and the reconnect backoff so the backend keeps treating the mounted pane as an
+  // attached viewer (its archive gate would otherwise see nobody attached between the socket
+  // close and the reconnect). Ready is remembered so reconnects skip re-registering.
+  const viewerReadyRef = useRef(false);
   const viewerReleasedRef = useRef(false);
 
   const connectImplRef = useRef<() => void>(() => undefined);
@@ -175,11 +197,15 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
     }
   };
 
-  const disconnectCurrentRfb = () => {
+  const disconnectCurrentRfb = (options?: { keepViewerRegistration?: boolean }) => {
     setSharedDesktop(null);
     const currentRfb = rfbRef.current;
-    const registration = viewerRegistrationRef.current;
-    viewerRegistrationRef.current = null;
+    const keepRegistration = options?.keepViewerRegistration === true;
+    const registration = keepRegistration ? null : viewerRegistrationRef.current;
+    if (!keepRegistration) {
+      viewerRegistrationRef.current = null;
+      viewerReadyRef.current = false;
+    }
     setControlling(false);
     inputRef.current?.dispose();
     inputRef.current = null;
@@ -230,7 +256,13 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
       generationRef.current = generation;
       isDisposedRef.current = false;
       clearReconnectTimer();
-      disconnectCurrentRfb();
+      // Only a registration that already reported ready is reusable; a still-pending one is
+      // superseded by this attempt's own registration.
+      const reuseViewerRegistration =
+        viewerRegistrationRef.current !== null &&
+        !viewerRegistrationRef.current.signal.aborted &&
+        viewerReadyRef.current;
+      disconnectCurrentRfb({ keepViewerRegistration: reuseViewerRegistration });
       setReason(null);
 
       if (!api) {
@@ -320,7 +352,9 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
             if (generationRef.current !== generation || isDisposedRef.current) {
               return;
             }
-            disconnectCurrentRfb();
+            // A transport drop is not the pane going away: keep the viewer registered while
+            // the reconnect backoff runs; the reconnect reuses it once ready.
+            disconnectCurrentRfb({ keepViewerRegistration: hasEverConnectedRef.current });
             if (hasEverConnectedRef.current) {
               setState("disconnected");
               setReason(null);
@@ -356,12 +390,15 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
           setState("connecting");
         };
 
-        if (typeof window.api !== "undefined") {
+        if (!registerViewer || reuseViewerRegistration) {
           connectRfb();
           return;
         }
 
-        // A browser viewer must be registered for cooperative release before opening VNC.
+        // The viewer must be registered for cooperative release before opening VNC. The loop
+        // below is scoped to the registration, not to this connection attempt: reconnects
+        // after a transient drop keep it (see reuseViewerRegistration), so a release arriving
+        // during a later generation must still be honored here.
         const registration = new AbortController();
         viewerRegistrationRef.current = registration;
         setState("connecting");
@@ -370,25 +407,23 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
             { workspaceId },
             { signal: registration.signal }
           );
-          if (
-            registration.signal.aborted ||
-            generationRef.current !== generation ||
-            isDisposedRef.current
-          ) {
+          if (registration.signal.aborted || isDisposedRef.current) {
             await events.return?.();
             return;
           }
           let viewerId: string | null = null;
           for await (const event of events) {
-            if (
-              registration.signal.aborted ||
-              generationRef.current !== generation ||
-              isDisposedRef.current
-            )
-              return;
+            if (registration.signal.aborted || isDisposedRef.current) return;
             if (event.type === "ready") {
               assertDesktop(viewerId === null, "Desktop viewer registered more than once.");
               viewerId = event.viewerId;
+              viewerReadyRef.current = true;
+              // Ready only opens this attempt's connection; a superseding attempt already
+              // aborted a not-yet-ready registration, so this generation is still current.
+              assertDesktop(
+                generationRef.current === generation,
+                "Desktop viewer became ready for a superseded connection attempt."
+              );
               connectRfb();
               continue;
             }
@@ -400,6 +435,7 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
             // disconnectAndWait normally unregisters. Keep this subscription alive until ACK
             // so the server can still associate that acknowledgment with this viewer.
             viewerRegistrationRef.current = null;
+            viewerReadyRef.current = false;
             const disconnected = disconnectAndWait();
             const stoppedGeneration = generationRef.current;
             try {

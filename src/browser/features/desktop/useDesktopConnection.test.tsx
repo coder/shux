@@ -119,10 +119,10 @@ describe("useDesktopConnection control ownership", () => {
     Object.assign(globalThis, originals);
   });
 
-  function mountConnection() {
+  function mountConnection(options?: DesktopModule.UseDesktopConnectionOptions) {
     let desktop!: DesktopModule.UseDesktopConnectionResult;
     function Harness() {
-      desktop = useDesktopConnection("workspace-1");
+      desktop = useDesktopConnection("workspace-1", options);
       return <div ref={desktop.containerRef} />;
     }
     const client: RecursivePartial<APIClient> = {
@@ -463,11 +463,64 @@ describe("useDesktopConnection control ownership", () => {
     expect(aborted).toHaveBeenCalledTimes(1);
   });
 
-  test("Electron retains its native-window cleanup path without a browser registration", async () => {
+  test("the Electron popout window relies on native cleanup instead of a viewer registration", async () => {
     Object.defineProperty(window, "api", { value: {} });
-    const view = mountConnection();
+    const view = mountConnection({ nativeWindowCleanup: true });
     await connect(view);
     expect(watchViewer).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["Electron inline", false],
+    ["browser popout", true],
+  ])(
+    "the %s pane registers a viewer (nativeWindowCleanup=%s only skips in Electron)",
+    async (surface, nativeWindowCleanup) => {
+      if (surface === "Electron inline") Object.defineProperty(window, "api", { value: {} });
+      const view = mountConnection({ nativeWindowCleanup });
+      await connect(view);
+      expect(watchViewer).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test("a transient transport drop keeps the viewer registered through the reconnect backoff", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    const registration = registrations[0];
+    // Simulate the bridge socket dropping: the pane stays mounted and schedules a reconnect.
+    rfb.events.dispatchEvent(new Event("disconnect"));
+    await waitFor(() => expect(view.desktop.state).toBe("disconnected"));
+    expect(registration.signal.aborted).toBe(false);
+    // The reconnect reuses the ready registration rather than re-registering.
+    await waitFor(() => expect(view.desktop.state).toBe("connected"), { timeout: 5_000 });
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+    expect(registration.signal.aborted).toBe(false);
+    expect(DesktopRfbFixture.instances).toHaveLength(2);
+    // A release after the reconnect is still honored by the retained registration.
+    registration.queue.push({ type: "release", viewerId: registration.viewerId });
+    await waitFor(() =>
+      expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: registration.viewerId })
+    );
+    await waitFor(() => expect(registration.signal.aborted).toBe(true));
+    expect(DesktopRfbFixture.instances[1].disconnectCount).toBe(1);
+  });
+
+  test("a release during the reconnect backoff disconnects, ACKs, and stops reconnecting", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    const registration = registrations[0];
+    rfb.events.dispatchEvent(new Event("disconnect"));
+    await waitFor(() => expect(view.desktop.state).toBe("disconnected"));
+    registration.queue.push({ type: "release", viewerId: registration.viewerId });
+    await waitFor(() =>
+      expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: registration.viewerId })
+    );
+    await waitFor(() => expect(registration.signal.aborted).toBe(true));
+    await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
+    // The pending backoff timer must not resurrect the connection after the release.
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_200));
+    expect(DesktopRfbFixture.instances).toHaveLength(1);
+    expect(getBootstrap).toHaveBeenCalledTimes(1);
   });
 
   test("unmount prevents a pending bootstrap from creating a connection", async () => {

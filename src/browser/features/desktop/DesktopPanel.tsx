@@ -91,8 +91,12 @@ export function DesktopViewer(props: {
   onBringBack?: () => void;
   attach?: (disconnect: () => void, disconnectAndWait: () => Promise<void>) => () => void;
   onStartupError?: () => void;
+  /** See UseDesktopConnectionOptions.nativeWindowCleanup. */
+  nativeWindowCleanup?: boolean;
 }) {
-  const desktop = useDesktopConnection(props.workspaceId);
+  const desktop = useDesktopConnection(props.workspaceId, {
+    nativeWindowCleanup: props.nativeWindowCleanup,
+  });
 
   useEffect(() => {
     const detach = props.attach?.(desktop.disconnect, desktop.disconnectAndWait);
