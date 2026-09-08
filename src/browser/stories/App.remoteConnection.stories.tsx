@@ -267,7 +267,10 @@ export const BrowserWithoutBridge: AppStory = {
   render: () => <AppWithMocks setup={setupRemoteSettings} />,
   play: async ({ canvasElement }) => {
     const canvas = await openSettings(canvasElement);
-    await expect(await canvas.findByRole("button", { name: "Server Access" })).toBeVisible();
+    // Settings can mount while AppLoader's fade-in still makes the button invisible.
+    await waitFor(() =>
+      expect(canvas.getByRole("button", { name: "Server Access" })).toBeVisible()
+    );
     await expect(canvas.queryByRole("button", { name: "Remote Connection" })).toBeNull();
   },
 };
