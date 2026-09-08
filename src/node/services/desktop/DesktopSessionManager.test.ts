@@ -658,15 +658,21 @@ describe("DesktopSessionManager browser viewer releases", () => {
         definitive.controller.abort();
         await definitive.watcher.return(undefined);
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
-        // ...and retracts the grace its superseded registration stamped: a ready registration
-        // that dropped while the bootstrap was pending is replaced at once, and the terminal
-        // outcome arrives through the replacement.
+        // ...and retracts the grace a superseded registration stamped when the pane reports that
+        // viewerId too (a ready registration that dropped while the bootstrap was pending is
+        // replaced at once; the terminal outcome arrives through the replacement) — but never
+        // the grace another pane of the same requester left while it re-registers.
+        const otherPane = await registerViewer("isolated");
+        otherPane.controller.abort();
+        await otherPane.watcher.return(undefined);
         const superseded = await registerViewer("isolated");
         superseded.controller.abort();
         await superseded.watcher.return(undefined);
-        expect(manager.hasAttachedViewers("isolated")).toBe(true);
         const replacement = await registerViewer("isolated");
         manager.detachViewer(replacement.viewerId);
+        manager.detachViewer(superseded.viewerId);
+        expect(manager.hasAttachedViewers("isolated")).toBe(true);
+        manager.detachViewer(otherPane.viewerId);
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
         replacement.controller.abort();
         await replacement.watcher.return(undefined);

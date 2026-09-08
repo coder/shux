@@ -193,15 +193,26 @@ export function useDesktopConnection(
   // Set when the pane settles in a terminal unavailable/error state with no retry pending: a
   // background re-registration must not outlive that and re-attach a pane showing nothing.
   const terminalRef = useRef(false);
+  // Ready registrations this pane lost to a subscription drop and replaced. Each left an
+  // attachment grace on the backend that only a definitive outcome of this pane can retract.
+  const supersededViewerIdsRef = useRef<string[]>([]);
 
   // A terminal outcome gives the registration up definitively: tell the backend before the
   // abort so the detachment leaves no attachment grace (nothing will reconnect), then tear down.
+  // The superseded registrations are reported too: their graces would otherwise keep a pane that
+  // shows nothing "attached" for the whole grace after it settled.
   const settleTerminal = () => {
     terminalRef.current = true;
-    const viewerId = viewerIdRef.current;
     const client = apiRef.current;
-    if (viewerId !== null && client && viewerRegistrationRef.current !== null) {
-      void client.desktop.detachViewer({ viewerId }).catch(() => undefined);
+    const viewerId = viewerIdRef.current;
+    const viewerIds =
+      viewerId !== null && viewerRegistrationRef.current !== null
+        ? [...supersededViewerIdsRef.current, viewerId]
+        : supersededViewerIdsRef.current;
+    supersededViewerIdsRef.current = [];
+    if (!client) return;
+    for (const id of viewerIds) {
+      void client.desktop.detachViewer({ viewerId: id }).catch(() => undefined);
     }
   };
 
@@ -416,6 +427,7 @@ export function useDesktopConnection(
           // Lost the release channel after ready. The server can no longer ask this pane to
           // release input, so drop control now, but keep the healthy VNC bridge (it still
           // marks the pane as attached) and re-register in the background.
+          supersededViewerIdsRef.current.push(viewerId);
           retire();
           setControlling(false);
           scheduleViewerReregistration();

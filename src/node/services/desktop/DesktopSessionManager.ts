@@ -38,6 +38,7 @@ interface DesktopViewerRegistration {
 }
 
 interface DetachmentGrace {
+  requesterWorkspaceId: string;
   expiresAt: number;
   /** Owner captured at stamp time: the fallback when the requester can no longer be resolved. */
   capturedOwnerWorkspaceId: string;
@@ -65,14 +66,17 @@ export class DesktopSessionManager {
   private readonly windowOwners = new Map<string, string>();
   private readonly closingWorkspaces = new Map<string, Promise<void>>();
   /**
-   * Requester whose attachment detached → its grace. Keyed by requester (not by the workspaces
-   * it keeps attached) so an explicit close or a definitive detach can retract exactly the grace
-   * that requester's attachments produced without touching graces other requesters left on the
-   * same owner, and so the owner it covers is re-resolved at query time: a grace stamped while the
+   * Detached source → its grace. Viewer detachments are keyed by their viewerId so a pane's
+   * definitive detach can retract exactly the graces its own (possibly superseded) registrations
+   * stamped — never another pane's; bridge detachments get an opaque key. Graces record the
+   * requester rather than the workspaces they keep attached so an explicit close can retract a
+   * released requester's graces without touching graces other requesters left on the same owner,
+   * and so the owner a grace covers is re-resolved at query time: a grace stamped while the
    * borrower targeted owner A must follow the borrower to owner B when the binding changes before
    * it reconnects (see noteDetached / hasRecentDetachment).
    */
   private readonly recentDetachments = new Map<string, DetachmentGrace>();
+  private bridgeDetachmentSequence = 0;
   /**
    * Closes in flight, keyed by the closing workspace → requesters whose attachments to it
    * detached during the teardown (borrowers' viewers and bridges when an owner closes). One
@@ -125,15 +129,13 @@ export class DesktopSessionManager {
    * backend never infers "will not reconnect" from a bootstrap outcome.
    */
   detachViewer(viewerId: string): void {
-    const viewer = this.viewers.get(viewerId);
-    if (!viewer) return;
     this.viewers.delete(viewerId);
-    // The pane may already have stamped a grace under this requester: a ready registration
-    // that dropped while its bootstrap was pending is replaced immediately, and the terminal
-    // outcome then arrives through the replacement. That grace is stale too; retracting the
-    // requester's grace cannot un-attach another pane of the same requester, because a pane
-    // that will reconnect keeps its own live registration through the whole reconnect loop.
-    this.recentDetachments.delete(viewer.workspaceId);
+    // The registration may already be gone and have stamped a grace instead: a ready
+    // registration that dropped while its bootstrap was pending is replaced immediately, and the
+    // pane reports the terminal outcome for the superseded viewerId too. Only that registration's
+    // own grace is retracted — a grace another pane of the same requester left while it
+    // re-registers must keep that pane attached.
+    this.recentDetachments.delete(viewerId);
   }
 
   private releaseViewer(viewer: DesktopViewerRegistration): Promise<void> {
@@ -477,9 +479,23 @@ export class DesktopSessionManager {
    * "reconnecting" from "closed". An idle desktop that never had an attachment gets no grace.
    */
   noteDetached(requesterWorkspaceId: string, capturedOwnerWorkspaceId: string): void {
+    this.bridgeDetachmentSequence += 1;
+    this.stampDetachment(
+      `bridge:${this.bridgeDetachmentSequence}`,
+      requesterWorkspaceId,
+      capturedOwnerWorkspaceId
+    );
+  }
+
+  private stampDetachment(
+    sourceKey: string,
+    requesterWorkspaceId: string,
+    capturedOwnerWorkspaceId: string
+  ): void {
     assert(requesterWorkspaceId.length > 0, "noteDetached requires the detached requester");
     assert(capturedOwnerWorkspaceId.length > 0, "noteDetached requires the attachment's owner");
-    this.recentDetachments.set(requesterWorkspaceId, {
+    this.recentDetachments.set(sourceKey, {
+      requesterWorkspaceId,
       expiresAt: this.now() + DESKTOP_ATTACHMENT_GRACE_MS,
       capturedOwnerWorkspaceId,
       coversOwner: true,
@@ -492,7 +508,7 @@ export class DesktopSessionManager {
   }
 
   private noteViewerDetached(viewer: DesktopViewerRegistration): void {
-    this.noteDetached(viewer.workspaceId, viewer.ownerWorkspaceId);
+    this.stampDetachment(viewer.viewerId, viewer.workspaceId, viewer.ownerWorkspaceId);
   }
 
   /**
@@ -502,9 +518,13 @@ export class DesktopSessionManager {
    * own workspace stays covered). Graces other requesters left on other owners stay untouched.
    */
   private retractDetachments(closedWorkspaceId: string, releasedRequesters: Set<string>): void {
-    for (const requester of releasedRequesters) this.recentDetachments.delete(requester);
-    for (const [requester, grace] of this.recentDetachments) {
-      if (this.currentOwnerOf(requester, grace.capturedOwnerWorkspaceId) === closedWorkspaceId) {
+    for (const [sourceKey, grace] of this.recentDetachments) {
+      if (releasedRequesters.has(grace.requesterWorkspaceId)) {
+        this.recentDetachments.delete(sourceKey);
+      } else if (
+        this.currentOwnerOf(grace.requesterWorkspaceId, grace.capturedOwnerWorkspaceId) ===
+        closedWorkspaceId
+      ) {
         grace.coversOwner = false;
       }
     }
@@ -524,15 +544,16 @@ export class DesktopSessionManager {
   private hasRecentDetachment(workspaceId: string): boolean {
     const now = this.now();
     let covered = false;
-    for (const [requester, grace] of this.recentDetachments) {
+    for (const [sourceKey, grace] of this.recentDetachments) {
       if (grace.expiresAt <= now) {
-        this.recentDetachments.delete(requester);
+        this.recentDetachments.delete(sourceKey);
         continue;
       }
-      if (requester === workspaceId) covered = true;
+      if (grace.requesterWorkspaceId === workspaceId) covered = true;
       else if (
         grace.coversOwner &&
-        this.currentOwnerOf(requester, grace.capturedOwnerWorkspaceId) === workspaceId
+        this.currentOwnerOf(grace.requesterWorkspaceId, grace.capturedOwnerWorkspaceId) ===
+          workspaceId
       ) {
         covered = true;
       }

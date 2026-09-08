@@ -587,6 +587,32 @@ describe("useDesktopConnection control ownership", () => {
     expect(registrations[0].signal.aborted).toBe(true);
   });
 
+  test("a terminal outcome also gives up the registrations it superseded during bootstrap", async () => {
+    let resolveBootstrap!: (value: Awaited<ReturnType<typeof getBootstrap>>) => void;
+    getBootstrap = mock(
+      () =>
+        new Promise<Awaited<ReturnType<typeof getBootstrap>>>((done) => {
+          resolveBootstrap = done;
+        })
+    );
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(getBootstrap).toHaveBeenCalledTimes(1));
+    // The ready subscription drops while bootstrap is pending: the backend stamps a grace for
+    // it and the pane re-registers at once.
+    registrations[0].queue.end();
+    await waitFor(() => expect(registrations).toHaveLength(2));
+    await act(async () => {
+      resolveBootstrap({ ...bootstrap, capability: { available: false, reason: "disabled" } });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
+    // Both the replacement and the superseded registration are detached definitively, so the
+    // superseded one's grace cannot keep a pane that shows nothing attached.
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registrations[1].viewerId });
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registrations[0].viewerId });
+  });
+
   test("a security failure before the first connect is terminal and gives the viewer up", async () => {
     const view = mountConnection();
     act(() => view.desktop.connect());
