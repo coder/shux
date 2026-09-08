@@ -44,6 +44,13 @@ async function checkLoadingLayout(canvasElement: HTMLElement) {
     const statusRect = status!.getBoundingClientRect();
     const dockRect = dock.getBoundingClientRect();
     const composerRect = composer.getBoundingClientRect();
+    const transcript = within(canvasElement).getByRole("log");
+    const transcriptContentBottom =
+      transcript.getBoundingClientRect().bottom -
+      Number.parseFloat(getComputedStyle(transcript).paddingBottom);
+    // The badge must stay inside the permanent gutter, even when the final row
+    // has no extra margin (e.g. a compact tool or reasoning row).
+    await expect(statusRect.top).toBeGreaterThanOrEqual(transcriptContentBottom);
     await expect(statusRect.bottom).toBeLessThanOrEqual(composerRect.top);
     await expect(Math.abs(dockRect.left - composerRect.left)).toBeLessThan(1);
     await expect(Math.abs(dockRect.right - composerRect.right)).toBeLessThan(1);

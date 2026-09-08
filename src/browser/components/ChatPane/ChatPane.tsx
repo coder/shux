@@ -1440,9 +1440,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // margins disable flex-item stretch.
                 chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-4xl mx-auto w-full",
                 // `flex-1` pushes the dock to the scrollport bottom for short
-                // transcripts; `pb-[15px]` keeps the original gap between the last
-                // message and the composer.
-                "flex-1 pb-[15px]",
+                // transcripts. Keep a permanent gutter for the loading overlay so
+                // even compact tail rows remain unobscured without resizing on catch-up.
+                "flex-1 pb-8",
                 // Only the empty/centered placeholder fills height (as a flex column
                 // so the placeholder's flex-1 centering works). The hydration
                 // skeleton renders in normal top-aligned transcript flow so it sits
