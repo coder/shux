@@ -3,6 +3,14 @@ import type { Client, ClientContext } from "@orpc/client";
 import type { AnySchema, InferSchemaInput, InferSchemaOutput } from "@orpc/contract";
 import { RPCLink } from "@orpc/client/websocket";
 import type * as schemas from "../../../src/common/orpc/schemas/api";
+import {
+  ORPC_WS_PROTOCOL,
+  ORPC_WS_TICKET_PREFIX,
+} from "../../../src/common/constants/webSocketAuth";
+import {
+  requestWebSocketTicket,
+  WebSocketTicketError,
+} from "../../../src/common/orpc/webSocketTicket";
 import { normalizeEndpoint } from "./endpoint";
 
 // Infer the wire contract without importing the Node router's implementation
@@ -39,47 +47,54 @@ export async function connect(
   if (!token.trim()) throw new Error("Enter a server token.");
   if (options.signal?.aborted) throw new Error("Connection cancelled.");
 
-  const url = new URL(`${normalized}/orpc/ws`);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.searchParams.set("token", token.trim());
-  let socket: WebSocket;
-  try {
-    socket = new WebSocket(url.toString());
-    socket.binaryType = "arraybuffer";
-  } catch {
-    // Native WebSocket errors may include the credential-bearing URL.
-    throw new Error("Unable to open a connection to the server.");
-  }
-
   const probe = new AbortController();
+  let socket: WebSocket | undefined;
   let closed = false;
   let timedOut = false;
+  const closeSocket = () => {
+    if (!socket) return;
+    const ownedSocket = socket;
+    try {
+      if (ownedSocket.readyState < 2) ownedSocket.close();
+    } catch {
+      // Some native implementations cannot close a pending handshake. Do not
+      // let a late open outlive cancellation of the connection that owns it.
+      ownedSocket.addEventListener("open", () => ownedSocket.close(), { once: true });
+    }
+  };
   const close = () => {
     if (closed) return;
     closed = true;
     options.signal?.removeEventListener("abort", close);
-    socket.removeEventListener("close", close);
+    socket?.removeEventListener("close", close);
     probe.abort();
-    try {
-      if (socket.readyState < 2) socket.close();
-    } catch {
-      // Some native implementations throw when closing a pending handshake.
-      // Still close if that handshake subsequently succeeds.
-      socket.addEventListener("open", () => socket.close(), { once: true });
-    }
+    closeSocket();
   };
-  socket.addEventListener("close", close);
   options.signal?.addEventListener("abort", close, { once: true });
+  // One deadline covers both the HTTP mint and the authenticated socket probe.
   const timeout = setTimeout(() => {
     timedOut = true;
     close();
   }, CONNECT_TIMEOUT_MS);
 
   try {
+    const { ticket } = await requestWebSocketTicket(normalized, token, probe.signal);
+    probe.signal.throwIfAborted();
+    const url = new URL(`${normalized}/orpc/ws`);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    // Never put the reusable bearer in URLs or protocols; every reconnect mints
+    // a fresh, short-lived single-use ticket through authenticated HTTP instead.
+    socket = new WebSocket(url.toString(), [ORPC_WS_PROTOCOL, ORPC_WS_TICKET_PREFIX + ticket]);
+    socket.binaryType = "arraybuffer";
+    socket.addEventListener("close", close);
+    if (closed) {
+      closeSocket();
+      throw new Error("Connection closed.");
+    }
     const client = createORPCClient<MobileClient>(
       new RPCLink({
         connect: () => {
-          if (closed) throw new Error("Connection closed.");
+          if (closed || !socket) throw new Error("Connection closed.");
           return socket;
         },
         reconnect: { enabled: false },
@@ -102,10 +117,11 @@ export async function connect(
       endpoint: normalized,
       reconnect: (options) => connect(normalized, token, options),
     };
-  } catch {
+  } catch (error) {
     close();
     if (options.signal?.aborted) throw new Error("Connection cancelled.");
     if (timedOut) throw new Error("Connection timed out.");
+    if (error instanceof WebSocketTicketError) throw error;
     throw new Error("Unable to connect. Check the server address and token.");
   } finally {
     clearTimeout(timeout);

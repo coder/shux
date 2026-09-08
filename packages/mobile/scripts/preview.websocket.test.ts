@@ -2,16 +2,30 @@ import { expect, test } from "bun:test";
 import net from "node:net";
 import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
+import { once } from "node:events";
+import { WebSocket } from "ws";
+import {
+  ORPC_WS_PROTOCOL,
+  ORPC_WS_TICKET_PREFIX,
+} from "../../../src/common/constants/webSocketAuth";
 
 // Exercise the same Node entry used by make mobile-web. Bun's node:http proxy
 // accepts upgrades but can stall binary oRPC frames, invisible to HTTP-only tests.
-test("Node preview forwards binary WebSocket frames with prefix and token intact", async () => {
+test("Node preview forwards binary WebSocket frames with ticket protocols intact and browser identity stripped", async () => {
+  const ticket = "a".repeat(64);
+  const protocols = [ORPC_WS_PROTOCOL, ORPC_WS_TICKET_PREFIX + ticket];
+  const requests: Request[] = [];
   const upstream = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
     fetch(req, server) {
       const url = new URL(req.url);
-      if (url.pathname !== "/prefix/orpc/ws" || url.searchParams.get("token") !== "test-only")
+      requests.push(req);
+      if (
+        url.pathname !== "/prefix/orpc/ws" ||
+        url.search ||
+        req.headers.get("sec-websocket-protocol")?.split(/,\s*/).join(",") !== protocols.join(",")
+      )
         return new Response("Unauthorized", { status: 401 });
       return server.upgrade(req) ? undefined : new Response("Upgrade required", { status: 400 });
     },
@@ -56,7 +70,14 @@ test("Node preview forwards binary WebSocket frames with prefix and token intact
     ]);
     clearTimeout(timeout);
     const bytes = new Uint8Array([0, 128, 255, 10]);
-    socket = new WebSocket(`ws://127.0.0.1:${port}/__xum/orpc/ws?token=test-only`);
+    socket = new WebSocket(`ws://127.0.0.1:${port}/__xum/orpc/ws`, protocols, {
+      headers: {
+        origin: `http://127.0.0.1:${port}`,
+        cookie: "private-preview-cookie",
+        forwarded: "host=attacker.test",
+        "x-forwarded-host": "attacker.test",
+      },
+    });
     socket.binaryType = "arraybuffer";
     const reply = await new Promise<ArrayBuffer>((resolve, reject) => {
       const ws = socket!;
@@ -66,6 +87,36 @@ test("Node preview forwards binary WebSocket frames with prefix and token intact
       ws.onerror = () => reject(new Error("Proxy WebSocket failed"));
     });
     expect(new Uint8Array(reply)).toEqual(bytes);
+    expect(socket.protocol).toBe(protocols[0]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0].headers.get("cookie")).toBeNull();
+    expect(requests[0].headers.get("authorization")).toBeNull();
+    expect(requests[0].headers.get("forwarded")).toBeNull();
+    expect(requests[0].headers.get("x-forwarded-host")).toBeNull();
+    expect(requests[0].headers.get("origin")).toBe(`http://127.0.0.1:${upstream.port}`);
+    const rejected = net.createConnection({ host: "127.0.0.1", port });
+    try {
+      await once(rejected, "connect");
+      rejected.write(
+        [
+          "GET /__xum/orpc/ws HTTP/1.1",
+          `Host: 127.0.0.1:${port}`,
+          "Connection: Upgrade",
+          "Upgrade: websocket",
+          "Origin: https://attacker.test",
+          "Sec-WebSocket-Version: 13",
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+          `Sec-WebSocket-Protocol: ${protocols.join(", ")}`,
+          "",
+          "",
+        ].join("\r\n")
+      );
+      const [response] = await once(rejected, "data");
+      expect(String(response)).toContain("403 Forbidden");
+      expect(requests).toHaveLength(1);
+    } finally {
+      rejected.destroy();
+    }
   } finally {
     clearTimeout(timeout);
     socket?.close();

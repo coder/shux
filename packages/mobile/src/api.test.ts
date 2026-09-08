@@ -1,11 +1,20 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { ORPCError, os } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/websocket";
+import { RPCHandler as HTTPHandler } from "@orpc/server/node";
+import { createServer } from "node:http";
+import type { IncomingMessage } from "node:http";
+import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import { once } from "node:events";
 import assert from "node:assert/strict";
 import { WebSocketServer } from "ws";
 import { connect } from "./api";
+import {
+  ORPC_WS_PROTOCOL,
+  ORPC_WS_TICKET_PREFIX,
+  ORPC_WS_TICKET_TTL_MS,
+} from "../../../src/common/constants/webSocketAuth";
 import type { WorkspaceChatMessage } from "./transcript";
 
 async function expectFailure(promise: Promise<unknown>, message?: string): Promise<void> {
@@ -31,7 +40,17 @@ async function serverFixture(stallProbe = false) {
     if (!context.authenticated) throw new ORPCError("UNAUTHORIZED");
     return next();
   });
-  const handler = new RPCHandler({
+  const tickets = new Set<string>();
+  const mintRequests: Array<{ url: string | undefined; authorization: string | undefined }> = [];
+  const handshakes: Array<{ url: string | undefined; protocols: string | undefined }> = [];
+  const router = {
+    serverAuth: {
+      issueWebSocketTicket: procedure.handler(() => {
+        const ticket = randomBytes(32).toString("hex");
+        tickets.add(ticket);
+        return { ticket, expiresAtMs: Date.now() + ORPC_WS_TICKET_TTL_MS };
+      }),
+    },
     workspace: {
       list: procedure.handler(async ({ signal }) => {
         calls++;
@@ -58,23 +77,60 @@ async function serverFixture(stallProbe = false) {
           yield { type: "caught-up", replay: "full" };
         }),
     },
+  };
+  const handler = new RPCHandler(router);
+  const httpHandler = new HTTPHandler(router);
+  const httpServer = createServer((request, response) => {
+    mintRequests.push({ url: request.url, authorization: request.headers.authorization });
+    httpHandler
+      .handle(request, response, {
+        prefix: "/proxy/orpc",
+        context: { authenticated: request.headers.authorization === `Bearer ${token}` },
+      })
+      .then(({ matched }) => {
+        if (!matched) {
+          response.statusCode = 404;
+          response.end();
+        }
+      })
+      .catch(() => {
+        response.statusCode = 500;
+        response.end();
+      });
   });
-  const server = new WebSocketServer({ host: "127.0.0.1", port: 0, path: "/proxy/orpc/ws" });
-  server.on("connection", (socket, request) => {
+  const server = new WebSocketServer({
+    server: httpServer,
+    path: "/proxy/orpc/ws",
+    handleProtocols: () => ORPC_WS_PROTOCOL,
+    verifyClient: ({ req }: { req: IncomingMessage }) => {
+      const protocols = req.headers["sec-websocket-protocol"]?.split(/,\s*/);
+      const ticket = protocols
+        ?.find((value) => value.startsWith(ORPC_WS_TICKET_PREFIX))
+        ?.slice(ORPC_WS_TICKET_PREFIX.length);
+      handshakes.push({ url: req.url, protocols: req.headers["sec-websocket-protocol"] });
+      return (
+        req.url === "/proxy/orpc/ws" &&
+        protocols?.includes(ORPC_WS_PROTOCOL) === true &&
+        ticket !== undefined &&
+        tickets.delete(ticket)
+      );
+    },
+  });
+  server.on("connection", (socket) => {
     upgrades++;
-    const url = new URL(request.url ?? "", "http://localhost");
-    handler.upgrade(socket, {
-      context: { authenticated: url.searchParams.get("token") === token },
-    });
+    handler.upgrade(socket, { context: { authenticated: true } });
     socket.once("close", onClose);
     onOpen();
   });
-  await once(server, "listening");
-  const address = server.address();
+  httpServer.listen(0, "127.0.0.1");
+  await once(httpServer, "listening");
+  const address = httpServer.address();
   assert(address && typeof address !== "string", "Test server must bind a TCP port");
   return {
     endpoint: `http://127.0.0.1:${address.port}/proxy`,
     token,
+    mintRequests,
+    handshakes,
     opened,
     closed,
     calls: () => calls,
@@ -84,6 +140,12 @@ async function serverFixture(stallProbe = false) {
       for (const socket of server.clients) socket.terminate();
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
+      });
+      await new Promise<void>((resolve, reject) => {
+        // Bun can stop listening here after terminating an upgraded connection.
+        httpServer.closeAllConnections();
+        if (!httpServer.listening) resolve();
+        else httpServer.close((error) => (error ? reject(error) : resolve()));
       });
     },
   };
@@ -113,6 +175,15 @@ describe("mobile WebSocket connection", () => {
     try {
       expect(connection.endpoint).toBe(server.endpoint);
       expect(server.calls()).toBe(1);
+      expect(server.mintRequests).toEqual([
+        {
+          url: "/proxy/orpc/serverAuth/issueWebSocketTicket",
+          authorization: `Bearer ${server.token}`,
+        },
+      ]);
+      expect(server.handshakes[0].url).toBe("/proxy/orpc/ws");
+      expect(server.handshakes[0].protocols).not.toContain(server.token);
+
       const events: WorkspaceChatMessage[] = [];
       const subscription = await connection.client.workspace.onChat({
         workspaceId: "w",
@@ -149,14 +220,14 @@ describe("mobile WebSocket connection", () => {
     expect(server.upgrades()).toBe(1);
   });
 
-  test("rejects bad auth without exposing token or URL and closes its socket", async () => {
+  test("rejects bad auth without exposing token or URL or opening a socket", async () => {
     await using server = await serverFixture();
     const secret = "wrong-secret";
     const error = await connect(server.endpoint, secret).catch((error: unknown) => error);
     expect(error).toBeInstanceOf(Error);
     expect(String(error)).not.toContain(secret);
     expect(String(error)).not.toContain(server.endpoint);
-    await server.closed;
+    expect(server.upgrades()).toBe(0);
     expect(server.calls()).toBe(0);
   });
 
@@ -169,6 +240,11 @@ describe("mobile WebSocket connection", () => {
       hostname: "127.0.0.1",
       port: 0,
       fetch(request) {
+        if (new URL(request.url).pathname === "/orpc/serverAuth/issueWebSocketTicket") {
+          return Response.json({
+            json: { ticket: "a".repeat(64), expiresAtMs: Date.now() + ORPC_WS_TICKET_TTL_MS },
+          });
+        }
         onRequest(request);
         return new Promise<Response>((resolve) => {
           request.signal.addEventListener(
@@ -222,6 +298,148 @@ describe("mobile WebSocket connection", () => {
     connection.close();
     expect(server.upgrades()).toBe(1);
   });
+
+  test("explicit reconnect mints a fresh ticket without replaying a failed mutation", async () => {
+    await using server = await serverFixture();
+    const first = await connect(server.endpoint, server.token);
+    await expectFailure(first.client.workspace.interruptStream({ workspaceId: "w" }));
+    first.close();
+    const second = await first.reconnect();
+    try {
+      expect(server.mintRequests).toHaveLength(2);
+      expect(server.handshakes).toHaveLength(2);
+      expect(server.handshakes[0].protocols).not.toBe(server.handshakes[1].protocols);
+      expect(server.mutations()).toBe(1);
+    } finally {
+      second.close();
+    }
+  });
+
+  test.each(["cancel", "timeout"] as const)(
+    "%s bounds ticket acquisition even when fetch ignores abort",
+    async (action) => {
+      await using server = await serverFixture();
+      let finishFetch!: (response: Response) => void;
+      let requested!: () => void;
+      const started = new Promise<void>((resolve) => {
+        requested = resolve;
+      });
+      const response = new Promise<Response>((resolve) => {
+        finishFetch = resolve;
+      });
+      let requestSignal: AbortSignal | undefined;
+      const originalTimeout = globalThis.setTimeout;
+      let expire!: () => void;
+      const timer = spyOn(globalThis, "setTimeout").mockImplementation(
+        Object.assign((...args: Parameters<typeof setTimeout>) => {
+          const [callback, delay, ...callbackArgs] = args;
+          if (delay === 10_000) expire = () => callback(...callbackArgs);
+          return originalTimeout(...args);
+        }, originalTimeout)
+      );
+      const fetchMock = spyOn(globalThis, "fetch").mockImplementation(
+        Object.assign((...args: Parameters<typeof fetch>) => {
+          requestSignal = args[1]?.signal ?? undefined;
+          requested();
+          return response;
+        }, globalThis.fetch)
+      );
+      try {
+        const controller = new AbortController();
+        const pending = connect(server.endpoint, server.token, { signal: controller.signal });
+        await started;
+        if (action === "cancel") controller.abort("private cancellation reason");
+        else expire();
+        await expectFailure(
+          pending,
+          action === "cancel" ? "Connection cancelled." : "Connection timed out."
+        );
+        expect(requestSignal?.aborted).toBe(true);
+        finishFetch(
+          Response.json({
+            json: { ticket: "a".repeat(64), expiresAtMs: Date.now() + ORPC_WS_TICKET_TTL_MS },
+          })
+        );
+        await response;
+        await Promise.resolve();
+        expect(server.handshakes).toHaveLength(0);
+      } finally {
+        fetchMock.mockRestore();
+        timer.mockRestore();
+      }
+    }
+  );
+
+  test("cancellation closes a late native handshake that could not close while connecting", async () => {
+    const OriginalWebSocket = globalThis.WebSocket;
+    let opened!: (socket: PendingSocket) => void;
+    const constructed = new Promise<PendingSocket>((resolve) => {
+      opened = resolve;
+    });
+    class PendingSocket extends EventTarget {
+      readyState = 0;
+      binaryType = "blob";
+      closes = 0;
+      constructor() {
+        super();
+        opened(this);
+      }
+      close() {
+        this.closes++;
+        if (this.readyState === 0) throw new Error("Cannot close pending native handshake");
+        this.readyState = 3;
+        this.dispatchEvent(new Event("close"));
+      }
+      send() {
+        throw new Error("Cancelled socket must not dispatch RPCs");
+      }
+    }
+    Object.assign(globalThis, { WebSocket: PendingSocket });
+    const fetchMock = spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        json: { ticket: "a".repeat(64), expiresAtMs: Date.now() + ORPC_WS_TICKET_TTL_MS },
+      })
+    );
+    try {
+      const controller = new AbortController();
+      const pending = connect("http://localhost", "private token/+?", {
+        signal: controller.signal,
+      });
+      const lateSocket = await constructed;
+      controller.abort();
+      await expectFailure(pending, "Connection cancelled.");
+      expect(lateSocket.closes).toBe(1);
+      lateSocket.readyState = 1;
+      lateSocket.dispatchEvent(new Event("open"));
+      expect(lateSocket.closes).toBe(2);
+      expect(lateSocket.readyState).toBe(3);
+    } finally {
+      Object.assign(globalThis, { WebSocket: OriginalWebSocket });
+      fetchMock.mockRestore();
+    }
+  });
+
+  test.each([401, 404, 500])(
+    "ticket HTTP %s fails closed without an insecure upgrade or credential-bearing error",
+    async (status) => {
+      await using server = await serverFixture();
+      const fetchMock = spyOn(globalThis, "fetch").mockResolvedValue(
+        new Response(server.token, { status })
+      );
+      try {
+        const failure = await connect(server.endpoint, server.token).catch(
+          (cause: unknown) => cause
+        );
+        expect(failure).toBeInstanceOf(Error);
+        expect(String(failure)).not.toContain(server.token);
+        expect(String(failure)).not.toContain(server.endpoint);
+        expect(server.handshakes).toHaveLength(0);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        fetchMock.mockRestore();
+      }
+    }
+  );
 
   test("a stalled authenticated RPC probe times out and closes its socket", async () => {
     await using server = await serverFixture(true);

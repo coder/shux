@@ -36,7 +36,8 @@ describe("fixed-target mobile preview", () => {
     const preview = await listen(
       createPreviewServer({ endpoint: `${endpoint}/@me/dev/apps/xum`, origin })
     );
-    const result = await fetch(`${preview}/__xum/orpc/workspace/list`, {
+    const result = await fetch(`${preview}/__xum/orpc/serverAuth/issueWebSocketTicket`, {
+      method: "POST",
       headers: {
         host,
         origin,
@@ -48,7 +49,7 @@ describe("fixed-target mobile preview", () => {
     });
     const body = await result.json();
     expect(result.status).toBe(200);
-    expect(body.url).toBe("/@me/dev/apps/xum/orpc/workspace/list");
+    expect(body.url).toBe("/@me/dev/apps/xum/orpc/serverAuth/issueWebSocketTicket");
     expect(body.headers.authorization).toBe("Bearer test-only");
     expect(body.headers.origin).toBe(endpoint);
     expect(body.headers.cookie).toBeUndefined();
