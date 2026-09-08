@@ -107,7 +107,11 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { runtimeModeSupportsSharedTaskWorkspace, type RuntimeConfig } from "@/common/types/runtime";
-import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
+import type {
+  ProjectRef,
+  WorkspaceMetadata,
+  WorkspaceRemovalDescendant,
+} from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import { SendMessageOptionsSchema, ToolPolicySchema } from "@/common/orpc/schemas/stream";
@@ -9163,88 +9167,154 @@ export class TaskService implements AgentTaskIntegration {
     assert(ownerWorkspaceId.length > 0, "removeInactiveDescendantAgentTask requires owner");
     assert(taskId.length > 0, "removeInactiveDescendantAgentTask requires taskId");
 
-    return await this.withTaskTreeLifecycleLock(taskId, async () => {
-      const config = this.config.loadConfigOrDefault();
-      const entry = findWorkspaceEntry(config, taskId);
-      if (entry == null) {
-        const wasOwned =
-          (await this.hasRemovedAgentTaskTombstone(ownerWorkspaceId, taskId)) ||
-          (await this.filterDescendantAgentTaskIds(ownerWorkspaceId, [taskId])).includes(taskId);
-        return Ok(
-          wasOwned
-            ? { status: "already_removed", action: "remove", taskId, workspaceId: taskId }
-            : { status: "invalid_scope", action: "remove", taskId }
-        );
-      }
+    return await this.withTaskTreeLifecycleLock(taskId, () =>
+      this.removeInactiveDescendantAgentTaskWhileTaskTreeLocked(ownerWorkspaceId, taskId)
+    );
+  }
 
-      const index = this.buildAgentTaskIndex(config);
-      if (!this.isDescendantAgentTaskUsingParentById(index.parentById, ownerWorkspaceId, taskId)) {
-        return Ok({ status: "invalid_scope", action: "remove", taskId });
-      }
+  private async removeInactiveDescendantAgentTaskWhileTaskTreeLocked(
+    ownerWorkspaceId: string,
+    taskId: string
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    const config = this.config.loadConfigOrDefault();
+    const entry = findWorkspaceEntry(config, taskId);
+    if (entry == null) {
+      const wasOwned =
+        (await this.hasRemovedAgentTaskTombstone(ownerWorkspaceId, taskId)) ||
+        (await this.filterDescendantAgentTaskIds(ownerWorkspaceId, [taskId])).includes(taskId);
+      return Ok(
+        wasOwned
+          ? { status: "already_removed", action: "remove", taskId, workspaceId: taskId }
+          : { status: "invalid_scope", action: "remove", taskId }
+      );
+    }
 
-      const displayName = coerceNonEmptyString(entry.workspace.title) ?? entry.workspace.name;
-      const target = {
-        taskId,
-        workspaceId: taskId,
-        ...(displayName != null ? { displayName } : {}),
-      };
-      const descendantTaskIds = this.listDescendantAgentTasks(taskId).map((task) => task.taskId);
-      if (descendantTaskIds.length > 0) {
-        return Ok({
-          status: "error",
-          action: "remove",
-          ...target,
-          descendantTaskIds,
-          error: "Cannot remove a sub-agent while descendant sub-agents remain.",
-        });
-      }
+    const index = this.buildAgentTaskIndex(config);
+    if (!this.isDescendantAgentTaskUsingParentById(index.parentById, ownerWorkspaceId, taskId)) {
+      return Ok({ status: "invalid_scope", action: "remove", taskId });
+    }
 
-      if (
-        this.isActiveAgentTaskEntry({ ...entry.workspace, projectPath: entry.projectPath }) ||
-        this.aiService.isStreaming(taskId)
-      ) {
-        return Ok({
-          status: "active",
-          action: "remove",
-          ...target,
-          activeTaskIds: [taskId],
-          note: "Stop the sub-agent before removing it.",
-        });
-      }
-
-      return await this.gitPatchArtifactService.withOperationLock(taskId, async () => {
-        // The task can become inactive before its background format-patch job finishes. Wait for the
-        // in-process job, then refuse removal if a restart left a durable pending marker behind; the
-        // child worktree is the source needed to recover that artifact.
-        await this.gitPatchArtifactService.waitForGeneration(taskId);
-        const parentWorkspaceId = entry.workspace.parentWorkspaceId;
-        if (parentWorkspaceId) {
-          const patchArtifact = await readSubagentGitPatchArtifact(
-            path.join(this.config.sessionsDir, parentWorkspaceId),
-            taskId
-          );
-          if (patchArtifact?.status === "pending") {
-            return Ok({
-              status: "error",
-              action: "remove",
-              ...target,
-              error: "Cannot remove the sub-agent while its git patch artifact is still pending.",
-            });
-          }
-        }
-
-        const tombstoneResult = await this.persistRemovedAgentTaskTombstones(taskId);
-        if (!tombstoneResult.success) {
-          return Ok({ status: "error", action: "remove", ...target, error: tombstoneResult.error });
-        }
-        const result = await this.workspaceService.removeWhileTaskTreeLocked(taskId, true);
-        return Ok(
-          result.success
-            ? { status: "removed", action: "remove", ...target }
-            : { status: "error", action: "remove", ...target, error: result.error }
-        );
+    const displayName = coerceNonEmptyString(entry.workspace.title) ?? entry.workspace.name;
+    const target = {
+      taskId,
+      workspaceId: taskId,
+      ...(displayName != null ? { displayName } : {}),
+    };
+    const descendantTaskIds = this.listDescendantAgentTasks(taskId).map((task) => task.taskId);
+    if (descendantTaskIds.length > 0) {
+      return Ok({
+        status: "error",
+        action: "remove",
+        ...target,
+        descendantTaskIds,
+        error: "Cannot remove a sub-agent while descendant sub-agents remain.",
       });
+    }
+
+    if (
+      this.isActiveAgentTaskEntry({ ...entry.workspace, projectPath: entry.projectPath }) ||
+      this.aiService.isStreaming(taskId)
+    ) {
+      return Ok({
+        status: "active",
+        action: "remove",
+        ...target,
+        activeTaskIds: [taskId],
+        note: "Stop the sub-agent before removing it.",
+      });
+    }
+
+    return await this.gitPatchArtifactService.withOperationLock(taskId, async () => {
+      // The task can become inactive before its background format-patch job finishes. Wait for the
+      // in-process job, then refuse removal if a restart left a durable pending marker behind; the
+      // child worktree is the source needed to recover that artifact.
+      await this.gitPatchArtifactService.waitForGeneration(taskId);
+      const parentWorkspaceId = entry.workspace.parentWorkspaceId;
+      if (parentWorkspaceId) {
+        const patchArtifact = await readSubagentGitPatchArtifact(
+          path.join(this.config.sessionsDir, parentWorkspaceId),
+          taskId
+        );
+        if (patchArtifact?.status === "pending") {
+          return Ok({
+            status: "error",
+            action: "remove",
+            ...target,
+            error: "Cannot remove the sub-agent while its git patch artifact is still pending.",
+          });
+        }
+      }
+
+      const tombstoneResult = await this.persistRemovedAgentTaskTombstones(taskId);
+      if (!tombstoneResult.success) {
+        return Ok({ status: "error", action: "remove", ...target, error: tombstoneResult.error });
+      }
+      const result = await this.workspaceService.removeWhileTaskTreeLocked(taskId, true);
+      return Ok(
+        result.success
+          ? { status: "removed", action: "remove", ...target }
+          : { status: "error", action: "remove", ...target, error: result.error }
+      );
     });
+  }
+
+  listWorkspaceRemovalDescendants(workspaceId: string): WorkspaceRemovalDescendant[] {
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    return this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).map((taskId) => {
+      const entry = index.byId.get(taskId)!;
+      return {
+        workspaceId: taskId,
+        title: coerceNonEmptyString(entry.title) ?? entry.name ?? taskId,
+        active: this.isActiveAgentTaskEntry(entry) || this.aiService.isStreaming(taskId),
+      };
+    });
+  }
+
+  async removeAcknowledgedDescendantsWhileTaskTreeLocked(
+    workspaceId: string,
+    acknowledgedIds: string[]
+  ): Promise<Result<void>> {
+    const descendants = this.listWorkspaceRemovalDescendants(workspaceId);
+    const acknowledged = new Set(acknowledgedIds);
+    const current = new Set(descendants.map((descendant) => descendant.workspaceId));
+    if (descendants.some((descendant) => !acknowledged.has(descendant.workspaceId))) {
+      return Err("The descendant scope changed. Confirm the current descendants before removal.");
+    }
+    for (const taskId of acknowledged) {
+      // Only a durable removal record permits an absent ID during a partial retry.
+      if (
+        !current.has(taskId) &&
+        (this.config.findWorkspace(taskId) != null ||
+          !(await this.hasRemovedAgentTaskTombstone(workspaceId, taskId)))
+      ) {
+        return Err("The acknowledged descendant scope does not match this workspace.");
+      }
+    }
+    // Check the full scope before removal. Force does not grant consent to stop children.
+    if (descendants.some((descendant) => descendant.active)) {
+      return Err("Stop active descendant sub-agents before removing this workspace.");
+    }
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    descendants.sort(
+      (a, b) =>
+        this.getTaskDepthFromParentById(index.parentById, b.workspaceId) -
+        this.getTaskDepthFromParentById(index.parentById, a.workspaceId)
+    );
+    for (const descendant of descendants) {
+      const result = await this.removeInactiveDescendantAgentTaskWhileTaskTreeLocked(
+        workspaceId,
+        descendant.workspaceId
+      );
+      if (!result.success) return Err(result.error);
+      if (result.data.status !== "removed" && result.data.status !== "already_removed") {
+        return Err(
+          "error" in result.data
+            ? (result.data.error ?? "Descendant removal failed.")
+            : "Descendant removal failed."
+        );
+      }
+    }
+    return Ok(undefined);
   }
 
   private removedAgentTaskTombstonePath(ownerWorkspaceId: string, taskId: string): string {

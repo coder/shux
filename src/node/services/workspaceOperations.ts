@@ -205,10 +205,12 @@ export async function removeWorkspace(
   context: ORPCContext,
   input: z.infer<typeof schemas.workspace.remove.input>
 ) {
-  const result = await context.workspaceService.remove(input.workspaceId, input.options?.force);
+  const result = await context.workspaceService.remove(input.workspaceId, input.options?.force, {
+    acknowledgedDescendantIds: input.options?.acknowledgedDescendantIds,
+  });
   return result.success
     ? { success: true as const }
-    : { success: false as const, error: result.error };
+    : { success: false as const, error: result.error, descendants: result.descendants };
 }
 
 export async function forkWorkspace(context: ORPCContext, input: ForkWorkspaceInput) {

@@ -13110,6 +13110,68 @@ describe("TaskService", () => {
     );
   });
 
+  test("acknowledged removal preflights activity and scope and retries deepest-first", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parent = "ack-parent";
+    const child = "ack-child";
+    const grandchild = "ack-grandchild";
+    const workspaces = [
+      projectWorkspace(projectPath, "parent", parent),
+      projectWorkspace(projectPath, "child", child, {
+        parentWorkspaceId: parent,
+        taskStatus: "reported",
+      }),
+      projectWorkspace(projectPath, "grandchild", grandchild, {
+        parentWorkspaceId: child,
+        taskStatus: "running",
+        taskIsolation: "none",
+      }),
+    ];
+    await saveWorkspaces(config, projectPath, workspaces, testTaskSettings());
+    let fail = true;
+    const remove = mock(async (workspaceId: string): Promise<Result<void>> => {
+      if (workspaceId === child && fail) return Err("runtime failure");
+      await removeWorkspaceFromTestConfig(config, workspaceId);
+      return Ok(undefined);
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    let streaming = false;
+    const { aiService } = createAIServiceMocks(config, {
+      isStreaming: mock((id: string) => streaming && id === grandchild),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+    const removeScope = (ids: string[]) =>
+      taskService.withTaskTreeLifecycleLock(parent, () =>
+        taskService.removeAcknowledgedDescendantsWhileTaskTreeLocked(parent, ids)
+      );
+    expect(taskService.listWorkspaceRemovalDescendants(parent)).toContainEqual({
+      workspaceId: grandchild,
+      title: "grandchild",
+      active: true,
+    });
+    expect((await removeScope([child, grandchild])).success).toBe(false);
+    expect(remove).not.toHaveBeenCalled();
+    workspaces[2].taskStatus = "reported";
+    await saveWorkspaces(config, projectPath, workspaces, testTaskSettings());
+    streaming = true;
+    expect((await removeScope([child, grandchild])).success).toBe(false);
+    expect(remove).not.toHaveBeenCalled();
+    streaming = false;
+    expect((await removeScope([child])).success).toBe(false);
+    expect((await removeScope([child, grandchild, "unrelated"])).success).toBe(false);
+    expect(remove).not.toHaveBeenCalled();
+    expect(await removeScope([child, grandchild])).toEqual(Err("runtime failure"));
+    expect(
+      taskService.listWorkspaceRemovalDescendants(parent).map((entry) => entry.workspaceId)
+    ).toEqual([child]);
+    expect(config.findWorkspace(parent)).not.toBeNull();
+    fail = false;
+    expect(await removeScope([child, grandchild])).toEqual(Ok(undefined));
+    expect(remove.mock.calls.map((call) => call[0])).toEqual([grandchild, child, child]);
+    expect(await removeScope([child, grandchild])).toEqual(Ok(undefined));
+  });
+
   test("removeInactiveDescendantAgentTask enforces scope, leaf order, and idempotency", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

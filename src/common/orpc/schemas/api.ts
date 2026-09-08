@@ -84,6 +84,7 @@ import { BashToolResultSchema, FileTreeNodeSchema } from "./tools";
 import { WorkspaceStatsSnapshotSchema } from "./workspaceStats";
 import {
   FrontendWorkspaceMetadataSchema,
+  WorkspaceRemoveResultSchema,
   GitStatusSchema,
   ProjectRefSchema,
   WorkspaceActivitySnapshotSchema,
@@ -1383,9 +1384,14 @@ export const workspace = {
   remove: {
     input: z.object({
       workspaceId: z.string(),
-      options: z.object({ force: z.boolean().optional() }).optional(),
+      options: z
+        .object({
+          force: z.boolean().optional(),
+          acknowledgedDescendantIds: z.array(z.string()).optional(),
+        })
+        .optional(),
     }),
-    output: z.object({ success: z.boolean(), error: z.string().optional() }),
+    output: WorkspaceRemoveResultSchema,
   },
   rename: {
     input: z.object({ workspaceId: z.string(), newName: z.string() }),

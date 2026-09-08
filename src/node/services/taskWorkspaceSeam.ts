@@ -13,7 +13,11 @@ import type {
 import type { Result } from "@/common/types/result";
 import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { RuntimeConfig } from "@/common/types/runtime";
-import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
+import type {
+  FrontendWorkspaceMetadata,
+  WorkspaceMetadata,
+  WorkspaceRemovalDescendant,
+} from "@/common/types/workspace";
 import type { AgentAiSettingsLayerValues } from "@/common/types/agentAiSettings";
 import type {
   OpenAIReasoningMode,
@@ -535,6 +539,11 @@ export type WorkspaceHost = WorkspaceTurnHost &
 export interface AgentTaskIntegration {
   withTaskTreeLifecycleLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T>;
   hasDescendantAgentTasks(workspaceId: string): boolean;
+  listWorkspaceRemovalDescendants(workspaceId: string): WorkspaceRemovalDescendant[];
+  removeAcknowledgedDescendantsWhileTaskTreeLocked(
+    workspaceId: string,
+    acknowledgedIds: string[]
+  ): Promise<Result<void>>;
   hasActiveDescendantAgentTasksForWorkspace(workspaceId: string): boolean;
   hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId: string): Promise<boolean>;
   getAgentTaskStatus(workspaceId: string): AgentTaskStatus | null | undefined;

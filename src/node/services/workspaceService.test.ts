@@ -13508,6 +13508,74 @@ describe("WorkspaceService assertPricedModelForBudgetedGoal", () => {
 });
 
 describe("WorkspaceService remove lifecycle coordination", () => {
+  test("acknowledged removal keeps the parent last and returns forced failure scope", async () => {
+    const workspaceService = createWorkspaceServiceForTest({
+      config: { findWorkspace: mock(() => null) },
+    });
+    const descendants = [{ workspaceId: "child", title: "Child", active: true }];
+    const order: string[] = [];
+    let locked = false;
+    let blocked = true;
+    const removeDescendants = mock(() => {
+      expect(locked).toBe(true);
+      order.push("descendants");
+      return Promise.resolve(blocked ? Err("active child") : Ok(undefined));
+    });
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        withTaskTreeLifecycleLock: async <T>(
+          _id: string,
+          operation: () => Promise<T>
+        ): Promise<T> => {
+          expect(locked).toBe(false);
+          locked = true;
+          try {
+            return await operation();
+          } finally {
+            locked = false;
+          }
+        },
+        listWorkspaceRemovalDescendants: () => descendants,
+        removeAcknowledgedDescendantsWhileTaskTreeLocked: removeDescendants,
+      })
+    );
+    const removeParent = spyOn(
+      workspaceService as unknown as {
+        removeUnlocked(id: string, force: boolean): Promise<Result<void>>;
+      },
+      "removeUnlocked"
+    ).mockImplementation(() => {
+      expect(locked).toBe(true);
+      order.push("parent");
+      return Promise.resolve(Err("parent failure"));
+    });
+    expect(
+      await workspaceService.remove("parent", true, { acknowledgedDescendantIds: ["child"] })
+    ).toEqual({
+      success: false,
+      error: "active child",
+      descendants,
+    });
+    expect(removeParent).not.toHaveBeenCalled();
+    blocked = false;
+    expect(
+      await workspaceService.remove("parent", true, { acknowledgedDescendantIds: ["child"] })
+    ).toEqual({
+      success: false,
+      error: "parent failure",
+      descendants,
+    });
+    expect(order).toEqual(["descendants", "descendants", "parent"]);
+    removeDescendants.mockClear();
+    expect(await workspaceService.remove("parent", true)).toEqual({
+      success: false,
+      error: "parent failure",
+      descendants,
+    });
+    expect(removeDescendants).not.toHaveBeenCalled();
+    removeParent.mockRestore();
+  });
+
   test("checks descendant tasks while holding the task-tree lifecycle lock", async () => {
     const workspaceId = "parent-remove-lifecycle";
     const workspaceService = createWorkspaceServiceForTest({

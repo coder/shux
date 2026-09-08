@@ -393,3 +393,14 @@ export const GitStatusSchema = z.object({
   incomingAdditions: z.number(),
   incomingDeletions: z.number(),
 });
+
+export const WorkspaceRemovalDescendantSchema = z.object({
+  workspaceId: z.string(),
+  title: z.string(),
+  active: z.boolean(),
+});
+export const WorkspaceRemoveResultSchema = z.object({
+  success: z.boolean(),
+  error: z.string().optional(),
+  descendants: z.array(WorkspaceRemovalDescendantSchema).optional(),
+});
