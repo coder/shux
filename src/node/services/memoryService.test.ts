@@ -1064,6 +1064,27 @@ describe("MemoryService", () => {
       expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
     });
 
+    it("announces the self→shared transition when config.json recovers after being unreadable", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const invalidated: string[][] = [];
+      fixture.service.on("ownersInvalidated", (ids: string[]) => invalidated.push(ids));
+
+      // config.json vanishes (another backend mid-rewrite): the child cannot
+      // resolve its tree and falls back to its private store...
+      const configFile = path.join(fixture.xumHome, "config.json");
+      const parked = `${configFile}.parked`;
+      await fsPromises.rename(configFile, parked);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+      expect(invalidated).toEqual([]);
+
+      // ...and once it is back, sessions that built a context on the fallback
+      // store must be told, even though no shared mapping was ever memoized.
+      await fsPromises.rename(parked, configFile);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      expect(invalidated).toEqual([["ws-child"]]);
+    });
+
     it("refuses a child's rollback into the shared store once the owner is tombstoned", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

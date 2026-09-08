@@ -46,7 +46,6 @@ import {
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
-import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
 import {
   REFINEMENT_CAPTURE_MAX_FILES,
@@ -609,10 +608,13 @@ export class MemoryService extends EventEmitter {
   // -------------------------------------------------------------------------
 
   /**
-   * Positive-only memo for resolveWorkspaceMemoryOwnerId: a workspace's
-   * parentWorkspaceId is fixed at creation and IDs are never reused, so a
-   * resolved chain stays valid for the process lifetime. Unknown IDs are not
-   * cached — the workspace may simply not be registered yet.
+   * Memo of every owner this process resolved (self-resolutions included),
+   * valid for one config-file stamp: a workspace's parentWorkspaceId is fixed
+   * at creation and IDs are never reused, so a mapping can only change through
+   * a config rewrite, which the stamp check / onConfigChanged catch. Fallback
+   * observations (unregistered ID, config missing or malformed → self) are
+   * memoized too, so their recovery to a shared owner is a visible transition
+   * (see invalidateWorkspaceMemoryOwnerMemo).
    */
   private readonly workspaceMemoryOwnerById = new Map<string, string>();
   /** Config-file stamp (Config.configFileStamp) the memo was built against. */
@@ -640,45 +642,33 @@ export class MemoryService extends EventEmitter {
     }
     const cached = this.workspaceMemoryOwnerById.get(workspaceId);
     if (cached !== undefined) return cached;
-    const cfg = this.config.loadConfigOrDefault();
-    const owner = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
-    // Only positive (registered) results are memoized; the workspace may
-    // simply not be registered yet.
-    if (findWorkspaceEntry(cfg, workspaceId) !== null) {
-      this.workspaceMemoryOwnerById.set(workspaceId, owner);
-    }
+    const owner = resolveWorkspaceMemoryOwnerId(this.config.loadConfigOrDefault(), workspaceId);
+    this.workspaceMemoryOwnerById.set(workspaceId, owner);
     return owner;
   }
 
   /**
-   * Drop the owner memo and tell listeners which formerly-shared workspaces
-   * now resolve to a DIFFERENT owner: their live sessions hold a memory
-   * context built from an owner that was just removed, so core.ts invalidates
-   * those caches (there is no memory-change event for a removal to ride on).
+   * Re-resolve every memoized workspace against the current config and tell
+   * listeners which ones now map to a DIFFERENT owner: their live sessions
+   * hold a memory context built from the previous store (an owner that was
+   * just removed — or the private fallback store used while config.json was
+   * missing/malformed and the tree could not be resolved), so core.ts
+   * invalidates those caches and the memory subscription refreshes. There is
+   * no memory-change event for either transition to ride on.
    *
    * Most config edits (titles, models, task status) leave the topology alone;
    * emitting for those would make every live child rebuild its index and hot
-   * set from disk on ordinary churn, so the memoized shared children are
-   * re-resolved against the new config first (one parse, only when something
-   * was shared) and only real owner changes are reported. Unchanged shared
-   * mappings are re-memoized on the spot.
+   * set from disk on ordinary churn, so only real owner changes are reported.
+   * One parse, only when something was memoized.
    */
   private invalidateWorkspaceMemoryOwnerMemo(): void {
-    const shared = [...this.workspaceMemoryOwnerById].filter(
-      ([workspaceId, owner]) => workspaceId !== owner
-    );
-    this.workspaceMemoryOwnerById.clear();
-    if (shared.length === 0) return;
+    if (this.workspaceMemoryOwnerById.size === 0) return;
     const cfg = this.config.loadConfigOrDefault();
     const changed: string[] = [];
-    for (const [workspaceId, owner] of shared) {
-      // A non-self owner implies the child is registered (dangling roots
-      // resolve to self), so re-memoizing an unchanged mapping stays positive-only.
-      if (resolveWorkspaceMemoryOwnerId(cfg, workspaceId) === owner) {
-        this.workspaceMemoryOwnerById.set(workspaceId, owner);
-      } else {
-        changed.push(workspaceId);
-      }
+    for (const [workspaceId, previousOwner] of this.workspaceMemoryOwnerById) {
+      const owner = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
+      this.workspaceMemoryOwnerById.set(workspaceId, owner);
+      if (owner !== previousOwner) changed.push(workspaceId);
     }
     if (changed.length > 0) this.emit("ownersInvalidated", changed);
   }
