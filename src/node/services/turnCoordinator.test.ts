@@ -121,6 +121,68 @@ describe("TurnCoordinator", () => {
     coordinator.finishCompactionFollowUp(token);
   });
 
+  test("a continuation cannot borrow the active edit's reservation to admit itself", () => {
+    const { coordinator } = setup();
+    const token = coordinator.claimCompactionFollowUp();
+    assert(token != null, "Expected a follow-up owner before the edit");
+    using edit = coordinator.reserve("edit");
+    const expectedTurnId = coordinator.turnId;
+    const install = mock(() => undefined);
+    const result = coordinator.prepare(
+      {
+        kind: "fresh",
+        intent: "direct",
+        expectedTurnId,
+        compactionHandoff: token,
+        editReservation: edit.id,
+      },
+      undefined,
+      install
+    );
+    expect(result).toEqual({ status: "deferred", reason: "busy" });
+    expect(coordinator.turnId).toBe(expectedTurnId);
+    expect(install).not.toHaveBeenCalled();
+    coordinator.finishCompactionFollowUp(token);
+  });
+
+  test.each(["abandon", "retire", "finish"] as const)(
+    "%s during PREPARING publication prevents a successful continuation handoff",
+    (action) => {
+      const { coordinator } = setup({
+        phaseChanged: (phase) => {
+          if (phase !== "preparing") return;
+          assert(token != null, "Expected the published follow-up owner");
+          if (action === "abandon") coordinator.abandonCompaction();
+          if (action === "retire") coordinator.retireCompactionFollowUp();
+          if (action === "finish") coordinator.finishCompactionFollowUp(token);
+        },
+      });
+      const token = coordinator.claimCompactionFollowUp();
+      assert(token != null, "Expected a follow-up owner");
+      let installed: TurnId | undefined;
+      try {
+        const result = coordinator.prepare(
+          {
+            kind: "fresh",
+            intent: "direct",
+            expectedTurnId: coordinator.turnId,
+            compactionHandoff: token,
+          },
+          undefined,
+          (turnId) => {
+            installed = turnId;
+          }
+        );
+        expect(result).toEqual({ status: "rejected", reason: "retired" });
+        expect(coordinator.isCurrentCompactionFollowUp(token)).toBe(false);
+        expect(coordinator.midStreamCompactionPending).toBe(action !== "finish");
+      } finally {
+        if (installed != null) coordinator.finishPreparation(installed);
+        coordinator.finishCompactionFollowUp(token);
+      }
+    }
+  );
+
   test.each(["mutation", "replacement", "abandon", "dispose"] as const)(
     "%s cannot release a continuation's physical slot or its waiting batch",
     async (action) => {

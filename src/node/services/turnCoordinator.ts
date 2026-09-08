@@ -221,9 +221,9 @@ export function transition(
       }
       const request = event.request;
       // An edit owns history before PREPARING. Only its exact reservation can claim the
-      // replacement; sharing the idle turn epoch never authorizes a competing send.
+      // replacement, never a compaction handoff; sharing the idle turn epoch is not ownership.
       const editOwner =
-        request.kind === "fresh" && request.intent === "direct"
+        request.kind === "fresh" && request.intent === "direct" && request.compactionHandoff == null
           ? request.editReservation
           : undefined;
       if (hasConflictingEdit(state, editOwner)) {
@@ -944,7 +944,12 @@ export class TurnCoordinator {
     // service preflight handoff or dequeue on the strength of that obsolete publication.
     if (
       admission.status === "admitted" &&
-      (!this.isCurrentTurn(id) || this.closing || this.phase !== "preparing")
+      (!this.isCurrentTurn(id) ||
+        this.closing ||
+        this.phase !== "preparing" ||
+        (request.kind === "fresh" &&
+          request.compactionHandoff != null &&
+          !this.isCurrentCompactionFollowUp(request.compactionHandoff)))
     )
       return { status: "rejected", reason: "retired" };
     return admission;
