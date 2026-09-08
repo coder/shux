@@ -29,7 +29,7 @@ export function safeEq(a: string, b: string): boolean {
   return bytesMatch && bufA.length === bufB.length;
 }
 
-function extractBearerToken(header: string | string[] | undefined): string | null {
+export function extractBearerToken(header: string | string[] | undefined): string | null {
   const h = Array.isArray(header) ? header[0] : header;
   if (!h?.toLowerCase().startsWith("bearer ")) return null;
   return h.slice(7).trim() || null;
@@ -110,6 +110,14 @@ export function extractCookieValues(
   return tokens;
 }
 
+// Object identity, not a request header value, grants a redeemed master ticket's
+// authority to exactly its connection. HTTP/cookie contexts cannot manufacture it.
+const ticketAuthorizedHeaders = new WeakSet<IncomingHttpHeaders>();
+
+export function authorizeWebSocketTicketHeaders(headers: IncomingHttpHeaders): void {
+  ticketAuthorizedHeaders.add(headers);
+}
+
 /** Create auth middleware that validates Authorization header or session cookie from context */
 export function createAuthMiddleware(authToken?: string) {
   // oRPC >=1.14 no longer accepts a union of differently-typed middlewares in
@@ -125,7 +133,7 @@ export function createAuthMiddleware(authToken?: string) {
       },
     })
     .middleware(async ({ context, errors, next }) => {
-      if (!expectedToken) {
+      if (!expectedToken || (context.headers && ticketAuthorizedHeaders.has(context.headers))) {
         return next();
       }
 

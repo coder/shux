@@ -1,3 +1,4 @@
+import { ORPC_WS_TICKET_PATTERN } from "@/common/constants/webSocketAuth";
 import {
   ClaudeDesignSettingsSchema,
   ClaudeDesignStatusSchema,
@@ -2499,6 +2500,15 @@ export const server = {
 };
 
 export const serverAuth = {
+  issueWebSocketTicket: {
+    input: z.void(),
+    output: z
+      .object({
+        ticket: z.string().regex(ORPC_WS_TICKET_PATTERN),
+        expiresAtMs: z.number().int().nonnegative(),
+      })
+      .strict(),
+  },
   listSessions: {
     input: z.void(),
     output: z.array(ServerAuthSessionSchema),

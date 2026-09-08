@@ -31,7 +31,14 @@ export function createOpenAPIGenerator(): OpenAPIGenerator {
 }
 import { router, type AppRouter } from "@/node/orpc/router";
 import type { ORPCContext } from "@/node/orpc/context";
-import { extractCookieValues, extractWsHeaders, safeEq } from "@/node/orpc/authMiddleware";
+import {
+  authorizeWebSocketTicketHeaders,
+  extractCookieValues,
+  extractWsHeaders,
+  safeEq,
+} from "@/node/orpc/authMiddleware";
+import { ORPC_WS_PROTOCOL } from "@/common/constants/webSocketAuth";
+import { parseWebSocketTicketProtocols, WebSocketTicketStore } from "./webSocketTickets";
 import { VERSION } from "@/version";
 import { formatOrpcError } from "@/node/orpc/formatOrpcError";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH, ORPC_WS_PATH } from "@/node/orpc/wsPaths";
@@ -787,6 +794,10 @@ export async function createOrpcServer({
   desktopBridgeServer = context.desktopBridgeServer,
   browserBridgeServer = context.browserBridgeServer,
 }: OrpcServerOptions): Promise<OrpcServer> {
+  // authToken/router authentication is immutable for this server lifetime. Closing
+  // the server destroys its ticket audience; no credential epoch or disk state is needed.
+  const webSocketTickets = new WebSocketTicketStore();
+  const ticketAuthenticatedRequests = new WeakSet<http.IncomingMessage>();
   // Express app setup
   const app = express();
   app.use((req, res, next) => {
@@ -1559,7 +1570,22 @@ export async function createOrpcServer({
   app.use("/orpc", async (req, res, next) => {
     const { matched } = await orpcHandler.handle(req, res, {
       prefix: getDirectAppProxyHandlerPrefix(req, "/orpc"),
-      context: { ...context, headers: req.headers },
+      context: {
+        ...context,
+        headers: req.headers,
+        issueWebSocketTicket:
+          req.method === "POST"
+            ? () => {
+                res.setHeader("Cache-Control", "no-store");
+                const issued = webSocketTickets.mint();
+                if (!issued)
+                  throw new ORPCError("TOO_MANY_REQUESTS", {
+                    message: "WebSocket ticket capacity unavailable",
+                  });
+                return issued;
+              }
+            : undefined,
+      },
     });
     if (matched) return;
     next();
@@ -1621,7 +1647,13 @@ export async function createOrpcServer({
   });
 
   // oRPC WebSocket handler
-  const wsServer = new WebSocketServer({ noServer: true });
+  const wsServer = new WebSocketServer({
+    noServer: true,
+    handleProtocols: (protocols, req) =>
+      parseWebSocketTicketProtocols(req.headers["sec-websocket-protocol"]).type === "ticket"
+        ? ORPC_WS_PROTOCOL
+        : (protocols.values().next().value ?? false),
+  });
 
   httpServer.on("upgrade", (req, socket, head) => {
     const normalizedRoute = getNormalizedUpgradeRoute(req.url);
@@ -1638,7 +1670,7 @@ export async function createOrpcServer({
         log.warn("Blocked cross-origin WebSocket upgrade request", {
           origin: getFirstHeaderValue(req, "origin"),
           expectedOrigins,
-          url: req.url,
+          url: routePathname,
         });
 
         try {
@@ -1650,7 +1682,27 @@ export async function createOrpcServer({
         return;
       }
 
+      const ticket = parseWebSocketTicketProtocols(req.headers["sec-websocket-protocol"]);
+      if (
+        ticket.type === "invalid" ||
+        (ticket.type === "ticket" && !webSocketTickets.isValid(ticket.ticket))
+      ) {
+        socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n", () =>
+          socket.destroy()
+        );
+        return;
+      }
       wsServer.handleUpgrade(req, socket, head, (ws) => {
+        // No awaits: competing successful peeks must yield only one authorized
+        // consumer, before any connection listener or oRPC context can observe it.
+        if (ticket.type === "ticket") {
+          if (!webSocketTickets.consume(ticket.ticket)) {
+            ws.terminate();
+            return;
+          }
+          ticketAuthenticatedRequests.add(req);
+          req.headers["sec-websocket-protocol"] = ORPC_WS_PROTOCOL;
+        }
         wsServer.emit("connection", ws, req);
       });
       return;
@@ -1729,12 +1781,15 @@ export async function createOrpcServer({
       socket.isAlive = true;
     });
 
-    const headers = extractWsHeaders(req);
+    const ticketAuthenticated = ticketAuthenticatedRequests.has(req);
+    const headers = ticketAuthenticated ? { ...req.headers } : extractWsHeaders(req);
+    if (ticketAuthenticated) authorizeWebSocketTicketHeaders(headers);
     // Use Object.defineProperties to copy all property descriptors from
     // the base context as own-properties (required by oRPC's internal
     // property enumeration) while preserving any lazily-resolving getters.
     const wsContext = Object.defineProperties({} as typeof context, {
       ...Object.getOwnPropertyDescriptors(context),
+      issueWebSocketTicket: { value: undefined, enumerable: true, configurable: true },
       headers: {
         value: headers,
         enumerable: true,
@@ -1780,6 +1835,7 @@ export async function createOrpcServer({
     specUrl: `http://${connectableHostForUrl}:${actualPort}/api/spec.json`,
     docsUrl: `http://${connectableHostForUrl}:${actualPort}/api/docs`,
     close: async () => {
+      webSocketTickets.dispose();
       clearInterval(heartbeatInterval);
       for (const ws of wsServer.clients) {
         ws.terminate();

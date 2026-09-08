@@ -63,6 +63,7 @@ export type FrontendWorkspaceMetadataSchemaType = z.infer<
 // Server types (single source of truth - derived from schemas)
 export type ApiServerStatus = z.infer<typeof schemas.ApiServerStatusSchema>;
 export type ServerAuthSession = z.infer<typeof schemas.ServerAuthSessionSchema>;
+export type WebSocketTicket = z.infer<typeof schemas.serverAuth.issueWebSocketTicket.output>;
 // Experiment types (single source of truth - derived from schemas)
 
 // Policy types (single source of truth - derived from schemas)
