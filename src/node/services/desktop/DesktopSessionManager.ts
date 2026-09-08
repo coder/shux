@@ -374,13 +374,26 @@ export class DesktopSessionManager {
 
   /** Whether a live desktop session exists for this workspace. */
   has(workspaceId: string): boolean {
-    // Pending startups count as live activity: a user-initiated start that has not resolved
-    // yet exists only in startupPromises, and archive refusal gates must observe it instead of
-    // letting close() cancel it mid-startup. A session whose process exited or crashed is NOT
-    // live activity, though — stale map entries linger until the next ensureStarted()/close()
-    // touches them and must not hold the archive refusal gate open indefinitely.
+    // A session whose process exited or crashed is NOT live — stale map entries linger until
+    // the next ensureStarted()/close() touches them.
     return (
-      (this.sessions.get(workspaceId)?.isAlive() ?? false) ||
+      (this.sessions.get(workspaceId)?.isAlive() ?? false) || this.hasAttachedViewers(workspaceId)
+    );
+  }
+
+  /**
+   * Whether someone is attached to this workspace's desktop: a startup still resolving, a
+   * registered browser viewer, or an open/pending popout window (including borrowers of a
+   * shared desktop this workspace owns). Agent-driven archive gates consult this instead of
+   * has(): the bare desktop process is disposable infrastructure that lingers after the agent
+   * that started it finished (nothing idles it out), and archive closes it exactly like the
+   * user-driven path does — so an idle process alone must not stall an archive. A pending
+   * startup still counts: a user-initiated start that has not resolved yet exists only in
+   * startupPromises, and the gate must observe it instead of letting close() cancel it
+   * mid-startup.
+   */
+  hasAttachedViewers(workspaceId: string): boolean {
+    return (
       this.startupPromises.has(workspaceId) ||
       Array.from(this.viewers.values()).some(
         (viewer) => viewer.workspaceId === workspaceId || viewer.ownerWorkspaceId === workspaceId

@@ -532,6 +532,31 @@ describe("DesktopSessionManager browser viewer releases", () => {
     });
   });
 
+  test("hasAttachedViewers() ignores an idle desktop process but tracks viewers on the owner and borrower", async () => {
+    if (process.platform === "win32") return;
+    await withBrowserViewerHarness(async ({ manager, watch }) => {
+      // An agent left the desktop process running with nobody attached: live for has(), but
+      // not activity an agent-driven archive should stall on.
+      await manager.ensureStarted("owner");
+      expect(manager.has("owner")).toBe(true);
+      expect(manager.hasAttachedViewers("owner")).toBe(false);
+
+      // A borrower viewer attaches to the owner's desktop, so both sides report attachment.
+      const borrower = watch("child");
+      const ready = await nextViewerEvent(borrower, "ready");
+      expect(manager.hasAttachedViewers("child")).toBe(true);
+      expect(manager.hasAttachedViewers("owner")).toBe(true);
+      expect(manager.hasAttachedViewers("isolated")).toBe(false);
+
+      const closing = manager.close("child");
+      await nextViewerEvent(borrower, "release");
+      manager.acknowledgeViewerRelease(ready.viewerId);
+      await closing;
+      expect(manager.hasAttachedViewers("owner")).toBe(false);
+      expect(manager.has("owner")).toBe(true);
+    });
+  });
+
   test("owner cleanup releases each borrower viewer but leaves unrelated viewers registered", async () => {
     await withBrowserViewerHarness(async ({ manager, watch }) => {
       const owner = watch("owner");

@@ -3384,8 +3384,10 @@ export class WorkspaceTurnManager {
           }
 
           // Live activity with no delegated workspace-turn handle (a user-initiated stream,
-          // queued messages, terminal PTYs, or a desktop session) is user work: the archive path
-          // would silently terminate it, so refuse — interrupt_active covers delegated turns only.
+          // queued messages, terminal PTYs, or an attached desktop viewer/popout) is user work:
+          // the archive path would silently terminate it, so refuse — interrupt_active covers
+          // delegated turns only. An idle desktop process with nobody attached is not user
+          // work; the sink closes it like the user-driven archive does.
           const liveActivity = this.workspaceService.listLiveWorkspaceActivity(
             resolved.workspaceId
           );
@@ -3413,7 +3415,7 @@ export class WorkspaceTurnManager {
             nonTurnActivity.push("running background bash processes");
           }
           if (liveActivity.terminalSessions) nonTurnActivity.push("open terminal sessions");
-          if (liveActivity.desktopSession) nonTurnActivity.push("a desktop session");
+          if (liveActivity.desktopViewers) nonTurnActivity.push("an open desktop viewer or popout");
           if (nonTurnActivity.length > 0) {
             return Ok({
               status: "active",

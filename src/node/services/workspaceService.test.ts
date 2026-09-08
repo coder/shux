@@ -15401,6 +15401,47 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(hookBehavior).toBe("keep");
   });
 
+  test("archive() under refuseLiveUserActivity closes an idle desktop process instead of refusing", async () => {
+    // The desktop process an agent started lingers after its turn finished; nobody is attached,
+    // so an agent-driven archive must proceed and close it like the user-driven path does.
+    const close = mock(() => Promise.resolve(undefined));
+    const desktopSessionManager = {
+      close,
+      has: () => true,
+      hasAttachedViewers: () => false,
+      setWorkspaceArchiveGuard: () => undefined,
+    } as unknown as DesktopSessionManager;
+    workspaceService.setDesktopSessionManager(desktopSessionManager);
+
+    const result = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+
+    expect(result).toEqual(Ok({ kind: "archived" }));
+    expect(close).toHaveBeenCalledWith(workspaceId);
+  });
+
+  test("archive() under refuseLiveUserActivity refuses while a desktop viewer is attached", async () => {
+    const close = mock(() => Promise.resolve(undefined));
+    const desktopSessionManager = {
+      close,
+      has: () => true,
+      hasAttachedViewers: () => true,
+      setWorkspaceArchiveGuard: () => undefined,
+    } as unknown as DesktopSessionManager;
+    workspaceService.setDesktopSessionManager(desktopSessionManager);
+
+    const result = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("desktop viewer");
+    }
+    expect(close).not.toHaveBeenCalled();
+  });
+
   test("archive() refuses while in-process workflow work exists under refuseLiveUserActivity", async () => {
     // Simulates a workflow admission/runner that entered before the archive gate armed: the
     // sink's synchronous gate must observe it and refuse instead of orphaning the run.

@@ -35,7 +35,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
       queuedMessages: false,
       backgroundBashProcesses: false,
       terminalSessions: false,
-      desktopSession: false,
+      desktopViewers: false,
     }),
     hasRunningBackgroundBashProcesses: () => Promise.resolve(false),
     hasUntrackableExternalAppOpen: () => Promise.resolve(false),

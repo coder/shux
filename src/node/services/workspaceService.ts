@@ -8407,7 +8407,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       backgroundBashProcesses:
         this.backgroundProcessManager.hasRunningBackgroundProcesses(workspaceId),
       terminalSessions: this.terminalService?.hasWorkspaceSessions(workspaceId) === true,
-      desktopSession: this.desktopSessionManager?.has(workspaceId) === true,
+      desktopViewers: this.desktopSessionManager?.hasAttachedViewers(workspaceId) === true,
     };
   }
 
@@ -8525,8 +8525,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if (this.terminalService?.hasWorkspaceSessions(workspaceId) === true) {
       activityLabels.push("open terminal sessions");
     }
-    if (this.desktopSessionManager?.has(workspaceId) === true) {
-      activityLabels.push("a desktop session");
+    if (this.desktopSessionManager?.hasAttachedViewers(workspaceId) === true) {
+      activityLabels.push("an open desktop viewer or popout");
     }
     // Narrow PREPARING/auto-retry check, NOT hasPendingQueuedOrPreparingTurn: that predicate
     // also reports plain queued messages, which would refuse every interrupt_active on a
@@ -8622,7 +8622,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           activityLabels.push("running background bash processes");
         }
         if (liveActivity.terminalSessions) activityLabels.push("open terminal sessions");
-        if (liveActivity.desktopSession) activityLabels.push("a desktop session");
+        if (liveActivity.desktopViewers) activityLabels.push("an open desktop viewer or popout");
         // Workflow admissions pair with this gate (see workflowArchiveAdmission): an admission
         // whose synchronous entry ran first is counted here; one entering later observes the
         // archivingWorkspaces guard registered in the constructor and refuses.

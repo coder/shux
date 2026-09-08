@@ -258,9 +258,10 @@ export interface ArchiveWorkspaceOptions {
   forbidWorktreeCheckoutDeletion?: boolean;
   /**
    * Refuse to archive when live user activity exists at the sink (a stream, a send still in
-   * its pre-admission window, queued/preparing turns, terminal sessions, or a desktop
-   * session). Model-facing callers set this so an agent-driven archive fails closed instead
-   * of silently terminating user work that started after the caller's earlier activity check.
+   * its pre-admission window, queued/preparing turns, terminal sessions, or an attached
+   * desktop viewer/popout). Model-facing callers set this so an agent-driven archive fails
+   * closed instead of silently terminating user work that started after the caller's earlier
+   * activity check.
    * Checked synchronously in the same block that marks the workspace as archiving, pairing
    * with sendMessage's synchronous entry guards: whichever side runs first is observed by the
    * other. Also holds the session's turn admission for the rest of the archive so a queued
@@ -306,7 +307,12 @@ export interface WorkspaceLiveActivity {
    */
   backgroundBashProcesses: boolean;
   terminalSessions: boolean;
-  desktopSession: boolean;
+  /**
+   * A desktop startup, browser viewer, or popout window attached to this workspace's desktop.
+   * A bare idle desktop process is intentionally excluded (see
+   * DesktopSessionManager.hasAttachedViewers).
+   */
+  desktopViewers: boolean;
 }
 
 export interface SendMessageInternalOptions {
