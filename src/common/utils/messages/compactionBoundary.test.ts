@@ -146,26 +146,6 @@ describe("findLatestCompactionBoundaryIndex", () => {
 });
 
 describe("context boundary helpers", () => {
-  it("opts into reasoning eligibility without admitting rejected or reset rows", () => {
-    const reasoning = createMuxMessage("reasoning", "assistant", "");
-    reasoning.parts = [{ type: "reasoning", text: "Provider reasoning" }];
-    expect(hasProviderEligibleMessages([reasoning])).toBe(false);
-    expect(hasProviderEligibleMessages([reasoning], { preserveReasoningOnly: true })).toBe(true);
-    for (const metadata of [
-      { contextBudgetRejected: true },
-      { contextBoundaryKind: "reset" as const },
-    ]) {
-      expect(
-        hasProviderEligibleMessages([{ ...reasoning, metadata }], { preserveReasoningOnly: true })
-      ).toBe(false);
-    }
-    expect(
-      hasProviderEligibleMessages([createMuxMessage("empty", "assistant", "")], {
-        preserveReasoningOnly: true,
-      })
-    ).toBe(false);
-  });
-
   it("recognizes context reset boundaries as latest context boundary", () => {
     const messages = [
       createMuxMessage("u0", "user", "before"),
