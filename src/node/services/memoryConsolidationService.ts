@@ -598,6 +598,38 @@ export class MemoryConsolidationService extends EventEmitter {
     return Effect.runPromise(this.cancelInFlightConsolidationEffect(workspaceId));
   }
 
+  /** Terminal failed record for a policy-refused harvest (see maybeHarvestThenSweep). */
+  private async recordRefusedHarvest(
+    metadata: CompactionCompletionMetadata,
+    reason: string
+  ): Promise<void> {
+    const sidecar = await this.load();
+    const existing = sidecar.harvestsByWorkspace[metadata.workspaceId]?.[metadata.summaryMessageId];
+    if (existing?.status === "completed") return;
+    const workspace = this.config.findWorkspace(metadata.workspaceId);
+    const projectPath = workspace == null ? "" : resolveConsolidationProjectPath(workspace);
+    const now = Date.now();
+    await Effect.runPromise(
+      this.saveHarvestRecordEffect(
+        metadata.workspaceId,
+        metadata.summaryMessageId,
+        {
+          status: "failed",
+          startedAt: existing?.startedAt ?? now,
+          completedAt: now,
+          attemptCount: HARVEST_MAX_ATTEMPTS,
+          boundaryKey: metadata.summaryMessageId,
+          compactionEpoch: metadata.compactionEpoch,
+          completionMetadata: metadata,
+          acceptedCandidates: 0,
+          skippedCandidates: 0,
+          error: reason,
+        },
+        projectPath
+      )
+    );
+  }
+
   /**
    * Removal teardown for harvest state: the workspace's transcript is about
    * to be deleted, so its failed/stale-pending harvest records can never be
@@ -915,9 +947,17 @@ export class MemoryConsolidationService extends EventEmitter {
     }
     // The harvest writes /memories/workspace on the agent's behalf — for a
     // sub-agent, into the OWNER's shared notebook — and then sweeps it. A
-    // read-only (explore-like) agent's transcript must not reach either.
-    if (metadata.workspaceMemoryWritable === false) {
-      return Err("workspace memory is read-only for this agent; harvest and sweep refused");
+    // read-only (explore-like) agent's transcript must not reach either, and
+    // an UNKNOWN policy (legacy record, no persisted value) fails closed. The
+    // refusal is recorded as a terminal harvest record so recovery does not
+    // retry it forever and the Memory tab shows why the epoch was skipped.
+    if (metadata.workspaceMemoryWritable !== true) {
+      const reason =
+        metadata.workspaceMemoryWritable === false
+          ? "workspace memory is read-only for this agent; harvest and sweep refused"
+          : "workspace memory write policy is unknown for this epoch; harvest refused (fail closed)";
+      await this.recordRefusedHarvest(metadata, reason);
+      return Err(reason);
     }
 
     const boundaryRunKey = `${metadata.workspaceId}:${metadata.summaryMessageId}`;

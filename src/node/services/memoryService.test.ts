@@ -26,8 +26,10 @@ import {
 import { applyRefinementInverse, readRefinementEvents } from "./refinement/refinementTestHelpers";
 import { rollbackRefinement } from "./refinement/refinementRollback";
 import { migrateSharedMemoryRefinementRows } from "./refinement/sharedMemoryRowMigration";
+import { createRefinementRollbackTool } from "./tools/refinement_rollback";
+import type { MemoryScopeAccess } from "@/common/constants/memory";
 import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
-import { TestTempDir } from "./tools/testHelpers";
+import { TestTempDir, mockToolCallOptions } from "./tools/testHelpers";
 
 function pathExists(target: string): Promise<boolean> {
   return fsPromises.access(target).then(
@@ -1215,6 +1217,44 @@ describe("MemoryService", () => {
       expect(await pathExists(shared)).toBe(false);
     });
 
+    it("the refinement_rollback tool refuses memory rollbacks into a read-only scope", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      const [row] = await readRefinementEvents(childSessionDir);
+      const physical = path.join(ownerSessionDir, "memory", "n.md");
+
+      const makeTool = (access: MemoryScopeAccess) =>
+        createRefinementRollbackTool({
+          workspaceId: "ws-child",
+          sessionDir: childSessionDir,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+          memory: { service: fixture.service, ctx: fixture.ctx, access },
+        });
+      const run = async (access: MemoryScopeAccess) =>
+        (await makeTool(access).execute!({ id: row.id, reason: "test" }, mockToolCallOptions)) as {
+          success: boolean;
+          error?: string;
+        };
+
+      // Explore-like agent: workspace scope is read-only → the rollback (a
+      // write into the owner's shared notebook) is refused before the engine.
+      const refused = await run({ global: "read", project: "read", workspace: "read" });
+      expect(refused.success).toBe(false);
+      expect(refused.error).toContain("read-only");
+      expect(await pathExists(physical)).toBe(true);
+
+      const allowed = await run({
+        global: "readwrite",
+        project: "readwrite",
+        workspace: "readwrite",
+      });
+      expect(allowed.success).toBe(true);
+      expect(await pathExists(physical)).toBe(false);
+    });
+
     it("notifyExternalMutation emits one owner-addressed event per touched scope", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -1228,7 +1268,7 @@ describe("MemoryService", () => {
         path.join(fixture.xumHome, "elsewhere", "x.md"),
         ownerMemory, // the root itself is not a file inside the scope
       ]);
-      expect(events.map((event) => [event.scope, event.path, event.workspaceId])).toEqual([
+      expect(events.map((event) => [event.scope, event.path, event.workspaceId]).sort()).toEqual([
         ["global", "/memories/global", "ws-owner"],
         ["workspace", "/memories/workspace", "ws-owner"],
       ]);

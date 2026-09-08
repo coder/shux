@@ -105,6 +105,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",
   }),
+  workspaceMemoryWritable: z.boolean().optional().meta({
+    description:
+      "Whether this workspace's agent may write /memories/workspace, as resolved on its last normal turn. Persisted so a post-compaction memory harvest that resumes in a fresh session (restart, recovery) still knows the policy; harvest fails closed when unknown.",
+  }),
   memoryOwnerWorkspaceId: z.string().optional().meta({
     description:
       "Memory owner pinned when an intermediate ancestor was removed while this descendant stayed alive: the parentWorkspaceId chain no longer reaches the task-tree root, so this keeps /memories/workspace bound to the root's store (memoryWorkspaceOwner.ts). Set only by workspace removal.",

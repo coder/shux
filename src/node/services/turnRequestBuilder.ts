@@ -2356,6 +2356,7 @@ export class TurnRequestBuilder {
             : {
                 service: memoryService,
                 ctx: memoryScopeContextFromToolConfig(toolsForModelConfig),
+                access: memoryAccess,
               };
         const applyPolicyStartedAt = Date.now();
         let attemptTools = await applyToolPolicyAndExperiments({

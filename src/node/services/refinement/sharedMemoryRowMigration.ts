@@ -12,17 +12,6 @@ import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJour
 import { appendRefinementEventOrThrow, type RefinementInverseDraft } from "./refinementJournal";
 import { listRefinements } from "./refinementRollback";
 
-/** Removal must abort: a live shared-memory row could not be persisted in the owner's journal. */
-export class SharedMemoryRowMigrationError extends Error {
-  constructor(workspaceId: string, options?: ErrorOptions) {
-    super(
-      `Could not preserve ${workspaceId}'s shared-memory refinement rows in its owner's journal; removal aborted`,
-      options
-    );
-    this.name = "SharedMemoryRowMigrationError";
-  }
-}
-
 function inversePaths(inverse: RefinementInverse): string[] {
   switch (inverse.op) {
     case "delete-files":

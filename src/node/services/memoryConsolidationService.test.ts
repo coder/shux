@@ -343,6 +343,9 @@ async function seedCompactionEpoch(
   expect(typeof summaryHistorySequence).toBe("number");
   return {
     workspaceId,
+    // A normal editing-capable agent; the read-only / unknown gates are
+    // exercised explicitly where they matter.
+    workspaceMemoryWritable: true,
     summaryMessageId: "summary-1",
     summaryHistorySequence: summaryHistorySequence ?? -1,
     compactionEpoch: 1,
@@ -1156,20 +1159,34 @@ describe("MemoryConsolidationService", () => {
     const metadata = await seedCompactionEpoch(fixture);
     const refused = await fixture.service.maybeHarvestThenSweep({
       ...metadata,
+      summaryMessageId: "summary-readonly",
       workspaceMemoryWritable: false,
     });
     expect(refused.success).toBe(false);
     if (!refused.success) expect(refused.error).toContain("read-only");
     expect(fixture.modelCalls).toHaveLength(0);
-    expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toBeNull();
+    // Recorded as terminal so recovery never retries it, with the reason.
+    const refusedRecord = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(refusedRecord?.status).toBe("failed");
+    expect(refusedRecord?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+    expect(refusedRecord?.error).toContain("read-only");
 
-    // Explicitly writable (and legacy records without the flag) harvest as before.
-    const allowed = await fixture.service.maybeHarvestThenSweep({
+    // Unknown policy (legacy record / no persisted value) fails closed too.
+    const unknown = await fixture.service.maybeHarvestThenSweep({
       ...metadata,
-      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-unknown",
+      workspaceMemoryWritable: undefined,
     });
+    expect(unknown.success).toBe(false);
+    if (!unknown.success) expect(unknown.error).toContain("unknown");
+    expect(fixture.modelCalls).toHaveLength(0);
+
+    // Explicitly writable harvests as before.
+    const allowed = await fixture.service.maybeHarvestThenSweep(metadata);
     expect(allowed.success).toBe(true);
-    expect(fixture.modelCalls.length).toBeGreaterThan(0);
+    const harvested = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(harvested?.boundaryKey).toBe(metadata.summaryMessageId);
+    expect(harvested?.status).toBe("completed");
   });
 
   it("finalizes a removed workspace's retryable harvest records so they are never retried", async () => {

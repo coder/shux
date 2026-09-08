@@ -1074,6 +1074,20 @@ export class MemoryService extends EventEmitter {
    */
   notifyExternalMutation(ctx: MemoryScopeContext, physicalPaths: readonly string[]): void {
     const touched = new Set<MemoryScope>();
+    for (const physicalPath of physicalPaths) {
+      const scope = this.scopeOfPhysicalPath(ctx, physicalPath);
+      if (scope !== null) touched.add(scope);
+    }
+    for (const scope of touched) this.emitChange(ctx, scope, "", "agent");
+  }
+
+  /**
+   * The memory scope whose root (for this context) contains `physicalPath`,
+   * or null when the path lies outside every available scope root. Lets
+   * out-of-band writers (refinement rollback) apply the same per-scope write
+   * policy the memory tool enforces.
+   */
+  scopeOfPhysicalPath(ctx: MemoryScopeContext, physicalPath: string): MemoryScope | null {
     for (const scope of MEMORY_SCOPES) {
       let root: string;
       try {
@@ -1082,12 +1096,10 @@ export class MemoryService extends EventEmitter {
         if (error instanceof MemoryCommandError) continue; // scope unavailable in this context
         throw error;
       }
-      for (const physicalPath of physicalPaths) {
-        const rel = path.relative(root, path.resolve(physicalPath));
-        if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) touched.add(scope);
-      }
+      const rel = path.relative(root, path.resolve(physicalPath));
+      if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) return scope;
     }
-    for (const scope of touched) this.emitChange(ctx, scope, "", "agent");
+    return null;
   }
 
   /**
