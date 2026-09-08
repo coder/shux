@@ -541,6 +541,13 @@ describe("DesktopSessionManager browser viewer releases", () => {
       expect(manager.has("owner")).toBe(true);
       expect(manager.hasAttachedViewers("owner")).toBe(false);
 
+      // A live VNC bridge (the inline Electron pane registers no browser viewer) attaches too.
+      manager.setBridgeConnectionProbe((workspaceId) => workspaceId === "owner");
+      expect(manager.hasAttachedViewers("owner")).toBe(true);
+      expect(manager.hasAttachedViewers("child")).toBe(false);
+      manager.setBridgeConnectionProbe(() => false);
+      expect(manager.hasAttachedViewers("owner")).toBe(false);
+
       // A borrower viewer attaches to the owner's desktop, so both sides report attachment.
       const borrower = watch("child");
       const ready = await nextViewerEvent(borrower, "ready");

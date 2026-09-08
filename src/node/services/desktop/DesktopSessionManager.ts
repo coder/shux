@@ -381,9 +381,22 @@ export class DesktopSessionManager {
     );
   }
 
+  private bridgeConnectionProbe: ((workspaceId: string) => boolean) | undefined;
+
+  /**
+   * DesktopBridgeServer reports its live VNC bridge WebSockets through this probe (it depends
+   * on this manager, not the other way round). The inline Electron pane connects to the bridge
+   * without registering a browser viewer, so without this probe hasAttachedViewers() would
+   * report nobody attached while a user watches or controls the desktop in Electron.
+   */
+  setBridgeConnectionProbe(probe: (workspaceId: string) => boolean): void {
+    this.bridgeConnectionProbe = probe;
+  }
+
   /**
    * Whether someone is attached to this workspace's desktop: a startup still resolving, a
-   * registered browser viewer, or an open/pending popout window (including borrowers of a
+   * registered browser viewer, a live VNC bridge connection (inline Electron pane, inline
+   * browser pane, popouts), or an open/pending popout window (including borrowers of a
    * shared desktop this workspace owns). Agent-driven archive gates consult this instead of
    * has(): the bare desktop process is disposable infrastructure that lingers after the agent
    * that started it finished (nothing idles it out), and archive closes it exactly like the
@@ -395,6 +408,7 @@ export class DesktopSessionManager {
   hasAttachedViewers(workspaceId: string): boolean {
     return (
       this.startupPromises.has(workspaceId) ||
+      this.bridgeConnectionProbe?.(workspaceId) === true ||
       Array.from(this.viewers.values()).some(
         (viewer) => viewer.workspaceId === workspaceId || viewer.ownerWorkspaceId === workspaceId
       ) ||

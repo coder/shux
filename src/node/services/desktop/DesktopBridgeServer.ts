@@ -129,6 +129,25 @@ export class DesktopBridgeServer {
     assert(this.wss, "DesktopBridgeServer WebSocketServer must be initialized");
   }
 
+  /**
+   * Whether a VNC bridge WebSocket is attached for this workspace, as requester or as owner of
+   * a shared desktop. Every viewer surface (inline browser pane, inline Electron pane, popout
+   * windows) reaches the desktop through this bridge, so it is the ground truth that someone is
+   * watching; the browser viewer registry alone misses the inline Electron pane, which skips
+   * watchViewer. Pairs are registered synchronously with their admission lookup (which honors
+   * the archive guard), so an archive gate observing no pair cannot be beaten by a connection
+   * admitted earlier.
+   */
+  hasActiveBridge(workspaceId: string): boolean {
+    assert(workspaceId.length > 0, "hasActiveBridge requires a workspaceId");
+    for (const pair of this.activePairs) {
+      if (pair.requesterWorkspaceId === workspaceId || pair.ownerWorkspaceId === workspaceId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   public handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
     this.ensureReady();
     if (this.isStopping) {

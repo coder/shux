@@ -795,11 +795,25 @@ describe("DesktopBridgeServer", () => {
     const upgradeHarness = await listenUpgradeServer(bridgeServer);
     let ws: WebSocket | null = null;
     try {
+      expect(bridgeServer.hasActiveBridge("child")).toBe(false);
       ws = new WebSocket(`ws://127.0.0.1:${upgradeHarness.port}/?token=${token}&workspaceId=owner`);
       await waitForWebSocketOpen(ws);
       const tcpSocket = await tcpHarness.connectionPromise;
       ws.send(Buffer.from([1, 2, 3]));
       expect(await waitForTcpData(tcpSocket)).toEqual(Buffer.from([1, 2, 3]));
+      // The attached bridge counts for the requester and the owner whose desktop it shows,
+      // but not for unrelated workspaces.
+      expect(bridgeServer.hasActiveBridge("child")).toBe(true);
+      expect(bridgeServer.hasActiveBridge("owner")).toBe(true);
+      expect(bridgeServer.hasActiveBridge("isolated")).toBe(false);
+      await closeWebSocket(ws);
+      ws = null;
+      // The client's close event can land before the server finishes its own close handling.
+      for (let attempt = 0; attempt < 50 && bridgeServer.hasActiveBridge("child"); attempt++) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+      expect(bridgeServer.hasActiveBridge("child")).toBe(false);
+      expect(bridgeServer.hasActiveBridge("owner")).toBe(false);
       expect(getLiveSessionConnection.mock.calls.map((call) => call[0])).toEqual([
         "child",
         "child",
