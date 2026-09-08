@@ -1,11 +1,18 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
 import { HistoryAppendProvenance } from "./historyAppendProvenance";
+import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+
+type PublicationObserver = NonNullable<
+  Parameters<HistoryService["appendManyToHistoryUnderWriteLock"]>[2]
+>;
+// Compile-time assertion only; behavioral tests below check receipt timing at rename.
+expectTypeOf<() => Promise<undefined>>().not.toMatchTypeOf<PublicationObserver["onCommitted"]>();
 
 describe("HistoryService private publication seam", () => {
   let fixture: Awaited<ReturnType<typeof createTestHistoryService>>;
@@ -29,10 +36,7 @@ describe("HistoryService private publication seam", () => {
 
   // Exercise the inactive seam under its real recovery/provenance/removal locks,
   // without adding a public acceptance option just for tests.
-  function publish(
-    kind: "single" | "batch" | "update",
-    publication: { isCurrent: () => boolean; onCommitted: () => void }
-  ) {
+  function publish(kind: "single" | "batch" | "update", publication: PublicationObserver) {
     const service = fixture.historyService as unknown as {
       withRecoveredHistoryWriteResultLock(
         workspaceId: string,
@@ -131,7 +135,9 @@ describe("HistoryService private publication seam", () => {
             .some((name) => name.startsWith("chat.jsonl.publication-"));
           return false;
         },
-        onCommitted: () => commits++,
+        onCommitted: () => {
+          commits++;
+        },
       });
       expect(result.success).toBe(false);
       expect(staged).toBe(true);
@@ -151,7 +157,9 @@ describe("HistoryService private publication seam", () => {
       try {
         const result = await publish(kind, {
           isCurrent: () => true,
-          onCommitted: () => commits++,
+          onCommitted: () => {
+            commits++;
+          },
         });
         expect(result.success).toBe(false);
         expect(commits).toBe(0);

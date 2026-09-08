@@ -94,7 +94,8 @@ interface HistoryTruncateTransaction extends HistoryTruncateHashes {
 
 interface HistoryPublicationObserver {
   isCurrent: () => boolean;
-  onCommitted: () => void;
+  // Returning undefined excludes async callbacks: receipt capture must not yield after rename.
+  onCommitted: () => undefined;
 }
 
 interface HistoryRewriteRow {
