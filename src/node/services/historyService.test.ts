@@ -6,6 +6,7 @@ import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCom
 import { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createTestHistoryService } from "./testHistoryService";
+import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { updateSubagentTranscriptArtifactsFile } from "./subagentTranscriptArtifacts";
@@ -1037,7 +1038,7 @@ describe("HistoryService", () => {
       return service.rejectContextBudgetRequest(ws, latest.data[0]);
     }
 
-    async function capturePublication() {
+    async function capturePublication(effectiveThinkingLevel: "off" | "high" = "off") {
       const store = service.getContinuousCompactionJournal(ws);
       const journal: ContinuousCompactionJournal = {
         version: 1,
@@ -1058,7 +1059,7 @@ describe("HistoryService", () => {
         preparation: {
           modelString: "anthropic:claude-sonnet-4-5",
           providerForMessages: "anthropic",
-          effectiveThinkingLevel: "off",
+          effectiveThinkingLevel,
           effectiveAgentId: "exec",
           toolNamesForSentinel: [],
         },
@@ -1111,6 +1112,153 @@ describe("HistoryService", () => {
     }
 
     it.each(
+      ["single", "batch", "archive"].flatMap((method) => [0, 1].map((extra) => ({ method, extra })))
+    )(
+      "$method deletion counts JSON bytes without the LF at the reset limit (+$extra)",
+      async ({ method, extra }) => {
+        const old = row("old");
+        const floor = { ...reset(), padding: "" };
+        const fresh = row("fresh");
+        const source = [old, floor, fresh];
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(
+          method === "archive" ? source : [],
+          method === "archive" ? [] : source
+        );
+        floor.padding = "x".repeat(
+          SESSION_HISTORY_MAX_LINE_BYTES + extra - Buffer.byteLength(messageLine(ws, floor))
+        );
+        expect(Buffer.byteLength(messageLine(ws, floor))).toBe(
+          SESSION_HISTORY_MAX_LINE_BYTES + extra
+        );
+        const targetPath = method === "archive" ? archivePath : chatPath;
+        const beforeBytes = bytes(source);
+        await fs.writeFile(targetPath, beforeBytes);
+        const before = await service.getHistoryFromLatestBoundary(ws);
+        assert(before.success);
+        expect(before.data.map((message) => message.id)).toEqual(
+          extra === 0 ? [floor.id, fresh.id] : [fresh.id]
+        );
+        const { store, receipt } = await capturePublication();
+        const result =
+          method === "batch"
+            ? await service.deleteMessages(ws, [floor.id])
+            : await service.deleteMessage(ws, floor.id);
+        expect(result.success).toBe(extra === 0);
+        expect(await fs.readFile(targetPath)).toEqual(
+          extra === 0 ? bytes([old, fresh]) : beforeBytes
+        );
+        const after = await service.getHistoryFromLatestBoundary(ws);
+        assert(after.success);
+        expect(after.data.map((message) => message.id)).toEqual(
+          extra === 0 ? [old.id, fresh.id] : [fresh.id]
+        );
+        expect((await store.captureGeneration()) !== receipt.publicationGeneration).toBe(
+          extra === 0
+        );
+      }
+    );
+
+    it.each(["single", "batch", "archive", "partial"])(
+      "%s deletion preserves oversized token-separated raw reset evidence",
+      async (method) => {
+        const floor = {
+          ...createMuxMessage("floor", "assistant", ""),
+          contextBoundaryKind: 0,
+          padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES),
+          candidate: "reset",
+        };
+        const placeholder =
+          method === "partial" ? [createMuxMessage("floor", "assistant", "")] : [];
+        const source = [row("old"), floor, ...placeholder, row("fresh")];
+        const { chatPath, archivePath } = await seedDeletionHistory(
+          method === "archive" ? source : [],
+          method === "archive" ? [] : source
+        );
+        const targetPath = method === "archive" ? archivePath : chatPath;
+        const beforeBytes = await fs.readFile(targetPath);
+        const before = await service.getHistoryFromLatestBoundary(ws);
+        assert(before.success);
+        expect(before.data.map((message) => message.id)).toEqual([
+          ...placeholder.map((message) => message.id),
+          "fresh",
+        ]);
+        const { store, receipt } = await capturePublication();
+        const result =
+          method === "partial"
+            ? await deleteErroredPlaceholder("floor")
+            : method === "batch"
+              ? await service.deleteMessages(ws, ["floor"])
+              : await service.deleteMessage(ws, "floor");
+        const after = await service.getHistoryFromLatestBoundary(ws);
+        assert(after.success);
+        expect(after.data.map((message) => message.id)).toEqual(["fresh"]);
+        expect(result.success).toBe(method === "partial");
+        expect(await fs.readFile(targetPath)).toEqual(
+          method === "partial"
+            ? Buffer.from(
+                beforeBytes.toString("utf8").replace(messageLine(ws, placeholder[0]) + "\n", "")
+              )
+            : beforeBytes
+        );
+        expect(await store.read()).toEqual(receipt);
+        expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+      }
+    );
+
+    it.each(["single", "batch", "archive", "partial"])(
+      "%s deletion fences provider-preserved reasoning-only context",
+      async (method) => {
+        const reasoning: MuxMessage = {
+          ...createMuxMessage("reasoning", "assistant", ""),
+          parts: [{ type: "reasoning", text: "Preserved provider reasoning" }],
+        };
+        const placeholder =
+          method === "partial" ? [createMuxMessage("reasoning", "assistant", "")] : [];
+        const source = [row("old"), reasoning, ...placeholder, row("fresh")];
+        await seedDeletionHistory(
+          method === "archive" ? source : [],
+          method === "archive" ? [] : source
+        );
+        const before = await service.getHistoryFromLatestBoundary(ws);
+        assert(before.success);
+        expect(
+          prepareProviderRequestMessages(
+            before.data,
+            "anthropic",
+            "high"
+          ).providerRequestMessages.map((message) => message.id)
+        ).toEqual(["old", "reasoning", "fresh"]);
+        const { receipt } = await capturePublication("high");
+        if (method === "partial") {
+          assert(
+            (
+              await service.writePartial(ws, {
+                ...placeholder[0],
+                metadata: { ...placeholder[0].metadata, error: "stream failed" },
+              })
+            ).success
+          );
+        }
+        const result =
+          method === "partial"
+            ? await service.commitPartial(ws, "reasoning")
+            : method === "batch"
+              ? await service.deleteMessages(ws, ["reasoning"])
+              : await service.deleteMessage(ws, "reasoning");
+        expect(result.success).toBe(true);
+        const foreign = new HistoryService(config).getContinuousCompactionJournal(ws);
+        expect(
+          await foreign.recordFallbackPrefix(
+            receipt,
+            { modelString: "anthropic:next", prefix },
+            () => true
+          )
+        ).toBeNull();
+        expect(await foreign.captureGeneration()).not.toBe(receipt.publicationGeneration);
+      }
+    );
+
+    it.each(
       [
         {
           name: "empty placeholder",
@@ -1148,6 +1296,33 @@ describe("HistoryService", () => {
           chat: [reset()],
           changed: false,
         },
+        ...[false, true].map((archived) => {
+          const reasoning: MuxMessage = {
+            ...createMuxMessage("target", "assistant", ""),
+            parts: [{ type: "reasoning", text: "Sealed reasoning" }],
+          };
+          return {
+            name: `${archived ? "archive" : "active"} sealed reasoning`,
+            archive: archived ? [reasoning] : [],
+            chat: [...(archived ? [] : [reasoning]), boundary()],
+            changed: false,
+          };
+        }),
+        ...[
+          {
+            name: "ordinary oversized row",
+            padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES),
+            candidate: "ordinary",
+          },
+          { name: "readable reset-token payload", padding: "small", candidate: "reset" },
+        ].map(({ name, ...payload }) => ({
+          name,
+          archive: [],
+          chat: [
+            { ...createMuxMessage("target", "assistant", ""), contextBoundaryKind: 0, ...payload },
+          ],
+          changed: false,
+        })),
         {
           name: "active-first duplicate",
           archive: [row("target")],

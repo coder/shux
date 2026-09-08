@@ -3,7 +3,10 @@ import {
   HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
   invalidateHistoryAppendProvenance,
 } from "./historyAppendProvenance";
-import { SESSION_HISTORY_MAX_SCAN_BYTES } from "@/common/constants/contextBudget";
+import {
+  SESSION_HISTORY_MAX_SCAN_BYTES,
+  SESSION_HISTORY_MAX_LINE_BYTES,
+} from "@/common/constants/contextBudget";
 import {
   hasRawResetMarker,
   hasAmbiguousResetKeys,
@@ -2657,12 +2660,20 @@ export class HistoryService {
   }> {
     const raw = (await this.readExistingFileBytes(filePath)) ?? Buffer.alloc(0);
     const rows = splitHistoryLines(raw).map((line) => {
-      const text = line.toString("utf8");
+      // Match the provider scanner's row budget without the JSONL delimiter.
+      const content = line.at(-1) === 10 ? line.subarray(0, -1) : line;
+      const text = content.toString("utf8");
       return {
         raw: line,
         message: this.parseMessages(text, filePath, (value) =>
           isReadableHistoryMessage(value) &&
-          !(hasRawResetMarker(text) && hasAmbiguousResetKeys(text))
+          !(hasRawResetMarker(text) && hasAmbiguousResetKeys(text)) &&
+          // Oversized rows use the provider scanner's token probe, even when
+          // intervening bytes prevent a contiguous raw reset marker match.
+          !(
+            content.length > SESSION_HISTORY_MAX_LINE_BYTES &&
+            hasUnreadableHistoryResetEvidence([line])
+          )
             ? normalizeLegacyMuxMetadata(value)
             : null
         )[0],
