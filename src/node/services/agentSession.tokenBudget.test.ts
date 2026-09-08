@@ -133,7 +133,7 @@ describe("AgentSession token-budget lifecycle", () => {
   }) {
     const requests: Request[] = [];
     const secondRequest = Promise.withResolvers<Request>();
-    const requestWaiters = new Map<number, PromiseWithResolvers<Request>>();
+    const requestWaiters = new Map<number, ReturnType<typeof Promise.withResolvers<Request>>>();
     const waitForRequest = (count: number) => {
       let waiter = requestWaiters.get(count);
       if (!waiter) {
