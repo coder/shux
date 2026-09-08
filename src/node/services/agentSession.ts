@@ -9,7 +9,9 @@ import { createContextBudgetRejectedMessage } from "@/common/utils/messages/cont
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
-import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
+import { applyToolPolicyToNames, isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
+import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
+import { resolveMemoryAccessPolicy } from "./tools/memory";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_NOTES_MEMORY_PATH,
@@ -28,7 +30,7 @@ import {
   estimateLastStepToolResults,
   type ContextWindowRollover,
 } from "./contextWindowRollover";
-import { resolveAgentForStream } from "./agentResolution";
+import { resolveAgentForStream, type AgentResolutionResult } from "./agentResolution";
 import type { SettledStepBudget } from "./streamManager";
 import type { TurnStreamHandle } from "./streamManager";
 import type { StreamManager } from "./streamManager";
@@ -5067,6 +5069,14 @@ export class AgentSession {
     }
     // Agent allowlists and removals are absent from caller options. Resolve them before sealing
     // history, including after restart or switching agents between turns.
+    const resolved = await this.resolveAgentForBudgetChecks(options);
+    if (!resolved.success) return resolved;
+    return isSessionHistoryDisabled(resolved.data.effectiveToolPolicy) ? blocked : Ok(undefined);
+  }
+
+  private async resolveAgentForBudgetChecks(
+    options: SendMessageOptions | undefined
+  ): Promise<Result<AgentResolutionResult, SendMessageError>> {
     try {
       const metadata = await this.aiService.getWorkspaceMetadata(this.workspaceId);
       if (!metadata.success) return Err(createUnknownSendMessageError(metadata.error));
@@ -5085,8 +5095,7 @@ export class AgentSession {
           this.aiService.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL),
         includeAgentPlugins: this.aiService.isAgentPluginsEnabled?.() ?? false,
       });
-      if (!resolved.success) return Err(resolved.error);
-      return isSessionHistoryDisabled(resolved.data.effectiveToolPolicy) ? blocked : Ok(undefined);
+      return resolved.success ? Ok(resolved.data) : Err(resolved.error);
     } catch (error) {
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
@@ -6999,6 +7008,7 @@ export class AgentSession {
         });
       }
 
+      let resumedFlushCannotWrite = false;
       if (this.isTokenBudgetActive(options)) {
         this.contextBudgetWarningClaimed ||= historyResult.data.some(
           (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
@@ -7035,6 +7045,25 @@ export class AgentSession {
           if (isStreamStartAborted()) return Ok(undefined);
           if (!captured.success) return await fail(captured.error);
           this.pendingRolloverSnapshot = captured.data;
+          // The promised notes write needs a writable memory tool under the *current* options
+          // and agent; when it is gone, degrade the resumed flush to a tool-less step so the
+          // queued rollover still seals the window instead of running an unwritable flush.
+          const resolvedAgent = await this.resolveAgentForBudgetChecks(options);
+          if (isStreamStartAborted()) return Ok(undefined);
+          const memoryEnabled =
+            options.experiments?.memory ??
+            this.aiService.isExperimentEnabled(EXPERIMENT_IDS.MEMORY);
+          resumedFlushCannotWrite =
+            !memoryEnabled ||
+            !resolvedAgent.success ||
+            applyToolPolicyToNames(["memory"], resolvedAgent.data.effectiveToolPolicy).length ===
+              0 ||
+            resolveMemoryAccessPolicy({
+              planLike: resolvedAgent.data.agentIsPlanLike,
+              editingCapable: isExecLikeEditingCapableInResolvedChain(
+                resolvedAgent.data.agentInheritanceChain
+              ),
+            }).workspace !== "readwrite";
           this.pendingRollover = {
             type: "context-window-rollover",
             rolloverId: randomUUID(),
@@ -7220,9 +7249,10 @@ export class AgentSession {
         thinkingLevel: effectiveThinkingLevel,
         // Orthogonal to thinking level; buildRequestHeaders gates it per model.
         reasoningMode: options?.reasoningMode,
-        toolPolicy: flushAlreadyStepped
-          ? [...(options?.toolPolicy ?? []), { regex_match: ".*", action: "disable" }]
-          : options?.toolPolicy,
+        toolPolicy:
+          flushAlreadyStepped || resumedFlushCannotWrite
+            ? [...(options?.toolPolicy ?? []), { regex_match: ".*", action: "disable" }]
+            : options?.toolPolicy,
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
         maxOutputTokens: options?.maxOutputTokens,

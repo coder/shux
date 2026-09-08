@@ -5,6 +5,7 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { type MemoryScope, type MemoryScopeAccess } from "@/common/constants/memory";
+import { CONTEXT_NOTES_RESERVED_BYTES } from "@/common/constants/contextBudget";
 import type { z } from "zod";
 import {
   formatMemoryIndexForToolDescription,
@@ -152,17 +153,27 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
             error: `This turn may only create or update ${writePath}; '${input.command}' is unavailable.`,
           });
         }
-        // Only a well-formed, correctly targeted mutation claims the single slot, so a
-        // malformed or mis-targeted sibling cannot waste the preservation step.
+        // Only a mutation the executor would accept (required fields present, pinned path)
+        // claims the single slot, so a malformed or mis-targeted sibling cannot waste the
+        // preservation step. Mirrors executeMemoryCommand's own field validation exactly.
         const wellFormed =
           input.path != null &&
           checkPinnedPath(input.path) == null &&
           (input.command === "create"
             ? input.file_text != null
             : input.command === "str_replace"
-              ? input.old_str != null && input.new_str != null
+              ? input.old_str != null
               : input.insert_line != null && input.insert_text != null);
         if (wellFormed) {
+          // The notes are preloaded truncated to CONTEXT_NOTES_RESERVED_BYTES; larger writes
+          // would only bloat the file with content the next window never sees.
+          const written = input.file_text ?? input.insert_text ?? input.new_str ?? "";
+          if (Buffer.byteLength(written, "utf8") > CONTEXT_NOTES_RESERVED_BYTES) {
+            return Promise.resolve({
+              success: false,
+              error: `Context notes are limited to ${CONTEXT_NOTES_RESERVED_BYTES} bytes; shorten the content (essential state first).`,
+            });
+          }
           if (pinnedMutationUsed) {
             return Promise.resolve({
               success: false,

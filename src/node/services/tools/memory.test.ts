@@ -365,8 +365,15 @@ describe("memory tool", () => {
       expect(
         (await run(fixture.tool, { command: "rename", old_path: notes, new_path: notes })).success
       ).toBe(false);
-      // Refused destructive, malformed, or mis-targeted siblings do not consume the slot.
+      // Refused destructive, malformed, mis-targeted, or oversized siblings do not consume the slot.
       expect((await run(fixture.tool, { command: "create", path: notes })).success).toBe(false);
+      const oversized = await run(fixture.tool, {
+        command: "create",
+        path: notes,
+        file_text: "x".repeat(8 * 1024 + 1),
+      });
+      expect(oversized.success).toBe(false);
+      if (!oversized.success) expect(oversized.error).toContain("limited to");
       expect(
         (
           await run(fixture.tool, {
@@ -379,11 +386,11 @@ describe("memory tool", () => {
       expect(
         (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success
       ).toBe(true);
+      // A null replacement still counts: the executor would treat it as deleting old_str.
       const second = await run(fixture.tool, {
-        command: "insert",
+        command: "str_replace",
         path: notes,
-        insert_line: 0,
-        insert_text: "more",
+        old_str: "state",
       });
       expect(second.success).toBe(false);
       if (!second.success) expect(second.error).toContain("single memory mutation");

@@ -1585,6 +1585,29 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   });
 
+  test("resuming a flush without a writable memory tool degrades it to a tool-less step", async () => {
+    const first = await setup();
+    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await first.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await first.finishAndDispatch();
+    await first.session.dispose();
+    const h = await setup({ previous: first });
+    // The Memory experiment was turned off before the restart resume.
+    expect(
+      (
+        await h.session.resumeStream({
+          ...options,
+          experiments: { tokenBudget: true, memory: false },
+        })
+      ).success
+    ).toBe(true);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    expect(applyToolPolicyToNames(["memory", "bash"], h.requests[0].toolPolicy)).toEqual([]);
+    h.settleStream(0, { finishReason: "stop" });
+    await h.waitForRequest(2);
+    expect(rolloverRows(await allRows(h))).toHaveLength(1);
+  });
+
   test("toolset-changing middleware blocks the flush dispatch like the rollover it promises", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
