@@ -114,6 +114,7 @@ import {
 } from "@/common/utils/providers/customProviders";
 import type { MCPServerManager, MCPWorkspaceStats } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
+import { memoryScopeContextFromToolConfig } from "@/node/services/tools/memory";
 import type { TaskService } from "@/node/services/taskService";
 import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
@@ -2325,14 +2326,23 @@ export class TurnRequestBuilder {
         }
 
         // A sub-agent's workspace-scope memory rows point into its task-tree
-        // owner's session dir; rollback must admit that root (and only that).
+        // owner's session dir; rollback must admit that root (and only that),
+        // and announce its direct-to-disk writes through MemoryService so the
+        // shared store's readers refresh.
+        const memoryService = this.dependencies.bindings.memoryService;
         const memoryOwnerId =
-          this.dependencies.bindings.memoryService?.resolveWorkspaceMemoryOwnerId(workspaceId) ??
-          workspaceId;
+          memoryService?.resolveWorkspaceMemoryOwnerId(workspaceId) ?? workspaceId;
         const sharedWorkspaceMemorySessionDir =
           memoryOwnerId === workspaceId
             ? undefined
             : path.join(this.dependencies.config.sessionsDir, memoryOwnerId);
+        const sandboxMemory =
+          memoryService === undefined
+            ? undefined
+            : {
+                service: memoryService,
+                ctx: memoryScopeContextFromToolConfig(toolsForModelConfig),
+              };
         const applyPolicyStartedAt = Date.now();
         let attemptTools = await applyToolPolicyAndExperiments({
           allTools: this.dependencies.wrapToolsForDelegation(
@@ -2348,6 +2358,7 @@ export class TurnRequestBuilder {
             workspaceId,
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             sharedWorkspaceMemorySessionDir,
+            memory: sandboxMemory,
             kernelFileLoader,
           },
         });

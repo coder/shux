@@ -36,6 +36,7 @@ import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { PTCExecutionResult } from "@/node/services/ptc/types";
 import { sandboxHostService, type SandboxMount } from "@/node/services/sandbox/sandboxHostService";
 import { createRefinementRollbackTool } from "@/node/services/tools/refinement_rollback";
+import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { log } from "./log";
 import type { MCPWorkspaceStats } from "@/node/services/mcpServerManager";
@@ -120,6 +121,8 @@ export interface ApplyToolPolicyAndExperimentsOptions {
     sessionDir: string;
     /** Owner session dir when the workspace is a sub-agent sharing its notebook. */
     sharedWorkspaceMemorySessionDir?: string;
+    /** Lets refinement_rollback announce its direct-to-disk memory writes. */
+    memory?: { service: MemoryService; ctx: MemoryScopeContext };
     kernelFileLoader?: KernelFileLoader;
   };
   /**

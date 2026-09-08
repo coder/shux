@@ -3,6 +3,7 @@ import { tool, type Tool } from "ai";
 import type { RefinementRollbackToolResult } from "@/common/types/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { rollbackRefinement } from "@/node/services/refinement/refinementRollback";
+import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 
 interface RefinementRollbackToolArgs {
   id: string;
@@ -22,6 +23,8 @@ export function createRefinementRollbackTool(ctx: {
   sessionDir: string;
   /** Owner session dir when this workspace is a sub-agent sharing its notebook. */
   sharedWorkspaceMemorySessionDir?: string;
+  /** Announces rolled-back memory files so shared-store readers refresh. */
+  memory?: { service: MemoryService; ctx: MemoryScopeContext };
 }): Tool {
   return tool({
     description: TOOL_DEFINITIONS.refinement_rollback.description,
@@ -40,6 +43,16 @@ export function createRefinementRollbackTool(ctx: {
       if (!result.success) {
         return { success: false, error: result.error };
       }
+      // Rollback writes inverses straight to disk, bypassing MemoryService's
+      // change events; announce them so the (possibly shared) store's other
+      // readers — owner, siblings, open Memory tabs — do not keep stale context.
+      ctx.memory?.service.notifyExternalMutation(ctx.memory.ctx, [
+        ...result.data.restored,
+        ...result.data.deleted,
+        ...(result.data.renamed === undefined
+          ? []
+          : [result.data.renamed.from, result.data.renamed.to]),
+      ]);
       return {
         success: true,
         rollbackOf: id,

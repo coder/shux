@@ -1284,22 +1284,13 @@ describe("MemoryConsolidationService", () => {
     expect(fixture.modelCalls).toHaveLength(1);
   });
 
-  it("refuses Dream runs for sub-agent children and lets the owner sweep their shared writes", async () => {
+  it("redirects a sub-agent's Dream runs and status to the memory owner", async () => {
     using fixture = await createFixture();
     await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
 
-    // Every trigger, including an explicit /dream, is refused on the child:
-    // its /memories/workspace IS the owner's store.
-    for (const trigger of ["manual", "compaction", "archive"] as const) {
-      const result = await fixture.service.maybeRun("ws-sub", trigger);
-      expect(result.success).toBe(false);
-      if (!result.success) expect(result.error).toContain("owner");
-    }
-    expect(fixture.modelCalls).toHaveLength(0);
-
-    // A child's workspace write is keyed under the owner (MemoryService
-    // resolution), so an idle owner qualifies for the launch sweep while the
-    // idle child is skipped even though it is listed.
+    // Launch sweep: a child's workspace write is keyed under the owner
+    // (MemoryService resolution), so the idle owner qualifies while the idle
+    // child is skipped even though it is listed.
     await fixture.memoryService.create(
       { runtime: null, checkoutCwd: "", workspaceId: "ws-sub", projectPath: "" },
       "/memories/workspace/from-child.md",
@@ -1317,12 +1308,31 @@ describe("MemoryConsolidationService", () => {
     expect(await fixture.service.getRecord("ws-sub")).toBeNull();
     expect(await fixture.service.getRecord("ws-dream")).not.toBeNull();
 
+    // Manual/compaction runs from the child consolidate the OWNER's store
+    // under the owner's lock; the record lands on the owner and the child's
+    // status view reports it (the tab shows the shared store).
+    const manual = await fixture.service.maybeRun("ws-sub", "manual");
+    expect(manual.success).toBe(true);
+    expect(fixture.modelCalls).toHaveLength(2);
+    expect(await fixture.service.getRecord("ws-sub")).toBeNull();
+    expect((await fixture.service.getStatus("ws-sub")).workspaceRecord).toEqual(
+      await fixture.service.getRecord("ws-dream")
+    );
+
+    // Archive is the owner's own one-shot promotion pass: a child archive is
+    // refused instead of running it.
+    const archive = await fixture.service.maybeRun("ws-sub", "archive");
+    expect(archive.success).toBe(false);
+    if (!archive.success) expect(archive.error).toContain("owner");
+    expect(fixture.modelCalls).toHaveLength(2);
+
     // A dangling parent chain resolves to a PRIVATE store (owner == self), so
-    // that workspace must remain consolidatable rather than orphaned forever.
+    // that workspace consolidates itself rather than being orphaned forever.
     await fixture.addWorkspace("ws-orphan", { parentWorkspaceId: "ws-gone" });
     const orphan = await fixture.service.maybeRun("ws-orphan", "manual");
     expect(orphan.success).toBe(true);
-    expect(fixture.modelCalls).toHaveLength(2);
+    expect(await fixture.service.getRecord("ws-orphan")).not.toBeNull();
+    expect(fixture.modelCalls).toHaveLength(3);
   });
 
   it("launch sweep skips archived workspaces and caps runs per launch", async () => {

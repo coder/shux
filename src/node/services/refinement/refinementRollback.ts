@@ -53,6 +53,7 @@ import {
   type RefinementInverseDraft,
 } from "./refinementJournal";
 import { withTargetMutationLocks } from "./targetMutationLocks";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 
 export type RefinementEvent = Extract<DurableEvent, { kind: "refinement" }>;
 
@@ -851,6 +852,22 @@ export async function rollbackRefinement(
     // targetMutationLocks.ts.
     const targetLockRoot = inferMemoryLayout(opts.sessionDir)?.muxRoot ?? null;
     const applied = await withTargetMutationLocks(targetLockRoot, lockKeys, async () => {
+      // Shared-store owner teardown gate: a delete inverse expects its target
+      // absent, so divergence alone would let a rollback that was waiting on
+      // this lock recreate the removed owner's <sessionDir>/memory. Same
+      // tombstone MemoryService checks pre-commit (r61), same lock.
+      if (opts.sharedWorkspaceMemorySessionDir !== undefined && targetLockRoot !== null) {
+        const ownerSessionDir = path.resolve(opts.sharedWorkspaceMemorySessionDir);
+        const ownerMemoryRoot = path.join(ownerSessionDir, "memory");
+        if (
+          lockKeys.includes(ownerMemoryRoot) &&
+          (await isWorkspaceRemovalTombstoned(targetLockRoot, path.basename(ownerSessionDir)))
+        ) {
+          throw new RollbackError(
+            `Refusing rollback of '${opts.id}': the workspace owning the shared memory store was removed`
+          );
+        }
+      }
       // Re-verify INSIDE the lock, immediately before mutating: a writer that
       // won the lock first has already landed, and its change must surface as
       // divergence rather than be overwritten. `rows` is intentionally the

@@ -414,8 +414,12 @@ export class MemoryConsolidationService extends EventEmitter {
       const workspace = self.config.findWorkspace(workspaceId);
       const projectPath = workspace == null ? "" : resolveConsolidationProjectPath(workspace);
       const globalRecord = findNewestWorkspaceRecord(file.workspaces);
+      // The workspace record describes the STORE the tab shows: for a
+      // sub-agent that is the owner's (runs are redirected there, see
+      // maybeRun); harvests stay per acting workspace.
+      const ownerWorkspaceId = self.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
       return {
-        workspaceRecord: file.workspaces[workspaceId] ?? null,
+        workspaceRecord: file.workspaces[ownerWorkspaceId] ?? null,
         projectRecord: projectPath === "" ? null : (file.projects[projectPath] ?? null),
         globalRecord,
         latestHarvestRecord: findNewestHarvestRecord(file.harvestsByWorkspace[workspaceId]),
@@ -667,6 +671,23 @@ export class MemoryConsolidationService extends EventEmitter {
     options: MemoryConsolidationRunOptions = {}
   ): Promise<Result<MemoryConsolidationRecord, string>> {
     if (!this.enabled()) return Err("memory-consolidation experiment is disabled");
+    // Sub-agents share their task-tree owner's /memories/workspace store
+    // (MemoryService.resolveWorkspaceMemoryOwnerId): a child's manual or
+    // post-compaction run consolidates the OWNER's notebook under the owner's
+    // in-flight lock, so it never races the owner's own runs and the child's
+    // harvested candidates are actually swept. Archive is the owner's own
+    // one-shot promotion pass; a child archive must not trigger it. Compared
+    // by resolved owner, not parentWorkspaceId: a dangling/cyclic chain falls
+    // back to a private store that must stay consolidatable.
+    const ownerWorkspaceId = this.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
+    if (ownerWorkspaceId !== workspaceId) {
+      if (trigger === "archive") {
+        return Err(
+          "sub-agent workspaces share their owner's workspace memory; the owner's archive pass promotes it"
+        );
+      }
+      return this.maybeRun(ownerWorkspaceId, trigger, options);
+    }
     if (this.removalCancelled.has(workspaceId)) {
       return Err("workspace is being removed; consolidation refused");
     }
@@ -738,13 +759,6 @@ export class MemoryConsolidationService extends EventEmitter {
       // child would consolidate the owner's notebook concurrently with the
       // owner's own runs. Children still harvest into the shared inbox; only
       // the owner sweeps it.
-      // Compared by resolved owner, not parentWorkspaceId: a dangling/cyclic
-      // chain falls back to a private store that must stay consolidatable.
-      if (self.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId) !== workspaceId) {
-        return Err(
-          "sub-agent workspaces share their owner's workspace memory; the owner consolidates it"
-        );
-      }
 
       const agentBody = yield* Effect.promise(() => resolveDreamAgentBody(self.config.rootDir));
       if (agentBody === null) return Err("dream agent definition is missing");
@@ -969,7 +983,13 @@ export class MemoryConsolidationService extends EventEmitter {
           .pipe(Effect.catch(journalHarvestFailure), Effect.catchDefect(journalHarvestFailure));
       }
 
-      return yield* Effect.promise(() => self.runCompactionSweepAfterHarvest(metadata.workspaceId));
+      // A sub-agent's inbox lives in the owner's store: wait on and run the
+      // OWNER's consolidation (see maybeRun) so the harvest is actually swept.
+      return yield* Effect.promise(() =>
+        self.runCompactionSweepAfterHarvest(
+          self.memoryService.resolveWorkspaceMemoryOwnerId(metadata.workspaceId)
+        )
+      );
     });
   }
 
@@ -1237,7 +1257,7 @@ export class MemoryConsolidationService extends EventEmitter {
         if (now - recency < MEMORY_CONSOLIDATION_IDLE_MS) continue;
         if (archivedById.get(workspaceId) === true) continue;
         // Shared store: the owner's own sweep covers a child's writes (they
-        // are keyed under the owner), and runLockedEffect refuses children.
+        // are keyed under the owner); running the child would just redirect.
         if (sharesOwnerStore(workspaceId)) continue;
         const lastRunAt = sidecar.workspaces[workspaceId]?.lastRunAt ?? 0;
         const projectPath = projectPathByWorkspace.get(workspaceId) ?? "";

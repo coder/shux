@@ -587,6 +587,11 @@ export class MemoryService extends EventEmitter {
     private readonly metaService: MemoryMetaService
   ) {
     super();
+    // Parent links are immutable, but an OWNER can be removed while a
+    // shared-checkout descendant keeps running; its deregistration lands as a
+    // config change, after which the child must re-resolve (and fall back to
+    // its own store) instead of writing into the tombstoned owner forever.
+    this.config.onConfigChanged(() => this.workspaceMemoryOwnerById.clear());
   }
 
   // -------------------------------------------------------------------------
@@ -1010,6 +1015,32 @@ export class MemoryService extends EventEmitter {
    * scope root: subscribers refetch the whole scope per event, so per-file events for a
    * bulk restore would only multiply identical refreshes.
    */
+  /**
+   * Announces memory files mutated outside this service by a refinement
+   * rollback (which applies inverses straight to disk). Physical paths are
+   * classified against this context's scope roots and one root-addressed
+   * event per touched scope is emitted, so Memory tabs refresh and — for the
+   * shared workspace store — every task-tree session drops its cached
+   * context (see the change listener wired in di/layers/core.ts).
+   */
+  notifyExternalMutation(ctx: MemoryScopeContext, physicalPaths: readonly string[]): void {
+    const touched = new Set<MemoryScope>();
+    for (const scope of MEMORY_SCOPES) {
+      let root: string;
+      try {
+        root = this.getStore(ctx, scope).physicalRoot;
+      } catch (error) {
+        if (error instanceof MemoryCommandError) continue; // scope unavailable in this context
+        throw error;
+      }
+      for (const physicalPath of physicalPaths) {
+        const rel = path.relative(root, path.resolve(physicalPath));
+        if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) touched.add(scope);
+      }
+    }
+    for (const scope of touched) this.emitChange(ctx, scope, "", "agent");
+  }
+
   notifyExternalProjectChange(projectPath: string): void {
     const event: MemoryChangeEvent = {
       scope: "project",

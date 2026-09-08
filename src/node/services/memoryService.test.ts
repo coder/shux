@@ -13,6 +13,7 @@ import {
   MemoryService,
   projectMemoryDirName,
   resolveMemoryProjectIdentity,
+  type MemoryChangeEvent,
   type MemoryScopeContext,
 } from "./memoryService";
 import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
@@ -24,6 +25,7 @@ import {
 } from "@/common/types/refinement";
 import { applyRefinementInverse, readRefinementEvents } from "./refinement/refinementTestHelpers";
 import { rollbackRefinement } from "./refinement/refinementRollback";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 import { TestTempDir } from "./tools/testHelpers";
 
 function pathExists(target: string): Promise<boolean> {
@@ -930,6 +932,72 @@ describe("MemoryService", () => {
       });
       expect(rolledBack.success).toBe(true);
       expect(await pathExists(physical)).toBe(false);
+    });
+    it("re-resolves the owner after config changes so a removed owner's child falls back to its own store", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+
+      // The owner is deregistered (removal with a live shared-checkout child);
+      // the dangling chain must not keep pointing at the tombstoned owner.
+      await fixture.config.editConfig((cfg) => {
+        const project = cfg.projects.get(FIXTURE_PROJECT_PATH)!;
+        project.workspaces = project.workspaces.filter((ws) => ws.id !== "ws-owner");
+        return cfg;
+      });
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/after.md",
+        "own store now",
+        "agent"
+      );
+      expect(created.success).toBe(true);
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-child", "memory", "after.md"))
+      ).toBe(true);
+    });
+
+    it("refuses a child's rollback into the shared store once the owner is tombstoned", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const [row] = await readRefinementEvents(childSessionDir);
+
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-owner");
+      await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-owner" }));
+
+      const refused = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        id: row.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("was removed");
+      expect(await pathExists(path.join(ownerSessionDir, "memory", "n.md"))).toBe(true);
+    });
+
+    it("notifyExternalMutation emits one owner-addressed event per touched scope", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const events: MemoryChangeEvent[] = [];
+      fixture.service.on("change", (event: MemoryChangeEvent) => events.push(event));
+      const ownerMemory = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      fixture.service.notifyExternalMutation(fixture.ctx, [
+        path.join(ownerMemory, "a.md"),
+        path.join(ownerMemory, "dir", "b.md"),
+        path.join(fixture.xumHome, "memory", "global", "g.md"),
+        path.join(fixture.xumHome, "elsewhere", "x.md"),
+        ownerMemory, // the root itself is not a file inside the scope
+      ]);
+      expect(events.map((event) => [event.scope, event.path, event.workspaceId])).toEqual([
+        ["global", "/memories/global", "ws-owner"],
+        ["workspace", "/memories/workspace", "ws-owner"],
+      ]);
     });
   });
 
