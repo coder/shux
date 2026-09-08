@@ -71,7 +71,7 @@ export async function migrateSharedMemoryRefinementRows(args: {
   const rollbackByTarget = new Map(
     rows
       .filter((row) => row.data.rollbackOf !== undefined)
-      .map((row) => [row.data.rollbackOf as string, row] as const)
+      .map((row) => [row.data.rollbackOf!, row] as const)
   );
   const isLive = (rowId: string): boolean => {
     let depth = 0;
