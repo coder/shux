@@ -5,6 +5,7 @@ import { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createTestHistoryService } from "./testHistoryService";
 import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
+import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { updateSubagentTranscriptArtifactsFile } from "./subagentTranscriptArtifacts";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "node:assert";
@@ -1022,6 +1023,12 @@ describe("HistoryService", () => {
       });
     const prefix = [{ role: "user" as const, content: "Discarded provider context" }];
 
+    async function rejectLatestBudgetRequest() {
+      const latest = await service.getLastMessages(ws, 1);
+      assert(latest.success && latest.data.length === 1);
+      return service.rejectContextBudgetRequest(ws, latest.data[0]);
+    }
+
     async function capturePublication() {
       const store = service.getContinuousCompactionJournal(ws);
       const journal: ContinuousCompactionJournal = {
@@ -1117,6 +1124,25 @@ describe("HistoryService", () => {
         rows: [row("old"), boundary(), row("tail")],
         mutate: () => service.truncateAfterMessage(ws, "old", { keepTargetMessage: true }),
         expected: ["old"],
+      },
+      {
+        name: "context-budget rejection",
+        rows: [
+          row("old"),
+          createMuxMessage("prelude", "assistant", "Owned payload", { synthetic: true }),
+          createMuxMessage("trigger", "user", "Rejected request", {
+            requestPreludeMessageIds: ["prelude"],
+          }),
+        ],
+        mutate: async () => {
+          const result = await rejectLatestBudgetRequest();
+          if (result.success) {
+            expect(result.data.map((message) => message.id)).toEqual(["prelude", "trigger"]);
+            expect(result.data.every((message) => message.parts.length === 0)).toBe(true);
+          }
+          return result;
+        },
+        expected: ["old", "prelude", "trigger"],
       },
     ];
 
@@ -1330,6 +1356,24 @@ describe("HistoryService", () => {
         expected: ["old", "sealed"],
         success: true,
       },
+      {
+        name: "missing rejection trigger",
+        rows: [row("old")],
+        mutate: () =>
+          service.rejectContextBudgetRequest(
+            ws,
+            createMuxMessage("missing", "user", "Gone request", { historySequence: 0 })
+          ),
+        expected: ["old"],
+        success: false,
+      },
+      {
+        name: "repeated rejection capsule",
+        rows: [createContextBudgetRejectedMessage(row("old"))],
+        mutate: rejectLatestBudgetRequest,
+        expected: ["old"],
+        success: true,
+      },
     ])("$name preserves a usable compaction publication", async (testCase) => {
       for (const message of testCase.rows) {
         assert((await service.appendToHistory(ws, message)).success);
@@ -1363,6 +1407,62 @@ describe("HistoryService", () => {
       expect(active.data.map((message) => message.id)).toEqual([receipt.boundary.id]);
       expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
     });
+
+    it.each(
+      [
+        '{"metadata":{"contextBoundaryKind":"reset"},broken\n',
+        ' {\n"contextBoundaryKind"\n:\n"reset"\n}\n',
+        '{"id":"reset","role":"assistant","parts":[],"metadata":{"contextBoundaryKind":"reset"},"metadata":{}}\n',
+      ].flatMap((raw) =>
+        ["chat", "archive"].flatMap((artifact) =>
+          [0, 0.1, 0.5].map((percentage) => ({ raw, artifact, percentage }))
+        )
+      )
+    )(
+      "prefix $percentage respects the retained raw reset floor in $artifact ($raw)",
+      async ({ raw, artifact, percentage }) => {
+        const source = [
+          row("old"),
+          row("active"),
+          createMuxMessage("tail", "assistant", "Active reply", {
+            contextUsage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+          }),
+        ];
+        assert((await service.appendManyToHistory(ws, source)).success);
+        assert((await service.getHistoryFromLatestBoundary(ws)).success);
+        const chatPath = path.join(config.sessionsDir, ws, "chat.jsonl");
+        const archivePath = path.join(config.sessionsDir, ws, "chat-archive.jsonl");
+        const lines = (await fs.readFile(chatPath, "utf8")).trimEnd().split("\n");
+        const sealed = lines[0] + "\n" + raw;
+        const active = lines.slice(1).join("\n") + "\n";
+        if (artifact === "archive") await fs.writeFile(archivePath, sealed);
+        await fs.writeFile(chatPath, (artifact === "chat" ? sealed : "") + active);
+        const before = await service.getHistoryFromLatestBoundary(ws);
+        assert(before.success);
+        expect(before.data.map((message) => message.id)).toEqual(["active", "tail"]);
+        const { store, receipt } = await capturePublication();
+        const truncated = await service.truncateHistory(ws, percentage);
+        assert(truncated.success);
+        const changed = percentage === 0.5;
+        expect(truncated.data).toEqual(percentage === 0 ? [] : changed ? [0, 1] : [0]);
+        const restarted = new HistoryService(config);
+        const after = await restarted.getHistoryFromLatestBoundary(ws);
+        assert(after.success);
+        if (changed) {
+          expect(after.data.map((message) => message.id)).toEqual(["tail"]);
+          expect(after.data[0].metadata?.contextUsage).toBeUndefined();
+          expect(await store.read()).toBeNull();
+          expect(await store.captureGeneration()).not.toBe(receipt.publicationGeneration);
+        } else {
+          expect(after.data).toEqual(before.data);
+          expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+          expect(await store.read()).toEqual(receipt);
+        }
+        expect(await fs.readFile(artifact === "chat" ? chatPath : archivePath, "utf8")).toContain(
+          raw
+        );
+      }
+    );
   });
 
   describe("clearHistory", () => {

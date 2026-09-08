@@ -49,7 +49,6 @@ import { safeStringifyForCounting } from "@/common/utils/tokens/safeStringifyFor
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import {
-  findLatestContextBoundaryIndex,
   getContextBoundaryKind,
   hasProviderEligibleMessages,
   isDurableCompactedMarker,
@@ -116,19 +115,6 @@ function hasDurableCompactionBoundary(metadata: MuxMetadata | undefined): boolea
   }
 
   return isPositiveInteger(metadata.compactionEpoch);
-}
-
-function prefixCutChangesActiveContext(messages: MuxMessage[], removeCount: number): boolean {
-  const boundaryIndex = findLatestContextBoundaryIndex(messages);
-  const activeStart =
-    boundaryIndex < 0
-      ? 0
-      : getContextBoundaryKind(messages[boundaryIndex]) === CONTEXT_BOUNDARY_KINDS.RESET
-        ? boundaryIndex + 1
-        : boundaryIndex;
-  return hasProviderEligibleMessages(
-    filterWorkflowDisplayOnlyMessages(messages.slice(activeStart, removeCount))
-  );
 }
 
 function stripContextUsage(message: MuxMessage): MuxMessage {
@@ -2873,6 +2859,7 @@ export class HistoryService {
           )
         );
         const rejected: MuxMessage[] = [];
+        let providerContextChanged = false;
         const earlier = new Set(messages.slice(0, triggerIndex));
         const updated = this.serializeHistoryRewrite(rows, workspaceId, (row) => {
           const ownedPrelude =
@@ -2882,10 +2869,20 @@ export class HistoryService {
             (isSyntheticSnapshotUserMessage(row) ||
               (row.role === "assistant" && row.metadata?.synthetic === true));
           if (row !== persisted && !ownedPrelude) return row;
+          providerContextChanged ||= hasProviderEligibleMessages(
+            filterWorkflowDisplayOnlyMessages([row])
+          );
           const marked = createContextBudgetRejectedMessage(row);
           rejected.push(marked);
           return marked;
         });
+        // Rejection removes provider context just like truncation. Retire foreign
+        // compactors before rewriting, but preserve publication on capsule retries.
+        if (providerContextChanged) {
+          await this.getContinuousCompactionJournal(
+            workspaceId
+          ).advanceGenerationUnderHistoryLock();
+        }
         await writeFileAtomic(historyPath, updated);
         return Ok(rejected);
       }
@@ -3648,7 +3645,23 @@ export class HistoryService {
             return Ok(allSequences);
           }
 
-          const activeContextChanged = prefixCutChangesActiveContext(messages, removeCount);
+          // The raw-aware reader returns the active suffix of these parsed rows.
+          // Reuse its privacy floor: retained unreadable reset evidence can seal
+          // rows that parsed boundary markers alone would misclassify as active.
+          const activeMessages = await readProviderHistoryFromLatestBoundary(
+            {
+              chat: this.getChatHistoryPath(workspaceId),
+              archive: this.getChatArchivePath(workspaceId),
+            },
+            0
+          );
+          const activeRemoveCount = Math.max(
+            0,
+            removeCount - (messages.length - activeMessages.length)
+          );
+          const activeContextChanged = hasProviderEligibleMessages(
+            filterWorkflowDisplayOnlyMessages(activeMessages.slice(0, activeRemoveCount))
+          );
           const sanitize = activeContextChanged
             ? stripContextUsage
             : (message: MuxMessage) => message;
