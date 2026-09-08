@@ -34,9 +34,12 @@ export interface UseDesktopConnectionResult {
    * Register as a viewer without connecting: the popout coordinator calls this for a suspended
    * inline pane once a live detached child is confirmed (Electron manager truth, or a bring-back
    * in flight), so the inline registration covers the popout→inline handoff. A bare persisted
-   * browser hint never registers: it is recovery UI, not proof that a popout is alive.
+   * browser hint never registers: it is recovery UI, not proof that a popout is alive. Resolves
+   * once the backend reports the registration ready (immediately when one is already ready, and
+   * without a lease when none can be made right now), so the coordinator can wait for the lease
+   * before asking the child to close; it never rejects.
    */
-  register: () => void;
+  register: () => Promise<void>;
   controlling: boolean;
   setControlling: (value: boolean) => void;
   scaleToFit: boolean;
@@ -196,6 +199,17 @@ export function useDesktopConnection(
   // Ready registrations this pane lost to a subscription drop and replaced. Each left an
   // attachment grace on the backend that only a definitive outcome of this pane can retract.
   const supersededViewerIdsRef = useRef<string[]>([]);
+  // A pane that registers no viewer (an Electron popout: its window is manager truth) still
+  // names its bridge under a private id so giving it up (the window closing, which Electron
+  // always routes through the manager's cleanup) retracts the bridge's grace all the same.
+  const anonymousBridgeIdRef = useRef<string | null>(null);
+  // Readiness of the current registration attempt, for register() callers that wait on it.
+  const registrationReadyRef = useRef<Promise<void> | null>(null);
+  const bootstrapViewerId = (): string | null => {
+    if (registerViewer) return viewerIdRef.current;
+    anonymousBridgeIdRef.current ??= crypto.randomUUID();
+    return anonymousBridgeIdRef.current;
+  };
 
   // Giving the registration up (terminal outcome, explicit disconnect, unmount) is definitive:
   // this pane will not reconnect, so tell the backend before the abort and the bridge close so
@@ -204,11 +218,11 @@ export function useDesktopConnection(
   const detachViewerDefinitively = () => {
     const client = apiRef.current;
     const viewerId = viewerIdRef.current;
-    const viewerIds =
-      viewerId !== null && viewerRegistrationRef.current !== null
-        ? [...supersededViewerIdsRef.current, viewerId]
-        : supersededViewerIdsRef.current;
+    const viewerIds = [...supersededViewerIdsRef.current];
+    if (viewerId !== null && viewerRegistrationRef.current !== null) viewerIds.push(viewerId);
+    if (anonymousBridgeIdRef.current !== null) viewerIds.push(anonymousBridgeIdRef.current);
     supersededViewerIdsRef.current = [];
+    anonymousBridgeIdRef.current = null;
     if (!client) return;
     for (const id of viewerIds) {
       void client.desktop.detachViewer({ viewerId: id }).catch(() => undefined);
@@ -323,22 +337,20 @@ export function useDesktopConnection(
     setReason(null);
   };
 
-  const register = () => {
-    if (
-      !registerViewer ||
-      viewerReleasedRef.current ||
-      terminalRef.current ||
-      viewerRegistrationRef.current !== null
-    ) {
-      return;
+  const register = (): Promise<void> => {
+    if (!registerViewer || viewerReleasedRef.current || terminalRef.current) {
+      return Promise.resolve();
+    }
+    if (viewerRegistrationRef.current !== null) {
+      return registrationReadyRef.current ?? Promise.resolve();
     }
     const client = apiRef.current;
     if (!client) {
       // The API provider may still be connecting; retry until a client is published.
       scheduleViewerReregistration();
-      return;
+      return Promise.resolve();
     }
-    registerViewerRegistration(client).catch(() => {
+    return registerViewerRegistration(client).catch(() => {
       if (
         !isDisposedRef.current &&
         !terminalRef.current &&
@@ -369,7 +381,7 @@ export function useDesktopConnection(
       }
       registration.abort();
     };
-    return new Promise<void>((resolve, reject) => {
+    const ready = new Promise<void>((resolve, reject) => {
       void (async () => {
         let viewerId: string | null = null;
         try {
@@ -440,6 +452,10 @@ export function useDesktopConnection(
         retire();
       })();
     });
+    // register() hands the pending readiness to the popout coordinator; rejection is reported to
+    // the caller of this function, so the shared copy only ever resolves.
+    registrationReadyRef.current = ready.catch(() => undefined);
+    return ready;
   };
 
   const scheduleViewerReregistration = () => {
@@ -536,7 +552,7 @@ export function useDesktopConnection(
         // The registration is named so the bridge this bootstrap opens is attributed to it.
         const result = await api.desktop.getBootstrap({
           workspaceId,
-          viewerId: viewerIdRef.current,
+          viewerId: bootstrapViewerId(),
         });
         if (generationRef.current !== generation || isDisposedRef.current) {
           return;

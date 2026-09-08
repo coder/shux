@@ -61,9 +61,10 @@ export class DesktopPopout {
   private closeTimer: number | undefined;
   private suspendInline: (() => void) | undefined;
   private resumeInline: (() => void) | undefined;
-  private registerInline: (() => void) | undefined;
+  private registerInline: (() => Promise<void> | void) | undefined;
   private inlineSuspended = false;
   private childConfirmed = false;
+  private readonly confirmationWaiters = new Set<(confirmed: boolean) => void>();
 
   constructor(
     private readonly workspaceId: string,
@@ -141,6 +142,7 @@ export class DesktopPopout {
     this.channel = null;
     updatePersistedState(this.storageKey, null);
     this.childConfirmed = false;
+    this.settleConfirmation(false);
     this.update("inline", error);
     // The inline viewer stays mounted while detached; reconnect it only if we suspended it
     // (a blocked popup never suspended, so its connection must not be restarted).
@@ -162,7 +164,55 @@ export class DesktopPopout {
    */
   private confirmChild() {
     this.childConfirmed = true;
-    if (this.inlineSuspended) this.registerInline?.();
+    if (this.inlineSuspended) void this.registerInline?.();
+    this.settleConfirmation(true);
+  }
+
+  private settleConfirmation(confirmed: boolean) {
+    const waiters = Array.from(this.confirmationWaiters);
+    this.confirmationWaiters.clear();
+    for (const waiter of waiters) waiter(confirmed);
+  }
+
+  /**
+   * A bare persisted hint is not proof of a live child: ask it to confirm itself and wait,
+   * bounded. A dead child never answers, so the hint is stale and must be rolled back rather
+   * than treated as a viewer to hand off from.
+   */
+  private awaitConfirmation(): Promise<boolean> {
+    if (this.childConfirmed) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.confirmationWaiters.delete(waiter);
+        resolve(false);
+      }, DESKTOP_POPOUT_READY_TIMEOUT_MS);
+      const waiter = (confirmed: boolean) => {
+        clearTimeout(timer);
+        resolve(confirmed);
+      };
+      this.confirmationWaiters.add(waiter);
+      this.send("ping");
+    });
+  }
+
+  /**
+   * Attach the inline pane and wait until the backend reports it ready, bounded. The child's
+   * close is definitive (it retracts its own attachment graces), so the inline lease must be
+   * live BEFORE the child is asked to close or an agent-driven archive could close the desktop
+   * in between. A lease that cannot be established (no API client, registration refused)
+   * leaves nothing to protect the pane with either way, so the handoff still proceeds.
+   */
+  private leaseInline(): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, DESKTOP_POPOUT_READY_TIMEOUT_MS);
+      Promise.resolve()
+        .then(() => this.registerInline?.())
+        .catch(() => undefined)
+        .finally(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+    });
   }
 
   /**
@@ -175,14 +225,14 @@ export class DesktopPopout {
     suspend: () => void,
     resume?: () => void,
     suspended = false,
-    register?: () => void
+    register?: () => Promise<void> | void
   ): () => void {
     this.suspendInline = suspend;
     this.resumeInline = resume;
     this.registerInline = register;
     if (suspended) {
       this.inlineSuspended = true;
-      if (this.childConfirmed) register?.();
+      if (this.childConfirmed) void register?.();
     }
     return () => {
       if (this.suspendInline === suspend) {
@@ -270,14 +320,23 @@ export class DesktopPopout {
     }
   }
 
-  bringBack() {
-    if (!this.instanceId) return;
+  async bringBack(): Promise<void> {
+    const instanceId = this.instanceId;
+    if (!instanceId) return;
     this.returning = true;
     this.grantPending = false;
-    // Attach the inline pane before a confirmed child disconnects so the desktop stays marked
-    // as in use through the handoff. An unconfirmed hint gets no lease: a dead child never
-    // answers, so nothing would ever release it.
-    if (this.childConfirmed) this.registerInline?.();
+    // Only a confirmed child is asked to close: an unconfirmed hint is pinged first, and a hint
+    // nobody answers is stale and rolled back (a dead child would never release a lease).
+    const confirmed = await this.awaitConfirmation();
+    if (this.instanceId !== instanceId) return;
+    if (!confirmed) {
+      this.restore();
+      return;
+    }
+    // Attach the inline pane and wait for its lease before the child disconnects so the desktop
+    // stays marked as in use through the handoff.
+    await this.leaseInline();
+    if (this.instanceId !== instanceId) return;
     this.send("bring-back");
   }
 
@@ -292,7 +351,7 @@ export class DesktopPopout {
         if (this.instanceId !== instanceId) finish(true);
       });
       const timer = setTimeout(() => finish(false), DESKTOP_POPOUT_READY_TIMEOUT_MS);
-      this.bringBack();
+      this.bringBack().catch(() => finish(false));
     });
   }
 
@@ -333,12 +392,16 @@ export class DesktopPopout {
         return;
       }
     } else {
-      this.bringBack();
       // A browser reload loses the Window handle, not the named popup. Reacquire it
-      // in this user gesture so a stale hint can be recovered without granting a
-      // second viewer while a live child is still releasing its inputs.
+      // in this user gesture (before any await) so a stale hint can be recovered without
+      // granting a second viewer while a live child is still releasing its inputs.
       this.popup ??= window.open("", `xum-desktop-${this.workspaceId}`, "popup");
       if (!this.popup) throw new Error("Allow popups to reconnect the desktop here.");
+      // Recovery closes the window whether or not the child answers, so lease the inline pane
+      // first: a live child's close is definitive and must not leave the desktop unattached.
+      await this.leaseInline();
+      if (this.instanceId !== instanceId) return;
+      this.send("bring-back");
       const request: DesktopPopoutCloseRequest = { instanceId: instanceId ?? "", handled: false };
       try {
         // Broadcast delivery can lose a race with window.close(). A responsive same-origin

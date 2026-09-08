@@ -566,8 +566,13 @@ describe("useDesktopConnection control ownership", () => {
 
   test("register attaches without bootstrapping and connect reuses the registration", async () => {
     const view = mountConnection();
-    act(() => view.desktop.register());
+    let ready: Promise<void> | undefined;
+    act(() => {
+      ready = view.desktop.register();
+    });
     await waitFor(() => expect(registrations).toHaveLength(1));
+    // Resolves once the backend reported the registration ready, so a handoff can wait for it.
+    await ready;
     expect(getBootstrap).not.toHaveBeenCalled();
     expect(view.desktop.state).toBe("idle");
     await connect(view);
@@ -678,6 +683,13 @@ describe("useDesktopConnection control ownership", () => {
     const view = mountConnection({ nativeWindowCleanup: true });
     await connect(view);
     expect(watchViewer).not.toHaveBeenCalled();
+    // It still names its bridge, and gives that name up when the window's cleanup disconnects,
+    // so the bridge's detachment grace is retracted like a registered pane's.
+    const call = getBootstrap.mock.calls[0]?.[0];
+    expect(typeof call?.viewerId).toBe("string");
+    expect(call?.viewerId?.length).toBeGreaterThan(0);
+    act(() => view.desktop.disconnect());
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: call?.viewerId });
   });
 
   test.each([

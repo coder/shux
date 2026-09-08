@@ -177,7 +177,7 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
   };
   const bringBack = () => {
     setActionError(null);
-    popout.bringBack();
+    popout.bringBack().catch(reportError);
   };
   const recover = () => {
     setActionError(null);

@@ -36,6 +36,11 @@ class TestChannel {
   }
 }
 
+/** Flush the microtask chain behind an awaited lease/confirmation without real timers. */
+async function settle() {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => {
@@ -215,8 +220,12 @@ describe("DesktopPopout handoff", () => {
     // The child's own ready message confirms it; bring-back re-asserts before the handoff.
     message("ready");
     expect(register).toHaveBeenCalledTimes(1);
-    popout.bringBack();
+    // The lease is awaited before the child is asked to close.
+    const returning = popout.bringBack();
+    expect(channel().sent.at(-1)).not.toEqual({ type: "bring-back", instanceId: instanceId() });
+    await returning;
     expect(register).toHaveBeenCalledTimes(2);
+    expect(channel().sent.at(-1)).toEqual({ type: "bring-back", instanceId: instanceId() });
     message("closed");
     expect(resume).toHaveBeenCalledTimes(1);
   });
@@ -229,11 +238,44 @@ describe("DesktopPopout handoff", () => {
     popout.attach(() => undefined, undefined, /* suspended */ true, register);
     await popout.reconcile(api);
     expect(channel().sent).toEqual([{ type: "ping", instanceId: "hinted-instance" }]);
-    // Bring back before confirmation must not lease: a dead child would never release it.
-    popout.bringBack();
+    // Bring back before confirmation must not lease or close: a dead child would never release
+    // a lease, so the child is pinged again and the handoff waits for its answer.
+    const returning = popout.bringBack();
+    await settle();
     expect(register).not.toHaveBeenCalled();
+    expect(channel().sent).toEqual([
+      { type: "ping", instanceId: "hinted-instance" },
+      { type: "ping", instanceId: "hinted-instance" },
+    ]);
     channel().receive({ type: "opened", instanceId: "hinted-instance" });
-    expect(register).toHaveBeenCalledTimes(1);
+    await returning;
+    // Confirmed: leased (confirmation and the awaited lease each register), then asked to close.
+    expect(register).toHaveBeenCalledTimes(2);
+    expect(channel().sent.at(-1)).toEqual({ type: "bring-back", instanceId: "hinted-instance" });
+    expect(popout.getSnapshot().state).toBe("detached");
+  });
+
+  test("a hint nobody answers is stale: bring-back rolls back inline without asking anything to close", async () => {
+    updatePersistedState(`desktop-popout:${workspaceId}`, "hinted-instance");
+    const popout = new DesktopPopout(workspaceId, false);
+    const register = mock(() => undefined);
+    const resume = mock(() => undefined);
+    popout.attach(() => undefined, resume, /* suspended */ true, register);
+    await popout.reconcile(api);
+    const returning = popout.bringBack();
+    await settle();
+    const confirmation = deadlines.at(-1);
+    assert(confirmation);
+    confirmation.run();
+    await returning;
+    expect(register).not.toHaveBeenCalled();
+    expect(
+      channel().sent.filter((sent) => (sent as { type: string }).type === "bring-back")
+    ).toEqual([]);
+    expect(popout.getSnapshot()).toEqual({ state: "inline", error: null });
+    expect(readPersistedState(`desktop-popout:${workspaceId}`, null)).toBeNull();
+    // The inline viewer that mounted detached now connects in place of the stale hint.
+    expect(resume).toHaveBeenCalledTimes(1);
   });
 
   test("a remount keeps the coordinator and only disconnects the current attachment", async () => {
@@ -274,7 +316,7 @@ describe("DesktopPopout handoff", () => {
     await popout.open(api);
     message("ready");
     message("opened");
-    popout.bringBack();
+    await popout.bringBack();
     expect(channel().sent.at(-1)).toEqual({ type: "bring-back", instanceId: instanceId() });
     expect(popout.getSnapshot().state).toBe("detached");
     message("closed");
@@ -320,6 +362,8 @@ describe("DesktopPopout handoff", () => {
       (event as CustomEvent<DesktopPopoutCloseRequest>).detail.handled = true;
     });
     const recovery = popout.recover(api);
+    // The inline lease is awaited before a possibly live child is asked to close.
+    await settle();
     expect(channel().sent).toEqual([
       { type: "ping", instanceId: "old-window" },
       { type: "bring-back", instanceId: "old-window" },
@@ -457,7 +501,7 @@ describe("DesktopPopout handoff", () => {
       Object.defineProperty(popup, "closed", { value: true });
     });
     deadline.run();
-    await Promise.resolve();
+    await settle();
     expect(close).toHaveBeenCalledTimes(1);
     expect(disconnect).not.toHaveBeenCalled();
     expect(popout.getSnapshot().state).toBe("inline");
@@ -508,7 +552,7 @@ describe("DesktopPopout handoff", () => {
     api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));
     await popout.reconcile(api);
     const recovering = popout.recover(api);
-    await Promise.resolve();
+    await settle();
     expect(channel().sent.at(-1)).toEqual({ type: "bring-back", instanceId: "existing" });
     expect(api.closeWindow).not.toHaveBeenCalled();
     expect(popout.getSnapshot().state).toBe("detached");
