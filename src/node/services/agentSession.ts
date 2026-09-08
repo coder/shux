@@ -2829,12 +2829,24 @@ export class AgentSession {
     let sentRowCount = 0;
     let emittedReplayMessages = false;
 
+    let stoppedReplayTail: { messageId: string; userMessageId: string } | undefined;
+
     // Self-healing: persisted rows can fail the current wire schema (older
     // writers, schema drift, corruption). oRPC validates every event yielded to
     // onChat subscribers and a single invalid row terminates the iterator,
     // which would permanently brick workspace fetch. Skip such rows instead of
     // letting one bad line take down the whole transcript.
     const emitReplayMessage = (message: WorkspaceChatMessage): boolean => {
+      if (
+        message.type === "message" &&
+        message.id === stoppedReplayTail?.messageId &&
+        !this.isBusy() &&
+        !this.isAiStreaming() &&
+        this.startupAutoRetryAbandon?.reason === "aborted" &&
+        this.startupAutoRetryAbandon.userMessageId === stoppedReplayTail.userMessageId
+      ) {
+        message = { ...message, metadata: { ...message.metadata, userStopped: true } };
+      }
       const validation = ChatMuxMessageSchema.safeParse(message);
       if (!validation.success) {
         const row = message as { id?: string; metadata?: { historySequence?: number } };
@@ -2953,6 +2965,29 @@ export class AgentSession {
 
       if (historyResult.success) {
         const history = historyResult.data;
+        if (!streamInfo && !this.isBusy()) {
+          // Stop already durably records this user-tail marker before acknowledgment.
+          // Project it instead of adding a second, fallible write to partial cleanup.
+          await this.loadAutoRetryState();
+          const marker = this.startupAutoRetryAbandon;
+          const user = this.findLastRetryUserMessage(history);
+          const last = history.at(-1);
+          const latest =
+            partial &&
+            partialHistorySequence != null &&
+            partialHistorySequence >= (last?.metadata?.historySequence ?? -1)
+              ? partial
+              : last;
+          if (
+            marker?.reason === "aborted" &&
+            marker.userMessageId != null &&
+            marker.userMessageId === user?.id &&
+            latest?.role === "assistant" &&
+            latest.metadata?.partial
+          ) {
+            stoppedReplayTail = { messageId: latest.id, userMessageId: marker.userMessageId };
+          }
+        }
         epochRowCount = history.length;
 
         // Cursor-based replay: only use incremental mode when all provided cursor segments are valid.

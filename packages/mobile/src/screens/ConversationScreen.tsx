@@ -145,7 +145,9 @@ export function ConversationScreen(props: {
   // Historical unanswered tools may have been abandoned by a later user turn.
   const answerMessage = running
     ? transcript.messages.find((message) => message.id === transcript.streamingMessageId)
-    : lastMessage?.role === "assistant" && lastMessage.metadata?.partial
+    : lastMessage?.role === "assistant" &&
+        lastMessage.metadata?.partial &&
+        !lastMessage.metadata.userStopped
       ? lastMessage
       : undefined;
   // The saved tool result survives remount/reconnect even when the answer RPC's
@@ -153,6 +155,7 @@ export function ConversationScreen(props: {
   const resumeTargetId =
     lastMessage?.role === "assistant" &&
     lastMessage.metadata?.partial &&
+    !lastMessage.metadata.userStopped &&
     (resumeMessageId === lastMessage.id ||
       lastMessage.parts.some(
         (part) =>
@@ -253,6 +256,7 @@ export function ConversationScreen(props: {
       signal.aborted ||
       current.streaming ||
       latest?.id !== messageId ||
+      latest?.metadata?.userStopped ||
       !latest.metadata?.partial
     )
       return;

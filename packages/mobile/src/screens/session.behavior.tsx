@@ -658,6 +658,50 @@ function answeredPartial(id = "question", partial = true) {
   };
 }
 
+test("answer recovery does not reappear after an intentional Stop and reconnect", async () => {
+  const messages: WorkspaceChatMessage[] = [question()];
+  const view = fixture(messages);
+  await view.select("alpha");
+  view.setAnswer(async () => {
+    messages[0] = answeredPartial();
+    view.chats.at(-1)!.events.enqueue(answered());
+    return { success: true };
+  });
+  await submitAnswer(view);
+  expect(callCount(view, "resumeStream")).toBe(1);
+  await view.emit({
+    type: "stream-start",
+    workspaceId: "alpha",
+    messageId: "question",
+    historySequence: 1,
+    startTime: 1,
+    model,
+  });
+  await view.emit(messages[0]);
+  view.setInterrupt(async () => {
+    const stopped = answeredPartial();
+    // The server projects its durable Stop marker when the conversation reconnects.
+    messages[0] = { ...stopped, metadata: { ...stopped.metadata, userStopped: true } };
+    view.chats.at(-1)!.events.enqueue({
+      type: "stream-abort",
+      workspaceId: "alpha",
+      messageId: "question",
+      abortReason: "user",
+      metadata: { duration: 1 },
+    });
+    return { success: true };
+  });
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Interrupt agent" })));
+  expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+  expect(view.queryByRole("button", { name: "Send answers" })).toBeNull();
+  await act(async () => view.chats.at(-1)!.end());
+  await act(async () => fireEvent.click(view.getByRole("button", { name: "Retry" })));
+  await waitFor(() => expect(view.chats).toHaveLength(2));
+  expect(view.queryByRole("button", { name: "Resume agent" })).toBeNull();
+  expect(callCount(view, "resumeStream")).toBe(1);
+  expect(callCount(view, "answerAskUserQuestion")).toBe(1);
+});
+
 test("replayed saved answers offer manual resume, preserve no-op/error retries, and suppress duplicate starts until reconnect", async () => {
   const saved = answeredPartial();
   const view = fixture([saved]);

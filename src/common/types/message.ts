@@ -983,6 +983,8 @@ export interface MuxMetadata {
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
+  /** Replay projection of the server's durable user Stop intent for this partial turn. */
+  userStopped?: true;
   partial?: boolean; // Whether this message was interrupted and is incomplete
   synthetic?: boolean; // Whether this message was synthetically generated (e.g., [CONTINUE] sentinel)
   /**

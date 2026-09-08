@@ -205,6 +205,7 @@ export const MuxMessageSchema = z.object({
       disableWorkspaceAgents: z.boolean().optional(),
       retrySendOptions: z.any().optional(),
       agentId: AgentIdSchema.optional().catch(undefined),
+      userStopped: z.literal(true).optional().catch(undefined),
       partial: z.boolean().optional(),
       synthetic: z.boolean().optional(),
       uiVisible: z.boolean().optional(),

@@ -50,6 +50,27 @@ const toolEnd: Extract<WorkspaceChatMessage, { type: "tool-call-end" }> = {
 };
 
 describe("mobile transcript", () => {
+  test.each(["user", "system", "startup"] as const)(
+    "records %s abort intent without suppressing involuntary recovery",
+    (abortReason) => {
+      const stopped = replay(start, delta("partial"), {
+        type: "stream-abort",
+        workspaceId: "w",
+        messageId: "a",
+        abortReason,
+      });
+      expect(stopped.messages[0].metadata?.userStopped).toBe(
+        abortReason === "user" ? true : undefined
+      );
+      const replayed = replay({ ...stopped.messages[0], type: "message" });
+      expect(replayed.messages[0].metadata?.userStopped).toBe(
+        stopped.messages[0].metadata?.userStopped
+      );
+      const resumed = applyChatEvent(stopped, start);
+      expect(resumed.messages[0].metadata?.userStopped).toBeUndefined();
+    }
+  );
+
   test("replaces authoritative snapshots by ID and sorts by server sequence", () => {
     const state = replay(row("b", 3, "later"), row("u", 1, "old"), row("u", 1, "edited"), {
       type: "caught-up",

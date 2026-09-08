@@ -250,7 +250,12 @@ export function applyChatEvent(
         ? { ...state, messages: state.messages.filter((message) => message.id !== event.messageId) }
         : updateMessage(state, event.messageId, (message) => ({
             ...message,
-            metadata: { ...message.metadata, ...event.metadata, partial: true },
+            metadata: {
+              ...message.metadata,
+              ...event.metadata,
+              partial: true,
+              ...(event.abortReason === "user" ? { userStopped: true as const } : {}),
+            },
           }));
       return finish(next, event.messageId);
     }
