@@ -184,6 +184,36 @@ describe("DesktopPopout handoff", () => {
     expect(popout.getSnapshot().state).toBe("detached");
   });
 
+  test("restore resumes the inline viewer only when the handoff suspended it", async () => {
+    const popout = new DesktopPopout(workspaceId, false);
+    const suspend = mock(() => undefined);
+    const resume = mock(() => undefined);
+    popout.attach(suspend, resume);
+    // A blocked popup never suspended the inline viewer, so restoring must not restart it.
+    spyOn(window, "open").mockReturnValueOnce(null);
+    await popout.open(api);
+    expect(popout.getSnapshot().state).toBe("inline");
+    expect(resume).not.toHaveBeenCalled();
+    // A real handoff suspends on ready and resumes once the popout reports closed.
+    await popout.open(api);
+    message("ready");
+    expect(suspend).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+    message("closed");
+    expect(popout.getSnapshot().state).toBe("inline");
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
+  test("an inline viewer mounted while detached is resumed on restore", async () => {
+    const popout = new DesktopPopout(workspaceId, false);
+    const resume = mock(() => undefined);
+    popout.attach(() => undefined, resume, /* suspended */ true);
+    await popout.open(api);
+    message("ready");
+    message("closed");
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
   test("a remount keeps the coordinator and only disconnects the current attachment", async () => {
     const popout = getDesktopPopout(workspaceId);
     const focus = spyOn(popup, "focus");

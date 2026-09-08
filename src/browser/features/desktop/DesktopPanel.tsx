@@ -89,18 +89,25 @@ export function DesktopViewer(props: {
   workspaceId: string;
   onDetach?: () => void;
   onBringBack?: () => void;
-  attach?: (disconnect: () => void, disconnectAndWait: () => Promise<void>) => () => void;
+  attach?: (desktop: UseDesktopConnectionResult) => () => void;
   onStartupError?: () => void;
   /** See UseDesktopConnectionOptions.nativeWindowCleanup. */
   nativeWindowCleanup?: boolean;
+  /**
+   * Mounted while the desktop is shown in a popout: register as an attached viewer but do not
+   * connect; the popout coordinator resumes the connection when the desktop comes back.
+   */
+  suspended?: boolean;
+  hidden?: boolean;
 }) {
   const desktop = useDesktopConnection(props.workspaceId, {
     nativeWindowCleanup: props.nativeWindowCleanup,
   });
 
   useEffect(() => {
-    const detach = props.attach?.(desktop.disconnect, desktop.disconnectAndWait);
-    desktop.connect();
+    const detach = props.attach?.(desktop);
+    if (props.suspended) desktop.register();
+    else desktop.connect();
     return detach;
     // disconnect handled by hook's own cleanup
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -112,7 +119,10 @@ export function DesktopViewer(props: {
   }, [desktop.state, onStartupError]);
 
   return (
-    <div className="bg-background @container flex h-full min-h-0 min-w-0 flex-col">
+    <div
+      className="bg-background @container flex h-full min-h-0 min-w-0 flex-col"
+      hidden={props.hidden}
+    >
       {desktop.sharedDesktop && (
         <div className="text-muted-foreground border-border shrink-0 truncate border-b px-3 py-1.5 text-xs">
           Shared desktop · {desktop.sharedDesktop.ownerName}
@@ -181,13 +191,20 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
           {snapshot.error ?? actionError}
         </p>
       ) : null}
-      {inline ? (
+      {/* The viewer stays mounted (hidden) while detached so its viewer registration keeps the
+          pane attached across the inline↔popout handoff; otherwise nothing would mark the
+          desktop as in use between the source disconnecting and the destination registering,
+          and an agent-driven archive could close it mid-handoff. */}
+      {snapshot.state !== "checking" ? (
         <DesktopViewer
           workspaceId={props.workspaceId}
-          attach={(disconnect) => popout.attach(disconnect)}
+          attach={(desktop) => popout.attach(desktop.suspend, desktop.connect, !inline)}
           onDetach={detach}
+          suspended={!inline}
+          hidden={!inline}
         />
-      ) : (
+      ) : null}
+      {inline ? null : (
         <div
           className="text-muted-foreground flex h-full flex-col items-center justify-center gap-3 p-4 text-center"
           onKeyDown={(event) => {

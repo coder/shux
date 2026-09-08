@@ -9,6 +9,7 @@ import {
   mock,
   spyOn,
   test,
+  type Mock,
 } from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
@@ -66,7 +67,9 @@ describe("useDesktopConnection control ownership", () => {
     bridgePath: "/desktop/ws",
     token: "test-token",
   };
-  let getBootstrap = mock(() => Promise.resolve(bootstrap));
+  let getBootstrap: Mock<APIClient["desktop"]["getBootstrap"]> = mock(() =>
+    Promise.resolve(bootstrap)
+  );
 
   const watchViewer = mock<APIClient["desktop"]["watchViewer"]>();
   const acknowledgeViewerRelease = mock<APIClient["desktop"]["acknowledgeViewerRelease"]>();
@@ -533,6 +536,50 @@ describe("useDesktopConnection control ownership", () => {
     await waitFor(() => expect(view.desktop.state).toBe("connected"), { timeout: 10_000 });
     expect(watchViewer).toHaveBeenCalledTimes(1);
     expect(registration.signal.aborted).toBe(false);
+  });
+
+  test("suspend keeps the ready registration and a later connect reuses it", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    const registration = registrations[0];
+    act(() => view.desktop.suspend());
+    expect(view.desktop.state).toBe("idle");
+    expect(rfb.disconnectCount).toBe(1);
+    // Suspended (desktop shown in a popout): the pane stays attached...
+    expect(registration.signal.aborted).toBe(false);
+    // ...and still honors a release while suspended.
+    await connect(view);
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+    expect(DesktopRfbFixture.instances).toHaveLength(2);
+    act(() => view.desktop.suspend());
+    registration.queue.push({ type: "release", viewerId: registration.viewerId });
+    await waitFor(() =>
+      expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: registration.viewerId })
+    );
+    await waitFor(() => expect(registration.signal.aborted).toBe(true));
+    act(() => view.desktop.connect());
+    expect(getBootstrap).toHaveBeenCalledTimes(2);
+  });
+
+  test("register attaches without bootstrapping and connect reuses the registration", async () => {
+    const view = mountConnection();
+    act(() => view.desktop.register());
+    await waitFor(() => expect(registrations).toHaveLength(1));
+    expect(getBootstrap).not.toHaveBeenCalled();
+    expect(view.desktop.state).toBe("idle");
+    await connect(view);
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+  });
+
+  test("a terminal unavailable bootstrap unregisters the viewer", async () => {
+    getBootstrap.mockImplementationOnce(() =>
+      Promise.resolve({ ...bootstrap, capability: { available: false, reason: "disabled" } })
+    );
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
+    expect(registrations).toHaveLength(1);
+    expect(registrations[0].signal.aborted).toBe(true);
   });
 
   test("normal unmount unregisters after releasing held input", async () => {

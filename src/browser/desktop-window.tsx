@@ -98,9 +98,9 @@ function DesktopWindow(props: { workspaceId: string; instanceId: string }) {
     <DesktopViewer
       workspaceId={props.workspaceId}
       nativeWindowCleanup
-      attach={(disconnect, disconnectAndWait) => {
-        disconnectNowRef.current = disconnect;
-        disconnectRef.current = disconnectAndWait;
+      attach={(desktop) => {
+        disconnectNowRef.current = desktop.disconnect;
+        disconnectRef.current = desktop.disconnectAndWait;
         return () => {
           disconnectRef.current = null;
           disconnectNowRef.current = null;

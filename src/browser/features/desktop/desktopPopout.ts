@@ -58,6 +58,8 @@ export class DesktopPopout {
   private deadline: ReturnType<typeof setTimeout> | undefined;
   private closeTimer: number | undefined;
   private suspendInline: (() => void) | undefined;
+  private resumeInline: (() => void) | undefined;
+  private inlineSuspended = false;
 
   constructor(
     private readonly workspaceId: string,
@@ -94,7 +96,7 @@ export class DesktopPopout {
           this.grantPending = false;
           if (this.snapshot.state === "opening") {
             // Flush human input and close the inline socket before the child can start VNC.
-            this.suspendInline?.();
+            this.suspend();
             updatePersistedState(this.storageKey, this.instanceId);
             this.update("detached");
           }
@@ -132,12 +134,29 @@ export class DesktopPopout {
     this.channel = null;
     updatePersistedState(this.storageKey, null);
     this.update("inline", error);
+    // The inline viewer stays mounted while detached; reconnect it only if we suspended it
+    // (a blocked popup never suspended, so its connection must not be restarted).
+    if (this.inlineSuspended) {
+      this.inlineSuspended = false;
+      this.resumeInline?.();
+    }
   }
 
-  attach(suspend: () => void): () => void {
+  private suspend() {
+    this.suspendInline?.();
+    this.inlineSuspended = true;
+  }
+
+  /** `suspended` marks an inline viewer that mounted while the desktop was already detached. */
+  attach(suspend: () => void, resume?: () => void, suspended = false): () => void {
     this.suspendInline = suspend;
+    this.resumeInline = resume;
+    if (suspended) this.inlineSuspended = true;
     return () => {
-      if (this.suspendInline === suspend) this.suspendInline = undefined;
+      if (this.suspendInline === suspend) {
+        this.suspendInline = undefined;
+        this.resumeInline = undefined;
+      }
     };
   }
 
@@ -150,7 +169,7 @@ export class DesktopPopout {
         if (snapshot !== this.snapshot || snapshot.state === "opening") return;
         if (current) {
           if (this.returning) return;
-          this.suspendInline?.();
+          this.suspend();
           this.instanceId = current.instanceId;
           this.listen();
           // A reloaded parent may have missed ready. Manager truth, unlike a browser
@@ -192,7 +211,7 @@ export class DesktopPopout {
         const opened = await api.openWindow({ workspaceId: this.workspaceId, instanceId });
         if (this.instanceId !== instanceId) return;
         if (opened.instanceId !== instanceId) {
-          this.suspendInline?.();
+          this.suspend();
           clearTimeout(this.deadline);
           this.instanceId = opened.instanceId;
           this.update("detached");

@@ -24,6 +24,14 @@ export interface UseDesktopConnectionResult {
   connect: () => void;
   disconnect: () => void;
   disconnectAndWait: () => Promise<void>;
+  /**
+   * Close the RFB connection and stop reconnecting, but keep the viewer registration: used by
+   * the inline pane while its desktop is shown in a popout, so the pane stays attached (the
+   * backend keeps refusing agent-driven archives) across the handoff and the detached period.
+   */
+  suspend: () => void;
+  /** Register as a viewer without connecting (a pane mounted while its desktop is detached). */
+  register: () => void;
   controlling: boolean;
   setControlling: (value: boolean) => void;
   scaleToFit: boolean;
@@ -269,6 +277,33 @@ export function useDesktopConnection(
     setReason(null);
   };
 
+  const suspend = () => {
+    // Bumping the generation retires in-flight attempts and reconnect timers without disposing
+    // the hook, so the registration loop keeps delivering a release while suspended.
+    generationRef.current += 1;
+    clearReconnectTimer();
+    disconnectCurrentRfb({ keepViewerRegistration: viewerReadyRef.current });
+    setState("idle");
+    setReason(null);
+  };
+
+  const register = () => {
+    const client = apiRef.current;
+    if (
+      !registerViewer ||
+      viewerReleasedRef.current ||
+      viewerRegistrationRef.current !== null ||
+      !client
+    ) {
+      return;
+    }
+    registerViewerRegistration(client).catch(() => {
+      if (!isDisposedRef.current && viewerRegistrationRef.current === null) {
+        scheduleViewerReregistration();
+      }
+    });
+  };
+
   /**
    * Register this pane as a desktop viewer and resolve once the backend reports ready. The
    * subscription keeps running afterwards to receive the cooperative release; it is scoped to
@@ -374,14 +409,18 @@ export function useDesktopConnection(
     reregisterAttemptRef.current += 1;
     reregisterTimerRef.current = setTimeout(() => {
       reregisterTimerRef.current = null;
-      const client = apiRef.current;
       // A connection attempt started meanwhile registers on its own; do not race it.
       if (
         isDisposedRef.current ||
         viewerReleasedRef.current ||
-        viewerRegistrationRef.current !== null ||
-        !client
+        viewerRegistrationRef.current !== null
       ) {
+        return;
+      }
+      const client = apiRef.current;
+      if (!client) {
+        // The API provider publishes null while it reconnects; keep retrying until it returns.
+        scheduleViewerReregistration();
         return;
       }
       registerViewerRegistration(client).catch(() => {
@@ -452,6 +491,8 @@ export function useDesktopConnection(
             scheduleReconnectRef.current();
             return;
           }
+          // Terminal: nothing to view, so stop counting this pane as an attached viewer.
+          disconnectCurrentRfb();
           setState("unavailable");
           setReason(UNAVAILABLE_REASONS[result.capability.reason]);
           return;
@@ -595,6 +636,8 @@ export function useDesktopConnection(
     connect: connectHandleRef.current,
     disconnect: disconnectHandleRef.current,
     disconnectAndWait,
+    suspend,
+    register,
     controlling,
     setControlling,
     scaleToFit,
