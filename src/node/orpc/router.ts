@@ -2121,7 +2121,9 @@ export const router = (authToken?: string) => {
       getBootstrap: t
         .input(schemas.desktop.getBootstrap.input)
         .output(schemas.desktop.getBootstrap.output)
-        .handler(({ context, input }) => getDesktopBootstrap(context, input.workspaceId)),
+        .handler(({ context, input }) =>
+          getDesktopBootstrap(context, input.workspaceId, input.viewerId ?? null)
+        ),
     },
     update: {
       check: t

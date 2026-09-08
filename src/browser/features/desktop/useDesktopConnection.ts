@@ -197,12 +197,11 @@ export function useDesktopConnection(
   // attachment grace on the backend that only a definitive outcome of this pane can retract.
   const supersededViewerIdsRef = useRef<string[]>([]);
 
-  // A terminal outcome gives the registration up definitively: tell the backend before the
-  // abort so the detachment leaves no attachment grace (nothing will reconnect), then tear down.
-  // The superseded registrations are reported too: their graces would otherwise keep a pane that
-  // shows nothing "attached" for the whole grace after it settled.
-  const settleTerminal = () => {
-    terminalRef.current = true;
+  // Giving the registration up (terminal outcome, explicit disconnect, unmount) is definitive:
+  // this pane will not reconnect, so tell the backend before the abort and the bridge close so
+  // neither detachment leaves an attachment grace that keeps a pane showing nothing "attached".
+  // The superseded registrations are reported too, for the graces they left.
+  const detachViewerDefinitively = () => {
     const client = apiRef.current;
     const viewerId = viewerIdRef.current;
     const viewerIds =
@@ -214,6 +213,10 @@ export function useDesktopConnection(
     for (const id of viewerIds) {
       void client.desktop.detachViewer({ viewerId: id }).catch(() => undefined);
     }
+  };
+
+  const settleTerminal = () => {
+    terminalRef.current = true;
   };
 
   const connectImplRef = useRef<() => void>(() => undefined);
@@ -262,6 +265,7 @@ export function useDesktopConnection(
     const registration = keepRegistration ? null : viewerRegistrationRef.current;
     if (!keepRegistration) {
       clearReregisterTimer();
+      detachViewerDefinitively();
       viewerRegistrationRef.current = null;
       viewerReadyRef.current = false;
       viewerIdRef.current = null;
@@ -529,7 +533,11 @@ export function useDesktopConnection(
 
         // Shared-target metadata is display-only: the caller's bootstrap/token preserves the
         // backend's authorization and binding checks; never bootstrap the owner directly.
-        const result = await api.desktop.getBootstrap({ workspaceId });
+        // The registration is named so the bridge this bootstrap opens is attributed to it.
+        const result = await api.desktop.getBootstrap({
+          workspaceId,
+          viewerId: viewerIdRef.current,
+        });
         if (generationRef.current !== generation || isDisposedRef.current) {
           return;
         }
@@ -543,8 +551,8 @@ export function useDesktopConnection(
             scheduleReconnectRef.current();
             return;
           }
-          // Terminal: nothing to view, so stop counting this pane as an attached viewer (and
-          // keep any in-flight re-registration from attaching it again).
+          // Terminal: nothing to view, so give the registration up (disconnectCurrentRfb detaches
+          // it definitively) and keep any in-flight re-registration from attaching it again.
           settleTerminal();
           disconnectCurrentRfb();
           setState("unavailable");

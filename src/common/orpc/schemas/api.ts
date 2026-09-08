@@ -3251,8 +3251,12 @@ export const desktop = {
     input: z.object({ workspaceId: z.string() }),
     output: DesktopCapabilitySchema,
   },
+  /**
+   * `viewerId` is the pane's ready viewer registration (see watchViewer): the bridge opened with
+   * this bootstrap is attributed to it, so detachViewer can retract that bridge's grace too.
+   */
   getBootstrap: {
-    input: z.object({ workspaceId: z.string() }),
+    input: z.object({ workspaceId: z.string(), viewerId: z.string().min(1).nullish() }),
     output: z.object({
       capability: DesktopCapabilitySchema,
       bridgePath: z.string().optional(),

@@ -11,7 +11,11 @@ interface DesktopContext {
   serverService: Pick<ORPCContext["serverService"], "getServerInfo">;
 }
 
-export async function getDesktopBootstrap(context: DesktopContext, workspaceId: string) {
+export async function getDesktopBootstrap(
+  context: DesktopContext,
+  workspaceId: string,
+  viewerId: string | null = null
+) {
   const capability = await context.desktopSessionManager.getCapability(workspaceId);
   if (!capability.available) return { capability };
   const serverInfo = context.serverService.getServerInfo();
@@ -36,7 +40,9 @@ export async function getDesktopBootstrap(context: DesktopContext, workspaceId: 
     return {
       capability: startedCapability,
       bridgePath: DESKTOP_WS_PATH,
-      token: context.desktopTokenManager.mint(workspaceId, startedCapability.sessionId),
+      // Bound to the pane's viewer registration so the bridge's later detachment is attributed
+      // to that registration (see DesktopSessionManager.detachViewer).
+      token: context.desktopTokenManager.mint(workspaceId, startedCapability.sessionId, viewerId),
       localBridgeBaseUrl: serverInfo.baseUrl,
     };
   } catch (error) {

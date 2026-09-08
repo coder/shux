@@ -150,8 +150,13 @@ describe("DesktopPanel binding", () => {
   test("shows bootstrap binding while connecting with the caller's bridge and token", async () => {
     const view = render(<DesktopPanel workspaceId="caller" />);
     const viewer = await connectedViewer();
-    expect(getBootstrap).toHaveBeenCalledWith({ workspaceId: "caller" });
-    expect(getBootstrap).not.toHaveBeenCalledWith({ workspaceId: "owner" });
+    expect(getBootstrap).toHaveBeenCalledWith({
+      workspaceId: "caller",
+      viewerId: "desktop-fixture",
+    });
+    expect(getBootstrap).not.toHaveBeenCalledWith(
+      expect.objectContaining({ workspaceId: "owner" })
+    );
     expect(viewer.url).toBe("ws://localhost/desktop/ws/caller?token=caller-token");
     expect(view.getByText(/Original desktop/)).toBeTruthy();
   });
@@ -201,7 +206,10 @@ describe("DesktopPanel binding", () => {
     expect(view.queryByText(/Original desktop/)).toBeNull();
     expect(previousViewer.disconnected).toBe(true);
     await waitFor(() => expect(FakeRfb.instances).toHaveLength(2));
-    expect(getBootstrap).toHaveBeenLastCalledWith({ workspaceId: "isolated" });
+    expect(getBootstrap).toHaveBeenLastCalledWith({
+      workspaceId: "isolated",
+      viewerId: "desktop-fixture",
+    });
     expect(FakeRfb.instances[1].url).toBe(
       "ws://localhost/desktop/ws/isolated?token=isolated-token"
     );
@@ -214,7 +222,12 @@ describe("DesktopPanel binding", () => {
     const view = render(<DesktopPanel workspaceId="caller" />);
     // Bootstrap follows the viewer registration, so wait for the caller's request to be in
     // flight before switching workspaces underneath it.
-    await waitFor(() => expect(getBootstrap).toHaveBeenCalledWith({ workspaceId: "caller" }));
+    await waitFor(() =>
+      expect(getBootstrap).toHaveBeenCalledWith({
+        workspaceId: "caller",
+        viewerId: "desktop-fixture",
+      })
+    );
     getBootstrap.mockResolvedValue({ ...sharedBootstrap, capability: ownCapability });
     view.rerender(<DesktopPanel workspaceId="isolated" />);
     await connectedViewer();
@@ -224,6 +237,9 @@ describe("DesktopPanel binding", () => {
     });
     expect(FakeRfb.instances).toHaveLength(1);
     expect(view.queryByText(/Original desktop/)).toBeNull();
-    expect(getBootstrap).toHaveBeenLastCalledWith({ workspaceId: "isolated" });
+    expect(getBootstrap).toHaveBeenLastCalledWith({
+      workspaceId: "isolated",
+      viewerId: "desktop-fixture",
+    });
   });
 });

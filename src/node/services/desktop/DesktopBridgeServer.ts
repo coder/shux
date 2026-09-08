@@ -19,6 +19,8 @@ interface BridgePair {
   tcp: net.Socket | null;
   requesterWorkspaceId: string;
   ownerWorkspaceId: string;
+  /** The requesting pane's viewer registration, when it bootstrapped with one. */
+  viewerId: string | null;
   sessionId: string;
   vncPort: number;
   connectAbort: AbortController;
@@ -257,6 +259,7 @@ export class DesktopBridgeServer {
       tcp: null,
       requesterWorkspaceId: payload.workspaceId,
       ownerWorkspaceId: liveSession.ownerWorkspaceId,
+      viewerId: payload.viewerId,
       sessionId: liveSession.sessionId,
       vncPort: liveSession.vncPort,
       connectAbort: new AbortController(),
@@ -544,9 +547,14 @@ export class DesktopBridgeServer {
     // An established bridge was a known attachment: let the manager's archive gate keep the
     // requester and owner attached for the bounded grace while the client reconnects or hands
     // off. A pair that never reached VNC (admission/TCP/revalidation failure) never showed a
-    // desktop, so its loss is not evidence of a viewer.
+    // desktop, so its loss is not evidence of a viewer. Attributed to the pane's viewer
+    // registration so a pane that gives that registration up definitively retracts this too.
     if (pair.tcp !== null) {
-      this.desktopSessionManager.noteDetached?.(pair.requesterWorkspaceId, pair.ownerWorkspaceId);
+      this.desktopSessionManager.noteDetached?.(
+        pair.requesterWorkspaceId,
+        pair.ownerWorkspaceId,
+        pair.viewerId ?? undefined
+      );
     }
     if (this.activePairs.size === 0) {
       const stopConfigWatch = this.stopConfigWatch;

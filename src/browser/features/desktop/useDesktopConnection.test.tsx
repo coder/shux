@@ -631,6 +631,32 @@ describe("useDesktopConnection control ownership", () => {
     expect(registrations).toHaveLength(1);
   });
 
+  test("bootstrap names the ready registration so the bridge is attributed to it", async () => {
+    const view = mountConnection();
+    await connect(view);
+    expect(getBootstrap).toHaveBeenCalledWith({
+      workspaceId: "workspace-1",
+      viewerId: registrations[0].viewerId,
+    });
+  });
+
+  test("an explicit disconnect gives the registration up definitively before aborting it", async () => {
+    const view = mountConnection();
+    await connect(view);
+    const registration = registrations[0];
+    const abortedAtDetach: boolean[] = [];
+    detachViewer.mockImplementationOnce(() => {
+      abortedAtDetach.push(registration.signal.aborted);
+      return Promise.resolve();
+    });
+    act(() => view.desktop.disconnect());
+    // The pane will not reconnect: the backend learns that before the abort and the bridge
+    // close can stamp attachment graces.
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registration.viewerId });
+    expect(abortedAtDetach).toEqual([false]);
+    await waitFor(() => expect(registration.signal.aborted).toBe(true));
+  });
+
   test("normal unmount unregisters after releasing held input", async () => {
     const view = mountConnection();
     const rfb = await connect(view);
