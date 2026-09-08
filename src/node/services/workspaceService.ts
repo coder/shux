@@ -2264,6 +2264,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   // re-wake a stopped Coder workspace). See acquirePreflightAdmission.
   private readonly preflightStagingCounts = new Map<string, number>();
   private readonly preflightFileCompletionCounts = new Map<string, number>();
+  // Same pairing for renderer MCP prompt discovery (workspace.mcp.prompts.list): it readies the
+  // runtime (which can re-wake a stopped Coder workspace) and starts cached stdio servers inside
+  // the checkout. See acquireMcpPromptDiscoveryAdmission.
+  private readonly preflightMcpPromptDiscoveryCounts = new Map<string, number>();
   /**
    * In-flight forks counted per SOURCE workspace. A fork clones the source checkout and (for
    * SSH/Coder runtimes) shares its remote workspace, so a model-driven archive admitted
@@ -3397,6 +3401,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
     // Archiving hides workspace UI; do not leave terminal PTYs running headless.
     this.terminalService?.closeWorkspaceSessions(workspaceId);
+
+    // Cached MCP servers outlive the stream that started them, and stdio ones run inside the
+    // checkout a snapshot archive is about to delete. Removal-style stop (no
+    // retainRestartOptions): its stop-epoch bump makes a startup already in flight close its late
+    // clients instead of publishing them; servers restart lazily on the first MCP use after
+    // unarchive.
+    await this.mcpServerManager?.stopServers(workspaceId);
   }
 
   /**
@@ -8506,6 +8517,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
       activityLabels.push("a fork of this workspace in progress");
     }
+    if ((this.preflightMcpPromptDiscoveryCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("an MCP prompt discovery in progress");
+    }
     // In-flight native-terminal/editor opens passed their own archive guards before this
     // hold armed and surface only through the pending-open counters until their durable
     // markers persist; the sink's untrackable-app check would refuse on them after the
@@ -8616,6 +8630,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
           activityLabels.push("a fork of this workspace in progress");
+        }
+        if ((this.preflightMcpPromptDiscoveryCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("an MCP prompt discovery in progress");
         }
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
         if (liveActivity.backgroundBashProcesses) {
@@ -10778,6 +10795,30 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
       },
     };
+  }
+
+  /**
+   * Archive admission pairing for MCP prompt discovery (workspace.mcp.prompts.list), which
+   * readies the runtime and starts cached stdio servers outside any stream. The guard check and
+   * the counter increment run in one synchronous block, mirroring executeBash: a discovery
+   * admitted first holds the archive gate open until the caller disposes the admission, and one
+   * entering after the gate armed (or against an archived workspace) is refused with undefined.
+   */
+  acquireMcpPromptDiscoveryAdmission(workspaceId: string): Disposable | undefined {
+    if (this.archivingWorkspaces.has(workspaceId)) {
+      return undefined;
+    }
+    const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (
+      workspaceEntry != null &&
+      isWorkspaceArchived(
+        workspaceEntry.workspace.archivedAt,
+        workspaceEntry.workspace.unarchivedAt
+      )
+    ) {
+      return undefined;
+    }
+    return this.acquirePreflightAdmission(this.preflightMcpPromptDiscoveryCounts, workspaceId);
   }
 
   async stageAttachment(input: {

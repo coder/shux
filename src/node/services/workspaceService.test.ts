@@ -58,6 +58,7 @@ import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
 import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
@@ -15443,6 +15444,20 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       expect(refused.error).toContain("workflow run");
     }
 
+    // MCP prompt discovery admitted before the hold pairs the same way: its counter refuses
+    // the hold before any delegated turn is interrupted.
+    const discovery = workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId);
+    expect(discovery).toBeDefined();
+    const refusedByDiscovery = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [],
+    });
+    expect(refusedByDiscovery.success).toBe(false);
+    if (!refusedByDiscovery.success) {
+      expect(refusedByDiscovery.error).toContain("MCP prompt discovery in progress");
+    }
+    discovery![Symbol.dispose]();
+
     // In-flight editor/terminal opens are visible only through the pending-open counters
     // until their durable markers persist; the hold must refuse on them before the caller
     // interrupts anything (the sink's untrackable-app check would refuse only afterwards).
@@ -15475,6 +15490,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       if (!refusedOpen.success) {
         expect(refusedOpen.error).toContain("being archived");
       }
+      expect(workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId)).toBeUndefined();
     } finally {
       hold.data[Symbol.dispose]();
     }
@@ -16353,6 +16369,102 @@ describe("WorkspaceService archive snapshots", () => {
     });
   });
 
+  test("archive() stops cached MCP servers before snapshot capture", async () => {
+    const order: string[] = [];
+    const stopServers = mock(
+      (_workspaceId: string, _options?: { retainRestartOptions?: boolean }) => {
+        order.push("stop-mcp");
+        return Promise.resolve();
+      }
+    );
+    workspaceService.setMCPServerManager({ stopServers } as unknown as MCPServerManager);
+    const snapshot = {
+      version: 1 as const,
+      capturedAt: "2026-03-30T00:00:00.000Z",
+      stateDirPath: "archive-state",
+      projects: [],
+    };
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => {
+        order.push("capture");
+        return Promise.resolve(Ok(snapshot));
+      }),
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result).toEqual(Ok({ kind: "archived" }));
+    // Removal-style stop (no retainRestartOptions) so its stop epoch retires in-flight startups.
+    expect(stopServers).toHaveBeenCalledWith(workspaceId);
+    expect(order).toEqual(["stop-mcp", "capture"]);
+  });
+
+  test("in-flight MCP prompt discovery holds the model-facing archive gate until released", async () => {
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+
+    const admission = workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId);
+    expect(admission).toBeDefined();
+
+    const refused = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error).toContain("an MCP prompt discovery in progress");
+    }
+    expect(configState.projects.get(projectPath)?.workspaces[0]?.archivedAt).toBeUndefined();
+
+    admission![Symbol.dispose]();
+
+    const afterRelease = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+    if (!afterRelease.success) {
+      expect(afterRelease.error).not.toContain("MCP prompt discovery");
+    }
+  });
+
+  test("acquireMcpPromptDiscoveryAdmission refuses archiving and archived workspaces", () => {
+    addToArchivingWorkspaces(workspaceService, workspaceId);
+    expect(workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId)).toBeUndefined();
+
+    // Discovery on an archived workspace would re-wake its runtime; refuse it durably too.
+    const archivedService = createWorkspaceServiceForTest({
+      config: {
+        srcDir: "/tmp/src",
+        sessionsDir: "/tmp/test/sessions",
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([
+            [
+              projectPath,
+              {
+                workspaces: [
+                  {
+                    path: workspacePath,
+                    id: workspaceId,
+                    name: "ws-archive-snapshot",
+                    archivedAt: "2026-01-01T00:00:00.000Z",
+                  },
+                ],
+              },
+            ],
+          ]),
+        })),
+      } as unknown as Config,
+      historyService,
+    });
+    expect(archivedService.acquireMcpPromptDiscoveryAdmission(workspaceId)).toBeUndefined();
+    expect(archivedService.acquireMcpPromptDiscoveryAdmission("ws-other")).toBeDefined();
+  });
+
   test("archive() does not close live sessions when archive readiness checks fail", async () => {
     const closeWorkspaceSessions = mock(() => undefined);
     workspaceService.setTerminalService({
@@ -16365,6 +16477,9 @@ describe("WorkspaceService archive snapshots", () => {
       close: closeDesktopSession,
       setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager);
+
+    const stopServers = mock(() => Promise.resolve());
+    workspaceService.setMCPServerManager({ stopServers } as unknown as MCPServerManager);
 
     const captureSnapshotForArchive = mock(() => Promise.resolve(Err("should not run")));
     workspaceService.setWorktreeArchiveSnapshotService({
@@ -16380,6 +16495,7 @@ describe("WorkspaceService archive snapshots", () => {
     expect(captureSnapshotForArchive).not.toHaveBeenCalled();
     expect(closeWorkspaceSessions).not.toHaveBeenCalled();
     expect(closeDesktopSession).not.toHaveBeenCalled();
+    expect(stopServers).not.toHaveBeenCalled();
   });
 
   test("archive() skips snapshot capture for multi-project workspaces", async () => {
