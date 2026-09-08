@@ -253,7 +253,11 @@ export function createConsolidationMemoryTool(args: {
       const entries = await metaService.getEntries();
       const key = memoryLogicalKey(scope, relPath, {
         projectPath: ctx.projectPath,
-        workspaceId: ctx.workspaceId,
+        // Sidecar keys follow the shared store's owner (MemoryService.logicalKeyFor).
+        workspaceId:
+          ctx.workspaceId === ""
+            ? ""
+            : memoryService.resolveWorkspaceMemoryOwnerId(ctx.workspaceId),
       });
       const subtreePrefix = `${key}/`;
       for (const [entryKey, entry] of entries) {

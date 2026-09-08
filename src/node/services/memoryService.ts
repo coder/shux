@@ -46,6 +46,7 @@ import {
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
   REFINEMENT_CAPTURE_MAX_FILES,
   REFINEMENT_CAPTURE_MAX_TOTAL_BYTES,
@@ -70,7 +71,12 @@ export interface MemoryScopeContext {
   runtime: Runtime | null;
   /** Workspace checkout cwd. Kept in the context shape for existing callers; storage ignores it. */
   checkoutCwd: string;
-  /** Workspace ID; workspace scope root is <sessionDir>/memory. */
+  /**
+   * ACTING workspace ID. The workspace scope root is the memory OWNER's
+   * <sessionDir>/memory, where the owner is the task-tree root: sub-agent
+   * children (parentWorkspaceId set) share their parent's workspace notes
+   * (see MemoryService.resolveWorkspaceMemoryOwnerId).
+   */
   workspaceId: string;
   /**
    * Stable project identity from Xum config (the project root path, never the
@@ -589,12 +595,79 @@ export class MemoryService extends EventEmitter {
   // Best-effort: stats failures must never break a memory command.
   // -------------------------------------------------------------------------
 
+  /**
+   * Positive-only memo for resolveWorkspaceMemoryOwnerId: a workspace's
+   * parentWorkspaceId is fixed at creation and IDs are never reused, so a
+   * resolved chain stays valid for the process lifetime. Unknown IDs are not
+   * cached — the workspace may simply not be registered yet.
+   */
+  private readonly workspaceMemoryOwnerById = new Map<string, string>();
+
+  /**
+   * The workspace whose <sessionDir>/memory backs `/memories/workspace` for
+   * `workspaceId`: the root of its parentWorkspaceId chain. Sub-agents (and
+   * nested sub-agents) thereby share ONE notebook with the workspace that
+   * spawned the task tree, while their transcripts/session artifacts stay
+   * separate. Full `kind: "workspace"` tasks and forks carry no
+   * parentWorkspaceId and own their notes. Unknown IDs, cycles, and depth
+   * overflow resolve to the ID itself so a misconfigured tree degrades to
+   * today's per-workspace behavior instead of failing every memory command.
+   */
+  resolveWorkspaceMemoryOwnerId(workspaceId: string): string {
+    assert(workspaceId.length > 0, "resolveWorkspaceMemoryOwnerId requires a workspaceId");
+    const cached = this.workspaceMemoryOwnerById.get(workspaceId);
+    if (cached !== undefined) return cached;
+    const cfg = this.config.loadConfigOrDefault();
+    let current = workspaceId;
+    const visited = new Set<string>();
+    for (let depth = 0; depth < 32; depth++) {
+      if (visited.has(current)) {
+        log.warn(
+          "[MemoryService] parentWorkspaceId cycle; using acting workspace as memory owner",
+          {
+            workspaceId,
+          }
+        );
+        return workspaceId;
+      }
+      visited.add(current);
+      const entry = findWorkspaceEntry(cfg, current);
+      if (entry === null) {
+        // Only the chain root may be unknown without invalidating the walk:
+        // an unregistered starting workspace resolves to itself (not cached).
+        if (current === workspaceId) return workspaceId;
+        log.warn("[MemoryService] parentWorkspaceId points at an unknown workspace", {
+          workspaceId,
+          parentWorkspaceId: current,
+        });
+        return workspaceId;
+      }
+      const parentWorkspaceId = entry.workspace.parentWorkspaceId;
+      if (parentWorkspaceId === undefined || parentWorkspaceId === "") {
+        this.workspaceMemoryOwnerById.set(workspaceId, current);
+        return current;
+      }
+      current = parentWorkspaceId;
+    }
+    log.warn("[MemoryService] parentWorkspaceId chain too deep; using acting workspace", {
+      workspaceId,
+    });
+    return workspaceId;
+  }
+
+  /** Owner of the workspace scope for this context ("" when there is no workspace). */
+  private ownerWorkspaceIdFor(ctx: MemoryScopeContext): string {
+    return ctx.workspaceId === "" ? "" : this.resolveWorkspaceMemoryOwnerId(ctx.workspaceId);
+  }
+
   /** Logical sidecar key, or null when the scope has no stable identity. */
   private logicalKeyFor(ctx: MemoryScopeContext, scope: MemoryScope, relPath: string) {
     if (scope === "project" && ctx.projectPath === "") return null;
     return memoryLogicalKey(scope, relPath, {
       projectPath: ctx.projectPath,
-      workspaceId: ctx.workspaceId,
+      // Pins/usage stats follow the physical file, so a shared notebook has
+      // one ranking regardless of which tree member touched it.
+      workspaceId: this.ownerWorkspaceIdFor(ctx),
     });
   }
 
@@ -697,7 +770,9 @@ export class MemoryService extends EventEmitter {
             "Workspace memory is unavailable: no workspace is associated with this session"
           );
         }
-        return new LocalMemoryStore(path.join(this.config.sessionsDir, ctx.workspaceId, "memory"));
+        return new LocalMemoryStore(
+          path.join(this.config.sessionsDir, this.ownerWorkspaceIdFor(ctx), "memory")
+        );
       }
     }
   }
@@ -750,12 +825,17 @@ export class MemoryService extends EventEmitter {
    * Rows land in the ACTING workspace's session journal even though memory
    * files can be global/project-scoped: the journal is per-session, so
    * cross-workspace edits to a shared file are attributed to (and invertible
-   * from) whichever workspace made them — the intended v1 scope. When the
-   * context has no workspace, there is no session journal; skip (log-only).
+   * from) whichever workspace made them — the intended v1 scope. The one
+   * exception is workspace scope written by a sub-agent: the file lives in
+   * the OWNER's <sessionDir>/memory and rollback confinement only admits a
+   * journal's own session memory root, so those rows go to the owner's
+   * journal (where they are actually invertible). When the context has no
+   * workspace, there is no session journal; skip (log-only).
    * Never throws: journaling failures must not fail the memory command.
    */
   private async journalRefinement(
     ctx: MemoryScopeContext,
+    scope: MemoryScope,
     action: MemoryRefinementAction,
     inverse: RefinementInverseDraft,
     actor: MemoryActor,
@@ -768,9 +848,11 @@ export class MemoryService extends EventEmitter {
       });
       return;
     }
+    const journalWorkspaceId =
+      scope === "workspace" ? this.ownerWorkspaceIdFor(ctx) : ctx.workspaceId;
     await appendRefinementEvent({
-      sessionDir: path.join(this.config.sessionsDir, ctx.workspaceId),
-      workspaceId: ctx.workspaceId,
+      sessionDir: path.join(this.config.sessionsDir, journalWorkspaceId),
+      workspaceId: journalWorkspaceId,
       kind: "memory",
       action,
       inverse,
@@ -781,6 +863,51 @@ export class MemoryService extends EventEmitter {
       },
       ...(postFiles !== undefined ? { postFiles } : {}),
     });
+  }
+
+  /**
+   * Refuse to COMMIT a mutation whose caller was torn down (r59/r61). Checked
+   * INSIDE the target mutation lock immediately before the first durable
+   * write; a mutation that already committed always journals (mutation → row
+   * → ack) so rollback lineage stays intact. Two teardown signals:
+   *
+   * - The caller's abort signal (r59): consolidation/refine passes receive no
+   *   hard tool cancellation — an execution wedged in pre-commit I/O (e.g. a
+   *   named pipe under a memory root) is detached by the caller's bounded
+   *   drain, and once the I/O unblocks after workspace teardown it would
+   *   still write durable memory AND append its refinement journal row into
+   *   the deleted session directory, recreating it.
+   * - The durable removal tombstone (r61): with multiple backends over one
+   *   Xum root, the remover cannot abort a dream/harvest run in ANOTHER
+   *   process — that run's signal stays live after removal. The tombstone is
+   *   published under the same memory target locks this check runs inside
+   *   (see workspaceRemoval.ts), so a foreign backend's mutation observes
+   *   removal here at commit time and refuses instead of recreating the
+   *   deleted session directory via its write or journal append.
+   *
+   * Both the acting workspace and the workspace-memory owner are checked: a
+   * removed sub-agent must not keep writing into its parent's notebook, and
+   * a removed owner must not have its session directory recreated by a
+   * lingering child's write.
+   */
+  private async assertMutationCommittable(
+    ctx: MemoryScopeContext,
+    signal: AbortSignal | undefined,
+    virtualPath: string
+  ): Promise<void> {
+    if (signal?.aborted === true) {
+      throw new MemoryCommandError(
+        `Mutation of ${virtualPath} was cancelled before commit (caller torn down)`
+      );
+    }
+    if (ctx.workspaceId === "") return;
+    for (const workspaceId of new Set([ctx.workspaceId, this.ownerWorkspaceIdFor(ctx)])) {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+        throw new MemoryCommandError(
+          `Workspace ${workspaceId} was removed; refusing to commit the mutation of ${virtualPath}`
+        );
+      }
+    }
   }
 
   /**
@@ -901,7 +1028,9 @@ export class MemoryService extends EventEmitter {
       scope,
       path: toVirtualPath(scope, relPath),
       actor,
-      workspaceId: ctx.workspaceId,
+      // Owner, not actor: subscribers filter workspace-scope events by the
+      // store they display, and every tree member displays the owner's.
+      workspaceId: this.ownerWorkspaceIdFor(ctx),
       projectPath: ctx.projectPath,
     };
     this.emit("change", event);
@@ -1004,7 +1133,7 @@ export class MemoryService extends EventEmitter {
         // only INSIDE the lock and after the removal check (r62), so the
         // mkdir serializes with removal's locked deletion and cannot
         // recreate a removed session directory.
-        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
         await store.ensureRoot();
         const existing = await store.kind(parsed.relPath);
         if (existing !== null) {
@@ -1018,11 +1147,12 @@ export class MemoryService extends EventEmitter {
             `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
           );
         }
-        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, fileText);
         // Row is written before the create is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
+          scope,
           { op: "create", path: toVirtualPath(scope, parsed.relPath) },
           { op: "delete-files", paths: [store.physicalPath(parsed.relPath)] },
           actor,
@@ -1059,11 +1189,12 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const updated = computeStrReplaceUpdate(content, oldStr, newStr, virtualPath);
         assertWithinFileSizeCap(updated);
-        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
+          scope,
           { op: "str_replace", path: toVirtualPath(scope, parsed.relPath) },
           {
             op: "restore-files",
@@ -1112,11 +1243,12 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
         assertWithinFileSizeCap(updated);
-        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
+          scope,
           { op: "insert", path: toVirtualPath(scope, parsed.relPath) },
           {
             op: "restore-files",
@@ -1295,11 +1427,12 @@ export class MemoryService extends EventEmitter {
         // Prior contents must be captured before removal; the row itself is
         // written after the mutation succeeds and before it is acknowledged.
         const inverse = await this.captureDeleteInverse(store, parsed.relPath, kind);
-        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
         await store.remove(parsed.relPath);
         if (inverse !== null) {
           await this.journalRefinement(
             ctx,
+            scope,
             { op: "delete", path: toVirtualPath(scope, parsed.relPath) },
             inverse,
             actor,
@@ -1357,11 +1490,12 @@ export class MemoryService extends EventEmitter {
         if (newKind !== null) {
           throw new MemoryCommandError(`Destination ${newVirtualPath} already exists`);
         }
-        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, oldVirtualPath);
+        await this.assertMutationCommittable(ctx, abortSignal, oldVirtualPath);
         await store.rename(oldParsed.relPath, newParsed.relPath);
         // Row is written before the rename is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
+          scope,
           {
             op: "rename",
             path: toVirtualPath(scope, oldParsed.relPath),
@@ -1481,7 +1615,7 @@ export class MemoryService extends EventEmitter {
         async () => {
           // UI save can create new files: materialize the scope root on
           // first use — in-lock, after the removal check (r62; see create).
-          await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+          await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
           await store.ensureRoot();
           const kind = await store.kind(parsed.relPath);
           if (kind === "dir") {
@@ -1508,7 +1642,7 @@ export class MemoryService extends EventEmitter {
               );
             }
           }
-          await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+          await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
           await store.writeFile(parsed.relPath, content);
           await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
           this.emitChange(ctx, scope, parsed.relPath, actor);
@@ -1680,44 +1814,6 @@ export function formatMemoryIndexForToolDescription(
 
 function sha256Hex(content: string): string {
   return createHash("sha256").update(content, "utf-8").digest("hex");
-}
-
-/**
- * Refuse to COMMIT a mutation whose caller was torn down (r59/r61). Checked
- * INSIDE the target mutation lock immediately before the first durable
- * write; a mutation that already committed always journals (mutation → row
- * → ack) so rollback lineage stays intact. Two teardown signals:
- *
- * - The caller's abort signal (r59): consolidation/refine passes receive no
- *   hard tool cancellation — an execution wedged in pre-commit I/O (e.g. a
- *   named pipe under a memory root) is detached by the caller's bounded
- *   drain, and once the I/O unblocks after workspace teardown it would
- *   still write durable memory AND append its refinement journal row into
- *   the deleted session directory, recreating it.
- * - The durable removal tombstone (r61): with multiple backends over one
- *   Xum root, the remover cannot abort a dream/harvest run in ANOTHER
- *   process — that run's signal stays live after removal. The tombstone is
- *   published under the same memory target locks this check runs inside
- *   (see workspaceRemoval.ts), so a foreign backend's mutation observes
- *   removal here at commit time and refuses instead of recreating the
- *   deleted session directory via its write or journal append.
- */
-async function assertMutationCommittable(
-  rootDir: string,
-  ctx: MemoryScopeContext,
-  signal: AbortSignal | undefined,
-  virtualPath: string
-): Promise<void> {
-  if (signal?.aborted === true) {
-    throw new MemoryCommandError(
-      `Mutation of ${virtualPath} was cancelled before commit (caller torn down)`
-    );
-  }
-  if (ctx.workspaceId !== "" && (await isWorkspaceRemovalTombstoned(rootDir, ctx.workspaceId))) {
-    throw new MemoryCommandError(
-      `Workspace ${ctx.workspaceId} was removed; refusing to commit the mutation of ${virtualPath}`
-    );
-  }
 }
 
 /**

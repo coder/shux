@@ -204,7 +204,10 @@ interface Fixture extends Disposable {
   setEnabled: (enabled: boolean) => void;
   /** When true, scripted runs emit a fatal stream error instead of finishing. */
   setStreamFailing: (failing: boolean) => void;
-  addWorkspace: (id: string, opts?: { archivedAt?: string }) => Promise<void>;
+  addWorkspace: (
+    id: string,
+    opts?: { archivedAt?: string; parentWorkspaceId?: string }
+  ) => Promise<void>;
   addMultiProjectWorkspace: (id: string, opts?: { bucket?: string }) => Promise<void>;
 }
 
@@ -283,6 +286,7 @@ async function createFixture(options?: {
           name: id,
           path: `/projects/demo/${id}`,
           archivedAt: opts?.archivedAt,
+          parentWorkspaceId: opts?.parentWorkspaceId,
         });
         return cfg;
       });
@@ -1278,6 +1282,40 @@ describe("MemoryConsolidationService", () => {
     await fixture.metaService.recordAccess("global:lesson2.md", { write: true });
     await fixture.service.runLaunchSweep(new Map([["ws-dream", now]]));
     expect(fixture.modelCalls).toHaveLength(1);
+  });
+
+  it("refuses Dream runs for sub-agent children and lets the owner sweep their shared writes", async () => {
+    using fixture = await createFixture();
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+
+    // Every trigger, including an explicit /dream, is refused on the child:
+    // its /memories/workspace IS the owner's store.
+    for (const trigger of ["manual", "compaction", "archive"] as const) {
+      const result = await fixture.service.maybeRun("ws-sub", trigger);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("owner");
+    }
+    expect(fixture.modelCalls).toHaveLength(0);
+
+    // A child's workspace write is keyed under the owner (MemoryService
+    // resolution), so an idle owner qualifies for the launch sweep while the
+    // idle child is skipped even though it is listed.
+    await fixture.memoryService.create(
+      { runtime: null, checkoutCwd: "", workspaceId: "ws-sub", projectPath: "" },
+      "/memories/workspace/from-child.md",
+      "shared lesson",
+      "agent"
+    );
+    const dayAgo = Date.now() - 25 * 60 * 60 * 1000;
+    await fixture.service.runLaunchSweep(
+      new Map([
+        ["ws-sub", dayAgo],
+        ["ws-dream", dayAgo],
+      ])
+    );
+    expect(fixture.modelCalls).toHaveLength(1);
+    expect(await fixture.service.getRecord("ws-sub")).toBeNull();
+    expect(await fixture.service.getRecord("ws-dream")).not.toBeNull();
   });
 
   it("launch sweep skips archived workspaces and caps runs per launch", async () => {

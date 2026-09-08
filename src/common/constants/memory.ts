@@ -9,7 +9,8 @@
  *                per-project notes; never committed to the repo, survives
  *                workspaces; carried by the settings backup only when the
  *                user opts into the project bundle)
- * - workspace -> <sessionDir>/memory/ (host-local, deleted with the workspace)
+ * - workspace -> <sessionDir>/memory/ of the task-tree OWNER (host-local, deleted
+ *                with that workspace; sub-agents share their parent's store)
  */
 
 /** Virtual root prefix all memory paths are expressed under. */

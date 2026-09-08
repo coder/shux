@@ -13,7 +13,11 @@ import { TestClock } from "effect/testing";
 import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/common/utils/withQueueHeartbeat";
 import { disposeAppRuntime, makeAppRuntime } from "@/node/services/di/appRuntime";
 import type { ORPCContext } from "./context";
-import { subscribeWorkspaceActivity, subscribeDesignExperiment } from "./routerSubscriptions";
+import {
+  subscribeWorkspaceActivity,
+  subscribeDesignExperiment,
+  subscribeMemoryChanges,
+} from "./routerSubscriptions";
 
 test("subscription handlers forward the oRPC runtime Clock", async () => {
   const app = makeAppRuntime(TestClock.layer());
@@ -35,6 +39,52 @@ test("subscription handlers forward the oRPC runtime Clock", async () => {
     await disposeAppRuntime(app.managed);
   }
   expect(workspaceService.listenerCount("activity")).toBe(0);
+});
+
+test("memory subscriptions match workspace-scope events on the shared memory owner", async () => {
+  // Workspace-scope change events carry the memory OWNER (task-tree root);
+  // a sub-agent's subscription must see edits to the notebook it shares.
+  const app = makeAppRuntime(TestClock.layer());
+  const memoryService = new EventEmitter();
+  const memoryConsolidationService = new EventEmitter();
+  const controller = new AbortController();
+  const context = {
+    "effect/context": app.context,
+    workspaceService: { getInfo: () => Promise.resolve(null) },
+    memoryService: Object.assign(memoryService, {
+      resolveWorkspaceMemoryOwnerId: (workspaceId: string) =>
+        workspaceId === "ws-child" ? "ws-owner" : workspaceId,
+    }),
+    memoryConsolidationService,
+  } as unknown as ORPCContext;
+  const stream = subscribeMemoryChanges(context, "ws-child", controller.signal);
+  try {
+    const first = stream.next();
+    // The listener attaches once the generator has started running.
+    while (memoryService.listenerCount("change") === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const base = {
+      scope: "workspace",
+      path: "/memories/workspace/n.md",
+      actor: "agent",
+      projectPath: "",
+    };
+    memoryService.emit("change", { ...base, workspaceId: "ws-other" });
+    memoryService.emit("change", { ...base, workspaceId: "ws-child" });
+    memoryService.emit("change", { ...base, workspaceId: "ws-owner" });
+    // Global scope is never filtered: it marks the end of the batch, so
+    // receiving it second proves the other/child events were dropped.
+    const marker = { ...base, scope: "global", path: "/memories/global/g.md", workspaceId: "" };
+    memoryService.emit("change", marker);
+    expect((await first).value).toEqual({ ...base, workspaceId: "ws-owner" });
+    expect((await stream.next()).value).toEqual(marker);
+  } finally {
+    controller.abort();
+    await stream.return(undefined);
+    await disposeAppRuntime(app.managed);
+  }
+  expect(memoryService.listenerCount("change")).toBe(0);
 });
 
 test("Design subscriptions publish sibling changes only after client shutdown", async () => {

@@ -207,11 +207,16 @@ export function subscribeMemoryChanges(
     validate?.();
     const metadata = workspaceId ? await context.workspaceService.getInfo(workspaceId) : null;
     const projectPath = metadata ? resolveMemoryProjectIdentity(metadata) : null;
+    // Workspace-scope events carry the memory OWNER (task-tree root), which is
+    // also the store this subscriber's workspace displays.
+    const ownerWorkspaceId = workspaceId
+      ? context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId)
+      : null;
     yield* runtimeSubscription(context, {
       signal,
       subscribe: (emit) => {
         const onChange = (event: MemoryChangeEvent) => {
-          if (event.scope === "workspace" && event.workspaceId !== workspaceId) return;
+          if (event.scope === "workspace" && event.workspaceId !== ownerWorkspaceId) return;
           if (event.scope === "project" && event.projectPath !== projectPath) return;
           emit.push(event);
         };
