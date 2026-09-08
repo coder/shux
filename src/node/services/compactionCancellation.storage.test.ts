@@ -15,6 +15,7 @@ import { createTestHistoryService } from "./testHistoryService";
 import { historyWriteLockPath, removeSessionDirUnderMemoryLocks } from "./workspaceRemoval";
 import {
   CompactionCancellation,
+  CompactionCancellationReadRefusedError,
   FileCompactionCancellationStorage,
   MalformedCompactionCancellationError,
   type CompactionCancellationMutation,
@@ -237,14 +238,20 @@ describe("inactive real cancellation storage", () => {
         nodeFs.writeFileSync(generationPath, "foreign-generation");
       };
       if (phase === "retirement") {
-        const read = nodeFs.promises.readFile;
-        spyOn(nodeFs.promises, "readFile").mockImplementation((async (
-          ...args: Parameters<typeof read>
-        ) => {
-          const result = await read(...args);
-          if (args[0] === storage.path && !displaced) displace();
-          return result;
-        }) as typeof read);
+        const open = nodeFs.promises.open;
+        spyOn(nodeFs.promises, "open").mockImplementation(
+          async (...args: Parameters<typeof open>) => {
+            const handle = await open(...args);
+            if (args[0] === storage.path) {
+              const close = handle.close.bind(handle);
+              spyOn(handle, "close").mockImplementation(async () => {
+                await close();
+                if (!displaced) displace();
+              });
+            }
+            return handle;
+          }
+        );
       } else {
         const target = phase === "generation" ? generationPath : storage.path;
         afterCompactionStaging(target, () => {
@@ -414,6 +421,71 @@ describe("inactive real cancellation storage", () => {
       for (const [file, contents] of expected)
         expect(await fs.readFile(file, "utf8")).toBe(contents);
       expect(await fs.readFile(lockPath, "utf8")).toBe(`${process.pid}:foreign-repair-holder`);
+    }
+  );
+
+  it.each(["limit", "oversized", "malformed", "read error"] as const)(
+    "bounds short descriptor reads and closes the handle for %s sidecars",
+    async (kind) => {
+      const valid = JSON.stringify(record("bounded"));
+      const contents =
+        kind === "malformed"
+          ? "{invalid"
+          : valid.padEnd(SESSION_HISTORY_MAX_LINE_BYTES * (kind === "oversized" ? 2 : 1), " ");
+      await fs.writeFile(storage.path, contents);
+      let reads = 0;
+      let totalRead = 0;
+      let largestBuffer = 0;
+      let closed = false;
+      const open = nodeFs.promises.open;
+      spyOn(nodeFs.promises, "open").mockImplementation(
+        async (...args: Parameters<typeof open>) => {
+          const handle = await open(...args);
+          if (args[0] === storage.path) {
+            const close = handle.close.bind(handle);
+            spyOn(handle, "close").mockImplementation(async () => {
+              await close();
+              closed = true;
+            });
+            const read = handle.read.bind(handle);
+            spyOn(handle, "read").mockImplementation((async (
+              buffer: Buffer,
+              offset: number,
+              length: number,
+              position: number
+            ) => {
+              reads++;
+              largestBuffer = Math.max(largestBuffer, buffer.byteLength);
+              if (kind === "read error") throw new Error("descriptor read failed");
+              // Exercise legal short reads; a single read must not mistake them for EOF.
+              const result = await read(
+                buffer,
+                offset,
+                Math.min(length, SESSION_HISTORY_MAX_LINE_BYTES / 16),
+                position
+              );
+              totalRead += result.bytesRead;
+              return result;
+            }) as typeof handle.read);
+          }
+          return handle;
+        }
+      );
+      if (kind === "limit") expect(await storage.read()).toEqual(record("bounded"));
+      else
+        await assert.rejects(
+          storage.read(),
+          kind === "oversized"
+            ? CompactionCancellationReadRefusedError
+            : kind === "malformed"
+              ? MalformedCompactionCancellationError
+              : /descriptor read failed/
+        );
+      expect(reads).toBeGreaterThan(kind === "read error" ? 0 : 1);
+      expect(totalRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_LINE_BYTES + 1);
+      expect(largestBuffer).toBeLessThanOrEqual(SESSION_HISTORY_MAX_LINE_BYTES + 1);
+      expect(closed).toBe(true);
+      expect(await fs.readFile(storage.path, "utf8")).toBe(contents);
     }
   );
 

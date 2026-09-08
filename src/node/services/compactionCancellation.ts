@@ -134,7 +134,20 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
   async read(): Promise<CompactionCancellationRecord | null> {
     let contents: string;
     try {
-      contents = await fs.readFile(this.path, "utf8");
+      const handle = await fs.open(this.path, "r");
+      try {
+        // Bound allocation even if the file grows; short reads do not imply EOF.
+        const buffer = Buffer.alloc(SESSION_HISTORY_MAX_LINE_BYTES + 1);
+        let count = 0;
+        while (count < buffer.length) {
+          const { bytesRead } = await handle.read(buffer, count, buffer.length - count, count);
+          if (bytesRead === 0) break;
+          count += bytesRead;
+        }
+        contents = buffer.toString("utf8", 0, count);
+      } finally {
+        await handle.close();
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
