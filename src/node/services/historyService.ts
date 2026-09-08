@@ -100,7 +100,7 @@ interface HistoryTruncateTransaction extends HistoryTruncateHashes {
 interface HistoryRewriteRow {
   raw: Buffer;
   message: MuxMessage | undefined;
-  protectedMessageId?: string;
+  protectedMessage?: MuxMessage;
 }
 
 function splitHistoryLines(raw: Buffer): Buffer[] {
@@ -2678,11 +2678,21 @@ export class HistoryService {
       return {
         raw: line,
         message: protectedReset ? undefined : parsed,
-        // Preserve identity for active-first lookup even when the raw floor cannot be rewritten.
-        protectedMessageId: protectedReset ? parsed?.id : undefined,
+        // Keep identity and sequence accounting even when the raw floor cannot be rewritten.
+        protectedMessage: protectedReset ? parsed : undefined,
       };
     });
     return { rows, messages: rows.flatMap((row) => (row.message ? [row.message] : [])) };
+  }
+
+  private getProtectedRewriteMaxSequence(rows: readonly HistoryRewriteRow[]): number {
+    // These parsed rows survive every partial rewrite as raw bytes, even beyond a cut.
+    // Their sequences remain occupied regardless of whether they are transformable.
+    return (
+      this.getNewestHistorySequence(
+        rows.flatMap((row) => (row.protectedMessage ? [row.protectedMessage] : []))
+      ) ?? -1
+    );
   }
 
   private serializeHistoryRewrite(
@@ -3452,7 +3462,7 @@ export class HistoryService {
               return max;
             }
             return sequence > max ? sequence : max;
-          }, -1);
+          }, this.getProtectedRewriteMaxSequence(rows));
           const archiveMaxSeq = await this.getArchiveTailMaxSequence(workspaceId);
           const nextSeq = Math.max(maxSeq, archiveMaxSeq) + 1;
           assert(
@@ -3532,7 +3542,7 @@ export class HistoryService {
       const filteredMessages = messages.filter((msg) => msg.id !== messageId);
 
       if (filteredMessages.length === messages.length) {
-        if (rows.some((row) => row.protectedMessageId === messageId)) {
+        if (rows.some((row) => row.protectedMessage?.id === messageId)) {
           return Err(`Message with ID ${messageId} is protected reset evidence in active history`);
         }
         // Not in the active epoch — the row may live in the sealed archive
@@ -3590,7 +3600,7 @@ export class HistoryService {
         }
 
         return seq > max ? seq : max;
-      }, -1);
+      }, this.getProtectedRewriteMaxSequence(rows));
       // Sealed archive rows keep their sequences across active-file deletes.
       // Without this floor, deleting the last sequenced active row in a fresh
       // process would cache a counter below archived rows and reuse their
@@ -3703,7 +3713,7 @@ export class HistoryService {
             }
 
             return seq > max ? seq : max;
-          }, -1);
+          }, this.getProtectedRewriteMaxSequence(rows));
           // Sealed archive rows keep their sequences across an active-epoch
           // truncation. When the truncation empties the active file, floor the
           // counter with the archive max so new appends can never reuse archived
@@ -3776,6 +3786,10 @@ export class HistoryService {
 
       // Update sequence counter to continue from where we truncated.
       // Self-healing read path: skip malformed persisted historySequence values.
+      const protectedMaxSeq = this.getProtectedRewriteMaxSequence([
+        ...archiveRows,
+        ...activeEpochRows,
+      ]);
       const maxTruncatedSeq = truncatedMessages.reduce((max, msg) => {
         const seq = msg.metadata?.historySequence;
         if (seq === undefined) {
@@ -3795,7 +3809,7 @@ export class HistoryService {
         }
 
         return seq > max ? seq : max;
-      }, -1);
+      }, protectedMaxSeq);
       const nextSeq = maxTruncatedSeq + 1;
       assert(
         isNonNegativeInteger(nextSeq),
@@ -4025,6 +4039,10 @@ export class HistoryService {
 
           // Update sequence counter to continue from where we are.
           // Self-healing read path: skip malformed persisted historySequence values.
+          const protectedMaxSeq = this.getProtectedRewriteMaxSequence([
+            ...archiveRows,
+            ...chatRows,
+          ]);
           const maxRemainingSeq = remainingMessages.reduce((max, msg) => {
             const seq = msg.metadata?.historySequence;
             if (seq === undefined) {
@@ -4044,7 +4062,7 @@ export class HistoryService {
             }
 
             return seq > max ? seq : max;
-          }, -1);
+          }, protectedMaxSeq);
           const nextSeq = maxRemainingSeq + 1;
           assert(
             isNonNegativeInteger(nextSeq),
@@ -4112,12 +4130,15 @@ export class HistoryService {
           const { rows, messages } = await this.readHistoryForRewrite(
             this.getChatHistoryPath(newWorkspaceId)
           );
+          const oldCounter = Math.max(
+            this.sequenceCounters.get(oldWorkspaceId) ?? 0,
+            this.getProtectedRewriteMaxSequence([...archiveRows, ...rows]) + 1
+          );
           if (messages.length === 0) {
             // No active messages to migrate, just transfer the sequence counter.
             // Floor it with the archive max: an archive-only session (active file
             // deleted/truncated) renamed in a fresh process has no cached counter,
             // and seeding 0 would reuse archived historySequence values.
-            const oldCounter = this.sequenceCounters.get(oldWorkspaceId) ?? 0;
             const archiveFloor = (await this.getArchiveTailMaxSequence(newWorkspaceId)) + 1;
             this.sequenceCounters.set(newWorkspaceId, Math.max(oldCounter, archiveFloor));
             this.sequenceCounters.delete(oldWorkspaceId);
@@ -4132,7 +4153,6 @@ export class HistoryService {
           await writeFileAtomic(newHistoryPath, historyEntries);
 
           // Transfer sequence counter to new workspace ID
-          const oldCounter = this.sequenceCounters.get(oldWorkspaceId) ?? 0;
           this.sequenceCounters.set(newWorkspaceId, oldCounter);
           this.sequenceCounters.delete(oldWorkspaceId);
 

@@ -1258,6 +1258,96 @@ describe("HistoryService", () => {
       }
     );
 
+    it.each(
+      [
+        "single delete",
+        "batch delete",
+        "archive delete",
+        "active truncation",
+        "archive truncation",
+        "prefix truncation",
+        "rename",
+        "protected-only rename",
+        "clear",
+      ].flatMap((method) => ["chat", "archive"].map((artifact) => ({ method, artifact })))
+    )(
+      "$method accounts for a retained protected sequence in $artifact after restart",
+      async ({ method, artifact }) => {
+        const target = row("target");
+        const fresh = row("fresh");
+        const floor = {
+          ...createMuxMessage("floor", "assistant", ""),
+          contextBoundaryKind: 0,
+          padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES),
+          candidate: "reset",
+        };
+        const archivedTarget = method.startsWith("archive");
+        const protectedOnly = method === "protected-only rename";
+        const archive = [
+          ...(archivedTarget ? [target] : []),
+          ...(artifact === "archive" ? [floor] : []),
+        ];
+        const chat = [
+          ...(!protectedOnly && !archivedTarget ? [target] : []),
+          ...(artifact === "chat" ? [floor] : []),
+          ...(protectedOnly ? [] : [fresh]),
+        ];
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(archive, chat);
+        floor.metadata = { ...floor.metadata, historySequence: 100 };
+        await fs.writeFile(
+          artifact === "chat" ? chatPath : archivePath,
+          bytes(artifact === "chat" ? chat : archive)
+        );
+        const floorBytes = bytes([floor]);
+        const restarted = new HistoryService(config);
+        let nextWorkspace = ws;
+        const result =
+          method === "single delete" || method === "archive delete"
+            ? await restarted.deleteMessage(ws, target.id)
+            : method === "batch delete"
+              ? await restarted.deleteMessages(ws, [target.id])
+              : method === "active truncation" || method === "archive truncation"
+                ? await restarted.truncateAfterMessage(ws, target.id, { keepTargetMessage: true })
+                : method === "prefix truncation"
+                  ? await restarted.truncateHistory(ws, 0.1)
+                  : method === "clear"
+                    ? await restarted.clearHistory(ws)
+                    : await (async () => {
+                        nextWorkspace = `${ws}-renamed`;
+                        await fs.rename(
+                          path.dirname(chatPath),
+                          path.join(config.sessionsDir, nextWorkspace)
+                        );
+                        return restarted.migrateWorkspaceId(ws, nextWorkspace);
+                      })();
+        expect(result.success).toBe(true);
+        const retainedBytes = Buffer.concat(
+          await Promise.all(
+            ["chat.jsonl", "chat-archive.jsonl"].map((file) =>
+              fs
+                .readFile(path.join(config.sessionsDir, nextWorkspace, file))
+                .catch(() => Buffer.alloc(0))
+            )
+          )
+        );
+        expect(retainedBytes.includes(floorBytes)).toBe(method !== "clear");
+        // The rewrite must publish a counter consistent with retained bytes immediately;
+        // the append path's disk refresh must not be needed to repair its bookkeeping.
+        const counters = restarted as unknown as { sequenceCounters: Map<string, number> };
+        const cachedNext = counters.sequenceCounters.get(nextWorkspace);
+        const next = row("next");
+        expect((await restarted.appendToHistory(nextWorkspace, next)).success).toBe(true);
+        expect(next.metadata?.historySequence).toBe(method === "clear" ? 0 : 101);
+        const reloaded = new HistoryService(config);
+        const later = row("later");
+        expect((await reloaded.appendToHistory(nextWorkspace, later)).success).toBe(true);
+        expect(later.metadata?.historySequence).toBe(method === "clear" ? 1 : 102);
+        if (method !== "archive delete") {
+          expect(cachedNext).toBe(method === "clear" ? 0 : 101);
+        }
+      }
+    );
+
     it.each(["single", "batch", "archive", "partial"])(
       "%s deletion preserves oversized token-separated raw reset evidence",
       async (method) => {
