@@ -12644,9 +12644,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         refuseRowRemoval: truncationScope === "none",
         requireFullDelete: truncationScope === "all",
       });
-    const cancellationNonce = isFullClear
-      ? ((await this.getOrCreateSession(workspaceId).getCompactionCancellationNonce()) ?? null)
-      : null;
+    if (isFullClear) {
+      try {
+        await this.getOrCreateSession(workspaceId).fenceCompactionForContextClear();
+      } catch (error) {
+        return Err(
+          `Cannot clear history: compaction cancellation could not be persisted (${getErrorMessage(error)})`
+        );
+      }
+    }
     const truncateResult =
       effectivePercentage > 0
         ? await this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, truncate, {
@@ -12660,7 +12666,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // r41: the discard is durable — sends that entered before it must not be
     // admitted afterwards (their content references the discarded context).
     const cancellationRetirement = isFullClear
-      ? await this.advanceContextMutationEpoch(workspaceId, cancellationNonce)
+      ? await this.advanceContextMutationEpoch(workspaceId, null)
       : Ok(undefined);
     // r43: a fork's settled branch-summary registration stays consumable
     // until the first send; its row was just deleted, so drop the

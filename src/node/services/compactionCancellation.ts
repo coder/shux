@@ -7,6 +7,7 @@ import type { HistoryService } from "./historyService";
 export const CompactionCancellationSchema = z.object({
   version: z.literal(1),
   nonce: z.string().min(1),
+  retainUntilReplacement: z.boolean().optional(),
   scope: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("unresolved") }),
     z.object({
@@ -18,6 +19,12 @@ export const CompactionCancellationSchema = z.object({
   ]),
 });
 export type CompactionCancellationRecord = z.infer<typeof CompactionCancellationSchema>;
+
+/** Process-local retry ownership; durable nonce + epoch prevent adopting foreign mutations. */
+export interface CompactionCancellationPublication {
+  attempts: number;
+  predecessor?: { nonce: string | null | undefined; generation: string | undefined };
+}
 
 /** Only successfully read bytes with invalid JSON/schema may enter automatic repair. */
 export class MalformedCompactionCancellationError extends Error {
@@ -34,7 +41,11 @@ export class CompactionCancellation {
   private replacementNonce?: string;
   private pending: Promise<void> = Promise.resolve();
   private unsettled = false;
-  private mutation?: { record: CompactionCancellationRecord | null; retiredNonce?: string };
+  private mutation?: {
+    record: CompactionCancellationRecord | null;
+    retiredNonce?: string;
+    publication?: CompactionCancellationPublication;
+  };
 
   constructor(
     private readonly history: HistoryService,
@@ -85,29 +96,64 @@ export class CompactionCancellation {
     return this.effectiveRecord();
   }
 
-  cancel(): Promise<void> {
+  cancel(options?: { retainUntilReplacement?: boolean }): Promise<void> {
     // Each explicit Stop is new intent, even during a previous retirement's
     // post-commit await. Only retry() may reuse publication identity.
-    this.current = { version: 1, nonce: randomUUID(), scope: { kind: "unresolved" } };
+    this.current = {
+      version: 1,
+      nonce: randomUUID(),
+      scope: { kind: "unresolved" },
+      ...(options?.retainUntilReplacement || this.current?.retainUntilReplacement
+        ? { retainUntilReplacement: true }
+        : {}),
+    };
     this.generation++;
-    return this.persist(this.current);
+    return this.persist(this.current, undefined, { attempts: 0 });
   }
 
   async readForReplacement(): Promise<CompactionCancellationRecord | null> {
-    try {
-      return await this.read();
-    } catch {
-      // Explicit user intervention may repair corrupt state. First publish a
-      // conservative fence; failed writes still refuse the replacement safely.
-      await this.cancel();
-      return this.read();
+    for (;;) {
+      // An unpublished nonce cannot pass the shared append CAS. Repair only the
+      // latest blocking publication; witnessed unlink debt remains ancillary.
+      if (this.blocksRecovery) {
+        const pending = this.pending;
+        try {
+          await pending;
+        } catch {
+          // Join first, then retry only the exact failed publication. Concurrent
+          // readers share the retry instead of continually superseding one another.
+          if (pending !== this.pending) continue;
+          const retried = this.retry();
+          try {
+            await retried;
+          } catch (error) {
+            if (retried === this.pending) throw error;
+          }
+        }
+        continue;
+      }
+      let record: CompactionCancellationRecord | null;
+      try {
+        record = await this.read();
+      } catch {
+        // Explicit intervention can replace corrupt/unreadable state with a
+        // conservative fence, but failed publication must remain visible.
+        await this.cancel();
+        continue;
+      }
+      if (!this.blocksRecovery) return record;
     }
   }
 
   async narrow(nonce: string, summary: MuxMessage): Promise<void> {
     // Exact CAS cannot turn a failed initial publication into apparent success.
     await this.pending;
-    if (this.current?.nonce !== nonce || this.current.scope.kind !== "unresolved") return;
+    if (
+      this.current?.nonce !== nonce ||
+      this.current.scope.kind !== "unresolved" ||
+      this.current.retainUntilReplacement
+    )
+      return;
     const metadata = summary.metadata?.muxMetadata;
     if (!metadata || !("pendingFollowUp" in metadata) || !metadata.pendingFollowUp) return;
     this.current = {
@@ -151,12 +197,16 @@ export class CompactionCancellation {
 
   retry(): Promise<void> {
     return this.unsettled && this.mutation
-      ? this.persist(this.mutation.record, this.mutation.retiredNonce)
+      ? this.persist(this.mutation.record, this.mutation.retiredNonce, this.mutation.publication)
       : this.pending;
   }
 
   retire(nonce: string): Promise<void> {
-    if (this.current?.nonce !== nonce) return Promise.resolve();
+    if (
+      this.current?.nonce !== nonce ||
+      (this.current.retainUntilReplacement && this.replacementNonce !== nonce)
+    )
+      return Promise.resolve();
     this.generation++;
     // Keep conservative exclusion in memory until deletion really commits. The
     // retry payload remains a deletion, not a republication of that read state.
@@ -165,20 +215,23 @@ export class CompactionCancellation {
 
   private persist(
     snapshot: CompactionCancellationRecord | null,
-    retiredNonce?: string
+    retiredNonce?: string,
+    publication?: CompactionCancellationPublication
   ): Promise<void> {
     const generation = this.generation;
-    const mutation = { record: snapshot, retiredNonce };
+    const mutation = { record: snapshot, retiredNonce, publication };
     this.mutation = mutation;
     this.unsettled = true;
     const result = this.pending
       .catch(() => undefined)
       .then(async () => {
+        if (publication) publication.attempts++;
         await this.history.writeCompactionCancellation(
           this.workspaceId,
           snapshot,
           () => this.generation === generation,
-          retiredNonce
+          retiredNonce,
+          publication
         );
         if (this.generation === generation && this.mutation === mutation) {
           this.unsettled = false;

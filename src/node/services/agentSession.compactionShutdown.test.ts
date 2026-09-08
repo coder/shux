@@ -1,3 +1,5 @@
+import { makeTestEffectRunner } from "./di/testEffectRunner";
+import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
 import * as fs from "node:fs/promises";
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import { COMPACTION_CANCELLATION_FILE } from "@/common/constants/compactionCancellation";
@@ -15,7 +17,7 @@ import { log } from "./log";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import { createTestHistoryService } from "./testHistoryService";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
 
 const workspaceId = "compaction-shutdown";
 const options = { model: "openai:gpt-4o", agentId: "exec" };
@@ -858,8 +860,9 @@ test("a delayed cancellation write survives failed manual preparation", async ()
     spyOn(h.historyService, "appendToHistory").mockResolvedValueOnce(
       Err("replacement append failed")
     );
-    expect((await h.session.sendMessage("replacement", options)).success).toBe(false);
+    const replacement = h.session.sendMessage("replacement", options);
     release.resolve();
+    expect((await replacement).success).toBe(false);
     await stopping;
     await h.session.dispose();
     const freshHistory = new HistoryService(h.config);
@@ -1518,7 +1521,11 @@ test("a second Stop after the resume witness commits cannot be retired by the fi
   try {
     await entered.promise;
     const stopping = h.session.interruptStream({ abandonPartial: true });
-    const secondNonce = await h.session.getCompactionCancellationNonce();
+    const secondNonce = (
+      await (
+        h.session as unknown as { compactionCancellation: CompactionCancellation }
+      ).compactionCancellation.read()
+    )?.nonce;
     expect(secondNonce).not.toBe(firstNonce);
     release.resolve();
     await stopping;
@@ -1559,7 +1566,7 @@ test.each(["history failure", "witness no-op", "automatic"] as const)(
       expect(
         (await new HistoryService(h.config).readCompactionCancellation(workspaceId))?.nonce
       ).toBe(nonce);
-      expect(stream).toHaveBeenCalledTimes(outcome === "automatic" ? 1 : 0);
+      expect(stream).not.toHaveBeenCalled();
     } finally {
       await h.session.dispose();
       await h.cleanup();
@@ -2520,6 +2527,7 @@ test("interrupted handoff snapshot persistence leaves a fresh service able to re
 
 test("Stop survives failed rollback of a committed handoff snapshot batch across restart", async () => {
   const h = await setup();
+  const clock = makeTestEffectRunner();
   await h.historyService.appendToHistory(workspaceId, summary());
   const snapshot = createMuxMessage("retained-snapshot", "user", "Expanded context", {
     synthetic: true,
@@ -2555,10 +2563,19 @@ test("Stop survives failed rollback of a committed handoff snapshot batch across
       workspaceId,
       config: h.config,
       historyService: foreign,
+      streamManager: { ...createStreamLifecycleMocks(), effectRunner: clock.runner },
+      captureEvents: true,
     });
     try {
       const recovered = spyOn(fresh.aiService, "streamMessage");
+      const retries = fresh.session as unknown as { retryActiveStream(): Promise<void> };
+      const deliver = spyOn(retries, "retryActiveStream");
       await fresh.session.runStartupRecovery();
+      await clock.adjust(calculateBackoffDelay(6) * 2);
+      // Deliver any armed retry and join its actual callback before checking provider entry.
+      await Promise.all(deliver.mock.results.map((result) => result.value));
+      expect(deliver).not.toHaveBeenCalled();
+      expect(fresh.events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
       expect(recovered).not.toHaveBeenCalled();
       expect(await foreign.readCompactionCancellation(workspaceId)).not.toBeNull();
     } finally {
@@ -2567,6 +2584,7 @@ test("Stop survives failed rollback of a committed handoff snapshot batch across
   } finally {
     await h.session.dispose();
     await h.cleanup();
+    await clock.dispose();
   }
 });
 
@@ -2731,6 +2749,491 @@ test.each(["absence", "witnessed debt", "Stop after commit"] as const)(
       if (state === "witnessed debt") expect(cancellation.blocksRecovery).toBe(false);
     } finally {
       restoreWrite?.();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each([false, true])(
+  "manual replacement retries a failed Stop publication (storage still fails=%s)",
+  async (persistent) => {
+    const h = await setup();
+    const write = spyOn(h.historyService, "writeCompactionCancellation").mockRejectedValueOnce(
+      new Error("Stop disk unavailable")
+    );
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      expect((await h.session.interruptStream({ abandonPartial: true })).success).toBe(false);
+      if (persistent) write.mockRejectedValue(new Error("Stop disk unavailable"));
+      const result = await h.session
+        .sendMessage("Fresh explicit work", options)
+        .catch((error: unknown) => error);
+      if (persistent) {
+        expect(result).toHaveProperty("message", "Stop disk unavailable");
+        expect(stream).not.toHaveBeenCalled();
+        expect(h.session.hasBlockingCompactionCleanup).toBe(true);
+      } else {
+        expect(result).toEqual(Ok(undefined));
+        expect(stream).toHaveBeenCalledTimes(1);
+        const rows = await new HistoryService(h.config).getLastMessages(workspaceId, 1);
+        expect(rows.success && rows.data[0].parts).toMatchObject([
+          { type: "text", text: "Fresh explicit work" },
+        ]);
+      }
+    } finally {
+      write.mockRestore();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(
+  ["legacy", "failed apply", "failed apply compact"].flatMap((kind) =>
+    [false, true].map((unlinkDebt) => ({ kind, unlinkDebt }))
+  )
+)(
+  "captured source-less $kind cannot follow a foreign replacement (unlink debt=$unlinkDebt)",
+  async ({ kind, unlinkDebt }) => {
+    const h = await setup();
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("original", "user", "Old work")
+    );
+    const context = {
+      modelString: options.model,
+      options,
+      providersConfig: null,
+      compactionPublication: {
+        generation: await h.historyService
+          .getContinuousCompactionJournal(workspaceId)
+          .captureGeneration(),
+      },
+    };
+    const direct = h.session as unknown as {
+      activeStreamContext: typeof context;
+      interruptForCompaction(): Promise<void>;
+      finishContinuousCompaction(
+        applied: boolean,
+        streamContext: typeof context,
+        token: NonNullable<ReturnType<TurnCoordinator["beginCompactionObservation"]>>
+      ): Promise<void>;
+      compactionMonitor: CompactionMonitor;
+    };
+    direct.activeStreamContext = context;
+    if (kind === "failed apply compact")
+      spyOn(direct.compactionMonitor, "checkBeforeSend").mockReturnValue({
+        shouldShowWarning: true,
+        shouldForceCompact: true,
+        usagePercentage: 99,
+        thresholdPercentage: 85,
+        contextTokens: 99_000,
+        maxTokens: 100_000,
+      });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const pricing = h.goalService.assertPricedModelForBudgetedGoal.bind(h.goalService);
+    spyOn(h.goalService, "assertPricedModelForBudgetedGoal").mockImplementationOnce(
+      async (...args) => {
+        const result = await pricing(...args);
+        entered.resolve();
+        await release.promise;
+        return result;
+      }
+    );
+    const token =
+      kind === "legacy"
+        ? undefined
+        : h.internals.coordinator.beginCompactionObservation("continuous");
+    if (token) h.internals.coordinator.setCompactionStage(token, "stopped");
+    const pending =
+      kind === "legacy"
+        ? direct.interruptForCompaction()
+        : direct.finishContinuousCompaction(false, context, token!);
+    const stream = spyOn(h.aiService, "streamMessage");
+    const foreignHistory = new HistoryService(h.config);
+    const foreign = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: foreignHistory,
+    });
+    let restoreWrite: (() => void) | undefined;
+    try {
+      await entered.promise;
+      await foreign.session.interruptStream({ abandonPartial: true });
+      if (unlinkDebt) {
+        const write = foreignHistory.writeCompactionCancellation.bind(foreignHistory);
+        const spy = spyOn(foreignHistory, "writeCompactionCancellation").mockImplementation(
+          (...args) =>
+            args[1] === null ? Promise.reject(new Error("unlink unavailable")) : write(...args)
+        );
+        restoreWrite = () => spy.mockRestore();
+      }
+      expect((await foreign.session.sendMessage("New accepted work", options)).success).toBe(true);
+      release.resolve();
+      await pending;
+      expect(stream).not.toHaveBeenCalled();
+      const rows = await foreignHistory.getLastMessages(workspaceId, 10);
+      expect(
+        rows.success && rows.data.filter((row) => row.role === "user").map((row) => row.parts)
+      ).toMatchObject([[{ text: "Old work" }], [{ text: "New accepted work" }]]);
+      if (token) h.internals.coordinator.finishCompactionObservation(token);
+      direct.activeStreamContext = {
+        ...context,
+        compactionPublication: {
+          generation: await h.historyService
+            .getContinuousCompactionJournal(workspaceId)
+            .captureGeneration(),
+        },
+      };
+      await direct.interruptForCompaction();
+      expect(stream).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      restoreWrite?.();
+      await foreign.session.dispose();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(["unresolved", "absent", "witnessed", "Stop during backoff", "Stop during preparation"])(
+  "startup retry actually delivers retained user rows only without unresolved Stop (%s)",
+  async (state) => {
+    const h = await setup();
+    const clock = makeTestEffectRunner();
+    const foreign = new HistoryService(h.config);
+    const cancellation = new CompactionCancellation(foreign, workspaceId);
+    if (state === "unresolved" || state === "witnessed") await cancellation.cancel();
+    const record = await cancellation.read();
+    await foreign.appendToHistory(
+      workspaceId,
+      createMuxMessage("retained-trigger", "user", "Retained explicit work", {
+        synthetic: true,
+        uiVisible: true,
+        retrySendOptions: options,
+        ...(state === "witnessed" ? { compactionCancellationNonce: record?.nonce } : {}),
+      })
+    );
+    const fresh = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: foreign,
+      streamManager: { ...createStreamLifecycleMocks(), effectRunner: clock.runner },
+      captureEvents: true,
+    });
+    const deliver = spyOn(
+      fresh.session as unknown as { retryActiveStream(): Promise<void> },
+      "retryActiveStream"
+    );
+    const stream = spyOn(fresh.aiService, "streamMessage");
+    try {
+      await fresh.session.runStartupRecovery();
+      if (state === "Stop during backoff") await cancellation.cancel();
+      if (state === "Stop during preparation") {
+        const read = foreign.getHistoryFromLatestBoundary.bind(foreign);
+        spyOn(foreign, "getHistoryFromLatestBoundary").mockImplementationOnce(async (...args) => {
+          const result = await read(...args);
+          await cancellation.cancel();
+          return result;
+        });
+      }
+      await clock.adjust(calculateBackoffDelay(6) * 2);
+      await Promise.all(deliver.mock.results.map((result) => result.value));
+      expect(deliver).toHaveBeenCalledTimes(state === "unresolved" ? 0 : 1);
+      expect(stream).toHaveBeenCalledTimes(state === "absent" || state === "witnessed" ? 1 : 0);
+      expect(fresh.events.some((event) => event.type === "auto-retry-scheduled")).toBe(
+        state !== "unresolved"
+      );
+    } finally {
+      await fresh.session.dispose();
+      await h.session.dispose();
+      await clock.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(["before capture", "after capture"])(
+  "a real stream pins handoff publication when foreign Stop wins %s",
+  async (stage) => {
+    const h = await setup();
+    const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
+    const capture = journal.captureGeneration.bind(journal);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spyOn(journal, "captureGeneration").mockImplementationOnce(async () => {
+      if (stage === "before capture") {
+        entered.resolve();
+        await release.promise;
+      }
+      const generation = await capture();
+      if (stage === "after capture") {
+        entered.resolve();
+        await release.promise;
+      }
+      return generation;
+    });
+    const completed = Promise.withResolvers<TurnCompletion>();
+    const stream = spyOn(h.aiService, "streamMessage").mockResolvedValueOnce(
+      Ok({ messageId: "original-live-stream", completion: completed.promise })
+    );
+    spyOn(h.aiService, "stopStream").mockImplementation(() => {
+      completed.resolve({ status: "aborted", abortReason: "system" });
+      return Promise.resolve(Ok(undefined));
+    });
+    const sending = h.session.sendMessage("Original work", options);
+    const foreign = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: new HistoryService(h.config),
+    });
+    try {
+      await entered.promise;
+      await foreign.session.interruptStream({ abandonPartial: true });
+      expect((await foreign.session.sendMessage("Replacement work", options)).success).toBe(true);
+      release.resolve();
+      expect((await sending).success).toBe(true);
+      const direct = h.session as unknown as { interruptForCompaction(): Promise<void> };
+      await direct.interruptForCompaction();
+      // Capturing after Stop precedes this stream's first context read/provider call;
+      // capturing before it keeps the older epoch even through delayed provider entry.
+      expect(stream).toHaveBeenCalledTimes(stage === "before capture" ? 2 : 1);
+    } finally {
+      release.resolve();
+      completed.resolve({ status: "aborted", abortReason: "system" });
+      await sending.catch(() => undefined);
+      await foreign.session.dispose();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(["replacement", "dispose"])(
+  "held stream generation capture cannot mutate its %s successor",
+  async (action) => {
+    const h = await setup();
+    const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
+    const capture = journal.captureGeneration.bind(journal);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spyOn(journal, "captureGeneration").mockImplementationOnce(async () => {
+      const generation = await capture();
+      entered.resolve();
+      await release.promise;
+      return generation;
+    });
+    const pending = h.session.sendMessage("Old held preparation", options);
+    let closing: Promise<void> | undefined;
+    try {
+      await entered.promise;
+      if (action === "replacement") {
+        await h.session.interruptStream({ abandonPartial: true });
+        // This fixture has no engine startup-abort event; finish its logical turn
+        // while the old physical capture remains held, then admit the successor.
+        h.internals.coordinator.finishTurn(h.internals.coordinator.turnId);
+        expect(await h.session.sendMessage("New successor", options)).toEqual(Ok(undefined));
+        const rows = await h.historyService.getLastMessages(workspaceId, 1);
+        expect(rows.success && rows.data[0].parts).toMatchObject([{ text: "New successor" }]);
+      } else closing = h.session.dispose();
+      const state = h.session as unknown as {
+        activeStreamContext: unknown;
+        activeStreamUserMessageId: string | undefined;
+      };
+      const context = state.activeStreamContext;
+      const userId = state.activeStreamUserMessageId;
+      await h.historyService.writePartial(
+        workspaceId,
+        createMuxMessage("successor-partial", "assistant", "Successor owned partial")
+      );
+      const commit = spyOn(h.historyService, "commitPartial");
+      release.resolve();
+      await pending;
+      await closing;
+      expect(commit).not.toHaveBeenCalled();
+      expect(state.activeStreamContext).toBe(context);
+      expect(state.activeStreamUserMessageId).toBe(userId);
+      expect((await h.historyService.readPartial(workspaceId))?.id).toBe("successor-partial");
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      await closing;
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(["heartbeat", "legacy"])(
+  "invalidated %s publication preserves a successor partial and pending context",
+  async (producer) => {
+    const h = await setup();
+    const followUp = { text: "Continue old work", ...options };
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("old-request", "user", "Compact", {
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: { followUpContent: followUp },
+        },
+      })
+    );
+    const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
+    const capture = journal.captureGeneration.bind(journal);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spyOn(journal, "captureGeneration").mockImplementationOnce(async () => {
+      const generation = await capture();
+      entered.resolve();
+      await release.promise;
+      return generation;
+    });
+    const pending =
+      producer === "heartbeat"
+        ? h.internals.compactionHandler.appendHeartbeatContextResetBoundary({
+            boundaryText: "Old context",
+            pendingFollowUp: followUp,
+          })
+        : h.internals.compactionHandler.handleCompletion(
+            {
+              type: "stream-end",
+              workspaceId,
+              messageId: "old-stream",
+              parts: [{ type: "text", text: "Old context" }],
+              metadata: { model: options.model, duration: 1 },
+            },
+            "old-request"
+          );
+    const foreign = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: new HistoryService(h.config),
+    });
+    try {
+      await entered.promise;
+      await foreign.session.interruptStream({ abandonPartial: true });
+      expect((await foreign.session.sendMessage("B replacement", options)).success).toBe(true);
+      await foreign.historyService.writePartial(
+        workspaceId,
+        createMuxMessage("b-partial", "assistant", "B live partial")
+      );
+      const pendingPath = `${h.config.sessionsDir}/${workspaceId}/post-compaction.json`;
+      await writeFile(pendingPath, "foreign B pending state");
+      release.resolve();
+      await pending;
+      expect((await foreign.historyService.readPartial(workspaceId))?.id).toBe("b-partial");
+      expect(await readFile(pendingPath, "utf8")).toBe("foreign B pending state");
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      await foreign.session.dispose();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  }
+);
+
+test.each(
+  ["heartbeat", "legacy"].flatMap((producer) =>
+    ["prepare write", "failed cleanup", "invalid read cleanup"].map((stage) => ({
+      producer,
+      stage,
+    }))
+  )
+)(
+  "retired $producer $stage cannot change successor pending-state bytes",
+  async ({ producer, stage }) => {
+    const h = await setup();
+    const followUp = { text: "Continue old work", ...options };
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("old-request", "user", "Compact", {
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: { followUpContent: followUp },
+        },
+      })
+    );
+    if (producer === "legacy")
+      await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("old-stream", "assistant", "Streamed old summary")
+      );
+    const pendingPath = `${h.config.sessionsDir}/${workspaceId}/post-compaction.json`;
+    if (stage === "invalid read cleanup") await writeFile(pendingPath, "malformed old state");
+    const handler = h.internals.compactionHandler;
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    if (stage !== "failed cleanup") {
+      const writes = handler as unknown as {
+        enqueuePendingStateWrite(write: () => Promise<void>): Promise<void>;
+      };
+      const enqueue = writes.enqueuePendingStateWrite.bind(writes);
+      spyOn(writes, "enqueuePendingStateWrite").mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return enqueue(...args);
+      });
+    } else if (producer === "heartbeat") {
+      spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        return Err("held heartbeat append failure");
+      });
+    } else {
+      const update = h.historyService.updateHistory.bind(h.historyService);
+      spyOn(h.historyService, "updateHistory").mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return update(...args);
+      });
+    }
+    const pending =
+      producer === "heartbeat"
+        ? handler.appendHeartbeatContextResetBoundary({
+            boundaryText: "Old context",
+            pendingFollowUp: followUp,
+          })
+        : handler.handleCompletion(
+            {
+              type: "stream-end",
+              workspaceId,
+              messageId: "old-stream",
+              parts: [{ type: "text", text: "Old context" }],
+              metadata: { model: options.model, duration: 1 },
+            },
+            "old-request"
+          );
+    const foreign = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: new HistoryService(h.config),
+    });
+    const successor = JSON.stringify({
+      version: 1,
+      createdAt: 1,
+      diffs: [],
+      loadedSkills: [],
+      readFiles: ["/foreign/successor.ts"],
+    });
+    try {
+      await entered.promise;
+      await foreign.session.interruptStream({ abandonPartial: true });
+      expect((await foreign.session.sendMessage("B replacement", options)).success).toBe(true);
+      await writeFile(pendingPath, successor);
+      release.resolve();
+      await pending;
+      expect(await readFile(pendingPath, "utf8").catch(() => "missing")).toBe(successor);
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+      await foreign.session.dispose();
       await h.session.dispose();
       await h.cleanup();
     }

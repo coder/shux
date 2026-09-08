@@ -386,6 +386,7 @@ interface CompactionHandlerOptions {
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
   /** Capture semantic ownership before I/O; durable completion must not retarget a successor. */
   captureCompletionGuard?: () => () => boolean;
+  getCompactionPublication?: () => ContinuousCompactionPublication | undefined;
   /**
    * Called with the terminal outcome of an idle compaction (source === "idle-compaction"),
    * after the summary is actually persisted (success) or a post-stream persistence failure
@@ -416,6 +417,7 @@ export class CompactionHandler {
 
   private readonly onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
   private readonly captureCompletionGuard?: () => () => boolean;
+  private readonly getCompactionPublication?: () => ContinuousCompactionPublication | undefined;
   private readonly onIdleCompactionOutcome?: (success: boolean) => void;
 
   /** Flag indicating post-compaction attachments should be generated on next turn */
@@ -426,8 +428,15 @@ export class CompactionHandler {
   private heartbeatResetRollbackState: HeartbeatResetRollbackState | null = null;
   private pendingStateWrites: Promise<unknown> = Promise.resolve();
 
-  private enqueuePendingStateWrite<T>(write: () => Promise<T>): Promise<T> {
-    const result = this.pendingStateWrites.then(write);
+  private enqueuePendingStateWrite(
+    write: () => Promise<void>,
+    publication?: ContinuousCompactionPublication
+  ): Promise<void> {
+    const result = this.pendingStateWrites.then(() =>
+      publication
+        ? this.historyService.withCompactionPublicationWrite(this.workspaceId, publication, write)
+        : write()
+    );
     this.pendingStateWrites = result.catch(() => undefined);
     return result;
   }
@@ -450,10 +459,13 @@ export class CompactionHandler {
     this.emitter = options.emitter;
     this.onCompactionComplete = options.onCompactionComplete;
     this.captureCompletionGuard = options.captureCompletionGuard;
+    this.getCompactionPublication = options.getCompactionPublication;
     this.onIdleCompactionOutcome = options.onIdleCompactionOutcome;
   }
 
-  private async loadPersistedPendingStateIfNeeded(): Promise<void> {
+  private async loadPersistedPendingStateIfNeeded(
+    publication?: ContinuousCompactionPublication
+  ): Promise<void> {
     if (this.persistedPendingStateLoaded || this.postCompactionAttachmentsPending) {
       return;
     }
@@ -472,14 +484,14 @@ export class CompactionHandler {
       parsed = JSON.parse(raw);
     } catch {
       log.warn("Invalid post-compaction state JSON; ignoring", { workspaceId: this.workspaceId });
-      await this.deletePersistedPendingStateBestEffort();
+      await this.deletePersistedPendingStateBestEffort(publication);
       return;
     }
 
     let state = coercePersistedPostCompactionState(parsed);
     if (!state) {
       log.warn("Invalid post-compaction state schema; ignoring", { workspaceId: this.workspaceId });
-      await this.deletePersistedPendingStateBestEffort();
+      await this.deletePersistedPendingStateBestEffort(publication);
       return;
     }
 
@@ -495,7 +507,7 @@ export class CompactionHandler {
         // nor lose an older, still-pending attachment snapshot.
         state = state.previousState ?? null;
         if (!state || (state.boundaryMessageId && state.boundaryMessageId !== boundaryId)) {
-          await this.deletePersistedPendingStateBestEffort();
+          await this.deletePersistedPendingStateBestEffort(publication);
           return;
         }
       }
@@ -612,15 +624,20 @@ export class CompactionHandler {
     }
   }
 
-  private async deletePersistedPendingStateBestEffort(): Promise<void> {
+  private async deletePersistedPendingStateBestEffort(
+    publication?: ContinuousCompactionPublication
+  ): Promise<void> {
     try {
-      await this.enqueuePendingStateWrite(() => fsPromises.unlink(this.postCompactionStatePath));
+      await this.enqueuePendingStateWrite(
+        () => fsPromises.unlink(this.postCompactionStatePath),
+        publication
+      );
     } catch {
       // ignore
     }
   }
 
-  private captureHeartbeatResetRollbackState(messages: MuxMessage[]): void {
+  private captureHeartbeatResetRollbackState(messages: MuxMessage[]): HeartbeatResetRollbackState {
     this.heartbeatResetRollbackState = {
       sourceRows: messages.map((row) => ({ id: row.id, sequence: row.metadata?.historySequence })),
       postCompactionAttachmentsPending: this.postCompactionAttachmentsPending,
@@ -629,11 +646,14 @@ export class CompactionHandler {
       cachedReadFilePaths: [...this.cachedReadFilePaths],
       persistedPendingStateLoaded: this.persistedPendingStateLoaded,
     };
+    return this.heartbeatResetRollbackState;
   }
 
-  private restoreHeartbeatResetRollbackState(): Promise<void> {
-    const rollbackState = this.heartbeatResetRollbackState;
-    if (!rollbackState) {
+  private restoreHeartbeatResetRollbackState(
+    publication?: ContinuousCompactionPublication,
+    rollbackState = this.heartbeatResetRollbackState
+  ): Promise<void> {
+    if (!rollbackState || rollbackState !== this.heartbeatResetRollbackState) {
       return Promise.resolve();
     }
 
@@ -651,10 +671,13 @@ export class CompactionHandler {
       return this.persistPendingStateBestEffort(
         this.cachedFileDiffs,
         this.cachedLoadedSkills,
-        this.cachedReadFilePaths
+        this.cachedReadFilePaths,
+        undefined,
+        undefined,
+        publication
       );
     } else {
-      return this.deletePersistedPendingStateBestEffort();
+      return this.deletePersistedPendingStateBestEffort(publication);
     }
   }
 
@@ -663,7 +686,8 @@ export class CompactionHandler {
     loadedSkills: LoadedSkillSnapshot[],
     readFiles: string[],
     boundaryMessageId?: string,
-    previousState?: PersistedPostCompactionStateV1
+    previousState?: PersistedPostCompactionStateV1,
+    publication?: ContinuousCompactionPublication
   ): Promise<void> {
     try {
       for (const snapshot of loadedSkills) {
@@ -685,7 +709,7 @@ export class CompactionHandler {
       await this.enqueuePendingStateWrite(async () => {
         await fsPromises.mkdir(this.sessionDir, { recursive: true });
         await fsPromises.writeFile(this.postCompactionStatePath, serialized);
-      });
+      }, publication);
     } catch (error) {
       log.warn("Failed to persist post-compaction state", {
         workspaceId: this.workspaceId,
@@ -697,9 +721,10 @@ export class CompactionHandler {
   async preparePendingStateFromMessages(
     messages: MuxMessage[],
     boundaryMessageId?: string,
-    previousState?: PersistedPostCompactionStateV1
+    previousState?: PersistedPostCompactionStateV1,
+    publication?: ContinuousCompactionPublication
   ): Promise<void> {
-    await this.loadPersistedPendingStateIfNeeded();
+    await this.loadPersistedPendingStateIfNeeded(publication);
     this.pendingStateBoundaryMessageId = boundaryMessageId;
 
     const latestCompactionEpochMessages = sliceMessagesFromLatestCompactionBoundary(messages);
@@ -726,7 +751,8 @@ export class CompactionHandler {
       this.cachedLoadedSkills,
       this.cachedReadFilePaths,
       boundaryMessageId,
-      previousState
+      previousState,
+      publication
     );
   }
 
@@ -813,11 +839,20 @@ export class CompactionHandler {
       "appendHeartbeatContextResetBoundary requires non-empty boundary text"
     );
 
-    const deletePartialResult = await this.historyService.deletePartial(this.workspaceId);
+    const publication = {
+      generation: await this.historyService
+        .getContinuousCompactionJournal(this.workspaceId)
+        .captureGeneration(),
+    };
+    const deletePartialResult = await this.historyService.deletePartial(
+      this.workspaceId,
+      publication
+    );
     if (!deletePartialResult.success) {
       log.warn(
         `Failed to delete partial before heartbeat reset boundary: ${deletePartialResult.error}`
       );
+      return Err(deletePartialResult.error);
     }
 
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
@@ -826,9 +861,9 @@ export class CompactionHandler {
     }
 
     const messages = historyResult.data;
-    await this.loadPersistedPendingStateIfNeeded();
-    this.captureHeartbeatResetRollbackState(messages);
-    await this.preparePendingStateFromMessages(messages);
+    await this.loadPersistedPendingStateIfNeeded(publication);
+    const rollbackState = this.captureHeartbeatResetRollbackState(messages);
+    await this.preparePendingStateFromMessages(messages, undefined, undefined, publication);
 
     const nextCompactionEpoch = getNextCompactionEpoch(messages);
     assert(
@@ -868,12 +903,22 @@ export class CompactionHandler {
     );
 
     const maxExistingHistorySequence = this.getMaxExistingHistorySequence(messages);
+    let skipped = false;
     const persistenceResult = await this.historyService.appendToHistory(
       this.workspaceId,
-      summaryMessage
+      summaryMessage,
+      {
+        publication,
+        allowedTailMessageIds: [],
+        isCurrent: () => true,
+        onSkipped: () => {
+          skipped = true;
+        },
+      }
     );
+    if (skipped) return Err("Heartbeat publication was invalidated");
     if (!persistenceResult.success) {
-      await this.restoreHeartbeatResetRollbackState();
+      await this.restoreHeartbeatResetRollbackState(publication, rollbackState);
       return Err(`Failed to append heartbeat reset boundary: ${persistenceResult.error}`);
     }
 
@@ -980,6 +1025,13 @@ export class CompactionHandler {
     event: StreamEndEvent,
     compactionRequestMessageId?: string
   ): Promise<boolean> {
+    // A streamed summary retains its original stream epoch across foreign Stop.
+    // Standalone callers capture before reading the context used for this completion.
+    const publication = this.getCompactionPublication?.() ?? {
+      generation: await this.historyService
+        .getContinuousCompactionJournal(this.workspaceId)
+        .captureGeneration(),
+    };
     const canComplete = this.captureCompletionGuard?.();
     // The current stream identifies its request when available. Synthetic prompt snapshots can
     // follow that request in history, so the last user row is not always the compaction request.
@@ -1077,7 +1129,8 @@ export class CompactionHandler {
       event.messageId,
       compactionRequestMessage.id,
       isIdleCompaction,
-      pendingFollowUp
+      pendingFollowUp,
+      publication
     );
     if (!result.success) {
       log.error("Compaction failed:", result.error);
@@ -1365,7 +1418,8 @@ export class CompactionHandler {
     streamedSummaryMessageId: string,
     compactionRequestMessageId: string,
     isIdleCompaction = false,
-    pendingFollowUp?: CompactionFollowUpRequest
+    pendingFollowUp?: CompactionFollowUpRequest,
+    publication?: ContinuousCompactionPublication
   ): Promise<Result<CompactionCompletionMetadata, string>> {
     assert(summary.trim().length > 0, "performCompaction requires a non-empty summary");
     assert(metadata.model.trim().length > 0, "Compaction summary requires a model");
@@ -1380,17 +1434,20 @@ export class CompactionHandler {
     // 2. sendQueuedMessages triggers commitPartial
     // 3. commitPartial finds stale partial.json and appends it to history
     // By deleting partial first, commitPartial becomes a no-op
-    const deletePartialResult = await this.historyService.deletePartial(this.workspaceId);
+    const deletePartialResult = await this.historyService.deletePartial(
+      this.workspaceId,
+      publication
+    );
     if (!deletePartialResult.success) {
       log.warn(`Failed to delete partial before compaction: ${deletePartialResult.error}`);
-      // Continue anyway - the partial may not exist, which is fine
+      if (publication) return Err(deletePartialResult.error);
     }
 
     // Extract diffs from the latest compaction epoch only, so append-only history
     // does not re-inject stale pre-boundary edits after subsequent compactions.
     // If boundary markers are malformed, slicing self-heals by falling back to
     // full history instead of crashing or dropping all diffs.
-    await this.preparePendingStateFromMessages(messages);
+    await this.preparePendingStateFromMessages(messages, undefined, undefined, publication);
 
     const nextCompactionEpoch = getNextCompactionEpoch(messages);
     assert(Number.isInteger(nextCompactionEpoch), "next compaction epoch must be an integer");
@@ -1505,21 +1562,40 @@ export class CompactionHandler {
       summaryMessage.id
     );
 
+    let skipped = false;
     const persistenceResult =
       preservedTailCopies.length > 0
         ? await this.historyService.persistBoundaryWithTailCopies(
             this.workspaceId,
             summaryMessage,
             preservedTailCopies,
-            persistedStreamSummary !== null
+            persistedStreamSummary !== null,
+            undefined,
+            publication
           )
         : persistedStreamSummary
-          ? await this.historyService.updateHistory(this.workspaceId, summaryMessage)
-          : await this.historyService.appendToHistory(this.workspaceId, summaryMessage);
+          ? await this.historyService.updateHistory(
+              this.workspaceId,
+              summaryMessage,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              publication
+            )
+          : await this.historyService.appendToHistory(this.workspaceId, summaryMessage, {
+              publication,
+              allowedTailMessageIds: [],
+              isCurrent: () => true,
+              onSkipped: () => {
+                skipped = true;
+              },
+            });
+    if (skipped) return Err("Compaction publication was invalidated");
     if (!persistenceResult.success) {
       this.cachedFileDiffs = [];
       this.cachedLoadedSkills = [];
-      await this.deletePersistedPendingStateBestEffort();
+      await this.deletePersistedPendingStateBestEffort(publication);
       const operation =
         preservedTailCopies.length > 0
           ? "commit boundary with preserved tail"

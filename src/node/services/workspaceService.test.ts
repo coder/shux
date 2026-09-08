@@ -1,3 +1,7 @@
+import type { CompactionHandler } from "./compactionHandler";
+import { CompactionCancellation } from "./compactionCancellation";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
+import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -7378,6 +7382,147 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     return { aiService, config, historyService, workspaceService, goalService, cleanup };
   }
 
+  test.each(
+    ["legacy", "heartbeat"].flatMap((producer) =>
+      [
+        "absent",
+        "unresolved",
+        "narrowed",
+        "manual before publication",
+        "newer Stop during clear",
+      ].map((initial) => ({ producer, initial }))
+    )
+  )(
+    "full clear fences captured foreign $producer publication ($initial Stop)",
+    async ({ producer, initial }) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "clear-foreign-compaction";
+      const options = { model: "openai:gpt-4o", agentId: "exec" };
+      await config.addWorkspace("/tmp/clear-foreign-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-foreign-project",
+        projectPath: "/tmp/clear-foreign-project",
+        runtimeConfig: { type: "local" },
+      });
+      const followUp = { text: "Continue discarded work", ...options };
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("old-request", "user", "Compact", {
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: { followUpContent: followUp },
+          },
+        })
+      );
+      const cancellation = new CompactionCancellation(historyService, workspaceId);
+      const foreignHistory = new HistoryService(config);
+      const foreign = await createAgentSessionHarness({
+        workspaceId,
+        config,
+        historyService: foreignHistory,
+      });
+      const handler = (foreign.session as unknown as { compactionHandler: CompactionHandler })
+        .compactionHandler;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const append = foreignHistory.appendToHistory.bind(foreignHistory);
+      spyOn(foreignHistory, "appendToHistory").mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return append(...args);
+      });
+      const publication =
+        producer === "heartbeat"
+          ? handler.appendHeartbeatContextResetBoundary({
+              boundaryText: "Captured old context",
+              pendingFollowUp: followUp,
+            })
+          : handler.handleCompletion({
+              type: "stream-end",
+              workspaceId,
+              messageId: "old-stream",
+              parts: [{ type: "text", text: "Captured old context" }],
+              metadata: { model: options.model, duration: 1 },
+            });
+      const clock = makeTestEffectRunner();
+      let fresh: Awaited<ReturnType<typeof createAgentSessionHarness>> | undefined;
+      try {
+        await entered.promise;
+        if (initial === "unresolved" || initial === "narrowed") {
+          await cancellation.cancel();
+          if (initial === "narrowed") {
+            const record = await cancellation.read();
+            if (!record) throw new Error("Expected Stop");
+            await cancellation.narrow(
+              record.nonce,
+              createMuxMessage("older-summary", "assistant", "Older work", {
+                historySequence: 10,
+                muxMetadata: { type: "compaction-summary", pendingFollowUp: followUp },
+              })
+            );
+          }
+        }
+        expect((await workspaceService.truncateHistory(workspaceId)).success).toBe(true);
+        if (initial === "newer Stop during clear")
+          await new CompactionCancellation(new HistoryService(config), workspaceId).cancel();
+        if (initial === "manual before publication") {
+          const replacement = await createAgentSessionHarness({
+            workspaceId,
+            config,
+            historyService: new HistoryService(config),
+          });
+          try {
+            expect(
+              (await replacement.session.sendMessage("Fresh explicit work", options)).success
+            ).toBe(true);
+          } finally {
+            await replacement.session.dispose();
+          }
+        }
+        release.resolve();
+        await publication.catch(() => undefined);
+        const published = await foreignHistory.getLastMessages(workspaceId, 10);
+        expect(
+          published.success &&
+            published.data.some((row) => row.metadata?.muxMetadata?.type === "compaction-summary")
+        ).toBe(false);
+        fresh = await createAgentSessionHarness({
+          workspaceId,
+          config,
+          historyService: new HistoryService(config),
+          streamManager: { ...createStreamLifecycleMocks(), effectRunner: clock.runner },
+          captureEvents: true,
+        });
+        const stream = spyOn(fresh.aiService, "streamMessage");
+        await fresh.session.runStartupRecovery();
+        await clock.adjust(calculateBackoffDelay(6) * 2);
+        if (initial === "manual before publication") {
+          const rows = await fresh.historyService.getLastMessages(workspaceId, 1);
+          expect(rows.success && rows.data[0].parts).toMatchObject([
+            { text: "Fresh explicit work" },
+          ]);
+        } else {
+          expect(stream).not.toHaveBeenCalled();
+          expect(fresh.events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+          expect((await fresh.session.sendMessage("Fresh explicit work", options)).success).toBe(
+            true
+          );
+          expect(stream).toHaveBeenCalledTimes(1);
+        }
+      } finally {
+        release.resolve();
+        await publication.catch(() => undefined);
+        await fresh?.session.dispose();
+        await foreign.session.dispose();
+        await workspaceService.disposeSession(workspaceId);
+        await clock.dispose();
+        await cleanup();
+      }
+    }
+  );
+
   test("requireIdle sends carry a live idle-admission probe re-evaluated at session gates", async () => {
     // Codex P1 (PRRT_kwDOPxxmWM6cJ6NI): the preflight count check at
     // sendMessage entry is a one-shot snapshot — a manual send can enter
@@ -8571,8 +8716,13 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
                   workspaceId,
                   createMuxMessage("replacement", "assistant", "new context")
                 );
-        expect(result.success).toBe(false);
-        expect(!result.success && result.error).toContain("cancel unlink unavailable");
+        expect(result.success).toBe(operation === "clear");
+        if (operation === "clear")
+          expect(await historyService.readCompactionCancellation(workspaceId)).toMatchObject({
+            retainUntilReplacement: true,
+            scope: { kind: "unresolved" },
+          });
+        else expect(!result.success && result.error).toContain("cancel unlink unavailable");
         expect(epochs.get(workspaceId)).toBe(before + 1);
         if (operation === "replace") {
           const persisted = await historyService.getHistoryFromLatestBoundary(workspaceId);

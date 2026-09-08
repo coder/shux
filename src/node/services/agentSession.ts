@@ -1,3 +1,4 @@
+import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { PreparedStreamMessage } from "./turnRequestBuilder";
@@ -765,6 +766,7 @@ interface CompactionFollowUpDispatch {
 
 interface SendMessageInternalOptions {
   compactionHandoff?: CompactionToken;
+  compactionHandoffPublication?: ContinuousCompactionPublication;
   /** Durable-summary handoffs revalidate their source inside the history append lock. */
   compactionHandoffSource?: { summary: MuxMessage; onSkipped: () => void };
   preparation?: PreparationAttempt;
@@ -867,6 +869,7 @@ interface PreparationAttempt {
   failure?: SendMessageError;
   onFailure?: (error: SendMessageError) => Promise<void> | void;
   resumeCancellation?: { nonce: string | null; epoch: number };
+  automaticResume?: boolean;
 }
 
 export class AgentSession {
@@ -1126,6 +1129,7 @@ export class AgentSession {
 
   /** Context needed to retry the current stream (cleared on stream end/abort/error). */
   private activeStreamContext?: {
+    compactionPublication?: ContinuousCompactionPublication;
     modelString: string;
     contextBudgetRetried?: boolean;
     requestAssemblySnapshot?: RequestAssemblySnapshot;
@@ -1210,6 +1214,7 @@ export class AgentSession {
 
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
+      getCompactionPublication: () => this.activeStreamContext?.compactionPublication,
       captureCompletionGuard: () => {
         const epoch = this.coordinator.compactionIntent.epoch;
         return () => !this.coordinator.closing && this.coordinator.compactionIntent.epoch === epoch;
@@ -1761,6 +1766,14 @@ export class AgentSession {
   ): Promise<void> {
     if (this.coordinator.closing || !isCurrent()) return;
     using _execution = this.coordinator.enterExecution();
+    // A foreign Stop can arrive while backoff sleeps. Automatic delivery never
+    // replaces that intent; only an accepted explicit row can witness replacement.
+    if (
+      (await this.reconcileCompactionCancellation())?.scope.kind === "unresolved" ||
+      !isCurrent() ||
+      this.coordinator.closing
+    )
+      return;
     const request = this.lastAutoRetryResumeRequest;
     if (!request) {
       this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
@@ -1786,6 +1799,11 @@ export class AgentSession {
     if (this.coordinator.closing || !isCurrent()) return;
     if (result.success) {
       if (!result.data.started) {
+        if (
+          (await this.reconcileCompactionCancellation())?.scope.kind === "unresolved" ||
+          !isCurrent()
+        )
+          return;
         // resumeStream can defer when a turn is still PREPARING/COMPLETING.
         // Treat this as retriable so auto-retry keeps progressing instead of
         // stalling after the "auto-retry-starting" status event.
@@ -2870,6 +2888,10 @@ export class AgentSession {
       });
       return "completed";
     }
+    // A retained handoff row may look interrupted after failed rollback. The
+    // unresolved Stop still owns it even when no live session remembers the abort.
+    if ((await this.reconcileCompactionCancellation())?.scope.kind === "unresolved" || !isCurrent())
+      return "completed";
     await this.handleStreamFailureForAutoRetry(
       {
         type: "unknown",
@@ -4107,6 +4129,7 @@ export class AgentSession {
               ? { replacementNonce: compactionCancellationNonce ?? null }
               : {}),
             summary: internal?.compactionHandoffSource?.summary,
+            publication: internal?.compactionHandoffPublication,
             allowedTailMessageIds: persistedCancelableMessageIds,
             isCurrent: () =>
               !isAdmissionStale() && !this.coordinator.closing && cancelSignal?.aborted !== true,
@@ -5070,6 +5093,7 @@ export class AgentSession {
     }
 
     const attempt: PreparationAttempt = {
+      automaticResume: internal?.automatic === true,
       expectedTurn: expectedTurnId,
       outcome: "preparing",
       durability: "accepted",
@@ -6712,6 +6736,7 @@ export class AgentSession {
         {
           synthetic: true,
           compactionHandoff: token,
+          compactionHandoffPublication: context.compactionPublication ?? { generation: undefined },
           agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
           goalKind: fallback ? undefined : context.goalKind,
           goalId: fallback ? undefined : context.goalId,
@@ -6805,6 +6830,9 @@ export class AgentSession {
           synthetic: true,
           agentInitiated: autoCompactionRequest.agentInitiated,
           compactionHandoff: token,
+          compactionHandoffPublication: streamContext.compactionPublication ?? {
+            generation: undefined,
+          },
           admissionStale: () => !this.coordinator.isCurrentCompaction(token),
         }
       );
@@ -7049,6 +7077,15 @@ export class AgentSession {
     const operation = this.coordinator.registerOperation(turn);
     let completionTransferred = false;
     try {
+      // Capture before the original provider can produce old-context work.
+      // Publish no shared startup state if this await outlives its operation.
+      const compactionPublication = {
+        generation: await this.historyService
+          .getContinuousCompactionJournal(this.workspaceId)
+          .captureGeneration(),
+      };
+      if (isStreamStartAborted() || !this.coordinator.isCurrentOperation(operation))
+        return Ok(undefined);
       // Reset per-stream flags (used for retries / crash-safe bookkeeping).
       this.compactionMonitor.resetForNewStream();
       this.clearLiveUsageState();
@@ -7057,6 +7094,7 @@ export class AgentSession {
       this.activeStreamHadPostCompactionInjection = false;
       const providersConfig = this.getProvidersConfigSafe();
       this.activeStreamContext = {
+        compactionPublication,
         modelString,
         contextBudgetRetried,
         requestAssemblySnapshot,
@@ -7258,6 +7296,12 @@ export class AgentSession {
       // collect them so the Err path resolves each exactly once.
       const preStartErrors: StreamErrorPayload[] = [];
       this.coordinator.configureOperation(operation, this.activeCompactionRequest != null);
+      if (
+        preparation?.automaticResume &&
+        (await this.reconcileCompactionCancellation())?.scope.kind === "unresolved"
+      )
+        return Ok(undefined);
+      if (isStreamStartAborted()) return Ok(undefined);
       const resumedCancellation = preparation?.resumeCancellation;
       if (resumedCancellation) {
         const resumedUser =
@@ -9016,6 +9060,12 @@ export class AgentSession {
     // Refine/archive and failed mutation acquisition share this temporary gate.
     // Only committed replacement history may retire Stop's exact cleanup owner.
     return this.coordinator.reserve("admission");
+  }
+
+  async fenceCompactionForContextClear(): Promise<void> {
+    // Empty history is no replacement witness: foreign legacy/heartbeat writers
+    // can still publish captured summaries after the clear has finished.
+    await this.compactionCancellation.cancel({ retainUntilReplacement: true });
   }
 
   async contextMutationCommitted(cancellationNonce?: string | null): Promise<void> {

@@ -330,7 +330,7 @@ test("a local Stop during corrupt repair prevents its obsolete history commit", 
     expect(await pending).toEqual(newer);
     await stop;
     const freshHistory = new HistoryService(h.config);
-    expect(await freshHistory.readCompactionCancellation(workspaceId)).toEqual(newer);
+    expect(await freshHistory.readCompactionCancellation(workspaceId)).toMatchObject(newer!);
     const rows = await freshHistory.getLastMessages(workspaceId, 1);
     expect(rows.success && rows.data[0].metadata?.muxMetadata).toHaveProperty("pendingFollowUp");
   } finally {
@@ -632,6 +632,158 @@ test("cancellation repair preserves raw reset privacy and invalidates an earlier
       })
       .catch((error: unknown) => error);
     expect(resumed).toHaveProperty("message", "stale_cursor");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test.each([false, true])(
+  "concurrent replacement readers share the latest Stop publication (initial failure=%s)",
+  async (failed) => {
+    const h = await createTestHistoryService();
+    const workspaceId = "shared-replacement-read";
+    const state = new CompactionCancellation(h.historyService, workspaceId);
+    const write = h.historyService.writeCompactionCancellation.bind(h.historyService);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const writes = spyOn(h.historyService, "writeCompactionCancellation");
+    if (failed) writes.mockRejectedValueOnce(new Error("initial publication failed"));
+    writes.mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return write(...args);
+    });
+    const stopped = state.cancel().catch(() => undefined);
+    if (failed) await stopped;
+    const a = state.readForReplacement();
+    const b = state.readForReplacement();
+    try {
+      await entered.promise;
+      release.resolve();
+      const [first, second] = await Promise.all([a, b]);
+      expect(first).toEqual(second);
+      expect(first).not.toBeNull();
+      expect(writes).toHaveBeenCalledTimes(failed ? 2 : 1);
+      expect(await new HistoryService(h.config).readCompactionCancellation(workspaceId)).toEqual(
+        first
+      );
+    } finally {
+      release.resolve();
+      await Promise.all([stopped, a.catch(() => undefined), b.catch(() => undefined)]);
+      await h.cleanup();
+    }
+  }
+);
+
+test.each([
+  "before lock",
+  "witnessed before lock",
+  "before advance",
+  "after advance",
+  "foreign Stop",
+  "foreign repair",
+  "witnessed acknowledgement failure",
+])("failed Stop retry preserves monotonic publication ownership (%s)", async (failure) => {
+  const h = await createTestHistoryService();
+  const workspaceId = "failed-publication-generation";
+  const state = new CompactionCancellation(h.historyService, workspaceId);
+  const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
+  const initial = await journal.captureGeneration();
+  const invalidate = journal.invalidateUnderHistoryLock.bind(journal);
+  if (failure === "before lock" || failure === "witnessed before lock")
+    spyOn(h.historyService, "writeCompactionCancellation").mockRejectedValueOnce(
+      new Error("publication unavailable before lock")
+    );
+  else if (failure === "before advance")
+    spyOn(journal, "invalidateUnderHistoryLock").mockRejectedValueOnce(
+      new Error("generation unavailable")
+    );
+  else if (failure !== "witnessed acknowledgement failure")
+    spyOn(journal, "invalidateUnderHistoryLock").mockImplementationOnce(async (...args) => {
+      await invalidate(...args);
+      throw new Error("sidecar unavailable after advancement");
+    });
+  else {
+    const write = h.historyService.writeCompactionCancellation.bind(h.historyService);
+    spyOn(h.historyService, "writeCompactionCancellation").mockImplementationOnce(
+      async (...args) => {
+        await write(...args);
+        throw new Error("acknowledgement unavailable");
+      }
+    );
+  }
+  try {
+    expect(
+      await state.cancel().then(
+        () => false,
+        () => true
+      )
+    ).toBe(true);
+    const attempted = await state.read();
+    const advanced = await journal.captureGeneration();
+    expect(advanced === initial).toBe(
+      failure === "before advance" ||
+        failure === "before lock" ||
+        failure === "witnessed before lock"
+    );
+    const foreign = new HistoryService(h.config);
+    let successor = await foreign.readCompactionCancellation(workspaceId);
+    if (
+      failure === "foreign Stop" ||
+      failure === "before lock" ||
+      failure === "witnessed before lock"
+    ) {
+      await new CompactionCancellation(foreign, workspaceId).cancel();
+      successor = await foreign.readCompactionCancellation(workspaceId);
+      if (failure === "witnessed before lock") {
+        const replacement = new CompactionCancellation(foreign, workspaceId);
+        const stopped = await replacement.read();
+        if (!stopped) throw new Error("Expected foreign Stop");
+        await foreign.appendToHistory(
+          workspaceId,
+          createMuxMessage("b-accepted", "user", "B accepted replacement", {
+            compactionCancellationNonce: stopped.nonce,
+          })
+        );
+        await replacement.retireReplacement(stopped.nonce);
+        successor = null;
+      }
+    } else if (failure === "foreign repair") {
+      await writeFile(
+        `${h.config.sessionsDir}/${workspaceId}/${COMPACTION_CANCELLATION_FILE}`,
+        "{"
+      );
+      await foreign.repairCompactionCancellation(
+        workspaceId,
+        () => true,
+        () => undefined
+      );
+      successor = null;
+    } else if (failure === "witnessed acknowledgement failure") {
+      await foreign.appendToHistory(
+        workspaceId,
+        createMuxMessage("accepted", "user", "New accepted work", {
+          compactionCancellationNonce: attempted?.nonce,
+        })
+      );
+    }
+    const epochBeforeRetry = await journal.captureGeneration();
+    const preserveForeign =
+      failure.startsWith("foreign") ||
+      failure === "witnessed acknowledgement failure" ||
+      failure === "before lock" ||
+      failure === "witnessed before lock";
+    if (preserveForeign) await writeFile(journal.path, "newer journal must survive stale cleanup");
+    const result = await state.readForReplacement();
+    if (preserveForeign) {
+      expect(result).toEqual(successor);
+      expect(await journal.captureGeneration()).toBe(epochBeforeRetry);
+      expect(await readFile(journal.path, "utf8")).toBe("newer journal must survive stale cleanup");
+    } else {
+      expect(result?.nonce).toBe(attempted?.nonce);
+      expect(await journal.captureGeneration()).not.toBe(advanced);
+    }
+    expect(state.needsPersistence).toBe(false);
   } finally {
     await h.cleanup();
   }

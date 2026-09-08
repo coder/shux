@@ -27,6 +27,7 @@ import {
   MalformedCompactionCancellationError,
   matchesCompactionCancellation,
   type CompactionCancellationRecord,
+  type CompactionCancellationPublication,
 } from "./compactionCancellation";
 import {
   ContinuousCompactionJournalStore,
@@ -89,6 +90,7 @@ import {
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
 
 interface CompactionFollowUpAppendCondition {
+  publication?: ContinuousCompactionPublication;
   /** Presence selects manual replacement admission; null captures semantic absence. */
   replacementNonce?: string | null;
   summary?: MuxMessage;
@@ -472,7 +474,8 @@ export class HistoryService {
     workspaceId: string,
     record: CompactionCancellationRecord | null,
     isCurrent: () => boolean,
-    retiredNonce?: string
+    retiredNonce?: string,
+    publication?: CompactionCancellationPublication
   ): Promise<void> {
     // This file supplements legacy pendingFollowUp removal when transcript I/O
     // fails. Older builds only honor successful cleanup of that legacy marker.
@@ -487,19 +490,67 @@ export class HistoryService {
       );
       if (record === null) {
         const current = await this.readCompactionCancellation(workspaceId);
+        if (!isCurrent() || current?.nonce !== retiredNonce) return;
+        if (
+          current?.retainUntilReplacement &&
+          !(await this.hasCompactionReplacementWitnessUnlocked(workspaceId, current.nonce))
+        )
+          return;
         if (isCurrent() && current?.nonce === retiredNonce)
           await fs.rm(cancellationPath, { force: true });
         return;
       }
+      const current = await this.readCompactionCancellation(workspaceId).catch(() => undefined);
       if (record.scope.kind === "summary") {
-        const current = await this.readCompactionCancellation(workspaceId);
-        if (current?.nonce !== record.nonce) return;
+        if (current?.nonce !== record.nonce || current.retainUntilReplacement) return;
+      } else if (current?.retainUntilReplacement || current === undefined) {
+        // Carry clear's conservative fence through a foreign Stop. An unreadable
+        // old sidecar cannot safely prove that this obligation was absent.
+        record = { ...record, retainUntilReplacement: true };
       }
       await ensurePrivateDir(this.getSessionDir(workspaceId));
+      if (record.scope.kind === "unresolved") {
+        // A lost acknowledgement must not erase fresh work after this exact Stop
+        // already published or was replaced. Transcript failure still permits Stop.
+        if (
+          current?.nonce === record.nonce ||
+          (await this.hasCompactionReplacementWitnessUnlocked(workspaceId, record.nonce).catch(
+            () => false
+          ))
+        )
+          return;
+        const journal = this.getContinuousCompactionJournal(workspaceId);
+        const predecessor = {
+          nonce: current === undefined ? undefined : (current?.nonce ?? null),
+          generation: await journal.captureGenerationUnderHistoryLock(),
+        };
+        // An unobserved failed attempt cannot adopt any established frontier,
+        // including a generation whose Stop was already witnessed and unlinked.
+        if (
+          publication &&
+          publication.attempts > 1 &&
+          !publication.predecessor &&
+          (current || predecessor.generation !== undefined)
+        )
+          return;
+        // Failed A may retry only its own publication frontier. A foreign Stop
+        // or repair supersedes it; refresh shared state instead of overwriting B.
+        if (publication?.predecessor && !isDeepStrictEqual(publication.predecessor, predecessor))
+          return;
+        if (publication) publication.predecessor = predecessor;
+        // Publish a never-reused epoch BEFORE the sidecar. Record advancement
+        // before journal cleanup so partial failure still has an exact retry CAS.
+        await journal.invalidateUnderHistoryLock((generation) => {
+          if (publication) publication.predecessor = { ...predecessor, generation };
+        });
+      }
       const stagedPath = `${cancellationPath}.${randomUUID()}`;
       try {
         await writeFileAtomic(stagedPath, JSON.stringify(record), { mode: 0o600 });
-        if (isCurrent()) renameSync(stagedPath, cancellationPath);
+        if (isCurrent()) {
+          renameSync(stagedPath, cancellationPath);
+          if (publication?.predecessor) publication.predecessor.nonce = record.nonce;
+        }
       } finally {
         await fs.rm(stagedPath, { force: true });
       }
@@ -2341,9 +2392,49 @@ export class HistoryService {
   }
 
   /**
-   * Delete the partial message file for a workspace.
+   * Pending-state writes must retain their original publication epoch across Stop.
+   * The callback performs filesystem I/O only; it must not reacquire history or journal queues.
    */
-  async deletePartial(workspaceId: string): Promise<Result<void>> {
+  async withCompactionPublicationWrite(
+    workspaceId: string,
+    publication: ContinuousCompactionPublication,
+    write: () => Promise<void>
+  ): Promise<void> {
+    await this.fileLocks.withLock(workspaceId, () =>
+      this.withHistoryWriteFileLock(workspaceId, async () => {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return;
+        if (
+          await this.getContinuousCompactionJournal(
+            workspaceId
+          ).isPublicationCurrentUnderHistoryLock(publication)
+        ) {
+          await write();
+        }
+      })
+    );
+  }
+
+  /** Delete the partial message file for a workspace. */
+  async deletePartial(
+    workspaceId: string,
+    publication?: ContinuousCompactionPublication
+  ): Promise<Result<void>> {
+    if (publication)
+      return this.withRecoveredHistoryWriteResultLock(
+        workspaceId,
+        "Failed to delete partial",
+        async () => {
+          // Compaction cleanup must share the publication lock: an old producer
+          // cannot unlink the replacement stream's partial while awaiting its epoch.
+          if (
+            !(await this.getContinuousCompactionJournal(
+              workspaceId
+            ).isPublicationCurrentUnderHistoryLock(publication))
+          )
+            return Err("Compaction publication was invalidated");
+          return this.deletePartialUnlocked(workspaceId);
+        }
+      );
     return this.fileLocks.withLock(workspaceId, () => this.deletePartialUnlocked(workspaceId));
   }
 
@@ -2878,6 +2969,13 @@ export class HistoryService {
     workspaceId: string,
     condition: CompactionFollowUpAppendCondition
   ): Promise<boolean> {
+    if (
+      condition.publication &&
+      !(await this.getContinuousCompactionJournal(workspaceId).isPublicationCurrentUnderHistoryLock(
+        condition.publication
+      ))
+    )
+      return false;
     if (condition.replacementNonce !== undefined) {
       return (
         (await this.matchesReplacementCancellationUnlocked(
@@ -3089,13 +3187,21 @@ export class HistoryService {
     shouldUpdate?: (current: MuxMessage) => boolean,
     updateFromCurrent?: (current: MuxMessage) => MuxMessage,
     onCommitted?: () => void,
-    cancellationNonce?: string
+    cancellationNonce?: string,
+    publication?: ContinuousCompactionPublication
   ): Promise<Result<void>> {
     assert(!onCommitted || shouldUpdate, "Update commit observers require a conditional mutation");
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to update history",
       async () => {
+        if (
+          publication &&
+          !(await this.getContinuousCompactionJournal(
+            workspaceId
+          ).isPublicationCurrentUnderHistoryLock(publication))
+        )
+          return Err("Compaction publication was invalidated");
         // A live cancellation read can age across another backend's accepted replacement.
         // Only the exact still-unwitnessed Stop may erase its captured pending summary.
         if (cancellationNonce !== undefined) {

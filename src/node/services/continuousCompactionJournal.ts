@@ -109,7 +109,7 @@ export class ContinuousCompactionJournalStore {
     return result;
   }
 
-  private async readGenerationUnderHistoryLock(): Promise<string | undefined> {
+  async captureGenerationUnderHistoryLock(): Promise<string | undefined> {
     try {
       // The bytes are an opaque version, not semantic configuration. Damaged
       // bytes fence older work while fresh capture can still make progress.
@@ -124,7 +124,7 @@ export class ContinuousCompactionJournalStore {
   }
 
   captureGeneration(): Promise<string | undefined> {
-    return this.enqueue(() => this.readGenerationUnderHistoryLock());
+    return this.enqueue(() => this.captureGenerationUnderHistoryLock());
   }
 
   /** Caller already owns the history lock; never join the queue of writers waiting for it. */
@@ -132,18 +132,20 @@ export class ContinuousCompactionJournalStore {
     publication: ContinuousCompactionPublication
   ): Promise<boolean> {
     return (
-      publication.generation === (await this.readGenerationUnderHistoryLock()) &&
+      publication.generation === (await this.captureGenerationUnderHistoryLock()) &&
       (await this.canPublishUnderHistoryLock())
     );
   }
 
   /** Authoritative repair, unlike an old compactor's identity-scoped cleanup. */
-  async invalidateUnderHistoryLock(): Promise<void> {
+  async invalidateUnderHistoryLock(onAdvanced?: (generation: string) => void): Promise<void> {
+    const generation = randomUUID();
     await writeFileAtomic(
       path.join(path.dirname(this.path), CONTINUOUS_COMPACTION_GENERATION_FILE),
-      randomUUID(),
+      generation,
       { mode: 0o600 }
     );
+    onAdvanced?.(createHash("sha256").update(generation).digest("hex"));
     await fs.rm(this.path, { force: true });
   }
 
