@@ -7,7 +7,11 @@ import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
-import { MEMORY_INTUITION_MAX_USES_PER_TURN } from "@/common/constants/memory";
+import {
+  MEMORY_INTUITION_MAX_USES_PER_TURN,
+  type MemoryScopeAccess,
+} from "@/common/constants/memory";
+import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
 import {
   resolveHeadlessAgentDefinition,
   resolveHeadlessAgentSettings,
@@ -1411,10 +1415,17 @@ export class TurnRequestBuilder {
       ) &&
       !isRlmModeEnabled(experiments, isExperimentEnabled);
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
-    const memoryAccess = resolveMemoryAccessPolicy({
+    const agentMemoryAccess = resolveMemoryAccessPolicy({
       planLike: agentIsPlanLike,
       editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
     });
+    // SECURITY: the context-budget final flush is a hidden automatic turn whose only job is
+    // writing the workspace context notes. Keep global/project stores read-only and pin
+    // mutations to that one file so injected transcript content cannot reach other memory.
+    const contextBudgetFlushTurn = muxMetadata?.contextBudgetFlush === true;
+    const memoryAccess: MemoryScopeAccess = contextBudgetFlushTurn
+      ? { global: "read", project: "read", workspace: agentMemoryAccess.workspace }
+      : agentMemoryAccess;
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
     // repo hook execution (tool_env/tool_pre/tool_post) while keeping
@@ -2243,6 +2254,7 @@ export class TurnRequestBuilder {
       historyService: this.dependencies.historyService,
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess,
+      ...(contextBudgetFlushTurn ? { memoryWritePath: CONTEXT_NOTES_MEMORY_PATH } : {}),
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {
         ...experiments,

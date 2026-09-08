@@ -45,6 +45,7 @@ function projectMemoryPath(xumHome: string, relPath: string): string {
 
 async function createFixture(options?: {
   memoryAccess?: MemoryScopeAccess;
+  memoryWritePath?: string;
 }): Promise<MemoryToolFixture> {
   const tempDir = new TestTempDir("test-memory-tool");
   const xumHome = path.join(tempDir.path, "mux-home");
@@ -60,6 +61,7 @@ async function createFixture(options?: {
     project: "readwrite",
     workspace: "readwrite",
   };
+  config.memoryWritePath = options?.memoryWritePath;
   return {
     xumHome,
     checkout,
@@ -307,6 +309,55 @@ describe("memory tool", () => {
       if (!result.success) {
         expect(result.error).toContain("read-only");
       }
+    });
+  });
+
+  describe("pinned write path", () => {
+    const notes = "/memories/workspace/context-notes.md";
+
+    it("allows mutations of the pinned file only, including normalized spellings", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      expect(
+        (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success
+      ).toBe(true);
+      expect(
+        (
+          await run(fixture.tool, {
+            command: "str_replace",
+            path: ` ${notes}/`,
+            old_str: "state",
+            new_str: "more state",
+          })
+        ).success
+      ).toBe(true);
+      expect((await run(fixture.tool, { command: "view", path: "/memories/global" })).success).toBe(
+        true
+      );
+    });
+
+    it("rejects mutations elsewhere, rename away from the pin, and non-workspace scopes", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      expect(
+        (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success
+      ).toBe(true);
+      for (const input of [
+        { command: "create", path: "/memories/workspace/other.md", file_text: "x" },
+        { command: "create", path: "/memories/global/notes.md", file_text: "x" },
+        { command: "delete", path: "/memories/workspace" },
+        { command: "rename", old_path: notes, new_path: "/memories/global/context-notes.md" },
+        { command: "rename", old_path: notes, new_path: "/memories/workspace/moved.md" },
+      ] as const) {
+        const result = await run(fixture.tool, input);
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("may only modify");
+      }
+      expect((await run(fixture.tool, { command: "view", path: notes })).success).toBe(true);
+    });
+
+    it("rejects a pin that is not a file inside a scope", async () => {
+      using fixture = await createFixture();
+      fixture.config.memoryWritePath = "/memories/workspace";
+      expect(() => createMemoryTool(fixture.config)).toThrow();
     });
   });
 

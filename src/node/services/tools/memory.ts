@@ -86,23 +86,39 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
   const access = config.memoryAccess ?? READ_ONLY_ACCESS;
 
   const ctx = memoryScopeContextFromToolConfig(config);
+  // Normalized once so trailing slashes or whitespace in a call cannot bypass the pin.
+  const writePin = config.memoryWritePath != null ? parseMemoryPath(config.memoryWritePath) : null;
+  assert(
+    writePin == null || (writePin.scope !== null && writePin.relPath !== ""),
+    "memoryWritePath must name a file inside a memory scope"
+  );
 
   /**
    * Returns a recoverable error result when the (parsed) scope is read-only
-   * for this agent; null when the mutation may proceed. Invalid paths fall
-   * through (null) so the service produces its canonical validation error.
+   * for this agent or the mutation leaves the pinned write path; null when the
+   * mutation may proceed. Invalid paths fall through (null) so the service
+   * produces its canonical validation error.
    */
   function checkWriteAccess(virtualPath: string): MemoryToolResult | null {
-    let scope: MemoryScope | null;
+    let parsed: ReturnType<typeof parseMemoryPath>;
     try {
-      scope = parseMemoryPath(virtualPath).scope;
+      parsed = parseMemoryPath(virtualPath);
     } catch {
       return null;
     }
+    const scope: MemoryScope | null = parsed.scope;
     if (scope !== null && access[scope] !== "readwrite") {
       return {
         success: false,
         error: `The ${scope} memory scope is read-only for this agent; only 'view' is allowed.`,
+      };
+    }
+    // SECURITY: a hidden flush turn runs on a transcript that may carry injected tool
+    // output; pinning writes to one file keeps it from reaching other memory stores.
+    if (writePin && (scope !== writePin.scope || parsed.relPath !== writePin.relPath)) {
+      return {
+        success: false,
+        error: `This turn may only modify ${config.memoryWritePath}; other memory paths are view-only.`,
       };
     }
     return null;

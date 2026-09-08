@@ -207,6 +207,11 @@ export interface ToolConfiguration {
   timelineService?: TimelineService;
   /** Per-scope memory write policy for the current agent (defaults to read-only). */
   memoryAccess?: MemoryScopeAccess;
+  /**
+   * When set, every mutating memory command is limited to this exact virtual path
+   * (context-budget flush turns may only write the workspace context notes).
+   */
+  memoryWritePath?: string;
   /** Callback to record file state for external edit detection (plan files) */
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
   /** Callback to notify that provider/config was written (triggers hot-reload). */

@@ -1360,6 +1360,8 @@ describe("AgentSession token-budget lifecycle", () => {
       "memory",
       "session_history",
     ]);
+    // The request builder pins memory writes to the notes file from this flag.
+    expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     // The flush turn's own settlement re-evaluates as rollover without queuing a second flush.
     expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
