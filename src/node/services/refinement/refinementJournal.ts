@@ -175,7 +175,17 @@ const reclamationStates = new WeakMap<DurableEventJournal, RefinementReclamation
  */
 export async function reclaimExcessRefinementInverseBlobs(
   journal: DurableEventJournal,
-  published: BlobQuotaEntry[]
+  published: BlobQuotaEntry[],
+  options?: {
+    /**
+     * The published payloads belong to rows appended out of chronological
+     * order (shared-memory row migration stamps `sourceTs`): re-derive the
+     * retained set from the journal in source order instead of treating them
+     * as the newest, so an old migrated inverse cannot evict the owner's
+     * genuinely recent rollback data.
+     */
+    resweep?: boolean;
+  }
 ): Promise<void> {
   await journal.withBlobLock(async () => {
     let state = reclamationStates.get(journal);
@@ -189,13 +199,25 @@ export async function reclaimExcessRefinementInverseBlobs(
     // foreign CLI appended and must be re-derived from the journal.
     const epoch = journal.blobIndexEpoch;
     let entries: BlobQuotaEntry[];
-    if (state.retainedInverseBlobs !== null && state.retainedEpoch === epoch) {
+    if (
+      state.retainedInverseBlobs !== null &&
+      state.retainedEpoch === epoch &&
+      options?.resweep !== true
+    ) {
       entries = [...published, ...state.retainedInverseBlobs];
     } else {
-      // Recovery sweep: walk refinement rows newest-first and re-derive the
+      // Recovery sweep: walk refinement rows newest-first — by SOURCE time
+      // (`data.sourceTs ?? ts`, append sequence as tie-breaker), so migrated
+      // rows sit at their real chronological position — and re-derive the
       // retained set. Rows never recorded payload sizes, so stat the blobs;
       // a missing blob was already evicted (or never landed) — skip it.
-      const events = await journal.read();
+      const events = (await journal.read())
+        .filter((event) => event.kind === "refinement")
+        .sort((left, right) => {
+          const leftTs = left.data.sourceTs ?? left.ts;
+          const rightTs = right.data.sourceTs ?? right.ts;
+          return leftTs !== rightTs ? leftTs - rightTs : left.seq - right.seq;
+        });
       entries = [];
       for (let i = events.length - 1; i >= 0; i--) {
         const event = events[i];
@@ -302,7 +324,9 @@ export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Pr
     // lock (reclaim takes it itself; the mutex is non-reentrant). Best-effort:
     // failure must never fail the mutation this row describes.
     try {
-      await reclaimExcessRefinementInverseBlobs(journal, publishedBlobs);
+      await reclaimExcessRefinementInverseBlobs(journal, publishedBlobs, {
+        resweep: args.sourceTs !== undefined,
+      });
     } catch (error) {
       log.debug("[refinement] inverse blob reclamation failed; continuing", { error });
     }

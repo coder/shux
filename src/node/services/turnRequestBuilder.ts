@@ -1437,6 +1437,22 @@ export class TurnRequestBuilder {
           memoryAccess.workspace === "readwrite"
         );
       if (!persisted) {
+        if (memoryAccess.workspace !== "readwrite") {
+          // A stale persisted `true` would let this now read-only agent's
+          // transcript harvest into the (shared) workspace notebook after a
+          // restart. Refuse to run the turn until the deny is durable.
+          const errorMessage =
+            "Could not persist this workspace's read-only memory policy; refusing to start the turn so a restart cannot fall back to a stale write permission. Retry once the config directory is writable.";
+          const errorEvent = createErrorEvent(workspaceId, {
+            messageId: createAssistantMessageId(),
+            error: errorMessage,
+            errorType: "unknown",
+            acpPromptId,
+          });
+          if (!context.admissionOnly) this.dependencies.emit("error", errorEvent);
+          onPreStartError?.(errorEvent);
+          return { type: "finished", result: Err({ type: "unknown", raw: errorMessage }) };
+        }
         log.warn(
           "Workspace memory write policy could not be persisted; harvests will fail closed",
           {

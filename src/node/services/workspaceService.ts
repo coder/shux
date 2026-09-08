@@ -4224,7 +4224,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
     )?.recordWorkspaceMemoryWritable(writable);
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-    if (entry === null) return false;
+    // Unregistered workspace: nothing durable to update and no stale
+    // permission to invalidate (harvests fail closed on the missing value).
+    if (entry === null) return true;
     if (entry.workspace.workspaceMemoryWritable === writable) return true;
     try {
       await this.config.editConfig((cfg) => {
@@ -5991,38 +5993,62 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
 
         // Shared workspace memory (sub-agents write into their task-tree
-        // owner's store): pin the owner on surviving descendants HERE, before
-        // any destructive step — their parent chain is about to lose this
-        // node — so an abort leaves a fully intact, retryable workspace. The
-        // refinement-row handover itself happens under the removal locks
-        // below (the point of no return), where no further child write can
-        // slip past the scan. Idempotent on retry.
+        // owner's store). BEFORE any destructive step — so a failure leaves a
+        // fully intact, retryable workspace:
+        //  - pin the owner on surviving descendants (their parent chain is
+        //    about to lose this node), verified by reading the config back
+        //    because Config swallows write failures;
+        //  - hand this workspace's live shared-memory refinement rows over to
+        //    the owner's journal (idempotent via `migratedFrom`). A second,
+        //    delta pass runs under the removal locks below so a write that
+        //    lands in between is captured too; that late pass only has the
+        //    few rows appended since this one, keeping the fallible work at
+        //    the point of no return minimal.
         const sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
           this.config.loadConfigOrDefault(),
           workspaceId
         );
         if (sharedMemoryOwnerId !== workspaceId) {
           try {
-            await this.config.editConfig((cfg) => {
+            const pinOwner = (cfg: ReturnType<Config["loadConfigOrDefault"]>): string[] => {
+              const pinned: string[] = [];
               for (const project of cfg.projects.values()) {
                 for (const workspace of project.workspaces) {
-                  if (
-                    workspace.parentWorkspaceId === workspaceId &&
-                    !workspace.memoryOwnerWorkspaceId
-                  ) {
-                    workspace.memoryOwnerWorkspaceId = sharedMemoryOwnerId;
+                  if (workspace.parentWorkspaceId === workspaceId) {
+                    if (!workspace.memoryOwnerWorkspaceId) {
+                      workspace.memoryOwnerWorkspaceId = sharedMemoryOwnerId;
+                    }
+                    if (workspace.id !== undefined) pinned.push(workspace.id);
                   }
                 }
               }
+              return pinned;
+            };
+            let pinnedIds: string[] = [];
+            await this.config.editConfig((cfg) => {
+              pinnedIds = pinOwner(cfg);
               return cfg;
+            });
+            const persisted = this.config.loadConfigOrDefault();
+            for (const id of pinnedIds) {
+              const entry = findWorkspaceEntry(persisted, id);
+              if (entry === null || !entry.workspace.memoryOwnerWorkspaceId) {
+                throw new Error(`memory owner pin for descendant ${id} did not persist`);
+              }
+            }
+            await migrateSharedMemoryRefinementRows({
+              childSessionDir: path.join(this.config.sessionsDir, workspaceId),
+              childWorkspaceId: workspaceId,
+              ownerSessionDir: path.join(this.config.sessionsDir, sharedMemoryOwnerId),
+              ownerWorkspaceId: sharedMemoryOwnerId,
             });
           } catch (error) {
             if (!force) {
               return Err(
-                `Failed to pin the shared memory owner on this sub-agent's descendants (${getErrorMessage(error)}); the workspace was left intact — retry the removal`
+                `Failed to hand this sub-agent's shared workspace memory over to its owner (${getErrorMessage(error)}); the workspace was left intact — retry the removal`
               );
             }
-            log.warn("Forced removal: could not pin the shared memory owner on descendants", {
+            log.warn("Forced removal: shared-memory handover to the owner failed", {
               workspaceId,
               sharedMemoryOwnerId,
               error: getErrorMessage(error),
@@ -6413,10 +6439,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // A sub-agent's workspace memory lives in its task-tree owner's
         // session dir; hold that store's lock as well so an admitted child
         // write cannot slip between this tombstone and its commit check, and
-        // copy the child's live shared-memory refinement rows to the owner
-        // inside those locks (the only durable inverse once the session dir
-        // is deleted). Resolved from persisted config, so the phantom
-        // (metadata-less) path is covered too.
+        // run the delta pass of the refinement-row handover inside those
+        // locks (rows appended since the pre-teardown pass; the phantom,
+        // metadata-less path gets its full pass here). Resolved from
+        // persisted config.
         const memoryOwnerId = resolveWorkspaceMemoryOwnerId(
           this.config.loadConfigOrDefault(),
           workspaceId
