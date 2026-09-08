@@ -1202,4 +1202,20 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(await store.read()).toBeNull();
     expect(await store.read()).toBeNull();
   });
+
+  it("keeps corrupt-journal cleanup failure from blocking recovery", async () => {
+    const { store } = await setup();
+    await writeFile(store.path, "{");
+    const remove = journalFs.rm;
+    const failure = spyOn(journalFs, "rm").mockImplementation((...args) =>
+      args[0] === store.path ? Promise.reject(new Error("cleanup unavailable")) : remove(...args)
+    );
+    expect(await store.read().catch((error: unknown) => error)).toBeNull();
+    const rows = await history.historyService.getLastMessages(workspaceId, 10);
+    assert(rows.success, "Expected source history");
+    expect(rows.data.map((row) => row.id)).toEqual(["live"]);
+    failure.mockRestore();
+    expect(await store.read()).toBeNull();
+    expect(await store.exists()).toBe(false);
+  });
 });

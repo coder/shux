@@ -115,7 +115,7 @@ export async function publishCompactionFile(
   }
 }
 
-/** Journal publication and history folding serialize on the same cross-process history lock. */
+/** Owned journal publication/cleanup and history folding share the cross-process history lock. */
 export class ContinuousCompactionJournalStore {
   private generation = 0;
   private pending: Promise<unknown> = Promise.resolve();
@@ -125,8 +125,13 @@ export class ContinuousCompactionJournalStore {
     private readonly withHistoryLock: <T>(operation: () => Promise<T>) => Promise<T>
   ) {}
 
-  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.pending.then(() => this.withHistoryLock(operation));
+  private enqueue<T>(
+    operation: () => Promise<T>,
+    lock: "history" | "local" = "history"
+  ): Promise<T> {
+    const result = this.pending.then(() =>
+      lock === "history" ? this.withHistoryLock(operation) : operation()
+    );
     this.pending = result.catch(() => undefined);
     return result;
   }
@@ -196,8 +201,11 @@ export class ContinuousCompactionJournalStore {
     // Migration seam: explicit destructive intent retains main's unconditional
     // clearing and synchronous local fence. Exact asynchronous cleanup cannot
     // assume this authority; durable cross-backend reset fencing is separate.
+    // Keep the legacy unlink on the local queue: making it acquire the history
+    // lock could time out and silently leave cancelled work recoverable. It does
+    // not create a directory or fence a foreign producer's future publication.
     this.generation++;
-    return this.enqueue(() => fs.rm(this.path, { force: true }));
+    return this.enqueue(() => fs.rm(this.path, { force: true }), "local");
   }
 
   exists(): Promise<boolean> {
@@ -235,7 +243,10 @@ export class ContinuousCompactionJournalStore {
         journal = ContinuousCompactionJournalSchema.parse(JSON.parse(contents));
       } catch (error) {
         log.warn("[continuous-compaction] discarded invalid journal", error);
-        await fs.rm(this.path, { force: true });
+        await fs.rm(this.path, { force: true }).catch((cleanupError: unknown) => {
+          // An unusable journal must not block recovery just because unlink is unavailable.
+          log.warn("[continuous-compaction] invalid journal cleanup failed", cleanupError);
+        });
         return null;
       }
       if (journal.publicationGeneration !== (await this.captureGenerationUnderHistoryLock())) {

@@ -1,5 +1,5 @@
 import type { ContinuousPrefixSwap } from "./continuousCompactionJournal";
-import { writeFile } from "node:fs/promises";
+import { stat, writeFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as atomicWrite from "write-file-atomic";
 import { EventEmitter } from "node:events";
@@ -18,6 +18,8 @@ import { ContinuousCompactor, type ContinuousCompactionContext } from "./continu
 import { CompactionHandler } from "./compactionHandler";
 import { createTestHistoryService } from "./testHistoryService";
 import { HistoryService } from "./historyService";
+import * as fileLock from "@/node/utils/concurrency/fileLock";
+import { historyWriteLockPath } from "./workspaceRemoval";
 
 type Dependencies = ConstructorParameters<typeof ContinuousCompactor>[0];
 type LiveSnapshot = NonNullable<ReturnType<Dependencies["streamManager"]["getStreamInfo"]>> & {
@@ -775,6 +777,46 @@ describe("ContinuousCompactor", () => {
     expect(await compactor.observe(0, context)).toBe("applied");
     expect((await foreign.read())?.boundary.id).toBe(successor.boundary.id);
     expect((await rows())[0].id).toBe(journal.boundary.id);
+  });
+
+  it("clears explicit reset intent despite contention on the history lock", async () => {
+    const { dependencies, journalStore } = await activateJournaledSwap();
+    streaming = false;
+    live = undefined;
+    const held = await fileLock.acquireProcessFileLock({
+      lockPath: historyWriteLockPath(store.config.rootDir, workspaceId),
+      timeoutMs: 1000,
+      label: "foreign history writer",
+    });
+    // Exercise the actual lock timeout branch without waiting ten seconds.
+    const acquire = fileLock.acquireProcessFileLock;
+    const timeout = spyOn(fileLock, "acquireProcessFileLock").mockImplementation((options) =>
+      acquire({ ...options, timeoutMs: 0 })
+    );
+    let clearing = Promise.resolve();
+    const clear = journalStore.clearForReset.bind(journalStore);
+    const observed = spyOn(journalStore, "clearForReset").mockImplementation(() => {
+      clearing = clear();
+      return clearing;
+    });
+    try {
+      compactor.reset("user-interrupt");
+      await clearing.catch(() => undefined);
+      expect(await stat(journalStore.path).catch((error: unknown) => error)).toHaveProperty(
+        "code",
+        "ENOENT"
+      );
+    } finally {
+      await held[Symbol.asyncDispose]();
+      timeout.mockRestore();
+      observed.mockRestore();
+    }
+    compactor = new ContinuousCompactor({
+      ...dependencies,
+      historyService: new HistoryService(store.config),
+    });
+    expect(await compactor.recover()).toBe(false);
+    expect((await rows())[0].id).toBe("old-user");
   });
 
   it.each(["failed-fast-apply", "legacy-fallback", "delete-message", "dispose"])(
