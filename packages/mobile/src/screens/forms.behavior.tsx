@@ -120,6 +120,62 @@ test("changes keep distinct deleted paths while additions use the new-side path"
   expect(view.getByText("+added")).toBeDefined();
 });
 
+test("changes preserve header-like source lines inside every hunk and count them", async () => {
+  const diff = [
+    "diff --git a/markers.txt b/markers.txt",
+    "index 1234567..89abcde 100644",
+    "--- a/markers.txt",
+    "+++ b/markers.txt",
+    "@@ -1,2 +1,2 @@",
+    "--- old comment",
+    "+++ new marker",
+    " unchanged",
+    "@@ -10 +10 @@",
+    "--- second old comment",
+    "+++ second new marker",
+    "diff --git a/script.sh b/script.sh",
+    "old mode 100644",
+    "new mode 100755",
+    "",
+  ].join("\n");
+  const client = createORPCClient<MobileClient>({
+    call: async () => [
+      {
+        projectName: "Project",
+        projectPath: "/project",
+        success: true,
+        data: { diff, truncated: false },
+      },
+    ],
+  });
+  const view = render(
+    <ChangesScreen
+      client={client}
+      workspaceId="workspace"
+      signal={new AbortController().signal}
+      onReconnect={async () => {}}
+      onBack={() => {}}
+    />
+  );
+  await waitFor(() => expect(view.getByText("markers.txt")).toBeDefined());
+  for (const line of [
+    "--- old comment",
+    "+++ new marker",
+    "--- second old comment",
+    "+++ second new marker",
+  ]) {
+    expect(view.getByText(line)).toBeDefined();
+  }
+  expect(view.getByText("+2")).toBeDefined();
+  expect(view.getByText("−2")).toBeDefined();
+  expect(view.queryByText("--- a/markers.txt")).toBeNull();
+  expect(view.queryByText("+++ b/markers.txt")).toBeNull();
+  expect(view.queryByText("index 1234567..89abcde 100644")).toBeNull();
+  expect(view.getByText("old mode 100644")).toBeDefined();
+  expect(view.getByText("new mode 100755")).toBeDefined();
+  expect(view.queryByText("diff --git a/script.sh b/script.sh")).toBeNull();
+});
+
 test("context meter exposes measured progress without inventing an unknown percentage", () => {
   const data = { segments: [], totalTokens: 200_000, maxTokens: 1_000_000, totalPercentage: 20 };
   const view = render(<ContextUsage data={data} />);
