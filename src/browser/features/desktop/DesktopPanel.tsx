@@ -93,6 +93,8 @@ export function DesktopViewer(props: {
   onStartupError?: () => void;
   /** See UseDesktopConnectionOptions.nativeWindowCleanup. */
   nativeWindowCleanup?: boolean;
+  /** See UseDesktopConnectionOptions.unmountKeepsGrace. */
+  unmountKeepsGrace?: () => boolean;
   /**
    * Mounted while the desktop is shown in a popout: do not connect; the popout coordinator
    * registers the pane once it has confirmed a live child and resumes the connection when the
@@ -103,6 +105,7 @@ export function DesktopViewer(props: {
 }) {
   const desktop = useDesktopConnection(props.workspaceId, {
     nativeWindowCleanup: props.nativeWindowCleanup,
+    unmountKeepsGrace: props.unmountKeepsGrace,
   });
 
   useEffect(() => {
@@ -201,6 +204,9 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
           attach={(desktop) =>
             popout.attach(desktop.suspend, desktop.connect, !inline, desktop.register)
           }
+          // Unmounting while a popout is opening (or showing the desktop) is not this pane
+          // giving the desktop up: the child takes over, so leave the grace for the gap.
+          unmountKeepsGrace={() => popout.getSnapshot().state !== "inline"}
           onDetach={detach}
           suspended={!inline}
           hidden={!inline}

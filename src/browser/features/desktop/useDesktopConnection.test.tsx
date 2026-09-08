@@ -690,6 +690,18 @@ describe("useDesktopConnection control ownership", () => {
     expect(registration.signal.aborted).toBe(true);
   });
 
+  test("unmount keeps the grace when the pane's desktop is handing off to a popout", async () => {
+    let handingOff = false;
+    const view = mountConnection({ unmountKeepsGrace: () => handingOff });
+    await connect(view);
+    handingOff = true;
+    act(() => view.unmount());
+    // The popup exists but connects only after ready/grant: the abort's bounded grace covers
+    // the gap, so nothing retracts it.
+    expect(detachViewer).not.toHaveBeenCalled();
+    expect(registrations[0].signal.aborted).toBe(true);
+  });
+
   test("normal unmount unregisters after releasing held input", async () => {
     const view = mountConnection();
     const rfb = await connect(view);

@@ -720,17 +720,15 @@ export class DesktopSessionManager {
     // transports that may come back; an explicit close is deterministic, so retract exactly the
     // graces produced by this teardown's own sources afterwards — a borrower closing must not
     // leave its owner "attached", while a grace an unrelated viewer stamped meanwhile survives.
-    // The teardown owns the graces every requester it releases (itself, its popouts, and — when
-    // it is a shared owner — its borrowers' viewers and bridges) had stamped before it started,
-    // plus whatever detaches from this workspace while it runs (see stampDetachment).
-    const releasedRequesters = new Set([
-      workspaceId,
-      ...viewers,
-      ...browserViewers.map((viewer) => viewer.workspaceId),
-    ]);
+    // The teardown owns the graces this workspace's own earlier attachments had stamped, plus
+    // whatever detaches from it while it runs (its viewers and popouts and — when it is a shared
+    // owner — its borrowers' viewers and bridges; see stampDetachment). A released borrower's
+    // EARLIER graces are not its to retract: a sibling pane of that borrower between
+    // registrations never received this release and still relies on its own grace; the owner leg
+    // of such graces is withdrawn by retractDetachments instead.
     const teardownSources = new Set<string>();
     for (const [sourceKey, grace] of this.recentDetachments) {
-      if (releasedRequesters.has(grace.requesterWorkspaceId)) teardownSources.add(sourceKey);
+      if (grace.requesterWorkspaceId === workspaceId) teardownSources.add(sourceKey);
     }
     this.teardownSources.set(workspaceId, teardownSources);
     // Latch before entering the async teardown, but leave established bridges alive long enough

@@ -924,6 +924,46 @@ describe("DesktopSessionManager browser viewer releases", () => {
     });
   });
 
+  test("an owner's close leaves a released borrower's earlier grace to its sibling pane", async () => {
+    if (process.platform === "win32") return;
+    await withDesktopManagerHarness(async ({ config }) => {
+      await registerSharedWorkspaces(config);
+      let now = 1_000_000;
+      const manager = new DesktopSessionManager({
+        config,
+        experimentsService: createExperimentsService(true),
+        workspaceService: createWorkspaceService(() => Promise.resolve(null)),
+        now: () => now,
+      });
+      const controller = new AbortController();
+      try {
+        // One borrower pane lost both transports and is between registrations (grace only)...
+        manager.noteDetached("child", "owner");
+        // ...while a sibling pane of the same borrower is live and gets released by the close.
+        const watcher = manager.watchViewer("child", controller.signal);
+        const ready: IteratorResult<DesktopViewerEvent> = await watcher.next();
+        expect(ready.value).toMatchObject({ type: "ready" });
+        const closing = manager.close("owner");
+        const release: IteratorResult<DesktopViewerEvent> = await watcher.next();
+        if (!release.done && release.value.type === "release") {
+          manager.acknowledgeViewerRelease(release.value.viewerId);
+        }
+        await closing;
+        controller.abort();
+        await watcher.return(undefined);
+        // The closed owner is no longer covered, but the sibling's own grace still keeps the
+        // borrower attached while it re-registers: the release never reached that pane.
+        expect(manager.hasAttachedViewers("owner")).toBe(false);
+        expect(manager.hasAttachedViewers("child")).toBe(true);
+        now += DESKTOP_ATTACHMENT_GRACE_MS;
+        expect(manager.hasAttachedViewers("child")).toBe(false);
+      } finally {
+        controller.abort();
+        await manager.closeAll();
+      }
+    });
+  });
+
   test("an owner's close does not retract the grace a rebound borrower stamps on its new owner meanwhile", async () => {
     if (process.platform === "win32") return;
     await withDesktopManagerHarness(async ({ config }) => {

@@ -88,7 +88,7 @@ function DesktopWindow(props: { workspaceId: string; instanceId: string }) {
       const request = (event as CustomEvent<DesktopPopoutCloseRequest | undefined>).detail;
       if (!request || request.instanceId !== props.instanceId) return;
       request.handled = true;
-      request.completion = finish(false, true);
+      request.completion = finish(false, request.leased === true);
       request.completion.catch((error: unknown) => setError(getErrorMessage(error)));
     };
     window.addEventListener(DESKTOP_POPOUT_CLOSE_EVENT, onDirectClose);

@@ -144,6 +144,13 @@ export interface UseDesktopConnectionOptions {
    * knows the pane is attached and can ask it to release input before closing the desktop.
    */
   nativeWindowCleanup?: boolean;
+  /**
+   * Consulted when the pane unmounts: true keeps the bounded attachment grace instead of giving
+   * the registration up definitively. The inline pane uses it while its desktop is detaching to
+   * a popout — the popup exists but connects only after the handoff's ready/grant exchange, so
+   * an unmount in between (switching tabs) must not leave the desktop unattached meanwhile.
+   */
+  unmountKeepsGrace?: () => boolean;
 }
 
 export function useDesktopConnection(
@@ -732,8 +739,12 @@ export function useDesktopConnection(
     })();
   };
 
+  const unmountKeepsGraceRef = useRef(options?.unmountKeepsGrace);
+  unmountKeepsGraceRef.current = options?.unmountKeepsGrace;
+
   useEffect(() => {
-    const disconnect = disconnectHandleRef.current;
+    const disconnect = () =>
+      disconnectHandleRef.current({ keepGrace: unmountKeepsGraceRef.current?.() === true });
     const release = () => setControlling(false);
     const onWindowBlur = (event: FocusEvent) => {
       // Capture runs before noVNC's window blur handler, but also sees toolbar/canvas

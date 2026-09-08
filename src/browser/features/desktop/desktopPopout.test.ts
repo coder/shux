@@ -315,6 +315,31 @@ describe("DesktopPopout handoff", () => {
     expect(popout.getSnapshot().error).not.toBeNull();
   });
 
+  test("Electron recovery confirms a manager-owned window itself and force-closes a hung renderer", async () => {
+    const popout = new DesktopPopout(workspaceId, true);
+    popout.attach(() => undefined, undefined, false, leasable);
+    // The initial reconciliation failed, so nothing confirmed the child yet.
+    api.getWindow = mock(() => Promise.reject(new Error("manager offline")));
+    await popout.reconcile(api);
+    expect(popout.getSnapshot().state).toBe("detached");
+    api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));
+    const closed = deferred<void>();
+    api.closeWindow = mock(() => closed.promise);
+    const recovering = popout.recover(api);
+    await settle();
+    // Manager truth confirms the window: no liveness ping that a hung renderer could never
+    // answer (which would roll the hint back as stale and orphan the window).
+    expect(channel().sent).toEqual([{ type: "bring-back", instanceId: "existing" }]);
+    const deadline = deadlines.at(-1);
+    assert(deadline);
+    deadline.run();
+    await settle();
+    expect(api.closeWindow).toHaveBeenCalledWith({ workspaceId, instanceId: "existing" });
+    closed.resolve();
+    await recovering;
+    expect(popout.getSnapshot().state).toBe("inline");
+  });
+
   test("Electron recovery never force-closes a child kept open for want of an inline lease", async () => {
     const popout = new DesktopPopout(workspaceId, true);
     api.getWindow = mock(() => Promise.resolve({ instanceId: "existing" }));

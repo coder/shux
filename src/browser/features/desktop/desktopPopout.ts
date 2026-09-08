@@ -21,6 +21,13 @@ export interface DesktopPopoutCloseRequest {
   handled: boolean;
   // Native close interception waits for renderer cleanup before allowing the window to close.
   completion?: Promise<void>;
+  /**
+   * Set only by a parent that leased its inline pane before asking: the child may then give its
+   * attachment up definitively. Electron's native close interception dispatches the same event
+   * without it (a titlebar close is not a handoff the parent prepared), so the child keeps the
+   * bounded grace there.
+   */
+  leased?: true;
 }
 
 export interface DesktopPopoutMessage {
@@ -407,6 +414,9 @@ export class DesktopPopout {
       if (current) {
         this.instanceId = current.instanceId;
         this.listen();
+        // Manager truth confirms the child (as reconcile does): a hung renderer cannot answer a
+        // ping, and an unconfirmed hint would be rolled back as stale instead of force-closed.
+        this.confirmChild();
         // A responsive renderer must release held inputs before native destruction.
         // Force-close only when its cleanup acknowledgment misses the bounded wait — never a
         // child that was kept open because the inline pane holds no lease.
@@ -431,7 +441,11 @@ export class DesktopPopout {
         throw new Error(INLINE_LEASE_ERROR);
       }
       this.send("bring-back");
-      const request: DesktopPopoutCloseRequest = { instanceId: instanceId ?? "", handled: false };
+      const request: DesktopPopoutCloseRequest = {
+        instanceId: instanceId ?? "",
+        handled: false,
+        leased: true,
+      };
       try {
         // Broadcast delivery can lose a race with window.close(). A responsive same-origin
         // child must synchronously release input before we allow its renderer to disappear.
