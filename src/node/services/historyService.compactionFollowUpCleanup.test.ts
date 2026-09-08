@@ -110,6 +110,59 @@ describe("conditional compaction follow-up cleanup", () => {
   });
 
   for (const action of actions) {
+    test(`${action} skips duplicate persisted identities without changing history`, async () => {
+      const expected = summary();
+      await store.historyService.appendToHistory(workspaceId, expected);
+      const historyPath = path.join(store.config.sessionsDir, workspaceId, "chat.jsonl");
+      const original = await fs.readFile(historyPath);
+      // Simulate a persisted duplicate that normal append sequence checks would reject.
+      await fs.appendFile(historyPath, original);
+      const duplicated = Buffer.concat([original, original]);
+      const loaded = await store.historyService.getLastMessages(workspaceId, 2);
+      assert(loaded.success && loaded.data.length === 2, "Expected readable duplicate summaries");
+      expect(loaded.data[0]).toEqual(loaded.data[1]);
+      expect(
+        await store.historyService.cleanupCompactionFollowUp(
+          workspaceId,
+          loaded.data[0],
+          action,
+          () => true
+        )
+      ).toEqual(Ok("skipped"));
+      expect(await fs.readFile(historyPath)).toEqual(duplicated);
+    });
+
+    test(`${action} preserves the same ID at a different persisted sequence`, async () => {
+      const expected = summary();
+      await store.historyService.appendToHistory(workspaceId, expected);
+      const sequence = expected.metadata?.historySequence;
+      assert(sequence != null, "Expected persisted summary sequence");
+      const unrelated = {
+        ...expected,
+        metadata: { ...expected.metadata, historySequence: sequence + 1 },
+      };
+      // Keep both rows active; normal boundary append would archive the cleanup target.
+      await fs.appendFile(
+        path.join(store.config.sessionsDir, workspaceId, "chat.jsonl"),
+        JSON.stringify({ ...unrelated, workspaceId }) + "\n"
+      );
+      expect(
+        await store.historyService.cleanupCompactionFollowUp(
+          workspaceId,
+          expected,
+          action,
+          () => true
+        )
+      ).toEqual(Ok("applied"));
+      const history = await store.historyService.getLastMessages(workspaceId, 2);
+      assert(history.success, "Expected history after cleanup");
+      expect(history.data).toHaveLength(action === "clear" ? 2 : 1);
+      expect(history.data.at(-1)).toMatchObject(unrelated);
+      if (action === "clear") {
+        expect(history.data[0].metadata?.muxMetadata).not.toHaveProperty("pendingFollowUp");
+      }
+    });
+
     test.each([undefined, null, -1, 0.5, "0"])(
       `${action} skips invalid persisted sequence %p and permits later healthy cleanup`,
       async (sequence) => {

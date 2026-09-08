@@ -2855,9 +2855,12 @@ export class HistoryService {
         const historyPath = this.getChatHistoryPath(workspaceId);
         const { rows, messages } = await this.readHistoryForRewrite(historyPath);
         // Archived summaries no longer own an active continuation or reset rollback.
-        const current = messages.find(
+        const matches = messages.filter(
           (row) => row.id === summary.id && row.metadata?.historySequence === sequence
         );
+        // Duplicate identities cannot prove which row owns the handoff; leave both untouched.
+        if (matches.length !== 1) return Ok("skipped");
+        const current = matches[0];
         const metadata = current?.metadata?.muxMetadata;
         if (
           !current ||
