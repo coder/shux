@@ -13,7 +13,9 @@ export type DesktopWindowAPI = Pick<
   "openWindow" | "closeWindow" | "getWindow"
 >;
 
-type PopoutMessageType = "ready" | "grant" | "opened" | "bring-back" | "closed" | "failed";
+// "ping" lets a reloaded parent (whose detached state is only a persisted hint) ask a live child
+// to re-announce itself with "opened", so the hint can be confirmed without a new handoff.
+type PopoutMessageType = "ready" | "grant" | "opened" | "bring-back" | "closed" | "failed" | "ping";
 export interface DesktopPopoutCloseRequest {
   instanceId: string;
   handled: boolean;
@@ -32,7 +34,7 @@ export function isDesktopPopoutMessage(value: unknown): value is DesktopPopoutMe
     typeof value.instanceId === "string" &&
     "type" in value &&
     typeof value.type === "string" &&
-    ["ready", "grant", "opened", "bring-back", "closed", "failed"].includes(value.type)
+    ["ready", "grant", "opened", "bring-back", "closed", "failed", "ping"].includes(value.type)
   );
 }
 export function desktopPopoutChannel(workspaceId: string): BroadcastChannel {
@@ -107,6 +109,7 @@ export class DesktopPopout {
           break;
         case "grant":
         case "bring-back":
+        case "ping":
           break;
         case "opened":
           if (this.snapshot.state !== "detached") return;
@@ -210,6 +213,8 @@ export class DesktopPopout {
           this.send("grant");
         } else this.restore();
       } else if (this.popup?.closed) this.restore();
+      // A reloaded browser parent holds only a hint: ask the child to confirm itself.
+      else if (this.instanceId && !this.childConfirmed) this.send("ping");
     } catch (error) {
       if (snapshot !== this.snapshot) return;
       // A failed manager query is not proof that an existing window is gone.
@@ -269,9 +274,10 @@ export class DesktopPopout {
     if (!this.instanceId) return;
     this.returning = true;
     this.grantPending = false;
-    // Attach the inline pane before the child disconnects so the desktop stays marked as in
-    // use through the handoff; a dead child still ends in restore(), which resumes inline.
-    this.registerInline?.();
+    // Attach the inline pane before a confirmed child disconnects so the desktop stays marked
+    // as in use through the handoff. An unconfirmed hint gets no lease: a dead child never
+    // answers, so nothing would ever release it.
+    if (this.childConfirmed) this.registerInline?.();
     this.send("bring-back");
   }
 

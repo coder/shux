@@ -221,6 +221,21 @@ describe("DesktopPopout handoff", () => {
     expect(resume).toHaveBeenCalledTimes(1);
   });
 
+  test("a reloaded parent pings its hint and leases the inline pane only once the child answers", async () => {
+    updatePersistedState(`desktop-popout:${workspaceId}`, "hinted-instance");
+    const popout = new DesktopPopout(workspaceId, false);
+    expect(popout.getSnapshot().state).toBe("detached");
+    const register = mock(() => undefined);
+    popout.attach(() => undefined, undefined, /* suspended */ true, register);
+    await popout.reconcile(api);
+    expect(channel().sent).toEqual([{ type: "ping", instanceId: "hinted-instance" }]);
+    // Bring back before confirmation must not lease: a dead child would never release it.
+    popout.bringBack();
+    expect(register).not.toHaveBeenCalled();
+    channel().receive({ type: "opened", instanceId: "hinted-instance" });
+    expect(register).toHaveBeenCalledTimes(1);
+  });
+
   test("a remount keeps the coordinator and only disconnects the current attachment", async () => {
     const popout = getDesktopPopout(workspaceId);
     const focus = spyOn(popup, "focus");
@@ -291,7 +306,8 @@ describe("DesktopPopout handoff", () => {
     await popout.reconcile(api);
     message("ready", "old-window");
     expect(popout.getSnapshot().state).toBe("detached");
-    expect(channel().sent).toEqual([]);
+    // Only the liveness ping; a hint never grants.
+    expect(channel().sent).toEqual([{ type: "ping", instanceId: "old-window" }]);
     expect(api.openWindow).not.toHaveBeenCalled();
     expect(api.getWindow).not.toHaveBeenCalled();
   });
@@ -304,7 +320,10 @@ describe("DesktopPopout handoff", () => {
       (event as CustomEvent<DesktopPopoutCloseRequest>).detail.handled = true;
     });
     const recovery = popout.recover(api);
-    expect(channel().sent).toEqual([{ type: "bring-back", instanceId: "old-window" }]);
+    expect(channel().sent).toEqual([
+      { type: "ping", instanceId: "old-window" },
+      { type: "bring-back", instanceId: "old-window" },
+    ]);
     expect(popout.getSnapshot().state).toBe("detached");
     message("closed", "old-window");
     await recovery;
@@ -323,7 +342,10 @@ describe("DesktopPopout handoff", () => {
     expect(close).toHaveBeenCalledTimes(1);
     expect(popout.getSnapshot().state).toBe("inline");
     expect(readPersistedState(`desktop-popout:${workspaceId}`, null)).toBeNull();
-    expect(channel().sent).toEqual([{ type: "bring-back", instanceId: "missing-window" }]);
+    expect(channel().sent).toEqual([
+      { type: "ping", instanceId: "missing-window" },
+      { type: "bring-back", instanceId: "missing-window" },
+    ]);
   });
 
   test("blocked handle recovery retains the hint and never authorizes another viewer", async () => {
@@ -413,7 +435,10 @@ describe("DesktopPopout handoff", () => {
     poll();
     expect(popout.getSnapshot().state).toBe("detached");
     expect(popout.getSnapshot().error).not.toBeNull();
-    expect(channel().sent).toEqual([{ type: "bring-back", instanceId: "live-child" }]);
+    expect(channel().sent).toEqual([
+      { type: "ping", instanceId: "live-child" },
+      { type: "bring-back", instanceId: "live-child" },
+    ]);
     expect(readPersistedState<string | null>(`desktop-popout:${workspaceId}`, null)).toBe(
       "live-child"
     );

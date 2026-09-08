@@ -17,6 +17,7 @@ import "./styles/globals.css";
 
 function DesktopWindow(props: { workspaceId: string; instanceId: string }) {
   const [granted, setGranted] = useState(false);
+  const grantedRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const disconnectRef = useRef<(() => Promise<void>) | null>(null);
   const disconnectNowRef = useRef<(() => void) | null>(null);
@@ -67,9 +68,14 @@ function DesktopWindow(props: { workspaceId: string; instanceId: string }) {
       if (event.data.type === "grant") {
         clearTimeout(deadline);
         setError(null);
+        grantedRef.current = true;
         setGranted(true);
         channel.postMessage({ type: "opened", instanceId: props.instanceId });
       } else if (event.data.type === "bring-back") requestFinish();
+      else if (event.data.type === "ping" && grantedRef.current) {
+        // A reloaded parent only holds a persisted hint; confirm this window is still live.
+        channel.postMessage({ type: "opened", instanceId: props.instanceId });
+      }
     };
     const onDirectClose = (event: Event) => {
       const request = (event as CustomEvent<DesktopPopoutCloseRequest | undefined>).detail;
