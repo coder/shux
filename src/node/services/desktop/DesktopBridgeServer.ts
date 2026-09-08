@@ -15,6 +15,8 @@ const SERVER_STOPPING_CLOSE_CODE = 1001;
 const VNC_HOST = "127.0.0.1";
 
 interface BridgePair {
+  /** Unique detachment source for the manager's attachment grace. */
+  graceSource: string;
   ws: WebSocket;
   tcp: net.Socket | null;
   requesterWorkspaceId: string;
@@ -111,6 +113,7 @@ export class DesktopBridgeServer {
   private readonly desktopTokenManager: Pick<DesktopTokenManager, "validate">;
   private readonly wss: WebSocketServer;
   private readonly activePairs = new Set<BridgePair>();
+  private pairSequence = 0;
   private readonly drainingSockets = new Map<net.Socket, Promise<void>>();
   private stopConfigWatch: (() => void) | undefined;
   // Keep upgrade rejection aligned with stop() so httpServer.close() cannot hang on sockets
@@ -253,6 +256,7 @@ export class DesktopBridgeServer {
     // Subscribe before connecting: cleanup must revoke both established viewers and connections
     // still awaiting TCP, even when a borrower has no owned desktop session to close.
     const pair: BridgePair = {
+      graceSource: `bridge:${++this.pairSequence}`,
       ws,
       tcp: null,
       requesterWorkspaceId: payload.workspaceId,
@@ -543,7 +547,10 @@ export class DesktopBridgeServer {
     this.activePairs.delete(pair);
     // A closed bridge was a known attachment: let the manager's archive gate keep the requester
     // and owner attached for the bounded grace while the client reconnects or hands off.
-    this.desktopSessionManager.noteDetached?.([pair.requesterWorkspaceId, pair.ownerWorkspaceId]);
+    this.desktopSessionManager.noteDetached?.(
+      [pair.requesterWorkspaceId, pair.ownerWorkspaceId],
+      pair.graceSource
+    );
     if (this.activePairs.size === 0) {
       const stopConfigWatch = this.stopConfigWatch;
       this.stopConfigWatch = undefined;

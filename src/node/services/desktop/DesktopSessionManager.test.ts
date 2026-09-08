@@ -599,19 +599,37 @@ describe("DesktopSessionManager browser viewer releases", () => {
         expect(manager.hasAttachedViewers("child")).toBe(false);
 
         // A closed VNC bridge reports through noteDetached the same way.
-        manager.noteDetached(["isolated"]);
+        manager.noteDetached(["isolated"], "bridge:1");
         expect(manager.hasAttachedViewers("isolated")).toBe(true);
         now += DESKTOP_ATTACHMENT_GRACE_MS;
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
 
         // An explicit close is definitive: it clears the grace it would otherwise leave behind,
-        // but a grace another detachment stamped earlier on a related workspace survives.
-        manager.noteDetached(["isolated"]);
+        // but a grace another detachment stamped on a related workspace survives — even one
+        // stamped while the close was in flight.
+        manager.noteDetached(["isolated"], "bridge:2");
         await manager.close("isolated");
         expect(manager.hasAttachedViewers("isolated")).toBe(false);
-        manager.noteDetached(["owner"]);
-        await manager.close("child");
+        const borrower = new AbortController();
+        const borrowerWatcher = manager.watchViewer("child", borrower.signal);
+        expect((await borrowerWatcher.next()).value).toMatchObject({ type: "ready" });
+        const closingChild = manager.close("child");
+        manager.noteDetached(["owner"], "bridge:unrelated");
+        await closingChild;
+        await borrowerWatcher.return(undefined);
+        expect(manager.hasAttachedViewers("child")).toBe(false);
         expect(manager.hasAttachedViewers("owner")).toBe(true);
+        now += DESKTOP_ATTACHMENT_GRACE_MS;
+        expect(manager.hasAttachedViewers("owner")).toBe(false);
+
+        // A viewer whose bootstrap reported no desktop leaves no grace when it detaches.
+        const unavailable = new AbortController();
+        const unavailableWatcher = manager.watchViewer("isolated", unavailable.signal);
+        expect((await unavailableWatcher.next()).value).toMatchObject({ type: "ready" });
+        manager.noteBootstrapOutcome("isolated", false);
+        unavailable.abort();
+        await unavailableWatcher.return(undefined);
+        expect(manager.hasAttachedViewers("isolated")).toBe(false);
       } finally {
         await manager.closeAll();
       }
