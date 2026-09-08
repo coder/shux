@@ -14,6 +14,7 @@ import {
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
   readProviderHistoryFromLatestBoundary,
+  readCompactionPendingHistoryBoundary,
   readHistoryControlEvidenceFromLatestBoundary,
   type HistoryControlRow,
   type BoundedHistoryScanOptions,
@@ -23,9 +24,10 @@ import { isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
-import { renameSync } from "node:fs";
+import { renameSync, unlinkSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import * as fs from "fs/promises";
+import type { CompactionPendingHistory } from "./compactionPendingState";
 import {
   ContinuousCompactionJournalStore,
   publishCompactionFile,
@@ -448,6 +450,31 @@ export class HistoryService {
       this.continuousJournals.set(workspaceId, journal);
     }
     return journal;
+  }
+
+  /** Inactive G1 adapter: pending-file I/O must finish before either history lock is released. */
+  getCompactionPendingHistory(workspaceId: string): CompactionPendingHistory {
+    return {
+      withLock: (operation) =>
+        this.fileLocks.withLock(workspaceId, () =>
+          this.withCrossProcessWriteLock(workspaceId, async (assertStillOwned) => {
+            const journal = this.getContinuousCompactionJournal(workspaceId);
+            // Carry raw reset evidence: missing projected rows cannot prove legacy context safe.
+            // Avoid the public history reader: its lazy rotation would re-enter the lock.
+            const boundary = await readCompactionPendingHistoryBoundary({
+              chat: this.getChatHistoryPath(workspaceId),
+              archive: this.getChatArchivePath(workspaceId),
+            });
+            return await operation({
+              generation: await journal.captureGenerationUnderHistoryLock(),
+              assertStillOwned,
+              boundary,
+              isPublicationCurrent: (publication) =>
+                journal.isPublicationCurrentUnderHistoryLock(publication),
+            });
+          })
+        ),
+    };
   }
 
   private getSessionDir(workspaceId: string): string {
@@ -2436,6 +2463,38 @@ export class HistoryService {
     }
   }
 
+  /** Inactive compaction seam: retire only the captured partial, including its last flush. */
+  deletePartialIfMatches(
+    workspaceId: string,
+    captured: MuxMessage,
+    isCurrent: () => boolean
+  ): Promise<Result<boolean>> {
+    // Capture before queueing: callers may keep updating their streamed message object.
+    const expected = structuredClone(captured);
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to retire compaction partial",
+      async (assertStillOwned) => {
+        if (!isCurrent()) return Ok(false);
+        const partialPath = this.getPartialPath(workspaceId);
+        let raw: string;
+        try {
+          raw = await fs.readFile(partialPath, "utf8");
+        } catch (error) {
+          if (isErrnoWithCode(error, "ENOENT")) return Ok(false);
+          throw error;
+        }
+        const current = normalizeLegacyMuxMetadata(JSON.parse(raw) as MuxMessage);
+        await assertStillOwned();
+        if (!isDeepStrictEqual(current, expected) || !isCurrent()) return Ok(false);
+        // Keep the final ownership check and unlink indivisible to local cancellation.
+        // Both history locks exclude successor flushes from another service/process.
+        unlinkSync(partialPath);
+        return Ok(true);
+      }
+    );
+  }
+
   /**
    * Delete the partial message file only when it still belongs to the expected message.
    * Returns true when a matching partial was deleted, false when the partial was missing
@@ -2895,7 +2954,7 @@ export class HistoryService {
       return this.getAppendProvenance(workspaceId).runMutation(async () => {
         if (await this.truncateRecoveryArtifactsPresent(workspaceId))
           invalidateHistoryAppendProvenance();
-        await this.recoverTruncateTransactionUnlocked(workspaceId);
+        await this.recoverTruncateTransactionUnlocked(workspaceId, assertStillOwned);
         return operation(assertStillOwned);
       }, assertStillOwned);
     });
@@ -3111,7 +3170,9 @@ export class HistoryService {
     workspaceId: string,
     summary: MuxMessage,
     action: "clear" | "rollback-heartbeat",
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    // Unlike void, undefined rejects async observers that would outlive the held locks.
+    onCommitted?: () => undefined
   ): Promise<Result<CompactionFollowUpCleanupOutcome>> {
     const expected = summary.metadata?.muxMetadata;
     const sequence = summary.metadata?.historySequence;
@@ -3127,7 +3188,7 @@ export class HistoryService {
     return this.withRecoveredHistoryWriteResultLock<CompactionFollowUpCleanupOutcome>(
       workspaceId,
       "Failed to clean up compaction follow-up",
-      async () => {
+      async (assertStillOwned) => {
         if (!isCurrent() || !expected.pendingFollowUp) return Ok("skipped");
         const historyPath = this.getChatHistoryPath(workspaceId);
         const { rows, messages } = await this.readHistoryForRewrite(historyPath);
@@ -3164,12 +3225,20 @@ export class HistoryService {
         let published = false;
         try {
           await writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
+          await assertStillOwned();
           // Admission may change while the file is staged. The final check and rename
           // are synchronous, so the retired owner cannot publish in that gap.
           if (!isCurrent()) return Ok("skipped");
           invalidateHistoryAppendProvenance();
           renameSync(stagedPath, historyPath);
           published = true;
+          // Inactive G2a receipt seam: absence alone cannot authorize restoring pending
+          // attachments. Notify exact cleanup before lock disposal admits a replacement.
+          try {
+            onCommitted?.();
+          } catch (error) {
+            log.error("Compaction cleanup commit observer failed", error);
+          }
           if (action === "rollback-heartbeat") {
             // Do not reuse the removed row's sequence within this process.
             this.sequenceCounters.set(

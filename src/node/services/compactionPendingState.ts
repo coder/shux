@@ -42,6 +42,8 @@ interface PersistedState extends CompactionPendingAttachments {
 
 export interface CompactionPendingHistoryView {
   generation: string | undefined;
+  /** Recheck physical lock ownership after awaited I/O before publishing or retiring bytes. */
+  assertStillOwned(): Promise<void>;
   /**
    * Provenance from the same verified chat/archive scan as the history rows. `none` requires
    * exhausting both files without a boundary or raw reset floor; unreadable is never absence.
@@ -54,7 +56,7 @@ export interface CompactionPendingHistory {
   /**
    * Hold BOTH existing history locks throughout the callback, reject removed workspaces,
    * and provide a stable view without reacquiring history/journal queues inside the lock.
-   * Deliberately has no runtime adapter yet: every producer/consumer must activate together.
+   * The HistoryService adapter remains inactive: every producer/consumer must activate together.
    */
   withLock<T>(operation: (view: CompactionPendingHistoryView) => Promise<T>): Promise<T>;
 }
