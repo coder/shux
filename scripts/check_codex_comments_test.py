@@ -198,6 +198,10 @@ else:
             "The review incorrectly says " + FIXTURES["security_no_findings"]["body"],
             FIXTURES["security_no_findings"]["body"]
             + "\n[P1] But the code review found a bug.",
+            FIXTURES["security_no_findings_titled"]["body"].replace(
+                "No security issues were found in this pull request.",
+                "Found a P1 credential disclosure.",
+            ),
             FIXTURES["security_no_findings"]["body"].replace(
                 "</details>", "[P1] A finding inside the footer.\n</details>"
             ),
