@@ -4220,18 +4220,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * new value could not be confirmed durable.
    */
   async recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): Promise<boolean> {
-    (
-      this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
-    )?.recordWorkspaceMemoryWritable(writable);
+    // The session accumulates the policy over the compaction epoch
+    // (fail-closed); the durable copy mirrors that effective value so a
+    // restart-time fallback cannot be more permissive than the live session.
+    const effective =
+      (
+        this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
+      )?.recordWorkspaceMemoryWritable(writable) ?? writable;
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
     // Unregistered workspace: nothing durable to update and no stale
     // permission to invalidate (harvests fail closed on the missing value).
     if (entry === null) return true;
-    if (entry.workspace.workspaceMemoryWritable === writable) return true;
+    if (entry.workspace.workspaceMemoryWritable === effective) return true;
     try {
       await this.config.editConfig((cfg) => {
         const current = findWorkspaceEntry(cfg, workspaceId);
-        if (current !== null) current.workspace.workspaceMemoryWritable = writable;
+        if (current !== null) current.workspace.workspaceMemoryWritable = effective;
         return cfg;
       });
     } catch (error: unknown) {
@@ -4244,7 +4248,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
     const persisted = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
       .workspaceMemoryWritable;
-    if (persisted !== writable) {
+    if (persisted !== effective) {
       log.error("Workspace memory write policy did not persist (config write swallowed?)", {
         workspaceId,
         writable,

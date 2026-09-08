@@ -1054,15 +1054,21 @@ export class AgentSession {
   private memoryContextGeneration = 0;
 
   /**
-   * Workspace-memory write policy of the last normal turn (TurnRequestBuilder
-   * via WorkspaceService). Attached to compaction completions so the memory
-   * harvest — which writes to the (possibly shared) workspace store on this
-   * agent's behalf — can honor a read-only agent's policy.
+   * Workspace-memory write policy accumulated over the current compaction
+   * epoch (TurnRequestBuilder via WorkspaceService). Attached to compaction
+   * completions so the memory harvest — which writes to the (possibly shared)
+   * workspace store on this agent's behalf — can honor a read-only agent's
+   * policy. Fail-closed across turns: the harvest reads EVERY message of the
+   * epoch, so one read-only turn denies the whole epoch even if a writable
+   * turn follows; the accumulator restarts at the compaction boundary
+   * (unless a preserved tail carries the epoch's messages forward).
    */
   private workspaceMemoryWritable: boolean | undefined;
 
-  recordWorkspaceMemoryWritable(writable: boolean): void {
-    this.workspaceMemoryWritable = writable;
+  /** Returns the effective (accumulated) value, which is what gets persisted. */
+  recordWorkspaceMemoryWritable(writable: boolean): boolean {
+    this.workspaceMemoryWritable = (this.workspaceMemoryWritable ?? true) && writable;
+    return this.workspaceMemoryWritable;
   }
 
   /**
@@ -1233,6 +1239,12 @@ export class AgentSession {
             ? { workspaceMemoryWritable: this.workspaceMemoryWritable }
             : {}),
         });
+        // New epoch. A preserved tail copies messages produced under this
+        // epoch's policy into the next one, so the fail-closed accumulator
+        // carries over with them; otherwise the next normal turn restarts it.
+        if ((metadata.preservedTailMessageCount ?? 0) === 0) {
+          this.workspaceMemoryWritable = undefined;
+        }
       },
       onIdleCompactionOutcome,
     });

@@ -1142,21 +1142,20 @@ export class MemoryService extends EventEmitter {
       workspaceId: this.ownerWorkspaceIdFor(ctx),
       projectPath: ctx.projectPath,
     };
-    // Pin toggles and rollback announcements reach the store's other readers
-    // only through this event, so the cross-process token moves here as well
-    // (mutations already advanced it for their row's sourceTs; a second tick
-    // is harmless — the clock only ever grows).
-    if (scope === "workspace" && event.workspaceId !== "") {
-      await this.advanceStoreRevision(this.getStore(ctx, "workspace"));
-    }
+    // Pure in-process signal. The cross-process token (store clock) is NOT
+    // advanced here: it must move under the store's mutation lock, which
+    // mutations hold when they journal (journalRefinement / saveFile) and the
+    // rollback engine holds when it appends its row; notifyPinChange takes it
+    // explicitly.
     this.emit("change", event);
   }
 
   /**
    * Advance the owner store's clock (see workspaceMemoryRevision.ts) for a
    * workspace-scope mutation and return it for the row's `sourceTs`. Callers
-   * hold the store's target mutation lock. Best-effort: a failure (removed
-   * owner directory — mutations are already refused pre-commit, see
+   * MUST hold the store's target mutation lock (the clock's monotonicity is
+   * only as good as the lock around its read→write). Best-effort: a failure
+   * (removed owner directory — mutations are already refused pre-commit, see
    * assertMutationCommittable; a pin toggle on a never-written store) must
    * not fail the command, so the row then falls back to its journal `ts`.
    */
@@ -1194,7 +1193,9 @@ export class MemoryService extends EventEmitter {
    * classified against this context's scope roots and one root-addressed
    * event per touched scope is emitted, so Memory tabs refresh and — for the
    * shared workspace store — every task-tree session drops its cached
-   * context (see the change listener wired in di/layers/core.ts).
+   * context (see the change listener wired in di/layers/core.ts). The store
+   * clock is not touched: the rollback engine advanced it under the target
+   * lock when it journaled its row (refinementRollback.ts).
    */
   async notifyExternalMutation(
     ctx: MemoryScopeContext,
@@ -1237,6 +1238,16 @@ export class MemoryService extends EventEmitter {
   async notifyPinChange(ctx: MemoryScopeContext, virtualPath: string): Promise<void> {
     const parsed = parseMemoryPath(virtualPath);
     const scope = this.requireFilePath(parsed, virtualPath);
+    if (scope === "workspace") {
+      // A pin changes the hot set other backends derive from this store, so
+      // the store clock must move — under the same mutation lock writers
+      // hold, or an unlocked read→write could overwrite a concurrent
+      // mutation's higher value and break the clock's monotonicity.
+      const store = this.getStore(ctx, scope);
+      await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), () =>
+        this.advanceStoreRevision(store)
+      );
+    }
     await this.emitChange(ctx, scope, parsed.relPath, "user");
   }
 
@@ -1849,6 +1860,8 @@ export class MemoryService extends EventEmitter {
           }
           await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
           await store.writeFile(parsed.relPath, content);
+          // UI saves are not journaled, so advance the store clock here (in-lock).
+          await this.advanceStoreRevision(store);
           await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
           await this.emitChange(ctx, scope, parsed.relPath, actor);
           return { success: true as const, data: { sha256: sha256Hex(content) } };

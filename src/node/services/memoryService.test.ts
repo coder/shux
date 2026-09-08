@@ -1102,6 +1102,10 @@ describe("MemoryService", () => {
       // Other scopes leave the workspace store's token alone...
       await fixture.service.create(fixture.ctx, "/memories/global/g.md", "g", "agent");
       expect(await foreign.workspaceMemoryRevision("ws-owner")).toBe(afterCreate);
+      // ...a pin toggle (hot-set input, no store write) advances it...
+      await fixture.service.notifyPinChange(fixture.ctx, "/memories/workspace/shared.md");
+      const afterPin = await foreign.workspaceMemoryRevision("ws-owner");
+      expect(Number(afterPin)).toBeGreaterThan(Number(afterCreate));
       // ...while every shared-store mutation advances it.
       await fixture.service.strReplace(
         fixture.ctx,
@@ -1110,7 +1114,9 @@ describe("MemoryService", () => {
         "v2",
         "agent"
       );
-      expect(await foreign.workspaceMemoryRevision("ws-owner")).not.toBe(afterCreate);
+      expect(Number(await foreign.workspaceMemoryRevision("ws-owner"))).toBeGreaterThan(
+        Number(afterPin)
+      );
     });
 
     it("refuses to commit into a self-fallback store once config.json has recovered", async () => {
