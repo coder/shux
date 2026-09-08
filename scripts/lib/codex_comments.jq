@@ -1,5 +1,5 @@
 # Codex now edits a protocol status comment alongside its actionable findings.
-# Only recognize the observed informational envelopes; extra text/metadata may
+# Only recognize completed informational envelopes; extra text/metadata may
 # carry findings, so unknown shapes stay blocking. This never supplies approval.
 # Strip only the observed help text: a heading alone must not hide a finding
 # added inside the details section, or a second section appended after it.
@@ -31,7 +31,9 @@ def codex_comment_is_informational($bot):
               and (.headSha | test("^[0-9a-f]{40}$"))
               and (.pullRequestNumber | type == "number")
               and (.repository | test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"))
-              and (.status | IN("completed", "running", "in_progress", "queued", "pending")))
+              # CI calls this checker before reviews finish; pending metadata or
+              # a pending review row must keep that gate blocking independently.
+              and .status == "completed")
             and ($lines[2:] | length >= 5)
             and ($lines[2:] | all(
               . == "## Codex Review Summary"
@@ -39,8 +41,8 @@ def codex_comment_is_informational($bot):
               or . == "| Review | Status | Commit | Review trigger |"
               or . == "| --- | --- | --- | --- |"
               or test("^\\| [^[:alnum:]|]*\\*\\*(Code|Security) Review\\*\\* \\| "
-                + "[^[:alnum:]|]*\\*\\*(Completed|Running|In progress|Queued|Pending)\\*\\*"
-                + "( (since )?<relative-time datetime=\"[0-9TZ:.+-]+\">[0-9TZ:.+-]+</relative-time>)? "
+                + "[^[:alnum:]|]*\\*\\*Completed\\*\\*"
+                + "( <relative-time datetime=\"[0-9TZ:.+-]+\">[0-9TZ:.+-]+</relative-time>)? "
                 + "\\| `[0-9a-f]+` \\| (Manual request|New commits|Draft marked ready|PR opened) \\|$")
             ))
         ) catch false) // false

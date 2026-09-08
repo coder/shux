@@ -130,12 +130,39 @@ else:
         result = self.run_gate(data, script, cache)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
-    def test_observed_informational_comments_do_not_block(self):
+    def test_observed_comments_only_exempt_completed_informational_reviews(self):
         for name, fixture in FIXTURES.items():
             for cached in (False, True):
                 with self.subTest(name=name, cached=cached):
                     data = snapshot([comment(fixture["body"])])
-                    self.assert_gate(0, data, cache=data if cached else None)
+                    self.assert_gate(
+                        fixture["expected_exit_code"],
+                        data,
+                        cache=data if cached else None,
+                    )
+
+    def test_summary_completion_requires_metadata_and_every_review_row(self):
+        completed = FIXTURES["summary"]["body"]
+        completed_pr_opened = (
+            FIXTURES["pr_opened_summary"]["body"]
+            .replace('"status":"running"', '"status":"completed"')
+            .replace("🔄 **Running** since", "✅ **Completed**")
+        )
+        completed_findings = (
+            FIXTURES["security_findings_summary"]["body"]
+            .replace('"status":"running"', '"status":"completed"')
+            .replace("🔄 **Running** since", "✅ **Completed**")
+        )
+        for body, expected in (
+            (completed.replace('"status":"completed"', '"status":"running"'), 1),
+            (completed.replace("✅ **Completed**", "🔄 **Running** since", 1), 1),
+            (completed_pr_opened, 0),
+            (completed_findings, 1),
+        ):
+            for cached in (False, True):
+                with self.subTest(body=body, cached=cached):
+                    data = snapshot([comment(body)])
+                    self.assert_gate(expected, data, cache=data if cached else None)
 
     def test_real_findings_survive_metadata_and_pagination(self):
         summary = comment(FIXTURES["summary"]["body"])
@@ -213,19 +240,11 @@ else:
     def test_metadata_is_not_approval(self):
         request = comment("@codex review", "maintainer", REQUEST)
         for name, fixture in FIXTURES.items():
-            for body in (
-                fixture["body"],
-                fixture["body"]
-                .replace("completed", "running")
-                .replace("Completed", "Running"),
-            ):
-                with self.subTest(name=name, body=body):
-                    result = self.run_gate(
-                        snapshot([request, comment(body)]), "wait_pr_codex.sh"
-                    )
-                    self.assertNotEqual(
-                        result.returncode, 0, result.stdout + result.stderr
-                    )
+            with self.subTest(name=name):
+                result = self.run_gate(
+                    snapshot([request, comment(fixture["body"])]), "wait_pr_codex.sh"
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_only_authenticated_codex_authors_get_protocol_exemptions(self):
         comments = [
