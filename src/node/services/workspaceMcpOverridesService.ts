@@ -213,7 +213,7 @@ export class WorkspaceMcpOverridesService {
 
   private getLegacyOverridesFromConfig(
     workspaceId: string,
-    config: ProjectsConfig = this.config.loadConfigOrDefault()
+    config: ProjectsConfig
   ): WorkspaceMCPOverrides | undefined {
     for (const [_projectPath, projectConfig] of config.projects) {
       const workspace = projectConfig.workspaces.find((w) => w.id === workspaceId);
@@ -437,14 +437,14 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
-   * `legacyConfig` lets batch callers reuse one config snapshot: loading
+   * `loadLegacyConfig` lets batch callers share one config snapshot: loading
    * config.json is a synchronous full parse, so re-reading it per workspace
    * made a 2000-workspace sweep take tens of minutes.
    */
   private async loadOverridesForResolved(
     resolved: ResolvedWorkspace,
     mode: "lenient" | "strict",
-    legacyConfig?: ProjectsConfig
+    loadLegacyConfig: () => ProjectsConfig = () => this.config.loadConfigOrDefault()
   ): Promise<WorkspaceMCPOverrides> {
     const { metadata, runtime, workspacePath } = resolved;
     const workspaceId = metadata.id;
@@ -460,7 +460,7 @@ export class WorkspaceMcpOverridesService {
     }
 
     // No workspace-local file => try migrating legacy config.json storage.
-    const legacy = this.getLegacyOverridesFromConfig(workspaceId, legacyConfig);
+    const legacy = this.getLegacyOverridesFromConfig(workspaceId, loadLegacyConfig());
     if (!legacy || isEmptyOverrides(legacy)) {
       return {};
     }
@@ -665,12 +665,21 @@ export class WorkspaceMcpOverridesService {
       publish?: (persisted: WorkspaceMCPOverrides) => Promise<void>;
     }
   ): Promise<void> {
-    const failures = await this.prunePluginOverrideKeysForWorkspaces([workspaceId], keyPrefix, {
-      publish: (_workspaceId, persisted) => options?.publish?.(persisted) ?? Promise.resolve(),
+    assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
+    // Deliberately NOT routed through the batch: workspace creation calls
+    // this on a hot path, and the batch's post-sweep re-resolution (a second
+    // full config parse) only guards multi-workspace sweeps against
+    // concurrent renames — a workspace still being created cannot be renamed.
+    return this.runExclusive(async () => {
+      const resolved = await this.getRuntimeAndWorkspacePath(workspaceId);
+      await this.pruneResolvedWorkspace(resolved, keyPrefix);
+      if (options?.publish) {
+        // Strict re-read: the prune above already threw on anything
+        // unreadable, so a failure here is a real regression and must keep
+        // the caller's retry tombstone rather than publish a guess.
+        await options.publish(await this.loadOverridesForResolved(resolved, "strict"));
+      }
     });
-    if (failures.length > 0) {
-      throw failures[0].error;
-    }
   }
 
   /**
@@ -694,14 +703,20 @@ export class WorkspaceMcpOverridesService {
 
     return this.runExclusive(async () => {
       // Group, don't index: a corrupted config can list one ID under several
-      // entries (different checkouts). Every checkout carrying the ID must be
-      // pruned, or retiring the tombstone would leave a stale enable behind
-      // in the entry a last-write-wins map dropped.
+      // entries (different checkouts). Every host-local checkout carrying the
+      // ID must be pruned, or retiring the tombstone would leave a stale
+      // enable behind in the entry a last-write-wins map dropped. Off-host
+      // entries (SSH/Docker) sharing the ID are skipped: plugin servers never
+      // run there, and the symlink guard below uses host fs semantics.
       const groupMetadataById = (
         all: FrontendWorkspaceMetadata[]
       ): Map<string, FrontendWorkspaceMetadata[]> => {
         const grouped = new Map<string, FrontendWorkspaceMetadata[]>();
         for (const metadata of all) {
+          const runtimeType = metadata.runtimeConfig.type;
+          if (runtimeType !== "local" && runtimeType !== "worktree") {
+            continue;
+          }
           const entries = grouped.get(metadata.id);
           if (entries) {
             entries.push(metadata);
@@ -718,14 +733,17 @@ export class WorkspaceMcpOverridesService {
           .join("\0");
 
       const metadataById = groupMetadataById(await this.config.getAllWorkspaceMetadata());
-      const legacyConfig = this.config.loadConfigOrDefault();
+      // Lazy: only workspaces WITHOUT an override file consult legacy config.
+      let legacyConfig: ProjectsConfig | undefined;
+      const loadLegacyConfig = (): ProjectsConfig =>
+        (legacyConfig ??= this.config.loadConfigOrDefault());
       const failures: Array<{ workspaceId: string; error: unknown }> = [];
       const swept: string[] = [];
       for (const workspaceId of workspaceIds) {
         try {
           const entries = metadataById.get(workspaceId.trim());
           if (!entries) {
-            throw new Error(`Workspace metadata not found for ${workspaceId.trim()}`);
+            throw new Error(`Host-local workspace metadata not found for ${workspaceId.trim()}`);
           }
           for (const metadata of entries) {
             await this.pruneResolvedWorkspace(this.resolveWorkspace(metadata), keyPrefix);
@@ -740,7 +758,7 @@ export class WorkspaceMcpOverridesService {
               await this.loadOverridesForResolved(
                 this.resolveWorkspace(entries[0]),
                 "strict",
-                legacyConfig
+                loadLegacyConfig
               )
             );
           }

@@ -504,6 +504,43 @@ describe("WorkspaceMcpOverridesService", () => {
     }
   });
 
+  it("prunePluginOverrideKeysForWorkspaces skips off-host entries sharing a duplicated ID", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const local = await registerWorkspace("dup-local");
+    // Corrupted config: an SSH entry reuses the local workspace's ID. Plugin
+    // servers never run off-host, and reaching for it would attempt remote
+    // I/O against an unreachable host.
+    await config.editConfig((cfg) => {
+      cfg.projects.set("/fake/remote", {
+        workspaces: [
+          {
+            path: "/remote/checkout",
+            id: local.workspaceId,
+            name: "remote-branch",
+            runtimeConfig: { type: "ssh", host: "unreachable.invalid", srcBaseDir: "/remote" },
+          },
+        ],
+      });
+      return cfg;
+    });
+    await fs.mkdir(path.join(local.workspacePath, ".xum"), { recursive: true });
+    await fs.writeFile(
+      path.join(local.workspacePath, ".xum", "mcp.local.jsonc"),
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo"] })
+    );
+
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [local.workspaceId],
+      "plugin:0123456789abcdef:"
+    );
+
+    expect(failures).toEqual([]);
+    const after = jsoncParse(
+      await fs.readFile(path.join(local.workspacePath, ".xum", "mcp.local.jsonc"), "utf-8")
+    ) as Record<string, unknown>;
+    expect(after.enabledServers).toEqual([]);
+  });
+
   it("acquireExclusiveLock holds the prune sweep until released", async () => {
     const service = new WorkspaceMcpOverridesService(config);
     const { workspaceId } = await registerWorkspace("locked");

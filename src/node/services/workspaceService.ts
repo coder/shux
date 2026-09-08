@@ -7335,6 +7335,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         return config;
       });
+      // Checkout and config agree again: let MCP-settings writers proceed
+      // instead of queueing behind plan-file moves and .code-workspace sync.
+      const releaseNow = releaseOverridesLock;
+      releaseOverridesLock = undefined;
+      await releaseNow?.().catch((error: unknown) => {
+        // The rename itself is complete; a lock-file cleanup failure must not
+        // report it as failed. The lease simply ages out for other holders.
+        log.warn("Failed to release MCP-overrides lock after rename", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
 
       // Rename plan file if it exists (uses workspace name, not ID)
       await movePlanFile(runtimeForPlanFile, oldName, newName, oldMetadata.projectName);
@@ -7361,7 +7373,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to rename workspace: ${message}`);
     } finally {
-      await releaseOverridesLock?.();
+      // Still held only when the move/config section exited early. Never let
+      // a release failure skip clearing the renaming flag below.
+      await releaseOverridesLock?.().catch((error: unknown) => {
+        log.warn("Failed to release MCP-overrides lock after rename", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
       // Always clear renaming flag, even on error
       this.renamingWorkspaces.delete(workspaceId);
     }
