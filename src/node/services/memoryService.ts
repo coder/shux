@@ -1274,6 +1274,11 @@ export class MemoryService extends EventEmitter {
     // folded in): either changes what the shared store's readers derive from it.
     let adoptedCount = 0;
     let skipped = 0;
+    // Some listed note was not represented this pass (owner store full, both
+    // destinations taken, unreadable, sidecar fold failed): the retry it
+    // promises depends on OWNER-side state the check key does not observe,
+    // so such a pass is never memoized — the next access runs it again.
+    let incomplete = false;
     const pass = async (): Promise<void> => {
       await this.assertMutationCommittable(ctx, store, undefined, toVirtualPath("workspace", ""));
       if ((await lstatKind(legacyRoot)) !== "dir") return; // swapped while waiting for the lock
@@ -1406,6 +1411,7 @@ export class MemoryService extends EventEmitter {
               "[MemoryService] failed to fold legacy memory stats into the shared store; retrying on next access",
               { relPath, error }
             );
+            incomplete = true;
             continue;
           }
         }
@@ -1442,7 +1448,12 @@ export class MemoryService extends EventEmitter {
     }
     // Recorded against the state observed BEFORE the pass: a foreign write
     // landing during it changes the stamp and re-runs the (idempotent) pass.
-    this.legacyStoreCheckedAgainst.set(childId, checkKey);
+    // Only a complete pass is memoized (see `incomplete`).
+    if (skipped === 0 && !incomplete) {
+      this.legacyStoreCheckedAgainst.set(childId, checkKey);
+    } else {
+      this.legacyStoreCheckedAgainst.delete(childId);
+    }
     if (adoptedCount > 0) this.emitChange(ctx, "workspace", "", "agent");
     return { skipped };
   }

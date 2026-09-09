@@ -1584,11 +1584,12 @@ describe("MemoryService", () => {
         "agent"
       );
       expect(full.success).toBe(false);
-      // Freed capacity lets a later pass (fresh process) fold in the rest.
+      // Freed capacity lets a later pass of the SAME process fold in the rest:
+      // an incomplete pass is not memoized, since its retry depends on owner
+      // state the legacy check key does not observe.
       await fixture.service.deletePath({ ...fixture.ctx }, "/memories/workspace/o0000.md", "agent");
       await fixture.service.deletePath({ ...fixture.ctx }, "/memories/workspace/o0001.md", "agent");
-      const restarted = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
-      const relisted = (await restarted.listIndexEntries({ ...fixture.ctx }))
+      const relisted = (await fixture.service.listIndexEntries({ ...fixture.ctx }))
         .filter((e) => e.scope === "workspace")
         .map((e) => e.relPath);
       expect(relisted).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);

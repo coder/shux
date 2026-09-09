@@ -6758,6 +6758,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           error instanceof TombstoneNotDurableError ||
           error instanceof SharedMemoryRemovalAbortedError
         ) {
+          // No durable tombstone was published (the locked handover or the
+          // tombstone write itself failed): the workspace stays registered
+          // with its session directory intact, so the consolidation teardown
+          // gate is lifted again in the finally like any pre-commit abort.
+          removalCommitted = false;
           throw error;
         }
         log.error(`Failed to remove session directory for ${workspaceId}:`, error);

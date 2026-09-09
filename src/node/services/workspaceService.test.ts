@@ -14705,9 +14705,53 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     const aborted = await workspaceService.remove(workspaceId);
     expect(aborted.success).toBe(false);
     expect(calls).toEqual(["release"]);
+    // Aborted inside the locked handover (a late legacy note the owner store
+    // cannot take), i.e. after the drain but BEFORE the tombstone: the session
+    // directory survives, so the gate is lifted too.
+    descendants = false;
+    calls.length = 0;
+    const sessionDir = path.join(tempRoot, "sessions", workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    const topology = {
+      projects: new Map([
+        [
+          "/tmp/src/project",
+          {
+            workspaces: [
+              { path: "/tmp/src/project/owner", id: "ws-owner" },
+              { path: "/tmp/src/project/child", id: workspaceId, parentWorkspaceId: "ws-owner" },
+            ],
+          },
+        ],
+      ]),
+    };
+    // The service holds its own copy of the mock config (createWorkspaceServiceForTest).
+    const config = (workspaceService as unknown as { config: MockWorkspaceConfig }).config;
+    const previousLoad = config.loadConfigOrDefault;
+    const previousLoadExisting = config.loadExistingConfigOrThrow;
+    config.loadConfigOrDefault = (() => topology) as MockWorkspaceConfig["loadConfigOrDefault"];
+    config.loadExistingConfigOrThrow = (() =>
+      topology) as MockWorkspaceConfig["loadExistingConfigOrThrow"];
+    workspaceService.setSharedWorkspaceMemoryStore({
+      adoptLegacyPrivateStoreForRemoval: () =>
+        Promise.reject(new Error("1 legacy note could not be folded into the shared notebook")),
+    });
+    try {
+      const lockedAbort = await workspaceService.remove(workspaceId);
+      expect(lockedAbort.success).toBe(false);
+      if (!lockedAbort.success) expect(lockedAbort.error).toContain("tombstone could be published");
+      expect(existsSync(sessionDir)).toBe(true);
+      expect(calls).toContain("cancel");
+      expect(calls).toContain("release");
+    } finally {
+      config.loadConfigOrDefault = previousLoad;
+      config.loadExistingConfigOrThrow = previousLoadExisting;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
+      });
+    }
     // Committed removal: cancelled (drained) and never released.
     calls.length = 0;
-    descendants = false;
     const removed = await workspaceService.remove(workspaceId);
     expect(removed.success).toBe(true);
     expect(calls.filter((call) => call === "cancel").length).toBeGreaterThan(0);
