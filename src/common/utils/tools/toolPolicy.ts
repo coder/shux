@@ -86,8 +86,8 @@ export function isSessionHistoryDisabled(policy?: ToolPolicy): boolean {
 
 /**
  * Caller policy for a context-budget final-flush turn: the memory-only ceiling is appended
- * last so it wins regardless of the caller's or agent's own rules, while `memory` and
- * `session_history` keep whatever verdict the inherited policy gave them.
+ * last so it wins regardless of the caller's or agent's own rules, while `memory` keeps
+ * whatever verdict the inherited policy gave it.
  */
 export function withContextBudgetFlushToolPolicy(policy?: ToolPolicy): ToolPolicy {
   return [...(policy ?? []), CONTEXT_FLUSH_TOOL_POLICY_RULE];

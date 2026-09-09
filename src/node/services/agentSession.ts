@@ -5884,8 +5884,11 @@ export class AgentSession {
     }
     // Fallbacks rebuild this callback's model binding; never use the requested primary's limit.
     context.modelString = step.model;
-    this.contextBudgetMemoryWritable = step.memoryWritable;
-    this.contextBudgetHistoryAvailable = step.sessionHistoryAvailable;
+    // A flush turn's memory-only toolset says nothing about what ordinary turns can use.
+    if (context.contextBudgetFlushTurn !== true) {
+      this.contextBudgetMemoryWritable = step.memoryWritable;
+      this.contextBudgetHistoryAvailable = step.sessionHistoryAvailable;
+    }
     const usage = createDisplayUsage(step.usage, step.model, step.providerMetadata);
     const maxTokens = getEffectiveContextLimit(
       step.model,
@@ -7289,7 +7292,9 @@ export class AgentSession {
             : options?.toolPolicy,
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
-        maxOutputTokens: options?.maxOutputTokens,
+        // A terse cap chosen for the triggering request could cut the notes payload short and
+        // waste the single flush step; the paired continuation keeps the caller's cap.
+        maxOutputTokens: contextBudgetFlushTurn ? undefined : options?.maxOutputTokens,
         muxProviderOptions: options?.providerOptions,
         agentInitiated,
         agentId: options?.agentId,

@@ -6,11 +6,13 @@ export const CONTEXT_CONTINUE_DEDUPE_KEY = "context-budget-continue";
 export const CONTEXT_WARNING_DEDUPE_KEY = "context-budget-warning";
 /**
  * Appended to the inherited tool policy for the hidden final-flush turn: only `memory` (the
- * write it exists for) and read-only `session_history` stay enabled. Leaving those two names
- * untouched keeps the inherited policy's session_history verdict intact for rollover admission.
+ * write it exists for) stays enabled. The turn is bounded to one provider step, so a read-only
+ * `session_history` call would consume the whole preservation opportunity without a write; the
+ * transcript is still in context anyway, and history retrieval belongs to the next window.
+ * Rollover admission checks `session_history` against the inherited policy separately.
  */
 export const CONTEXT_FLUSH_TOOL_POLICY_RULE = {
-  regex_match: "(?!memory$|session_history$).*",
+  regex_match: "(?!memory$).*",
   action: "disable",
 } as const;
 export const OUTPUT_RESERVE_TOKENS = 8_192;

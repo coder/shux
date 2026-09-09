@@ -643,8 +643,11 @@ describe("pinned full-payload rollover admission", () => {
         true
       );
       expect(start).toHaveBeenCalledTimes(1);
-      // The memory-only ceiling proves the flag reached the builder.
-      expect(Object.keys(start.mock.calls[0][0].tools ?? {})).not.toContain("tool_catalog_search");
+      // The memory-only ceiling proves the flag reached the builder: no catalog search and no
+      // read-only session_history (a history read would consume the single flush step).
+      const flushTools = Object.keys(start.mock.calls[0][0].tools ?? {});
+      expect(flushTools).not.toContain("tool_catalog_search");
+      expect(flushTools).not.toContain("session_history");
       expect(startServers).not.toHaveBeenCalled();
       await h.session.interruptStream();
       await h.session.waitForIdle();

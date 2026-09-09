@@ -73,7 +73,7 @@ export function buildBudgetWarningText(
     return [
       usage,
       "This is the last step in this context window: the next message starts a fresh provider context that does not carry this transcript.",
-      `${CONTEXT_NOTES_MEMORY_PATH} stays available through the memory tool and, when memory hot-set loading is enabled, is preloaded there if present (bounded to 8 KiB); session_history can retrieve earlier messages.`,
+      `${CONTEXT_NOTES_MEMORY_PATH} stays available through the memory tool and, when memory hot-set loading is enabled, is preloaded there if present (bounded to 8 KiB); in the next window, session_history can retrieve earlier messages.`,
       "Write or update that file now in a single memory call, essential state first: goal, decisions, invariants, open tasks, blockers, and the exact paths/IDs needed to resume.",
       // The pinned memory tool resolves create-or-update atomically (see
       // MemoryService.writePinnedFile), so no on-disk existence verdict is needed here and a

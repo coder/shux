@@ -1358,9 +1358,14 @@ describe("AgentSession token-budget lifecycle", () => {
     // hooks/PTC for the hidden flush turn from this flag (see turnRequestBuilder).
     expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     // The flush turn's own settlement re-evaluates as rollover without queuing a second flush.
-    expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
+    // Its memory-only request reports session_history as unavailable; that must not poison the
+    // recorded availability used by later admissions.
+    expect(
+      await h.requests[1].onStepSettled?.(step(112_000, { sessionHistoryAvailable: false }))
+    ).toBe("rollover");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    expect(Reflect.get(h.session, "contextBudgetHistoryAvailable")).toBe(true);
     h.settleStream(1);
     await h.waitForRequest(3);
     rows = await allRows(h);
@@ -1383,6 +1388,22 @@ describe("AgentSession token-budget lifecycle", () => {
         text(row).startsWith("Flush context notes")
       )
     ).toBe(false);
+  });
+
+  test("the flush request drops the caller's output cap; the paired continuation keeps it", async () => {
+    const h = await setup();
+    expect(
+      (await h.session.sendMessage("Work", { ...options, maxOutputTokens: 300 })).success
+    ).toBe(true);
+    expect(h.requests[0].maxOutputTokens).toBe(300);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await h.finishAndDispatch();
+    expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    expect(h.requests[1].maxOutputTokens).toBeUndefined();
+    expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
+    h.settleStream(1);
+    await h.waitForRequest(3);
+    expect(h.requests[2].maxOutputTokens).toBe(300);
   });
 
   test("a top-level workspace (no delegated correlation) still flags the flush request", async () => {
