@@ -1474,9 +1474,11 @@ export class MemoryService extends EventEmitter {
         // tolerates readdir failures (a partial list). Only a provable ENOENT
         // on the source itself counts; any other outcome keeps the entry
         // (and the copy) for a later pass.
+        // ENOTDIR is proof too: the downgraded build replaced `dir/` with a
+        // regular note, deleting every descendant.
         const sourceGone = await fsPromises.lstat(path.join(legacyRoot, relPath)).then(
           () => false,
-          (error: unknown) => hasErrorCode(error, "ENOENT")
+          (error: unknown) => isMissingPathError(error)
         );
         if (!sourceGone) continue;
         if (previous.created === true) {
@@ -1507,12 +1509,30 @@ export class MemoryService extends EventEmitter {
             skipped++;
             continue;
           }
-          const current =
-            targetKind === "file"
-              ? await this.readBoundedTextFile(store, previous.target, previous.target).catch(
-                  () => null
-                )
-              : null;
+          // Same for the content read: a failure other than the cap check
+          // (MemoryCommandError: the owner grew the copy past the cap, which
+          // IS a change) says nothing about the content.
+          let current: string | null = null;
+          if (targetKind === "file") {
+            try {
+              current = await this.readBoundedTextFile(store, previous.target, previous.target);
+            } catch (error) {
+              if (!(error instanceof MemoryCommandError)) {
+                log.warn(
+                  "[MemoryService] cannot read an adopted legacy note's copy; retrying later",
+                  {
+                    childId,
+                    owner,
+                    relPath,
+                    target: previous.target,
+                    error,
+                  }
+                );
+                skipped++;
+                continue;
+              }
+            }
+          }
           const unchanged = current !== null && sha256Hex(current) === previous.content;
           // A listed note may now point at this very target (the downgraded
           // build renamed `a.md` to the path its conflict copy was adopted

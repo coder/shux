@@ -2,6 +2,7 @@ import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
   clearWorkspaceMemoryDenyMarker,
   readWorkspaceMemoryDenyMarker,
+  readWorkspaceMemoryDenyMarkerForEpochs,
   workspaceMemoryDenyMarkerPath,
   writeWorkspaceMemoryDenyMarker,
 } from "@/node/services/workspaceMemoryDenyMarker";
@@ -9514,6 +9515,10 @@ describe("WorkspaceService initialize", () => {
         return cfg;
       });
       await writeWorkspaceMemoryDenyMarker(sessionDir, 12);
+      // One snapshot answers for every epoch consulted (a carry re-stamping
+      // 12 → 16 between two separate reads could hide the entry from both).
+      expect(await readWorkspaceMemoryDenyMarkerForEpochs(sessionDir, [16, -1, 12])).toBe(true);
+      expect(await readWorkspaceMemoryDenyMarkerForEpochs(sessionDir, [16, -1])).toBe(false);
       expect(
         await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
           epochHasPriorTurns: false,

@@ -56,7 +56,10 @@ export async function refinementsCommand(
   if (opts.rollback !== undefined) {
     // Sub-agents journal workspace-scope rows that point into the owner's
     // session dir; admit that root the same way the in-app tool does.
-    const cfg = defaultConfig.loadConfigOrDefault();
+    // Strict: a tolerant read of an unreadable config.json would resolve a
+    // sub-agent to ITSELF, and the rollback would then mutate its hidden
+    // legacy notebook (no owner root, no adoption remap) and report success.
+    const cfg = defaultConfig.loadConfigOrDefault({ throwOnError: true });
     const memoryOwnerId = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
     const result = await rollbackRefinement({
       sessionDir,

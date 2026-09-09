@@ -125,10 +125,29 @@ export async function readWorkspaceMemoryDenyMarker(
   sessionDir: string,
   epoch?: number
 ): Promise<boolean> {
+  return readWorkspaceMemoryDenyMarkerForEpochs(
+    sessionDir,
+    epoch === undefined ? undefined : [epoch]
+  );
+}
+
+/**
+ * `readWorkspaceMemoryDenyMarker` for several epochs from ONE read of the
+ * marker: a deny recorded for any of them. A preserved-tail turn consults its
+ * own epoch and the epochs its tail copies were produced under; the carry
+ * (carryWorkspaceMemoryDenyMarker) re-stamps an entry from the closing epoch
+ * to the new one atomically, so two separate reads could each miss it (old
+ * gone, new not yet seen) while a single snapshot always holds it under one
+ * key or the other. Without `epochs`, any present marker is a deny.
+ */
+export async function readWorkspaceMemoryDenyMarkerForEpochs(
+  sessionDir: string,
+  epochs?: readonly number[]
+): Promise<boolean> {
   const record = await readMarkerRecord(workspaceMemoryDenyMarkerPath(sessionDir));
   if (record === "absent") return false;
-  if (record === null || record === "unreadable" || epoch === undefined) return true;
-  return record.wildcard || record.epochs.includes(epoch);
+  if (record === null || record === "unreadable" || epochs === undefined) return true;
+  return record.wildcard || epochs.some((epoch) => record.epochs.includes(epoch));
 }
 
 /**

@@ -578,6 +578,7 @@ async function readSharedMemoryPeerRows(
     "memory"
   );
   const ownerSessionDir = path.dirname(sharedRoot);
+  const actingWorkspaceId = path.basename(path.resolve(opts.sessionDir));
   const peerRows: RefinementEvent[] = [];
   for (const peerDir of peerDirs) {
     assert(
@@ -599,6 +600,11 @@ async function readSharedMemoryPeerRows(
         : await createLegacyPathRemapper({ childSessionDir: peerDir, ownerSessionDir });
     for (const row of await listRefinements(peerDir)) {
       if (row.data.kind !== "memory") continue;
+      // A removal that aborted after its pre-teardown pass leaves the owner
+      // journal holding COPIES of this session's rows (migratedFrom =
+      // "<this workspace>:<row id>") while this session lives on. They are
+      // this journal's rows seen twice, not later peer edits.
+      if (row.data.migratedFrom?.startsWith(`${actingWorkspaceId}:`) === true) continue;
       const parsed = parseRemappedInverse(row, remap);
       if (parsed === null) continue;
       if (!inversePaths(parsed).some((p) => pathsOverlap(p, sharedRoot))) continue;
@@ -1217,13 +1223,16 @@ export async function rollbackRefinement(
           isWorkspaceMemoryRoot(opts.sessionDir, root, opts.sharedWorkspaceMemorySessionDir)
         );
         let sourceTs: number | undefined;
+        let orderUnknownRow = false;
         if (kind === "memory" && workspaceMemoryRoot !== undefined) {
           try {
             sourceTs = await advanceWorkspaceMemoryRevision(path.dirname(workspaceMemoryRoot));
           } catch (error) {
-            // Best-effort like the rest of this block: the row must still be
-            // journaled (falling back to its own `ts` for ordering).
+            // The inverse is already applied, so the row must still be
+            // journaled — as order-unknown (see MemoryService.journalRefinement):
+            // its journal-local `ts` is incomparable with other journals' rows.
             log.debug("[refinement] failed to advance workspace memory revision", { error });
+            orderUnknownRow = true;
           }
         }
         let publishedBlobs: BlobQuotaEntry[] = [];
@@ -1247,6 +1256,7 @@ export async function rollbackRefinement(
               },
               rollbackOf: opts.id,
               ...(sourceTs !== undefined ? { sourceTs } : {}),
+              ...(orderUnknownRow ? { orderUnknown: true as const } : {}),
             },
           });
         });

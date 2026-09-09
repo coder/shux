@@ -926,6 +926,27 @@ describe("refinementRollback", () => {
       "not folded into the shared workspace store"
     );
     expect(await pathExists(path.join(fixture.sessionDir, "memory", "orphan.md"))).toBe(true);
+    // A note the owner already had (adoption created nothing, `created`
+    // unset): the child's create row must not delete the owner's own file.
+    await fixture.service.create(fixture.ctx, "/memories/workspace/same.md", "same\n", "agent");
+    const sameRow = await lastRow(fixture.sessionDir);
+    await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "same.md"), "same\n");
+    await fsPromises.writeFile(
+      path.join(fixture.sessionDir, "memory", ".adopted-into-shared-store.json"),
+      JSON.stringify({
+        "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
+        "same.md": { content: "x", sidecar: "", target: "same.md" },
+      })
+    );
+    const ownerOwned = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: sameRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(ownerOwned.success).toBe(false);
+    expect(ownerOwned.success ? "" : ownerOwned.error).toContain("owner's own note");
+    expect(await pathExists(path.join(ownerSessionDir, "memory", "same.md"))).toBe(true);
   });
 
   it("journals the rollback row before releasing the target locks (no durable-order inversion)", async () => {

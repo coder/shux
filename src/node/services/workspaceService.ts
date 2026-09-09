@@ -147,6 +147,7 @@ import {
 } from "@/node/services/workspaceRemoval";
 import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
 import {
+  readWorkspaceMemoryDenyMarkerForEpochs,
   readWorkspaceMemoryDenyMarker,
   writeWorkspaceMemoryDenyMarker,
 } from "@/node/services/workspaceMemoryDenyMarker";
@@ -4386,18 +4387,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // removed the durable field underneath it.
     // A fourth input: the session-dir deny marker, the durable fallback taken
     // when config.json could not record a deny (denyDurableFallback above).
-    const denyMarker = await readWorkspaceMemoryDenyMarker(sessionDir, policyEpoch);
     // Preserved-tail epoch: the accumulators of the epochs its tail copies
     // were produced under are part of this one. The compacting session's
     // carry moves a record/marker from the carried key to this one
     // asynchronously; reading EVERY key (records inside the transaction
-    // below, markers here) makes the conjunction independent of that carry's
-    // timing — a deny is visible under one key or another at every instant,
-    // never under none.
-    let carriedDenyMarker = false;
-    for (const epoch of carriedPolicyEpochs) {
-      if (await readWorkspaceMemoryDenyMarker(sessionDir, epoch)) carriedDenyMarker = true;
-    }
+    // below, marker entries from ONE snapshot here) makes the conjunction
+    // independent of that carry's timing — a deny is visible under one key
+    // or another at every instant, never under none. One read for all the
+    // epochs: separate reads could straddle the carry's atomic re-stamp and
+    // each miss the entry.
+    const denyMarker = await readWorkspaceMemoryDenyMarkerForEpochs(sessionDir, [
+      policyEpoch,
+      ...carriedPolicyEpochs,
+    ]);
     // undefined: no carried epoch recorded anything; false: some carried deny.
     const carriedFor = (entry: WorkspaceConfigEntry): boolean | undefined => {
       let carried: boolean | undefined;
@@ -4424,7 +4426,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       options.carriedPolicyUnknown === true;
     const conjunction = (durable: boolean | undefined, carried: boolean | undefined): boolean =>
       !denyMarker &&
-      !carriedDenyMarker &&
       !unknownHistory &&
       (durable ?? true) &&
       (carried ?? true) &&

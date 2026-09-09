@@ -97,9 +97,13 @@ export async function migrateSharedMemoryRefinementRows(args: {
   // session still exists). Retargeted like the rollback engine does, so the
   // adopted copy stays rollbackable once the child journal is gone; legacy
   // paths the shared store never took are skipped below like other roots.
+  // Strict: an unreadable manifest must abort the removal (throws), not read
+  // as "nothing adopted" and let the child journal be deleted with the only
+  // rollback IDs and inverse payloads of adopted notes.
   const remap = await createLegacyPathRemapper({
     childSessionDir: args.childSessionDir,
     ownerSessionDir: args.ownerSessionDir,
+    strict: true,
   });
   const remapInverse = (inverse: RefinementInverse): RefinementInverse | null => {
     try {

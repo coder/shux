@@ -1552,24 +1552,30 @@ export class TurnRequestBuilder {
     const tailCopies = activeContextMessages.filter(
       (message) => message.metadata?.rlmPreservedTailCopy === true
     );
+    // A usable source epoch is an integer earlier than this epoch (persisted
+    // history is unvalidated). A copy without one — persisted by a build
+    // before the field, a re-copy of such a copy, or a malformed value —
+    // carries a policy nobody can look up: it is excluded from the prior-turn
+    // check like every copy, so without this the epoch would grant on the
+    // strength of the turns it can see. Unknown fails closed — the epoch is
+    // denied until a no-tail boundary (or the tail turning over) leaves no
+    // such copy in the active context.
+    const usableSourceEpoch = (message: MuxMessage): number | undefined => {
+      const epoch = message.metadata?.rlmPreservedTailSourcePolicyEpoch;
+      return typeof epoch === "number" && Number.isInteger(epoch) && epoch < policyEpoch
+        ? epoch
+        : undefined;
+    };
     const carriedPolicyEpochs = [
       ...new Set(
         tailCopies.flatMap((message) => {
-          const epoch = message.metadata?.rlmPreservedTailSourcePolicyEpoch;
-          return typeof epoch === "number" && Number.isInteger(epoch) && epoch < policyEpoch
-            ? [epoch]
-            : [];
+          const epoch = usableSourceEpoch(message);
+          return epoch === undefined ? [] : [epoch];
         })
       ),
     ].sort((a, b) => a - b);
-    // A copy without a source epoch (persisted by a build before the field,
-    // or a re-copy of one) carries a policy nobody can look up: it is
-    // excluded from the prior-turn check like every copy, so without this
-    // the epoch would grant on the strength of the turns it can see. Unknown
-    // fails closed — the epoch is denied until a no-tail boundary (or the
-    // tail turning over) leaves no such copy in the active context.
     const carriedPolicyUnknown = tailCopies.some(
-      (message) => typeof message.metadata?.rlmPreservedTailSourcePolicyEpoch !== "number"
+      (message) => usableSourceEpoch(message) === undefined
     );
     const persistWorkspaceMemoryWritable = async (writable: boolean): Promise<boolean> => {
       const sink = this.dependencies.bindings.workspaceMemoryPolicySink;

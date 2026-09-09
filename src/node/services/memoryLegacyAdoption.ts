@@ -86,9 +86,11 @@ export async function readLegacyAdoptionManifest(
 
 /** Thrown for a legacy path the shared store does not represent (see below). */
 export class LegacyPathNotAdoptedError extends Error {
-  constructor(legacyPath: string) {
+  constructor(legacyPath: string, reason: "not-adopted" | "owner-owned") {
     super(
-      `'${legacyPath}' addresses this sub-agent's pre-sharing private notebook, and that note was not folded into the shared workspace store (never adopted, or unplaceable there): the shared notebook does not show it, so rolling it back there would change nothing visible`
+      reason === "owner-owned"
+        ? `'${legacyPath}' addresses this sub-agent's pre-sharing private notebook; the shared workspace store holds an identical note the owner already had (adoption created nothing), so a rollback there would alter the owner's own note`
+        : `'${legacyPath}' addresses this sub-agent's pre-sharing private notebook, and that note was not folded into the shared workspace store (never adopted, or unplaceable there): the shared notebook does not show it, so rolling it back there would change nothing visible`
     );
     this.name = "LegacyPathNotAdoptedError";
   }
@@ -103,12 +105,19 @@ export class LegacyPathNotAdoptedError extends Error {
  * would re-import as a conflicting duplicate). Paths outside the legacy root
  * pass through unchanged. A legacy path the manifest does not know throws
  * LegacyPathNotAdoptedError — fail closed rather than mutate an invisible
- * file. Only the manifest's `target` is trusted for the destination's
- * relPath; callers re-run their confinement checks on the mapped result.
+ * file. So does a record the adoption did NOT create (`created` unset: the
+ * owner already had an identical note of its own): the child's rows never
+ * touched that file, and applying their inverses there — a create row's
+ * delete-files in particular — would alter or remove the owner's own note.
+ * Only the manifest's `target` is trusted for the destination's relPath;
+ * callers re-run their confinement checks on the mapped result. `strict`
+ * (removal's row migration) throws on an unreadable manifest instead of
+ * treating every legacy path as unadopted.
  */
 export async function createLegacyPathRemapper(args: {
   childSessionDir: string;
   ownerSessionDir: string;
+  strict?: boolean;
 }): Promise<{
   path(filePath: string): string;
   inverse(inverse: RefinementInverse): RefinementInverse;
@@ -116,14 +125,17 @@ export async function createLegacyPathRemapper(args: {
   const legacyRoot = path.join(path.resolve(args.childSessionDir), "memory");
   const ownerRoot = path.join(path.resolve(args.ownerSessionDir), "memory");
   const adopted = await readLegacyAdoptionManifest(
-    path.join(legacyRoot, LEGACY_ADOPTION_MANIFEST_FILE_NAME)
+    path.join(legacyRoot, LEGACY_ADOPTION_MANIFEST_FILE_NAME),
+    { strict: args.strict === true }
   );
   const remapPath = (filePath: string): string => {
     const relative = path.relative(legacyRoot, path.resolve(filePath));
     if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return filePath;
     const record = adopted.get(relative.split(path.sep).join("/"));
-    if (record === undefined || record.pending === true)
-      throw new LegacyPathNotAdoptedError(filePath);
+    if (record === undefined || record.pending === true) {
+      throw new LegacyPathNotAdoptedError(filePath, "not-adopted");
+    }
+    if (record.created !== true) throw new LegacyPathNotAdoptedError(filePath, "owner-owned");
     return path.join(ownerRoot, ...record.target.split("/"));
   };
   return {
