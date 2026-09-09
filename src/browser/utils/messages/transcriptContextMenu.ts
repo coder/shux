@@ -398,9 +398,11 @@ function appendClipboardNodes(
       child.nodeType === 1 &&
       (child as Element).matches('li > input[type="checkbox"][disabled]:first-child') &&
       hasSelectedOwnListText(child.parentElement!, range);
+    // Empty cells retain column positions and alignment without copying unselected text.
     const isTableStructure =
-      preserveSpanningTable &&
-      ["THEAD", "TBODY", "TFOOT", "TR", "TD", "TH"].includes(child.nodeName);
+      child.nodeName === "TD" ||
+      child.nodeName === "TH" ||
+      (preserveSpanningTable && ["THEAD", "TBODY", "TFOOT", "TR"].includes(child.nodeName));
     if (
       source.nodeName === "DETAILS" &&
       !(source as Element).hasAttribute("open") &&
@@ -408,10 +410,6 @@ function appendClipboardNodes(
     )
       continue;
     if (!range.intersectsNode(child) && !isTaskMarker && !isTableStructure) {
-      // Empty cells retain column positions without copying unselected text.
-      if (child.nodeName === "TH" || child.nodeName === "TD") {
-        destination.appendChild(document.createElement(child.nodeName.toLowerCase()));
-      }
       continue;
     }
     if (child.nodeType === 3) {
@@ -467,7 +465,12 @@ function appendClipboardNodes(
       element.getAttribute("data-streamdown") === "strong"
         ? "strong"
         : element.tagName.toLowerCase();
-    if (!CLIPBOARD_TAGS.has(tag)) {
+    const summary = tag === "details" ? element.querySelector(":scope > summary") : null;
+    // Body-only selections must not create a browser-generated disclosure label.
+    if (
+      !CLIPBOARD_TAGS.has(tag) ||
+      (tag === "details" && (!summary || !range.intersectsNode(summary)))
+    ) {
       appendClipboardNodes(element, destination, range, preserveSpanningTable);
       continue;
     }
@@ -478,6 +481,8 @@ function appendClipboardNodes(
     }
     if (tag === "td" || tag === "th") {
       const cell = element as HTMLTableCellElement;
+      const alignment = cell.getAttribute("align") ?? cell.style.textAlign;
+      if (["left", "center", "right"].includes(alignment)) copy.setAttribute("align", alignment);
       if (/^\d+$/.test(element.getAttribute("colspan") ?? ""))
         copy.setAttribute("colspan", String(cell.colSpan));
       if (/^\d+$/.test(element.getAttribute("rowspan") ?? ""))
@@ -576,7 +581,21 @@ export function getTranscriptContextMenuMarkdown(
     filter: "table",
     replacement: (_content, node) => {
       // GFM cannot represent spans. Keep sanitized HTML instead of inventing a different table layout.
-      if (node.querySelector("[rowspan], [colspan]")) return "\n\n" + node.outerHTML + "\n\n";
+      if (node.querySelector("[rowspan], [colspan]")) {
+        // Blank lines let Markdown parse cell content inside the span-preserving HTML.
+        const serialize = (element: Element): string => {
+          const tag = element.tagName.toLowerCase();
+          const attributes = Array.from(
+            element.attributes,
+            (attribute) => " " + attribute.name + '="' + attribute.value + '"'
+          ).join("");
+          const content = element.matches("td, th")
+            ? markdown.turndown(element as HTMLElement)
+            : Array.from(element.children, serialize).join("\n\n");
+          return "<" + tag + attributes + ">\n\n" + content + "\n\n</" + tag + ">";
+        };
+        return "\n\n" + serialize(node) + "\n\n";
+      }
       const rows = Array.from(node.querySelectorAll<HTMLTableRowElement>("tr"), (row) =>
         Array.from(row.cells, (cell) =>
           markdown.turndown(cell).replace(/\|/g, "\\|").replace(/\n/g, "<br>")
@@ -585,7 +604,21 @@ export function getTranscriptContextMenuMarkdown(
       const width = Math.max(0, ...rows.map((row) => row.length));
       if (!width) return "";
       if (!node.querySelector("tr th")) rows.unshift(Array<string>(width).fill(""));
-      rows.splice(1, 0, Array<string>(width).fill("---"));
+      const firstRow = node.querySelector("tr");
+      rows.splice(
+        1,
+        0,
+        Array.from({ length: width }, (_, index) => {
+          const alignment = firstRow?.cells[index]?.getAttribute("align");
+          return alignment === "left"
+            ? ":---"
+            : alignment === "right"
+              ? "---:"
+              : alignment === "center"
+                ? ":---:"
+                : "---";
+        })
+      );
       return (
         "\n\n" +
         rows

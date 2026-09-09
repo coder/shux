@@ -114,6 +114,34 @@ describe("MarkdownRenderer raw HTML handling", () => {
     ).toBe("x^2");
   });
 
+  test("spanning tables retain rendered math after copying", () => {
+    const { view, copied } = copyRenderedMarkdown(
+      '<table><tr><td colspan="2">\n\n$$x^2$$\n\n</td></tr></table>'
+    );
+    expect(view.container.querySelector("td .katex")).not.toBeNull();
+    const pasted = renderMarkdown(copied!.text);
+    expect(pasted.container.querySelector("td")?.getAttribute("colspan")).toBe("2");
+    expect(
+      pasted.container.querySelector('td .katex annotation[encoding="application/x-tex"]')
+        ?.textContent
+    ).toBe("x^2");
+    expect(copied!.text).not.toContain("data-clipboard-math");
+  });
+
+  test("GFM table alignment survives copying", () => {
+    const { copied } = copyRenderedMarkdown(
+      "| L | C | R |\n| :--- | :---: | ---: |\n| a | b | c |"
+    );
+    const pasted = renderMarkdown(copied!.text);
+    expect(
+      Array.from(
+        pasted.container.querySelectorAll("th"),
+        (cell) => cell.style.textAlign || cell.getAttribute("align")
+      )
+    ).toEqual(["left", "center", "right"]);
+    expect(copied!.html).toContain('align="right"');
+  });
+
   test("closed disclosures do not copy their hidden body", () => {
     const { copied } = copyRenderedMarkdown(
       "<details><summary>Visible</summary><p>HIDDEN</p></details>"

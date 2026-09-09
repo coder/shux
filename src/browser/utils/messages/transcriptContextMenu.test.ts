@@ -68,6 +68,16 @@ describe("transcriptContextMenu", () => {
       expect(result).toEqual({ text: "**beta**", html: "<p><strong>beta</strong></p>" });
     });
 
+    test("body-only disclosure selections omit the disclosure control", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<details open><summary>Title</summary><p id="part">Body</p></details>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
+      expect(result).toEqual({ text: "Body", html: "<p>Body</p>" });
+    });
+
     test("preserves links when the selection target is an anchor", () => {
       const root = createTranscriptRoot(
         createQuoteableTranscriptMessage(

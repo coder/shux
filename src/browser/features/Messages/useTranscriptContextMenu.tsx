@@ -35,6 +35,16 @@ interface UseTranscriptContextMenuReturn {
   menu: React.ReactNode;
 }
 
+async function handleCopyMarkdown(markdown: FormattedClipboardContent | null, close: () => void) {
+  if (!markdown) return;
+  close();
+  try {
+    await copyFormattedToClipboard(markdown);
+  } catch (error) {
+    console.error("Failed to copy Markdown:", error);
+  }
+}
+
 export function useTranscriptContextMenu(
   options: UseTranscriptContextMenuOptions
 ): UseTranscriptContextMenuReturn {
@@ -115,16 +125,6 @@ export function useTranscriptContextMenu(
     transcriptMenu.close();
   }, [options, transcriptMenu]);
 
-  const handleCopyMarkdown = useCallback(async () => {
-    if (!markdown) return;
-    transcriptMenu.close();
-    try {
-      await copyFormattedToClipboard(markdown);
-    } catch (error) {
-      console.error("Failed to copy Markdown:", error);
-    }
-  }, [markdown, transcriptMenu]);
-
   useEffect(() => {
     if (!transcriptMenu.isOpen || !markdown) return;
     // Right-click menus can leave focus on the transcript instead of the menu.
@@ -139,11 +139,11 @@ export function useTranscriptContextMenu(
         return;
       event.preventDefault();
       stopKeyboardPropagation(event);
-      handleCopyMarkdown().catch(console.error);
+      handleCopyMarkdown(markdown, transcriptMenu.close).catch(console.error);
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [transcriptMenu.isOpen, markdown, handleCopyMarkdown]);
+  }, [transcriptMenu, markdown]);
 
   return {
     onContextMenu: handleTranscriptContextMenu,
@@ -173,7 +173,7 @@ export function useTranscriptContextMenu(
             label="Copy Markdown"
             shortcut="M"
             onClick={() => {
-              handleCopyMarkdown().catch(console.error);
+              handleCopyMarkdown(markdown, transcriptMenu.close).catch(console.error);
             }}
           />
         )}
