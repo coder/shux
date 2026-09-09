@@ -1191,6 +1191,43 @@ export class MemoryService extends EventEmitter {
   }
 
   /**
+   * Fingerprint of a sub-agent's legacy private notebook as seen by the
+   * adoption pass: owner, legacy root kind, the legacy store's stamp (child
+   * store clock, root entry, listed files' size/mtime) and the child-keyed
+   * sidecar entries. Also folded into the child's memory probe token
+   * (workspaceMemoryRevision): a downgraded backend's edit to the legacy note
+   * or its pin never moves the OWNER store's clock, so a cached session
+   * context keyed on that clock alone would keep serving the pre-edit index
+   * until some unrelated owner mutation. Cheap when no legacy root exists
+   * (one lstat).
+   */
+  private async legacyAdoptionCheckKey(
+    childId: string,
+    owner: string
+  ): Promise<{ legacyRootKind: Awaited<ReturnType<typeof lstatKind>>; checkKey: string }> {
+    const childSessionDir = path.join(this.config.sessionsDir, childId);
+    const legacyRoot = path.join(childSessionDir, "memory");
+    const legacyRootKind = await lstatKind(legacyRoot);
+    // Workspace-scope keys embed only the workspace id (see logicalKeyFor).
+    const childKeyPrefix = memoryLogicalKey("workspace", "", {
+      projectPath: "",
+      workspaceId: childId,
+    });
+    const childSidecarFingerprint =
+      legacyRootKind === "dir"
+        ? JSON.stringify(
+            [...(await this.metaService.getEntries())]
+              .filter(([key]) => key.startsWith(childKeyPrefix))
+              .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          )
+        : "";
+    const checkKey = `${owner}\u0000${legacyRootKind}\u0000${
+      legacyRootKind === "dir" ? await legacyStoreStamp(childSessionDir, legacyRoot) : ""
+    }\u0000${childSidecarFingerprint}`;
+    return { legacyRootKind, checkKey };
+  }
+
+  /**
    * The adoption pass (see adoptLegacyPrivateStore). `force` skips the
    * per-process "already checked" memo: removal wants the pass to run against
    * the current legacy directory regardless of what an earlier access saw.
@@ -1219,22 +1256,7 @@ export class MemoryService extends EventEmitter {
     // The pass itself is idempotent.
     const childSessionDir = path.join(this.config.sessionsDir, childId);
     const legacyRoot = path.join(childSessionDir, "memory");
-    const legacyRootKind = await lstatKind(legacyRoot);
-    const childKeyPrefix = memoryLogicalKey("workspace", "", {
-      projectPath: ctx.projectPath,
-      workspaceId: childId,
-    });
-    const childSidecarFingerprint =
-      legacyRootKind === "dir"
-        ? JSON.stringify(
-            [...(await this.metaService.getEntries())]
-              .filter(([key]) => key.startsWith(childKeyPrefix))
-              .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-          )
-        : "";
-    const checkKey = `${owner}\u0000${legacyRootKind}\u0000${
-      legacyRootKind === "dir" ? await legacyStoreStamp(childSessionDir, legacyRoot) : ""
-    }\u0000${childSidecarFingerprint}`;
+    const { legacyRootKind, checkKey } = await this.legacyAdoptionCheckKey(childId, owner);
     if (options?.force !== true && this.legacyStoreCheckedAgainst.get(childId) === checkKey) {
       return { skipped: 0 };
     }
@@ -1786,7 +1808,12 @@ export class MemoryService extends EventEmitter {
       if (await isWorkspaceRemovalTombstoned(this.config.rootDir, guarded)) return "revoked";
     }
     const revision = await readWorkspaceMemoryRevision(path.join(this.config.sessionsDir, owner));
-    return revision === null ? "missing" : String(revision);
+    const token = revision === null ? "missing" : String(revision);
+    // A redirected sub-agent's token also tracks its legacy private notebook
+    // (see legacyAdoptionCheckKey): its next store access adopts the change,
+    // so the cached context must miss as soon as the legacy state moves.
+    if (owner === workspaceId) return token;
+    return `${token}\u0000${(await this.legacyAdoptionCheckKey(workspaceId, owner)).checkKey}`;
   }
 
   /**

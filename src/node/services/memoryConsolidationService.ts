@@ -356,7 +356,8 @@ class HarvestRefusedError extends Error {
  * stamp (a build that does not maintain the policy — e.g. turns run by a
  * downgraded build mid-epoch, which also left the durable accumulator
  * untouched; synthetic payload/summary rows that are no turn) cover nothing
- * (fail closed). Token-budget control rows (rollover lead-in, budget
+ * (fail closed); a stamp that is present but malformed refuses like a foreign
+ * epoch's. Token-budget control rows (rollover lead-in, budget
  * warning) need no turn: backend template text appended in the same durable
  * batch as the turn they precede, carrying neither agent nor repository
  * content.
@@ -374,10 +375,14 @@ function epochHarvestRefusal(messages: readonly MuxMessage[], closingEpoch: numb
     const bound = message.metadata?.requestHistorySequence;
     if (typeof bound !== "number") continue;
     const policyEpoch = message.metadata?.workspaceMemoryPolicyEpoch;
-    if (typeof policyEpoch === "number" && policyEpoch !== closingEpoch) {
+    // No stamp at all: a row that is no turn of this build (covers nothing).
+    if (policyEpoch === undefined) continue;
+    // History rows are raw JSON: a stamp that is present but not the integer
+    // equal to the closing epoch — another epoch's, or a corrupted value such
+    // as null — proves no policy for this epoch and refuses the harvest.
+    if (!Number.isInteger(policyEpoch) || policyEpoch !== closingEpoch) {
       return "the compacted epoch holds a turn whose memory policy was recorded for another epoch; harvest refused (fail closed)";
     }
-    if (policyEpoch === undefined) continue;
     const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;
     if (anchor === undefined) continue;
     covered.add(anchor.id);
@@ -445,10 +450,9 @@ export class MemoryConsolidationService extends EventEmitter {
    * post-harvest sweep, and a cancelled run still starts retryable-harvest
    * recovery, each with a fresh un-aborted signal. Entry points refuse and
    * new controllers start pre-aborted while a workspace is in this set.
-   * Entries are never cleared: removal is terminal, and if a force=false
-   * removal fails after the drain, losing background consolidation for the
-   * surviving workspace (until restart) matches the documented drained-
-   * producers tradeoff in WorkspaceService.removeWorkspace. Cross-PROCESS
+   * Entries are cleared only when removal aborts before its point of no
+   * return (releaseRemovalCancellation); once the tombstone is published,
+   * removal is terminal. Cross-PROCESS
    * teardown is covered by the durable removal tombstone instead (see
    * workspaceRemoval.ts), checked at memory mutation commit points.
    */
@@ -734,6 +738,18 @@ export class MemoryConsolidationService extends EventEmitter {
    */
   cancelInFlightConsolidation(workspaceId: string): Promise<void> {
     return Effect.runPromise(this.cancelInFlightConsolidationEffect(workspaceId));
+  }
+
+  /**
+   * Removal aborted BEFORE its point of no return (no tombstone published, the
+   * workspace stays registered and intact — e.g. a non-forced removal whose
+   * shared-memory handover found the owner notebook full): lift the teardown
+   * gate again, or the surviving workspace would refuse every Dream run and
+   * post-compaction harvest until restart. The drained in-flight runs are
+   * gone regardless (retryable harvests recover on the next trigger).
+   */
+  releaseRemovalCancellation(workspaceId: string): void {
+    this.removalCancelled.delete(workspaceId);
   }
 
   /** Terminal failed record for a policy-refused harvest (see maybeHarvestThenSweep). */

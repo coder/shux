@@ -1209,8 +1209,26 @@ describe("MemoryService", () => {
       await fixture.service.create(fixture.ctx, "/memories/workspace/shared.md", "v1", "agent");
       const afterCreate = await foreign.workspaceMemoryRevision("ws-owner");
       expect(afterCreate).not.toBe("missing");
-      // Child and owner read the same (owner-keyed) token.
-      expect(await foreign.workspaceMemoryRevision("ws-child")).toBe(afterCreate);
+      // The child's token tracks the owner clock, plus its own legacy notebook
+      // state (see below); the child has none yet.
+      const childToken = await foreign.workspaceMemoryRevision("ws-child");
+      expect(childToken.startsWith(`${afterCreate}\u0000`)).toBe(true);
+      // A downgraded backend writing the child's LEGACY notebook (or toggling a
+      // child-keyed pin) moves no owner clock, yet the child's cached context
+      // must miss so its next access adopts the change.
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "old.md"), "legacy");
+      const afterLegacyWrite = await foreign.workspaceMemoryRevision("ws-child");
+      expect(afterLegacyWrite).not.toBe(childToken);
+      expect(await foreign.workspaceMemoryRevision("ws-owner")).toBe(afterCreate);
+      await fixture.metaService.setPinned(
+        memoryLogicalKey("workspace", "old.md", { projectPath: "", workspaceId: "ws-child" }),
+        true
+      );
+      expect(await foreign.workspaceMemoryRevision("ws-child")).not.toBe(afterLegacyWrite);
+      expect(await foreign.workspaceMemoryRevision("ws-owner")).toBe(afterCreate);
+      await fsPromises.rm(legacyRoot, { recursive: true, force: true });
 
       // Other scopes leave the workspace store's token alone...
       await fixture.service.create(fixture.ctx, "/memories/global/g.md", "g", "agent");
@@ -2405,7 +2423,7 @@ describe("MemoryService", () => {
       expect(clocks[1]!).toBeLessThan(clocks[2]!);
       // The published token never lags a row's clock (change events tick it once more).
       expect(
-        Number(await fixture.service.workspaceMemoryRevision("ws-child"))
+        Number(await fixture.service.workspaceMemoryRevision("ws-owner"))
       ).toBeGreaterThanOrEqual(Math.max(...(clocks as number[])));
 
       // The owner's edit is not the newest for that path: refused without force.

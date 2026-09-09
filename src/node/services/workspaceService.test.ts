@@ -14682,6 +14682,38 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     expect(reopened).toEqual([workspaceId]);
   });
 
+  test("remove() lifts the consolidation teardown gate only when it aborts before committing", async () => {
+    const calls: string[] = [];
+    workspaceService.setMemoryConsolidationService({
+      triggerInBackground: () => undefined,
+      triggerHarvestThenSweepInBackground: () => undefined,
+      cancelInFlightConsolidation: () => {
+        calls.push("cancel");
+        return Promise.resolve();
+      },
+      releaseRemovalCancellation: () => {
+        calls.push("release");
+      },
+      finalizeHarvestsForRemoval: () => Promise.resolve(),
+    });
+    // Aborted before the point of no return (live descendant tasks): the
+    // workspace stays intact, so any teardown gate is lifted again.
+    let descendants = true;
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ hasDescendantAgentTasks: () => descendants })
+    );
+    const aborted = await workspaceService.remove(workspaceId);
+    expect(aborted.success).toBe(false);
+    expect(calls).toEqual(["release"]);
+    // Committed removal: cancelled (drained) and never released.
+    calls.length = 0;
+    descendants = false;
+    const removed = await workspaceService.remove(workspaceId);
+    expect(removed.success).toBe(true);
+    expect(calls.filter((call) => call === "cancel").length).toBeGreaterThan(0);
+    expect(calls).not.toContain("release");
+  });
+
   test("remove() flushes the timeline before deleting the session directory", async () => {
     const sessionDir = path.join(tempRoot, "sessions", workspaceId);
     await fsPromises.mkdir(sessionDir, { recursive: true });

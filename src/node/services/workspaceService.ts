@@ -2757,6 +2757,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
+    releaseRemovalCancellation(workspaceId: string): void;
     finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   };
   /** Narrow MemoryService surface for removal's shared-memory handover; wired by coreServices. */
@@ -3103,6 +3104,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
+    releaseRemovalCancellation(workspaceId: string): void;
     finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   }): void {
     this.memoryConsolidationService = service;
@@ -6105,6 +6107,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       .filter((session): session is AgentSession => session != null)
       .map((session) => session.holdTurnAdmission());
 
+    // Set once removal passes its point of no return (session teardown and
+    // tombstone follow unconditionally); an abort before that leaves the
+    // workspace registered and intact, so the finally lifts the consolidation
+    // teardown gate the drains below installed.
+    let removalCommitted = false;
     // Try to remove from runtime (filesystem)
     try {
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
@@ -6199,9 +6206,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         //     with no second rollup).
         // Trade-off: a force=false deletion failure below keeps the
         // workspace but its producers were already drained. That loss is
-        // recoverable (rerun /refine, refork); a checkout write racing
-        // deletion is not. Both calls are idempotent; they run again later
-        // for the phantom-metadata path.
+        // recoverable (rerun /refine, refork; the consolidation teardown gate
+        // is lifted again in the finally); a checkout write racing deletion
+        // is not. Both calls are idempotent; they run again later for the
+        // phantom-metadata path.
         // Dream/harvest consolidation is a third producer (r60): its runs
         // ride only a hard timeout, so removal must abort them explicitly or
         // a detached run could mutate memory and journal into the deleted
@@ -6583,6 +6591,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       //
       // Intentionally deferred until we're committed to removal: if runtime deletion fails with
       // force=false we return early and keep init state intact so init-end can refresh metadata.
+      removalCommitted = true;
       this.initStateManager.clearInMemoryState(workspaceId);
 
       // Dispose the session before deleting its directory: disposal aborts the active stream, and
@@ -6874,6 +6883,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
+      if (!removalCommitted) {
+        this.memoryConsolidationService?.releaseRemovalCancellation(workspaceId);
+      }
       for (const hold of admissionHolds) {
         hold[Symbol.dispose]();
       }

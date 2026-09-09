@@ -1325,7 +1325,8 @@ describe("MemoryConsolidationService", () => {
   it("refuses a turn whose policy was recorded for another epoch, and ignores preserved-tail copies", async () => {
     using fixture = await createFixture();
     await fixture.addWorkspace("ws-clean");
-    const seed = async (workspaceId: string, foreignTurn: boolean) => {
+    await fixture.addWorkspace("ws-corrupt");
+    const seed = async (workspaceId: string, foreignTurn: number | null | undefined) => {
       const reset = createMuxMessage("reset-1", "assistant", "", {
         compactionBoundary: true,
         compacted: "user",
@@ -1357,17 +1358,18 @@ describe("MemoryConsolidationService", () => {
           workspaceMemoryPolicyEpoch: closingEpoch,
         })
       );
-      if (foreignTurn) {
+      if (foreignTurn !== undefined) {
         // Backend B started a read-only turn under the previous epoch (-1) and
         // recorded its deny there; backend A then reset the context (the deny
         // went with the epoch) and B's assistant landed after the new boundary
         // — without its user row, which the reset removed. Only the epoch
-        // stamp can surface it.
+        // stamp can surface it. A corrupted stamp (raw JSON row) refuses too.
         await fixture.historyService.appendToHistory(
           workspaceId,
           createMuxMessage("b-reply", "assistant", "Read-only output.", {
             requestHistorySequence: closingEpoch - 1,
-            workspaceMemoryPolicyEpoch: -1,
+            // `null` models a corrupted raw-JSON row.
+            workspaceMemoryPolicyEpoch: foreignTurn as unknown as number,
           })
         );
       }
@@ -1393,15 +1395,19 @@ describe("MemoryConsolidationService", () => {
         previousBoundaryHistorySequence: closingEpoch,
       });
     };
-    const refused = await seed("ws-dream", true);
+    const refused = await seed("ws-dream", -1);
     expect(refused.success).toBe(false);
     if (!refused.success) expect(refused.error).toContain("another epoch");
     expect(fixture.modelCalls).toHaveLength(0);
     expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord?.refused).toBe(true);
+    // `null` is neither "no stamp" nor this epoch's: fail closed.
+    const corrupt = await seed("ws-corrupt", null);
+    expect(corrupt.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
 
     // Without the foreign turn the copies alone refuse nothing, and the
     // harvest transcript leaves them out.
-    const granted = await seed("ws-clean", false);
+    const granted = await seed("ws-clean", undefined);
     expect(granted.success).toBe(true);
     expect(fixture.modelPrompts.length).toBeGreaterThan(0);
     expect(fixture.modelPrompts[0]).toContain("concise tests");
