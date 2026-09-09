@@ -71,7 +71,7 @@ Core workflow:
 - When checking PR readiness, audit **all** PR reviews, review comments, and issue comments from every reviewer/bot (including `coder-agents-review`), not just Codex; address or explicitly resolve them before declaring readiness.
 - If a PR has `coder-agents-review` feedback, address it and reply before resolving: either reply inline on each finding or leave a PR comment that explicitly lists each finding and your response. Do not silently resolve those threads.
 - If a PR has Codex review comments, address + resolve them, then re-request review by commenting `@codex review` on the PR.
-- Prefer `gh` CLI for GitHub interactions over manual web/curl flows.
+- Prefer `gh` CLI for GitHub interactions over manual web/curl flows. Use `./scripts/wait_pr_ready.sh` for readiness: `gh pr checks` deduplicates names across check suites and can hide failures.
 - User preference: use `gh stack` to manage GitHub-native stacked PRs; keep every PR linked in the native stack, not just chained by base branches.
 
 - User preference: when work is already on an open PR, push branch updates at the end of each completed change set so the PR stays current.

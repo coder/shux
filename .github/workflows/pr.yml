@@ -665,8 +665,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Test comment classification
-        run: make test-codex-comments
+      - name: Test PR readiness gates
+        run: make test-codex-comments test-pr-checks
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/check_codex_comments.sh ${{ github.event.pull_request.number }}
