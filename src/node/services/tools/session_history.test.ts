@@ -3061,3 +3061,241 @@ describe("session_history item listing and filters", () => {
     expect([opening.text, second.text]).toEqual(["opening facts", "row 0"]);
   });
 });
+
+describe("session_history newest-first browsing", () => {
+  const row = (
+    id: string,
+    text: string,
+    metadata?: MuxMetadata,
+    role: "user" | "assistant" = "assistant"
+  ) => JSON.stringify(createMuxMessage(id, role, text, metadata));
+  const compaction = (epoch: number, sequence?: number): MuxMetadata => ({
+    compacted: true,
+    compactionBoundary: true,
+    compactionEpoch: epoch,
+    ...(sequence === undefined ? {} : { historySequence: sequence }),
+  });
+  /**
+   * Archive + active files with a manual reset floor, rollover and compaction
+   * boundaries, malformed and oversized rows, an unaddressable window, and a
+   * window (C1) that starts in the archive and continues into the active file.
+   */
+  async function writeMixedFixture() {
+    await fs.writeFile(
+      archivePath,
+      [
+        row("private", "private before reset", { historySequence: 1 }),
+        row("manual-reset", "", {
+          contextBoundaryKind: "reset",
+          synthetic: true,
+          historySequence: 10,
+        }),
+        row("a1", "alpha one", { historySequence: 11 }, "user"),
+        "{broken",
+        row("r1", "", { ...rollover, historySequence: 20 }),
+        row("a4", "alpha two", { historySequence: 21 }),
+        row("a5", "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 16), { historySequence: 22 }),
+        row("c1", "summary one", compaction(1, 30)),
+        row("a7", "beta", { historySequence: 31 }, "user"),
+      ].join("\n") + "\n"
+    );
+    await fs.writeFile(
+      chatPath,
+      [
+        row("ch1", "gamma", { historySequence: 32 }),
+        row("u".repeat(SESSION_HISTORY_MAX_ID_CHARS + 8), "unaddressable summary", compaction(2)),
+        row("hidden", "hidden in unaddressable window", { historySequence: 40 }),
+        row("c3", "summary three", compaction(3, 50)),
+        row("d1", "delta", { historySequence: 51 }, "user"),
+        row("e1", "epsilon", { historySequence: 52 }),
+      ].join("\n") +
+        "\n" +
+        // A torn trailing row (crash mid-append) is malformed in both directions.
+        '{"id":"torn","role":"assistant","metadata":{"historySequence":53},"parts":[{"type":"text","text":"to'
+    );
+  }
+  const collect = async (input: SessionHistoryArgs) => {
+    const results = await pages(input);
+    return {
+      pages: results,
+      items: results.flatMap((page) => page.items ?? []),
+      windows: results.flatMap((page) => page.windows ?? []),
+    };
+  };
+
+  test("reverse listing, search and windows equal the reversed forward walk on a mixed fixture", async () => {
+    await writeMixedFixture();
+    const forward = await collect({ action: "list_items", limit: 3 });
+    expect(forward.items.map((item) => item.text)).toEqual([
+      "alpha one",
+      "alpha two",
+      "summary one",
+      "beta",
+      "gamma",
+      "summary three",
+      "delta",
+      "epsilon",
+    ]);
+    expect(forward.items.map((item) => item.windowId)).toEqual([
+      "w:10",
+      "w:20",
+      "w:30",
+      "w:30",
+      "w:30",
+      "w:50",
+      "w:50",
+      "w:50",
+    ]);
+    const reverse = await collect({ action: "list_items", limit: 3, recent_first: true });
+    expect(reverse.items).toEqual([...forward.items].reverse());
+    // Floor discovery, span discovery and delivery each re-read the oversized row.
+    expect(reverse.pages.length).toBeGreaterThan(1);
+    expect(reverse.pages.at(-1)?.exhausted).toBe(true);
+    const forwardWindows = await collect({ action: "list_windows", limit: 2 });
+    const reverseWindows = await collect({ action: "list_windows", limit: 2, recent_first: true });
+    expect(forwardWindows.windows).toEqual([
+      { windowId: "w:10", boundaryKind: "reset" },
+      { windowId: "w:20", boundaryKind: "reset" },
+      { windowId: "w:30", boundaryKind: "compaction" },
+      { windowId: "w:50", boundaryKind: "compaction" },
+    ]);
+    expect(reverseWindows.windows).toEqual([...forwardWindows.windows].reverse());
+    const forwardSearch = await collect({ action: "search", query: "a", role: "user", limit: 1 });
+    const reverseSearch = await collect({
+      action: "search",
+      query: "a",
+      role: "user",
+      limit: 1,
+      recent_first: true,
+    });
+    expect(reverseSearch.items).toEqual([...forwardSearch.items].reverse());
+    expect(reverseSearch.items.map((item) => item.text)).toEqual(["delta", "beta", "alpha one"]);
+    const scoped = await collect({ action: "list_items", window_id: "w:30", recent_first: true });
+    expect(scoped.items.map((item) => item.text)).toEqual(["gamma", "beta", "summary one"]);
+    for (const item of reverse.items) {
+      const read = (await collect({ action: "read_item", item_id: item.itemId })).items;
+      expect(read).toHaveLength(1);
+      expect(read[0]).toMatchObject({ itemId: item.itemId, windowId: item.windowId });
+    }
+    expect(
+      (await collect({ action: "search", query: "private", recent_first: true })).items
+    ).toEqual([]);
+    expect(
+      (await collect({ action: "search", query: "hidden in", recent_first: true })).items
+    ).toEqual([]);
+  });
+
+  test("a window larger than one scan page is discovered before any of its rows are delivered", async () => {
+    const boundary = createMuxMessage("big-window", "assistant", "big summary", compaction(1, 100));
+    const tail = Array.from({ length: SESSION_HISTORY_MAX_SCAN_ROWS + 100 }, (_, i) =>
+      createMuxMessage(`tail-${i}`, "assistant", `public-${i}`, { historySequence: 101 + i })
+    );
+    await appendTrackedHistory(
+      chatPath,
+      [boundary, ...tail].map((message) => JSON.stringify(message)).join("\n") + "\n"
+    );
+    const results = await pages({ action: "list_items", limit: 25, recent_first: true });
+    const items = results.flatMap((page) => page.items ?? []);
+    // Floor discovery and span discovery each need more than one page before delivery starts.
+    expect(results.slice(0, 2).every((page) => page.items?.length === 0 && page.nextCursor)).toBe(
+      true
+    );
+    expect(items).toHaveLength(tail.length + 2);
+    expect(items[0]).toMatchObject({ text: `public-${tail.length - 1}`, windowId: "w:100" });
+    expect(items.at(-2)).toMatchObject({ text: "big summary", windowId: "w:100" });
+    expect(items.at(-1)).toMatchObject({ text: "opening facts", windowId: "w:0" });
+    for (let i = 0; i < items.length - 1; i++)
+      expect(
+        items[i].windowId === items[i + 1].windowId || items[i + 1].text === "opening facts"
+      ).toBe(true);
+    const windows = (await pages({ action: "list_windows", recent_first: true })).flatMap(
+      (page) => page.windows ?? []
+    );
+    expect(windows).toEqual([
+      { windowId: "w:100", boundaryKind: "compaction" },
+      { windowId: "w:0", boundaryKind: "root" },
+    ]);
+  });
+
+  test("reverse cursors bind direction, freeze the snapshot, and expire on resets, rewrites and rotation", async () => {
+    await append("two", "second");
+    await append("three", "third");
+    const first = await call({ action: "list_items", limit: 1, recent_first: true });
+    expect(first.items?.map((item) => item.text)).toEqual(["third"]);
+    const cursor = first.nextCursor!;
+    expect(cursor).toBeString();
+    expect((await call({ action: "list_items", limit: 1, cursor })).error).toBe("invalid_cursor");
+    expect((await call({ action: "list_items", recent_first: false, cursor })).error).toBe(
+      "invalid_cursor"
+    );
+    // Ordinary appends keep the retrieval snapshot fixed: the new row is not exposed.
+    await append("four", "fourth");
+    const second = await call({ action: "list_items", limit: 1, recent_first: true, cursor });
+    expect(second.items?.map((item) => item.text)).toEqual(["second"]);
+    const third = await call({
+      action: "list_items",
+      limit: 1,
+      recent_first: true,
+      cursor: second.nextCursor,
+    });
+    expect(third.items?.map((item) => item.text)).toEqual(["opening facts"]);
+    expect(third.exhausted).toBe(true);
+    expect(third.nextCursor).toBeUndefined();
+    // A fresh newest-first scan sees the appended row first.
+    expect(
+      (await call({ action: "list_items", limit: 1, recent_first: true })).items?.[0]?.text
+    ).toBe("fourth");
+    const paused = await call({ action: "list_items", limit: 1, recent_first: true });
+    await append("reset", "", { contextBoundaryKind: "reset", synthetic: true });
+    expect(
+      (
+        await call({
+          action: "list_items",
+          limit: 1,
+          recent_first: true,
+          cursor: paused.nextCursor,
+        })
+      ).error
+    ).toBe("stale_cursor");
+    const afterReset = await call({ action: "list_items", limit: 1, recent_first: true });
+    expect(afterReset.items).toEqual([]);
+    expect(afterReset.exhausted).toBe(true);
+    await append("five", "fifth");
+    await append("six", "sixth");
+    const rotated = await call({ action: "list_items", limit: 1, recent_first: true });
+    expect(rotated.items?.map((item) => item.text)).toEqual(["sixth"]);
+    expect(rotated.nextCursor).toBeString();
+    await append("rotate", "summary", compaction(1));
+    expect(
+      (
+        await call({
+          action: "list_items",
+          limit: 1,
+          recent_first: true,
+          cursor: rotated.nextCursor,
+        })
+      ).error
+    ).toBe("stale_cursor");
+    const rewound = await call({ action: "list_items", limit: 1, recent_first: true });
+    const handle = await fs.open(chatPath, "r+");
+    try {
+      await handle.write(Buffer.from("!"), 0, 1, 0);
+    } finally {
+      await handle.close();
+    }
+    expect(
+      (
+        await call({
+          action: "list_items",
+          limit: 1,
+          recent_first: true,
+          cursor: rewound.nextCursor,
+        })
+      ).error
+    ).toBe("stale_cursor");
+    expect(await call({ action: "read_item", item_id: "1", recent_first: true })).toMatchObject({
+      success: false,
+      error: "filters_unsupported",
+    });
+  });
+});

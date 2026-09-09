@@ -130,9 +130,11 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           skipped_oversized_rows: 0,
         };
       // Reject rather than silently ignore filters on actions that cannot honor them.
+      // read_item resolves one exact row, so ordering does not apply to it either.
       if (
-        !FILTERABLE_ACTIONS.has(args.action) &&
-        (args.role != null || args.tool_name != null || args.max_chars_per_item != null)
+        (!FILTERABLE_ACTIONS.has(args.action) &&
+          (args.role != null || args.tool_name != null || args.max_chars_per_item != null)) ||
+        (args.action === "read_item" && args.recent_first != null)
       )
         return {
           success: false,
@@ -153,6 +155,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               args.role ?? null,
               args.tool_name ?? null,
               args.max_chars_per_item ?? null,
+              args.recent_first === true,
             ])
           )
           .digest("hex"),
@@ -191,6 +194,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             : null;
         const scan = await history.scanHistoryBounded(workspaceId, {
           cursor: args.cursor != null ? decodeHistoryCursor(args.cursor, binding) : undefined,
+          recentFirst: args.recent_first === true,
           visit: ({ message, itemId, windowId, windowBoundaryKind, startsWindow }) => {
             if (args.action === "list_windows") {
               if (!startsWindow) return true;

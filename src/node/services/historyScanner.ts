@@ -411,6 +411,12 @@ export interface BoundedHistoryRow {
 }
 export interface BoundedHistoryScanOptions {
   cursor?: HistoryScanState;
+  /**
+   * Visit rows newest-first. Attribution stays exact: each window span is
+   * discovered backwards to its boundary row before any of its rows are
+   * emitted, so no row is ever attributed to a window guessed from the tail.
+   */
+  recentFirst?: boolean;
   /** Return false to leave this row unconsumed for the next page. */
   visit: (row: BoundedHistoryRow) => boolean;
 }
@@ -519,6 +525,7 @@ export async function scanHistoryFilesBounded(
           snapshots: { chat: initialChat!, archive: await snapshot("archive") },
           validatedChatSnapshot: initialChat!,
           phase: "floor",
+          recentFirst: options.recentFirst === true,
           artifact: "chat",
           byteOffset: 0,
           skippingOversized: false,
@@ -532,8 +539,13 @@ export async function scanHistoryFilesBounded(
           windowBoundaryKind: null,
           windowPending: true,
           appendCheck: null,
+          floor: null,
+          probe: null,
+          span: null,
         };
     if (state.provenanceEpoch !== provenanceEpoch) throw new Error("stale_cursor");
+    // Direction is bound into the authenticated cursor; a mismatch is a forged or misused cursor.
+    if (state.recentFirst !== (options.recentFirst === true)) throw new Error("invalid_cursor");
     if (!options.cursor) state.byteOffset = state.snapshots.chat.endOffsetSnapshot;
     else {
       await snapshot("chat", state.snapshots.chat);
@@ -726,11 +738,165 @@ export async function scanHistoryFilesBounded(
         }
       }
     }
+    const freshPosition = () => ({
+      skippingOversized: false,
+      oversizedRowEnd: null,
+      resetProbe: "",
+      resetStage: 0 as const,
+      possibleReset: false,
+    });
+    // Browsing starts where the floor phase stopped: at the reset row's end, or at
+    // the archive head when no reset exists. Newest-first remembers that floor and
+    // walks back from the tail instead.
+    const enterBrowse = () => {
+      if (!state.recentFirst) {
+        state.phase = "browse";
+        return;
+      }
+      state.floor = {
+        artifact: state.artifact,
+        byteOffset: state.byteOffset,
+        windowId: state.windowId,
+        windowBoundaryKind: state.windowBoundaryKind,
+      };
+      state.phase = "probe";
+      state.artifact = "chat";
+      state.byteOffset = state.snapshots.chat.endOffsetSnapshot;
+      Object.assign(state, freshPosition());
+      state.probe = {
+        artifact: "chat",
+        byteOffset: state.byteOffset,
+        ...freshPosition(),
+        lowestReadable: null,
+      };
+    };
+    // Reverse discovery: walk back from the pending span end to the nearest
+    // boundary row (or the floor), retaining only locations. Returns false when
+    // the page budget ran out.
+    const probePage = async (): Promise<boolean> => {
+      const probe = state.probe!;
+      const floor = state.floor!;
+      assert(probe && floor, "newest-first probe requires floor and probe state");
+      const lower = probe.artifact === floor.artifact ? floor.byteOffset : 0;
+      let boundary:
+        | { start: number; windowId: string | null; kind: HistoryScanState["windowBoundaryKind"] }
+        | undefined;
+      const completed = await scan(
+        probe.artifact,
+        probe,
+        true,
+        state.snapshots[probe.artifact].endOffsetSnapshot,
+        lower,
+        (message, start) => {
+          if (!message) return true;
+          const kind = getContextBoundaryKind(message);
+          if (kind) {
+            boundary = { start, windowId: boundedWindowId(message), kind };
+            return false;
+          }
+          probe.lowestReadable = { artifact: probe.artifact, byteOffset: start };
+          return true;
+        }
+      );
+      if (boundary) {
+        const start = { artifact: probe.artifact, byteOffset: boundary.start };
+        state.span = {
+          start,
+          windowId: boundary.windowId,
+          windowBoundaryKind: boundary.kind,
+          startsWindow: start,
+        };
+      } else if (!completed) return false;
+      else if (probe.artifact === "chat" && floor.artifact === "archive") {
+        Object.assign(probe, freshPosition(), {
+          artifact: "archive",
+          byteOffset: state.snapshots.archive.endOffsetSnapshot,
+        });
+        return true;
+      } else {
+        // The oldest visible span has no boundary row of its own; like the forward
+        // walk, its first readable row is the one that starts the window.
+        state.span = {
+          start: { artifact: floor.artifact, byteOffset: floor.byteOffset },
+          windowId: floor.windowId,
+          windowBoundaryKind: floor.windowBoundaryKind,
+          startsWindow: probe.lowestReadable,
+        };
+      }
+      state.probe = null;
+      state.phase = "deliver";
+      return true;
+    };
+    // Reverse delivery of one discovered span, from its end (state position) down
+    // to its boundary row, crossing the chat -> archive seam when the span does.
+    const deliverPage = async (): Promise<boolean> => {
+      const span = state.span!;
+      const floor = state.floor!;
+      assert(span && floor, "newest-first delivery requires span and floor state");
+      const artifact = state.artifact;
+      const lower = artifact === span.start.artifact ? span.start.byteOffset : 0;
+      const completed = await scan(
+        artifact,
+        state,
+        true,
+        state.snapshots[artifact].endOffsetSnapshot,
+        lower,
+        (message, start, _finish, _oversized, _possibleReset, raw) => {
+          if (!message) return true;
+          assert(raw, "readable browse rows retain their bounded raw bytes");
+          // Unaddressable windows are consumed silently, as in the forward walk.
+          if (span.windowId === null) return true;
+          return options.visit({
+            message,
+            itemId: `r:${state.provenanceEpoch}:${artifact}:${start}:${createHash("sha256").update(raw).digest("hex")}`,
+            windowId: span.windowId,
+            windowBoundaryKind: span.windowBoundaryKind,
+            startsWindow:
+              span.startsWindow !== null &&
+              span.startsWindow.artifact === artifact &&
+              span.startsWindow.byteOffset === start,
+          });
+        }
+      );
+      if (!completed) return false;
+      if (artifact === "chat" && span.start.artifact === "archive") {
+        Object.assign(state, freshPosition(), {
+          artifact: "archive",
+          byteOffset: state.snapshots.archive.endOffsetSnapshot,
+        });
+        return true;
+      }
+      assert(
+        state.artifact === span.start.artifact && state.byteOffset === span.start.byteOffset,
+        "reverse delivery must stop exactly at the span start"
+      );
+      state.span = null;
+      if (span.start.artifact === floor.artifact && span.start.byteOffset === floor.byteOffset) {
+        state.phase = "done";
+        return true;
+      }
+      state.probe = {
+        artifact: state.artifact,
+        byteOffset: state.byteOffset,
+        ...freshPosition(),
+        lowestReadable: null,
+      };
+      state.phase = "probe";
+      return true;
+    };
     while (
       state.phase !== "done" &&
       remaining() > 0 &&
       result.rowsScanned < SESSION_HISTORY_MAX_SCAN_ROWS
     ) {
+      if (state.phase === "probe") {
+        if (!(await probePage())) break;
+        continue;
+      }
+      if (state.phase === "deliver") {
+        if (!(await deliverPage())) break;
+        continue;
+      }
       const artifact = state.artifact;
       const reverse = state.phase === "floor";
       const end = state.snapshots[artifact].endOffsetSnapshot;
@@ -797,28 +963,24 @@ export async function scanHistoryFilesBounded(
       );
       if (floor) {
         result.privacyFloorReached = true;
-        state.phase = "browse";
         state.byteOffset = floor.offset;
         state.windowId = floor.windowId;
         // Browsing excludes the reset row itself; preserve its verified kind
         // alongside its ID even when the first visible row is on another page.
         state.windowBoundaryKind = floor.windowBoundaryKind;
         state.windowPending = true;
-        state.skippingOversized = false;
-        state.oversizedRowEnd = null;
-        state.resetProbe = "";
-        state.resetStage = 0;
-        state.possibleReset = false;
+        Object.assign(state, freshPosition());
+        enterBrowse();
       } else if (!completed) break;
       else if (reverse && artifact === "chat") {
         state.artifact = "archive";
         state.byteOffset = state.snapshots.archive.endOffsetSnapshot;
       } else if (reverse) {
-        state.phase = "browse";
         state.byteOffset = 0;
         state.resetProbe = "";
         state.resetStage = 0;
         state.possibleReset = false;
+        enterBrowse();
       } else if (artifact === "archive") {
         state.artifact = "chat";
         state.byteOffset = 0;

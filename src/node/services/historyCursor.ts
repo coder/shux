@@ -27,34 +27,63 @@ export const HistorySnapshotSchema = z
   })
   .strict();
 export type HistorySnapshot = z.infer<typeof HistorySnapshotSchema>;
+const positionFields = {
+  byteOffset: offset,
+  skippingOversized: z.boolean(),
+  oversizedRowEnd: offset.nullable(),
+  resetProbe: z.string().max(SESSION_HISTORY_RESET_PROBE_CHARS),
+  resetStage: z.union([z.literal(0), z.literal(1), z.literal(2)]),
+  possibleReset: z.boolean(),
+};
+// null means an unaddressable persisted window, not an alias for the root.
+const windowIdField = z.string().refine(isHistoryIdentifierRepresentable).nullable();
+const windowBoundaryKindField = z.nativeEnum(CONTEXT_BOUNDARY_KINDS).nullable();
+const rowLocation = z.object({ artifact: HistoryArtifactSchema, byteOffset: offset }).strict();
 export const HistoryScanStateSchema = z
   .object({
     provenanceEpoch: z.string().uuid(),
     snapshots: z.object({ chat: HistorySnapshotSchema, archive: HistorySnapshotSchema }).strict(),
     validatedChatSnapshot: HistorySnapshotSchema,
-    phase: z.enum(["floor", "browse", "done"]),
+    // Oldest-first: floor -> browse -> done. Newest-first: floor -> (probe -> deliver)* -> done.
+    phase: z.enum(["floor", "browse", "probe", "deliver", "done"]),
+    recentFirst: z.boolean(),
     artifact: HistoryArtifactSchema,
-    byteOffset: offset,
-    skippingOversized: z.boolean(),
-    oversizedRowEnd: offset.nullable(),
-    resetProbe: z.string().max(SESSION_HISTORY_RESET_PROBE_CHARS),
-    resetStage: z.union([z.literal(0), z.literal(1), z.literal(2)]),
-    possibleReset: z.boolean(),
+    ...positionFields,
     archiveWatermark: z.number().int().min(-1).safe(),
     anchorSequence: offset.nullable(),
-    // null means an unaddressable persisted window, not an alias for the root.
-    windowId: z.string().refine(isHistoryIdentifierRepresentable).nullable(),
-    windowBoundaryKind: z.nativeEnum(CONTEXT_BOUNDARY_KINDS).nullable(),
+    windowId: windowIdField,
+    windowBoundaryKind: windowBoundaryKindField,
     windowPending: z.boolean(),
     appendCheck: z
+      .object({ snapshot: HistorySnapshotSchema, ...positionFields })
+      .strict()
+      .nullable(),
+    // Newest-first browsing never crosses the floor discovered by the floor phase.
+    floor: z
       .object({
-        snapshot: HistorySnapshotSchema,
+        artifact: HistoryArtifactSchema,
         byteOffset: offset,
-        skippingOversized: z.boolean(),
-        oversizedRowEnd: offset.nullable(),
-        resetProbe: z.string().max(SESSION_HISTORY_RESET_PROBE_CHARS),
-        resetStage: z.union([z.literal(0), z.literal(1), z.literal(2)]),
-        possibleReset: z.boolean(),
+        windowId: windowIdField,
+        windowBoundaryKind: windowBoundaryKindField,
+      })
+      .strict()
+      .nullable(),
+    // Reverse discovery position: only locations, never buffered rows.
+    probe: z
+      .object({
+        artifact: HistoryArtifactSchema,
+        ...positionFields,
+        lowestReadable: rowLocation.nullable(),
+      })
+      .strict()
+      .nullable(),
+    // The window span currently being delivered in reverse, ending at artifact/byteOffset above.
+    span: z
+      .object({
+        start: rowLocation,
+        windowId: windowIdField,
+        windowBoundaryKind: windowBoundaryKindField,
+        startsWindow: rowLocation.nullable(),
       })
       .strict()
       .nullable(),
