@@ -58,13 +58,12 @@ function buildMemoryDescription(config: ToolConfiguration): string {
   // told the opposite during its only preservation step.
   const baseDescription =
     config.memoryWritePath != null
-      ? `Persistent memory, pinned for this preservation step to ${config.memoryWritePath}: only that file may be viewed or written, and this request allows exactly one write. ` +
-        "Commands:\n" +
-        "- view: show the file with line numbers (offset/limit supported)\n" +
+      ? `Persistent memory, pinned for this preservation step to ${config.memoryWritePath}: only that file may be written, and this request allows exactly one call. ` +
+        "There is no second step, so do not read first (view is unavailable here; the file's current text, if any, is preloaded above). Commands:\n" +
         "- create: write the complete file (REPLACES existing contents)\n" +
         "- str_replace: replace a unique occurrence of old_str with new_str (creates the file with new_str if it is missing)\n" +
         "- insert: insert insert_text after line insert_line (0 = top; creates the file if it is missing)\n" +
-        "delete, rename, and every other path are refused. " +
+        "view, delete, rename, and every other path are refused. " +
         `The resulting file is limited to ${CONTEXT_NOTES_RESERVED_BYTES} bytes (essential state first).`
       : TOOL_DEFINITIONS.memory.description;
   if (config.memoryIndexEntries == null) {
@@ -159,8 +158,10 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
     description: buildMemoryDescription(config),
     inputSchema: TOOL_DEFINITIONS.memory.schema,
     execute: async (input, { toolCallId, abortSignal }): Promise<MemoryToolResult> => {
-      if (writePath != null && writePin && input.command !== "view") {
-        if (input.command === "delete" || input.command === "rename") {
+      if (writePath != null && writePin) {
+        // The pinned turn gets one provider step: a read-only view would consume it without a
+        // write, so the only accepted calls are the ones that preserve the notes.
+        if (input.command === "view" || input.command === "delete" || input.command === "rename") {
           return {
             success: false,
             error: `This turn may only create or update ${writePath}; '${input.command}' is unavailable.`,
@@ -213,9 +214,7 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
           return result;
         }
       }
-      return executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId, {
-        checkReadAccess: checkPinnedPath,
-      });
+      return executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId);
     },
   });
 };
@@ -258,8 +257,6 @@ export async function executeMemoryCommand(
      * I/O unblocks. Ignored by reads.
      */
     abortSignal?: AbortSignal;
-    /** Read guard (view); the agent tool uses it to pin flush turns to one file. */
-    checkReadAccess?: (virtualPath: string) => MemoryToolResult | null;
   }
 ): Promise<MemoryToolResult> {
   try {
@@ -268,8 +265,6 @@ export async function executeMemoryCommand(
         if (input.path == null) {
           return { success: false, error: "view requires 'path'" };
         }
-        const pinned = options?.checkReadAccess?.(input.path);
-        if (pinned) return pinned;
         return await memoryService.view(ctx, input.path, {
           offset: input.offset ?? undefined,
           limit: input.limit ?? undefined,

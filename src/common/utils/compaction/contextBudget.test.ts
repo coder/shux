@@ -5,7 +5,7 @@ import {
   IMAGE_TOKEN_ESTIMATE,
   OUTPUT_RESERVE_TOKENS,
   WARNING_ADVANCE_MIN_TOKENS,
-  WARNING_RESERVE_TOKENS,
+  FLUSH_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
@@ -59,18 +59,18 @@ describe("step budget decisions", () => {
 
   test("rollover flush opportunity requires reserve headroom below the hard ceiling", () => {
     const hardCeiling = 100_000 - OUTPUT_RESERVE_TOKENS;
-    expect(evaluate({ contextTokens: hardCeiling - WARNING_RESERVE_TOKENS - 1 })).toMatchObject({
+    expect(evaluate({ contextTokens: hardCeiling - FLUSH_RESERVE_TOKENS - 1 })).toMatchObject({
       decision: "rollover",
       flushOpportunity: true,
     });
-    expect(evaluate({ contextTokens: hardCeiling - WARNING_RESERVE_TOKENS })).toMatchObject({
+    expect(evaluate({ contextTokens: hardCeiling - FLUSH_RESERVE_TOKENS })).toMatchObject({
       decision: "rollover",
       flushOpportunity: false,
     });
     // Real-encoding tool tokens can exceed the chars/4 heuristic and consume the reserve.
     expect(
       evaluate({
-        contextTokens: hardCeiling - WARNING_RESERVE_TOKENS - 100,
+        contextTokens: hardCeiling - FLUSH_RESERVE_TOKENS - 100,
         toolResultChars: 4,
         toolResultTokens: 100,
       })
@@ -89,7 +89,7 @@ describe("step budget decisions", () => {
   });
 
   test("warning must fit strictly below the hard ceiling", () => {
-    const contextTokens = 100_000 - OUTPUT_RESERVE_TOKENS - WARNING_RESERVE_TOKENS;
+    const contextTokens = 100_000 - OUTPUT_RESERVE_TOKENS - FLUSH_RESERVE_TOKENS;
     expect(evaluate({ contextTokens, threshold: 0.99 })).toMatchObject({
       decision: "rollover",
       flushOpportunity: false,

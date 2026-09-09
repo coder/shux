@@ -15,7 +15,7 @@ import { resolveMemoryAccessPolicy } from "./tools/memory";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
-  WARNING_RESERVE_TOKENS,
+  FLUSH_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
@@ -3979,6 +3979,22 @@ export class AgentSession {
     // that normally drops the intent. Drop it here, unconditionally, so re-enabling the mode later
     // (possibly with a larger model) cannot seal a below-threshold context with a stale snapshot.
     if (!tokenBudgetActive && this.pendingRollover != null) this.dropContextBudgetIntent();
+    // A queued flush entry dispatched after the mode went inactive cannot be admitted (no pinned
+    // middleware snapshot, nothing to seal): dispatch it as an ordinary continuation instead of a
+    // hidden memory-only turn, and drop its paired continuation (mirrors the pre-dispatch degrade).
+    if (!tokenBudgetActive && userMessage.metadata?.muxMetadata?.contextBudgetFlush === true) {
+      userMessage.parts = [{ type: "text", text: "Continue" }];
+      const { contextBudgetFlush: _dropped, ...rest } = userMessage.metadata.muxMetadata;
+      userMessage.metadata.muxMetadata = rest;
+      // Delegated turns resolve the stream metadata from the send options: strip it there too.
+      if ((optionsForStream.muxMetadata as MuxMessageMetadata | undefined)?.contextBudgetFlush) {
+        const { contextBudgetFlush: _optionFlag, ...optionRest } =
+          optionsForStream.muxMetadata as MuxMessageMetadata;
+        optionsForStream = { ...optionsForStream, muxMetadata: optionRest };
+      }
+      if (this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY).removedCount > 0)
+        this.emitQueuedMessageChanged();
+    }
     // Await rejection at each return so the execution lease owns persistence and goal safety.
     const rejectBudgetSend = async (error: SendMessageError) => {
       if (isManualUserMessage) {
@@ -5699,7 +5715,7 @@ export class AgentSession {
       const rolloverEnabled = this.compactionMonitor.getThreshold() < 1;
       const flushStillSafe =
         decision.hardCeiling !== undefined &&
-        decision.projected + WARNING_RESERVE_TOKENS < decision.hardCeiling;
+        decision.projected + FLUSH_RESERVE_TOKENS < decision.hardCeiling;
       // The prompt promises that the next message seals the window, so require the same
       // admission the rollover itself needs (history access, toolset-preserving middleware).
       // Threshold 100% disables automatic rollover: a flush promising a sealed window would lie.
@@ -7124,6 +7140,14 @@ export class AgentSession {
             this.emitQueuedMessageChanged();
           }
         }
+      } else if (lastUserMessage?.metadata?.muxMetadata?.contextBudgetFlush === true) {
+        // Token-budget mode is inactive but the persisted trigger still makes this a hidden
+        // memory-only turn: pin a toolset-preserving middleware chain for it too, or run it
+        // without tools when none can be pinned (the turn then only ends).
+        const captured = await this.captureRolloverRequestAssembly();
+        if (isStreamStartAborted()) return Ok(undefined);
+        if (captured.success) resumedFlushSnapshot = captured.data;
+        else resumedFlushCannotWrite = true;
       }
 
       // A crash between snapshot and user-row appends can leave orphaned prompt

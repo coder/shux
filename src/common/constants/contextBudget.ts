@@ -19,6 +19,10 @@ export const OUTPUT_RESERVE_TOKENS = 8_192;
 export const MAX_OUTPUT_RESERVE_CONTEXT_RATIO = 0.25;
 export const MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO = 0.5;
 export const WARNING_RESERVE_TOKENS = 2_048;
+// Headroom one final notes-writing step needs below the hard ceiling: the warning row plus the
+// pinned-tool prompt, and the context-notes preload the flush-only memory context may add even
+// when the ordinary session context had not selected the notes yet.
+export const FLUSH_RESERVE_TOKENS = WARNING_RESERVE_TOKENS + CONTEXT_NOTES_RESERVED_TOKENS;
 // Absolute floor on how far ahead of the rollover point the advance warning fires. The
 // percent-based advance shrinks with the window (a 15% gap is under 5k tokens at 32k), so
 // reserve three WARNING_RESERVE_TOKENS: one notes flush plus roughly two working steps.

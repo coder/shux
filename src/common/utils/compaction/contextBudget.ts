@@ -10,7 +10,7 @@ import {
   OUTPUT_RESERVE_TOKENS,
   SYSTEM_FLOOR_TOKENS_ESTIMATE,
   WARNING_ADVANCE_MIN_TOKENS,
-  WARNING_RESERVE_TOKENS,
+  FLUSH_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
@@ -113,7 +113,7 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   if (input.threshold >= 1) return result;
   // A flush opportunity means one more notes-writing step fits below the hard ceiling.
   // Use the real-encoding projection where available: it can exceed the chars/4 heuristic.
-  const safeFlush = hardProjected + WARNING_RESERVE_TOKENS < hardCeiling;
+  const safeFlush = hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling;
   const forceAt = limit * ((input.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT) / 100);
   if (projected >= forceAt) {
     return { ...result, decision: "rollover", flushOpportunity: safeFlush };

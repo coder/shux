@@ -631,17 +631,33 @@ describe("pinned full-payload rollover admission", () => {
     // No on-send auto-compaction: the persisted trigger must be the request's last user row.
     h.session.setAutoCompactionThreshold(1);
     try {
-      // Token-budget mode off keeps the persisted trigger's flag intact for the request builder
-      // (a resumed flush after a restart takes the same path).
-      const flushSend = {
-        model,
-        agentId: "exec",
-        experiments: { tokenBudget: false },
-        muxMetadata: { type: "normal", contextBudgetFlush: true },
-      } as const;
-      expect((await h.session.sendMessage("Flush context notes now.", flushSend)).success).toBe(
-        true
-      );
+      // A persisted flush trigger resumed after a restart keeps its flag for the request builder
+      // even with token-budget mode off (a fresh queued entry would be degraded instead).
+      expect(
+        (
+          await fixture.historyService.appendToHistory(
+            workspaceId,
+            createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
+              synthetic: true,
+              uiVisible: false,
+              muxMetadata: {
+                type: "normal",
+                contextBudgetContinuation: true,
+                contextBudgetFlush: true,
+              },
+            })
+          )
+        ).success
+      ).toBe(true);
+      expect(
+        (
+          await h.session.resumeStream({
+            model,
+            agentId: "exec",
+            experiments: { tokenBudget: false },
+          })
+        ).success
+      ).toBe(true);
       expect(start).toHaveBeenCalledTimes(1);
       // The memory-only ceiling proves the flag reached the builder: no catalog search and no
       // read-only session_history (a history read would consume the single flush step).

@@ -318,6 +318,14 @@ describe("memory tool", () => {
 
   describe("pinned write path", () => {
     const notes = "/memories/workspace/context-notes.md";
+    // The pinned tool refuses reads (one step, one write), so verify contents via the service.
+    const readNotes = async (fixture: MemoryToolFixture) => {
+      const result = await fixture.config.memoryService!.readFileWithSha(
+        memoryScopeContextFromToolConfig(fixture.config),
+        notes
+      );
+      return result.success ? result.data.content : null;
+    };
 
     it("allows mutations of the pinned file only, including normalized spellings", async () => {
       using fixture = await createFixture({ memoryWritePath: notes });
@@ -335,12 +343,18 @@ describe("memory tool", () => {
           })
         ).success
       ).toBe(true);
-      expect((await run(fixture.tool, { command: "view", path: notes })).success).toBe(true);
-      // Reads are pinned too: other stores must not be disclosed from the hidden turn.
-      for (const path of ["/memories/global", "/memories/workspace", "/memories/project/x.md"]) {
+      expect(await readNotes(fixture)).toBe("more state");
+      // Reads are refused entirely: a view would spend the single step, and other stores must
+      // not be disclosed from the hidden turn.
+      for (const path of [
+        notes,
+        "/memories/global",
+        "/memories/workspace",
+        "/memories/project/x.md",
+      ]) {
         const result = await run(fixture.tool, { command: "view", path });
         expect(result.success).toBe(false);
-        if (!result.success) expect(result.error).toContain("may only access");
+        if (!result.success) expect(result.error).toContain("may only create or update");
       }
     });
 
@@ -360,7 +374,7 @@ describe("memory tool", () => {
         expect(result.success).toBe(false);
         if (!result.success) expect(result.error).toMatch(/may only (access|create or update)/);
       }
-      expect((await run(fixture.tool, { command: "view", path: notes })).success).toBe(true);
+      expect(await readNotes(fixture)).toBe("state");
     });
 
     it("allows exactly one non-destructive mutation per tool instance", async () => {
@@ -398,8 +412,7 @@ describe("memory tool", () => {
       });
       expect(second.success).toBe(false);
       if (!second.success) expect(second.error).toContain("single memory mutation");
-      // Reads remain available and a fresh instance (next request) may mutate again.
-      expect((await run(fixture.tool, { command: "view", path: notes })).success).toBe(true);
+      // A fresh instance (next request) may mutate again.
       const fresh = createMemoryTool(fixture.config);
       // The resulting size is checked against the actual file (an irrelevant empty file_text
       // does not hide an oversized insert); the refused write frees the slot.
@@ -433,9 +446,7 @@ describe("memory tool", () => {
           })
         ).success
       ).toBe(true);
-      let view = await run(fixture.tool, { command: "view", path: notes });
-      expect(view.success && view.output).toContain("ours");
-      expect(view.success && view.output).not.toContain("theirs");
+      expect(await readNotes(fixture)).toBe("ours");
       // ...or "exists" while it was deleted meanwhile.
       await fixture.config.memoryService!.deletePath(
         memoryScopeContextFromToolConfig(fixture.config),
@@ -452,8 +463,7 @@ describe("memory tool", () => {
           })
         ).success
       ).toBe(true);
-      view = await run(fixture.tool, { command: "view", path: notes });
-      expect(view.success && view.output).toContain("recovered");
+      expect(await readNotes(fixture)).toBe("recovered");
     });
 
     it("an aborted flush write cannot land after Stop", async () => {
@@ -465,7 +475,7 @@ describe("memory tool", () => {
         { ...mockToolCallOptions, abortSignal: controller.signal }
       )) as MemoryToolResult;
       expect(result).toMatchObject({ success: false });
-      expect((await run(fixture.tool, { command: "view", path: notes })).success).toBe(false);
+      expect(await readNotes(fixture)).toBeNull();
       // The refused write freed the single slot for a live retry.
       expect(
         (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success

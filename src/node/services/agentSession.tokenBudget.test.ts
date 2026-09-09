@@ -1674,7 +1674,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
   });
 
-  test("disabling token-budget mode while the flush pair is queued bounds the flush and keeps its Continue", async () => {
+  test("disabling token-budget mode while the flush pair is queued dispatches it as a plain continuation", async () => {
     const h = await setup();
     const globalOptions: SendMessageOptions = { model, agentId: "exec", muxMetadata: correlation };
     const experiment = spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
@@ -1685,17 +1685,21 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
     experiment.mockImplementation(() => false);
     await h.finishAndDispatch();
-    // The hidden trigger keeps its memory-only ceiling and its single-step bound.
-    expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    expect(await h.requests[1].onStepSettled?.(step(50_000))).toBe("rollover");
-    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
-    h.settleStream(1, { finishReason: "stop" });
-    await h.waitForRequest(3);
+    // Without admission there is no pinned middleware snapshot and nothing to seal, so the hidden
+    // memory-only turn must not run: the entry becomes an ordinary continuation of the work and
+    // its paired continuation is dropped (mirrors the pre-dispatch degrade path).
     const rows = await allRows(h);
-    expect(rolloverRows(rows)).toHaveLength(0);
+    expect(warningRows(rows)).toHaveLength(0);
     expect(text(rows.at(-1)!)).toBe("Continue");
-    expect(h.requests[2].muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    expect(h.requests[2].onStepSettled).toBeUndefined();
+    expect(rows.at(-1)?.metadata?.muxMetadata).toMatchObject(correlation);
+    expect(rows.at(-1)?.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    expect(h.requests[1].onStepSettled).toBeUndefined();
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    h.settleStream(1, { finishReason: "stop" });
+    await h.session.waitForIdle();
+    expect(h.requests).toHaveLength(2);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
   });
 
   test("a Stop during flush admission degrades the flush instead of running it unsealed", async () => {
@@ -1728,8 +1732,10 @@ describe("AgentSession token-budget lifecycle", () => {
     const h = await setup({ previous: first });
     const disabled = { ...options, experiments: { tokenBudget: false } };
     expect((await h.session.resumeStream(disabled)).success).toBe(true);
-    // The hidden trigger keeps its memory-only ceiling, but nothing restores the promised reset.
+    // The hidden trigger keeps its memory-only ceiling and a pinned middleware chain, but nothing
+    // restores the promised reset.
     expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    expect(h.requests[0].requestAssemblySnapshot?.preservesToolset).toBe(true);
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
     // The settled-step callback still ends the turn after its single step.
     expect(await h.requests[0].onStepSettled?.(step(50_000))).toBe("rollover");
@@ -1739,6 +1745,32 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.session.sendMessage("Follow-up", disabled)).success).toBe(true);
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
     expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+  });
+
+  test("a persisted flush resumed with the mode disabled runs tool-less when no chain can be pinned", async () => {
+    const first = await setup();
+    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await first.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await first.finishAndDispatch();
+    await first.session.dispose();
+    const h = await setup({ previous: first });
+    const unregister = eventSpine.useBefore(
+      "request.assemble",
+      (ctx) => {
+        delete ctx.tools.session_history;
+      },
+      { workspaceId }
+    );
+    try {
+      expect(
+        (await h.session.resumeStream({ ...options, experiments: { tokenBudget: false } })).success
+      ).toBe(true);
+      expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
+      expect(h.requests[0].requestAssemblySnapshot).toBeUndefined();
+      expect(applyToolPolicyToNames(["memory"], h.requests[0].toolPolicy)).toEqual([]);
+    } finally {
+      unregister();
+    }
   });
 
   test("resuming a persisted flush re-validates rollover admission first", async () => {
