@@ -2,10 +2,13 @@ import { createHash } from "node:crypto";
 import { tool } from "ai";
 import type { z } from "zod";
 import assert from "@/common/utils/assert";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { MuxMessage } from "@/common/types/message";
 import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import {
+  SESSION_HISTORY_MAX_SCAN_BYTES,
+  SESSION_HISTORY_MAX_SCAN_ROWS,
   SESSION_HISTORY_DEFAULT_LIMIT,
   SESSION_HISTORY_RESULT_ENVELOPE_BYTES,
   SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES,
@@ -93,6 +96,29 @@ function projectHistory(message: MuxMessage): { text: string; toolNames: Set<str
   return { text, toolNames };
 }
 
+/**
+ * Whether a caller row holds a canonical `task` creation receipt for `taskId`: a top-level or
+ * PTC-nested `task` tool result naming it in taskId / taskIds / tasks[] / reports[]. IDs that
+ * merely appear in reports, other tools' output (task_list, task_await) or free text do not count.
+ */
+function createsTask(message: MuxMessage, taskId: string): boolean {
+  const names = (entry: unknown): boolean => isPlainObject(entry) && entry.taskId === taskId;
+  const receiptNames = (output: unknown): boolean =>
+    isPlainObject(output) &&
+    (names(output) ||
+      (Array.isArray(output.taskIds) && output.taskIds.includes(taskId)) ||
+      (Array.isArray(output.tasks) && output.tasks.some(names)) ||
+      (Array.isArray(output.reports) && output.reports.some(names)));
+  const spawns = (record: Record<string, unknown>): boolean =>
+    (record.toolName === "task" && receiptNames(record.output)) ||
+    (Array.isArray(record.nestedCalls) &&
+      record.nestedCalls.some((nested) => isPlainObject(nested) && spawns(nested)));
+  // Parts are persisted JSON; validate the shape at this boundary instead of asserting types.
+  return message.parts.some(
+    (part: unknown) => isPlainObject(part) && part.type === "dynamic-tool" && spawns(part)
+  );
+}
+
 const FILTERABLE_ACTIONS: ReadonlySet<SessionHistoryArgs["action"]> = new Set([
   "list_items",
   "search",
@@ -143,29 +169,32 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           exhausted: false,
           skipped_oversized_rows: 0,
         };
-      // Descendant history: only canonical task IDs of this workspace's own
-      // descendants that the caller's current privacy segment spawned (a manual
-      // reset preserves tasks, so ancestry alone would let the post-reset model
-      // read child output derived from its discarded context). Re-authorized on
-      // every call, including cursor continuations; unauthorized targets get one
+      // Descendant history: only this workspace's own descendants, and only when
+      // the caller's CURRENT privacy segment created the branch (a manual reset
+      // preserves tasks, so ancestry alone would let the post-reset model read
+      // child output derived from its discarded context). The branch root is
+      // proven by a bounded scan of the caller's post-floor history below; verified
+      // ancestry extends that proof to grandchildren. Unrelated targets get one
       // generic error so no target metadata leaks.
       const target = args.task_id ?? workspaceId;
       const foreign = target !== workspaceId;
-      const authorized =
-        !foreign ||
-        (taskService !== undefined &&
-          // Fail closed: an ancestry lookup failure denies rather than grants.
-          (await taskService.isDescendantAgentTask(workspaceId, target).catch(() => false)) &&
-          (await history.spawnedTaskIdsSinceManualReset(workspaceId).catch(() => new Set())).has(
-            target
-          ));
-      if (!authorized)
-        return {
-          success: false,
-          error: "task_not_found",
-          exhausted: false,
-          skipped_oversized_rows: 0,
-        };
+      let branchRoot: string | null = null;
+      if (foreign) {
+        // Fail closed: an ancestry lookup failure denies rather than grants.
+        const relation = taskService
+          ? await taskService
+              .resolveDescendantAgentTaskBranchRoot(workspaceId, target)
+              .catch(() => ({ status: "unrelated" as const }))
+          : { status: "unrelated" as const };
+        if (relation.status !== "live")
+          return {
+            success: false,
+            error: relation.status === "removed" ? "session_unavailable" : "task_not_found",
+            exhausted: false,
+            skipped_oversized_rows: 0,
+          };
+        branchRoot = relation.branchRootTaskId;
+      }
       // Caller and target identities are both bound so a cursor cannot be replayed
       // by another caller or against another target.
       const binding = {
@@ -219,10 +248,61 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           args.action === "search"
             ? new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
             : null;
+        const cursor = args.cursor != null ? decodeHistoryCursor(args.cursor, binding) : undefined;
+        // One page budget is shared by the authorization scan and the target scan.
+        const budget = {
+          maxBytes: SESSION_HISTORY_MAX_SCAN_BYTES,
+          maxRows: SESSION_HISTORY_MAX_SCAN_ROWS,
+        };
+        let authorization = cursor?.authorization ?? null;
+        if (branchRoot !== null) {
+          assert(
+            authorization === null || authorization.branchRoot === branchRoot,
+            "descendant cursor binding must pin the branch root"
+          );
+          // Proven cursors carry the caller scan as "done": continuing it only runs the
+          // append check (an appended manual reset or rewrite throws stale_cursor) without
+          // browsing further caller rows.
+          let found = authorization?.proven === true;
+          const auth = await history.scanHistoryBounded(workspaceId, {
+            cursor: authorization?.scan,
+            budget,
+            visit: ({ message }) => {
+              if (found || !createsTask(message, branchRoot)) return true;
+              found = true;
+              return false;
+            },
+          });
+          budget.maxBytes -= auth.bytesRead;
+          budget.maxRows -= auth.rowsScanned;
+          result.bytesRead = auth.bytesRead;
+          result.rowsScanned = auth.rowsScanned;
+          if (authorization?.proven) {
+            // A partially completed append check resumes next page; otherwise keep the proof.
+            authorization = { ...authorization, scan: auth.cursor ?? authorization.scan };
+          } else if (found) {
+            assert(auth.cursor, "a receipt row leaves the caller scan resumable");
+            authorization = { branchRoot, scan: { ...auth.cursor, phase: "done" }, proven: true };
+          } else if (auth.cursor) {
+            authorization = { branchRoot, scan: auth.cursor, proven: false };
+            result.exhausted = false;
+            result.nextCursor = encodeHistoryCursor({ ...binding, scan: null, authorization });
+            return result;
+          } else {
+            // The caller's whole post-floor history holds no creation receipt for this branch.
+            return {
+              success: false,
+              error: "task_not_found",
+              exhausted: false,
+              skipped_oversized_rows: 0,
+            };
+          }
+        }
         const scan = await history.scanHistoryBounded(target, {
-          cursor: args.cursor != null ? decodeHistoryCursor(args.cursor, binding) : undefined,
+          cursor: cursor?.scan ?? undefined,
           recentFirst: args.recent_first === true,
           requireExistingHistory: foreign,
+          budget,
           visit: ({ message, itemId, windowId, windowBoundaryKind, startsWindow }) => {
             if (args.action === "list_windows") {
               if (!startsWindow) return true;
@@ -304,14 +384,14 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             return true;
           },
         });
-        result.bytesRead = scan.bytesRead;
-        result.rowsScanned = scan.rowsScanned;
+        result.bytesRead = (result.bytesRead ?? 0) + scan.bytesRead;
+        result.rowsScanned = (result.rowsScanned ?? 0) + scan.rowsScanned;
         result.oversizedLines = scan.oversizedLines;
         result.skipped_oversized_rows = scan.oversizedLines;
         result.exhausted = foundItem || scan.cursor == null;
         result.malformedLines = scan.malformedLines;
         if (scan.cursor && !foundItem)
-          result.nextCursor = encodeHistoryCursor({ ...binding, scan: scan.cursor });
+          result.nextCursor = encodeHistoryCursor({ ...binding, scan: scan.cursor, authorization });
         if (args.action === "read_item" && !foundItem && !scan.cursor) {
           result.success = false;
           result.error = "item_not_found";

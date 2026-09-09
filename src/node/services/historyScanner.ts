@@ -282,9 +282,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
   paths: Record<HistoryArtifact, string>,
   skip: number,
   project: (value: unknown) => Row | null,
-  includeReadableResetFloor = false,
-  /** Start at the latest manual reset (or retained history start) instead of a durable boundary. */
-  manualResetFloorOnly = false
+  includeReadableResetFloor = false
 ): Promise<Row[]> {
   assert(Number.isSafeInteger(skip) && skip >= 0, "provider boundary skip must be non-negative");
   const files = new Map<HistoryArtifact, { handle: fs.FileHandle; size: number; stamp: string }>();
@@ -333,14 +331,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
     const chat = await locate("chat", skip);
     let messages: Row[];
     if (chat.kind === "start") messages = await readTail("chat", chat.offset);
-    else if (manualResetFloorOnly) {
-      // Durable boundaries were never a stop (skip is unreachable); only a reset floor is.
-      const archive = await locate("archive", skip);
-      messages = [
-        ...(await readTail("archive", archive.kind === "start" ? archive.offset : 0)),
-        ...(await readTail("chat", 0)),
-      ];
-    } else {
+    else {
       const archive = await locate("archive", skip - chat.boundaryCount);
       if (archive.kind === "start" || archive.oldestBoundary !== null) {
         messages = [
@@ -385,46 +376,6 @@ export function readProviderHistoryFromLatestBoundary(
     (value) => (isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null),
     options?.includeReadableResetFloor
   );
-}
-
-/**
- * Task IDs spawned by `task` tool calls (top-level or PTC-nested) since the latest manual reset.
- * Reading a descendant's transcript is only allowed for children the caller's current privacy
- * segment created: an older child would otherwise leak the caller's discarded context.
- * This is a floor-bounded full read of the caller's own retained rows, not a paged scan.
- */
-export function readSpawnedTaskIdsSinceManualReset(
-  paths: Record<HistoryArtifact, string>
-): Promise<Set<string>> {
-  const collect = (value: unknown, into: Set<string>, depth: number): void => {
-    if (depth > 30 || !value || typeof value !== "object") return;
-    if (Array.isArray(value)) {
-      for (const item of value) collect(item, into, depth + 1);
-      return;
-    }
-    const record = value as Record<string, unknown>;
-    if (typeof record.taskId === "string") into.add(record.taskId);
-    if (Array.isArray(record.taskIds))
-      for (const id of record.taskIds) if (typeof id === "string") into.add(id);
-    for (const item of Object.values(record)) collect(item, into, depth + 1);
-  };
-  const spawnedBy = (record: Record<string, unknown>, into: Set<string>): void => {
-    if (record.toolName === "task") collect(record.output, into, 0);
-    if (Array.isArray(record.nestedCalls))
-      for (const nested of record.nestedCalls) if (isPlainObject(nested)) spawnedBy(nested, into);
-  };
-  return readHistoryProjectionFromLatestBoundary(
-    paths,
-    Number.MAX_SAFE_INTEGER,
-    (value) => {
-      if (!isReadableHistoryMessage(value)) return null;
-      const ids = new Set<string>();
-      for (const part of value.parts) if (isPlainObject(part)) spawnedBy(part, ids);
-      return ids.size > 0 ? ids : null;
-    },
-    false,
-    true
-  ).then((sets) => new Set(sets.flatMap((ids) => [...ids])));
 }
 
 /** Ordered lifecycle evidence, not a provider message or a source of repaired IDs. */
@@ -483,8 +434,10 @@ export async function scanHistoryFilesBounded(
   paths: Record<HistoryArtifact, string>,
   options: BoundedHistoryScanOptions,
   provenanceEpoch: string,
-  maxBytes = SESSION_HISTORY_MAX_SCAN_BYTES
+  maxBytes = SESSION_HISTORY_MAX_SCAN_BYTES,
+  maxRows = SESSION_HISTORY_MAX_SCAN_ROWS
 ): Promise<BoundedHistoryScanResult> {
+  assert(maxBytes >= 0 && maxRows >= 0, "history scan budgets must be non-negative");
   const result: BoundedHistoryScanResult = {
     bytesRead: 0,
     rowsScanned: 0,
@@ -684,7 +637,7 @@ export async function scanHistoryFilesBounded(
       while (
         (reverse ? cursor > lower : cursor < end) &&
         remaining() > 0 &&
-        result.rowsScanned < SESSION_HISTORY_MAX_SCAN_ROWS
+        result.rowsScanned < maxRows
       ) {
         const length = Math.min(
           SESSION_HISTORY_SCAN_CHUNK_BYTES,
@@ -714,7 +667,7 @@ export async function scanHistoryFilesBounded(
           const edge = start + i + 1;
           if (!deliver(edge)) return false;
           segmentEdge = reverse ? i : i + 1;
-          if (result.rowsScanned >= SESSION_HISTORY_MAX_SCAN_ROWS) return false;
+          if (result.rowsScanned >= maxRows) return false;
         }
         add(reverse ? chunk.subarray(0, segmentEdge) : chunk.subarray(segmentEdge));
         cursor = reverse ? start : start + length;
@@ -933,11 +886,7 @@ export async function scanHistoryFilesBounded(
       state.phase = "probe";
       return true;
     };
-    while (
-      state.phase !== "done" &&
-      remaining() > 0 &&
-      result.rowsScanned < SESSION_HISTORY_MAX_SCAN_ROWS
-    ) {
+    while (state.phase !== "done" && remaining() > 0 && result.rowsScanned < maxRows) {
       if (state.phase === "probe") {
         if (!(await probePage())) break;
         continue;

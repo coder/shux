@@ -3306,12 +3306,21 @@ describe("session_history newest-first browsing", () => {
 
 describe("session_history descendant task history", () => {
   const childId = "child-task";
+  const grandchildId = "grandchild-task";
   const removedChildId = "removed-child";
-  // Authorization itself is TaskService's contract; the tool must only consult it
-  // for every foreign call and fail closed on anything but an explicit true.
+  // Ancestry itself is TaskService's contract; the tool must consult it on every foreign
+  // call, treat anything but a live branch as denied/unavailable, and then prove that the
+  // caller's current privacy segment created the branch root.
+  const relation = (ancestor: string, task: string) => {
+    if (ancestor !== workspaceId) return { status: "unrelated" as const };
+    if (task === childId || task === grandchildId)
+      return { status: "live" as const, branchRootTaskId: childId };
+    if (task === removedChildId) return { status: "removed" as const };
+    return { status: "unrelated" as const };
+  };
   const taskService = {
-    isDescendantAgentTask: (ancestor: string, task: string) =>
-      Promise.resolve(ancestor === workspaceId && [childId, removedChildId].includes(task)),
+    resolveDescendantAgentTaskBranchRoot: (ancestor: string, task: string) =>
+      Promise.resolve(relation(ancestor, task)),
   } as unknown as TaskService;
   const callAs = async (
     input: SessionHistoryArgs,
@@ -3327,15 +3336,33 @@ describe("session_history descendant task history", () => {
       await tool.execute!(input, mockToolCallOptions)
     );
   };
-  const appendChild = async (id: string, text: string, metadata?: MuxMetadata) => {
+  const pagesAs = async (input: SessionHistoryArgs) => {
+    const results: SessionHistoryResult[] = [];
+    let cursor: string | undefined;
+    do {
+      const result = await callAs({ ...input, cursor });
+      expect(result.success).toBe(true);
+      expect(result.bytesRead ?? 0).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
+      expect(result.rowsScanned ?? 0).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
+      results.push(result);
+      cursor = result.nextCursor;
+      expect(results.length).toBeLessThan(40);
+    } while (cursor);
+    return results;
+  };
+  const appendTo = async (workspace: string, id: string, text: string, metadata?: MuxMetadata) => {
     const message = createMuxMessage(id, "assistant", text, metadata);
-    expect((await fixture.historyService.appendToHistory(childId, message)).success).toBe(true);
+    expect((await fixture.historyService.appendToHistory(workspace, message)).success).toBe(true);
     return message;
   };
-  // The caller's transcript must show that its current privacy segment spawned the child.
-  const appendSpawn = async (taskIds: string[], nested = false) => {
-    const output = { status: "completed", taskIds, note: "done" };
-    const part: MuxMessage["parts"][number] = nested
+  const appendChild = (id: string, text: string, metadata?: MuxMetadata) =>
+    appendTo(childId, id, text, metadata);
+  const taskPart = (
+    toolName: string,
+    output: unknown,
+    nested = false
+  ): MuxMessage["parts"][number] =>
+    nested
       ? {
           type: "dynamic-tool",
           toolCallId: "ptc",
@@ -3343,20 +3370,26 @@ describe("session_history descendant task history", () => {
           state: "output-available",
           input: {},
           output: {},
-          nestedCalls: [
-            { toolCallId: "nested-spawn", toolName: "task", state: "output-available", output },
-          ],
+          nestedCalls: [{ toolCallId: "nested", toolName, state: "output-available", output }],
         }
       : {
           type: "dynamic-tool",
-          toolCallId: `spawn-${taskIds.join("-")}`,
-          toolName: "task",
+          toolCallId: `${toolName}-call`,
+          toolName,
           state: "output-available",
-          input: { prompt: "work" },
+          input: {},
           output,
         };
-    await append(`spawn-${taskIds.join("-")}-${nested ? "nested" : "top"}`, "", undefined, [part]);
+  // A canonical `task` creation receipt in the caller's transcript.
+  const appendSpawnPart = async (part: MuxMessage["parts"][number], workspace = workspaceId) => {
+    const message = createMuxMessage(`spawn-${Math.random()}`, "assistant", "", undefined, [part]);
+    expect((await fixture.historyService.appendToHistory(workspace, message)).success).toBe(true);
   };
+  const spawn = (taskIds: string[], nested = false, workspace = workspaceId) =>
+    appendSpawnPart(
+      taskPart("task", { status: "completed", taskIds, note: "done" }, nested),
+      workspace
+    );
   const sessionDir = (id: string) => path.join(fixture.config.sessionsDir, id);
   const expectNoSession = async (id: string) =>
     expect(
@@ -3367,7 +3400,7 @@ describe("session_history descendant task history", () => {
     ).toBe("ENOENT");
 
   test("reads a descendant's retained history behind its own reset floor and never the caller's rows", async () => {
-    await appendSpawn([childId]);
+    await spawn([childId]);
     await appendChild("child-private", "child private facts");
     await appendChild("child-reset", "", { contextBoundaryKind: "reset", synthetic: true });
     const visible = await appendChild("child-public", "child public facts");
@@ -3392,25 +3425,37 @@ describe("session_history descendant task history", () => {
       )
     ).toEqual(["child public facts"]);
     // The caller's own history is unaffected by the target parameter.
-    expect((await callAs({ action: "list_items" })).items?.map((item) => item.text)).toEqual([
-      "opening facts",
-      expect.stringContaining("spawn-child-task"),
-    ]);
+    const own = (await callAs({ action: "list_items" })).items?.map((item) => item.text);
+    expect(own).toEqual(["opening facts", expect.stringContaining("child-task")]);
     expect(
       (await callAs({ action: "list_items", task_id: workspaceId })).items?.map((item) => item.text)
-    ).toEqual(["opening facts", expect.stringContaining("spawn-child-task")]);
+    ).toEqual(own);
   });
 
-  test("a manual reset in the caller revokes children spawned before it; PTC-nested spawns count", async () => {
+  test("a caller reset revokes earlier branches; grandchildren and PTC-nested receipts are covered", async () => {
     await appendChild("child-row", "child facts from the old segment");
-    await appendSpawn([childId]);
+    await appendTo(grandchildId, "grandchild-row", "grandchild facts");
+    await spawn([childId]);
     expect((await callAs({ action: "list_items", task_id: childId })).success).toBe(true);
+    // Grandchild: only the branch root (the child) needs a receipt in the caller's transcript.
+    expect(
+      (await callAs({ action: "list_items", task_id: grandchildId })).items?.map((i) => i.text)
+    ).toEqual(["grandchild facts"]);
     await append("caller-reset", "", { contextBoundaryKind: "reset", synthetic: true });
+    for (const target of [childId, grandchildId])
+      expect(await callAs({ action: "list_items", task_id: target })).toMatchObject({
+        success: false,
+        error: "task_not_found",
+      });
+    // Mentions that are not creation receipts never authorize.
+    await append("mention", `see ${childId}`);
+    await appendSpawnPart(taskPart("task_list", { tasks: [{ taskId: childId }] }));
+    await appendSpawnPart(taskPart("task_await", { results: [{ taskId: childId }] }));
     expect(await callAs({ action: "list_items", task_id: childId })).toMatchObject({
       success: false,
       error: "task_not_found",
     });
-    await appendSpawn(["other-task", childId], true);
+    await spawn(["other-task", childId], true);
     expect(
       (await callAs({ action: "list_items", task_id: childId })).items?.map((item) => item.text)
     ).toEqual(["child facts from the old segment"]);
@@ -3424,8 +3469,52 @@ describe("session_history descendant task history", () => {
     ).toEqual(["child facts from the old segment"]);
   });
 
+  test("authorization is proven in bounded pages and revalidated before later target pages", async () => {
+    const filler = Array.from({ length: SESSION_HISTORY_MAX_SCAN_ROWS + 50 }, (_, i) =>
+      createMuxMessage(`filler-${i}`, "assistant", `filler ${i}`, { historySequence: 100 + i })
+    );
+    await appendTrackedHistory(
+      chatPath,
+      filler.map((message) => JSON.stringify(message)).join("\n") + "\n"
+    );
+    await spawn([childId]);
+    await appendChild("child-one", "child one");
+    await appendChild("child-two", "child two");
+    const results = await pagesAs({ action: "list_items", task_id: childId, limit: 1 });
+    // The caller's floor discovery and receipt search need more than one page.
+    expect(results[0]).toMatchObject({ success: true, exhausted: false, items: [] });
+    expect(results[0].nextCursor).toBeString();
+    expect(results.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
+      "child one",
+      "child two",
+    ]);
+    // A proven cursor keeps working across ordinary caller appends, but a caller reset
+    // appended between pages expires it, and a fresh call is denied.
+    const first = await pagesAs({ action: "list_items", task_id: childId, limit: 1 });
+    const partial = first.find((page) => page.items?.length === 1 && page.nextCursor)!;
+    expect(partial).toBeDefined();
+    await append("caller-later", "later caller row");
+    const continued = await callAs({
+      action: "list_items",
+      task_id: childId,
+      limit: 1,
+      cursor: partial.nextCursor,
+    });
+    expect(continued.items?.map((item) => item.text)).toEqual(["child two"]);
+    const paused = await pagesAs({ action: "list_items", task_id: childId, limit: 1 });
+    const cursor = paused.find((page) => page.items?.length === 1 && page.nextCursor)!.nextCursor;
+    await append("caller-reset", "", { contextBoundaryKind: "reset", synthetic: true });
+    expect((await callAs({ action: "list_items", task_id: childId, limit: 1, cursor })).error).toBe(
+      "stale_cursor"
+    );
+    expect(await callAs({ action: "list_items", task_id: childId })).toMatchObject({
+      success: false,
+      error: "task_not_found",
+    });
+  });
+
   test("unauthorized, unknown and unavailable targets fail closed without creating sessions", async () => {
-    await appendSpawn([childId, removedChildId, "sibling-workspace", "unknown"]);
+    await spawn([childId, removedChildId, "sibling-workspace", "unknown"]);
     await appendChild("child-row", "child facts");
     for (const target of ["sibling-workspace", "unknown"]) {
       expect(await callAs({ action: "list_items", task_id: target })).toMatchObject({
@@ -3442,24 +3531,28 @@ describe("session_history descendant task history", () => {
       await callAs({ action: "list_items", task_id: childId }, { taskService: null })
     ).toMatchObject({ success: false, error: "task_not_found" });
     const failing = {
-      isDescendantAgentTask: () => Promise.reject(new Error("config unavailable")),
+      resolveDescendantAgentTaskBranchRoot: () => Promise.reject(new Error("config unavailable")),
     } as unknown as TaskService;
     expect(
       await callAs({ action: "list_items", task_id: childId }, { taskService: failing })
     ).toMatchObject({ success: false, error: "task_not_found" });
-    // Authorized descendant whose files were removed: distinguishable, but never created.
+    // Removed descendant (tombstone/report evidence only): distinguishable, never created.
     expect(await callAs({ action: "list_items", task_id: removedChildId })).toMatchObject({
       success: false,
       error: "session_unavailable",
     });
     await expectNoSession(removedChildId);
-    expect(
-      await callAs({ action: "read_item", task_id: removedChildId, item_id: "1" })
-    ).toMatchObject({ success: false, error: "session_unavailable" });
+    // A live descendant whose files are gone is unavailable too, and never created.
+    await fs.rm(sessionDir(grandchildId), { recursive: true, force: true });
+    expect(await callAs({ action: "list_items", task_id: grandchildId })).toMatchObject({
+      success: false,
+      error: "session_unavailable",
+    });
+    await expectNoSession(grandchildId);
   });
 
   test("cursors bind caller and target, and removal during pagination fails closed", async () => {
-    await appendSpawn([childId]);
+    await spawn([childId]);
     await appendChild("child-one", "child one");
     await appendChild("child-two", "child two");
     await append("own-two", "own second");
@@ -3474,32 +3567,12 @@ describe("session_history descendant task history", () => {
       (await callAs({ action: "list_items", task_id: childId, limit: 1, cursor: own.nextCursor }))
         .error
     ).toBe("invalid_cursor");
-    // Another caller with a descendant of the same ID still cannot replay this cursor.
+    // Another caller with its own receipt for the same child still cannot replay this cursor.
     const otherParent = {
-      isDescendantAgentTask: () => Promise.resolve(true),
+      resolveDescendantAgentTaskBranchRoot: () =>
+        Promise.resolve({ status: "live", branchRootTaskId: childId }),
     } as unknown as TaskService;
-    // Without spawn evidence in its own transcript the other caller is denied outright.
-    expect(
-      (
-        await callAs(
-          { action: "list_items", task_id: childId, limit: 1, cursor },
-          { caller: "other-parent", taskService: otherParent }
-        )
-      ).error
-    ).toBe("task_not_found");
-    const otherMessage = createMuxMessage("other-spawn", "assistant", "", undefined, [
-      {
-        type: "dynamic-tool",
-        toolCallId: "other",
-        toolName: "task",
-        state: "output-available",
-        input: {},
-        output: { status: "completed", taskId: childId },
-      },
-    ]);
-    expect(
-      (await fixture.historyService.appendToHistory("other-parent", otherMessage)).success
-    ).toBe(true);
+    await spawn([childId], false, "other-parent");
     expect(
       (
         await callAs(
@@ -3518,10 +3591,7 @@ describe("session_history descendant task history", () => {
     );
     expect(
       await callAs({ action: "list_items", task_id: childId, limit: 1, cursor })
-    ).toMatchObject({
-      success: false,
-      error: "session_unavailable",
-    });
+    ).toMatchObject({ success: false, error: "session_unavailable" });
     await fs.rm(sessionDir(childId), { recursive: true, force: true });
     expect(await callAs({ action: "list_items", task_id: childId })).toMatchObject({
       success: false,

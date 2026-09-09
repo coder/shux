@@ -9649,6 +9649,35 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
+  /**
+   * Locate a live descendant's branch root: the direct child of `ancestorWorkspaceId` on the
+   * parent chain leading to `taskId` (the task itself for a direct child). Callers that must
+   * respect the ancestor's privacy floor prove that this branch root was created inside the
+   * ancestor's current context segment; verified ancestry then extends the proof to the whole
+   * branch. Tasks that were removed (tombstone/report evidence only) have no live chain.
+   */
+  async resolveDescendantAgentTaskBranchRoot(
+    ancestorWorkspaceId: string,
+    taskId: string
+  ): Promise<{ status: "live"; branchRootTaskId: string } | { status: "removed" | "unrelated" }> {
+    assert(
+      ancestorWorkspaceId.length > 0,
+      "resolveDescendantAgentTaskBranchRoot: ancestor required"
+    );
+    assert(taskId.length > 0, "resolveDescendantAgentTaskBranchRoot: taskId required");
+    const parentById = this.buildAgentTaskIndex(this.config.loadConfigOrDefault()).parentById;
+    let current = taskId;
+    for (let i = 0; i < 32; i++) {
+      const parent = parentById.get(current);
+      if (!parent) break;
+      if (parent === ancestorWorkspaceId) return { status: "live", branchRootTaskId: current };
+      current = parent;
+    }
+    return (await this.isDescendantAgentTask(ancestorWorkspaceId, taskId))
+      ? { status: "removed" }
+      : { status: "unrelated" };
+  }
+
   isDescendantAgentTaskUsingParentById(
     parentById: Map<string, string>,
     ancestorWorkspaceId: string,

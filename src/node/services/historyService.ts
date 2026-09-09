@@ -12,7 +12,6 @@ import {
   hasAmbiguousResetKeys,
   hasUnreadableHistoryResetEvidence,
   isReadableHistoryMessage,
-  readSpawnedTaskIdsSinceManualReset,
   scanHistoryFilesBounded,
   readProviderHistoryFromLatestBoundary,
   readHistoryControlEvidenceFromLatestBoundary,
@@ -323,6 +322,8 @@ export class HistoryService {
        * deleting files, so this check cannot race a concurrent removal.
        */
       requireExistingHistory?: boolean;
+      /** Remaining page budget when one tool call chains several scans (authorization + target). */
+      budget?: { maxBytes: number; maxRows: number };
     }
   ) {
     assert(workspaceId.trim().length > 0, "history scan requires workspaceId");
@@ -373,28 +374,17 @@ export class HistoryService {
           },
           options,
           receipt.epoch,
-          SESSION_HISTORY_MAX_SCAN_BYTES - 2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES
+          Math.max(
+            0,
+            (options.budget?.maxBytes ?? SESSION_HISTORY_MAX_SCAN_BYTES) -
+              2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES
+          ),
+          options.budget?.maxRows
         );
         result.bytesRead += bytesRead + (await provenance.validatePage(receipt));
         await assertNoTruncate();
         return result;
       })
-    );
-  }
-
-  /**
-   * Task IDs the workspace spawned since its latest manual reset. Serialized with writers like
-   * scanHistoryBounded so a concurrent reset cannot be observed half-written.
-   */
-  spawnedTaskIdsSinceManualReset(workspaceId: string): Promise<Set<string>> {
-    assert(workspaceId.trim().length > 0, "spawn evidence requires workspaceId");
-    return this.fileLocks.withLock(workspaceId, () =>
-      this.withHistoryWriteFileLock(workspaceId, () =>
-        readSpawnedTaskIdsSinceManualReset({
-          chat: this.getChatHistoryPath(workspaceId),
-          archive: this.getChatArchivePath(workspaceId),
-        })
-      )
     );
   }
 

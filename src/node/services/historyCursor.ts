@@ -97,10 +97,19 @@ const CursorSchema = z
     workspaceId: z.string(),
     action: z.enum(["list_windows", "list_items", "search", "read_item"]),
     query: z.string(),
-    scan: HistoryScanStateSchema,
+    // null while a descendant read is still proving authorization in the caller's history.
+    scan: HistoryScanStateSchema.nullable(),
+    // Descendant reads: bounded scan of the caller's own post-floor history looking for the
+    // branch root's creation receipt. Present until proven; the proof is then carried as the
+    // finished scan so later pages can revalidate the caller snapshot (an appended manual
+    // reset expires it) before disclosing more target rows.
+    authorization: z
+      .object({ branchRoot: z.string(), scan: HistoryScanStateSchema, proven: z.boolean() })
+      .strict()
+      .nullable(),
   })
   .strict();
-type HistoryCursor = z.infer<typeof CursorSchema>;
+export type HistoryCursor = z.infer<typeof CursorSchema>;
 // Authentication prevents a model from manufacturing a pre-reset byte offset.
 // A backend restart intentionally expires cursors; callers can restart their query.
 const cursorKey = randomBytes(32);
@@ -112,7 +121,7 @@ export function encodeHistoryCursor(cursor: Omit<HistoryCursor, "version">): str
 export function decodeHistoryCursor(
   value: string,
   binding: Pick<HistoryCursor, "workspaceId" | "action" | "query">
-): HistoryScanState {
+): Pick<HistoryCursor, "scan" | "authorization"> {
   try {
     const envelope = z
       .object({ data: z.string(), signature: z.string().regex(/^[a-f0-9]{64}$/) })
@@ -127,7 +136,7 @@ export function decodeHistoryCursor(
       cursor.query !== binding.query
     )
       throw new Error();
-    return cursor.scan;
+    return { scan: cursor.scan, authorization: cursor.authorization };
   } catch {
     throw new Error("invalid_cursor");
   }
