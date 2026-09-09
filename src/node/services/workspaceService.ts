@@ -138,6 +138,7 @@ import {
   healRemovalTombstonesForRegisteredWorkspaces,
   isWorkspaceRemovalTombstoned,
   removeSessionDirUnderMemoryLocks,
+  sealSubAgentForRemovalUnderMemoryLocks,
   SharedMemoryRemovalAbortedError,
   refineApplyLockPath,
   rollbackRemovalTombstoneIfOwned,
@@ -4430,6 +4431,41 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return true;
   }
 
+  /**
+   * Removal's in-lock shared-memory handover for a sub-agent (owner store's
+   * lock AND the child's own held by the caller): legacy-notebook adoption —
+   * a self-fallback backend's late note into <child>/memory either landed
+   * before this pass or is refused — then the refinement-row delta. Throws
+   * so removal aborts with the session intact; `force` logs and proceeds
+   * instead, accepting the loss (the user asked for the deletion regardless).
+   */
+  private async lockedSharedMemoryHandover(
+    workspaceId: string,
+    ownerWorkspaceId: string,
+    force: boolean
+  ): Promise<void> {
+    try {
+      await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
+        workspaceId,
+        ownerWorkspaceId,
+        { locksHeld: true }
+      );
+      await migrateSharedMemoryRefinementRows({
+        childSessionDir: path.join(this.config.sessionsDir, workspaceId),
+        childWorkspaceId: workspaceId,
+        ownerSessionDir: path.join(this.config.sessionsDir, ownerWorkspaceId),
+        ownerWorkspaceId,
+      });
+    } catch (error) {
+      if (!force) throw error;
+      log.warn("Forced removal: locked shared-memory handover to the owner failed", {
+        workspaceId,
+        ownerWorkspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
   /** Transfer destructive cleanup out of a callback that still owns a session lease. */
   deferWorkspaceCleanup(run: () => Promise<void>): void {
     this.trackWorkspaceCleanup(run).catch((error: unknown) =>
@@ -6112,11 +6148,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // workspace registered and intact, so the finally lifts the consolidation
     // teardown gate the drains below installed.
     let removalCommitted = false;
+    // r66: identifies THIS removal attempt in the durable tombstone so the
+    // compensating rollback below cannot delete a concurrent backend
+    // attempt's marker.
+    const removalAttemptId = crypto.randomUUID();
+    // Sub-agents: the tombstone was published (with the final shared-memory
+    // handover) BEFORE the checkout deletion; an abort between the two rolls
+    // it back so the intact workspace stays usable.
+    let sealedForRemoval = false;
     // Try to remove from runtime (filesystem)
     try {
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
 
       // The captured engine stop joins partial finalization and raw terminal delivery.
       try {
@@ -6294,6 +6339,26 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               error: getErrorMessage(error),
             });
           }
+          // Final handover + tombstone under the removal locks, BEFORE the
+          // checkout is deleted (sealSubAgentForRemovalUnderMemoryLocks): a
+          // late legacy note the owner store cannot take must abort while the
+          // checkout still exists, and once sealed no backend can add
+          // another (they honor the tombstone at their commit points), so the
+          // session-dir deletion after runtime deletion has nothing fallible
+          // left. `force` accepts the loss of notes the handover cannot place.
+          await sealSubAgentForRemovalUnderMemoryLocks({
+            rootDir: this.config.rootDir,
+            sessionDir,
+            workspaceId,
+            attemptId: removalAttemptId,
+            sharedWorkspaceMemorySessionDir: path.join(
+              this.config.sessionsDir,
+              sharedMemoryOwnerId
+            ),
+            beforeTombstone: () =>
+              this.lockedSharedMemoryHandover(workspaceId, sharedMemoryOwnerId, force),
+          });
+          sealedForRemoval = true;
         }
 
         if (isMultiProject(metadata)) {
@@ -6643,11 +6708,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       );
 
       // Remove session data
-      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
-      // r66: identifies THIS removal attempt in the durable tombstone so the
-      // compensating rollback below cannot delete a concurrent backend
-      // attempt's marker.
-      const removalAttemptId = crypto.randomUUID();
       try {
         if (parentWorkspaceId) {
           try {
@@ -6723,26 +6783,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             workspaceId,
             attemptId: removalAttemptId,
             sharedWorkspaceMemorySessionDir: ownerSessionDir,
+            tombstoneSealed: sealedForRemoval,
+            // Sealed above (metadata path): handover done and tombstone
+            // published under these locks already. Otherwise (phantom,
+            // metadata-less path) the handover runs here, inside the locks
+            // and right before the tombstone. Throws → removal aborts,
+            // session intact.
             beforeTombstone:
-              ownerSessionDir === undefined
+              ownerSessionDir === undefined || sealedForRemoval
                 ? undefined
-                : async () => {
-                    // Legacy-notebook delta too (locks held: the owner store's
-                    // AND this child's own, so a self-fallback backend's late
-                    // note into <child>/memory either landed before this pass
-                    // or is refused). Throws → removal aborts, session intact.
-                    await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
-                      workspaceId,
-                      memoryOwnerId,
-                      { locksHeld: true }
-                    );
-                    await migrateSharedMemoryRefinementRows({
-                      childSessionDir: sessionDir,
-                      childWorkspaceId: workspaceId,
-                      ownerSessionDir,
-                      ownerWorkspaceId: memoryOwnerId,
-                    });
-                  },
+                : () => this.lockedSharedMemoryHandover(workspaceId, memoryOwnerId, force),
           });
           // Only once the session (and with it the transcript) is gone are the
           // retryable harvest records truly unrecoverable; an aborted removal
@@ -6889,6 +6939,26 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
       if (!removalCommitted) {
+        // A sealed sub-agent whose checkout deletion was then refused
+        // (force=false) keeps its session dir and config entry: lift the
+        // tombstone again (ownership-checked, r66) so it stays usable.
+        if (sealedForRemoval) {
+          try {
+            await rollbackRemovalTombstoneIfOwned({
+              rootDir: this.config.rootDir,
+              sessionDir: path.join(this.config.sessionsDir, workspaceId),
+              workspaceId,
+              attemptId: removalAttemptId,
+              workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
+            });
+          } catch (rollbackError) {
+            log.error(
+              "Failed to roll back the removal tombstone after an aborted removal; " +
+                "the startup self-heal will reclaim it",
+              { workspaceId, rollbackError }
+            );
+          }
+        }
         this.memoryConsolidationService?.releaseRemovalCancellation(workspaceId);
       }
       for (const hold of admissionHolds) {

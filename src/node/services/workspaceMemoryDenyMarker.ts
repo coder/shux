@@ -22,7 +22,8 @@
  * compacting backend observes it (see workspaceMemoryPolicyEpochs.ts).
  *
  * Fail-closed by construction: a missing marker (or one without an entry for
- * this epoch) is "no deny"; a present entry for this epoch, or a
+ * this epoch) is "no deny"; a present entry for this epoch, a wildcard entry
+ * (inherited from a malformed marker some later writer replaced), or a
  * malformed/unreadable marker, is a deny.
  */
 import * as fsPromises from "node:fs/promises";
@@ -49,33 +50,44 @@ export async function writeWorkspaceMemoryDenyMarker(
   const markerPath = workspaceMemoryDenyMarkerPath(sessionDir);
   await fsPromises.mkdir(sessionDir, { recursive: true });
   const record = await readMarkerRecord(markerPath);
-  // A malformed marker was a deny for every reader while it existed; a
-  // well-formed write for this epoch supersedes it (the boundary clear would
-  // heal it the same way).
+  // A malformed marker was a deny for EVERY epoch's reader while it existed,
+  // possibly the only evidence of some other backend's read-only turn in
+  // the closing epoch. This writer, recording a deny for its own epoch,
+  // cannot know which epoch that was, so the well-formed file it leaves
+  // behind carries the deny forward as a wildcard until a boundary
+  // observation clears it (clearWorkspaceMemoryDenyMarker).
   const epochs = record === "absent" || record === null ? [] : record.epochs;
-  await writeMarkerRecord(markerPath, [...epochs.filter((e) => e !== epoch), epoch]);
+  const wildcard = record === null || (record !== "absent" && record.wildcard);
+  await writeMarkerRecord(markerPath, [...epochs.filter((e) => e !== epoch), epoch], wildcard);
   if (!(await readWorkspaceMemoryDenyMarker(sessionDir, epoch))) {
     throw new Error(`Workspace memory deny marker did not persist at ${markerPath}`);
   }
 }
 
-async function writeMarkerRecord(markerPath: string, epochs: readonly number[]): Promise<void> {
+/** `wildcard`: a deny of unknown epoch (inherited from a malformed marker), denying every reader. */
+async function writeMarkerRecord(
+  markerPath: string,
+  epochs: readonly number[],
+  wildcard: boolean
+): Promise<void> {
   const retained = [...epochs]
     .sort((a, b) => b - a)
     .slice(0, WORKSPACE_MEMORY_POLICY_EPOCHS_RETAINED);
-  await writeFileAtomic(markerPath, JSON.stringify({ deniedAt: Date.now(), epochs: retained }), {
-    encoding: "utf-8",
-  });
+  await writeFileAtomic(
+    markerPath,
+    JSON.stringify({ deniedAt: Date.now(), epochs: retained, wildcard }),
+    { encoding: "utf-8" }
+  );
 }
 
 /** Parsed marker, or null when it is unreadable/malformed (which readers treat as a deny). */
 async function readMarkerRecord(
   markerPath: string
-): Promise<{ epochs: number[] } | "absent" | null> {
+): Promise<{ epochs: number[]; wildcard: boolean } | "absent" | null> {
   try {
     const parsed: unknown = JSON.parse(await fsPromises.readFile(markerPath, "utf-8"));
     if (typeof parsed !== "object" || parsed === null) return null;
-    const { epochs } = parsed as { epochs?: unknown };
+    const { epochs, wildcard } = parsed as { epochs?: unknown; wildcard?: unknown };
     if (
       !Array.isArray(epochs) ||
       !epochs.every(
@@ -84,7 +96,7 @@ async function readMarkerRecord(
     ) {
       return null;
     }
-    return { epochs };
+    return { epochs, wildcard: wildcard === true };
   } catch (error) {
     return hasErrorCode(error, "ENOENT") ? "absent" : null;
   }
@@ -103,7 +115,7 @@ export async function readWorkspaceMemoryDenyMarker(
   const record = await readMarkerRecord(workspaceMemoryDenyMarkerPath(sessionDir));
   if (record === "absent") return false;
   if (record === null || epoch === undefined) return true;
-  return record.epochs.includes(epoch);
+  return record.wildcard || record.epochs.includes(epoch);
 }
 
 /**
@@ -134,10 +146,12 @@ export async function clearWorkspaceMemoryDenyMarker(
       const record = await readMarkerRecord(markerPath);
       if (record === "absent") return;
       if (record !== null) {
+        // This boundary observed the closing epoch (deny included): the
+        // epoch-less wildcard, if any, is consumed with it.
         const remaining = record.epochs.filter((epoch) => epoch !== options.closingEpoch);
-        if (remaining.length === record.epochs.length) return;
+        if (remaining.length === record.epochs.length && !record.wildcard) return;
         if (remaining.length > 0) {
-          await writeMarkerRecord(markerPath, remaining);
+          await writeMarkerRecord(markerPath, remaining, false);
           if (await readWorkspaceMemoryDenyMarker(sessionDir, options.closingEpoch)) {
             throw new Error(`Workspace memory deny marker could not be cleared at ${markerPath}`);
           }
@@ -169,11 +183,17 @@ export async function carryWorkspaceMemoryDenyMarker(
   await withTargetMutationLock(rootDir, sessionDir, async () => {
     const markerPath = workspaceMemoryDenyMarkerPath(sessionDir);
     const record = await readMarkerRecord(markerPath);
-    if (record === "absent" || !record?.epochs.includes(closingEpoch)) return;
-    await writeMarkerRecord(markerPath, [
-      ...record.epochs.filter((epoch) => epoch !== closingEpoch && epoch !== nextEpoch),
-      nextEpoch,
-    ]);
+    if (record === "absent" || record === null) return;
+    if (!record.wildcard && !record.epochs.includes(closingEpoch)) return;
+    // The wildcard denied the closing epoch; carried as the new epoch's deny.
+    await writeMarkerRecord(
+      markerPath,
+      [
+        ...record.epochs.filter((epoch) => epoch !== closingEpoch && epoch !== nextEpoch),
+        nextEpoch,
+      ],
+      false
+    );
     if (!(await readWorkspaceMemoryDenyMarker(sessionDir, nextEpoch))) {
       throw new Error(`Workspace memory deny marker did not persist at ${markerPath}`);
     }

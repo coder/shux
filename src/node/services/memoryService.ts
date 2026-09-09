@@ -408,11 +408,17 @@ const LEGACY_IMPORT_DIR = "imported";
  */
 const LEGACY_ADOPTION_MANIFEST_FILE_NAME = ".adopted-into-shared-store.json";
 
-/** One adopted legacy file: content hash, child sidecar fingerprint, owner-store relPath. */
+/**
+ * One adopted legacy file: content hash, child sidecar fingerprint, owner-store
+ * relPath, and whether the adoption CREATED that owner file (provenance: only
+ * such a copy may be removed again when the legacy source disappears; a
+ * pre-existing identical owner note is the owner's own).
+ */
 interface LegacyAdoptionRecord {
   content: string;
   sidecar: string;
   target: string;
+  created?: boolean;
 }
 
 function isLegacyAdoptionRecord(value: unknown): value is LegacyAdoptionRecord {
@@ -1278,11 +1284,6 @@ export class MemoryService extends EventEmitter {
     // folded in): either changes what the shared store's readers derive from it.
     let adoptedCount = 0;
     let skipped = 0;
-    // Some listed note was not represented this pass (owner store full, both
-    // destinations taken, unreadable, sidecar fold failed): the retry it
-    // promises depends on OWNER-side state the check key does not observe,
-    // so such a pass is never memoized — the next access runs it again.
-    let incomplete = false;
     const pass = async (): Promise<void> => {
       await this.assertMutationCommittable(ctx, store, undefined, toVirtualPath("workspace", ""));
       if ((await lstatKind(legacyRoot)) !== "dir") return; // swapped while waiting for the lock
@@ -1328,6 +1329,7 @@ export class MemoryService extends EventEmitter {
           content: sha256Hex(content),
           sidecar: childEntry === undefined ? "" : JSON.stringify(childEntry),
           target: "",
+          created: false,
         };
         const previous = adopted.get(relPath);
         if (previous?.content === record.content && previous.sidecar === record.sidecar) {
@@ -1349,7 +1351,10 @@ export class MemoryService extends EventEmitter {
             (await this.readBoundedTextFile(store, previous.target, previous.target).catch(
               () => null
             )) === content;
-          if (stillAdopted) target = { relPath: previous.target, write: false };
+          if (stillAdopted) {
+            target = { relPath: previous.target, write: false };
+            record.created = previous.created === true;
+          }
         }
         if (target === null) {
           target = await this.legacyImportTarget(store, childId, relPath, content);
@@ -1382,6 +1387,7 @@ export class MemoryService extends EventEmitter {
             await store.writeFile(target.relPath, content);
             remainingCapacity--;
             imported++;
+            record.created = true;
           }
         }
         record.target = target.relPath;
@@ -1415,13 +1421,58 @@ export class MemoryService extends EventEmitter {
               "[MemoryService] failed to fold legacy memory stats into the shared store; retrying on next access",
               { relPath, error }
             );
-            incomplete = true;
+            // Counts as skipped: the note's pin/usage metadata is still
+            // stranded under the child key, and removal must not delete the
+            // child session (the only trigger for a retry) on that basis.
+            skipped++;
             continue;
           }
         }
         adopted.set(relPath, record);
         manifestDirty = true;
         adoptedCount++;
+      }
+      // Legacy notes deleted or renamed on the downgraded build: a copy THIS
+      // adoption created, still holding the adopted bytes, follows the source
+      // out of the shared notebook (a rename's new name is adopted above like
+      // a fresh note). Provenance and unchanged content are both required —
+      // an owner note that merely happened to be identical, or an adopted
+      // copy the owner has since edited, is the owner's and stays. Unlisted
+      // sources are only ever judged against the listing that succeeded
+      // above; a failed listing never reaches this point.
+      const listed = new Set(files);
+      for (const [relPath, previous] of adopted) {
+        if (listed.has(relPath)) continue;
+        if (previous.created === true) {
+          const current =
+            (await store.assertContained(previous.target).then(
+              () => true,
+              () => false
+            )) && (await store.kind(previous.target)) === "file"
+              ? await this.readBoundedTextFile(store, previous.target, previous.target).catch(
+                  () => null
+                )
+              : null;
+          const unchanged = current !== null && sha256Hex(current) === previous.content;
+          if (unchanged) {
+            await store.remove(previous.target);
+            await this.metaService.removeKeys(
+              memoryLogicalKey("workspace", previous.target, {
+                projectPath: ctx.projectPath,
+                workspaceId: owner,
+              })
+            );
+            adoptedCount++;
+            log.info("[MemoryService] removed an adopted legacy note deleted on the old build", {
+              childId,
+              owner,
+              relPath,
+              target: previous.target,
+            });
+          }
+        }
+        adopted.delete(relPath);
+        manifestDirty = true;
       }
       if (manifestDirty) {
         await writeFileAtomic(manifestPath, JSON.stringify(Object.fromEntries(adopted)), {
@@ -1452,8 +1503,11 @@ export class MemoryService extends EventEmitter {
     }
     // Recorded against the state observed BEFORE the pass: a foreign write
     // landing during it changes the stamp and re-runs the (idempotent) pass.
-    // Only a complete pass is memoized (see `incomplete`).
-    if (skipped === 0 && !incomplete) {
+    // Only a complete pass is memoized: a note left unrepresented (owner
+    // store full, both destinations taken, unreadable, sidecar fold failed)
+    // is retried on the next access, and that retry depends on OWNER-side
+    // state the check key does not observe.
+    if (skipped === 0) {
       this.legacyStoreCheckedAgainst.set(childId, checkKey);
     } else {
       this.legacyStoreCheckedAgainst.delete(childId);
@@ -1822,13 +1876,28 @@ export class MemoryService extends EventEmitter {
     for (const guarded of new Set([workspaceId, owner])) {
       if (await isWorkspaceRemovalTombstoned(this.config.rootDir, guarded)) return "revoked";
     }
-    const revision = await readWorkspaceMemoryRevision(path.join(this.config.sessionsDir, owner));
-    const token = revision === null ? "missing" : String(revision);
+    const ownerSessionDir = path.join(this.config.sessionsDir, owner);
+    const revision = await readWorkspaceMemoryRevision(ownerSessionDir);
+    // The clock is what this build's writers advance. A downgraded build
+    // sharing the root writes straight into the owner's canonical notebook
+    // without touching it, so the token also carries the store's own file
+    // stamps (root mtime, per-file size + mtime; bounded by the per-scope
+    // file cap): stat fingerprints are cache hints — enough to make a cached
+    // context miss — never proof that authorizes any mutation.
+    const token = `${revision === null ? "missing" : String(revision)}\u0000${await legacyStoreStamp(
+      ownerSessionDir,
+      workspaceMemoryStorePath(this.config.sessionsDir, owner)
+    )}`;
     // A redirected sub-agent's token also tracks its legacy private notebook
     // (see legacyAdoptionCheckKey): its next store access adopts the change,
     // so the cached context must miss as soon as the legacy state moves.
     if (owner === workspaceId) return token;
     return `${token}\u0000${(await this.legacyAdoptionCheckKey(workspaceId, owner)).checkKey}`;
+  }
+
+  /** The store clock segment of a workspaceMemoryRevision token (tests, diagnostics). */
+  static revisionClockOf(token: string): string {
+    return token.split("\u0000", 1)[0] ?? token;
   }
 
   /**

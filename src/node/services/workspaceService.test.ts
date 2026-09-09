@@ -5,7 +5,10 @@ import {
   workspaceMemoryDenyMarkerPath,
   writeWorkspaceMemoryDenyMarker,
 } from "@/node/services/workspaceMemoryDenyMarker";
-import { workspaceRemovalTombstonePath } from "@/node/services/workspaceRemoval";
+import {
+  workspaceRemovalTombstonePath,
+  isWorkspaceRemovalTombstoned,
+} from "@/node/services/workspaceRemoval";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
@@ -9406,6 +9409,19 @@ describe("WorkspaceService initialize", () => {
       // deny — heals it and the next epoch can become writable again.
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
+      // Another backend's new-epoch deny write must not heal the malformed
+      // marker away (it may be the only evidence of a read-only turn in the
+      // closing epoch): the deny is carried as a wildcard until the closing
+      // boundary observes and clears it.
+      await writeWorkspaceMemoryDenyMarker(sessionDir, 7);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, -1)).toBe(true);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 3)).toBe(true);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: -1 });
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, -1)).toBe(false);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 7)).toBe(true);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: 7 });
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+      await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
       await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: -1 });
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "{}");
@@ -14362,6 +14378,169 @@ describe("WorkspaceService remove timing rollup", () => {
     } finally {
       stopRelease.resolve();
       await fsPromises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("WorkspaceService remove sub-agent handover ordering", () => {
+  // A sub-agent's final shared-memory handover + removal tombstone are sealed
+  // under the removal locks BEFORE the checkout is deleted: a handover the
+  // owner store cannot take aborts with the checkout intact, and a refused
+  // checkout deletion rolls the tombstone back.
+  const projectPath = "/tmp/proj-handover";
+  const workspaceId = "child-handover";
+  const ownerId = "owner-handover";
+  const workspacePath = path.join(projectPath, "child-ws");
+  const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
+  let rootDir: string;
+
+  beforeEach(async () => {
+    rootDir = path.join(tmpdir(), "mux-handover-order", `root-${crypto.randomUUID()}`);
+    await fsPromises.mkdir(path.join(rootDir, "sessions", workspaceId), { recursive: true });
+  });
+  afterEach(async () => {
+    await fsPromises.rm(rootDir, { recursive: true, force: true });
+  });
+
+  function buildConfig(): Partial<Config> {
+    const topology = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              {
+                id: ownerId,
+                name: "owner",
+                path: path.join(projectPath, "owner-ws"),
+                runtimeConfig,
+              },
+              {
+                id: workspaceId,
+                name: "child",
+                path: workspacePath,
+                runtimeConfig,
+                parentWorkspaceId: ownerId,
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    return {
+      rootDir,
+      srcDir: "/tmp/src",
+      sessionsDir: path.join(rootDir, "sessions"),
+      removeWorkspace: mock(() => Promise.resolve()),
+      findWorkspace: mock(() => ({ workspacePath, projectPath })),
+      loadConfigOrDefault: mock(() => topology),
+      editConfig: mock((edit: (cfg: typeof topology) => typeof topology) =>
+        Promise.resolve(edit(topology))
+      ),
+    } as unknown as Partial<Config>;
+  }
+
+  function buildAiService(): AIService {
+    return {
+      ...createStreamLifecycleMocks(),
+      isStreaming: mock(() => false),
+      stopStream: mock(() => Promise.resolve(Ok(undefined))),
+      getWorkspaceMetadata: mock(() =>
+        Promise.resolve(
+          Ok({
+            id: workspaceId,
+            name: "child",
+            projectPath,
+            projectName: "proj",
+            runtimeConfig,
+            parentWorkspaceId: ownerId,
+          })
+        )
+      ),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+  }
+
+  test("a handover the owner cannot take aborts before the checkout is deleted", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: workspacePath })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildConfig(),
+        aiService: buildAiService(),
+      });
+      let adoptions = 0;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: (_child, _owner, options) => {
+          adoptions++;
+          // The unlocked pre-pass succeeds; the late note appears for the
+          // locked pass, which cannot place it.
+          return options?.locksHeld
+            ? Promise.reject(new Error("1 legacy note could not be folded"))
+            : Promise.resolve();
+        },
+      });
+      const result = await workspaceService.remove(workspaceId);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("could not be folded");
+      expect(adoptions).toBe(2);
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+      // force accepts the loss and completes the removal.
+      expect((await workspaceService.remove(workspaceId, true)).success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(false);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("a refused checkout deletion rolls the sealed tombstone back", async () => {
+    let refuse = true;
+    const deleteWorkspace = mock(() =>
+      Promise.resolve(
+        refuse
+          ? { success: false as const, error: "Workspace has uncommitted changes" }
+          : { success: true as const, deletedPath: workspacePath }
+      )
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildConfig(),
+        aiService: buildAiService(),
+      });
+      let sealedTombstone = false;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
+      });
+      deleteWorkspace.mockImplementation(async () => {
+        // Runtime deletion runs with the tombstone already sealed.
+        sealedTombstone = await isWorkspaceRemovalTombstoned(rootDir, workspaceId);
+        return refuse
+          ? { success: false as const, error: "Workspace has uncommitted changes" }
+          : { success: true as const, deletedPath: workspacePath };
+      });
+      const refused = await workspaceService.remove(workspaceId);
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("uncommitted changes");
+      expect(sealedTombstone).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      refuse = false;
+      expect((await workspaceService.remove(workspaceId)).success).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+    } finally {
+      createRuntimeSpy.mockRestore();
     }
   });
 });

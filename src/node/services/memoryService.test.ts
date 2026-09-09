@@ -97,6 +97,9 @@ function projectMemoryRoot(fixture: MemoryFixture): string {
   );
 }
 
+/** Store clock segment of a workspaceMemoryRevision token (the rest are file/legacy stamps). */
+const clockOf = (token: string): number => Number(MemoryService.revisionClockOf(token));
+
 describe("MemoryService", () => {
   describe("create + view round-trip", () => {
     it("creates and views a global memory file at <xumHome>/memory/global", async () => {
@@ -1230,7 +1233,9 @@ describe("MemoryService", () => {
       // A second MemoryService over the same Xum root stands in for another
       // backend process: it receives none of this instance's change events.
       const foreign = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
-      expect(await foreign.workspaceMemoryRevision("ws-owner")).toBe("missing");
+      expect(MemoryService.revisionClockOf(await foreign.workspaceMemoryRevision("ws-owner"))).toBe(
+        "missing"
+      );
 
       await fixture.service.create(fixture.ctx, "/memories/workspace/shared.md", "v1", "agent");
       const afterCreate = await foreign.workspaceMemoryRevision("ws-owner");
@@ -1259,10 +1264,20 @@ describe("MemoryService", () => {
       // Other scopes leave the workspace store's token alone...
       await fixture.service.create(fixture.ctx, "/memories/global/g.md", "g", "agent");
       expect(await foreign.workspaceMemoryRevision("ws-owner")).toBe(afterCreate);
+      // ...a downgraded build writing straight into the owner's canonical
+      // notebook moves no clock, but the token still changes (file stamps)...
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.writeFile(
+        path.join(fixture.config.sessionsDir, "ws-owner", "memory", "old-build.md"),
+        "written by a downgraded build"
+      );
+      const afterOldBuildWrite = await foreign.workspaceMemoryRevision("ws-owner");
+      expect(afterOldBuildWrite).not.toBe(afterCreate);
+      expect(clockOf(afterOldBuildWrite)).toBe(clockOf(afterCreate));
       // ...a pin toggle (hot-set input, no store write) advances it...
       await fixture.service.setPinned(fixture.ctx, "/memories/workspace/shared.md", true);
       const afterPin = await foreign.workspaceMemoryRevision("ws-owner");
-      expect(Number(afterPin)).toBeGreaterThan(Number(afterCreate));
+      expect(clockOf(afterPin)).toBeGreaterThan(clockOf(afterCreate));
       // ...while every shared-store mutation advances it.
       await fixture.service.strReplace(
         fixture.ctx,
@@ -1272,7 +1287,7 @@ describe("MemoryService", () => {
         "agent"
       );
       const afterEdit = await foreign.workspaceMemoryRevision("ws-owner");
-      expect(Number(afterEdit)).toBeGreaterThan(Number(afterPin));
+      expect(clockOf(afterEdit)).toBeGreaterThan(clockOf(afterPin));
       // A read-side access (view / recall) re-ranks the shared hot set through
       // the owner-keyed usage stats: it advances the clock and announces the
       // owner's store like a pin does, so the rest of the tree (and other
@@ -1283,7 +1298,7 @@ describe("MemoryService", () => {
         (await fixture.service.view(fixture.ctx, "/memories/workspace/shared.md")).success
       ).toBe(true);
       const afterView = await foreign.workspaceMemoryRevision("ws-owner");
-      expect(Number(afterView)).toBeGreaterThan(Number(afterEdit));
+      expect(clockOf(afterView)).toBeGreaterThan(clockOf(afterEdit));
       expect(events).toHaveLength(1);
       expect(events[0]).toMatchObject({
         scope: "workspace",
@@ -1291,8 +1306,8 @@ describe("MemoryService", () => {
         workspaceId: "ws-owner",
       });
       await fixture.service.recordRecall(fixture.ctx, "/memories/workspace/shared.md");
-      expect(Number(await foreign.workspaceMemoryRevision("ws-owner"))).toBeGreaterThan(
-        Number(afterView)
+      expect(clockOf(await foreign.workspaceMemoryRevision("ws-owner"))).toBeGreaterThan(
+        clockOf(afterView)
       );
       expect(events).toHaveLength(2);
       // Global reads have no store clock and stay silent.
@@ -1493,11 +1508,11 @@ describe("MemoryService", () => {
       const restarted = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
       const restartedEvents: unknown[] = [];
       restarted.on("change", (event) => restartedEvents.push(event));
-      const revisionBefore = Number(await fixture.service.workspaceMemoryRevision("ws-owner"));
+      const revisionBefore = clockOf(await fixture.service.workspaceMemoryRevision("ws-owner"));
       const relisted = await restarted.listIndexEntries(fixture.ctx);
       // The pass wrote one file and copied one pin: both change what other
       // backends derive from the store, so the clock moved and the tabs heard.
-      expect(Number(await fixture.service.workspaceMemoryRevision("ws-owner"))).toBeGreaterThan(
+      expect(clockOf(await fixture.service.workspaceMemoryRevision("ws-owner"))).toBeGreaterThan(
         revisionBefore
       );
       expect(restartedEvents).toHaveLength(1);
@@ -1508,9 +1523,9 @@ describe("MemoryService", () => {
       const metaOnly = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
       const metaOnlyEvents: unknown[] = [];
       metaOnly.on("change", (event) => metaOnlyEvents.push(event));
-      const revisionMid = Number(await fixture.service.workspaceMemoryRevision("ws-owner"));
+      const revisionMid = clockOf(await fixture.service.workspaceMemoryRevision("ws-owner"));
       await metaOnly.listIndexEntries(fixture.ctx);
-      expect(Number(await fixture.service.workspaceMemoryRevision("ws-owner"))).toBeGreaterThan(
+      expect(clockOf(await fixture.service.workspaceMemoryRevision("ws-owner"))).toBeGreaterThan(
         revisionMid
       );
       expect(metaOnlyEvents).toHaveLength(1);
@@ -1700,6 +1715,77 @@ describe("MemoryService", () => {
           })
         )
       ).toBe(true);
+    });
+
+    it("follows legacy deletions and renames for copies the adoption created, never owner notes", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      // `same.md` pre-exists identically on the owner side (reused, not created);
+      // `mine.md` and `moved.md` are created by the adoption; `edited.md` too,
+      // but the owner edits it afterwards.
+      await fsPromises.writeFile(path.join(ownerRoot, "same.md"), "identical");
+      for (const [name, body] of [
+        ["same.md", "identical"],
+        ["mine.md", "child note"],
+        ["moved.md", "to be renamed"],
+        ["edited.md", "child draft"],
+      ]) {
+        await fsPromises.writeFile(path.join(legacyRoot, name), body);
+      }
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      for (const name of ["same.md", "mine.md", "moved.md", "edited.md"]) {
+        expect(
+          await fsPromises.stat(path.join(ownerRoot, name)).then(
+            () => true,
+            () => false
+          )
+        ).toBe(true);
+      }
+      await fixture.service.setPinned({ ...fixture.ctx }, "/memories/workspace/mine.md", true);
+      await fixture.service.strReplace(
+        { ...fixture.ctx },
+        "/memories/workspace/edited.md",
+        "draft",
+        "final",
+        "agent"
+      );
+      // The downgraded build deletes same.md and mine.md, renames moved.md, and
+      // deletes edited.md.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      for (const name of ["same.md", "mine.md", "edited.md"]) {
+        await fsPromises.rm(path.join(legacyRoot, name));
+      }
+      await fsPromises.rename(
+        path.join(legacyRoot, "moved.md"),
+        path.join(legacyRoot, "renamed.md")
+      );
+      const relisted = (await fixture.service.listIndexEntries({ ...fixture.ctx }))
+        .filter((entry) => entry.scope === "workspace")
+        .map((entry) => entry.relPath)
+        .sort();
+      // Created + unchanged copies are gone (mine.md, moved.md); the reused
+      // owner note and the owner-edited copy stay; the rename's new name is
+      // adopted.
+      expect(relisted).toEqual(["edited.md", "renamed.md", "same.md"]);
+      expect(await fsPromises.readFile(path.join(ownerRoot, "edited.md"), "utf-8")).toBe(
+        "child final"
+      );
+      // The removed copy's owner-side pin went with it.
+      expect(
+        (await fixture.metaService.getPinnedKeys()).has(
+          memoryLogicalKey("workspace", "mine.md", { projectPath: "", workspaceId: "ws-owner" })
+        )
+      ).toBe(false);
+      // Idempotent: a further pass changes nothing.
+      const again = (await fixture.service.listIndexEntries({ ...fixture.ctx }))
+        .filter((entry) => entry.scope === "workspace")
+        .map((entry) => entry.relPath)
+        .sort();
+      expect(again).toEqual(relisted);
     });
 
     it("keeps the owner's pin when a downgraded build only viewed the adopted note", async () => {
@@ -2450,7 +2536,7 @@ describe("MemoryService", () => {
       expect(clocks[1]!).toBeLessThan(clocks[2]!);
       // The published token never lags a row's clock (change events tick it once more).
       expect(
-        Number(await fixture.service.workspaceMemoryRevision("ws-owner"))
+        clockOf(await fixture.service.workspaceMemoryRevision("ws-owner"))
       ).toBeGreaterThanOrEqual(Math.max(...(clocks as number[])));
 
       // The owner's edit is not the newest for that path: refused without force.
@@ -2471,13 +2557,13 @@ describe("MemoryService", () => {
       });
       expect(undone.success).toBe(true);
       const after = await fixture.service.workspaceMemoryRevision("ws-owner");
-      expect(Number(after)).toBeGreaterThan(Number(before));
+      expect(clockOf(after)).toBeGreaterThan(clockOf(before));
       // ...and its row takes the next clock value, so the owner's edit is now
       // the newest and rolls back cleanly.
       const rollbackRow = (await readRefinementEvents(childSessionDir)).find(
         (row) => row.data.rollbackOf === childEdit.id
       )!;
-      expect(rollbackRow.data.sourceTs).toBe(Number(after));
+      expect(rollbackRow.data.sourceTs).toBe(clockOf(after));
       expect(
         (
           await rollbackRefinement({

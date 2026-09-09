@@ -1512,11 +1512,18 @@ export class TurnRequestBuilder {
           ? []
           : [latestUserMessage.id, ...(latestUserMessage.metadata?.requestPreludeMessageIds ?? [])]
       );
+      // RLM keep-recent copies are the previous epoch's turns re-appended
+      // after the boundary (compactionHandler), not turns of this epoch: the
+      // harvest gate skips them too, and counting them would make another
+      // backend's first turn of the new epoch — racing the compacting
+      // backend's asynchronous policy carry — record an unknown-history
+      // deny for an all-writable epoch.
       return activeContextMessages.some(
         (message) =>
           message.role === "user" &&
           !currentBatch.has(message.id) &&
-          message.metadata?.muxMetadata?.type !== "compaction-request"
+          message.metadata?.muxMetadata?.type !== "compaction-request" &&
+          message.metadata?.rlmPreservedTailCopy !== true
       );
     })();
     // The compaction epoch this turn's policy accumulates over: the latest
