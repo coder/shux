@@ -1473,11 +1473,35 @@ export class MemoryService extends EventEmitter {
         );
         if (!sourceGone) continue;
         if (previous.created === true) {
-          const current =
-            (await store.assertContained(previous.target).then(
+          // Strict probe: a target that merely could not be stat'ed is not
+          // "changed" — dropping the entry on that basis would lose the
+          // provenance for good and leave the obsolete copy visible forever
+          // once the filesystem recovers. Keep the entry (and the pass
+          // incomplete) so the next access reconciles it.
+          let targetKind: MemoryEntryKind;
+          try {
+            targetKind = (await store.assertContained(previous.target).then(
               () => true,
               () => false
-            )) && (await store.kind(previous.target)) === "file"
+            ))
+              ? await store.kind(previous.target, { strict: true })
+              : null;
+          } catch (error) {
+            log.warn(
+              "[MemoryService] cannot inspect an adopted legacy note's copy; retrying later",
+              {
+                childId,
+                owner,
+                relPath,
+                target: previous.target,
+                error,
+              }
+            );
+            skipped++;
+            continue;
+          }
+          const current =
+            targetKind === "file"
               ? await this.readBoundedTextFile(store, previous.target, previous.target).catch(
                   () => null
                 )
@@ -1658,7 +1682,14 @@ export class MemoryService extends EventEmitter {
     }
     // Workspace-scope rows carry the owner store's clock so rows from every
     // tree member's journal order consistently (see workspaceMemoryRevision.ts).
+    // The mutation is already on disk, so a failed clock write cannot fail the
+    // command; the row is journaled as `orderUnknown` instead — the rollback
+    // engine then treats it as conflicting with every overlapping row rather
+    // than ordering it by its journal-local `ts`, which another journal's rows
+    // cannot be compared against (a child's later edit beneath a directory
+    // the owner renamed would otherwise read as older and be moved silently).
     const sourceTs = await this.advanceStoreRevision(store);
+    const orderUnknown = sourceTs === undefined && this.storeOwnerWorkspaceId(store) !== null;
     await appendRefinementEvent({
       sessionDir: path.join(this.config.sessionsDir, ctx.workspaceId),
       workspaceId: ctx.workspaceId,
@@ -1672,6 +1703,7 @@ export class MemoryService extends EventEmitter {
       },
       ...(postFiles !== undefined ? { postFiles } : {}),
       ...(sourceTs !== undefined ? { sourceTs } : {}),
+      ...(orderUnknown ? { orderUnknown: true } : {}),
     });
   }
 

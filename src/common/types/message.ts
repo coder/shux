@@ -1086,6 +1086,18 @@ export interface MuxMetadata {
   rlmPreservedTailCopy?: boolean;
 
   /**
+   * Compaction epoch (opening boundary's history sequence, -1 before any) the
+   * copied row was ORIGINALLY produced under — carried unchanged through
+   * repeated copies, so a copy of a copy still names the first epoch. The
+   * workspace-memory write policy of that epoch applies to the copy
+   * (TurnRequestBuilder → WorkspaceService.recordWorkspaceMemoryWritable):
+   * derived from history it would be wrong whenever the active-epoch read
+   * holds only the newest boundary. Absent on copies written before the
+   * field existed, whose source epochs never had a policy record either.
+   */
+  rlmPreservedTailSourcePolicyEpoch?: number;
+
+  /**
    * @file mention snapshot token(s) this message provides content for.
    * Marks send-time materialized snapshot rows (the only @mention expansion
    * path); requests are built purely from history, so these rows carry the

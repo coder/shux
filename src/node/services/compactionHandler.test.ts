@@ -1880,12 +1880,32 @@ describe("CompactionHandler", () => {
         expect(copy.metadata?.contextUsage).toBeUndefined();
         // Copies must never masquerade as boundaries.
         expect(copy.metadata?.compactionBoundary).toBeUndefined();
+        // The epoch the row was produced under (none before this boundary):
+        // its workspace-memory write policy governs the copy.
+        expect(copy.metadata?.rlmPreservedTailSourcePolicyEpoch).toBe(-1);
       }
       // Informational metadata survives.
       expect(epoch[2].metadata?.model).toBe("claude-x");
 
       const metadata = onCompactionComplete.mock.calls[0]?.[0];
       expect(metadata?.preservedTailMessageCount).toBe(2);
+
+      // A second tail compaction re-copies the copies: they keep their
+      // ORIGINAL epoch (-1) while the new epoch's own rows carry this
+      // boundary's epoch — the chain stays visible to the policy conjunction.
+      const boundarySequence = epoch[0].metadata?.historySequence;
+      if (typeof boundarySequence !== "number") throw new Error("boundary lacks a sequence");
+      await seedHistory(
+        createMuxMessage("u2", "user", "second question"),
+        createMuxMessage("a2", "assistant", "second answer"),
+        createStampedCompactionRequest("compact-req-2", boundarySequence + 1)
+      );
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary 2"))).toBe(true);
+      const secondEpoch = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!secondEpoch.success) throw new Error(secondEpoch.error);
+      expect(
+        secondEpoch.data.slice(1).map((copy) => copy.metadata?.rlmPreservedTailSourcePolicyEpoch)
+      ).toEqual([-1, -1, boundarySequence, boundarySequence]);
     });
 
     it("rewrites MCP snapshot invoking IDs to the copy IDs of LATER tail rows", async () => {

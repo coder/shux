@@ -4273,7 +4273,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   async recordWorkspaceMemoryWritable(
     workspaceId: string,
     writable: boolean,
-    options: { epochHasPriorTurns: boolean; policyEpoch: number; carriedPolicyEpoch?: number }
+    options: { epochHasPriorTurns: boolean; policyEpoch: number; carriedPolicyEpochs?: number[] }
   ): Promise<boolean> {
     // The accumulator (config bit and deny marker alike) is bound to the
     // compaction epoch it accumulates over — the opening boundary's history
@@ -4283,12 +4283,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // compacting backend's durable reset landed (the reset is awaited only by
     // that backend's own session) and carry it, via its mirror, through an
     // otherwise all-writable epoch.
-    const { policyEpoch, carriedPolicyEpoch } = options;
+    const { policyEpoch } = options;
+    const carriedPolicyEpochs = options.carriedPolicyEpochs ?? [];
     assert(Number.isInteger(policyEpoch), "policyEpoch must be an integer");
     assert(
-      carriedPolicyEpoch === undefined ||
-        (Number.isInteger(carriedPolicyEpoch) && carriedPolicyEpoch < policyEpoch),
-      "carriedPolicyEpoch must be an earlier epoch"
+      carriedPolicyEpochs.every((epoch) => Number.isInteger(epoch) && epoch < policyEpoch),
+      "carriedPolicyEpochs must be earlier epochs"
     );
     const session =
       this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId);
@@ -4380,19 +4380,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // A fourth input: the session-dir deny marker, the durable fallback taken
     // when config.json could not record a deny (denyDurableFallback above).
     const denyMarker = await readWorkspaceMemoryDenyMarker(sessionDir, policyEpoch);
-    // Preserved-tail epoch: the previous epoch's accumulator is part of this
-    // one (its rows were copied in). The compacting session's carry moves the
-    // record/marker from the carried key to this one asynchronously; reading
-    // BOTH keys (record inside the transaction below, marker here) makes the
-    // conjunction independent of that carry's timing — a deny is visible
-    // under one key or the other at every instant, never under neither.
-    const carriedDenyMarker =
-      carriedPolicyEpoch !== undefined &&
-      (await readWorkspaceMemoryDenyMarker(sessionDir, carriedPolicyEpoch));
-    const carriedFor = (entry: WorkspaceConfigEntry): boolean | undefined =>
-      carriedPolicyEpoch === undefined
-        ? undefined
-        : workspaceMemoryWritableForEpoch(entry, carriedPolicyEpoch);
+    // Preserved-tail epoch: the accumulators of the epochs its tail copies
+    // were produced under are part of this one. The compacting session's
+    // carry moves a record/marker from the carried key to this one
+    // asynchronously; reading EVERY key (records inside the transaction
+    // below, markers here) makes the conjunction independent of that carry's
+    // timing — a deny is visible under one key or another at every instant,
+    // never under none.
+    let carriedDenyMarker = false;
+    for (const epoch of carriedPolicyEpochs) {
+      if (await readWorkspaceMemoryDenyMarker(sessionDir, epoch)) carriedDenyMarker = true;
+    }
+    // undefined: no carried epoch recorded anything; false: some carried deny.
+    const carriedFor = (entry: WorkspaceConfigEntry): boolean | undefined => {
+      let carried: boolean | undefined;
+      for (const epoch of carriedPolicyEpochs) {
+        const value = workspaceMemoryWritableForEpoch(entry, epoch);
+        if (value === undefined) continue;
+        carried = (carried ?? true) && value;
+      }
+      return carried;
+    };
     // Unknown history fails closed, like the harvest's own unknown → closed
     // rule: with no durable accumulator, no marker and no mirror, an epoch
     // that already holds turns has a policy nobody recorded — the record was

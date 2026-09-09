@@ -101,6 +101,14 @@ export const RefinementDataSchema = z.object({
    * comparable — still order totally; migrated rows keep their source value.
    */
   sourceTs: z.number().optional(),
+  /**
+   * The mutation landed but the shared store's clock write failed, so this
+   * row has NO defensible position relative to other rows (its `ts`/`seq`
+   * are journal-local). Rollback conflict detection treats such a row as
+   * conflicting with every overlapping row in either direction (force
+   * overrides), instead of ordering it by an incomparable timestamp.
+   */
+  orderUnknown: z.literal(true).optional(),
   /** Expected post-action file hashes (RefinementPostStateSchema in refinement.ts). */
   postState: JsonValueSchema.optional(),
   /**

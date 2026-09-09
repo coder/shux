@@ -1267,8 +1267,10 @@ export class CompactionHandler {
       }
     );
     const idMap = new Map(params.tail.map((row) => [row.id, createPreservedTailCopyMessageId()]));
+    // Same closing epoch the completion metadata reports below.
+    const closingPolicyEpoch = latestContextBoundaryHistorySequence(params.messages) ?? -1;
     const copies = params.tail.map((row) => {
-      const copy = this.buildPreservedTailCopy(row, idMap);
+      const copy = this.buildPreservedTailCopy(row, idMap, closingPolicyEpoch);
       // Continuous compaction prunes the just-finished answer too. Keep recent pages
       // visible below the boundary while retaining RLM's usage/snapshot sanitizer.
       copy.metadata = { ...copy.metadata, uiVisible: true };
@@ -1503,7 +1505,8 @@ export class CompactionHandler {
     const preservedTailCopies = this.buildPreservedTailCopies(
       messages,
       compactionRequestMessageId,
-      summaryMessage.id
+      summaryMessage.id,
+      previousBoundaryHistorySequence ?? -1
     );
 
     const persistenceResult =
@@ -1589,7 +1592,8 @@ export class CompactionHandler {
   private buildPreservedTailCopies(
     messages: MuxMessage[],
     compactionRequestMessageId: string,
-    summaryMessageId: string
+    summaryMessageId: string,
+    closingPolicyEpoch: number
   ): MuxMessage[] {
     const requestIndex = messages.findIndex((message) => message.id === compactionRequestMessageId);
     if (requestIndex === -1) {
@@ -1629,7 +1633,7 @@ export class CompactionHandler {
     for (const row of tailRows) {
       idMap.set(row.id, createPreservedTailCopyMessageId());
     }
-    return tailRows.map((row) => this.buildPreservedTailCopy(row, idMap));
+    return tailRows.map((row) => this.buildPreservedTailCopy(row, idMap, closingPolicyEpoch));
   }
 
   /**
@@ -1642,7 +1646,11 @@ export class CompactionHandler {
    * original rows remain visible above the boundary; fresh IDs keep UI
    * aggregation from collapsing a hidden copy over its visible original.
    */
-  private buildPreservedTailCopy(row: MuxMessage, idMap: Map<string, string>): MuxMessage {
+  private buildPreservedTailCopy(
+    row: MuxMessage,
+    idMap: Map<string, string>,
+    closingPolicyEpoch: number
+  ): MuxMessage {
     // IDs are preassigned for the whole tail (see caller) so forward-pointing
     // references (snapshot row → later invoking user row) rewrite correctly.
     const copyId = idMap.get(row.id);
@@ -1661,12 +1669,24 @@ export class CompactionHandler {
           }
         : source?.mcpPromptSnapshot;
 
+    // The epoch whose workspace-memory write policy governs this row: a copy
+    // of a copy keeps its ORIGINAL epoch (the chain must stay visible to the
+    // policy conjunction); a first-time copy was produced under the epoch
+    // this compaction closes. Copies from before the field existed carry
+    // nothing forward — no policy record ever existed for their epochs.
+    const sourcePolicyEpoch =
+      source?.rlmPreservedTailCopy === true
+        ? source.rlmPreservedTailSourcePolicyEpoch
+        : closingPolicyEpoch;
     return {
       ...row,
       id: copyId,
       metadata: {
         synthetic: true,
         rlmPreservedTailCopy: true,
+        ...(sourcePolicyEpoch !== undefined
+          ? { rlmPreservedTailSourcePolicyEpoch: sourcePolicyEpoch }
+          : {}),
         ...(source?.timestamp !== undefined ? { timestamp: source.timestamp } : {}),
         ...(source?.model !== undefined ? { model: source.model } : {}),
         ...(source?.thinkingLevel !== undefined ? { thinkingLevel: source.thinkingLevel } : {}),

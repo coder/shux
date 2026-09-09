@@ -227,6 +227,7 @@ export async function migrateSharedMemoryRefinementRows(args: {
         migratedFrom,
         ...(rollbackOf !== undefined ? { rollbackOf } : {}),
         sourceTs: row.data.sourceTs ?? row.ts,
+        ...(row.data.orderUnknown === true ? { orderUnknown: true as const } : {}),
         ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),
       });
       publishedBlobs.push(...appended.publishedBlobs);

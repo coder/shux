@@ -1,11 +1,16 @@
+import * as path from "node:path";
 import { tool, type Tool } from "ai";
 
 import type { RefinementRollbackToolResult } from "@/common/types/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { listRefinements, rollbackRefinement } from "@/node/services/refinement/refinementRollback";
-import { RefinementInverseSchema } from "@/common/types/refinement";
+import { RefinementInverseSchema, type RefinementInverse } from "@/common/types/refinement";
 import type { MemoryScopeAccess } from "@/common/constants/memory";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
+import {
+  createLegacyPathRemapper,
+  LegacyPathNotAdoptedError,
+} from "@/node/services/memoryLegacyAdoption";
 
 interface RefinementRollbackToolArgs {
   id: string;
@@ -27,19 +32,41 @@ interface RefinementRollbackToolArgs {
  */
 async function refuseReadOnlyMemoryRollback(
   sessionDir: string,
+  sharedWorkspaceMemorySessionDir: string | undefined,
   id: string,
   memory: { service: MemoryService; ctx: MemoryScopeContext; access: MemoryScopeAccess }
 ): Promise<string | null> {
   const row = (await listRefinements(sessionDir)).find((candidate) => candidate.id === id);
   if (row?.data.kind !== "memory") return null;
-  const inverse = RefinementInverseSchema.safeParse(row.data.inverse);
-  if (!inverse.success) return null;
+  const parsed = RefinementInverseSchema.safeParse(row.data.inverse);
+  if (!parsed.success) return null;
+  // The paths the engine will actually touch: a sub-agent's pre-sharing rows
+  // address its legacy private notebook, which the engine retargets to the
+  // adopted owner copy (refinementRollback.ts) — classify THOSE paths, or the
+  // legacy ones would read as unclassifiable and refuse every such row here.
+  // A legacy path the engine cannot map falls through to its refusal.
+  let inverse: RefinementInverse = parsed.data;
+  if (
+    sharedWorkspaceMemorySessionDir !== undefined &&
+    path.resolve(sharedWorkspaceMemorySessionDir) !== path.resolve(sessionDir)
+  ) {
+    const remap = await createLegacyPathRemapper({
+      childSessionDir: sessionDir,
+      ownerSessionDir: sharedWorkspaceMemorySessionDir,
+    });
+    try {
+      inverse = remap.inverse(parsed.data);
+    } catch (error) {
+      if (error instanceof LegacyPathNotAdoptedError) return null;
+      throw error;
+    }
+  }
   const paths =
-    inverse.data.op === "delete-files"
-      ? inverse.data.paths
-      : inverse.data.op === "rename"
-        ? [inverse.data.from, inverse.data.to]
-        : [...inverse.data.files.map((file) => file.path), ...(inverse.data.deletePaths ?? [])];
+    inverse.op === "delete-files"
+      ? inverse.paths
+      : inverse.op === "rename"
+        ? [inverse.from, inverse.to]
+        : [...inverse.files.map((file) => file.path), ...(inverse.deletePaths ?? [])];
   for (const physicalPath of paths) {
     const scope = memory.service.scopeOfPhysicalPath(memory.ctx, physicalPath);
     // Fail closed: a memory row's paths always lie in some scope root, so
@@ -81,7 +108,12 @@ export function createRefinementRollbackTool(ctx: {
       { toolCallId }
     ): Promise<RefinementRollbackToolResult> => {
       if (ctx.memory !== undefined) {
-        const refusal = await refuseReadOnlyMemoryRollback(ctx.sessionDir, id, ctx.memory);
+        const refusal = await refuseReadOnlyMemoryRollback(
+          ctx.sessionDir,
+          ctx.sharedWorkspaceMemorySessionDir,
+          id,
+          ctx.memory
+        );
         if (refusal !== null) return { success: false, error: refusal };
       }
       const result = await rollbackRefinement({

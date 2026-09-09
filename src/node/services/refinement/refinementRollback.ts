@@ -541,6 +541,16 @@ function isAfter(row: RefinementEvent, other: RefinementEvent): boolean {
 }
 
 /**
+ * Whether the order of two rows cannot be established: a row journaled while
+ * the shared store's clock write failed (`orderUnknown`) has only
+ * journal-local `ts`/`seq`, incomparable with other journals' rows. Callers
+ * fail closed — such a pair conflicts in either direction (force overrides).
+ */
+function orderUnknown(row: RefinementEvent, other: RefinementEvent): boolean {
+  return row.data.orderUnknown === true || other.data.orderUnknown === true;
+}
+
+/**
  * Memory rows from the other task-tree members' journals that touched the
  * shared workspace store (owner's <sessionDir>/memory). Read without their
  * session locks: journals are append-only and self-healing on read, and a
@@ -567,17 +577,32 @@ async function readSharedMemoryPeerRows(
     path.resolve(opts.sharedWorkspaceMemorySessionDir ?? opts.sessionDir),
     "memory"
   );
+  const ownerSessionDir = path.dirname(sharedRoot);
   const peerRows: RefinementEvent[] = [];
   for (const peerDir of peerDirs) {
     assert(
       path.resolve(peerDir) !== path.resolve(opts.sessionDir),
       "peer session dirs exclude the acting session"
     );
+    // A peer sub-agent's pre-sharing rows address ITS legacy private
+    // notebook; the notes live in the shared store now (adoption manifest
+    // beside the legacy files). Retarget them through that peer's manifest
+    // before the overlap test — the peer's later edit of an adopted note must
+    // surface against the owner's rollback like any shared-store row. The
+    // remapped inverse replaces the recorded one on the returned row, so the
+    // acting session's later checks (its own remapper is a no-op for owner
+    // paths) compare the paths the note actually lives at. Legacy paths the
+    // shared store never took address invisible files and are dropped.
+    const remap =
+      path.resolve(peerDir) === path.resolve(ownerSessionDir)
+        ? identityRemapper
+        : await createLegacyPathRemapper({ childSessionDir: peerDir, ownerSessionDir });
     for (const row of await listRefinements(peerDir)) {
       if (row.data.kind !== "memory") continue;
-      const parsed = RefinementInverseSchema.safeParse(row.data.inverse);
-      if (!parsed.success) continue;
-      if (inversePaths(parsed.data).some((p) => pathsOverlap(p, sharedRoot))) peerRows.push(row);
+      const parsed = parseRemappedInverse(row, remap);
+      if (parsed === null) continue;
+      if (!inversePaths(parsed).some((p) => pathsOverlap(p, sharedRoot))) continue;
+      peerRows.push({ ...row, data: { ...row.data, inverse: parsed } });
     }
   }
   return peerRows;
@@ -632,14 +657,19 @@ async function collectDivergence(
     rows.map((row) => row.data.rollbackOf).filter((id): id is string => id !== undefined)
   );
   for (const row of rows) {
-    if (!isAfter(row, target)) continue;
+    if (row.id === target.id) continue;
+    if (!isAfter(row, target) && !orderUnknown(row, target)) continue;
     if (rolledBackIds.has(row.id)) continue; // Effect undone by a later rollback row.
     if (!liveRowConflictsWithTarget(rows, row, target)) continue;
     const parsed = parseRemappedInverse(row, remap);
     if (parsed === null) continue;
     const overlap = inversePaths(parsed).some((p) => targetPaths.some((t) => pathsOverlap(p, t)));
     if (overlap) {
-      complaints.push(`later refinement row ${row.id} (seq ${row.seq}) touched the same paths`);
+      complaints.push(
+        orderUnknown(row, target)
+          ? `refinement row ${row.id} (seq ${row.seq}) touched the same paths and its order relative to this row is unknown (its store clock write failed)`
+          : `later refinement row ${row.id} (seq ${row.seq}) touched the same paths`
+      );
     }
   }
 
@@ -771,7 +801,9 @@ function liveRowConflictsWithTarget(
   if (rollbackCount % 2 === 0) {
     return true; // Even chain: the root row's edit was re-applied.
   }
-  return !isAfter(current, target); // Odd chain: rewound to just before root.
+  // Odd chain: rewound to just before root — a conflict unless the root is
+  // provably after the target.
+  return !isAfter(current, target) || orderUnknown(current, target);
 }
 
 async function dirExists(target: string): Promise<boolean> {

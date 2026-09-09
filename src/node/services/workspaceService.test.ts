@@ -9503,7 +9503,7 @@ describe("WorkspaceService initialize", () => {
         await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
           epochHasPriorTurns: false,
           policyEpoch: 14,
-          carriedPolicyEpoch: -1,
+          carriedPolicyEpochs: [-1],
         })
       ).toBe(true);
       expect(persistedFor(14)).toBe(false);
@@ -9518,7 +9518,7 @@ describe("WorkspaceService initialize", () => {
         await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
           epochHasPriorTurns: false,
           policyEpoch: 16,
-          carriedPolicyEpoch: 12,
+          carriedPolicyEpochs: [-1, 12],
         })
       ).toBe(true);
       expect(persistedFor(16)).toBe(false);
@@ -9533,7 +9533,7 @@ describe("WorkspaceService initialize", () => {
         await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
           epochHasPriorTurns: false,
           policyEpoch: 18,
-          carriedPolicyEpoch: -1,
+          carriedPolicyEpochs: [-1],
         })
       ).toBe(true);
       expect(persistedFor(18)).toBe(true);

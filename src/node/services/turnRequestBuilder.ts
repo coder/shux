@@ -567,7 +567,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
     recordWorkspaceMemoryWritable(
       workspaceId: string,
       writable: boolean,
-      options: { epochHasPriorTurns: boolean; policyEpoch: number; carriedPolicyEpoch?: number }
+      options: { epochHasPriorTurns: boolean; policyEpoch: number; carriedPolicyEpochs?: number[] }
     ): Promise<boolean>;
   };
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
@@ -1533,18 +1533,30 @@ export class TurnRequestBuilder {
     // and every backend's turn records agree on which epoch a value belongs to.
     const policyEpoch = latestContextBoundaryHistorySequence(messages) ?? -1;
     // A preserved-tail boundary (RLM keep-recent copies follow it) re-appends
-    // rows produced under the PREVIOUS epoch's policy: that epoch's
-    // accumulator is part of this one. The compacting session re-binds it to
+    // rows produced under EARLIER epochs' policies: those accumulators are
+    // part of this epoch. The compacting session re-binds the closing one to
     // this epoch durably (AgentSession.carryWorkspaceMemoryWritable), but
     // asynchronously — another backend's first turn here can precede that
-    // carry. Naming the carried epoch lets the sink AND its value directly
-    // (under whichever key it currently sits), so no window exists in which
-    // a read-only tail reads as writable.
-    const carriedPolicyEpoch = activeContextMessages.some(
-      (message) => message.metadata?.rlmPreservedTailCopy === true
-    )
-      ? (latestContextBoundaryHistorySequence(messages, { before: policyEpoch }) ?? -1)
-      : undefined;
+    // carry. Naming the carried epochs lets the sink AND their values
+    // directly (under whichever key each currently sits), so no window exists
+    // in which a read-only tail reads as writable. Each copy records the
+    // epoch it was originally produced under (compactionHandler stamps it; a
+    // copy of a copy keeps the first), so a chain of tail compactions names
+    // every epoch involved — `messages` here holds only the active epoch, so
+    // nothing about earlier boundaries can be derived from it.
+    const carriedPolicyEpochs = [
+      ...new Set(
+        activeContextMessages.flatMap((message) => {
+          const epoch = message.metadata?.rlmPreservedTailSourcePolicyEpoch;
+          return message.metadata?.rlmPreservedTailCopy === true &&
+            typeof epoch === "number" &&
+            Number.isInteger(epoch) &&
+            epoch < policyEpoch
+            ? [epoch]
+            : [];
+        })
+      ),
+    ].sort((a, b) => a - b);
     const persistWorkspaceMemoryWritable = async (writable: boolean): Promise<boolean> => {
       const sink = this.dependencies.bindings.workspaceMemoryPolicySink;
       if (isCompactionRequest || !sink) return true;
@@ -1552,7 +1564,7 @@ export class TurnRequestBuilder {
         await sink.recordWorkspaceMemoryWritable(workspaceId, writable, {
           epochHasPriorTurns,
           policyEpoch,
-          ...(carriedPolicyEpoch === undefined ? {} : { carriedPolicyEpoch }),
+          ...(carriedPolicyEpochs.length === 0 ? {} : { carriedPolicyEpochs }),
         })
       ) {
         return true;

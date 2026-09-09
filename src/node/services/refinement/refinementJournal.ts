@@ -108,6 +108,8 @@ export interface RefinementEmitArgs {
    * source row's value/`ts` for a migrated row.
    */
   sourceTs?: number;
+  /** See the durable event schema: the store clock write failed for this row. */
+  orderUnknown?: true;
   /**
    * "remote" when the mutation ran through a non-local runtime (SSH/Docker).
    * Such rows carry runtime-namespace paths and are refused by rollback,
@@ -369,6 +371,7 @@ export async function appendRefinementEventUnderBlobLock(
       ...(args.migratedFrom !== undefined ? { migratedFrom: args.migratedFrom } : {}),
       ...(args.rollbackOf !== undefined ? { rollbackOf: args.rollbackOf } : {}),
       ...(args.sourceTs !== undefined ? { sourceTs: args.sourceTs } : {}),
+      ...(args.orderUnknown === true ? { orderUnknown: true } : {}),
       ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
     },
   });
