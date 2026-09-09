@@ -103,7 +103,7 @@ import {
   getPinnedTodoExpandedKey,
 } from "@/common/constants/storage";
 import { DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT } from "@/common/constants/ui";
-import { APPROX_CHARS_PER_TOKEN, PENDING_SEND_ECHO_CLOCK_SKEW_MS } from "@/constants/streaming";
+import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
 import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
@@ -368,7 +368,7 @@ interface PendingSendState {
   message: PendingSendMessage;
   /** User echoes already in the transcript when the send began; null when begun before catch-up. */
   knownUserEchoIds: Set<string> | null;
-  /** Wall clock at begin; with no baseline, only rows persisted after it can be the echo. */
+  /** Wall clock at begin; with no baseline, only rows persisted at or after it can be the echo. */
   beganAtMs: number;
   /** The send request succeeded, so any later replay is guaranteed to contain its echo. */
   accepted: boolean;
@@ -4132,7 +4132,8 @@ export class WorkspaceStore {
   /**
    * Record that the backend accepted the send, so the next replay is known to contain its echo.
    * A direct send's echo always precedes the response, so an echo displayed by now retires the
-   * row; a row still standing belongs to a queued send whose queue update is in flight.
+   * row; a row still standing belongs to a queued send whose queue update is in flight. Without a
+   * baseline the echo cannot be told apart by id, so a caught-up transcript is trusted instead.
    */
   markPendingSendAccepted(workspaceId: string, id: string): void {
     const transient = this.chatTransientState.get(workspaceId);
@@ -4143,7 +4144,10 @@ export class WorkspaceStore {
     }
 
     pending.accepted = true;
-    if (transient.caughtUp && this.hasUnseenUserEcho(aggregator, pending)) {
+    if (
+      transient.caughtUp &&
+      (pending.knownUserEchoIds === null || this.hasUnseenUserEcho(aggregator, pending))
+    ) {
       transient.pendingSend = null;
       this.states.bump(workspaceId);
     }
@@ -4165,13 +4169,12 @@ export class WorkspaceStore {
     pending: PendingSendState
   ): boolean {
     const known = pending.knownUserEchoIds;
-    const earliestEchoMs = pending.beganAtMs - PENDING_SEND_ECHO_CLOCK_SKEW_MS;
     return aggregator
       .getAllMessages()
       .some(
         (message) =>
           isUserEcho(message) &&
-          (known ? !known.has(message.id) : (message.metadata?.timestamp ?? 0) >= earliestEchoMs)
+          (known ? !known.has(message.id) : (message.metadata?.timestamp ?? 0) >= pending.beganAtMs)
       );
   }
 

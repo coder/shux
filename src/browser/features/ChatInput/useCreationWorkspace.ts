@@ -703,23 +703,19 @@ export function useCreationWorkspace({
             : null;
 
         // Runtime startup can take minutes; keep the initial message visible in the new
-        // transcript until the backend echoes it. Files awaiting staging show as display-only
-        // parts until the staged notice replaces them below.
+        // transcript until the backend echoes it. Files awaiting staging show as inert chips
+        // until the staged notice replaces them below.
         pendingSendId = `pending-send-${Date.now()}`;
         const pendingDisplayText = overrideRawCommand ?? messageText;
         if (initialSlashCommand == null) {
-          const displayFileParts: FilePart[] = [
-            ...(fileParts ?? []),
-            ...pendingFilesToStage.map((file) => ({
-              mediaType: file.mediaType,
-              url: `data:${file.mediaType};base64,${file.dataBase64}`,
-              filename: file.filename,
-            })),
-          ];
           workspaceStore.beginPendingSend(metadata.id, {
             id: pendingSendId,
             content: pendingDisplayText,
-            fileParts: displayFileParts.length > 0 ? displayFileParts : undefined,
+            fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
+            stagingFilenames:
+              pendingFilesToStage.length > 0
+                ? pendingFilesToStage.map((file) => file.filename)
+                : undefined,
           });
         }
 

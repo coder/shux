@@ -5217,6 +5217,28 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
     });
 
+    it("retires an accepted row begun before catch-up once the transcript is caught up", async () => {
+      const workspaceId = "pending-send-hydration-accepted";
+      const replay = gate();
+      mockChatStreamFor(workspaceId, async function* (signal) {
+        await replay.opened;
+        yield createUserMessageEvent("user-old", "long ago", 1, Date.now() - 3_600_000);
+        yield { type: "caught-up", replay: "full" };
+        await waitForAbortSignal(signal);
+      });
+      createAndAddWorkspace(store, workspaceId);
+      store.beginPendingSend(workspaceId, pendingSend);
+
+      replay.release();
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+
+      store.markPendingSendAccepted(workspaceId, pendingSend.id);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
+    });
+
     it("retires a row begun before catch-up when the replay holds its fresh echo", async () => {
       const workspaceId = "pending-send-hydration-fresh-echo";
       const replay = gate();

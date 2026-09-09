@@ -6,12 +6,6 @@
 export const WORKSPACE_STREAMING_STATUS_TRANSITION_MS = 150;
 
 /**
- * A user row persisted at least this long before a send began cannot be that send's echo.
- * Absorbs client/server clock skew when a send begins before the transcript has caught up.
- */
-export const PENDING_SEND_ECHO_CLOCK_SKEW_MS = 30_000;
-
-/**
  * Average character-per-token estimate used to convert tokens-per-second (from
  * the streaming TPS calculator) into characters-per-second (consumed by the
  * smoothing engine to target the model's actual emission rate). 4 is the
