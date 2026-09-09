@@ -2637,6 +2637,37 @@ describe("ProviderModelFactory Coder", () => {
     }
   );
 
+  it("does not serialize a retained OpenAI tier under a Coder-only enforced policy", async () => {
+    await withTempPolicyProviderFactory(
+      { policy_format_version: "0.1", provider_access: [{ id: "coder" }] },
+      async (config, factory, _policyService, oauth) => {
+        saveCoderConfig(config);
+        const store = new ProvidersConfigStore(config.rootDir);
+        store.saveProvidersConfig({
+          ...store.loadProvidersConfig(),
+          openai: { serviceTier: "priority" },
+        });
+        oauth.coderOauthService = stubCoderOauthService();
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          for (const options of [undefined, { openai: { serviceTier: "priority" as const } }]) {
+            const created = await factory.createModel("coder:openai/gpt-6-astra", options);
+            if (!created.success) throw new Error(created.error.type);
+            const before = calls.length;
+            await generateText({ model: created.data, prompt: "hello", maxRetries: 0 }).catch(
+              () => undefined
+            );
+            expect(calls.length).toBe(before + 1);
+            expect(parseSentBody(calls[before])).not.toHaveProperty("service_tier");
+          }
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      }
+    );
+  });
+
   it("does not pin OpenAI tiers on OAuth or non-OpenAI Coder upstreams", async () => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, { additionalProviders: [{ name: "openai", type: "anthropic" }] });

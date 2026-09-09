@@ -17,7 +17,7 @@ export default { ...appMeta, title: "App/Gateway Fast Mode" };
 const workspaceId = "ws-gateway-fast-mode";
 const phoneViewport = { name: "Phone", styles: { width: "390px", height: "844px" } };
 
-function setupGatewayFastMode() {
+function setupGatewayFastMode(hideSharedPreference = false) {
   collapseLeftSidebar();
   updatePersistedState(getModelKey(workspaceId), "coder:openai/gpt-6-astra");
   updatePersistedState(getThinkingLevelKey(workspaceId), "high");
@@ -30,6 +30,10 @@ function setupGatewayFastMode() {
       models: ["openai/gpt-6-astra"],
     },
   };
+  // An allowed but unconfigured provider still exposes preferences; policy denial omits it.
+  if (!hideSharedPreference) {
+    providersConfig.openai = { apiKeySet: false, isEnabled: true, isConfigured: false };
+  }
   const client = setupSimpleChatStory({
     workspaceId,
     messages: [],
@@ -40,6 +44,7 @@ function setupGatewayFastMode() {
   // Keep reads stateful so refreshing configuration cannot silently undo the toggle.
   client.providers.getConfig = () => Promise.resolve(providersConfig);
   client.providers.setProviderConfig = ({ provider, keyPath, value }) => {
+    assert(!hideSharedPreference, "Policy-hidden OpenAI preferences must not be written");
     assert(provider === "openai", "Coder Fast must write the upstream OpenAI preference");
     const [key] = keyPath;
     assert(
@@ -164,4 +169,42 @@ export const Phone: AppStory = {
     pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
   },
   play: async (context) => Desktop.play!(context),
+};
+
+export const PolicyHiddenPreference: AppStory = {
+  ...Phone,
+  render: () => <AppWithMocks setup={() => setupGatewayFastMode(true)} />,
+  play: async ({ canvasElement }) => {
+    const root = document.getElementById("storybook-root") ?? canvasElement;
+    const canvas = within(root);
+    await waitForChatInputAutofocusDone(root);
+    blurActiveElement();
+
+    // Denying the shared OpenAI preference must not disable the permitted Coder model.
+    const model = canvas.getByRole("combobox");
+    await expect(model).toBeEnabled();
+    await userEvent.click(model);
+    await userEvent.click(canvas.getByRole("option", { name: /Astra/i, selected: true }));
+    await expect(model).toHaveAttribute("aria-expanded", "false");
+    await expect(model).toHaveTextContent(/Astra/i);
+
+    const trigger = canvas.getByRole("button", { name: /Thinking:/ });
+    await userEvent.click(trigger);
+    await expect(canvas.getByRole("option", { name: "High" })).toHaveAttribute(
+      "aria-selected",
+      "true"
+    );
+    await expect(trigger).toHaveAccessibleName("Thinking: high");
+    await expect(canvas.queryByRole("button", { name: /Fast mode/ })).not.toBeInTheDocument();
+    await expect(within(trigger).queryByLabelText("Fast mode enabled")).not.toBeInTheDocument();
+
+    const frame = canvas.getByTestId("gateway-fast-phone").getBoundingClientRect();
+    const menu = root.querySelector<HTMLElement>('[data-component="ThinkingSelectorMenu"]');
+    assert(menu, "Thinking controls must remain available under Coder-only policy");
+    await expect(frame.width).toBe(390);
+    await expect(menu.scrollWidth).toBeLessThanOrEqual(menu.clientWidth);
+    await expect(menu.getBoundingClientRect().left).toBeGreaterThanOrEqual(frame.left);
+    await expect(menu.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
+    blurActiveElement();
+  },
 };
