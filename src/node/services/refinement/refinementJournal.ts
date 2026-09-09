@@ -49,12 +49,28 @@ export interface RefinementFileCapture {
   content: string;
 }
 
+/**
+ * A payload reference carried over as-is instead of content: shared-memory row
+ * migration uses it for a row whose inverse blob was already reclaimed in the
+ * source journal. The copied row keeps its paths and order for conflict
+ * detection (an audit record), and the rollback engine refuses it exactly as
+ * it refuses any evicted payload — the ref resolves to nothing.
+ */
+export interface RefinementFileReference {
+  path: string;
+  blobRef: string;
+}
+
 /** Inverse draft with captured contents inline; blob offload happens at append. */
 export type RefinementInverseDraft =
   | { op: "delete-files"; paths: string[] }
   // deletePaths (r67): mixed force-apply pre-state — restore `files` AND
   // delete the paths the forced rollback created (see RefinementInverseSchema).
-  | { op: "restore-files"; files: RefinementFileCapture[]; deletePaths?: string[] }
+  | {
+      op: "restore-files";
+      files: Array<RefinementFileCapture | RefinementFileReference>;
+      deletePaths?: string[];
+    }
   | { op: "rename"; from: string; to: string };
 
 export interface RefinementEmitArgs {
@@ -137,6 +153,9 @@ export async function resolveRefinementInverse(
   const publishedBlobs: BlobQuotaEntry[] = [];
   const files = await Promise.all(
     draft.files.map(async (file) => {
+      // A bare reference (payload already gone at the source) is neither
+      // stored nor quota-charged: there is nothing to retain or reclaim.
+      if (!("content" in file)) return { path: file.path, blobRef: file.blobRef };
       const { ref, size } = await blobs.put(file.content);
       publishedBlobs.push({ ref, size: inverseQuotaCharge(size) });
       return { path: file.path, blobRef: ref };

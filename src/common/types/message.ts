@@ -952,6 +952,14 @@ export interface ContextBudgetRejectedMessage {
 export interface MuxMetadata {
   /** Highest persisted history sequence included in the provider request that produced this assistant. */
   requestHistorySequence?: number;
+  /**
+   * The turn that produced this assistant row recorded its workspace-memory
+   * write policy before the row was appended (TurnRequestBuilder start()).
+   * Builds that do not maintain that policy (older ones, after a downgrade)
+   * leave it unset, so the post-compaction harvest cannot take their turns'
+   * user rows as accounted for (memoryConsolidationService.ts).
+   */
+  workspaceMemoryPolicyRecorded?: true;
   historySequence?: number; // Assigned by backend for global message ordering (required when writing to history)
   /** Provider step boundaries in parts, persisted so continuous compaction can keep complete steps. */
   stepStartPartIndices?: number[];

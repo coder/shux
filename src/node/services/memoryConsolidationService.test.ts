@@ -336,6 +336,7 @@ async function seedCompactionEpoch(
     workspaceId,
     createMuxMessage("reply-1", "assistant", "Noted.", {
       requestHistorySequence: prompt.metadata?.historySequence,
+      workspaceMemoryPolicyRecorded: true,
     })
   );
   await fixture.historyService.appendToHistory(
@@ -1221,6 +1222,7 @@ describe("MemoryConsolidationService", () => {
       "ws-dream",
       createMuxMessage("reply-1", "assistant", "Noted.", {
         requestHistorySequence: prompt.metadata?.historySequence,
+        workspaceMemoryPolicyRecorded: true,
       })
     );
     await fixture.historyService.appendToHistory(
@@ -1274,6 +1276,47 @@ describe("MemoryConsolidationService", () => {
       "ws-dream",
       createMuxMessage("reply-1", "assistant", "Noted.", {
         requestHistorySequence: foreign.metadata?.historySequence,
+        workspaceMemoryPolicyRecorded: true,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("compact-request", "user", "Please compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+    });
+    await fixture.historyService.appendToHistory("ws-dream", summary);
+    const result = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    expect(result.success).toBe(true);
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.error).toContain("never recorded");
+  });
+
+  it("takes no coverage from assistant rows of a build that did not record the policy", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    // A downgraded build ran a (read-only) turn mid-epoch: its assistant row
+    // carries the request snapshot bound but no policy record, and it left
+    // the durable accumulator's stale grant untouched. The compaction then
+    // completes with that grant.
+    const prompt = createMuxMessage("pref-1", "user", "Read-only turn on the old build.");
+    await fixture.historyService.appendToHistory("ws-dream", prompt);
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("reply-1", "assistant", "Noted.", {
+        requestHistorySequence: prompt.metadata?.historySequence,
       })
     );
     await fixture.historyService.appendToHistory(
@@ -1339,6 +1382,7 @@ describe("MemoryConsolidationService", () => {
         "ws-dream",
         createMuxMessage(`${ids.summary}-reply`, "assistant", "Noted.", {
           requestHistorySequence: prompt.metadata?.historySequence,
+          workspaceMemoryPolicyRecorded: true,
         })
       );
       await fixture.historyService.appendToHistory(

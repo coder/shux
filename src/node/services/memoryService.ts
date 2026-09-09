@@ -721,7 +721,24 @@ export class MemoryService extends EventEmitter {
     }
     const cached = this.workspaceMemoryOwnerById.get(workspaceId);
     if (cached !== undefined) return cached;
-    const owner = resolveWorkspaceMemoryOwnerId(this.config.loadConfigOrDefault(), workspaceId);
+    // Only a successful load is memoized. A config.json that stats fine but
+    // cannot be read or parsed right now (EACCES interval, half-written by a
+    // non-atomic writer) yields the fresh-install default — the self
+    // fallback — and the stamp will not move when readability returns, so a
+    // memo taken now would pin the child to its private notebook until an
+    // unrelated config rewrite. The fallback is still returned (callers
+    // degrade to the private store), just re-resolved on the next call.
+    let cfg: ReturnType<Config["loadConfigOrDefault"]>;
+    try {
+      cfg = this.config.loadConfigOrDefault({ throwOnError: true });
+    } catch (error) {
+      log.debug("[MemoryService] config unreadable; workspace memory owner not memoized", {
+        workspaceId,
+        error,
+      });
+      return resolveWorkspaceMemoryOwnerId(this.config.loadConfigOrDefault(), workspaceId);
+    }
+    const owner = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
     this.workspaceMemoryOwnerById.set(workspaceId, owner);
     return owner;
   }
@@ -973,6 +990,13 @@ export class MemoryService extends EventEmitter {
   private async openWorkspaceStore(ctx: MemoryScopeContext, store: MemoryStore): Promise<void> {
     await this.assertWorkspaceStoreReadable(ctx, store);
     await this.adoptLegacyPrivateStore(ctx, store);
+    // The adoption pass waits for and holds the owner-store lock, a window in
+    // which another backend's removal can publish the acting workspace's (or
+    // the owner's) tombstone. The pass itself refuses on its commit guard
+    // and swallows that as a retryable adoption failure, so re-check here:
+    // the caller is about to read the owner's still-live notebook on behalf
+    // of a workspace that no longer exists.
+    await this.assertWorkspaceStoreReadable(ctx, store);
   }
 
   /**

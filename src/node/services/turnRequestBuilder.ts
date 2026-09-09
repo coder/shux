@@ -2834,6 +2834,13 @@ export class TurnRequestBuilder {
       }
       const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
+        // Proof for the harvest gate that this turn's policy was recorded
+        // (above, or the grant at onStreamStarted): a build without the sink
+        // — or an older build after a downgrade — leaves it unset and its
+        // turns' user rows stay unaccounted for.
+        ...(!isCompactionRequest && this.dependencies.bindings.workspaceMemoryPolicySink
+          ? { workspaceMemoryPolicyRecorded: true as const }
+          : {}),
         timestamp: Date.now(),
         model: canonicalModelString,
         routedThroughGateway,

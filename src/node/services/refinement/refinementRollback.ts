@@ -1234,6 +1234,8 @@ async function compensatePartialApply(
           ? preState.files.find((file) => file.path === p)
           : undefined;
       if (prior !== undefined) {
+        // Captured from disk moments ago; only migrated rows carry bare references.
+        assert("content" in prior, "pre-rollback capture carries file contents");
         await fsPromises.mkdir(path.dirname(p), { recursive: true });
         await writeFileAtomic(p, prior.content, { encoding: "utf-8" });
       } else {

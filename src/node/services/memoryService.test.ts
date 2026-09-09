@@ -27,6 +27,9 @@ import {
 import { applyRefinementInverse, readRefinementEvents } from "./refinement/refinementTestHelpers";
 import { rollbackRefinement } from "./refinement/refinementRollback";
 import { migrateSharedMemoryRefinementRows } from "./refinement/sharedMemoryRowMigration";
+import { reclaimExcessRefinementInverseBlobs } from "./refinement/refinementJournal";
+import { REFINEMENT_INVERSE_BLOB_QUOTA_BYTES } from "@/common/types/refinement";
+import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { sharedWorkspaceMemoryPeerSessionDirs } from "./memoryWorkspaceOwner";
 import { createRefinementRollbackTool } from "./tools/refinement_rollback";
 import type { MemoryScopeAccess } from "@/common/constants/memory";
@@ -1089,6 +1092,27 @@ describe("MemoryService", () => {
       expect(invalidated).toEqual([["ws-child"]]);
     });
 
+    it("does not memoize the self fallback taken while config.json is unreadable but unchanged", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      // The file stats the same (no stamp change) but cannot be read/parsed
+      // for a moment (EACCES interval, non-atomic writer): the lenient load
+      // yields the empty default while the strict one throws.
+      const real = fixture.config.loadConfigOrDefault.bind(fixture.config);
+      const unreadable = spyOn(fixture.config, "loadConfigOrDefault").mockImplementation(
+        (options?: { throwOnError?: boolean }) => {
+          if (options?.throwOnError) throw new Error("EACCES: permission denied");
+          return { ...real(), projects: new Map() };
+        }
+      );
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+      // Readability returns without the stamp moving: the next resolution
+      // must see the real tree instead of a pinned fallback.
+      unreadable.mockRestore();
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+    });
+
     it("advances the owner store's revision token on shared writes, visible to another backend", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -1205,6 +1229,26 @@ describe("MemoryService", () => {
           (entry) => entry.scope === "workspace"
         )
       ).toBe(false);
+    });
+
+    it("refuses a read whose workspace was tombstoned while the legacy adoption pass ran", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      // The adoption pass (owner-store lock) is the window: another backend's
+      // removal of ws-child publishes its tombstone after the readability
+      // check that opened the store, and the pass swallows its own refusal.
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-child");
+      spyOn(
+        fixture.service as unknown as { adoptLegacyPrivateStore: () => Promise<void> },
+        "adoptLegacyPrivateStore"
+      ).mockImplementationOnce(async () => {
+        await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+        await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+      });
+      const refused = await fixture.service.view(fixture.ctx, "/memories/workspace/n.md");
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("was removed");
     });
 
     it("refuses a pin toggle once the owner it was bound to is tombstoned", async () => {
@@ -1946,6 +1990,82 @@ describe("MemoryService", () => {
       });
       expect(redo.success).toBe(true);
       expect(await fsPromises.readFile(keep, "utf-8")).toBe("v2");
+    });
+
+    it("migrates a row whose inverse payload was reclaimed as an audit-only record", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      // Owner renames a directory (no post-state hash), then the child edits
+      // a file under the destination; the child's inverse payload is then
+      // reclaimed under its quota before the child is removed.
+      await fixture.service.create(ownerCtx, "/memories/workspace/notes/a.md", "v1", "agent");
+      await fixture.service.rename(
+        ownerCtx,
+        "/memories/workspace/notes",
+        "/memories/workspace/moved",
+        "agent"
+      );
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/workspace/moved/a.md",
+        "v1",
+        "child-v2",
+        "agent"
+      );
+      const childJournal = sharedDurableEventJournal(childSessionDir);
+      await reclaimExcessRefinementInverseBlobs(childJournal, [
+        { ref: `sha256:${"e".repeat(64)}`, size: REFINEMENT_INVERSE_BLOB_QUOTA_BYTES },
+      ]);
+      const childEdit = (await readRefinementEvents(childSessionDir)).find(
+        (row) => (row.data.action as { op: string }).op === "str_replace"
+      )!;
+      const childBlobRef = (childEdit.data.inverse as { files: Array<{ blobRef: string }> })
+        .files[0].blobRef;
+      expect(await childJournal.blobs.has(childBlobRef as never)).toBe(false);
+
+      expect(
+        await migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        })
+      ).toBe(1);
+      await fsPromises.rm(childSessionDir, { recursive: true, force: true });
+      const ownerRows = await readRefinementEvents(ownerSessionDir);
+      const copy = ownerRows.find((row) => row.data.migratedFrom === `ws-child:${childEdit.id}`)!;
+      // Paths and (dangling) payload reference preserved; nothing published.
+      expect(
+        (copy.data.inverse as { files: Array<{ path: string; blobRef: string }> }).files
+      ).toEqual([
+        { path: path.join(ownerSessionDir, "memory", "moved", "a.md"), blobRef: childBlobRef },
+      ]);
+      // Unrollbackable, like any evicted payload...
+      const undo = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: copy.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(undo.success).toBe(false);
+      if (!undo.success) expect(undo.error).toContain("no longer available");
+      // ...but still evidence: rolling the owner's rename back would move the
+      // child's newer content, so it is reported as a conflict instead.
+      const renameRow = ownerRows.find(
+        (row) => (row.data.action as { op: string }).op === "rename"
+      )!;
+      const renameUndo = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: renameRow.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(renameUndo.success).toBe(false);
+      if (!renameUndo.success) expect(renameUndo.error).toContain("diverges");
+      expect(
+        await fsPromises.readFile(path.join(ownerSessionDir, "memory", "moved", "a.md"), "utf-8")
+      ).toBe("child-v2");
     });
 
     it("concurrent migrations of the same child copy each row exactly once", async () => {

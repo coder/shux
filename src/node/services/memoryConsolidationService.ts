@@ -338,7 +338,10 @@ class HarvestRefusedError extends Error {
  * user message) and this turn's own row would be left without a turn of its
  * own — which is exactly what surfaces here as uncovered. Rows are matched by
  * exact id, never by adjacency, so no interleaved foreign row can ride along.
- * Assistant rows without the bound cover nothing (fail closed). Token-budget
+ * Assistant rows without the bound, or without `workspaceMemoryPolicyRecorded`
+ * (a build that does not maintain the policy — e.g. turns run by a downgraded
+ * build mid-epoch, which also left the durable accumulator untouched), cover
+ * nothing (fail closed). Token-budget
  * control rows (rollover lead-in, budget warning) need no turn: backend
  * template text appended in the same durable batch as the turn they precede,
  * carrying neither agent nor repository content.
@@ -352,7 +355,9 @@ function epochHasUncoveredUserRows(messages: readonly MuxMessage[]): boolean {
   }
   const covered = new Set<string>();
   for (const message of messages) {
-    if (message.role !== "assistant") continue;
+    if (message.role !== "assistant" || message.metadata?.workspaceMemoryPolicyRecorded !== true) {
+      continue;
+    }
     const bound = message.metadata?.requestHistorySequence;
     if (typeof bound !== "number") continue;
     const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;

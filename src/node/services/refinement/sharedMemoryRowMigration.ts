@@ -16,6 +16,8 @@ import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJour
 import {
   appendRefinementEventUnderBlobLock,
   reclaimRefinementInverseBlobsBestEffort,
+  type RefinementFileCapture,
+  type RefinementFileReference,
   type RefinementInverseDraft,
 } from "./refinementJournal";
 import { listRefinements } from "./refinementRollback";
@@ -54,8 +56,10 @@ function isInside(root: string, filePath: string): boolean {
  * rollbackable. A row rolled back before its FIRST copy is simply dead and
  * stays behind with its whole lineage.
  *
- * A row whose payload cannot be reconstructed (evicted blob, unparseable
- * action) is skipped with a log line — nothing durable exists to preserve.
+ * A row whose inverse payload was reclaimed is copied as an audit-only record
+ * (RefinementFileReference) so conflict detection keeps seeing the edit; a
+ * row that cannot be parsed at all is skipped with a log line — nothing
+ * durable exists to preserve.
  * A row that CAN be reconstructed but cannot be persisted in the owner's
  * journal throws: the caller must not delete the source journal, or the
  * only inverse and rollback ID would be lost. Returns the number migrated.
@@ -162,15 +166,28 @@ export async function migrateSharedMemoryRefinementRows(args: {
 
       let draft: RefinementInverseDraft;
       if (inverse.data.op === "restore-files") {
-        const files: Array<{ path: string; content: string }> = [];
+        const files: Array<RefinementFileCapture | RefinementFileReference> = [];
         for (const file of inverse.data.files) {
           // Contents are blob-offloaded at append (resolveRefinementInverse); older
           // rows may carry them inline.
           const content =
             file.text ??
             (file.blobRef === undefined ? null : await childJournal.blobs.getText(file.blobRef));
-          if (content === null) break;
-          files.push({ path: file.path, content });
+          if (content !== null) {
+            files.push({ path: file.path, content });
+          } else if (file.blobRef !== undefined) {
+            // Payload reclaimed under the child's inverse-blob quota. The row
+            // still travels as an audit record — its paths and source order
+            // are what conflict detection needs when the owner later rolls
+            // back an older edit over the same files (a directory rename has
+            // no post-state hash to notice the child's newer content by) —
+            // but it can no longer be rolled back: the reference resolves to
+            // nothing in the owner journal, which the rollback engine
+            // refuses exactly like an evicted payload of its own.
+            files.push({ path: file.path, blobRef: file.blobRef });
+          } else {
+            break; // neither text nor blobRef: nothing durable to preserve
+          }
         }
         if (files.length !== inverse.data.files.length) {
           log.debug("[refinement] skipping shared-memory row migration: inverse payload missing", {
