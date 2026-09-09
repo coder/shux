@@ -113,8 +113,9 @@ export async function selectHotMemories(args: {
   tokenBudgetActive?: boolean;
   /**
    * Context-budget final flush: preload only the context notes, always under their own
-   * 8 KiB / reserved-token caps. A pinned or well-used notes file would otherwise enter the
-   * ordinary pass under the larger per-item budget and eat the flush's reserved headroom.
+   * CONTEXT_NOTES_RESERVED_BYTES / CONTEXT_NOTES_RESERVED_TOKENS caps. A pinned or well-used
+   * notes file would otherwise enter the ordinary pass under the larger per-item budget and eat
+   * the flush's reserved headroom.
    */
   onlyContextNotes?: boolean;
   /** Read a memory file by virtual path; may reject for missing/unreadable files. */

@@ -1354,6 +1354,7 @@ describe("AgentSession token-budget lifecycle", () => {
       uiVisible: false,
       muxMetadata: { ...correlation, contextBudgetContinuation: true, contextBudgetFlush: true },
     });
+    const flushTriggerText = text(rows.at(-1)!);
     // The request builder derives the memory-only toolset, pinned notes path, and disabled
     // hooks/PTC for the hidden flush turn from this flag (see turnRequestBuilder).
     expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
@@ -1383,9 +1384,10 @@ describe("AgentSession token-budget lifecycle", () => {
     });
     expect(text(rows.at(-1)!)).toBe("Continue");
     expect(h.requests[2].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    // Neither the internal trigger text nor its flag reaches the fresh window.
     expect(
-      sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages).some((row) =>
-        text(row).startsWith("Flush context notes")
+      sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages).some(
+        (row) => text(row) === flushTriggerText || row.metadata?.muxMetadata?.contextBudgetFlush
       )
     ).toBe(false);
   });
@@ -1452,7 +1454,9 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
     expect(h.session.queueMessage("Later question", options)).not.toBeNull();
     await h.finishAndDispatch();
-    expect(text((await allRows(h)).at(-1)!)).toBe("Flush context notes now.");
+    expect((await allRows(h)).at(-1)?.metadata?.muxMetadata).toMatchObject({
+      contextBudgetFlush: true,
+    });
     expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
     h.settleStream(1);
     await h.waitForRequest(3);
@@ -1495,9 +1499,9 @@ describe("AgentSession token-budget lifecycle", () => {
     const trigger = rows.at(-1)!;
     expect(text(trigger)).toBe("Continue");
     expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    expect(h.requests[1].messages.some((row) => text(row).startsWith("Flush context notes"))).toBe(
-      false
-    );
+    expect(
+      h.requests[1].messages.some((row) => row.metadata?.muxMetadata?.contextBudgetFlush)
+    ).toBe(false);
   });
 
   test("disabling automatic rollover before the flush dispatches degrades it to a normal turn", async () => {
@@ -1804,7 +1808,7 @@ describe("AgentSession token-budget lifecycle", () => {
       const rows = await allRows(h);
       expect(warningRows(rows)).toHaveLength(0);
       expect(rolloverRows(rows)).toHaveLength(0);
-      expect(rows.some((row) => text(row).startsWith("Flush context notes"))).toBe(false);
+      expect(rows.some((row) => row.metadata?.muxMetadata?.contextBudgetFlush)).toBe(false);
       expect(
         h.events.some(
           (event) =>
@@ -1873,7 +1877,9 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
     expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
     await h.finishAndDispatch();
-    expect(text((await allRows(h)).at(-1)!)).toBe("Flush context notes now.");
+    const flushRow = (await allRows(h)).at(-1)!;
+    expect(flushRow.metadata?.muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    const flushTriggerText = text(flushRow);
     const streamError = {
       workspaceId,
       messageId: "assistant-2",
@@ -1899,10 +1905,11 @@ describe("AgentSession token-budget lifecycle", () => {
     const trigger = fresh.findLast((row) => row.role === "user")!;
     expect(text(trigger)).toBe("Continue");
     expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
-    expect(fresh.some((row) => text(row).startsWith("Flush context notes"))).toBe(false);
-    expect(h.requests[2].messages.some((row) => text(row).startsWith("Flush context notes"))).toBe(
-      false
-    );
+    // The sanitized retry carries neither the internal trigger text nor its flag.
+    const leaked = (row: MuxMessage) =>
+      text(row) === flushTriggerText || row.metadata?.muxMetadata?.contextBudgetFlush === true;
+    expect(fresh.some(leaked)).toBe(false);
+    expect(h.requests[2].messages.some(leaked)).toBe(false);
     // Without the flag the request builder applies the ordinary toolset to the retry.
     expect(h.requests[2].muxMetadata).not.toHaveProperty("contextBudgetFlush");
   });
