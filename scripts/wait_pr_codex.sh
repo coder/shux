@@ -460,13 +460,13 @@ CHECK_CODEX_STATUS_ONCE() {
   fi
 
   # Completed status/no-findings envelopes are neither approval nor a failed
-  # review. Reuse the CI classifier and keep waiting for the approval signal.
+  # review. Normalize titles like the CI classifier and keep waiting for approval.
   # Unfinished/unknown envelopes and account errors retain their blocking behavior.
   codex_response_count_comments=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '
     include "codex_comments";
     [.[] | select(.author.login == $bot and .createdAt > $request_at)
       | select(
-          ((.body | startswith("<!-- codex-pull-request-review-summary -->") or startswith("Security review completed."))
+          ((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->") or startswith("Security review completed."))
             and codex_comment_is_informational($bot)) | not
         )] | length
   ')
