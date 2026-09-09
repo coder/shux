@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import type { LanguageModelV4CallOptions } from "@ai-sdk/provider";
 import type { XaiProviderOptions } from "@ai-sdk/xai";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
@@ -285,6 +286,10 @@ export function wrapFetchWithXAIServiceTier(
   baseFetch: typeof fetch,
   serviceTier?: XAIServiceTier
 ): typeof fetch {
+  return wrapFetchWithServiceTier(baseFetch, serviceTier);
+}
+
+function wrapFetchWithServiceTier(baseFetch: typeof fetch, serviceTier?: string): typeof fetch {
   if (serviceTier == null) {
     return baseFetch;
   }
@@ -1435,13 +1440,11 @@ export class ProviderModelFactory {
         const serviceTier = ServiceTierSchema.safeParse(
           muxProviderOptions?.openai?.serviceTier ?? providersConfig.openai?.serviceTier
         );
-        if (
-          serviceTier.success &&
-          openaiServiceTierAvailable(modelString, {
-            providersConfig: self.providerService.getConfig(providersConfig),
-            openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
-          })
-        ) {
+        const serviceTierAvailable = openaiServiceTierAvailable(modelString, {
+          providersConfig: self.providerService.getConfig(providersConfig),
+          openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+        });
+        if (serviceTier.success && serviceTierAvailable) {
           serviceTierDefault = {
             namespace: "openai",
             option: "serviceTier",
@@ -2509,20 +2512,55 @@ export class ProviderModelFactory {
           }
 
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
-          const provider = createOpenAI({
-            apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
-            baseURL: gatewayBaseUrl,
-            fetch: coderFetch,
-          });
-          // The gateway intercepts both /responses and /chat/completions. Real
-          // OpenAI upstreams get the Responses API to match Xum's default OpenAI
-          // wire format; the other OpenAI-wire provider types front
-          // OpenAI-compatible upstreams where only /chat/completions can be
-          // assumed (see coderGatewayWireProtocol).
-          return Ok(
-            wire === "openai-responses"
+          const createCoderModel = (fetch: typeof coderFetch) => {
+            const provider = createOpenAI({
+              apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
+              baseURL: gatewayBaseUrl,
+              fetch,
+            });
+            // The gateway intercepts both /responses and /chat/completions. Real
+            // OpenAI upstreams use Responses; compatible upstreams use Chat.
+            return wire === "openai-responses"
               ? provider.responses(originModelId)
-              : provider.chat(originModelId)
+              : provider.chat(originModelId);
+          };
+          const model = createCoderModel(coderFetch);
+          if (!serviceTierAvailable) return Ok(model);
+
+          const createTieredCall = (params: LanguageModelV4CallOptions) => {
+            const tier = ServiceTierSchema.optional().parse(
+              params.providerOptions?.openai?.serviceTier
+            );
+            if (tier == null) return undefined;
+            // The SDK drops tiers for opaque gateway aliases. Preserve the raw
+            // model/endpoint and serialize the tier after SDK capability checks.
+            // Per-call adapters keep concurrent requests' overrides independent.
+            return {
+              model: createCoderModel(wrapFetchWithServiceTier(coderFetch, tier)),
+              params: {
+                ...params,
+                providerOptions: {
+                  ...params.providerOptions,
+                  openai: { ...params.providerOptions?.openai, serviceTier: undefined },
+                },
+              },
+            };
+          };
+          return Ok(
+            wrapLanguageModel({
+              model,
+              middleware: {
+                specificationVersion: "v4",
+                wrapGenerate: ({ params, doGenerate }) => {
+                  const call = createTieredCall(params);
+                  return call ? call.model.doGenerate(call.params) : doGenerate();
+                },
+                wrapStream: ({ params, doStream }) => {
+                  const call = createTieredCall(params);
+                  return call ? call.model.doStream(call.params) : doStream();
+                },
+              },
+            })
           );
         }
 

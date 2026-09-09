@@ -2423,6 +2423,8 @@ describe("ProviderModelFactory Coder", () => {
   it.each([
     "coder:openai/gpt-6-astra",
     "coder:prod-ai/gpt-6-astra",
+    "coder:prod-ai/team-astra",
+    "coder:chat-proxy/team-astra",
     "coder:chat-proxy/gpt-6-astra",
     "openrouter:openai/gpt-6-astra",
     "mux-gateway:openai/gpt-6-astra",
@@ -2433,6 +2435,10 @@ describe("ProviderModelFactory Coder", () => {
   ])("pins and serializes the shared Fast tier through %s", async (modelString) => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, {
+        models: [
+          { id: "prod-ai/team-astra", mappedToModel: "openai:gpt-6-astra" },
+          { id: "chat-proxy/team-astra", mappedToModel: "openai:gpt-6-astra" },
+        ],
         additionalProviders: [
           { name: "prod-ai", type: "openai" },
           { name: "chat-proxy", type: "openai-compat" },
@@ -2546,6 +2552,15 @@ describe("ProviderModelFactory Coder", () => {
               }
               expect(calls.length).toBe(before + 1);
               const body = parseSentBody(calls[before]);
+              if (modelString.endsWith("/team-astra")) {
+                const instance =
+                  modelString === "coder:prod-ai/team-astra" ? "prod-ai" : "chat-proxy";
+                const endpoint = instance === "prod-ai" ? "responses" : "chat/completions";
+                expect(body.model).toBe("team-astra");
+                expect(calls[before].url).toBe(
+                  `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/${instance}/v1/${endpoint}`
+                );
+              }
               if (modelString.startsWith("mux-gateway:")) {
                 expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
                   expected
@@ -2561,6 +2576,66 @@ describe("ProviderModelFactory Coder", () => {
       }
     });
   });
+
+  it.each(["openai", "openai-compat"])(
+    "keeps concurrent tier overrides isolated for Coder %s aliases",
+    async (type) => {
+      await withTempConfig(async (config, factory, oauth) => {
+        saveCoderConfig(config, {
+          additionalProviders: [{ name: "team", type }],
+          models: [{ id: "team/astra-alias", mappedToModel: "openai:gpt-6-astra" }],
+        });
+        await saveRoutePriority(config, ["direct"]);
+        const authStarted = Promise.withResolvers<void>();
+        const releaseAuth = Promise.withResolvers<void>();
+        const oauthService = stubCoderOauthService();
+        const getAuth = oauthService.getValidAuth.bind(oauthService);
+        let authCalls = 0;
+        oauthService.getValidAuth = async () => {
+          if (++authCalls === 1) {
+            authStarted.resolve();
+            await releaseAuth.promise;
+          }
+          return getAuth();
+        };
+        oauth.coderOauthService = oauthService;
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        let first: Promise<unknown> | undefined;
+        try {
+          const created = await factory.createModel("coder:team/astra-alias");
+          if (!created.success) throw new Error(created.error.type);
+          first = generateText({
+            model: created.data,
+            prompt: "first",
+            providerOptions: { openai: { serviceTier: "priority" } },
+            maxRetries: 0,
+          }).catch(() => undefined);
+          await authStarted.promise;
+          await streamText({
+            model: created.data,
+            prompt: "second",
+            providerOptions: { openai: { serviceTier: "flex" } },
+            maxRetries: 0,
+          }).consumeStream({ onError: () => undefined });
+          releaseAuth.resolve();
+          await first;
+          expect(calls.map((call) => parseSentBody(call).service_tier)).toEqual([
+            "flex",
+            "priority",
+          ]);
+          expect(calls.map((call) => parseSentBody(call).model)).toEqual([
+            "astra-alias",
+            "astra-alias",
+          ]);
+        } finally {
+          releaseAuth.resolve();
+          await first;
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
 
   it("does not pin OpenAI tiers on OAuth or non-OpenAI Coder upstreams", async () => {
     await withTempConfig(async (config, factory, oauth, store) => {
