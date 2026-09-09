@@ -130,6 +130,7 @@ import {
 } from "@/node/services/branchSummary";
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
+  isWorkspaceRemovalTombstoned,
   removeSessionDirUnderMemoryLocks,
   SharedMemoryRemovalAbortedError,
   refineApplyLockPath,
@@ -143,6 +144,7 @@ import {
   writeWorkspaceMemoryDenyMarker,
 } from "@/node/services/workspaceMemoryDenyMarker";
 import { migrateSharedMemoryRefinementRows } from "@/node/services/refinement/sharedMemoryRowMigration";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
@@ -4298,7 +4300,23 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const denyDurableFallback = async (cause: string): Promise<boolean> => {
       if (effective) return false;
       try {
-        await writeWorkspaceMemoryDenyMarker(sessionDir);
+        // Late session-dir writer (like headless usage): with several
+        // backends, this turn may reach the fallback after a remover has
+        // tombstoned, deleted and deregistered the workspace — the marker's
+        // mkdir would recreate the session dir as an orphan. Gate + write run
+        // inside the session-dir target lock that removal's tombstone+delete
+        // critical section also holds, so the check cannot go stale. A
+        // removed workspace has nothing left to harvest: recorded as done.
+        const written = await withTargetMutationLock(this.config.rootDir, sessionDir, async () => {
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return false;
+          await writeWorkspaceMemoryDenyMarker(sessionDir);
+          return true;
+        });
+        if (!written) {
+          log.debug("Skipping workspace memory deny marker for removed workspace", { workspaceId });
+          session?.recordWorkspaceMemoryWritable(false);
+          return true;
+        }
       } catch (markerError: unknown) {
         log.error("Workspace memory deny could not be made durable anywhere", {
           workspaceId,

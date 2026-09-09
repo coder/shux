@@ -436,6 +436,21 @@ async function readLegacyAdoptionManifest(
   }
 }
 
+/**
+ * Change stamp of a sub-agent's legacy private store: its store clock (any
+ * MemoryService write there advances it, including a foreign backend's
+ * self-fallback write) plus the root directory's mtime (top-level entry
+ * changes made outside MemoryService). Missing pieces read as fixed tokens.
+ */
+async function legacyStoreStamp(childSessionDir: string, legacyRoot: string): Promise<string> {
+  const revision = await readWorkspaceMemoryRevision(childSessionDir).catch(() => null);
+  const rootMtime = await fsPromises
+    .stat(legacyRoot)
+    .then((stat) => String(stat.mtimeMs))
+    .catch(() => "missing");
+  return `${revision ?? "none"}:${rootMtime}`;
+}
+
 /** Link-aware kind of a path: symlinks are reported as such, never followed. */
 async function lstatKind(absPath: string): Promise<"dir" | "symlink" | "other" | "missing"> {
   try {
@@ -749,8 +764,8 @@ export class MemoryService extends EventEmitter {
 
   /**
    * Sub-agents whose pre-sharing private notebook was found absent or already
-   * adopted during this process lifetime, keyed to the owner they resolved to
-   * at the time (see adoptLegacyPrivateStore).
+   * adopted during this process lifetime, keyed to the owner and legacy-store
+   * state observed at the time (see adoptLegacyPrivateStore).
    */
   private readonly legacyStoreCheckedAgainst = new Map<string, string>();
 
@@ -975,21 +990,28 @@ export class MemoryService extends EventEmitter {
     if (childId === "") return;
     const owner = this.storeOwnerWorkspaceId(store);
     assert(owner !== null, "workspace-scope stores live under sessionsDir");
-    // Checked once per (child, resolved owner) per process. Keyed by the owner
-    // because ownership can move: a command served while config.json was
-    // missing/malformed resolves the child to itself and writes into the
-    // legacy dir; once config recovers, the owner differs from the one this
-    // marker recorded and the fallback write is folded in on the next access.
-    if (this.legacyStoreCheckedAgainst.get(childId) === owner) return;
     if (owner === childId) {
       // Not redirected: the private store IS the store. Recorded so a later
-      // redirect (config recovered) is seen as an ownership change above.
+      // redirect (config recovered) is seen as a change of the key below.
       this.legacyStoreCheckedAgainst.set(childId, owner);
       return;
     }
-    const legacyRoot = path.join(this.config.sessionsDir, childId, "memory");
-    // One lstat per (child, owner) per process; the pass below is idempotent.
+    // Checked once per (child, owner, legacy-store state) per process. The
+    // owner is part of the key because ownership can move: a command served
+    // while config.json was missing/malformed resolves the child to itself
+    // and writes into the legacy dir. The legacy store's own state is part of
+    // it because ANOTHER backend can do the same while this process's
+    // resolution never changes: its self-fallback write advances the child's
+    // store clock (memory.revision in the child's session dir) and replaces a
+    // root entry, so either signal re-runs the pass. Two small stats per
+    // workspace-scope access; the pass itself is idempotent.
+    const childSessionDir = path.join(this.config.sessionsDir, childId);
+    const legacyRoot = path.join(childSessionDir, "memory");
     const legacyRootKind = await lstatKind(legacyRoot);
+    const checkKey = `${owner}\u0000${legacyRootKind}\u0000${
+      legacyRootKind === "dir" ? await legacyStoreStamp(childSessionDir, legacyRoot) : ""
+    }`;
+    if (this.legacyStoreCheckedAgainst.get(childId) === checkKey) return;
     if (legacyRootKind !== "dir") {
       if (legacyRootKind === "symlink") {
         log.warn("[MemoryService] ignoring a symlinked legacy workspace memory root", {
@@ -997,7 +1019,7 @@ export class MemoryService extends EventEmitter {
           legacyRoot,
         });
       }
-      this.legacyStoreCheckedAgainst.set(childId, owner);
+      this.legacyStoreCheckedAgainst.set(childId, checkKey);
       return;
     }
     // Files adopted this pass (bytes written OR only their sidecar entries
@@ -1143,7 +1165,9 @@ export class MemoryService extends EventEmitter {
           );
         }
       });
-      this.legacyStoreCheckedAgainst.set(childId, owner);
+      // Recorded against the state observed BEFORE the pass: a foreign write
+      // landing during it changes the stamp and re-runs the (idempotent) pass.
+      this.legacyStoreCheckedAgainst.set(childId, checkKey);
     } catch (error) {
       log.warn(
         "[MemoryService] failed to adopt a sub-agent's legacy workspace notebook; retrying on next access",

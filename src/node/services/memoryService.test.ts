@@ -1451,6 +1451,24 @@ describe("MemoryService", () => {
           "utf-8"
         )
       ).toBe("written while config was gone");
+
+      // ANOTHER backend hits the same fallback while this process's resolution
+      // never changes: its write advances the child's store clock, which this
+      // process notices on its next access and folds the note in.
+      const foreign = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
+      spyOn(foreign, "resolveWorkspaceMemoryOwnerId").mockReturnValue("ws-child");
+      const foreignWrite = await foreign.create(
+        { ...fixture.ctx },
+        "/memories/workspace/foreign.md",
+        "written by another backend's fallback",
+        "agent"
+      );
+      expect(foreignWrite.success).toBe(true);
+      const afterForeign = await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(afterForeign.filter((e) => e.scope === "workspace").map((e) => e.relPath)).toEqual([
+        "fallback.md",
+        "foreign.md",
+      ]);
     });
 
     it("never imports through a symlinked legacy notebook root or escaped files", async () => {

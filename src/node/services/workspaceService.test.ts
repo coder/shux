@@ -5,6 +5,7 @@ import {
   workspaceMemoryDenyMarkerPath,
   writeWorkspaceMemoryDenyMarker,
 } from "@/node/services/workspaceMemoryDenyMarker";
+import { workspaceRemovalTombstonePath } from "@/node/services/workspaceRemoval";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -9410,6 +9411,29 @@ describe("WorkspaceService initialize", () => {
         })
       ).toBe(true);
       expect(persisted()).toBe(true);
+
+      // A late deny reaching the marker fallback after the workspace was
+      // removed (tombstoned, session dir deleted) must not recreate the
+      // session dir as an orphan; nothing is left to harvest, so it is done.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritable;
+        return cfg;
+      });
+      await fsPromises.rm(sessionDir, { recursive: true, force: true });
+      const tombstonePath = workspaceRemovalTombstonePath(realConfig.rootDir, "policy-scratch");
+      await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "policy-scratch" }));
+      spyOn(realConfig, "editConfig").mockImplementationOnce(() =>
+        Promise.reject(new Error("disk full"))
+      );
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false)).toBe(true);
+      expect(
+        await fsPromises.stat(sessionDir).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
     } finally {
       await cleanup();
     }
