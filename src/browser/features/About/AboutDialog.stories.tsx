@@ -93,6 +93,7 @@ export const BlockedPhone: Story = {
     const dialog = await within(document.body).findByRole("dialog");
     const retry = within(dialog).getByRole("button", { name: "Install & restart" });
     await expect(retry).toBeEnabled();
+    await expect(within(dialog).getByRole("button", { name: "Restart anyway" })).toBeEnabled();
     await expect(within(dialog).getByRole("status")).toBeVisible();
     const npm = within(dialog).getByRole("radio", { name: "Newest npm" });
     await userEvent.click(npm);

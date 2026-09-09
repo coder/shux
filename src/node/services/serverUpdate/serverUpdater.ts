@@ -169,27 +169,34 @@ export class ServerUpdater {
     await this.download?.settled;
   }
 
-  async installUpdate(): Promise<void> {
+  /**
+   * `force` skips the blocker gate: the restart callback is the same graceful shutdown a
+   * supervisor restart runs, so in-flight streams are aborted with their partials committed and
+   * terminals and background processes are closed rather than left orphaned.
+   */
+  async installUpdate(options?: { force?: boolean }): Promise<void> {
     if (!this.layout || this.shuttingDown || !this.staged || this.installing) return;
     const staged = this.staged;
     this.installing = true;
     try {
-      await this.deps.refreshBlockers?.();
-      // An unrelated teardown (SIGTERM) may have begun during the refresh; it must not inherit
-      // the launcher swap.
-      if (this.shuttingDown) {
-        this.installing = false;
-        return;
-      }
-      const blockers = this.deps.collectBlockers();
-      if (blockers.length) {
-        this.installing = false;
-        this.setStatus({
-          type: "install-blocked",
-          info: { version: staged.version },
-          blockers,
-        });
-        return;
+      if (!options?.force) {
+        await this.deps.refreshBlockers?.();
+        // An unrelated teardown (SIGTERM) may have begun during the refresh; it must not inherit
+        // the launcher swap.
+        if (this.shuttingDown) {
+          this.installing = false;
+          return;
+        }
+        const blockers = this.deps.collectBlockers();
+        if (blockers.length) {
+          this.installing = false;
+          this.setStatus({
+            type: "install-blocked",
+            info: { version: staged.version },
+            blockers,
+          });
+          return;
+        }
       }
       // No await between the idle snapshot, atomic swap, and the CLI's shutdown latch.
       (this.deps.activate ?? activateUpdate)(this.layout, staged.entry);

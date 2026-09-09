@@ -776,6 +776,47 @@ describe("server updater", () => {
     await Promise.all([updater.installUpdate(), updater.installUpdate()]);
     expect(events).toEqual(["refresh", "snapshot", "activate", "restart"]);
   });
+  test("a forced install restarts despite blockers without consulting them", async () => {
+    const { layout } = await fixture();
+    const events: string[] = [];
+    const stagedUpdater = async () => {
+      const updater = new ServerUpdater({ supported: true, layout }, undefined, {
+        refreshBlockers: () => {
+          events.push("refresh");
+          return Promise.resolve();
+        },
+        collectBlockers: () => {
+          events.push("snapshot");
+          return [{ kind: "active-streams", count: 3 }];
+        },
+        restart: () => {
+          events.push("restart");
+          return Promise.resolve();
+        },
+        fetchDistTags: () => Promise.resolve({ next: "2.0.0" }),
+        runInstall: () => Promise.resolve("/staged"),
+        activate: () => {
+          events.push("activate");
+        },
+      });
+      await updater.checkForUpdates();
+      await updater.downloadUpdate();
+      return updater;
+    };
+    const updater = await stagedUpdater();
+    await updater.installUpdate();
+    expect(updater.getStatus().type).toBe("install-blocked");
+    events.length = 0;
+    await updater.installUpdate({ force: true });
+    expect(events).toEqual(["activate", "restart"]);
+
+    // An unrelated teardown already under way still wins over a forced install.
+    const shuttingDown = await stagedUpdater();
+    await shuttingDown.beginShutdown();
+    events.length = 0;
+    await shuttingDown.installUpdate({ force: true });
+    expect(events).toEqual([]);
+  });
   test("a re-check keeps a staged download the channel still points at and drops a stale one", async () => {
     const { layout } = await fixture();
     let next = "2.0.0";

@@ -2152,7 +2152,7 @@ export const router = (authToken?: string) => {
       install: t
         .input(schemas.update.install.input)
         .output(schemas.update.install.output)
-        .handler(({ context }) => context.updateService.install()),
+        .handler(({ context, input }) => context.updateService.install(input ?? undefined)),
       onStatus: t
         .input(schemas.update.onStatus.input)
         .output(schemas.update.onStatus.output)

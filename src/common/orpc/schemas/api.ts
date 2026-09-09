@@ -2997,7 +2997,7 @@ export const update = {
     output: z.void(),
   },
   install: {
-    input: z.void(),
+    input: z.object({ force: z.boolean().optional() }).optional(),
     output: z.void(),
   },
   onStatus: {
