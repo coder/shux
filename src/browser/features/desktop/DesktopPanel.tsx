@@ -214,9 +214,10 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
         attach={(desktop) =>
           popout.attach(desktop.suspend, desktop.connect, !inline, desktop.register)
         }
-        // Unmounting while a popout is opening (or showing the desktop) is not this pane
-        // giving the desktop up: the child takes over, so leave the grace for the gap.
-        unmountKeepsGrace={() => popout.getSnapshot().state !== "inline"}
+        // Unmounting while a popout is opening (or a confirmed child shows the desktop) is not
+        // this pane giving the desktop up: the child takes over, so leave the grace for the
+        // gap. A reservation abandoned while still checking for a popout is given up for good.
+        unmountKeepsGrace={() => popout.handoffInProgress()}
         onDetach={detach}
         suspended={!inline}
         reserve={snapshot.state === "checking"}

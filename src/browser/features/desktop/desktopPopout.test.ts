@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test, type Mock } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getErrorMessage } from "@/common/utils/errors";
 import {
   DESKTOP_POPOUT_READY_TIMEOUT_MS,
   DESKTOP_POPOUT_CLOSE_EVENT,
@@ -381,6 +382,63 @@ describe("DesktopPopout handoff", () => {
       channel().sent.filter((sent) => (sent as { type: string }).type === "bring-back")
     ).toEqual([]);
     expect(popout.getSnapshot().state).toBe("detached");
+  });
+
+  test("bring-back before any reconciliation opens the channel so a live child can confirm", async () => {
+    updatePersistedState(`desktop-popout:${workspaceId}`, "hinted-instance");
+    const popout = new DesktopPopout(workspaceId, false);
+    popout.attach(() => undefined, undefined, /* suspended */ true, leasable);
+    // No reconcile() yet (the API client is still reconnecting): the ping must still reach the
+    // child instead of being dropped and the child mistaken for a stale hint.
+    const returning = popout.bringBack();
+    await settle();
+    expect(TestChannel.channels).toHaveLength(1);
+    expect(channel().sent).toEqual([{ type: "ping", instanceId: "hinted-instance" }]);
+    channel().receive({ type: "opened", instanceId: "hinted-instance" });
+    expect(await returning).toBe(true);
+    expect(channel().sent.at(-1)).toEqual({ type: "bring-back", instanceId: "hinted-instance" });
+  });
+
+  test("a failed lease during recovery closes a blank window it created but keeps a live child", async () => {
+    updatePersistedState(`desktop-popout:${workspaceId}`, "old-window");
+    const popout = new DesktopPopout(workspaceId, false);
+    popout.attach(
+      () => undefined,
+      undefined,
+      false,
+      () => Promise.resolve(false)
+    );
+    await popout.reconcile(api);
+    // Reacquiring a name nobody holds creates a blank window...
+    const blank = new GlobalWindow({ url: "about:blank" }) as unknown as Window;
+    const closeBlank = spyOn(blank, "close").mockImplementation(() => undefined);
+    openPopup.mockReturnValueOnce(blank);
+    expect(await popout.recover(api).then(() => null, getErrorMessage)).toMatch(/stays open/);
+    expect(closeBlank).toHaveBeenCalledTimes(1);
+    expect(popout.getSnapshot().state).toBe("detached");
+    // ...whereas a live child (our viewer document) is kept for the retry.
+    const close = spyOn(popup, "close");
+    expect(await popout.recover(api).then(() => null, getErrorMessage)).toMatch(/stays open/);
+    expect(close).not.toHaveBeenCalled();
+    expect(
+      channel().sent.filter((sent) => (sent as { type: string }).type === "bring-back")
+    ).toEqual([]);
+  });
+
+  test("handoffInProgress covers an opening popout and a confirmed child, not a bare check or hint", async () => {
+    const popout = new DesktopPopout(workspaceId, false);
+    expect(popout.handoffInProgress()).toBe(false);
+    await popout.open(api);
+    expect(popout.handoffInProgress()).toBe(true);
+    message("ready");
+    expect(popout.handoffInProgress()).toBe(true);
+    message("closed");
+    expect(popout.handoffInProgress()).toBe(false);
+    updatePersistedState(`desktop-popout:${workspaceId}`, "hinted-instance");
+    const hinted = new DesktopPopout(workspaceId, false);
+    // A bare hint is not a handoff; an Electron coordinator still checking is not one either.
+    expect(hinted.handoffInProgress()).toBe(false);
+    expect(new DesktopPopout(workspaceId, true).handoffInProgress()).toBe(false);
   });
 
   test("a hint nobody answers is stale: bring-back rolls back inline without asking anything to close", async () => {

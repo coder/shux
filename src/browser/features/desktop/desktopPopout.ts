@@ -53,6 +53,15 @@ interface PopoutSnapshot {
   error: string | null;
 }
 
+function isBlankWindow(popup: Window): boolean {
+  try {
+    return popup.location.href === "about:blank";
+  } catch {
+    // A cross-origin document is not a window we created.
+    return false;
+  }
+}
+
 const INLINE_LEASE_ERROR =
   "Could not attach this pane before closing the detached desktop; it stays open. Try again.";
 
@@ -165,6 +174,14 @@ export class DesktopPopout {
   private suspend() {
     this.suspendInline?.();
     this.inlineSuspended = true;
+  }
+
+  /** Whether an inline pane unmounting now hands its desktop to a child rather than giving it up. */
+  handoffInProgress(): boolean {
+    return (
+      this.snapshot.state === "opening" ||
+      (this.snapshot.state === "detached" && this.childConfirmed)
+    );
   }
 
   /**
@@ -344,6 +361,15 @@ export class DesktopPopout {
   async bringBack(): Promise<boolean> {
     const instanceId = this.instanceId;
     if (!instanceId) return false;
+    // A reloaded parent whose API client is still reconnecting has not reconciled (and so not
+    // opened the channel) yet; without it the ping would be dropped and a live child mistaken
+    // for a stale hint. An unavailable channel is reported, and the child stays.
+    try {
+      this.listen();
+    } catch (error) {
+      this.update(this.snapshot.state, getErrorMessage(error));
+      return false;
+    }
     this.returning = true;
     this.grantPending = false;
     // Only a confirmed child is asked to close: an unconfirmed hint is pinged first, and a hint
@@ -436,14 +462,22 @@ export class DesktopPopout {
       // A browser reload loses the Window handle, not the named popup. Reacquire it
       // in this user gesture (before any await) so a stale hint can be recovered without
       // granting a second viewer while a live child is still releasing its inputs.
+      const reacquired = this.popup === null;
       this.popup ??= window.open("", `xum-desktop-${this.workspaceId}`, "popup");
       if (!this.popup) throw new Error("Allow popups to reconnect the desktop here.");
+      this.listen();
       // Recovery closes the window whether or not the child answers, so lease the inline pane
       // first: a live child's close is definitive and must not leave the desktop unattached.
       const leased = await this.leaseInline();
       if (this.instanceId !== instanceId) return;
       if (!leased) {
         this.returning = false;
+        // Reacquiring a name no live child holds created a blank window: do not leave it behind.
+        // A live child (its document is our viewer, not about:blank) is kept.
+        if (reacquired && isBlankWindow(this.popup)) {
+          this.popup.close();
+          this.popup = null;
+        }
         throw new Error(INLINE_LEASE_ERROR);
       }
       this.send("bring-back");
