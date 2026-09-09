@@ -12,6 +12,7 @@ import {
   hasAmbiguousResetKeys,
   hasUnreadableHistoryResetEvidence,
   isReadableHistoryMessage,
+  readSpawnedTaskIdsSinceManualReset,
   scanHistoryFilesBounded,
   readProviderHistoryFromLatestBoundary,
   readHistoryControlEvidenceFromLatestBoundary,
@@ -330,13 +331,19 @@ export class HistoryService {
         if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
           throw new Error(options.requireExistingHistory ? "session_unavailable" : "stale_cursor");
         if (options.requireExistingHistory) {
-          const retained = await fs.stat(this.getChatHistoryPath(workspaceId)).then(
-            (stat) => stat.isFile(),
-            (error: NodeJS.ErrnoException) => {
-              if (error.code !== "ENOENT") throw error;
-              return false;
-            }
-          );
+          // Either artifact counts as retained history (mirrors hasHistory): an archive-only
+          // session is a recoverable state the scanner already reads.
+          const isFile = (file: string) =>
+            fs.stat(file).then(
+              (stat) => stat.isFile(),
+              (error: NodeJS.ErrnoException) => {
+                if (error.code !== "ENOENT") throw error;
+                return false;
+              }
+            );
+          const retained =
+            (await isFile(this.getChatHistoryPath(workspaceId))) ||
+            (await isFile(this.getChatArchivePath(workspaceId)));
           if (!retained) throw new Error("session_unavailable");
         }
         // Recovery rewrites history and takes the write lock. This read-only tool
@@ -372,6 +379,22 @@ export class HistoryService {
         await assertNoTruncate();
         return result;
       })
+    );
+  }
+
+  /**
+   * Task IDs the workspace spawned since its latest manual reset. Serialized with writers like
+   * scanHistoryBounded so a concurrent reset cannot be observed half-written.
+   */
+  spawnedTaskIdsSinceManualReset(workspaceId: string): Promise<Set<string>> {
+    assert(workspaceId.trim().length > 0, "spawn evidence requires workspaceId");
+    return this.fileLocks.withLock(workspaceId, () =>
+      this.withHistoryWriteFileLock(workspaceId, () =>
+        readSpawnedTaskIdsSinceManualReset({
+          chat: this.getChatHistoryPath(workspaceId),
+          archive: this.getChatArchivePath(workspaceId),
+        })
+      )
     );
   }
 

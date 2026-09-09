@@ -144,15 +144,21 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           skipped_oversized_rows: 0,
         };
       // Descendant history: only canonical task IDs of this workspace's own
-      // descendants, re-authorized on every call (including cursor continuations).
-      // Unauthorized targets get one generic error so no target metadata leaks.
+      // descendants that the caller's current privacy segment spawned (a manual
+      // reset preserves tasks, so ancestry alone would let the post-reset model
+      // read child output derived from its discarded context). Re-authorized on
+      // every call, including cursor continuations; unauthorized targets get one
+      // generic error so no target metadata leaks.
       const target = args.task_id ?? workspaceId;
       const foreign = target !== workspaceId;
       const authorized =
         !foreign ||
         (taskService !== undefined &&
           // Fail closed: an ancestry lookup failure denies rather than grants.
-          (await taskService.isDescendantAgentTask(workspaceId, target).catch(() => false)));
+          (await taskService.isDescendantAgentTask(workspaceId, target).catch(() => false)) &&
+          (await history.spawnedTaskIdsSinceManualReset(workspaceId).catch(() => new Set())).has(
+            target
+          ));
       if (!authorized)
         return {
           success: false,
