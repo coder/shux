@@ -8,6 +8,7 @@ import React, {
   useMemo,
 } from "react";
 import { Lightbulb } from "lucide-react";
+import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
 import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
@@ -1455,7 +1456,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // margins disable flex-item stretch.
                 chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-4xl mx-auto w-full",
                 // Push the dock to the bottom for short transcripts without reserving
-                // loading space: initial hydration uses the in-flow shimmer, cached replay aria-busy.
+                // loading space: cached replay overlays the dock edge, not transcript rows.
                 "flex-1",
                 // Only the empty/centered placeholder fills height (as a flex column
                 // so the placeholder's flex-1 centering works). The hydration
@@ -1689,6 +1690,21 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   className="bg-surface-primary sticky bottom-0 z-10 mx-[-15px] break-normal whitespace-normal"
                   style={COMPOSER_DOCK_STYLE}
                 >
+                  {isHydratingTranscript &&
+                    !showTranscriptHydrationPlaceholder &&
+                    !shouldMountStreamingBarrier && (
+                      <div
+                        role="status"
+                        data-testid="transcript-loading-status"
+                        className="pointer-events-none absolute inset-x-0 top-0 z-20 h-1 overflow-hidden"
+                      >
+                        <Skeleton
+                          variant="shimmer"
+                          className="bg-muted/30 block h-full w-full rounded-none"
+                        />
+                        <span className="sr-only">Loading messages...</span>
+                      </div>
+                    )}
                   {!autoScroll && (
                     <button
                       onClick={handleJumpToBottom}

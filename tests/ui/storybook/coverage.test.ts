@@ -85,18 +85,6 @@ describe("Storybook coverage contract", () => {
   });
 
   describe("Story-specific visual contracts", () => {
-    test("chat loading phone story pins Pixel and local mobile viewports", () => {
-      const content = readFileSync("src/browser/stories/App.chatLoading.stories.tsx", "utf-8");
-      const initialLoadingIndex = content.indexOf("export const InitialLoadingPhone");
-      const phoneStory = content.slice(content.indexOf("export const Phone"), initialLoadingIndex);
-      expect(phoneStory).toMatch(/viewports:\s*\["phone"\]/);
-      expect(phoneStory).toMatch(/viewport:\s*\{\s*value:\s*"mobile1"/);
-      expect(phoneStory).toMatch(/width:\s*390/);
-      // The frozen first-load snapshot must inherit the same narrow decorator and Pixel policy.
-      expect(initialLoadingIndex).toBeGreaterThan(0);
-      expect(content.slice(initialLoadingIndex)).toMatch(/\.\.\.Phone,/);
-    });
-
     test("plan ToC story pins a wide Pixel viewport", () => {
       const content = readFileSync(PLAN_TOC_STORY_PATH, "utf-8");
 

@@ -16,6 +16,18 @@ import {
 
 export default { ...appMeta, title: "App/ChatLoading" };
 
+async function checkPhoneViewport(context: Parameters<NonNullable<AppStory["play"]>>[0]) {
+  // Check composed metadata and actual layout, not which spread syntax a story used.
+  await expect(context.parameters).toMatchObject({
+    pixel: { matrix: { viewports: expect.arrayContaining(["phone"]) } },
+  });
+  await waitFor(() =>
+    expect(
+      within(context.canvasElement).getByTestId("chat-loading-phone").getBoundingClientRect().width
+    ).toBe(390)
+  );
+}
+
 async function switchWorkspace(canvasElement: HTMLElement, workspaceId: string) {
   expandLeftSidebar();
   const row = await waitFor(async () => {
@@ -41,7 +53,19 @@ async function checkTranscriptLayout(canvasElement: HTMLElement, loading = true)
     );
     // Loading feedback must not reserve a gutter after hydration or cover compact tail rows.
     await expect(getComputedStyle(transcript).paddingBottom).toBe("0px");
-    await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+    const replayStatus = canvas.queryByTestId("transcript-loading-status");
+    if (loading && !canvas.queryByTestId("transcript-hydration-placeholder")) {
+      await expect(replayStatus).toBeVisible();
+      await expect(replayStatus).toHaveAttribute("role", "status");
+      const statusRect = replayStatus!.getBoundingClientRect();
+      const dockRect = canvas.getByTestId("chat-composer-dock").getBoundingClientRect();
+      // Feedback lives inside the existing dock edge, never over the transcript tail.
+      await expect(statusRect.top).toBe(dockRect.top);
+      await expect(statusRect.height).toBeGreaterThan(0);
+      await expect(statusRect.bottom).toBeLessThanOrEqual(dockRect.bottom);
+    } else {
+      await expect(replayStatus).toBeNull();
+    }
     const composer = canvasElement.querySelector(
       '[data-component="ChatInputSurface"], [data-testid="chat-composer-dock"] [role="note"]'
     )!;
@@ -224,8 +248,9 @@ function createHydrationStory(workspaceId: string): AppStory {
         await checkTranscriptLayout(canvasElement);
         await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
         await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
-        await expect(exposedStatuses()).toHaveLength(0);
-        // Replay stays busy while navigation remains available, including on phones.
+        await expect(exposedStatuses()).toHaveLength(1);
+        await expect(exposedStatuses()[0]).toBe(canvas.getByTestId("transcript-loading-status"));
+        // Replay stays visible while navigation remains available, including on phones.
         const scrollport = canvas.getByTestId("message-window");
         await expect(scrollport.scrollHeight).toBeGreaterThan(scrollport.clientHeight);
         scrollport.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
@@ -280,6 +305,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         hadAnyOutput: false,
       });
       await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat({
         type: "stream-start",
@@ -290,6 +316,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         startTime: STABLE_TIMESTAMP,
       });
       await expect(await canvas.findByText(/streaming\.\.\./)).toBeVisible();
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat(history);
       emitChat({
@@ -329,6 +356,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       await expect(
         await canvas.findByText(/Waiting on background bash monitor/, {}, { timeout: 5000 })
       ).toBeVisible();
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
     });
 
@@ -382,11 +410,20 @@ export const Replay: AppStory = {
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
 };
 
+const phoneHydration = createHydrationStory("ws-loading-phone");
+
 export const Phone: AppStory = {
-  ...createHydrationStory("ws-loading-phone"),
+  ...phoneHydration,
+  play: async (context) => {
+    await checkPhoneViewport(context);
+    await phoneHydration.play!(context);
+  },
   decorators: [
     (Story) => (
-      <div style={{ width: 390, maxWidth: "100%", height: "100vh", overflow: "hidden" }}>
+      <div
+        data-testid="chat-loading-phone"
+        style={{ width: 390, maxWidth: "100%", height: "100vh", overflow: "hidden" }}
+      >
         <Story />
       </div>
     ),
@@ -399,9 +436,10 @@ export const Phone: AppStory = {
 export const InitialLoadingPhone: AppStory = {
   ...Phone,
   ...createHydrationStory("ws-loading-initial-phone"),
-  play: async ({ canvasElement }) => {
-    await checkTranscriptLayout(canvasElement);
-    const skeleton = within(canvasElement).getByTestId("transcript-hydration-placeholder");
+  play: async (context) => {
+    await checkPhoneViewport(context);
+    await checkTranscriptLayout(context.canvasElement);
+    const skeleton = within(context.canvasElement).getByTestId("transcript-hydration-placeholder");
     await expect(skeleton).toBeVisible();
     // A fixed-height phone canvas can autofocus-scroll the initial shimmer out of view.
     await expect(skeleton.getBoundingClientRect().top).toBeGreaterThanOrEqual(0);
