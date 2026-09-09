@@ -2164,7 +2164,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       )
     );
     expect(writePartialResult.success).toBe(true);
-    expect(await session.getStartupRecoveryState()).toBe("blocked");
+    expect(await session.getStartupRecoveryState()).toBe("question");
 
     await session.ensureStartupAutoRetryCheck();
 

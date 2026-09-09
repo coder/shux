@@ -29,6 +29,7 @@ import type { ProjectsConfig } from "@/common/types/project";
 import type { Config, SecretsStore } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { SessionTimingService } from "./sessionTimingService";
 import { SessionUsageService } from "./sessionUsageService";
 import type { AIService } from "./aiService";
@@ -9770,6 +9771,119 @@ describe("WorkspaceService rename lock", () => {
     }
   });
 });
+
+test.each([
+  { source: "partial", live: false },
+  { source: "history", live: true },
+])(
+  "restored question guidance queues without dispatch and dedupes live sends (%j)",
+  async ({ source, live }) => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "restored-question";
+    const projectPath = path.join(config.rootDir, "repo");
+    await saveWorkspaces(config, projectPath, [
+      projectWorkspace(projectPath, "child", workspaceId),
+    ]);
+    const { session, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      config,
+      historyService,
+    });
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: aiService as unknown as AIService,
+    });
+    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      workspaceId,
+      session
+    );
+    const question = createMuxMessage("question", "assistant", "", {}, [
+      {
+        type: "dynamic-tool",
+        state: "input-available",
+        toolCallId: "ask-restored",
+        toolName: "ask_user_question",
+        input: {
+          questions: [
+            {
+              header: "Choice",
+              question: "Which option?",
+              options: [
+                { label: "First", description: "Use first" },
+                { label: "Second", description: "Use second" },
+              ],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+    ]);
+    await historyService.appendToHistory(workspaceId, createMuxMessage("user", "user", "Work"));
+    if (source === "partial") await historyService.writePartial(workspaceId, question);
+    else await historyService.appendToHistory(workspaceId, question);
+    const queue = spyOn(session, "queueMessage");
+    const send = spyOn(session, "sendMessage");
+    const drain = spyOn(session, "drainQueuedMessagesIfIdle");
+    const busy = spyOn(session, "isBusy").mockReturnValue(live);
+    const accepted = mock(() => undefined);
+    const internal = {
+      synthetic: true,
+      agentInitiated: true,
+      queueDedupeKey: "durable-guidance",
+      onAccepted: accepted,
+    };
+    const options = {
+      model: "openai:gpt-5.2",
+      agentId: "exec",
+      queueDispatchMode: "turn-end" as const,
+    };
+    try {
+      expect(
+        await workspaceService.sendMessage(workspaceId, "Correction", options, {
+          ...internal,
+          restoreQueued: !live,
+        })
+      ).toEqual(Ok(undefined));
+      if (!live) expect(drain).not.toHaveBeenCalled();
+      busy.mockReturnValue(false);
+      const drainsBeforeRestore = drain.mock.calls.length;
+      for (const restoreQueued of [true, true, false]) {
+        expect(
+          await workspaceService.sendMessage(workspaceId, "Correction", options, {
+            ...internal,
+            restoreQueued,
+          })
+        ).toEqual(Ok(undefined));
+      }
+      expect(queue).toHaveBeenCalledTimes(1);
+      expect(queue.mock.calls[0]?.[1]?.queueDispatchMode).toBe("turn-end");
+      expect(drain).toHaveBeenCalledTimes(drainsBeforeRestore);
+      expect(send).not.toHaveBeenCalled();
+      expect(accepted).not.toHaveBeenCalled();
+      const readQuestion = async () => {
+        if (source === "partial") return historyService.readPartial(workspaceId);
+        const history = await historyService.getLastMessages(workspaceId, 1);
+        expect(history.success).toBe(true);
+        return history.success ? history.data[0] : undefined;
+      };
+      expect((await readQuestion())?.parts[0]).toMatchObject({ state: "input-available" });
+      expect(
+        await workspaceService.answerAskUserQuestion(workspaceId, "ask-restored", {
+          "Which option?": "First",
+        })
+      ).toEqual(Ok(undefined));
+      expect((await readQuestion())?.parts[0]).toMatchObject({ state: "output-available" });
+      expect(session.hasQueuedDedupeKey(internal.queueDedupeKey)).toBe(true);
+      expect(accepted).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      busy.mockRestore();
+      await session.dispose();
+      await cleanup();
+    }
+  }
+);
 
 describe("WorkspaceService sendMessage status clearing", () => {
   let workspaceService: WorkspaceService;

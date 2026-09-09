@@ -2413,8 +2413,12 @@ export class TaskService implements AgentTaskIntegration {
     const eligible = startupTasks().filter(
       (task) => states.has(task.id) && states.get(task.id) !== "blocked"
     );
-    const awaitingReportTasks = eligible.filter((task) => task.taskStatus === "awaiting_report");
-    const runningTasks = eligible.filter((task) => (task.taskStatus ?? "running") === "running");
+    const awaitingReportTasks = eligible.filter(
+      (task) => task.taskStatus === "awaiting_report" && states.get(task.id) !== "question"
+    );
+    const runningTasks = eligible.filter(
+      (task) => (task.taskStatus ?? "running") === "running" || states.get(task.id) === "question"
+    );
 
     const admitRecovery = async (task: (typeof eligible)[number], reason: string) => {
       if (
@@ -2473,6 +2477,8 @@ export class TaskService implements AgentTaskIntegration {
       if (!(await admitRecovery(task, "startup-running"))) continue;
 
       const pendingGuidance = task.taskPendingGuidance ?? [];
+      const queueOnly = states.get(task.id) === "question";
+      if (queueOnly && pendingGuidance.length === 0) continue;
       const alreadyStreaming = this.aiService.isStreaming(task.id);
       // Guidance must queue even for active tasks; generic restart nudges must not.
       if (alreadyStreaming && pendingGuidance.length === 0) {
@@ -2488,9 +2494,10 @@ export class TaskService implements AgentTaskIntegration {
 
       // Restore compaction intent before new guidance/nudges make its tail stale.
       // Guidance then queues behind that continuation without losing either payload.
-      const followUp = alreadyStreaming
-        ? Ok(false)
-        : await this.workspaceService.dispatchPendingCompactionFollowUp(task.id);
+      const followUp =
+        alreadyStreaming || queueOnly
+          ? Ok(false)
+          : await this.workspaceService.dispatchPendingCompactionFollowUp(task.id);
       if (!followUp.success) failedRunningCount += 1;
       else if (followUp.data && pendingGuidance.length === 0) resumedRunningCount += 1;
       if (!followUp.success || (followUp.data && pendingGuidance.length === 0)) continue;
@@ -2504,32 +2511,22 @@ export class TaskService implements AgentTaskIntegration {
         experiments: task.taskExperiments,
       };
       if (pendingGuidance.length > 0) {
-        const pendingGuidanceIds = new Set(pendingGuidance.map((guidance) => guidance.id));
-        const clearAcceptedPendingGuidance = async (): Promise<void> => {
-          await this.editWorkspaceEntry(
-            task.id!,
-            (workspace) => {
-              const remaining = (workspace.taskPendingGuidance ?? []).filter(
-                (guidance) => !pendingGuidanceIds.has(guidance.id)
-              );
-              workspace.taskPendingGuidance = remaining.length > 0 ? remaining : undefined;
-            },
-            { allowMissing: true }
+        let sendResult: Result<void, SendMessageError> = Ok(undefined);
+        for (const guidance of pendingGuidance) {
+          sendResult = await this.workspaceService.sendMessage(
+            task.id,
+            `Updated guidance from parent:\n\n${guidance.message}`,
+            { ...sendOptions, queueDispatchMode: guidance.queueDispatchMode },
+            {
+              synthetic: true,
+              agentInitiated: true,
+              queueDedupeKey: guidance.id,
+              restoreQueued: queueOnly,
+              onAccepted: () => this.clearPendingTaskGuidance(task.id!, guidance.id),
+            }
           );
-        };
-        const sendResult = await this.workspaceService.sendMessage(
-          task.id,
-          "Xum restarted before these parent guidance updates could run. Apply them in order and continue:\n\n" +
-            pendingGuidance
-              .map((guidance, index) => `${index + 1}. ${guidance.message}`)
-              .join("\n\n"),
-          sendOptions,
-          {
-            synthetic: true,
-            agentInitiated: true,
-            onAccepted: clearAcceptedPendingGuidance,
-          }
-        );
+          if (!sendResult.success) break;
+        }
         if (!sendResult.success) {
           failedRunningCount += 1;
           log.error("Failed to replay pending task guidance on startup", {
@@ -4652,17 +4649,14 @@ export class TaskService implements AgentTaskIntegration {
         await this.editActiveWorkspaceEntry(
           taskId,
           (workspace) => {
-            workspace.taskPendingGuidance = [
-              ...(workspace.taskPendingGuidance ?? []),
-              {
-                id: guidanceId,
-                // Startup-recovery replay presents reservations as parent guidance, so
-                // non-default labels (sibling messages) must keep their attribution in
-                // the durable record.
-                message: options?.messageLabel != null ? labeledMessage : trimmedMessage,
-                queueDispatchMode,
-              },
-            ];
+            (workspace.taskPendingGuidance ??= []).push({
+              id: guidanceId,
+              // Startup-recovery replay presents reservations as parent guidance, so
+              // non-default labels (sibling messages) must keep their attribution in
+              // the durable record.
+              message: options?.messageLabel != null ? labeledMessage : trimmedMessage,
+              queueDispatchMode,
+            });
             if (workspace.taskStatus == null || previousStatus === "awaiting_report") {
               // Persist the legacy implicit-running state so startup recovery can replay this durable
               // guidance if Xum exits before the replacement turn accepts it.
@@ -4672,29 +4666,6 @@ export class TaskService implements AgentTaskIntegration {
           { allowMissing: true }
         );
 
-        const clearGuidanceReservation = async (restoreAfterFailure: boolean): Promise<void> => {
-          await this.editWorkspaceEntry(
-            taskId,
-            (workspace) => {
-              const remainingGuidance = (workspace.taskPendingGuidance ?? []).filter(
-                (guidance) => guidance.id !== guidanceId
-              );
-              workspace.taskPendingGuidance =
-                remainingGuidance.length > 0 ? remainingGuidance : undefined;
-              if (
-                restoreAfterFailure &&
-                remainingGuidance.length === 0 &&
-                workspace.taskStatus === "running"
-              ) {
-                workspace.taskStatus = this.aiService.isStreaming(taskId)
-                  ? previousStatus
-                  : "awaiting_report";
-              }
-            },
-            { allowMissing: true }
-          );
-        };
-
         const activeAgentId = resolveTaskAgentIdForResume(entry.workspace);
         const activeAiSettings = this.resolveWorkspaceAISettings(entry.workspace, activeAgentId);
         // Parent guidance continues the delegated execution, rather than superseding it and
@@ -4703,6 +4674,17 @@ export class TaskService implements AgentTaskIntegration {
           await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
             taskId
           );
+        const settleFailure = async (status: "interrupted" | "error", reason: string) => {
+          await this.clearPendingTaskGuidance(taskId, guidanceId, previousStatus);
+          if (workspaceTurnMuxMetadata != null) {
+            await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
+              taskId,
+              workspaceTurnMuxMetadata,
+              status,
+              reason
+            );
+          }
+        };
         let accepted = false;
         const sendResult = await this.workspaceService.sendMessage(
           taskId,
@@ -4726,50 +4708,28 @@ export class TaskService implements AgentTaskIntegration {
             agentInitiated: true,
             startStreamInBackground: true,
             workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
-            ...(workspaceTurnMuxMetadata != null
-              ? {
-                  onCanceled: async (reason: string) => {
-                    await clearGuidanceReservation(true);
-                    await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-                      taskId,
-                      workspaceTurnMuxMetadata,
-                      "interrupted",
-                      reason
-                    );
-                  },
-                }
-              : {}),
+            queueDedupeKey: guidanceId,
+            onCanceled: (reason) => settleFailure("interrupted", reason),
             // Live target: pre-turn rows ride the send through AgentSession
             // turn admission (queued with the trigger when the target is busy).
             preTurnMessages: options?.preTurnMessages,
-            onAcceptedPreStreamFailure: async (error: SendMessageError) => {
-              // If the replacement turn cannot start, remove the settlement reservation and restore
-              // an idle child to completion recovery instead of leaving it permanently running.
-              await clearGuidanceReservation(true);
-              if (workspaceTurnMuxMetadata != null) {
-                await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-                  taskId,
-                  workspaceTurnMuxMetadata,
-                  "error",
-                  formatSendMessageError(error).message
-                );
-              }
-            },
+            // If the replacement turn cannot start, remove the settlement reservation and restore
+            // an idle child to completion recovery instead of leaving it permanently running.
+            onAcceptedPreStreamFailure: (error) =>
+              settleFailure("error", formatSendMessageError(error).message),
             onAccepted: async () => {
-              await clearGuidanceReservation(false);
+              await this.clearPendingTaskGuidance(taskId, guidanceId);
               accepted = true;
             },
             // r54: persistence is signaled at the rollback horizon, not at
             // acceptance — acceptance can fail after the pre-turn batch is
             // already irrevocable, and the budget charge must stick then.
-            onPreTurnRowsPersisted: () => {
-              options?.onPreTurnPersisted?.();
-            },
+            onPreTurnRowsPersisted: options?.onPreTurnPersisted,
           }
         );
 
         if (!sendResult.success) {
-          await clearGuidanceReservation(true);
+          await this.clearPendingTaskGuidance(taskId, guidanceId, previousStatus);
           return Err({
             code: "send_failed" as const,
             message: formatSendMessageError(sendResult.error).message,
@@ -4778,6 +4738,28 @@ export class TaskService implements AgentTaskIntegration {
 
         return Ok(accepted ? { delivery: "accepted" } : { delivery: "queued", queueDispatchMode });
       })
+    );
+  }
+
+  private async clearPendingTaskGuidance(
+    taskId: string,
+    guidanceId: string,
+    restoreStatus?: AgentTaskStatus
+  ): Promise<void> {
+    await this.editWorkspaceEntry(
+      taskId,
+      (workspace) => {
+        const remaining = (workspace.taskPendingGuidance ?? []).filter(
+          (guidance) => guidance.id !== guidanceId
+        );
+        workspace.taskPendingGuidance = remaining.length > 0 ? remaining : undefined;
+        if (restoreStatus != null && remaining.length === 0 && workspace.taskStatus === "running") {
+          workspace.taskStatus = this.aiService.isStreaming(taskId)
+            ? restoreStatus
+            : "awaiting_report";
+        }
+      },
+      { allowMissing: true }
     );
   }
 

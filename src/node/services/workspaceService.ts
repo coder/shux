@@ -11020,6 +11020,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           raw: CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
         });
       }
+      const dedupeKey = internal?.queueDedupeKey;
+      if (dedupeKey && this.sessions.get(workspaceId)?.hasQueuedDedupeKey(dedupeKey)) {
+        return Ok(undefined);
+      }
+      // Restarted questions have no busy phase: regain their queue without preflight or dispatch.
+      if (internal?.restoreQueued) {
+        this.getOrCreateSession(workspaceId).queueMessage(message, options, {
+          ...internal,
+          dedupeKey,
+        });
+        return Ok(undefined);
+      }
       // r41: capture the mutation epoch in the same synchronous block as the
       // entry check; the session's admission gates re-verify it so a
       // reset/clear/replace that completes while this send is still doing

@@ -79,6 +79,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AIService } from "@/node/services/aiService";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { InitStateManager as RealInitStateManager } from "@/node/services/initStateManager";
 import assert from "node:assert";
@@ -3390,14 +3391,137 @@ describe("TaskService", () => {
 
       await taskService.initialize();
 
-      expect(sendMessage).toHaveBeenCalledWith(
-        childTaskId,
-        expect.stringContaining("1. First correction\n\n2. Second correction"),
-        expect.objectContaining({ model: "openai:gpt-5.2", agentId: "exec" }),
-        expect.objectContaining({ synthetic: true, agentInitiated: true })
-      );
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+      for (const [index, mode] of ["turn-end", "tool-end"].entries()) {
+        expect(sendMessage.mock.calls[index]?.[2]).toMatchObject({ queueDispatchMode: mode });
+        expect(sendMessage.mock.calls[index]?.[3]).toMatchObject({
+          synthetic: true,
+          agentInitiated: true,
+          queueDedupeKey: "guidance-" + (index + 1),
+        });
+      }
       expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toBeUndefined();
-      expect(recovered).toEqual(["compaction", "guidance"]);
+      expect(recovered).toEqual(["compaction", "guidance", "guidance"]);
+    }
+  );
+
+  test.each(["running", "awaiting_report", "stopped", "opted-out"] as const)(
+    "startup restores question guidance only as a queue (%s)",
+    async (state) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const childId = "question-child";
+      const guidance = [
+        { id: "first", message: "First correction", queueDispatchMode: "turn-end" as const },
+        { id: "second", message: "Second correction", queueDispatchMode: "tool-end" as const },
+      ];
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", "parent"),
+          projectWorkspace(projectPath, "child", childId, {
+            parentWorkspaceId: "parent",
+            agentId: "exec",
+            agentType: "exec",
+            taskStatus: state === "awaiting_report" ? "awaiting_report" : "running",
+            taskModelString: "openai:gpt-5.2",
+            taskPendingGuidance: guidance,
+          }),
+        ],
+        testTaskSettings()
+      );
+      const sends: Array<Parameters<WorkspaceHost["sendMessage"]>> = [];
+      const sendMessage = mock((...args: Parameters<WorkspaceHost["sendMessage"]>) => {
+        sends.push(args);
+        return Promise.resolve(Ok(undefined));
+      });
+      const compaction = mock(() => Promise.resolve(Ok(false)));
+      const { workspaceService } = createWorkspaceServiceMocks({
+        sendMessage,
+        dispatchPendingCompactionFollowUp: compaction,
+      });
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      await historyService.appendToHistory(childId, createMuxMessage("user", "user", "Work"));
+      await historyService.writePartial(
+        childId,
+        createMuxMessage("question", "assistant", "", {}, [
+          {
+            type: "dynamic-tool",
+            state: "input-available",
+            toolCallId: "ask",
+            toolName: "ask_user_question",
+            input: { question: "Which option?" },
+          },
+        ])
+      );
+      if (state === "stopped" || state === "opted-out") {
+        await fsPromises.writeFile(
+          path.join(config.sessionsDir, childId, "auto-retry-preference.json"),
+          JSON.stringify(
+            state === "stopped"
+              ? { startupAutoRetryAbandon: { reason: "aborted", userMessageId: "user" } }
+              : { enabled: false }
+          )
+        );
+      }
+      const { session } = await createAgentSessionHarness({
+        workspaceId: childId,
+        config,
+        historyService,
+      });
+      workspaceService.getStartupRecoveryState = () => session.getStartupRecoveryState();
+      try {
+        await taskService.initialize();
+        expect(compaction).not.toHaveBeenCalled();
+        expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toEqual(guidance);
+        if (state === "stopped" || state === "opted-out") {
+          expect(sends).toHaveLength(0);
+          return;
+        }
+        expect(sends).toHaveLength(2);
+        for (const [index, entry] of guidance.entries()) {
+          expect(sends[index]?.[2].queueDispatchMode).toBe(entry.queueDispatchMode);
+          expect(sends[index]?.[3]).toMatchObject({
+            restoreQueued: true,
+            queueDedupeKey: entry.id,
+          });
+        }
+        const finalEvent: StreamEndEvent = {
+          type: "stream-end",
+          workspaceId: childId,
+          messageId: "final",
+          metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+          parts: [{ type: "text", text: "Finished with the corrections" }],
+        };
+        await handleTaskServiceStreamEndForTest(taskService, finalEvent);
+        expect(findWorkspaceInConfig(config, childId)?.taskStatus).not.toBe("reported");
+        await taskService.sendMessageToDescendantAgentTask(
+          "parent",
+          childId,
+          "Later correction",
+          "turn-end"
+        );
+        const later = findWorkspaceInConfig(config, childId)?.taskPendingGuidance?.[2];
+        assert(later != null);
+        expect(sends[2]?.[3]?.queueDedupeKey).toBe(later.id);
+        await sends[0]?.[3]?.onAccepted?.();
+        expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toEqual([
+          guidance[1],
+          later,
+        ]);
+        await sends[1]?.[3]?.onAccepted?.();
+        expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toEqual([later]);
+        await sends[2]?.[3]?.onAccepted?.();
+        expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toBeUndefined();
+        await historyService.deletePartial(childId);
+        await handleTaskServiceStreamEndForTest(taskService, finalEvent);
+        expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
+      } finally {
+        await session.dispose();
+      }
     }
   );
 

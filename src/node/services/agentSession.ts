@@ -2775,11 +2775,6 @@ export class AgentSession {
         { signal, wait: (delay) => this.waitForStartupReadRetry(delay, signal) }
       ).catch(() => undefined)) ?? [];
     if (!history?.success || partial === undefined) return "blocked";
-    if (
-      this.isPendingAskUserQuestion(partial) ||
-      this.isPendingAskUserQuestion(this.getLastNonSystemHistoryMessage(history.data))
-    )
-      return "blocked";
     const abandon = this.startupAutoRetryAbandon;
     if (abandon?.reason === "aborted") {
       // Accepted synthetic guidance is new intent too; snapshots/notices are not.
@@ -2791,6 +2786,12 @@ export class AgentSession {
       if (!abandon.userMessageId || !latest || latest.id === abandon.userMessageId)
         return "blocked";
     }
+    // A question may regain its lost queue, but must never override an applicable Stop.
+    if (
+      this.isPendingAskUserQuestion(partial) ||
+      this.isPendingAskUserQuestion(this.getLastNonSystemHistoryMessage(history.data))
+    )
+      return "question";
     return this.hasInterruptedStartupTail(partial, history.data) ? "interrupted" : "idle";
   }
 

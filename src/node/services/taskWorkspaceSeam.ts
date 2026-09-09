@@ -365,6 +365,8 @@ export interface SendMessageInternalOptions {
   workspaceTurnContinuation?: boolean;
   /** Coalescing for queued sends: drop the message when the same key is already queued. */
   queueDedupeKey?: string;
+  /** Restore durable guidance behind a restarted question without dispatching a turn. */
+  restoreQueued?: boolean;
   /** Keep this dedupe-keyed queue entry isolated so it can be selectively superseded. */
   removableQueueDedupeKey?: boolean;
   /**
