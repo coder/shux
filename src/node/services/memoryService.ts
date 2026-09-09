@@ -1655,9 +1655,16 @@ export class MemoryService extends EventEmitter {
           // from the cap on write (writePinnedFile), so it must survive the cut
           // too or the flush handoff would vanish from the next window's index.
           log.debug("[MemoryService] truncating memory index to the per-scope cap", { scope });
-          // The bounded walk may have stopped before reaching the notes: probe them directly.
+          // The bounded walk may have stopped before reaching the notes: probe them
+          // directly. lstat (not store.kind, which follows symlinks) so the probe
+          // admits exactly what the walk's dirent filter would: a regular file. A
+          // symlinked notes slot must not smuggle an out-of-root file into the index.
           const keepNotes =
-            scope === CONTEXT_NOTES.scope && (await store.kind(CONTEXT_NOTES.relPath)) === "file";
+            scope === CONTEXT_NOTES.scope &&
+            (await fsPromises
+              .lstat(store.physicalPath(CONTEXT_NOTES.relPath))
+              .then((stat) => stat.isFile())
+              .catch(() => false));
           files.length = MEMORY_MAX_FILES_PER_SCOPE - (keepNotes ? 1 : 0);
           if (keepNotes && !files.includes(CONTEXT_NOTES.relPath))
             files.push(CONTEXT_NOTES.relPath);

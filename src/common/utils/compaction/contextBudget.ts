@@ -11,11 +11,43 @@ import {
   SYSTEM_FLOOR_TOKENS_ESTIMATE,
   WARNING_ADVANCE_MIN_TOKENS,
   FLUSH_RESERVE_TOKENS,
+  FLUSH_MAX_OUTPUT_TOKENS,
 } from "@/common/constants/contextBudget";
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { ANTHROPIC_THINKING_BUDGETS, type ThinkingLevel } from "@/common/types/thinking";
+import { enforceThinkingPolicy, resolveMinimumThinkingLevel } from "@/common/utils/thinking/policy";
 
 export type ContextBudgetExceeded = Extract<SendMessageError, { type: "context_budget_exceeded" }>;
+
+/**
+ * Output cap for the hidden flush step at a given thinking level: the notes-sized cap plus that
+ * level's Anthropic thinking budget (the API rejects a budget that is not strictly below
+ * max_tokens). Every model that may run the flush — the primary and each refusal fallback —
+ * must derive its cap from its OWN resolved level, not inherit the primary's.
+ */
+export function getContextBudgetFlushMaxOutputTokens(level: ThinkingLevel): number {
+  return FLUSH_MAX_OUTPUT_TOKENS + ANTHROPIC_THINKING_BUDGETS[level];
+}
+
+/**
+ * Thinking and output cap for the hidden flush step on one model. It is housekeeping, so the
+ * user's configured thinking floor does not apply — only the model's inherent minimum. Shared by
+ * admission (headroom) and the stream request so both agree.
+ */
+export function resolveContextBudgetFlushThinking(
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null
+): { level: ThinkingLevel; maxOutputTokens: number } {
+  const level = enforceThinkingPolicy(
+    modelString,
+    "off",
+    resolveMinimumThinkingLevel(modelString, undefined, providersConfig),
+    providersConfig
+  );
+  return { level, maxOutputTokens: getContextBudgetFlushMaxOutputTokens(level) };
+}
 
 /** Keep output headroom without making supported small context windows unusable. */
 export function getContextBudgetHardCeiling(modelContextLimit: number): number {

@@ -15,13 +15,13 @@ import { resolveMemoryAccessPolicy } from "./tools/memory";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
-  FLUSH_MAX_OUTPUT_TOKENS,
   FLUSH_RESERVE_TOKENS,
   OUTPUT_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
   getContextBudgetHardCeiling,
+  resolveContextBudgetFlushThinking,
 } from "@/common/utils/compaction/contextBudget";
 import {
   createRolloverPrefix,
@@ -96,7 +96,7 @@ import {
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import { isWorkspaceArchived } from "@/common/utils/archive";
-import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
@@ -117,7 +117,6 @@ import {
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import {
-  ANTHROPIC_THINKING_BUDGETS,
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
   type ThinkingLevel,
@@ -5082,25 +5081,6 @@ export class AgentSession {
   }
 
   /**
-   * Thinking and output cap for the hidden flush step. It is housekeeping, so the user's
-   * configured thinking floor does not apply — only the model's inherent minimum — and the cap
-   * sits above that level's Anthropic thinking budget (the API rejects a budget that is not below
-   * max_tokens). Shared by admission (headroom) and the stream request so both agree.
-   */
-  private resolveFlushThinking(
-    modelString: string,
-    providersConfig: ProvidersConfigMap | null
-  ): { level: ThinkingLevel; maxOutputTokens: number } {
-    const level = enforceThinkingPolicy(
-      modelString,
-      "off",
-      resolveMinimumThinkingLevel(modelString, undefined, providersConfig),
-      providersConfig
-    );
-    return { level, maxOutputTokens: FLUSH_MAX_OUTPUT_TOKENS + ANTHROPIC_THINKING_BUDGETS[level] };
-  }
-
-  /**
    * Drop a pending reset (intent, pinned snapshot, flush claim) without touching queued
    * continuations: used when rollover can no longer seal the window but a paired "Continue"
    * must still dispatch as an ordinary continuation.
@@ -5772,11 +5752,24 @@ export class AgentSession {
     if (userMessage.metadata?.muxMetadata?.contextBudgetFlush === true) {
       const rolloverEnabled = this.compactionMonitor.getThreshold() < 1;
       // The hard ceiling reserves OUTPUT_RESERVE_TOKENS for the step's output; a model whose
-      // inherent thinking minimum needs a larger flush cap must find that extra room too.
+      // inherent thinking minimum needs a larger flush cap must find that extra room too. A
+      // refusal may hand the flush to a fallback model with its own (possibly higher) minimum,
+      // so size the headroom for the largest cap any model in the chain would run with.
       const flushOutputBeyondReserve = Math.max(
         0,
-        this.resolveFlushThinking(options.model, providersConfig).maxOutputTokens -
-          OUTPUT_RESERVE_TOKENS
+        ...[
+          options.model,
+          ...resolveWorkspaceModelFallbackChain(
+            this.config.loadConfigOrDefault(),
+            this.workspaceId,
+            options.model,
+            providersConfig
+          ),
+        ].map(
+          (model) =>
+            resolveContextBudgetFlushThinking(model, providersConfig).maxOutputTokens -
+            OUTPUT_RESERVE_TOKENS
+        )
       );
       const flushStillSafe =
         decision.hardCeiling !== undefined &&
@@ -7335,7 +7328,7 @@ export class AgentSession {
       // configured floor is for real work) and a bounded cap sized for that level, so an
       // inherited medium/high level cannot make the only preservation step fail or overrun.
       const flushThinking = contextBudgetFlushTurn
-        ? this.resolveFlushThinking(modelString, providersConfig)
+        ? resolveContextBudgetFlushThinking(modelString, providersConfig)
         : undefined;
       // The flush turn is bounded to one provider step. If a crash left that step's completed
       // memory call on disk (committed above), the resumed request gets no tools at all so the

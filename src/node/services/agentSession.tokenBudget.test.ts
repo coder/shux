@@ -1436,14 +1436,23 @@ describe("AgentSession token-budget lifecycle", () => {
   });
 
   test.each([
-    // gpt-5.2 cannot go below medium thinking: its flush cap must exceed a 10k budget, i.e. it
-    // needs room beyond OUTPUT_RESERVE_TOKENS that a near-ceiling window no longer has.
-    ["openai:gpt-5.2", false],
-    [model, true],
+    // gpt-5.2 cannot go below medium thinking: its flush cap must exceed
+    // ANTHROPIC_THINKING_BUDGETS.medium, i.e. it needs room beyond OUTPUT_RESERVE_TOKENS that a
+    // near-ceiling window no longer has.
+    ["openai:gpt-5.2", false, undefined],
+    [model, true, undefined],
+    // A refusal may hand the flush to the fallback, which then needs that same room.
+    [model, false, "openai:gpt-5.2"],
   ])(
-    "dispatch-time headroom accounts for the flush cap the model's thinking minimum requires (%s)",
-    async (sendModel, admitted) => {
+    "dispatch-time headroom accounts for the flush cap the model's thinking minimum requires (%s, admitted=%p, fallback=%p)",
+    async (sendModel, admitted, fallbackModel) => {
       const h = await setup();
+      if (fallbackModel !== undefined) {
+        await h.config.editConfig((cfg) => ({
+          ...cfg,
+          modelFallbacks: { [sendModel]: { models: [fallbackModel] } },
+        }));
+      }
       spyOn(contextLimits, "getEffectiveContextLimit").mockReturnValue(128_000);
       expect((await h.session.sendMessage("Work", { ...options, model: sendModel })).success).toBe(
         true

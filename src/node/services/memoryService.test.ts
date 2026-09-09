@@ -1010,6 +1010,30 @@ describe("MemoryService", () => {
       expect(entries[0]?.relPath).toBe("a0000.md");
     });
 
+    it("drops a symlinked context-notes slot from the over-cap probe", async () => {
+      using fixture = await createFixture();
+      // The direct probe must admit only what the walk's dirent filter admits: a symlink
+      // pointing outside the root would otherwise be read into the provider request.
+      const memoryDir = path.join(fixture.xumHome, "sessions", fixture.ctx.workspaceId, "memory");
+      await fsPromises.mkdir(memoryDir, { recursive: true });
+      const outside = path.join(fixture.xumHome, "outside-secret.md");
+      await fsPromises.writeFile(outside, "---\ndescription: leaked\n---\n");
+      await Promise.all([
+        ...Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE + 5 }, (_, i) =>
+          fsPromises.writeFile(path.join(memoryDir, `a${String(i).padStart(4, "0")}.md`), "x")
+        ),
+        fsPromises.symlink(outside, path.join(memoryDir, "context-notes.md")),
+      ]);
+      const entries = (await fixture.service.listIndexEntries(fixture.ctx)).filter(
+        (entry) => entry.scope === "workspace"
+      );
+      expect(entries).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
+      expect(entries.map((entry) => entry.path)).not.toContain(
+        "/memories/workspace/context-notes.md"
+      );
+      expect(entries.some((entry) => entry.description === "leaked")).toBe(false);
+    });
+
     it("caps indexed files per scope to the declared limit", async () => {
       using fixture = await createFixture();
       // Files edited outside MemoryService can bypass the write-time per-scope

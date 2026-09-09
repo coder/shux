@@ -7,6 +7,8 @@ import { TelemetryService } from "./telemetryService";
 import { MemoryService } from "./memoryService";
 import { MemoryMetaService } from "./memoryMeta";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { FLUSH_MAX_OUTPUT_TOKENS } from "@/common/constants/contextBudget";
+import { ANTHROPIC_THINKING_BUDGETS } from "@/common/types/thinking";
 import * as fs from "node:fs/promises";
 import { attachLanguageModelCleanup, runLanguageModelCleanup } from "./languageModelCleanup";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -678,6 +680,83 @@ describe("pinned full-payload rollover admission", () => {
         ).success
       ).toBe(true);
       expect(startServers).toHaveBeenCalledTimes(1);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test("a final-flush fallback runs at its own inherent thinking minimum with a matching cap", async () => {
+    const fixture = await setup("small");
+    const { h, config, start } = fixture;
+    // gpt-5.2 cannot go below medium thinking, and the user floor for it is higher still; the
+    // flush must ignore the floor (housekeeping) but size its cap for the model's own minimum.
+    const fallbackModel = "openai:gpt-5.2";
+    await config.editConfig((cfg) => ({
+      ...cfg,
+      modelFallbacks: { [model]: { models: [fallbackModel] } },
+      minThinkingLevelByModel: { [fallbackModel]: "high" },
+    }));
+    h.session.setAutoCompactionThreshold(1);
+    try {
+      expect(
+        (
+          await fixture.historyService.appendToHistory(
+            workspaceId,
+            createMuxMessage("flush-trigger", "user", "Flush context notes now.", {
+              synthetic: true,
+              uiVisible: false,
+              muxMetadata: {
+                type: "normal",
+                contextBudgetContinuation: true,
+                contextBudgetFlush: true,
+              },
+            })
+          )
+        ).success
+      ).toBe(true);
+      expect(
+        (
+          await h.session.resumeStream({
+            model,
+            agentId: "exec",
+            thinkingLevel: "high",
+            experiments: { tokenBudget: false },
+          })
+        ).success
+      ).toBe(true);
+      expect(start).toHaveBeenCalledTimes(1);
+      const primary = start.mock.calls[0][0];
+      // The primary's inherent minimum is off, so its cap carries no thinking budget.
+      expect(primary.maxOutputTokens).toBe(FLUSH_MAX_OUTPUT_TOKENS);
+      const fallback = await primary.modelFallback!.prepare(fallbackModel, {
+        thinkingLevelOverride: "high",
+      });
+      expect(fallback.success).toBe(true);
+      if (fallback.success) {
+        expect(fallback.data.thinkingLevel).toBe("medium");
+        expect(fallback.data.maxOutputTokens).toBe(
+          FLUSH_MAX_OUTPUT_TOKENS + ANTHROPIC_THINKING_BUDGETS.medium
+        );
+      }
+      await h.session.interruptStream();
+      await h.session.waitForIdle();
+      // Control: an ordinary turn's fallback honors the user floor and keeps the caller's cap.
+      expect(
+        (
+          await h.session.sendMessage("Ordinary turn", {
+            model,
+            agentId: "exec",
+            thinkingLevel: "off",
+            experiments: { tokenBudget: false },
+          })
+        ).success
+      ).toBe(true);
+      const ordinary = await start.mock.calls[1][0].modelFallback!.prepare(fallbackModel);
+      expect(ordinary.success).toBe(true);
+      if (ordinary.success) {
+        expect(ordinary.data.thinkingLevel).toBe("high");
+        expect(ordinary.data.maxOutputTokens).toBeUndefined();
+      }
     } finally {
       await fixture.cleanup();
     }

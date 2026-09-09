@@ -12,6 +12,7 @@ import {
   type MemoryScopeAccess,
 } from "@/common/constants/memory";
 import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
+import { getContextBudgetFlushMaxOutputTokens } from "@/common/utils/compaction/contextBudget";
 import {
   resolveHeadlessAgentDefinition,
   resolveHeadlessAgentSettings,
@@ -2931,15 +2932,21 @@ export class TurnRequestBuilder {
                       prepareOptions.continuation.assistantMessage
                     )
                   : messages;
-                const requestedThinkingLevel =
-                  prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel;
+                // The flush is housekeeping: it runs at the fallback model's own inherent
+                // minimum (no user floor, no mid-turn override), mirroring the primary flush
+                // request, and gets a cap sized for THAT level below.
+                const requestedThinkingLevel = contextBudgetFlushTurn
+                  ? THINKING_LEVEL_OFF
+                  : (prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel);
                 const nextSeedResult = await prepareModelSeed({
                   rawModelString: nextModelString,
                   requestedThinkingLevel,
-                  minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
-                    this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
-                    nextModelString
-                  ),
+                  minimumThinkingLevelOverride: contextBudgetFlushTurn
+                    ? undefined
+                    : lookupMinThinkingLevelOverride(
+                        this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
+                        nextModelString
+                      ),
                   enforceMinimum: true,
                 });
                 if (!nextSeedResult.success) {
@@ -2983,6 +2990,16 @@ export class TurnRequestBuilder {
                   headers: nextHeaders,
                   callSettingsOverrides: nextRequest.resolvedOverrides.standard,
                   thinkingLevel: nextRequest.effectiveThinkingLevel,
+                  // A fallback with a higher thinking minimum than the primary would be
+                  // rejected under the primary's flush cap (thinking budget must stay below
+                  // max_tokens), losing the only notes-preserving step.
+                  ...(contextBudgetFlushTurn
+                    ? {
+                        maxOutputTokens: getContextBudgetFlushMaxOutputTokens(
+                          nextRequest.effectiveThinkingLevel
+                        ),
+                      }
+                    : {}),
                   forcedFirstStepToolNames: nextRequest.forcedFirstStepToolNames,
                   rebuildProviderOptionsForThinkingLevel:
                     nextRequest.rebuildProviderOptionsForThinkingLevel,
