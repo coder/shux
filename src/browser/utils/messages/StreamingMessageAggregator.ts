@@ -2008,6 +2008,10 @@ export class StreamingMessageAggregator {
     this.setPendingStreamStartTime(null);
   }
 
+  isOptimisticPendingStreamStart(): boolean {
+    return this.optimisticPendingStreamStart;
+  }
+
   resetForReplay(): void {
     const pendingStreamSnapshot =
       this.pendingStreamStartTime === null

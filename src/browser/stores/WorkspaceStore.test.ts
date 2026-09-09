@@ -5198,6 +5198,87 @@ describe("WorkspaceStore", () => {
       );
     });
 
+    it("keeps a row begun before catch-up when the replay only holds older user rows", async () => {
+      const workspaceId = "pending-send-hydration-old-rows";
+      const replay = gate();
+      mockChatStreamFor(workspaceId, async function* (signal) {
+        await replay.opened;
+        yield createUserMessageEvent("user-old", "long ago", 1, Date.now() - 3_600_000);
+        yield { type: "caught-up", replay: "full" };
+        await waitForAbortSignal(signal);
+      });
+      createAndAddWorkspace(store, workspaceId);
+      store.beginPendingSend(workspaceId, pendingSend);
+
+      replay.release();
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+    });
+
+    it("retires a row begun before catch-up when the replay holds its fresh echo", async () => {
+      const workspaceId = "pending-send-hydration-fresh-echo";
+      const replay = gate();
+      mockChatStreamFor(workspaceId, async function* (signal) {
+        await replay.opened;
+        yield createUserMessageEvent("user-old", "long ago", 1, Date.now() - 3_600_000);
+        yield createUserMessageEvent("user-new", "hello", 2, Date.now() + 5);
+        yield { type: "caught-up", replay: "full" };
+        await waitForAbortSignal(signal);
+      });
+      createAndAddWorkspace(store, workspaceId);
+      store.beginPendingSend(workspaceId, pendingSend);
+
+      replay.release();
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
+    });
+
+    it("forgets a queue shrink that restored the draft instead of dispatching", async () => {
+      const workspaceId = "pending-send-queue-restore";
+      const restore = gate();
+      const echo = gate();
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: true,
+          queuedMessages: ["queued draft"],
+          displayText: "queued draft",
+        };
+        await restore.opened;
+        // Editing the queued message clears the queue and hands the text back to the composer.
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: false,
+          queuedMessages: [],
+          displayText: "",
+        };
+        yield { type: "restore-to-input", workspaceId, text: "queued draft" };
+        await echo.opened;
+        yield createUserMessageEvent("user-2", "hello", 2, 2);
+        await waitForAbortSignal(signal);
+      });
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).queuedMessage !== null)
+      ).toBe(true);
+
+      restore.release();
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).queuedMessage === null)
+      ).toBe(true);
+      store.beginPendingSend(workspaceId, pendingSend);
+      echo.release();
+
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).pendingSend === null)).toBe(
+        true
+      );
+    });
+
     it("keeps a pending row begun before the first replay of an empty new workspace", async () => {
       const workspaceId = "pending-send-new-workspace";
       const replay = gate();

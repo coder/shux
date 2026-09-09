@@ -103,7 +103,7 @@ import {
   getPinnedTodoExpandedKey,
 } from "@/common/constants/storage";
 import { DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT } from "@/common/constants/ui";
-import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
+import { APPROX_CHARS_PER_TOKEN, PENDING_SEND_ECHO_CLOCK_SKEW_MS } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
 import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
@@ -368,6 +368,8 @@ interface PendingSendState {
   message: PendingSendMessage;
   /** User echoes already in the transcript when the send began; null when begun before catch-up. */
   knownUserEchoIds: Set<string> | null;
+  /** Wall clock at begin; with no baseline, only rows persisted after it can be the echo. */
+  beganAtMs: number;
   /** The send request succeeded, so any later replay is guaranteed to contain its echo. */
   accepted: boolean;
   /** A synthetic user row (pre-send compaction) took the turn; the echo follows that turn. */
@@ -918,6 +920,8 @@ export class WorkspaceStore {
     ) => void
   > = {
     "stream-start": (workspaceId, aggregator, data) => {
+      // Every dispatched entry echoes before its stream starts, so nothing is still owed.
+      this.assertChatTransientState(workspaceId).queueDispatchesAwaitingEcho = 0;
       applyWorkspaceChatEventToAggregator(aggregator, data);
       if (this.onModelUsed) {
         this.onModelUsed((data as { model: string }).model);
@@ -1211,8 +1215,11 @@ export class WorkspaceStore {
       transient.queuedMessageCount = nextCount;
       this.states.bump(workspaceId);
     },
-    "restore-to-input": (_workspaceId, _aggregator, data) => {
+    "restore-to-input": (workspaceId, _aggregator, data) => {
       if (!isRestoreToInput(data)) return;
+
+      // The queue was cleared, not dispatched; the shrink that preceded this owes no echo.
+      this.assertChatTransientState(workspaceId).queueDispatchesAwaitingEcho = 0;
 
       // Use UPDATE_CHAT_INPUT event with mode="replace"
       window.dispatchEvent(
@@ -4069,8 +4076,12 @@ export class WorkspaceStore {
       this.clearPendingSend(workspaceId, pendingSendId);
     }
 
+    // Only the optimistic barrier belongs to the creation send; an echoed later send owns it after.
     const aggregator = this.aggregators.get(workspaceId);
-    if (aggregator?.getPendingStreamStartTime() == null) {
+    if (
+      aggregator?.getPendingStreamStartTime() == null ||
+      !aggregator.isOptimisticPendingStreamStart()
+    ) {
       return;
     }
 
@@ -4100,6 +4111,7 @@ export class WorkspaceStore {
               .map((echo) => echo.id)
           )
         : null,
+      beganAtMs: Date.now(),
       accepted: false,
       deferredBehindSyntheticTurn: false,
     };
@@ -4153,9 +4165,14 @@ export class WorkspaceStore {
     pending: PendingSendState
   ): boolean {
     const known = pending.knownUserEchoIds;
+    const earliestEchoMs = pending.beganAtMs - PENDING_SEND_ECHO_CLOCK_SKEW_MS;
     return aggregator
       .getAllMessages()
-      .some((message) => isUserEcho(message) && !known?.has(message.id));
+      .some(
+        (message) =>
+          isUserEcho(message) &&
+          (known ? !known.has(message.id) : (message.metadata?.timestamp ?? 0) >= earliestEchoMs)
+      );
   }
 
   /**
