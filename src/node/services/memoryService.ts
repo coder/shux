@@ -1353,16 +1353,39 @@ export class MemoryService extends EventEmitter {
           // the owner may have edited, replaced or deleted it since, and the
           // child's pin must not land on unrelated content or a missing
           // file. Otherwise the note is placed anew like a fresh adoption.
-          const stillAdopted =
-            (await store.assertContained(previous.target).then(
+          // Inspected strictly: a prior target that merely cannot be stat'ed
+          // or read right now is not "replaced" — placing the note anew would
+          // leave the original copy visible without provenance for good.
+          // Retry on the next access instead (the pass stays incomplete).
+          let priorContent: string | null;
+          try {
+            const contained = await store.assertContained(previous.target).then(
               () => true,
               () => false
-            )) &&
-            (await store.kind(previous.target)) === "file" &&
-            (await this.readBoundedTextFile(store, previous.target, previous.target).catch(
-              () => null
-            )) === content;
-          if (stillAdopted) {
+            );
+            priorContent =
+              contained && (await store.kind(previous.target, { strict: true })) === "file"
+                ? await this.readBoundedTextFile(store, previous.target, previous.target)
+                : null;
+          } catch (error) {
+            if (error instanceof MemoryCommandError) {
+              priorContent = null; // over the cap: the owner changed it
+            } else {
+              log.warn(
+                "[MemoryService] cannot inspect an adopted note's prior copy; retrying later",
+                {
+                  childId,
+                  owner,
+                  relPath,
+                  target: previous.target,
+                  error,
+                }
+              );
+              skipped++;
+              continue;
+            }
+          }
+          if (priorContent === content) {
             target = { relPath: previous.target, write: false };
             record.created = previous.created === true;
           }

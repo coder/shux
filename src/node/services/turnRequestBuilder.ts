@@ -1552,8 +1552,9 @@ export class TurnRequestBuilder {
     const tailCopies = activeContextMessages.filter(
       (message) => message.metadata?.rlmPreservedTailCopy === true
     );
-    // A usable source epoch is an integer earlier than this epoch (persisted
-    // history is unvalidated). A copy without one — persisted by a build
+    // A usable source epoch is an integer in [-1, policyEpoch) — -1 before
+    // any boundary, else a boundary's history sequence (persisted history is
+    // unvalidated). A copy without one — persisted by a build
     // before the field, a re-copy of such a copy, or a malformed value —
     // carries a policy nobody can look up: it is excluded from the prior-turn
     // check like every copy, so without this the epoch would grant on the
@@ -1562,7 +1563,10 @@ export class TurnRequestBuilder {
     // such copy in the active context.
     const usableSourceEpoch = (message: MuxMessage): number | undefined => {
       const epoch = message.metadata?.rlmPreservedTailSourcePolicyEpoch;
-      return typeof epoch === "number" && Number.isInteger(epoch) && epoch < policyEpoch
+      return typeof epoch === "number" &&
+        Number.isInteger(epoch) &&
+        epoch >= -1 &&
+        epoch < policyEpoch
         ? epoch
         : undefined;
     };

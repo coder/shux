@@ -29,22 +29,48 @@ export function workspaceMemoryRevisionPath(ownerSessionDir: string): string {
 /** Current clock value, or null when the store was never written (or the file is unreadable). */
 export async function readWorkspaceMemoryRevision(ownerSessionDir: string): Promise<number | null> {
   try {
-    const raw = await fsPromises.readFile(workspaceMemoryRevisionPath(ownerSessionDir), "utf-8");
-    const value = Number.parseInt(raw, 10);
-    return Number.isSafeInteger(value) && value > 0 ? value : null;
+    return await readWorkspaceMemoryRevisionStrict(ownerSessionDir);
   } catch {
     return null;
   }
 }
 
 /**
+ * `readWorkspaceMemoryRevision` that distinguishes a never-written clock
+ * (null: proven ENOENT) from one that exists but cannot be trusted — an
+ * unreadable file, or content that is not a positive safe integer — which
+ * throws.
+ */
+async function readWorkspaceMemoryRevisionStrict(ownerSessionDir: string): Promise<number | null> {
+  const revisionPath = workspaceMemoryRevisionPath(ownerSessionDir);
+  let raw: string;
+  try {
+    raw = await fsPromises.readFile(revisionPath, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return null;
+    throw error;
+  }
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(
+      `workspace memory revision at ${revisionPath} is malformed: ${raw.slice(0, 32)}`
+    );
+  }
+  return value;
+}
+
+/**
  * Advance and persist the clock; returns the new value. Callers MUST hold the
  * store's target mutation lock (cross-process) — the read→write here is what
  * that lock makes atomic. Throws when the owner session dir is missing: the
- * file is never allowed to recreate a removed owner's directory.
+ * file is never allowed to recreate a removed owner's directory. Throws too
+ * when an EXISTING clock cannot be read or parsed: advancing from 0 instead
+ * could persist a value below the prior counter (which may run ahead of wall
+ * time) and hand callers a `sourceTs` that orders the mutation before rows
+ * it followed — callers treat the throw as "order unknown".
  */
 export async function advanceWorkspaceMemoryRevision(ownerSessionDir: string): Promise<number> {
-  const previous = (await readWorkspaceMemoryRevision(ownerSessionDir)) ?? 0;
+  const previous = (await readWorkspaceMemoryRevisionStrict(ownerSessionDir)) ?? 0;
   const next = Math.max(Date.now(), previous + 1);
   await fsPromises.writeFile(workspaceMemoryRevisionPath(ownerSessionDir), String(next));
   return next;

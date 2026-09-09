@@ -2077,6 +2077,51 @@ describe("MemoryService", () => {
       expect(await pathExists(target)).toBe(false);
     });
 
+    it("retries instead of duplicating when an adopted note's prior copy cannot be inspected", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "child notes");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const target = path.join(ownerRoot, "note.md");
+      const childKey = memoryLogicalKey("workspace", "note.md", {
+        projectPath: "",
+        workspaceId: "ws-child",
+      });
+      const ownerKey = memoryLogicalKey("workspace", "note.md", {
+        projectPath: "",
+        workspaceId: "ws-owner",
+      });
+      // Sidecar-only change (downgraded build pinned the note) while the
+      // prior copy cannot be read: no imported/ duplicate, record untouched.
+      await fixture.metaService.setPinned(childKey, true);
+      const realOpen = fsPromises.open.bind(fsPromises);
+      const unreadable = spyOn(fsPromises, "open").mockImplementation(((
+        p: Parameters<typeof fsPromises.open>[0],
+        ...rest: unknown[]
+      ) =>
+        String(p) === target
+          ? Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))
+          : (realOpen as (...args: unknown[]) => unknown)(p, ...rest)) as never);
+      try {
+        await fixture.service.listIndexEntries({ ...fixture.ctx });
+      } finally {
+        unreadable.mockRestore();
+      }
+      expect(await pathExists(path.join(ownerRoot, "imported", "ws-child", "note.md"))).toBe(false);
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(false);
+      const manifest = JSON.parse(
+        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+      ) as Record<string, { target: string; created?: boolean }>;
+      expect(manifest["note.md"]).toMatchObject({ target: "note.md", created: true });
+      // Readable again: the pin folds into the same copy.
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      expect(await pathExists(path.join(ownerRoot, "imported", "ws-child", "note.md"))).toBe(false);
+    });
+
     it("keeps adopting a legacy note named __proto__ exactly once", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -3029,6 +3074,48 @@ describe("MemoryService", () => {
       )!;
       expect(rollbackRow.data.sourceTs).toBeUndefined();
       expect(rollbackRow.data.orderUnknown).toBe(true);
+      // A clock that EXISTS but is unreadable/malformed must not be advanced
+      // from zero (a lower value would order this mutation before rows it
+      // followed): the row is order-unknown instead.
+      await fsPromises.writeFile(revisionPath, "garbage");
+      await fixture.service.create(ownerCtx, "/memories/workspace/after.md", "x", "agent");
+      const afterRow = (await readRefinementEvents(ownerSessionDir)).at(-1)!;
+      expect(afterRow.data.sourceTs).toBeUndefined();
+      expect(afterRow.data.orderUnknown).toBe(true);
+      expect(await fsPromises.readFile(revisionPath, "utf-8")).toBe("garbage");
+    });
+
+    it("refuses a rollback while a peer's adoption manifest cannot be read", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      await fixture.service.create(ownerCtx, "/memories/workspace/o.md", "v1", "agent");
+      const [ownerCreate] = await readRefinementEvents(ownerSessionDir);
+      // The child's (pre-sharing) manifest is unreadable: its adopted rows
+      // cannot be consulted, so the owner's rollback must not proceed blind.
+      const manifestPath = path.join(childSessionDir, "memory", ".adopted-into-shared-store.json");
+      await fsPromises.mkdir(manifestPath, { recursive: true });
+      const refused = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: ownerCreate.id,
+        listSharedWorkspaceMemoryPeerSessionDirs: () => [childSessionDir],
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(refused.success).toBe(false);
+      expect(refused.success ? "" : refused.error).toContain("adoption manifest could not be read");
+      await fsPromises.rmdir(manifestPath);
+      expect(
+        (
+          await rollbackRefinement({
+            sessionDir: ownerSessionDir,
+            id: ownerCreate.id,
+            listSharedWorkspaceMemoryPeerSessionDirs: () => [childSessionDir],
+            evidence: { toolName: "test", actor: "user" },
+          })
+        ).success
+      ).toBe(true);
     });
 
     it("ignores migrated copies of its own rows when a child rolls back after an aborted removal", async () => {

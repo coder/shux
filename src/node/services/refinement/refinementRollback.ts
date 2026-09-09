@@ -594,10 +594,24 @@ async function readSharedMemoryPeerRows(
     // acting session's later checks (its own remapper is a no-op for owner
     // paths) compare the paths the note actually lives at. Legacy paths the
     // shared store never took address invisible files and are dropped.
-    const remap =
-      path.resolve(peerDir) === path.resolve(ownerSessionDir)
-        ? identityRemapper
-        : await createLegacyPathRemapper({ childSessionDir: peerDir, ownerSessionDir });
+    // Strict: an unreadable peer manifest must refuse the rollback, not read
+    // as "nothing adopted" and silently drop that peer's later mutations.
+    let remap: RecordedPathRemapper;
+    if (path.resolve(peerDir) === path.resolve(ownerSessionDir)) {
+      remap = identityRemapper;
+    } else {
+      try {
+        remap = await createLegacyPathRemapper({
+          childSessionDir: peerDir,
+          ownerSessionDir,
+          strict: true,
+        });
+      } catch (error) {
+        throw new RollbackError(
+          `Refusing rollback of '${opts.id}': a tree member's adoption manifest could not be read (${getErrorMessage(error)})`
+        );
+      }
+    }
     for (const row of await listRefinements(peerDir)) {
       if (row.data.kind !== "memory") continue;
       // A removal that aborted after its pre-teardown pass leaves the owner
