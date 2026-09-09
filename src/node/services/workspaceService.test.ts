@@ -9382,6 +9382,34 @@ describe("WorkspaceService initialize", () => {
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
       await clearWorkspaceMemoryDenyMarker(sessionDir, { notAfter: Date.now() + 60_000 });
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+
+      // Unknown history fails closed: no accumulator, no marker, no mirror
+      // (this service never recorded this epoch), yet the epoch already holds
+      // turns — the record was lost (a deny that could not be made durable
+      // anywhere before a restart, an upgrade mid-epoch). A writable turn
+      // must not grant the whole epoch; the first turn of a fresh epoch does.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritable;
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: true,
+        })
+      ).toBe(true);
+      expect(persisted()).toBe(false);
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritable;
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+        })
+      ).toBe(true);
+      expect(persisted()).toBe(true);
     } finally {
       await cleanup();
     }

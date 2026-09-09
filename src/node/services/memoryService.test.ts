@@ -1363,6 +1363,57 @@ describe("MemoryService", () => {
       ).toBe(true);
     });
 
+    it("stops adopting legacy notes at the shared store's remaining file capacity", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      // Owner two below the cap; child brings five (one identical to an owner
+      // file, which needs no slot).
+      await Promise.all(
+        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE - 2 }, (_, i) =>
+          fsPromises.writeFile(path.join(ownerRoot, `o${String(i).padStart(4, "0")}.md`), "o")
+        )
+      );
+      await fsPromises.writeFile(path.join(ownerRoot, "shared.md"), "same");
+      for (const name of ["a.md", "b.md", "c.md", "d.md"]) {
+        await fsPromises.writeFile(path.join(legacyRoot, name), `child ${name}`);
+      }
+      await fsPromises.writeFile(path.join(legacyRoot, "shared.md"), "same");
+
+      const listed = await fixture.service.listIndexEntries(fixture.ctx);
+      const workspaceFiles = listed.filter((e) => e.scope === "workspace").map((e) => e.relPath);
+      // Exactly at the cap, never above: one slot was already taken by
+      // shared.md's owner copy, so only one of the four new notes fit.
+      expect(workspaceFiles).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
+      expect(workspaceFiles.filter((f) => ["a.md", "b.md", "c.md", "d.md"].includes(f))).toEqual([
+        "a.md",
+      ]);
+      // A create into the full scope is refused like before, so the invariant holds.
+      const full = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/new.md",
+        "x",
+        "agent"
+      );
+      expect(full.success).toBe(false);
+      // Freed capacity lets a later pass (fresh process) fold in the rest.
+      await fixture.service.deletePath({ ...fixture.ctx }, "/memories/workspace/o0000.md", "agent");
+      await fixture.service.deletePath({ ...fixture.ctx }, "/memories/workspace/o0001.md", "agent");
+      const restarted = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
+      const relisted = (await restarted.listIndexEntries({ ...fixture.ctx }))
+        .filter((e) => e.scope === "workspace")
+        .map((e) => e.relPath);
+      expect(relisted).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
+      expect(relisted.filter((f) => ["a.md", "b.md", "c.md", "d.md"].includes(f))).toEqual([
+        "a.md",
+        "b.md",
+        "c.md",
+      ]);
+    });
+
     it("folds in a note written under a self-fallback once ownership resolves to the tree root again", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

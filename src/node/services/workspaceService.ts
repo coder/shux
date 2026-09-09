@@ -4239,7 +4239,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * (workspaceMemoryDenyMarker.ts); resolves false only when the new value
    * could not be confirmed durable anywhere.
    */
-  async recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): Promise<boolean> {
+  async recordWorkspaceMemoryWritable(
+    workspaceId: string,
+    writable: boolean,
+    options?: { epochHasPriorTurns: boolean }
+  ): Promise<boolean> {
     const session =
       this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId);
     const mirror = session?.workspaceMemoryWritableMirror();
@@ -4266,11 +4270,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // when config.json could not record a deny (see below).
     const sessionDir = path.join(this.config.sessionsDir, workspaceId);
     const denyMarker = await readWorkspaceMemoryDenyMarker(sessionDir);
+    // Unknown history fails closed, like the harvest's own unknown → closed
+    // rule: with no durable accumulator, no marker and no mirror, an epoch
+    // that already holds turns has a policy nobody recorded — the record was
+    // lost (a deny that could not be made durable anywhere before this
+    // process died, an upgrade mid-epoch) — so this epoch's harvest is denied
+    // until the next boundary rather than granted by whichever turn comes
+    // first. The first turn of a fresh epoch has no prior turns and grants
+    // normally.
+    const stored = before.workspace.workspaceMemoryWritable;
+    const unknownHistory =
+      stored === undefined && mirror === undefined && options?.epochHasPriorTurns === true;
     const conjunction = (durable: boolean | undefined): boolean =>
-      !denyMarker && (durable ?? true) && (mirror ?? true) && writable;
+      !denyMarker && !unknownHistory && (durable ?? true) && (mirror ?? true) && writable;
     // Fast path (no write): the outcome cannot differ from the stored value —
     // it is already false, or already true and this turn grants.
-    const stored = before.workspace.workspaceMemoryWritable;
     if (stored === false || (stored === true && conjunction(stored))) {
       session?.recordWorkspaceMemoryWritable(stored);
       return true;

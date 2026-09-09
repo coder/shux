@@ -554,7 +554,11 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
    * the value could not be confirmed durable.
    */
   workspaceMemoryPolicySink?: {
-    recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): Promise<boolean>;
+    recordWorkspaceMemoryWritable(
+      workspaceId: string,
+      writable: boolean,
+      options: { epochHasPriorTurns: boolean }
+    ): Promise<boolean>;
   };
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
   desktopSessionManager?: DesktopSessionManager;
@@ -1462,10 +1466,30 @@ export class TurnRequestBuilder {
     // an admission-only candidate (prepareStreamMessage) may be rejected or
     // disposed without running. Awaited (a config write happens only when
     // the value changes). Returns false when a deny could not be persisted.
+    // Whether the active context already holds turns whose policy this
+    // process never recorded (see the unknown-history rule in
+    // WorkspaceService.recordWorkspaceMemoryWritable). The turn being started
+    // is its last user row plus that row's prelude snapshots; compaction
+    // request rows open an epoch rather than belong to one.
+    const epochHasPriorTurns = ((): boolean => {
+      const currentBatch = new Set<string>(
+        latestUserMessage === undefined
+          ? []
+          : [latestUserMessage.id, ...(latestUserMessage.metadata?.requestPreludeMessageIds ?? [])]
+      );
+      return activeContextMessages.some(
+        (message) =>
+          message.role === "user" &&
+          !currentBatch.has(message.id) &&
+          message.metadata?.muxMetadata?.type !== "compaction-request"
+      );
+    })();
     const persistWorkspaceMemoryWritable = async (writable: boolean): Promise<boolean> => {
       const sink = this.dependencies.bindings.workspaceMemoryPolicySink;
       if (isCompactionRequest || !sink) return true;
-      if (await sink.recordWorkspaceMemoryWritable(workspaceId, writable)) return true;
+      if (await sink.recordWorkspaceMemoryWritable(workspaceId, writable, { epochHasPriorTurns })) {
+        return true;
+      }
       if (!writable) return false;
       log.warn("Workspace memory write policy could not be persisted; harvests will fail closed", {
         workspaceId,

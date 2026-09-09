@@ -1019,6 +1019,13 @@ export class MemoryService extends EventEmitter {
         const manifestPath = path.join(legacyRoot, LEGACY_ADOPTION_MANIFEST_FILE_NAME);
         const adopted = await readLegacyAdoptionManifest(manifestPath);
         const sidecarEntries = await this.metaService.getEntries();
+        // The per-scope file cap is a store invariant (create/rename enforce
+        // it): the copy stops at the owner store's remaining capacity so a
+        // combined notebook cannot exceed it — an over-full scope is silently
+        // truncated by the index and refuses every later create. Files left
+        // behind stay unrecorded and are retried once space frees up.
+        let remainingCapacity = MEMORY_MAX_FILES_PER_SCOPE - (await store.listFiles()).length;
+        let capacityExhausted = false;
         let manifestDirty = false;
         let imported = 0;
         let skipped = 0;
@@ -1059,7 +1066,13 @@ export class MemoryService extends EventEmitter {
               continue;
             }
             if (target.write) {
+              if (remainingCapacity <= 0) {
+                capacityExhausted = true;
+                skipped++;
+                continue;
+              }
               await store.writeFile(target.relPath, content);
+              remainingCapacity--;
               imported++;
             }
           }
@@ -1096,6 +1109,12 @@ export class MemoryService extends EventEmitter {
         }
         if (manifestDirty) {
           await writeFileAtomic(manifestPath, JSON.stringify(adopted), { encoding: "utf-8" });
+        }
+        if (capacityExhausted) {
+          log.warn(
+            "[MemoryService] shared workspace notebook is full; legacy notes left in the sub-agent's private directory until space frees up",
+            { childId, owner, cap: MEMORY_MAX_FILES_PER_SCOPE }
+          );
         }
         if (adoptedCount > 0) {
           // A metadata-only adoption (identical bytes, child pin folded in)
