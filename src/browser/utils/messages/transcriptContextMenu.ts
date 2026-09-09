@@ -344,8 +344,10 @@ const CLIPBOARD_TAGS = new Set([
   "td",
   "details",
   "summary",
+  "sub",
+  "sup",
 ]);
-const CLIPBOARD_EXCLUDED_SELECTOR = `script, style, svg, img, iframe, object, .line-number, button, input, textarea, select, [hidden], [aria-hidden="true"], ${TRANSCRIPT_IGNORE_CONTEXT_MENU_SELECTOR}`;
+const CLIPBOARD_EXCLUDED_SELECTOR = `script, style, svg, img, iframe, object, .line-number, .sr-only, button, input, textarea, select, [hidden], [aria-hidden="true"], ${TRANSCRIPT_IGNORE_CONTEXT_MENU_SELECTOR}`;
 
 function isSafeClipboardHref(href: string): boolean {
   if (!href.trim() || href.includes("\\")) return false;
@@ -358,10 +360,23 @@ function isSafeClipboardHref(href: string): boolean {
   }
 }
 
+function isClipboardElementHidden(element: Element): boolean {
+  const style = element.ownerDocument.defaultView!.getComputedStyle(element);
+  return (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.visibility === "collapse" ||
+    style.opacity === "0"
+  );
+}
+
 function appendClipboardNodes(source: Node, destination: Node, range: Range): void {
   const document = destination.ownerDocument!;
   for (const child of source.childNodes) {
-    if (!range.intersectsNode(child)) {
+    const isTaskMarker =
+      child.nodeType === 1 &&
+      (child as Element).matches('li > input[type="checkbox"][disabled]:first-child');
+    if (!range.intersectsNode(child) && !isTaskMarker) {
       // Empty cells retain column positions without copying unselected text.
       if (child.nodeName === "TH" || child.nodeName === "TD") {
         destination.appendChild(document.createElement(child.nodeName.toLowerCase()));
@@ -376,6 +391,7 @@ function appendClipboardNodes(source: Node, destination: Node, range: Range): vo
     }
     if (child.nodeType !== 1) continue;
     const element = child as Element;
+    if (isClipboardElementHidden(element)) continue;
     if (element.matches('input[type="checkbox"][disabled]')) {
       const marker = document.createElement("span");
       marker.setAttribute("data-clipboard-task", "true");
@@ -405,7 +421,7 @@ function appendClipboardNodes(source: Node, destination: Node, range: Range): vo
       if (/^[\w.+#-]+$/.test(language)) code.className = `language-${language}`;
       const lines: string[] = [];
       for (const line of element.querySelectorAll(".code-line")) {
-        if (!range.intersectsNode(line)) continue;
+        if (!range.intersectsNode(line) || isClipboardElementHidden(line)) continue;
         const selectedLine = document.createElement("div");
         appendClipboardNodes(line, selectedLine, range);
         lines.push(selectedLine.textContent ?? "");
@@ -476,9 +492,17 @@ export function getTranscriptContextMenuMarkdown(
       node.getAttribute("data-clipboard-math") ?? node.textContent?.trimEnd() ?? "",
   });
   markdown.addRule("disclosure", {
-    filter: "details",
+    filter: ["details", "sub", "sup"],
     // SECURITY AUDIT: This node contains only the sanitized clipboard elements and attributes.
-    replacement: (_content, node) => "\n\n" + node.outerHTML + "\n\n",
+    replacement: (_content, node) =>
+      node.nodeName === "DETAILS" ? "\n\n" + node.outerHTML + "\n\n" : node.outerHTML,
+  });
+  markdown.addRule("safeLink", {
+    filter: (node) => node.nodeName === "A" && node.hasAttribute("href"),
+    replacement: (content, node) => {
+      const href = (node.getAttribute("href") ?? "").replace(/[<>\s]/g, encodeURIComponent);
+      return "[" + content + "](<" + href + ">)";
+    },
   });
   markdown.addRule("strikethrough", {
     filter: ["s", "del"],

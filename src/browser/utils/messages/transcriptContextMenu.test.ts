@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
+import MarkdownIt from "markdown-it";
 import {
   formatTranscriptTextAsQuote,
   getTranscriptContextMenuLink,
@@ -74,7 +75,7 @@ describe("transcriptContextMenu", () => {
         )
       );
       const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
-      expect(result?.text).toBe("[Example](https://example.com)");
+      expect(result?.text).toBe("[Example](<https://example.com>)");
       expect(result?.html).toContain('href="https://example.com"');
     });
 
@@ -150,6 +151,9 @@ describe("transcriptContextMenu", () => {
     test.each([
       "src/main.ts",
       "../my file.ts",
+      "docs/(file).ts",
+      "docs/file>next.ts",
+      "docs/%20exists.md",
       "#usage",
       "/docs",
       "https://example.com",
@@ -161,7 +165,9 @@ describe("transcriptContextMenu", () => {
       root.querySelector("a")!.setAttribute("href", href);
       const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
       expect(result?.html).toContain('href="' + href + '"');
-      expect(result?.text).toContain("[Link](");
+      const tokens = new MarkdownIt().parseInline(result?.text ?? "", {});
+      const link = tokens[0].children?.find((token) => token.type === "link_open");
+      expect(link?.attrGet("href")).toBe(href.replace(/[<>\s]/g, encodeURIComponent));
     });
 
     test.each([
@@ -232,6 +238,51 @@ describe("transcriptContextMenu", () => {
       const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
       expect(result?.text).toBe(["```typescript", "const x = 1;", "```"].join("\n"));
       expect(result?.html).toBe('<pre><code class="language-typescript">const x = 1;</code></pre>');
+    });
+
+    test.each([true, false])(
+      "retains task state when only item text is selected (checked=%s)",
+      (checked) => {
+        const root = createTranscriptRoot(
+          createQuoteableTranscriptMessage(
+            '<ul><li><input type="checkbox" disabled ' +
+              (checked ? "checked" : "") +
+              '><span id="part">done</span></li><li>Excluded</li></ul>'
+          )
+        );
+        const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
+        expect(result?.text).toBe(checked ? "*   [x] done" : "*   [ ] done");
+        expect(result?.html).not.toContain("Excluded");
+      }
+    );
+
+    test("preserves subscript and superscript semantics", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<p><span id="first">H</span><sub onclick="alert(1)">2</sub>O and x<sup id="last">2</sup></p>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#first", "#last"));
+      expect(result?.text).toBe("H<sub>2</sub>O and x<sup>2</sup>");
+      expect(result?.html).toBe("<p>H<sub>2</sub>O and x<sup>2</sup></p>");
+    });
+
+    test.each([
+      'class="sr-only"',
+      'style="display:none"',
+      'style="visibility:hidden"',
+      'style="opacity:0"',
+    ])("excludes visually hidden text: %s", (attributes) => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<p><span id="first">Before </span><span ' +
+            attributes +
+            '>HIDDEN PAYLOAD</span><span id="last"> after</span></p>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#first", "#last"));
+      expect(result?.text).toBe("Before after");
+      expect(result?.html).not.toContain("HIDDEN PAYLOAD");
     });
 
     test("removes unsafe URLs, attributes, and active content", () => {
