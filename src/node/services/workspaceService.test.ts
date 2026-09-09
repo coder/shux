@@ -9922,6 +9922,8 @@ describe("WorkspaceService transient startup probes", () => {
     const p = await setupProbe();
     try {
       expect(p.listenerCount()).toBeGreaterThan(0);
+      expect(p.service.clearQueue("legacy-child")).toEqual(Ok(undefined));
+      expect(p.create).not.toHaveBeenCalled();
       expect(await p.service.getStartupRecoveryState("legacy-child")).toBe("idle");
       await Promise.all(p.access.pendingWorkspaceCleanup);
       expect(p.listenerCount()).toBe(0);

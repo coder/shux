@@ -765,7 +765,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     try {
       expect(await session.getStartupRecoveryState()).toBe(
-        marker.stopped ? "blocked" : "interrupted"
+        marker.stopped ? "stopped" : "interrupted"
       );
       const history = await historyService.getLastMessages(workspaceId, 20);
       expect(history.success && history.data.map((message) => message.id)).toEqual(["user-1"]);
@@ -792,14 +792,14 @@ describe("AgentSession startup auto-retry recovery", () => {
       })
     );
     try {
-      expect(await session.getStartupRecoveryState()).toBe("blocked");
+      expect(await session.getStartupRecoveryState()).toBe("stopped");
       spyOn(historyService, "getLastMessages").mockRejectedValueOnce(new Error("unreadable"));
-      expect(await session.getStartupRecoveryState()).toBe("blocked");
+      expect(await session.getStartupRecoveryState()).toBe("stopped");
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage("notice", "user", "Snapshot", { synthetic: true })
       );
-      expect(await session.getStartupRecoveryState()).toBe("blocked");
+      expect(await session.getStartupRecoveryState()).toBe("stopped");
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage("guidance", "user", "Continue", {
@@ -1101,7 +1101,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     });
 
     await secondSession.ensureStartupAutoRetryCheck();
-    expect(await secondSession.getStartupRecoveryState()).toBe("blocked");
+    expect(await secondSession.getStartupRecoveryState()).toBe("stopped");
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 

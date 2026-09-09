@@ -12254,8 +12254,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void> {
     try {
-      const session = this.getOrCreateSession(workspaceId);
-      session.clearQueue(options?.cancelReason);
+      this.sessions.get(workspaceId.trim())?.clearQueue(options?.cancelReason);
       return Ok(undefined);
     } catch (error) {
       const errorMessage = getErrorMessage(error);

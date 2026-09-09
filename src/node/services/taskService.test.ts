@@ -3762,7 +3762,7 @@ describe("TaskService", () => {
   });
 
   test.each(["running", "awaiting_report", undefined] as const)(
-    "startup honors user Stop without changing steerable task status (%s)",
+    "startup preserves active status for indeterminate blockers (%s)",
     async (taskStatus) => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
@@ -3809,6 +3809,201 @@ describe("TaskService", () => {
       expect(dispatchPendingCompactionFollowUp).toHaveBeenCalledWith("compacted");
     }
   );
+
+  test.each([
+    "stop",
+    "opt-out",
+    "question",
+    "read-failure",
+    "streaming",
+    "preparing",
+    "handle",
+  ] as const)(
+    "startup reclaims stopped capacity without disturbing other blockers (%s)",
+    async (blocker) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      const pausedId = "paused-task";
+      const queuedId = "queued-sibling";
+      await config.editConfig((cfg) => {
+        cfg.taskSettings = testTaskSettings(1, 3);
+        cfg.projects.get(projectPath)!.workspaces.push(
+          ...[pausedId, queuedId].map((id) => ({
+            path: projectPath,
+            id,
+            name: id,
+            parentWorkspaceId: parentId,
+            agentId: "explore",
+            agentType: "explore",
+            taskIsolation: "none" as const,
+            runtimeConfig: { type: "local" as const },
+            taskStatus: id === pausedId ? ("running" as const) : ("queued" as const),
+            taskPrompt: id === queuedId ? "Start the queued sibling" : undefined,
+            taskModelString: defaultModel,
+          }))
+        );
+        return cfg;
+      });
+      let queuedStreaming = false;
+      const { aiService, stopStream } = createAIServiceMocks(config, {
+        isStreaming: mock((id: string) =>
+          id === queuedId ? queuedStreaming : id === pausedId && blocker === "streaming"
+        ),
+      });
+      const sendMessage = mock((_id: string, _message: string, _options: unknown) => {
+        queuedStreaming = true;
+        return Promise.resolve(Ok(undefined));
+      });
+      const { workspaceService } = createWorkspaceServiceMocks({
+        sendMessage,
+        isBusyForMessage: mock((id: string) => id === pausedId && blocker === "preparing"),
+      });
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+        aiService,
+      });
+      await historyService.appendToHistory(
+        pausedId,
+        createMuxMessage("paused-user", "user", "Work until stopped")
+      );
+      await historyService.writePartial(
+        pausedId,
+        createMuxMessage("question", "assistant", "", {}, [
+          {
+            type: "dynamic-tool",
+            state: "input-available",
+            toolCallId: "question",
+            toolName: "ask_user_question",
+            input: { question: "Continue?" },
+          },
+        ])
+      );
+      if (blocker !== "question") {
+        await fsPromises.writeFile(
+          path.join(config.sessionsDir, pausedId, "auto-retry-preference.json"),
+          JSON.stringify(
+            blocker === "opt-out"
+              ? { enabled: false }
+              : { startupAutoRetryAbandon: { reason: "aborted", userMessageId: "paused-user" } }
+          )
+        );
+      }
+      const { session } = await createAgentSessionHarness({
+        workspaceId: pausedId,
+        config,
+        historyService,
+      });
+      const stateProbe = mock((_id: string) => session.getStartupRecoveryState());
+      workspaceService.getStartupRecoveryState = stateProbe;
+      if (blocker === "read-failure") {
+        spyOn(historyService, "readPartial").mockRejectedValue(new Error("unreadable"));
+        spyOn(
+          session as unknown as { waitForStartupReadRetry: () => Promise<void> },
+          "waitForStartupReadRetry"
+        ).mockResolvedValue(undefined);
+      }
+      const interruptedHandle = "wst_paused_capacity";
+      if (blocker === "handle") {
+        await registerLiveWorkspaceTurnHandle(
+          taskService,
+          pausedId,
+          interruptedHandle,
+          parentId,
+          false
+        );
+      }
+      try {
+        expect(taskService.countActiveAgentTasks(config.loadConfigOrDefault())).toBe(1);
+        await taskService.recoverInterruptedTasks();
+        const stopped = ["stop", "opt-out", "handle"].includes(blocker);
+        expect(findWorkspaceInConfig(config, pausedId)?.taskStatus).toBe(
+          stopped ? "interrupted" : "running"
+        );
+        expect(findWorkspaceInConfig(config, queuedId)?.taskStatus).toBe(
+          stopped ? "running" : "queued"
+        );
+        expect(taskService.countActiveAgentTasks(config.loadConfigOrDefault())).toBe(1);
+        expect(stateProbe).not.toHaveBeenCalledWith(queuedId);
+        expect(sendMessage).toHaveBeenCalledTimes(stopped ? 1 : 0);
+        expect(stopStream).not.toHaveBeenCalledWith(queuedId, expect.anything());
+        if (stopped) {
+          expect(sendMessage.mock.calls[0]?.slice(0, 2)).toEqual([
+            queuedId,
+            "Start the queued sibling",
+          ]);
+          const result = await taskService
+            .waitForAgentReport(pausedId, { timeoutMs: 1_000 })
+            .catch((error: unknown) => error);
+          expect(result).toBeInstanceOf(Error);
+        }
+        if (blocker === "handle") {
+          expect(findWorkspaceInConfig(config, pausedId)?.taskExecutionStatus).toBe("interrupted");
+          expect(
+            await workspaceTurnSnapshot(taskService, parentId, interruptedHandle)
+          ).toMatchObject({ status: "interrupted" });
+          expect(
+            workspaceTurnManagerFor(taskService).getLiveWorkspaceTurnRegistration(pausedId)
+          ).toBeUndefined();
+        }
+      } finally {
+        await session.dispose();
+        await taskService.maybeStartQueuedTasks();
+        await flushTerminalAttentionDrains(taskService);
+      }
+    }
+  );
+
+  test("startup settles every stopped tree before handle cleanup can launch queued descendants", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.taskSettings = testTaskSettings(2, 3);
+      cfg.projects.get(projectPath)!.workspaces.push(
+        ...["first", "second", "descendant", "sibling"].map((id) => ({
+          path: projectPath,
+          id,
+          name: id,
+          parentWorkspaceId: id === "descendant" ? "second" : parentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskIsolation: "none" as const,
+          runtimeConfig: { type: "local" as const },
+          taskStatus:
+            id === "first" || id === "second" ? ("running" as const) : ("queued" as const),
+          taskPrompt: id,
+          taskModelString: defaultModel,
+        }))
+      );
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      getStartupRecoveryState: mock(() => Promise.resolve("stopped")),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const prematureDrains: string[] = [];
+    const scheduleDrain = taskService.scheduleMaybeStartQueuedTasks.bind(taskService);
+    spyOn(taskService, "scheduleMaybeStartQueuedTasks").mockImplementation(() => {
+      if (findWorkspaceInConfig(config, "second")?.taskStatus !== "interrupted") {
+        prematureDrains.push("second still needs normalization");
+      }
+      scheduleDrain();
+    });
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      "first",
+      "wst_startup_batch",
+      parentId,
+      false
+    );
+    await taskService.recoverInterruptedTasks();
+    expect(findWorkspaceInConfig(config, "first")?.taskStatus).toBe("interrupted");
+    expect(findWorkspaceInConfig(config, "second")?.taskStatus).toBe("interrupted");
+    expect(findWorkspaceInConfig(config, "descendant")?.taskStatus).toBe("interrupted");
+    expect(findWorkspaceInConfig(config, "sibling")?.taskStatus).toBe("running");
+    expect(prematureDrains).toHaveLength(0);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0]).toBe("sibling");
+  });
 
   test("initialize does not resend the restart nudge to a running task that is already streaming", async () => {
     const config = await createTestConfig(rootDir);

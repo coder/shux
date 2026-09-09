@@ -2334,12 +2334,9 @@ export class AgentSession {
     const lastAssistantMessage =
       params.partial?.role === "assistant"
         ? params.partial
-        : [...params.historyTail]
-            .reverse()
-            .find(
-              (message): message is MuxMessage & { role: "assistant" } =>
-                message.role === "assistant"
-            );
+        : params.historyTail.findLast(
+            (message): message is MuxMessage & { role: "assistant" } => message.role === "assistant"
+          );
 
     const workspaceMetadata =
       params.workspaceMetadata ?? (await this.getWorkspaceMetadataForRetry());
@@ -2767,7 +2764,8 @@ export class AgentSession {
 
   private async readStartupRecoveryState(signal: AbortSignal): Promise<StartupRecoveryState> {
     await this.loadAutoRetryState();
-    if (signal.aborted || this.autoRetryEnabledPreference === false) return "blocked";
+    if (signal.aborted) return "blocked";
+    if (this.autoRetryEnabledPreference === false) return "stopped";
     const [partial, history] =
       (await retryStartupRead(
         () => this.readStartupTail(true),
@@ -2784,7 +2782,7 @@ export class AgentSession {
           (message.role === "user" && message.metadata?.retrySendOptions != null)
       );
       if (!abandon.userMessageId || !latest || latest.id === abandon.userMessageId)
-        return "blocked";
+        return "stopped";
     }
     // A question may regain its lost queue, but must never override an applicable Stop.
     if (

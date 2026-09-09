@@ -2333,31 +2333,20 @@ export class TaskService implements AgentTaskIntegration {
       (task) => task.taskStatus === "starting" && typeof task.id === "string"
     );
     if (staleStartingTasks.length > 0) {
-      const recoveries = new Map<
-        string,
-        { status: Extract<AgentTaskStatus, "queued" | "running">; acceptedPrompt: boolean }
-      >();
+      let acceptedPromptCount = 0;
       for (const task of staleStartingTasks) {
         assert(task.id != null && task.id.length > 0, "stale starting task id is required");
         const isStreaming = this.aiService.isStreaming(task.id);
-        recoveries.set(task.id, {
-          status: isStreaming ? "running" : "queued",
-          acceptedPrompt: !isStreaming && (await this.hasAcceptedInitialTaskPrompt(task.id)),
-        });
-      }
-
-      for (const task of staleStartingTasks) {
-        assert(task.id != null && task.id.length > 0, "stale starting task id is required");
-        const recovery = recoveries.get(task.id);
-        assert(recovery != null, "stale starting task recovery is required");
+        const acceptedPrompt = !isStreaming && (await this.hasAcceptedInitialTaskPrompt(task.id));
+        if (acceptedPrompt) acceptedPromptCount += 1;
         try {
           await this.editActiveWorkspaceEntry(
             task.id,
             (workspace) => {
               if (workspace.taskStatus !== "starting") return;
-              workspace.taskStatus = recovery.status;
+              workspace.taskStatus = isStreaming ? "running" : "queued";
               // History already owns accepted prompts; do not duplicate them on restart.
-              if (recovery.acceptedPrompt) workspace.taskPrompt = undefined;
+              if (acceptedPrompt) workspace.taskPrompt = undefined;
             },
             { allowMissing: true }
           );
@@ -2367,14 +2356,9 @@ export class TaskService implements AgentTaskIntegration {
       }
       log.info("[startup] Recovered stale starting agent tasks", {
         count: staleStartingTasks.length,
-        acceptedPromptCount: [...recoveries.values()].filter((recovery) => recovery.acceptedPrompt)
-          .length,
+        acceptedPromptCount,
       });
     }
-
-    const maybeStartQueuedTasksStartedAt = Date.now();
-    await this.maybeStartQueuedTasks();
-    const maybeStartQueuedTasksMs = Date.now() - maybeStartQueuedTasksStartedAt;
 
     let config = this.config.loadConfigOrDefault();
     let taskIndex = this.buildAgentTaskIndex(config);
@@ -2383,19 +2367,15 @@ export class TaskService implements AgentTaskIntegration {
         (task) => task.id && ["running", "awaiting_report"].includes(task.taskStatus ?? "running")
       );
 
-    let interruptedInactiveWorkflowOwnerAtStartup = false;
     // Workflow cancellation is authoritative even when a child has its own Stop or question.
     for (const task of startupTasks()) {
-      if (
-        await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-          task.id!,
-          config,
-          "startup-inactive-workflow-owner-prepass",
-          taskIndex,
-          { scheduleQueueDrain: false }
-        )
-      )
-        interruptedInactiveWorkflowOwnerAtStartup = true;
+      await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+        task.id!,
+        config,
+        "startup-inactive-workflow-owner-prepass",
+        taskIndex,
+        { scheduleQueueDrain: false }
+      );
     }
     config = this.config.loadConfigOrDefault();
     const candidates = startupTasks();
@@ -2407,11 +2387,35 @@ export class TaskService implements AgentTaskIntegration {
         )
       )
     );
-    // Reads can outlive a queued child's stream: do not recover its stale running snapshot.
+    for (const task of candidates) {
+      const id = task.id!;
+      if (states.get(id) !== "stopped") continue;
+      await this.withTaskTreeLifecycleLock(id, async () => {
+        if (this.aiService.isStreaming(id) || this.workspaceService.isBusyForMessage(id)) return;
+        const stopped = await this.stopDescendantAgentTaskUnderLifecycleLock(
+          task.parentWorkspaceId!,
+          id,
+          false
+        );
+        if (!stopped.success)
+          log.warn("Failed to settle stopped task on startup", {
+            taskId: task.id,
+            error: stopped.error,
+          });
+      });
+    }
+
+    // Normalize stopped capacity before launching siblings; newly launched work is not part of
+    // the recovery snapshot and must never be interrupted by an old Stop or opt-out.
+    const maybeStartQueuedTasksStartedAt = Date.now();
+    await this.maybeStartQueuedTasks();
+    const maybeStartQueuedTasksMs = Date.now() - maybeStartQueuedTasksStartedAt;
+
+    // Recovery awaits and queue draining can change task status: re-read before replaying intent.
     config = this.config.loadConfigOrDefault();
     taskIndex = this.buildAgentTaskIndex(config);
     const eligible = startupTasks().filter(
-      (task) => states.has(task.id) && states.get(task.id) !== "blocked"
+      (task) => states.has(task.id) && !["blocked", "stopped"].includes(states.get(task.id)!)
     );
     const awaitingReportTasks = eligible.filter(
       (task) => task.taskStatus === "awaiting_report" && states.get(task.id) !== "question"
@@ -2576,12 +2580,6 @@ export class TaskService implements AgentTaskIntegration {
 
       resumedRunningCount += 1;
       log.info("[startup] Resumed running task", { ...logContext, durationMs });
-    }
-
-    if (interruptedInactiveWorkflowOwnerAtStartup) {
-      // Startup queue draining already ran before these interruptions freed slots.
-      // Run it once more after recovery prompts so unrelated queued work is not stranded.
-      await this.maybeStartQueuedTasks();
     }
 
     log.info("[startup] TaskService.recoverInterruptedTasks completed", {
@@ -5563,7 +5561,8 @@ export class TaskService implements AgentTaskIntegration {
 
   private async stopDescendantAgentTaskUnderLifecycleLock(
     ancestorWorkspaceId: string,
-    taskId: string
+    taskId: string,
+    drainQueue = true
   ): Promise<Result<{ stoppedTaskIds: string[] }, string>> {
     const stoppedTaskIds: string[] = [];
     const metadataToEmit = new Set<string>();
@@ -5621,7 +5620,8 @@ export class TaskService implements AgentTaskIntegration {
           for (const handle of activeHandles) {
             const interrupted = await this.getWorkspaceTurnManager().interruptWorkspaceTurn(
               handle.ownerWorkspaceId,
-              handle.handleId
+              handle.handleId,
+              { scheduleQueueDrain: false }
             );
             if (!interrupted.success) {
               return Err(interrupted.error);
@@ -5685,7 +5685,7 @@ export class TaskService implements AgentTaskIntegration {
     for (const id of metadataToEmit) {
       await this.emitWorkspaceMetadata(id);
     }
-    await this.maybeStartQueuedTasks();
+    if (drainQueue) await this.maybeStartQueuedTasks();
     return Ok({ stoppedTaskIds });
   }
 
