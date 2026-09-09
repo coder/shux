@@ -3,7 +3,11 @@ import {
   HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
 } from "@/node/services/historyAppendProvenance";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
-import { historyWriteLockPath } from "@/node/services/workspaceRemoval";
+import {
+  historyWriteLockPath,
+  workspaceRemovalTombstonePath,
+} from "@/node/services/workspaceRemoval";
+import type { TaskService } from "@/node/services/taskService";
 import { createRolloverPrefix } from "@/node/services/contextWindowRollover";
 import { hasRawResetMarker } from "@/node/services/historyScanner";
 import { createHash } from "node:crypto";
@@ -3297,5 +3301,158 @@ describe("session_history newest-first browsing", () => {
       success: false,
       error: "filters_unsupported",
     });
+  });
+});
+
+describe("session_history descendant task history", () => {
+  const childId = "child-task";
+  const removedChildId = "removed-child";
+  // Authorization itself is TaskService's contract; the tool must only consult it
+  // for every foreign call and fail closed on anything but an explicit true.
+  const taskService = {
+    isDescendantAgentTask: (ancestor: string, task: string) =>
+      Promise.resolve(ancestor === workspaceId && [childId, removedChildId].includes(task)),
+  } as unknown as TaskService;
+  const callAs = async (
+    input: SessionHistoryArgs,
+    options?: { caller?: string; taskService?: TaskService | null }
+  ) => {
+    const config = createTestToolConfig(fixture.tempDir, {
+      workspaceId: options?.caller ?? workspaceId,
+    });
+    config.historyService = fixture.historyService;
+    if (options?.taskService !== null) config.taskService = options?.taskService ?? taskService;
+    const tool = createSessionHistoryTool(config);
+    return TOOL_DEFINITIONS.session_history.resultSchema.parse(
+      await tool.execute!(input, mockToolCallOptions)
+    );
+  };
+  const appendChild = async (id: string, text: string, metadata?: MuxMetadata) => {
+    const message = createMuxMessage(id, "assistant", text, metadata);
+    expect((await fixture.historyService.appendToHistory(childId, message)).success).toBe(true);
+    return message;
+  };
+  const sessionDir = (id: string) => path.join(fixture.config.sessionsDir, id);
+  const expectNoSession = async (id: string) =>
+    expect(
+      await fs.stat(sessionDir(id)).then(
+        () => "exists",
+        (error: NodeJS.ErrnoException) => error.code
+      )
+    ).toBe("ENOENT");
+
+  test("reads a descendant's retained history behind its own reset floor and never the caller's rows", async () => {
+    await appendChild("child-private", "child private facts");
+    await appendChild("child-reset", "", { contextBoundaryKind: "reset", synthetic: true });
+    const visible = await appendChild("child-public", "child public facts");
+    const listed = await callAs({ action: "list_items", task_id: childId });
+    expect(listed.success).toBe(true);
+    expect(listed.items?.map((item) => item.text)).toEqual(["child public facts"]);
+    expect(
+      (await callAs({ action: "search", query: "facts", task_id: childId })).items
+    ).toHaveLength(1);
+    expect(
+      (await callAs({ action: "search", query: "child private", task_id: childId })).items
+    ).toEqual([]);
+    const read = await callAs({
+      action: "read_item",
+      task_id: childId,
+      item_id: String(visible.metadata!.historySequence),
+    });
+    expect(read.items?.[0]?.text).toBe("child public facts");
+    expect(
+      (await callAs({ action: "list_items", task_id: childId, recent_first: true })).items?.map(
+        (item) => item.text
+      )
+    ).toEqual(["child public facts"]);
+    // The caller's own history is unaffected by the target parameter.
+    expect((await callAs({ action: "list_items" })).items?.map((item) => item.text)).toEqual([
+      "opening facts",
+    ]);
+    expect(
+      (await callAs({ action: "list_items", task_id: workspaceId })).items?.map((item) => item.text)
+    ).toEqual(["opening facts"]);
+  });
+
+  test("unauthorized, unknown and unavailable targets fail closed without creating sessions", async () => {
+    await appendChild("child-row", "child facts");
+    for (const target of ["sibling-workspace", "unknown"]) {
+      expect(await callAs({ action: "list_items", task_id: target })).toMatchObject({
+        success: false,
+        error: "task_not_found",
+      });
+      await expectNoSession(target);
+    }
+    // A sibling caller cannot use the parent's descendant, and no taskService means no access.
+    expect(
+      await callAs({ action: "list_items", task_id: childId }, { caller: "sibling-workspace" })
+    ).toMatchObject({ success: false, error: "task_not_found" });
+    expect(
+      await callAs({ action: "list_items", task_id: childId }, { taskService: null })
+    ).toMatchObject({ success: false, error: "task_not_found" });
+    const failing = {
+      isDescendantAgentTask: () => Promise.reject(new Error("config unavailable")),
+    } as unknown as TaskService;
+    expect(
+      await callAs({ action: "list_items", task_id: childId }, { taskService: failing })
+    ).toMatchObject({ success: false, error: "task_not_found" });
+    // Authorized descendant whose files were removed: distinguishable, but never created.
+    expect(await callAs({ action: "list_items", task_id: removedChildId })).toMatchObject({
+      success: false,
+      error: "session_unavailable",
+    });
+    await expectNoSession(removedChildId);
+    expect(
+      await callAs({ action: "read_item", task_id: removedChildId, item_id: "1" })
+    ).toMatchObject({ success: false, error: "session_unavailable" });
+  });
+
+  test("cursors bind caller and target, and removal during pagination fails closed", async () => {
+    await appendChild("child-one", "child one");
+    await appendChild("child-two", "child two");
+    await append("own-two", "own second");
+    const own = await callAs({ action: "list_items", limit: 1 });
+    expect(own.nextCursor).toBeString();
+    const first = await callAs({ action: "list_items", task_id: childId, limit: 1 });
+    expect(first.items?.map((item) => item.text)).toEqual(["child one"]);
+    const cursor = first.nextCursor!;
+    expect(cursor).toBeString();
+    expect((await callAs({ action: "list_items", limit: 1, cursor })).error).toBe("invalid_cursor");
+    expect(
+      (await callAs({ action: "list_items", task_id: childId, limit: 1, cursor: own.nextCursor }))
+        .error
+    ).toBe("invalid_cursor");
+    // Another caller with a descendant of the same ID still cannot replay this cursor.
+    const otherParent = {
+      isDescendantAgentTask: () => Promise.resolve(true),
+    } as unknown as TaskService;
+    expect(
+      (
+        await callAs(
+          { action: "list_items", task_id: childId, limit: 1, cursor },
+          { caller: "other-parent", taskService: otherParent }
+        )
+      ).error
+    ).toBe("invalid_cursor");
+    // Removal publishes its tombstone under the history lock before deleting files.
+    await fs.mkdir(path.dirname(workspaceRemovalTombstonePath(fixture.config.rootDir, childId)), {
+      recursive: true,
+    });
+    await fs.writeFile(
+      workspaceRemovalTombstonePath(fixture.config.rootDir, childId),
+      JSON.stringify({ workspaceId: childId, removedAt: Date.now(), attemptId: "test" })
+    );
+    expect(
+      await callAs({ action: "list_items", task_id: childId, limit: 1, cursor })
+    ).toMatchObject({
+      success: false,
+      error: "session_unavailable",
+    });
+    await fs.rm(sessionDir(childId), { recursive: true, force: true });
+    expect(await callAs({ action: "list_items", task_id: childId })).toMatchObject({
+      success: false,
+      error: "session_unavailable",
+    });
+    await expectNoSession(childId);
   });
 });

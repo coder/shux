@@ -312,12 +312,33 @@ export class HistoryService {
   }
 
   /** One bounded page under both history locks; never performs mutation recovery. */
-  scanHistoryBounded(workspaceId: string, options: BoundedHistoryScanOptions) {
+  scanHistoryBounded(
+    workspaceId: string,
+    options: BoundedHistoryScanOptions & {
+      /**
+       * Foreign (descendant) targets must already have retained history: fail with
+       * `session_unavailable` instead of creating a session directory for them.
+       * Removal publishes its tombstone under this same history lock before
+       * deleting files, so this check cannot race a concurrent removal.
+       */
+      requireExistingHistory?: boolean;
+    }
+  ) {
     assert(workspaceId.trim().length > 0, "history scan requires workspaceId");
     return this.fileLocks.withLock(workspaceId, () =>
       this.withHistoryWriteFileLock(workspaceId, async () => {
         if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
-          throw new Error("stale_cursor");
+          throw new Error(options.requireExistingHistory ? "session_unavailable" : "stale_cursor");
+        if (options.requireExistingHistory) {
+          const retained = await fs.stat(this.getChatHistoryPath(workspaceId)).then(
+            (stat) => stat.isFile(),
+            (error: NodeJS.ErrnoException) => {
+              if (error.code !== "ENOENT") throw error;
+              return false;
+            }
+          );
+          if (!retained) throw new Error("session_unavailable");
+        }
         // Recovery rewrites history and takes the write lock. This read-only tool
         // must instead fail closed while a truncate transaction is unresolved.
         const assertNoTruncate = async () => {

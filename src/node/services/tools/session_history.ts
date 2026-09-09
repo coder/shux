@@ -110,6 +110,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
   const workspaceId = config.workspaceId;
   assert(workspaceId && workspaceId.trim().length > 0, "session_history requires workspaceId");
   const history = config.historyService ?? new HistoryService(new Config());
+  const taskService = config.taskService;
   return tool({
     description: TOOL_DEFINITIONS.session_history.description,
     inputSchema: TOOL_DEFINITIONS.session_history.schema,
@@ -142,6 +143,25 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           exhausted: false,
           skipped_oversized_rows: 0,
         };
+      // Descendant history: only canonical task IDs of this workspace's own
+      // descendants, re-authorized on every call (including cursor continuations).
+      // Unauthorized targets get one generic error so no target metadata leaks.
+      const target = args.task_id ?? workspaceId;
+      const foreign = target !== workspaceId;
+      const authorized =
+        !foreign ||
+        (taskService !== undefined &&
+          // Fail closed: an ancestry lookup failure denies rather than grants.
+          (await taskService.isDescendantAgentTask(workspaceId, target).catch(() => false)));
+      if (!authorized)
+        return {
+          success: false,
+          error: "task_not_found",
+          exhausted: false,
+          skipped_oversized_rows: 0,
+        };
+      // Caller and target identities are both bound so a cursor cannot be replayed
+      // by another caller or against another target.
       const binding = {
         workspaceId,
         action: args.action,
@@ -156,6 +176,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               args.tool_name ?? null,
               args.max_chars_per_item ?? null,
               args.recent_first === true,
+              target,
             ])
           )
           .digest("hex"),
@@ -192,9 +213,10 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           args.action === "search"
             ? new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
             : null;
-        const scan = await history.scanHistoryBounded(workspaceId, {
+        const scan = await history.scanHistoryBounded(target, {
           cursor: args.cursor != null ? decodeHistoryCursor(args.cursor, binding) : undefined,
           recentFirst: args.recent_first === true,
+          requireExistingHistory: foreign,
           visit: ({ message, itemId, windowId, windowBoundaryKind, startsWindow }) => {
             if (args.action === "list_windows") {
               if (!startsWindow) return true;
@@ -299,7 +321,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           success: false,
           exhausted: false,
           skipped_oversized_rows: 0,
-          error: ["stale_cursor", "invalid_cursor"].includes(message)
+          error: ["stale_cursor", "invalid_cursor", "session_unavailable"].includes(message)
             ? message
             : "history_unavailable",
         };
