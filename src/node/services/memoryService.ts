@@ -1292,15 +1292,22 @@ export class MemoryService extends EventEmitter {
       // store would be re-imported as a stale duplicate on every backend
       // start. Sidecar: a downgraded build can change only a pin or usage
       // stats, which must reach the owner key without the bytes changing.
+      // Strict reads throughout: this pass decides what the handover may
+      // consider done (and removal then deletes the child session on that
+      // basis), so a transiently unreadable manifest, sidecar or owner
+      // listing must fail the pass rather than stand in as "empty".
       const manifestPath = path.join(legacyRoot, LEGACY_ADOPTION_MANIFEST_FILE_NAME);
-      const adopted = await readLegacyAdoptionManifest(manifestPath);
-      const sidecarEntries = await this.metaService.getEntries();
+      const adopted = await readLegacyAdoptionManifest(manifestPath, { strict: true });
+      const sidecarEntries = await this.metaService.getEntriesOrThrow();
       // The per-scope file cap is a store invariant (create/rename enforce
       // it): the copy stops at the owner store's remaining capacity so a
       // combined notebook cannot exceed it — an over-full scope is silently
       // truncated by the index and refuses every later create. Files left
-      // behind stay unrecorded and are retried once space frees up.
-      let remainingCapacity = MEMORY_MAX_FILES_PER_SCOPE - (await store.listFiles()).length;
+      // behind stay unrecorded and are retried once space frees up. Complete
+      // owner listing: an undercount would let the copy push the store past
+      // the cap and hide an adopted note's only copy once readable again.
+      let remainingCapacity =
+        MEMORY_MAX_FILES_PER_SCOPE - (await store.listFiles({ strict: true })).length;
       let capacityExhausted = false;
       let manifestDirty = false;
       let imported = 0;
@@ -1507,7 +1514,21 @@ export class MemoryService extends EventEmitter {
                 )
               : null;
           const unchanged = current !== null && sha256Hex(current) === previous.content;
-          if (unchanged) {
+          // A listed note may now point at this very target (the downgraded
+          // build renamed `a.md` to the path its conflict copy was adopted
+          // under, and the new record reused the identical file): the target
+          // is that note's copy now. Provenance transfers to the successor
+          // record instead of the file being deleted from under it.
+          const successor = [...adopted].find(
+            ([rel, record]) =>
+              rel !== relPath && listed.has(rel) && record.target === previous.target
+          );
+          if (successor !== undefined) {
+            if (successor[1].created !== true) {
+              successor[1].created = true;
+              manifestDirty = true;
+            }
+          } else if (unchanged) {
             // Metadata first: a sidecar failure then aborts the pass with the
             // file and manifest entry intact, so the retry repeats both;
             // the reverse order would strand the owner-key pin/usage once

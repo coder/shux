@@ -9537,6 +9537,17 @@ describe("WorkspaceService initialize", () => {
         })
       ).toBe(true);
       expect(persistedFor(18)).toBe(true);
+      // A tail copy whose source epoch is unknown (persisted before the field
+      // existed) carries a policy nobody can look up: denied, like unknown
+      // history, even for an otherwise writable first turn.
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 22,
+          carriedPolicyUnknown: true,
+        })
+      ).toBe(true);
+      expect(persistedFor(22)).toBe(false);
       await realConfig.editConfig((cfg) => {
         const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
         entry.workspaceMemoryWritableByEpoch = { "-1": false, "12": true };
@@ -22290,6 +22301,47 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
       guardedAppendSpy.mockRestore();
       void realGuardedAppend;
       await fsPromises.rm(projectDir, { recursive: true, force: true });
+      await cleanup();
+    }
+  });
+});
+
+describe("WorkspaceService phantom removal probes", () => {
+  test("skips teardown only on PROVEN absence; an unreadable probe aborts the removal", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const service = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: createMockAIService({
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("not found"))),
+      }),
+    });
+    const workspaceId = "phantom-probe";
+    const sessionDir = path.join(config.sessionsDir, workspaceId);
+    try {
+      // No config.json and no session dir: nothing to tear down (idempotent).
+      expect((await service.remove(workspaceId, true)).success).toBe(true);
+      // (Deregistration wrote config.json; take it away again so the probe
+      // pair is exercised.) The session dir probe now fails for a reason
+      // other than absence: the removal must not deregister on a guess —
+      // abort, retryable.
+      await fsPromises.rm(path.join(config.rootDir, "config.json"), { force: true });
+      const realStat = fsPromises.stat.bind(fsPromises);
+      const unreadable = spyOn(fsPromises, "stat").mockImplementation(((
+        target: Parameters<typeof fsPromises.stat>[0],
+        ...rest: unknown[]
+      ) =>
+        String(target) === sessionDir
+          ? Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))
+          : (realStat as (...args: unknown[]) => unknown)(target, ...rest)) as never);
+      try {
+        const aborted = await service.remove(workspaceId, true);
+        expect(aborted.success).toBe(false);
+        expect(aborted.success ? "" : aborted.error).toContain("removal aborted");
+      } finally {
+        unreadable.mockRestore();
+      }
+    } finally {
       await cleanup();
     }
   });

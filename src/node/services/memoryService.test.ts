@@ -28,7 +28,7 @@ import {
 import { applyRefinementInverse, readRefinementEvents } from "./refinement/refinementTestHelpers";
 import { rollbackRefinement } from "./refinement/refinementRollback";
 import { migrateSharedMemoryRefinementRows } from "./refinement/sharedMemoryRowMigration";
-import { reclaimExcessRefinementInverseBlobs } from "./refinement/refinementJournal";
+import { reclaimExcessRefinementInverseBlobs, sha256Hex } from "./refinement/refinementJournal";
 import { REFINEMENT_INVERSE_BLOB_QUOTA_BYTES } from "@/common/types/refinement";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { sharedWorkspaceMemoryPeerSessionDirs } from "./memoryWorkspaceOwner";
@@ -1675,16 +1675,82 @@ describe("MemoryService", () => {
           .then(() => null, getErrorMessage)
       ).toMatch(/resolved to ws-owner/);
       // Failures surface (the access-time pass only logs and retries later).
-      spyOn(fixture.metaService, "getEntries").mockImplementationOnce(() =>
-        Promise.reject(new Error("sidecar unreadable"))
-      );
+      // A sidecar that exists but cannot be read is no "no metadata": the
+      // handover would copy the note without its pin and report success.
       await fsPromises.writeFile(path.join(legacyRoot, "late.md"), "written later");
-      expect(
-        await fixture.service
-          .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
-          .then(() => null, getErrorMessage)
-      ).toMatch(/sidecar unreadable/);
+      const metaPath = path.join(fixture.xumHome, "memory-meta.json");
+      const savedMeta = await fsPromises.readFile(metaPath).catch(() => null);
+      await fsPromises.rm(metaPath, { force: true });
+      await fsPromises.mkdir(metaPath); // EISDIR on read
+      try {
+        expect(
+          await fixture.service
+            .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
+            .then(() => null, getErrorMessage)
+        ).toMatch(/sidecar could not be read/);
+      } finally {
+        await fsPromises.rmdir(metaPath);
+        if (savedMeta !== null) await fsPromises.writeFile(metaPath, savedMeta);
+      }
       expect(await pathExists(path.join(ownerRoot, "late.md"))).toBe(false);
+      // Same for the adoption manifest: unreadable (not missing) aborts.
+      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const savedManifest = await fsPromises.readFile(manifestPath);
+      await fsPromises.rm(manifestPath);
+      await fsPromises.mkdir(manifestPath);
+      try {
+        expect(
+          await fixture.service
+            .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
+            .then(() => null, getErrorMessage)
+        ).toMatch(/EISDIR/);
+      } finally {
+        await fsPromises.rmdir(manifestPath);
+        await fsPromises.writeFile(manifestPath, savedManifest);
+      }
+      expect(await pathExists(path.join(ownerRoot, "late.md"))).toBe(false);
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      expect(await pathExists(path.join(ownerRoot, "late.md"))).toBe(true);
+    });
+
+    it("transfers provenance when a renamed legacy note lands on its own conflict copy", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      // Conflict: the owner has a different a.md, so the child's is adopted
+      // under imported/<child>/a.md.
+      await fsPromises.writeFile(path.join(ownerRoot, "a.md"), "owner's a");
+      await fsPromises.writeFile(path.join(legacyRoot, "a.md"), "child's a");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const importedCopy = path.join(ownerRoot, "imported", "ws-child", "a.md");
+      expect(await fsPromises.readFile(importedCopy, "utf-8")).toBe("child's a");
+      // The downgraded build renames the source to exactly that imported
+      // path: the new record reuses the identical target; the old record's
+      // reconciliation must hand the copy over, not delete it.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.mkdir(path.join(legacyRoot, "imported", "ws-child"), { recursive: true });
+      await fsPromises.rename(
+        path.join(legacyRoot, "a.md"),
+        path.join(legacyRoot, "imported", "ws-child", "a.md")
+      );
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await fsPromises.readFile(importedCopy, "utf-8")).toBe("child's a");
+      const manifest = JSON.parse(
+        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+      ) as Record<string, { target: string; created?: boolean }>;
+      expect(Object.keys(manifest)).toEqual(["imported/ws-child/a.md"]);
+      expect(manifest["imported/ws-child/a.md"]).toMatchObject({
+        target: "imported/ws-child/a.md",
+        created: true,
+      });
+      // With provenance transferred, deleting the renamed source removes the copy.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(legacyRoot, "imported", "ws-child", "a.md"));
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await pathExists(importedCopy)).toBe(false);
     });
 
     it("removal lists an oversized legacy notebook completely, counting every unplaceable note", async () => {
@@ -2478,6 +2544,71 @@ describe("MemoryService", () => {
       });
       expect(undo.success).toBe(true);
       expect(await fsPromises.readFile(keep, "utf-8")).toBe("v1");
+    });
+
+    it("migrates a pre-sharing row through the adoption manifest so the adopted copy stays rollbackable", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const legacyRoot = path.join(childSessionDir, "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      // Journaled before sharing: the inverse addresses the legacy notebook.
+      await fsPromises.writeFile(path.join(legacyRoot, "old.md"), "v2");
+      await sharedDurableEventJournal(childSessionDir).append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "str_replace", path: "/memories/workspace/old.md" },
+          inverse: {
+            op: "restore-files",
+            files: [{ path: path.join(legacyRoot, "old.md"), text: "v1" }],
+          },
+          postState: {
+            files: [{ path: path.join(legacyRoot, "old.md"), sha256: sha256Hex("v2") }],
+          },
+        },
+      });
+      // Also a legacy row for a note the shared store never took (unplaceable).
+      await sharedDurableEventJournal(childSessionDir).append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "create", path: "/memories/workspace/never.md" },
+          inverse: { op: "delete-files", paths: [path.join(legacyRoot, "never.md")] },
+        },
+      });
+      // Adoption folds old.md into the owner store.
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const ownerCopy = path.join(ownerSessionDir, "memory", "old.md");
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v2");
+      expect(
+        await migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        })
+      ).toBe(1);
+      await fsPromises.rm(childSessionDir, { recursive: true, force: true });
+      const copy = (await readRefinementEvents(ownerSessionDir)).find(
+        (row) => row.data.migratedFrom?.startsWith("ws-child:") === true
+      )!;
+      expect((copy.data.inverse as { files: Array<{ path: string }> }).files[0].path).toBe(
+        ownerCopy
+      );
+      expect((copy.data.postState as { files: Array<{ path: string }> }).files[0].path).toBe(
+        ownerCopy
+      );
+      const rolledBack = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: copy.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(rolledBack.success).toBe(true);
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
     });
 
     it("follows a row rolled back between the two handover passes with its rollback row", async () => {

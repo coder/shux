@@ -452,6 +452,21 @@ export class MemoryMetaService {
     return Effect.runPromise(this.effects.getEntries());
   }
 
+  /**
+   * `getEntries()` that refuses a healed substitute: throws when the sidecar
+   * exists but could not be read. For decisions that consume the entries
+   * destructively — the legacy-notebook handover before a sub-agent's session
+   * is deleted folds child-keyed pins/usage into the owner key; an empty
+   * substitute would fold nothing, report success, and strand the entries.
+   */
+  async getEntriesOrThrow(): Promise<Map<string, MemoryMetaEntry>> {
+    const { meta, readFailed } = await Effect.runPromise(this.loadWithHealth());
+    if (readFailed) {
+      throw new Error(`memory metadata sidecar could not be read at ${this.metaPath}`);
+    }
+    return new Map(Object.entries(meta.entries).map(([key, entry]) => [key, { ...entry }]));
+  }
+
   async setPinned(logicalKey: string, pinned: boolean): Promise<void> {
     await Effect.runPromise(this.effects.setPinned(logicalKey, pinned));
   }

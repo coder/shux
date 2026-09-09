@@ -46,19 +46,33 @@ function isLegacyAdoptionRecord(value: unknown): value is LegacyAdoptionRecord {
 }
 
 /**
- * Self-healing read of the adoption manifest: anything malformed reads as not
- * adopted. A Map, not a plain object: a legacy note may legitimately be named
- * `__proto__` (any store-valid relPath), and assigning that key on an
- * ordinary object hits the prototype setter instead of creating an entry the
- * serialization would carry — the note would then be re-adopted (and the
- * owner clock advanced) on every access. JSON.parse and Object.fromEntries
- * create own properties, so the round-trip below is exact.
+ * Self-healing read of the adoption manifest: a missing or malformed file
+ * reads as "nothing adopted" (malformed content IS the file's state; the next
+ * pass rewrites it). An UNREADABLE file (EACCES, EIO) says nothing about that
+ * state: tolerant callers read it as empty too, `strict` callers throw — the
+ * removal handover decides what may be deleted from the manifest, and an
+ * empty substitute would delete the child session with the only provenance
+ * for a stale owner copy. A Map, not a plain object: a legacy note may
+ * legitimately be named `__proto__` (any store-valid relPath), and assigning
+ * that key on an ordinary object hits the prototype setter instead of
+ * creating an entry the serialization would carry — the note would then be
+ * re-adopted (and the owner clock advanced) on every access. JSON.parse and
+ * Object.fromEntries create own properties, so the round-trip is exact.
  */
 export async function readLegacyAdoptionManifest(
-  manifestPath: string
+  manifestPath: string,
+  options?: { strict?: boolean }
 ): Promise<Map<string, LegacyAdoptionRecord>> {
+  let raw: string;
   try {
-    const parsed: unknown = JSON.parse(await fsPromises.readFile(manifestPath, "utf-8"));
+    raw = await fsPromises.readFile(manifestPath, "utf-8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (options?.strict === true && code !== "ENOENT" && code !== "ENOTDIR") throw error;
+    return new Map();
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return new Map();
     return new Map(
       Object.entries(parsed).filter((entry): entry is [string, LegacyAdoptionRecord] =>

@@ -21,6 +21,10 @@ import {
   type RefinementInverseDraft,
 } from "./refinementJournal";
 import { listRefinements } from "./refinementRollback";
+import {
+  createLegacyPathRemapper,
+  LegacyPathNotAdoptedError,
+} from "@/node/services/memoryLegacyAdoption";
 
 function inversePaths(inverse: RefinementInverse): string[] {
   switch (inverse.op) {
@@ -88,6 +92,23 @@ export async function migrateSharedMemoryRefinementRows(args: {
   );
   const ownerMemoryRoot = path.join(path.resolve(args.ownerSessionDir), "memory");
   const rows = await listRefinements(args.childSessionDir);
+  // Pre-sharing rows address the child's legacy private notebook; their notes
+  // live in the owner store now (adoption manifest, read while the child
+  // session still exists). Retargeted like the rollback engine does, so the
+  // adopted copy stays rollbackable once the child journal is gone; legacy
+  // paths the shared store never took are skipped below like other roots.
+  const remap = await createLegacyPathRemapper({
+    childSessionDir: args.childSessionDir,
+    ownerSessionDir: args.ownerSessionDir,
+  });
+  const remapInverse = (inverse: RefinementInverse): RefinementInverse | null => {
+    try {
+      return remap.inverse(inverse);
+    } catch (error) {
+      if (error instanceof LegacyPathNotAdoptedError) return null;
+      throw error;
+    }
+  };
   // Liveness follows the whole rollback chain (rollback → rollback of the
   // rollback re-applies): an original row is live when it has been rolled
   // back an even number of times. Rollback rows themselves are never copied.
@@ -160,8 +181,11 @@ export async function migrateSharedMemoryRefinementRows(args: {
         if (!parsed.success) continue;
         action = { ...parsed.data, of: rollbackOf };
       }
-      const inverse = RefinementInverseSchema.safeParse(row.data.inverse);
-      if (!inverse.success) continue;
+      const parsedInverse = RefinementInverseSchema.safeParse(row.data.inverse);
+      if (!parsedInverse.success) continue;
+      const remapped = remapInverse(parsedInverse.data);
+      if (remapped === null) continue;
+      const inverse = { success: true as const, data: remapped };
       if (!inversePaths(inverse.data).every((p) => isInside(ownerMemoryRoot, p))) continue;
 
       let draft: RefinementInverseDraft;
@@ -223,7 +247,20 @@ export async function migrateSharedMemoryRefinementRows(args: {
             ? { actor: evidence.data.actor }
             : {}),
         },
-        ...(postState.success ? { postState: postState.data } : {}),
+        ...(postState.success
+          ? {
+              postState: {
+                files: postState.data.files.flatMap((file) => {
+                  try {
+                    return [{ ...file, path: remap.path(file.path) }];
+                  } catch (error) {
+                    if (error instanceof LegacyPathNotAdoptedError) return [];
+                    throw error;
+                  }
+                }),
+              },
+            }
+          : {}),
         migratedFrom,
         ...(rollbackOf !== undefined ? { rollbackOf } : {}),
         sourceTs: row.data.sourceTs ?? row.ts,

@@ -402,6 +402,7 @@ import {
   upsertSubagentTranscriptArtifactIndexEntry,
 } from "@/node/services/subagentTranscriptArtifacts";
 import { getErrorMessage } from "@/common/utils/errors";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 /** Maximum number of retry attempts when workspace name collides */
 const MAX_WORKSPACE_NAME_COLLISION_RETRIES = 3;
@@ -4273,7 +4274,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   async recordWorkspaceMemoryWritable(
     workspaceId: string,
     writable: boolean,
-    options: { epochHasPriorTurns: boolean; policyEpoch: number; carriedPolicyEpochs?: number[] }
+    options: {
+      epochHasPriorTurns: boolean;
+      policyEpoch: number;
+      carriedPolicyEpochs?: number[];
+      /** The epoch holds tail copies whose source epoch is unknown: denied (see TurnRequestBuilder). */
+      carriedPolicyUnknown?: boolean;
+    }
   ): Promise<boolean> {
     // The accumulator (config bit and deny marker alike) is bound to the
     // compaction epoch it accumulates over — the opening boundary's history
@@ -4413,7 +4420,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       workspaceMemoryWritableForEpoch(entry, policyEpoch);
     const stored = storedFor(before.workspace);
     const unknownHistory =
-      stored === undefined && mirror === undefined && options.epochHasPriorTurns;
+      (stored === undefined && mirror === undefined && options.epochHasPriorTurns) ||
+      options.carriedPolicyUnknown === true;
     const conjunction = (durable: boolean | undefined, carried: boolean | undefined): boolean =>
       !denyMarker &&
       !carriedDenyMarker &&
@@ -6800,15 +6808,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // written (fresh install, nothing registered) and no session dir
         // means there is no topology to resolve and nothing a tombstone
         // could protect — removing an unknown id must still succeed.
-        const exists = (target: string): Promise<boolean> =>
+        // Proven absence only: a probe that fails for any other reason
+        // (EACCES, EIO) says nothing, and declaring "nothing to tear down"
+        // on it would deregister the workspace without deleting its session
+        // or publishing a tombstone — an orphan foreign writers keep mutating.
+        const provenAbsent = (target: string): Promise<boolean> =>
           fsPromises.stat(target).then(
-            () => true,
-            () => false
+            () => false,
+            (error: unknown) => {
+              if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) return true;
+              throw new SharedMemoryRemovalAbortedError(workspaceId, { cause: error });
+            }
           );
         const nothingToTearDown =
           verifiedSharedMemoryOwnerId === null &&
-          !(await exists(configFilePath(this.config.rootDir))) &&
-          !(await exists(sessionDir));
+          (await provenAbsent(configFilePath(this.config.rootDir))) &&
+          (await provenAbsent(sessionDir));
         if (nothingToTearDown) {
           log.debug("Skipping session teardown: no config.json and no session dir", {
             workspaceId,

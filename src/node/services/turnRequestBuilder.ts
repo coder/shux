@@ -567,7 +567,12 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
     recordWorkspaceMemoryWritable(
       workspaceId: string,
       writable: boolean,
-      options: { epochHasPriorTurns: boolean; policyEpoch: number; carriedPolicyEpochs?: number[] }
+      options: {
+        epochHasPriorTurns: boolean;
+        policyEpoch: number;
+        carriedPolicyEpochs?: number[];
+        carriedPolicyUnknown?: boolean;
+      }
     ): Promise<boolean>;
   };
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
@@ -1544,19 +1549,28 @@ export class TurnRequestBuilder {
     // copy of a copy keeps the first), so a chain of tail compactions names
     // every epoch involved — `messages` here holds only the active epoch, so
     // nothing about earlier boundaries can be derived from it.
+    const tailCopies = activeContextMessages.filter(
+      (message) => message.metadata?.rlmPreservedTailCopy === true
+    );
     const carriedPolicyEpochs = [
       ...new Set(
-        activeContextMessages.flatMap((message) => {
+        tailCopies.flatMap((message) => {
           const epoch = message.metadata?.rlmPreservedTailSourcePolicyEpoch;
-          return message.metadata?.rlmPreservedTailCopy === true &&
-            typeof epoch === "number" &&
-            Number.isInteger(epoch) &&
-            epoch < policyEpoch
+          return typeof epoch === "number" && Number.isInteger(epoch) && epoch < policyEpoch
             ? [epoch]
             : [];
         })
       ),
     ].sort((a, b) => a - b);
+    // A copy without a source epoch (persisted by a build before the field,
+    // or a re-copy of one) carries a policy nobody can look up: it is
+    // excluded from the prior-turn check like every copy, so without this
+    // the epoch would grant on the strength of the turns it can see. Unknown
+    // fails closed — the epoch is denied until a no-tail boundary (or the
+    // tail turning over) leaves no such copy in the active context.
+    const carriedPolicyUnknown = tailCopies.some(
+      (message) => typeof message.metadata?.rlmPreservedTailSourcePolicyEpoch !== "number"
+    );
     const persistWorkspaceMemoryWritable = async (writable: boolean): Promise<boolean> => {
       const sink = this.dependencies.bindings.workspaceMemoryPolicySink;
       if (isCompactionRequest || !sink) return true;
@@ -1565,6 +1579,7 @@ export class TurnRequestBuilder {
           epochHasPriorTurns,
           policyEpoch,
           ...(carriedPolicyEpochs.length === 0 ? {} : { carriedPolicyEpochs }),
+          ...(carriedPolicyUnknown ? { carriedPolicyUnknown } : {}),
         })
       ) {
         return true;
