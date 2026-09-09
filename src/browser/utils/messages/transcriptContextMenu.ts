@@ -730,10 +730,15 @@ export function getTranscriptContextMenuMarkdown(
   // Blank lines let Markdown parse content inside structures that GFM cannot represent.
   const serializeStructuredHtml = (element: Element): string => {
     const tag = element.tagName.toLowerCase();
-    const attributes = Array.from(
-      element.attributes,
-      (attribute) => " " + attribute.name + '="' + attribute.value + '"'
-    ).join("");
+    const attributes = Array.from(element.attributes, (attribute) => {
+      // SECURITY AUDIT: Safe URL schemes can still contain quotes or HTML delimiters.
+      const value = attribute.value
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+      return " " + attribute.name + '="' + value + '"';
+    }).join("");
     const content = element.matches("td, th, li, dt, dd")
       ? markdown.turndown(element as HTMLElement)
       : Array.from(element.children, serializeStructuredHtml).join("\n\n");

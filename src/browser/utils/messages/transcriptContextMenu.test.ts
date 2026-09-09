@@ -142,6 +142,24 @@ describe("transcriptContextMenu", () => {
       expect(code?.textContent?.trimEnd()).toBe("const x = 1;\n  x++;");
     });
 
+    test("structured HTML escapes URL attributes before Markdown parsing", () => {
+      const href = 'mailto:team@example.com"><img src=x onerror=alert(1)>';
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage('<dl><a id="part">Contact</a></dl>')
+      );
+      root.querySelector("a")!.setAttribute("href", href);
+      const copied = getTranscriptContextMenuMarkdown(select(root, "#part"))!;
+      for (const html of [copied.html, new MarkdownIt({ html: true }).render(copied.text)]) {
+        const pasted = document.createElement("div");
+        pasted.innerHTML = html;
+        expect(pasted.querySelector("img, [onerror]")).toBeNull();
+        expect(pasted.querySelectorAll("a")).toHaveLength(1);
+        expect(pasted.querySelector("a")?.getAttribute("href")).toStartWith(
+          "mailto:team@example.com"
+        );
+      }
+    });
+
     test("preserves links when the selection target is an anchor", () => {
       const root = createTranscriptRoot(
         createQuoteableTranscriptMessage(
