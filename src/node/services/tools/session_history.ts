@@ -118,10 +118,13 @@ function createsTask(message: MuxMessage, taskId: string): boolean {
     if (depth > 30) return false;
     if (record.toolName === "task" && receiptNames(record.output ?? record.result)) return true;
     const children = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
-    const nested: unknown[] = [
-      ...children(record.nestedCalls),
-      ...children(isPlainObject(record.output) ? record.output.toolCalls : undefined),
-    ];
+    // Only the PTC kernel's own result carries the legacy representation; any other tool's
+    // output (MCP, structured results) is attacker-controlled text, not a receipt.
+    const legacy =
+      record.toolName === "code_execution" && isPlainObject(record.output)
+        ? record.output.toolCalls
+        : undefined;
+    const nested: unknown[] = [...children(record.nestedCalls), ...children(legacy)];
     return nested.some((entry) => isPlainObject(entry) && spawns(entry, depth + 1));
   };
   return message.parts.some(
@@ -265,6 +268,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           maxRows: SESSION_HISTORY_MAX_SCAN_ROWS,
         };
         let authorization = cursor?.authorization ?? null;
+        let inFlight = false;
         if (branchRoot !== null) {
           assert(
             authorization === null || authorization.branchRoot === branchRoot,
@@ -272,10 +276,12 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           );
           // A child created earlier in the SAME streaming turn is only in the caller's
           // partial message until stream end; that receipt is inside the current segment by
-          // construction (resets require a settled stream). Re-derived every page: once the
-          // turn settles the receipt lives in chat.jsonl and the bounded scan proves it.
-          const partial = await history.readPartial(workspaceId);
-          const inFlight = partial !== null && createsTask(partial, branchRoot);
+          // construction (resets require a settled stream). Re-derived every page and read
+          // only within the page budget: an oversized partial defers proof to the settled scan.
+          const partial = await history.readPartialBounded(workspaceId, budget.maxBytes);
+          budget.maxBytes -= partial.bytesRead;
+          result.bytesRead = partial.bytesRead;
+          inFlight = partial.message !== null && createsTask(partial.message, branchRoot);
           if (!inFlight) {
             // Proven cursors carry the caller scan as "done": continuing it only runs the
             // append check (an appended manual reset or rewrite throws stale_cursor) without
@@ -292,16 +298,18 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             });
             budget.maxBytes -= auth.bytesRead;
             budget.maxRows -= auth.rowsScanned;
-            result.bytesRead = auth.bytesRead;
+            result.bytesRead += auth.bytesRead;
             result.rowsScanned = auth.rowsScanned;
             if (authorization?.proven) {
-              // An unfinished append check (large caller appends) resumes next page.
+              assert(auth.state, "a resumed caller scan reports its final state");
+              // Keep the advanced snapshot; an unfinished append check resumes next page.
+              authorization = { ...authorization, scan: auth.state };
               if (auth.cursor) {
                 result.exhausted = false;
                 result.nextCursor = encodeHistoryCursor({
                   ...binding,
                   scan: cursor?.scan ?? null,
-                  authorization: { ...authorization, scan: auth.cursor },
+                  authorization,
                 });
                 return result;
               }
@@ -430,6 +438,55 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             return true;
           },
         });
+        const withheld = () => {
+          result.items = [];
+          result.windows = [];
+          result.exhausted = false;
+          result.nextCursor = encodeHistoryCursor({
+            ...binding,
+            scan: cursor?.scan ?? null,
+            authorization,
+          });
+          return result;
+        };
+        if (inFlight) {
+          // The in-flight receipt must still be present after the target read; if the turn
+          // settled meanwhile the rows are withheld and the next page proves via the scan.
+          const again = await history.readPartialBounded(
+            workspaceId,
+            Math.max(0, budget.maxBytes - scan.bytesRead)
+          );
+          result.bytesRead = (result.bytesRead ?? 0) + again.bytesRead;
+          if (again.message === null || !createsTask(again.message, branchRoot!)) {
+            result.bytesRead += scan.bytesRead;
+            result.rowsScanned = (result.rowsScanned ?? 0) + scan.rowsScanned;
+            return withheld();
+          }
+        }
+        if (authorization?.proven) {
+          // Another backend may have appended a caller reset between the authorization
+          // scan (caller lock released) and this target scan. Revalidate the caller snapshot
+          // before disclosing anything; a reset throws stale_cursor here, and an append check
+          // that cannot finish in this page defers the rows (re-read next page).
+          budget.maxBytes -= scan.bytesRead;
+          budget.maxRows -= scan.rowsScanned;
+          const recheck = await history.scanHistoryBounded(workspaceId, {
+            cursor: authorization.scan,
+            budget: {
+              maxBytes: Math.max(budget.maxBytes, 4 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES),
+              maxRows: Math.max(budget.maxRows, 1),
+            },
+            visit: () => true,
+          });
+          assert(recheck.state, "a resumed caller scan reports its final state");
+          authorization = { ...authorization, scan: recheck.state };
+          result.bytesRead = (result.bytesRead ?? 0) + recheck.bytesRead;
+          if (recheck.cursor) {
+            result.bytesRead += scan.bytesRead;
+            result.rowsScanned = (result.rowsScanned ?? 0) + scan.rowsScanned;
+            return withheld();
+          }
+        }
         result.bytesRead = (result.bytesRead ?? 0) + scan.bytesRead;
         result.rowsScanned = (result.rowsScanned ?? 0) + scan.rowsScanned;
         result.oversizedLines = scan.oversizedLines;

@@ -422,6 +422,8 @@ export interface BoundedHistoryScanOptions {
 }
 export interface BoundedHistoryScanResult {
   cursor?: HistoryScanState;
+  /** Final state even when the scan finished (no cursor): carries the validated snapshots. */
+  state?: HistoryScanState;
   bytesRead: number;
   rowsScanned: number;
   oversizedLines: number;
@@ -729,6 +731,7 @@ export async function scanHistoryFilesBounded(
         );
         if (!completed && !reachedValidatedRow) {
           result.cursor = state;
+          result.state = state;
           return await finish();
         }
         // Keep the retrieval snapshot fixed even when our own result is appended.
@@ -736,6 +739,7 @@ export async function scanHistoryFilesBounded(
         state.appendCheck = null;
         if (chatSize > state.validatedChatSnapshot.endOffsetSnapshot) {
           result.cursor = state;
+          result.state = state;
           return await finish();
         }
       }
@@ -985,6 +989,7 @@ export async function scanHistoryFilesBounded(
       } else state.phase = "done";
     }
     if (state.phase !== "done") result.cursor = state;
+    result.state = state;
     return await finish();
   } finally {
     await Promise.all([...handles.values()].map((handle) => handle.close()));

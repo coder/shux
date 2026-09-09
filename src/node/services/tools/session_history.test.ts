@@ -3558,6 +3558,54 @@ describe("session_history descendant task history", () => {
     expect((await callAs({ action: "list_items", task_id: childId })).success).toBe(true);
   });
 
+  test("foreign toolCalls, oversized partials and cross-backend resets never disclose rows", async () => {
+    await appendChild("child-row", "child facts");
+    // Legacy toolCalls only count inside code_execution results; other tools' output is data.
+    await appendSpawnPart(
+      taskPart("mcp_structured", {
+        toolCalls: [{ toolName: "task", duration_ms: 1, result: { taskId: childId } }],
+      })
+    );
+    expect(await callAs({ action: "list_items", task_id: childId })).toMatchObject({
+      success: false,
+      error: "task_not_found",
+    });
+    // A partial larger than the page budget is not loaded; proof waits for the settled scan.
+    const huge = createMuxMessage(
+      "huge",
+      "assistant",
+      "x".repeat(SESSION_HISTORY_MAX_SCAN_BYTES),
+      undefined,
+      [taskPart("task", { status: "running", taskId: childId })]
+    );
+    await fixture.historyService.writePartial(workspaceId, huge);
+    const skipped = await callAs({ action: "list_items", task_id: childId });
+    expect(skipped).toMatchObject({ success: false, error: "task_not_found" });
+    await fixture.historyService.deletePartial(workspaceId);
+    // A reset appended to the caller (by another backend) between the authorization scan and
+    // the target scan is caught by the post-scan revalidation: nothing is disclosed.
+    await spawn([childId]);
+    const original = fixture.historyService.scanHistoryBounded.bind(fixture.historyService);
+    const spy = spyOn(fixture.historyService, "scanHistoryBounded").mockImplementation(
+      async (workspace, options) => {
+        if (workspace === childId)
+          await append("foreign-reset", "", { contextBoundaryKind: "reset", synthetic: true });
+        return original(workspace, options);
+      }
+    );
+    try {
+      const raced = await callAs({ action: "list_items", task_id: childId });
+      expect(raced).toMatchObject({ success: false, error: "stale_cursor" });
+      expect(raced.items ?? []).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(await callAs({ action: "list_items", task_id: childId })).toMatchObject({
+      success: false,
+      error: "task_not_found",
+    });
+  });
+
   test("large caller appends between proven pages resume the append check as progress pages", async () => {
     await spawn([childId]);
     await appendChild("child-one", "child one");
