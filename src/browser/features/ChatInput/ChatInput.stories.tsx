@@ -285,6 +285,9 @@ export const FocusedComposer: AppStory = {
 };
 
 export const SendingMessage: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
   render: () => (
     <AppWithMocks
       setup={() => {

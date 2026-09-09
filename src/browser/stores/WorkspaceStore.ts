@@ -388,7 +388,7 @@ interface WorkspaceChatTransientState {
   pendingStreamEvents: WorkspaceChatMessage[];
   replayingHistory: boolean;
   queuedMessage: QueuedMessage | null;
-  /** Visible queue strings from the last queue update, to tell drains from new enqueues. */
+  /** Visible queue payload size from the last queue update, to tell drains from new enqueues. */
   queuedMessageCount: number;
   pendingSend: PendingSendState | null;
   liveBashOutput: Map<string, LiveBashOutputInternal>;
@@ -1192,7 +1192,9 @@ export class WorkspaceStore {
       const transient = this.assertChatTransientState(workspaceId);
       transient.queuedMessage = queuedMessage;
       const pending = transient.pendingSend;
-      const nextCount = data.queuedMessages.length;
+      // Attachment-only entries add no text, so size the queue by every visible payload kind.
+      const nextCount =
+        data.queuedMessages.length + (data.fileParts?.length ?? 0) + (data.reviews?.length ?? 0);
       if (pending && transient.caughtUp && !transient.replayingHistory) {
         if (nextCount > transient.queuedMessageCount || (pending.accepted && queuedMessage)) {
           // The send landed in the backend queue; the queued card takes over from the pending row.
@@ -4156,8 +4158,9 @@ export class WorkspaceStore {
   }
 
   /**
-   * A live user row arrived. Synthetic rows (pre-send compaction) defer the echo and drained
-   * queue entries echo their own rows; anything else is this send's echo.
+   * A live user row arrived. A synthetic pre-send compaction request defers the echo behind its
+   * turn, drained queue entries echo their own rows, and other synthetic rows (monitor wakes,
+   * continuations) are unrelated; anything else is this send's echo.
    */
   private acknowledgePendingSendEcho(
     transient: WorkspaceChatTransientState,
@@ -4168,7 +4171,9 @@ export class WorkspaceStore {
       return;
     }
     if (echo.metadata?.synthetic === true) {
-      pending.deferredBehindSyntheticTurn = true;
+      if (echo.metadata.muxMetadata?.type === "compaction-request") {
+        pending.deferredBehindSyntheticTurn = true;
+      }
       return;
     }
     if (pending.drainedEchoesExpected > 0) {

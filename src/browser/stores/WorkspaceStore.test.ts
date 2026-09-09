@@ -4990,6 +4990,35 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
     });
 
+    it("clears an attachment-only pending row when the queue grows by a file", async () => {
+      const workspaceId = "pending-send-queued-file-only";
+      const queue = gate();
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        await queue.opened;
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: true,
+          queuedMessages: [],
+          displayText: "",
+          fileParts: [{ url: "data:image/png;base64,AA==", mediaType: "image/png" }],
+        };
+        await waitForAbortSignal(signal);
+      });
+
+      store.beginPendingSend(workspaceId, {
+        id: "pending-file",
+        content: "",
+        fileParts: [{ url: "data:image/png;base64,AA==", mediaType: "image/png" }],
+      });
+      queue.release();
+
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).queuedMessage !== null)
+      ).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
+    });
+
     it("retires the pending row when the compaction turn that took it over is abandoned", async () => {
       const workspaceId = "pending-send-compaction-abandoned";
       const compaction = gate();
@@ -5001,7 +5030,17 @@ describe("WorkspaceStore", () => {
           id: "compaction-1",
           role: "user",
           parts: [{ type: "text", text: "Summarize" }],
-          metadata: { historySequence: 1, timestamp: 1, synthetic: true, uiVisible: true },
+          metadata: {
+            historySequence: 1,
+            timestamp: 1,
+            synthetic: true,
+            uiVisible: true,
+            muxMetadata: {
+              type: "compaction-request",
+              rawCommand: "/compact",
+              parsed: { model: TEST_MODEL, followUpContent: { text: "hello" } },
+            },
+          },
         };
         yield compactionRequest;
         await abort.opened;
