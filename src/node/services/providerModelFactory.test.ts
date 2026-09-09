@@ -1346,6 +1346,66 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
     }
   );
 
+  it.each([
+    ["responses", "team-astra", "openai:gpt-5-nano"],
+    ["chatCompletions", "team-astra", "openai:gpt-5-nano"],
+    ["responses", "gpt-5-nano", "openai:gpt-6-astra"],
+    ["chatCompletions", "gpt-5-nano", "openai:gpt-6-astra"],
+  ] as const)(
+    "forwards %s tier for %s mapped to %s and surfaces upstream rejection",
+    async (wireFormat, modelId, mappedToModel) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        store.saveProvidersConfig({
+          openai: {
+            apiKey: "native-key",
+            baseUrl: "https://native.example.com/v1",
+            wireFormat,
+            serviceTier: "priority",
+            models: [{ id: modelId, mappedToModel }],
+          },
+        });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const message = "This model does not support the requested service tier.";
+        const rejectingFetch = Object.assign(async (...args: Parameters<typeof fakeFetch>) => {
+          await fakeFetch(...args);
+          return new Response(
+            JSON.stringify({
+              error: {
+                message,
+                type: "invalid_request_error",
+                param: "service_tier",
+                code: "unsupported_value",
+              },
+            }),
+            { status: 400, headers: { "content-type": "application/json" } }
+          );
+        }, fakeFetch);
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(rejectingFetch);
+        try {
+          const result = await factory.createModel(`openai:${modelId}`);
+          if (!result.success) throw new Error(result.error.type);
+          // Keep SDK retries enabled: an upstream 400 must surface, not retry a downgraded tier.
+          // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun mistypes rejection matchers.
+          await expect(generateText({ model: result.data, prompt: "hello" })).rejects.toMatchObject(
+            {
+              statusCode: 400,
+              message,
+            }
+          );
+          expect(calls).toHaveLength(1);
+          expect(parseSentBody(calls[0])).toMatchObject({
+            model: modelId,
+            service_tier: "priority",
+          });
+          const endpoint = wireFormat === "responses" ? "responses" : "chat/completions";
+          expect(calls[0].url).toBe(`https://native.example.com/v1/${endpoint}`);
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
+
   it.each(["responses", "chatCompletions"] as const)(
     "preserves tier and store precedence over %s without changing the raw alias",
     async (wireFormat) => {

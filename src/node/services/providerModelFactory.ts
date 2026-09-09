@@ -1904,8 +1904,9 @@ export class ProviderModelFactory {
           };
           // Reuse the same transport across per-call adapters. Inject tiers before
           // its HTTP/WebSocket dispatch, and keep OAuth's normalization unchanged.
-          // Only explicit native aliases bypass name-based SDK tier gating;
-          // ordinary model IDs retain their existing capability restrictions.
+          // Mappings are metadata, not authority over the raw/proxy model's tier support.
+          // Explicit mappings forward the requested tier for upstream validation;
+          // only unmapped native IDs retain the SDK's name-based restrictions.
           const isMappedAlias =
             resolveModelForMetadata(fullModelId, providersConfig) !== fullModelId;
           const model = shouldRouteThroughCodexOauth
