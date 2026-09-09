@@ -5335,6 +5335,57 @@ describe("WorkspaceStore", () => {
       );
     });
 
+    it("keeps the pending row when a full replay first delivers an owed dispatch echo", async () => {
+      const workspaceId = "pending-send-replay-owed-dispatch";
+      let attempt = 0;
+      mockChatStreamFor(workspaceId, async function* (signal) {
+        attempt += 1;
+        if (attempt === 1) {
+          yield createUserMessageEvent("user-1", "earlier", 1, 1);
+          yield {
+            type: "queued-message-changed",
+            workspaceId,
+            hasQueuedMessages: true,
+            queuedMessages: ["queued follow-up"],
+            displayText: "queued follow-up",
+          };
+          // No cursor: the next subscription falls back to a full replay and its reset.
+          yield { type: "caught-up", replay: "full" };
+          await tick(20);
+          // The entry dispatches, but its echo only shows up in the replay after reconnecting.
+          yield {
+            type: "queued-message-changed",
+            workspaceId,
+            hasQueuedMessages: false,
+            queuedMessages: [],
+            displayText: "",
+          };
+        } else {
+          yield createUserMessageEvent("user-1", "earlier", 1, 1);
+          yield createUserMessageEvent("follow-up-1", "queued follow-up", 2, 2);
+          yield { type: "caught-up", replay: "full" };
+        }
+        await waitForAbortSignal(signal);
+      });
+      createAndAddWorkspace(store, workspaceId);
+      expect(
+        await waitUntil(
+          () =>
+            store.getWorkspaceState(workspaceId).queuedMessage === null &&
+            store.getWorkspaceState(workspaceId).isTranscriptCaughtUp
+        )
+      ).toBe(true);
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      await resubscribe(workspaceId, `${workspaceId}-other`);
+      expect(attempt).toBe(2);
+
+      expect(
+        store.getWorkspaceState(workspaceId).muxMessages.some((m) => m.id === "follow-up-1")
+      ).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+    });
+
     it("keeps a pending row begun before the first replay of an empty new workspace", async () => {
       const workspaceId = "pending-send-new-workspace";
       const replay = gate();

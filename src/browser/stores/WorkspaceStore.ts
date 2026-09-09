@@ -3819,6 +3819,8 @@ export class WorkspaceStore {
     }
     // A send begun before the first replay (new workspace) is retired by the replay itself.
     nextTransient.pendingSend = previousTransient?.pendingSend ?? null;
+    // Dispatched entries still owe their echoes after the replay too.
+    nextTransient.queueDispatchesAwaitingEcho = previousTransient?.queueDispatchesAwaitingEcho ?? 0;
 
     this.chatTransientState.set(workspaceId, nextTransient);
 
@@ -4153,7 +4155,7 @@ export class WorkspaceStore {
     pending.accepted = true;
     if (
       transient.caughtUp &&
-      (pending.knownUserEchoIds === null || this.hasUnseenUserEcho(aggregator, pending))
+      (pending.knownUserEchoIds === null || this.settleUnseenUserEchoes(transient, aggregator))
     ) {
       transient.pendingSend = null;
       this.states.bump(workspaceId);
@@ -4171,17 +4173,28 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
   }
 
-  private hasUnseenUserEcho(
-    aggregator: StreamingMessageAggregator,
-    pending: PendingSendState
+  /**
+   * Whether an echo the pending send did not know about is displayed. Echoes still owed by
+   * dispatched queue entries are not this send's; they are consumed and remembered so a later
+   * replay cannot count them again.
+   */
+  private settleUnseenUserEchoes(
+    transient: WorkspaceChatTransientState,
+    aggregator: StreamingMessageAggregator
   ): boolean {
-    const known = pending.knownUserEchoIds;
+    const known = transient.pendingSend?.knownUserEchoIds;
     if (!known) {
       return false;
     }
-    return aggregator
+    const unseen = aggregator
       .getAllMessages()
-      .some((message) => isUserEcho(message) && !known.has(message.id));
+      .filter((message) => isUserEcho(message) && !known.has(message.id));
+    const owed = unseen.splice(0, Math.min(unseen.length, transient.queueDispatchesAwaitingEcho));
+    transient.queueDispatchesAwaitingEcho -= owed.length;
+    for (const echo of owed) {
+      known.add(echo.id);
+    }
+    return unseen.length > 0;
   }
 
   /**
@@ -4205,6 +4218,7 @@ export class WorkspaceStore {
     }
     if (transient.queueDispatchesAwaitingEcho > 0) {
       transient.queueDispatchesAwaitingEcho -= 1;
+      transient.pendingSend?.knownUserEchoIds?.add(echo.id);
       return;
     }
     transient.pendingSend = null;
@@ -4698,7 +4712,7 @@ export class WorkspaceStore {
       const pendingSend = transient.pendingSend;
       if (
         pendingSend &&
-        (pendingSend.accepted || this.hasUnseenUserEcho(aggregator, pendingSend))
+        (pendingSend.accepted || this.settleUnseenUserEchoes(transient, aggregator))
       ) {
         transient.pendingSend = null;
       }
