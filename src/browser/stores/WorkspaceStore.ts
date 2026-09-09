@@ -388,7 +388,7 @@ interface WorkspaceChatTransientState {
   pendingStreamEvents: WorkspaceChatMessage[];
   replayingHistory: boolean;
   queuedMessage: QueuedMessage | null;
-  /** Visible queue entries from the last queue update, to tell drains from new enqueues. */
+  /** Visible queue strings from the last queue update, to tell drains from new enqueues. */
   queuedMessageCount: number;
   pendingSend: PendingSendState | null;
   liveBashOutput: Map<string, LiveBashOutputInternal>;
@@ -1198,7 +1198,8 @@ export class WorkspaceStore {
           // The send landed in the backend queue; the queued card takes over from the pending row.
           transient.pendingSend = null;
         } else if (nextCount < transient.queuedMessageCount) {
-          pending.drainedEchoesExpected += transient.queuedMessageCount - nextCount;
+          // One dispatched entry per shrink, however many batched strings it carried.
+          pending.drainedEchoesExpected += 1;
         }
       }
       transient.queuedMessageCount = nextCount;

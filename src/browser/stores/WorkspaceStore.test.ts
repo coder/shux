@@ -4914,15 +4914,16 @@ describe("WorkspaceStore", () => {
       const drain = gate();
       const echo = gate();
       await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        // One queued entry batching two plain follow-ups: it dispatches as a single user row.
         yield {
           type: "queued-message-changed",
           workspaceId,
           hasQueuedMessages: true,
-          queuedMessages: ["earlier follow-up"],
-          displayText: "earlier follow-up",
+          queuedMessages: ["earlier follow-up", "and another"],
+          displayText: "earlier follow-up\nand another",
         };
         await drain.opened;
-        // The active turn ends: the queued follow-up dispatches and echoes its own user row.
+        // The active turn ends: the queued entry dispatches and echoes its own user row.
         yield {
           type: "queued-message-changed",
           workspaceId,
@@ -4930,7 +4931,7 @@ describe("WorkspaceStore", () => {
           queuedMessages: [],
           displayText: "",
         };
-        yield createUserMessageEvent("follow-up-1", "earlier follow-up", 2, 2);
+        yield createUserMessageEvent("follow-up-1", "earlier follow-up\n\nand another", 2, 2);
         await echo.opened;
         yield createUserMessageEvent("user-2", "hello", 3, 3);
         await waitForAbortSignal(signal);
