@@ -631,6 +631,7 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         type: "context-budget-warning";
         contextTokens: number;
         maxTokens: number;
+        budgetTokens: number;
         /** Final pre-rollover flush prompt (absent on the advance warning). */
         final?: true;
       }

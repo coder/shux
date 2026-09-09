@@ -21,6 +21,7 @@ import {
 import {
   evaluateStepBudget,
   getContextBudgetHardCeiling,
+  getContextBudgetRolloverPoint,
   resolveContextBudgetFlushThinking,
 } from "@/common/utils/compaction/contextBudget";
 import {
@@ -5809,7 +5810,19 @@ export class AgentSession {
         // this capture cannot add an executable tool to the memory-only turn either.
         this.pendingRolloverSnapshot = admitted.data;
         return Ok({
-          prefix: [createContextBudgetWarning(decision.projected, maxTokens, true, true, true)],
+          prefix: [
+            createContextBudgetWarning({
+              contextTokens: decision.projected,
+              maxTokens,
+              budgetTokens: getContextBudgetRolloverPoint(
+                maxTokens,
+                this.compactionMonitor.getThreshold()
+              ),
+              memoryWritable: true,
+              sessionHistoryAvailable: true,
+              final: true,
+            }),
+          ],
           requestAssemblySnapshot: admitted.data,
         });
       }
@@ -5903,12 +5916,17 @@ export class AgentSession {
     ) {
       return Ok({
         prefix: [
-          createContextBudgetWarning(
-            decision.projected,
+          createContextBudgetWarning({
+            contextTokens: decision.projected,
             maxTokens,
-            this.contextBudgetMemoryWritable,
-            this.contextBudgetHistoryAvailable && !isSessionHistoryDisabled(options.toolPolicy)
-          ),
+            budgetTokens: getContextBudgetRolloverPoint(
+              maxTokens,
+              this.compactionMonitor.getThreshold()
+            ),
+            memoryWritable: this.contextBudgetMemoryWritable,
+            sessionHistoryAvailable:
+              this.contextBudgetHistoryAvailable && !isSessionHistoryDisabled(options.toolPolicy),
+          }),
         ],
       });
     }

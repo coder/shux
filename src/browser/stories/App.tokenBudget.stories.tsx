@@ -39,7 +39,12 @@ function setupTokenBudgetStory(inputTokens = 2400) {
       timestamp: STABLE_TIMESTAMP - 30_000,
       synthetic: true,
       uiVisible: true,
-      muxMetadata: { type: "context-budget-warning", contextTokens: 650_000, maxTokens: 1_000_000 },
+      muxMetadata: {
+        type: "context-budget-warning",
+        contextTokens: 650_000,
+        maxTokens: 1_000_000,
+        budgetTokens: 750_000,
+      },
     }),
     createMuxMessage("final-flush", "user", FINAL_FLUSH, {
       historySequence: 3,
@@ -50,6 +55,7 @@ function setupTokenBudgetStory(inputTokens = 2400) {
         type: "context-budget-warning",
         contextTokens: 690_000,
         maxTokens: 1_000_000,
+        budgetTokens: 750_000,
         final: true,
       },
     }),

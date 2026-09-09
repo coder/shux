@@ -1294,6 +1294,7 @@ describe("AgentSession token-budget lifecycle", () => {
       (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
     );
     expect(warnings).toHaveLength(1);
+    expect(warnings[0].metadata!.muxMetadata).toMatchObject({ budgetTokens: 96_000 });
     const continuation = rows.at(-1)!;
     expect(continuation.metadata).toMatchObject({
       synthetic: true,
@@ -1349,7 +1350,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(rows)).toHaveLength(0);
     const finalRows = warningRows(rows);
     expect(finalRows).toHaveLength(1);
-    expect(finalRows[0].metadata?.muxMetadata).toMatchObject({ final: true });
+    expect(finalRows[0].metadata?.muxMetadata).toMatchObject({ final: true, budgetTokens: 96_000 });
     expect(rows.at(-1)?.metadata).toMatchObject({
       synthetic: true,
       uiVisible: false,
@@ -3286,7 +3287,13 @@ describe("AgentSession token-budget lifecycle", () => {
       )
     ).toBe("warn");
     await h.finishAndDispatch();
-    expect(warning).toHaveBeenCalledWith(expect.any(Number), 128_000, false, false);
+    expect(warning).toHaveBeenCalledWith(
+      expect.objectContaining({
+        maxTokens: 128_000,
+        memoryWritable: false,
+        sessionHistoryAvailable: false,
+      })
+    );
   });
 
   test.each([4096, 8192])(

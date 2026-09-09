@@ -20,7 +20,12 @@ describe("token-budget replay", () => {
         historySequence: 2,
         synthetic: true,
         uiVisible: true,
-        muxMetadata: { type: "context-budget-warning", contextTokens: 800, maxTokens: 1000 },
+        muxMetadata: {
+          type: "context-budget-warning",
+          contextTokens: 800,
+          maxTokens: 1000,
+          budgetTokens: 750,
+        },
       }),
       createMuxMessage("final-flush", "user", "Write workspace notes now; the window is ending.", {
         historySequence: 3,
@@ -30,6 +35,7 @@ describe("token-budget replay", () => {
           type: "context-budget-warning",
           contextTokens: 850,
           maxTokens: 1000,
+          budgetTokens: 750,
           final: true,
         },
       }),
@@ -86,6 +92,25 @@ describe("token-budget replay", () => {
     expect(displayed[3]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: true });
     expect(displayed[5]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: undefined });
     expect(aggregator.getActiveStreamMessageId()).toBeUndefined();
+  });
+
+  test("legacy warnings without a rollover budget still collapse on replay", () => {
+    const warning = MuxMessageSchema.parse({
+      id: "legacy-warning",
+      role: "user",
+      parts: [{ type: "text", text: "Save context notes." }],
+      metadata: {
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata: { type: "context-budget-warning", contextTokens: 800, maxTokens: 1000 },
+      },
+    });
+    const aggregator = new StreamingMessageAggregator(CREATED_AT);
+    aggregator.loadHistoricalMessages([warning], false);
+    expect(aggregator.getDisplayedMessages()[0]).toMatchObject({
+      type: "user",
+      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000 },
+    });
   });
 
   test.each([false, true])(
@@ -189,6 +214,7 @@ describe("token-budget replay", () => {
           type: "context-budget-warning",
           contextTokens: synthetic ? -1 : 800,
           maxTokens: 1000,
+          budgetTokens: 750,
         },
       });
       const aggregator = new StreamingMessageAggregator(CREATED_AT);
