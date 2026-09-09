@@ -976,7 +976,8 @@ export class AgentSession {
 
   /** Latest context-usage snapshot used for on-send compaction checks. */
   private lastUsageState?: AutoCompactionUsageState;
-  private pendingRollover?: ContextWindowRollover;
+  // Slider edits cannot expand the budget of a reset that has already been queued.
+  private pendingRollover?: ContextWindowRollover & { budgetTokens: number };
   /** Request-assembly snapshot admitted when a final flush was promised; pins the sealing reset. */
   private pendingRolloverSnapshot?: RequestAssemblySnapshot;
   private contextBudgetWarningClaimed = false;
@@ -5814,10 +5815,7 @@ export class AgentSession {
             createContextBudgetWarning({
               contextTokens: decision.projected,
               maxTokens,
-              budgetTokens: getContextBudgetRolloverPoint(
-                maxTokens,
-                this.compactionMonitor.getThreshold()
-              ),
+              budgetTokens: this.pendingRollover.budgetTokens,
               memoryWritable: true,
               sessionHistoryAvailable: true,
               final: true,
@@ -5851,7 +5849,7 @@ export class AgentSession {
     const shouldRollover =
       this.compactionMonitor.getThreshold() < 1 &&
       (this.pendingRollover != null || decision.decision === "rollover");
-    const rollover: ContextWindowRollover | undefined =
+    const rollover: AgentSession["pendingRollover"] =
       shouldRollover && hasRolloverEligibleMessages(history.data)
         ? (this.pendingRollover ?? {
             type: "context-window-rollover",
@@ -5861,6 +5859,10 @@ export class AgentSession {
             flushOpportunity: decision.flushOpportunity,
             contextTokens: decision.projected,
             maxTokens,
+            budgetTokens: getContextBudgetRolloverPoint(
+              maxTokens,
+              this.compactionMonitor.getThreshold()
+            ),
           })
         : undefined;
     // Recovery access is required only when sealing old context, not for a
@@ -5999,6 +6001,7 @@ export class AgentSession {
       log.warn("Token budget has no known model context limit", { model: step.model });
       return "continue";
     }
+    const threshold = this.compactionMonitor.getThreshold();
     const decision = evaluateStepBudget({
       contextTokens: usage
         ? usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens
@@ -6008,7 +6011,7 @@ export class AgentSession {
       imageParts: step.imageParts,
       toolResultTokens: step.toolResultTokens,
       modelContextLimit: maxTokens,
-      threshold: this.compactionMonitor.getThreshold(),
+      threshold,
       warningEmitted: this.contextBudgetWarningClaimed,
     });
     if (decision.decision === "block") return "block";
@@ -6051,6 +6054,7 @@ export class AgentSession {
         flushOpportunity: decision.flushOpportunity,
         contextTokens: decision.projected,
         maxTokens,
+        budgetTokens: getContextBudgetRolloverPoint(maxTokens, threshold),
       };
     } else {
       this.contextBudgetWarningClaimed = true;
@@ -7208,6 +7212,8 @@ export class AgentSession {
             flushOpportunity: true,
             contextTokens: finalRow.contextTokens,
             maxTokens: finalRow.maxTokens,
+            // Legacy final warnings reported the full model limit.
+            budgetTokens: finalRow.budgetTokens ?? finalRow.maxTokens,
           };
           if (this.messageQueue.isEmpty()) {
             const { contextBudgetFlush: _flush, ...continuationMetadata } = flushMuxMetadata;

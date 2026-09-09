@@ -1337,6 +1337,36 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test.each(["step-history", "queued"] as const)(
+    "the final flush retains its triggering budget when the threshold changes during %s",
+    async (phase) => {
+      const h = await setup();
+      expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+      if (phase === "step-history") {
+        const getHistory = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);
+        spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(
+          (...args) => {
+            h.session.setAutoCompactionThreshold(0.9);
+            return getHistory(...args);
+          }
+        );
+      }
+      expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+      h.session.setAutoCompactionThreshold(0.9);
+      await h.finishAndDispatch();
+      expect(
+        warningRows(await allRows(h)).find(isFinalFlushRow)?.metadata?.muxMetadata
+      ).toMatchObject({
+        final: true,
+        budgetTokens: 96_000,
+      });
+      // Raising the slider does not cancel the already-promised reset after the flush.
+      h.settleStream(1);
+      await h.waitForRequest(3);
+      expect(rolloverRows(await allRows(h))).toHaveLength(1);
+    }
+  );
+
   test("settled rollover with headroom offers exactly one final flush step, then seals", async () => {
     const h = await setup();
     expect(
