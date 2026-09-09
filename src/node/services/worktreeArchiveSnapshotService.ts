@@ -296,9 +296,10 @@ export class WorktreeArchiveSnapshotService {
     const tempAttachmentsDir = path.join(sessionDir, `${ATTACHMENTS_DIR_NAME}${tempSuffix}`);
 
     await fsPromises.mkdir(sessionDir, { recursive: true });
-    await fsPromises.rm(tempStateDir, { recursive: true, force: true });
+    // A crash mid-capture leaves the previous generation's temp dirs behind (the attachment copy
+    // can be large), and every capture picks a fresh suffix, so sweep them here.
+    await this.removeStaleTempDirs(sessionDir);
     await fsPromises.mkdir(tempStateDir, { recursive: true });
-    await fsPromises.rm(tempAttachmentsDir, { recursive: true, force: true });
     await fsPromises.mkdir(tempAttachmentsDir, { recursive: true });
 
     try {
@@ -1106,7 +1107,11 @@ export class WorktreeArchiveSnapshotService {
           args.sessionDir,
           entry.artifactPath
         );
-        assert(artifactDir != null, "commitStagedAttachmentArtifacts: artifact path escaped");
+        if (artifactDir == null) {
+          throw new Error(
+            `Refusing to store staged attachments: ${ATTACHMENTS_DIR_NAME} in the session dir is not a plain directory.`
+          );
+        }
         const tempArtifactDir = path.join(
           args.tempAttachmentsDir,
           path.relative(ATTACHMENTS_DIR_NAME, entry.artifactPath)
@@ -1133,13 +1138,19 @@ export class WorktreeArchiveSnapshotService {
     const sessionDir = path.join(this.config.sessionsDir, args.workspaceId);
     for (const entry of args.projectSnapshot.stagedAttachmentDirs ?? []) {
       // Both fields come from user-editable config: only a staged attachment directory may be
-      // written into the checkout, and only the attachment artifact subtree may be read.
-      assert(
-        isStagedAttachmentRelativeDir(entry.repoRelativeDir),
-        `restoreStagedAttachments: ${entry.repoRelativeDir} is not a staged attachment directory`
-      );
+      // written into the checkout, and only the attachment artifact subtree may be read. A
+      // malformed entry is skipped (its artifact is left in place for manual recovery) rather than
+      // turning every unarchive attempt into the same failure.
       const artifactDir = await this.resolveAttachmentArtifactDir(sessionDir, entry.artifactPath);
-      if (artifactDir == null || !(await this.isExistingDirectory(artifactDir))) {
+      if (!isStagedAttachmentRelativeDir(entry.repoRelativeDir) || artifactDir == null) {
+        log.warn("Skipping malformed staged attachment entry", {
+          workspaceId: args.workspaceId,
+          repoRelativeDir: entry.repoRelativeDir,
+          artifactPath: entry.artifactPath,
+        });
+        continue;
+      }
+      if (!(await this.isExistingDirectory(artifactDir))) {
         if (args.tolerateMissingArtifacts) {
           continue;
         }
@@ -1220,11 +1231,38 @@ export class WorktreeArchiveSnapshotService {
     sessionDir: string,
     artifactPath: string
   ): Promise<string | null> {
-    const attachmentsRoot = path.join(sessionDir, ATTACHMENTS_DIR_NAME);
-    if (!(await this.isExistingDirectory(attachmentsRoot))) {
+    const attachmentsRoot = await this.resolveAttachmentsRoot(sessionDir);
+    if (attachmentsRoot == null) {
       return null;
     }
     return this.resolveContainedRealPath(attachmentsRoot, path.resolve(sessionDir, artifactPath));
+  }
+
+  /**
+   * The artifact root itself must be a real directory: a symlink there (corrupted or hand-edited
+   * session state) would make an external tree look contained to the realpath checks.
+   */
+  private async resolveAttachmentsRoot(sessionDir: string): Promise<string | null> {
+    const attachmentsRoot = path.join(sessionDir, ATTACHMENTS_DIR_NAME);
+    try {
+      return (await fsPromises.lstat(attachmentsRoot)).isDirectory() ? attachmentsRoot : null;
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  private async removeStaleTempDirs(sessionDir: string): Promise<void> {
+    for (const entry of await fsPromises.readdir(sessionDir)) {
+      if (
+        entry.startsWith(`${SNAPSHOT_DIR_NAME}.tmp-`) ||
+        entry.startsWith(`${ATTACHMENTS_DIR_NAME}.tmp-`)
+      ) {
+        await fsPromises.rm(path.join(sessionDir, entry), { recursive: true, force: true });
+      }
+    }
   }
 
   private async findSymlink(root: string): Promise<string | null> {
@@ -1295,12 +1333,16 @@ export class WorktreeArchiveSnapshotService {
     for (const project of snapshot.projects) {
       for (const entry of project.stagedAttachmentDirs ?? []) {
         const artifactDir = await this.resolveAttachmentArtifactDir(sessionDir, entry.artifactPath);
-        if (artifactDir != null) {
+        // Same rule as restore: a malformed entry keeps its artifact for manual recovery.
+        if (isStagedAttachmentRelativeDir(entry.repoRelativeDir) && artifactDir != null) {
           await fsPromises.rm(artifactDir, { recursive: true, force: true });
         }
       }
     }
-    await this.pruneEmptyDirs(path.join(sessionDir, ATTACHMENTS_DIR_NAME));
+    const attachmentsRoot = await this.resolveAttachmentsRoot(sessionDir);
+    if (attachmentsRoot != null) {
+      await this.pruneEmptyDirs(attachmentsRoot);
+    }
 
     await this.config.editConfig((config) => {
       const workspaceEntry = findWorkspaceEntryByIdOrPath(this.config, config, workspaceId);
