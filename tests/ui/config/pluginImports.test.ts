@@ -171,6 +171,50 @@ describeIntegration("Selective plugin imports", () => {
     });
   }, 120000);
 
+  test.each(["button", "keyboard", "palette"] as const)(
+    "reopening installation via %s clears prior success through the next failed attempt",
+    async (entryPoint) => {
+      const { canvas, user } = await openPreview(app, remote);
+      await user.click(canvas.getByRole("button", { name: "Install" }));
+      await canvas.findByText("Plugin installed.", {}, { timeout: 10000 });
+
+      if (entryPoint === "palette") {
+        await user.keyboard("{Control>}{Shift>}p{/Shift}{/Control}");
+        const palette = within(app.view.container.ownerDocument.body);
+        await user.type(await palette.findByLabelText("Command palette"), "> Install Agent Plugin");
+        await user.click(await palette.findByRole("option", { name: "Install Agent Plugin…" }));
+      } else {
+        const add = canvas.getByRole("button", { name: "Add plugin" });
+        if (entryPoint === "keyboard") {
+          add.focus();
+          await user.keyboard("{Enter}");
+        } else {
+          await user.click(add);
+        }
+      }
+      const sourceInput = await canvas.findByLabelText("Git URL or owner/repo");
+      expect(canvas.queryByText("Plugin installed.")).toBeNull();
+
+      await fs.writeFile(
+        path.join(remote, "plugin.json"),
+        JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "other-tools" })
+      );
+      await commit(remote);
+      await user.type(sourceInput, remote);
+      await user.click(canvas.getByRole("button", { name: "Preview" }));
+      await canvas.findByRole("checkbox", { name: "review" }, { timeout: 10000 });
+      expect(canvas.queryByText("Plugin installed.")).toBeNull();
+      jest
+        .spyOn(app.env.services.agentPluginInstallService, "install")
+        .mockRejectedValueOnce(new Error("Second install unavailable"));
+      await user.click(canvas.getByRole("button", { name: "Install" }));
+      await canvas.findByRole("alert");
+      expect(canvas.queryByText("Plugin installed.")).toBeNull();
+      expect(canvas.getByRole("button", { name: "Install" }).hasAttribute("disabled")).toBe(false);
+    },
+    120000
+  );
+
   test("accepted new previews reset choices; inventory retries and stale versions require reselection after an update", async () => {
     const { canvas, user } = await openPreview(app, remote);
     await user.click(canvas.getByRole("checkbox", { name: "review" }));

@@ -760,6 +760,12 @@ export const PluginsSettingsSection: React.FC = () => {
   const listGenerationRef = useRef(0);
   const checkGenerationRef = useRef(0);
 
+  const openAddPanel = () => {
+    // Feedback belongs to the completed install, not the next attempt from any entry point.
+    setInstallSucceeded(false);
+    setAddOpen(true);
+  };
+
   const refresh = async () => {
     if (!api) return;
     // Overlapping list requests race the same way update checks do (mount
@@ -828,7 +834,7 @@ export const PluginsSettingsSection: React.FC = () => {
     return subscribePluginsSectionIntents((intent: PluginsSectionIntent) => {
       switch (intent.type) {
         case "open-add-panel":
-          setAddOpen(true);
+          openAddPanel();
           break;
         case "add-components":
           setComponentsTarget(intent.name);
@@ -983,7 +989,7 @@ export const PluginsSettingsSection: React.FC = () => {
               Check for updates
             </Button>
             {!addOpen && (
-              <Button size="sm" onClick={() => setAddOpen(true)}>
+              <Button size="sm" onClick={openAddPanel}>
                 <Plus className="h-3.5 w-3.5" />
                 Add plugin
               </Button>
