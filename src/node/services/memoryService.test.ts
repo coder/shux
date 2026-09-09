@@ -1626,6 +1626,19 @@ describe("MemoryService", () => {
         (row) => (row.data.action as { op: string }).op === "rename"
       )!;
 
+      // Membership that cannot be established (unreadable config) refuses the
+      // rollback instead of guessing an empty tree.
+      const unresolvable = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: renameRow.id,
+        listSharedWorkspaceMemoryPeerSessionDirs: () => {
+          throw new Error("config.json unreadable");
+        },
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(unresolvable.success).toBe(false);
+      if (!unresolvable.success) expect(unresolvable.error).toContain("could not be resolved");
+
       // Own journal only: the rename looks cleanly undoable and would move
       // the child's newer content back without a word.
       const blind = await rollbackRefinement({

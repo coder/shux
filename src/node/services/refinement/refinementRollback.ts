@@ -84,6 +84,8 @@ export interface RollbackRefinementOptions {
    * store, so their rows are merged into divergence detection: a child's
    * later edit under a path the owner renamed must surface as a conflict
    * when the owner rolls the rename back. Omit when the store is private.
+   * MUST throw when membership cannot be established (unreadable config);
+   * the rollback is then refused instead of assuming an empty tree.
    */
   listSharedWorkspaceMemoryPeerSessionDirs?: () => string[];
   /** Attribution for the emitted rollback row. */
@@ -544,7 +546,18 @@ function isAfter(row: RefinementEvent, other: RefinementEvent): boolean {
 async function readSharedMemoryPeerRows(
   opts: RollbackRefinementOptions
 ): Promise<RefinementEvent[]> {
-  const peerDirs = opts.listSharedWorkspaceMemoryPeerSessionDirs?.() ?? [];
+  // Membership must be established, not guessed: a resolver that cannot read
+  // the topology (config.json missing/malformed) throws, and the rollback is
+  // refused rather than proceeding with no peer journals — an owner would
+  // otherwise move a child's later edit without warning.
+  let peerDirs: string[];
+  try {
+    peerDirs = opts.listSharedWorkspaceMemoryPeerSessionDirs?.() ?? [];
+  } catch (error) {
+    throw new RollbackError(
+      `Refusing rollback of '${opts.id}': the task tree sharing this workspace's memory store could not be resolved (${getErrorMessage(error)})`
+    );
+  }
   if (peerDirs.length === 0) return [];
   const sharedRoot = path.join(
     path.resolve(opts.sharedWorkspaceMemorySessionDir ?? opts.sessionDir),

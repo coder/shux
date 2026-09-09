@@ -2418,12 +2418,14 @@ export class TurnRequestBuilder {
             : path.join(this.dependencies.config.sessionsDir, memoryOwnerId);
         // Resolved per rollback (not per turn): tree membership changes as
         // sub-agents are spawned and removed while the tool instance lives.
+        // Strict load: an unreadable config must refuse the rollback (see
+        // RollbackRefinementOptions), not read as an empty tree.
         const listSharedWorkspaceMemoryPeerSessionDirs =
           memoryService === undefined
             ? undefined
             : () =>
                 sharedWorkspaceMemoryPeerSessionDirs(
-                  this.dependencies.config.loadConfigOrDefault(),
+                  this.dependencies.config.loadConfigOrDefault({ throwOnError: true }),
                   this.dependencies.config.sessionsDir,
                   workspaceId
                 );

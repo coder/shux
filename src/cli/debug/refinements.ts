@@ -67,9 +67,10 @@ export async function refinementsCommand(
       // Reloaded per check (plan-time and in-lock), not from the snapshot
       // above: a live backend may register a new tree member while this
       // process waits for the shared-store lock, and its rows must count.
+      // Strict: an unreadable config refuses the rollback (empty tree = guess).
       listSharedWorkspaceMemoryPeerSessionDirs: () =>
         sharedWorkspaceMemoryPeerSessionDirs(
-          defaultConfig.loadConfigOrDefault(),
+          defaultConfig.loadConfigOrDefault({ throwOnError: true }),
           defaultConfig.sessionsDir,
           workspaceId
         ),

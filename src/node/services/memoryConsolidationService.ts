@@ -323,17 +323,28 @@ class HarvestRefusedError extends Error {
 }
 
 /**
- * Whether the epoch's tail is a user batch with no assistant reply: rows of a
- * turn that never started (its policy record happens in start(), before the
- * assistant row is appended), so nothing accounted for them.
+ * Whether some user row of the epoch is covered by no assistant row's request
+ * snapshot. An assistant row records `requestHistorySequence` — the last
+ * history sequence its turn's request was built from — and that turn recorded
+ * its write policy in start(), before the row was appended. A user row above
+ * every such snapshot belongs to a turn nobody accounted for: another
+ * backend's batch appended between a turn's snapshot and its assistant row
+ * (multi-instance), or a turn refused pre-start. A later assistant row is no
+ * proof by itself; only its snapshot bound is. Assistant rows without the
+ * field cover nothing (fail closed).
  */
-function epochEndsWithUnansweredUserRows(messages: readonly MuxMessage[]): boolean {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const role = messages[index].role;
-    if (role === "assistant") return false;
-    if (role === "user") return true;
+function epochHasUncoveredUserRows(messages: readonly MuxMessage[]): boolean {
+  let coverage = -1;
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    const bound = message.metadata?.requestHistorySequence;
+    if (typeof bound === "number" && bound > coverage) coverage = bound;
   }
-  return false;
+  return messages.some((message) => {
+    if (message.role !== "user") return false;
+    const sequence = message.metadata?.historySequence;
+    return typeof sequence !== "number" || sequence > coverage;
+  });
 }
 
 export class MemoryConsolidationService extends EventEmitter {
@@ -1192,17 +1203,13 @@ export class MemoryConsolidationService extends EventEmitter {
         catch: (error) => error,
       });
       if (!epoch.success) return yield* Effect.fail(new Error(epoch.error));
-      // Every scanned row must belong to a turn whose write policy was
-      // recorded. A turn records its policy in start(), BEFORE its assistant
-      // row is appended, so user rows after the epoch's last assistant reply
-      // are a turn that had not started when the summary landed above them —
-      // another backend's in-flight batch (multi-instance), or a turn refused
-      // pre-start. Their policy is unknown and the grant evaluated at
-      // completion could not have accounted for them. Terminal refusal: a
-      // retry would replay the same recorded grant.
-      if (epochEndsWithUnansweredUserRows(epoch.data.messages)) {
+      // Every scanned user row must be covered by a turn whose write policy
+      // was recorded (see epochHasUncoveredUserRows). Uncovered rows have an
+      // unknown policy the grant evaluated at completion could not have
+      // accounted for. Terminal refusal: a retry would replay that grant.
+      if (epochHasUncoveredUserRows(epoch.data.messages)) {
         const reason =
-          "the compacted epoch ends with user rows of a turn whose memory policy was never recorded; harvest refused (fail closed)";
+          "the compacted epoch holds user rows of a turn whose memory policy was never recorded; harvest refused (fail closed)";
         yield* Effect.promise(() => self.recordRefusedHarvest(metadata, reason));
         return yield* Effect.fail(new HarvestRefusedError(reason));
       }

@@ -327,15 +327,16 @@ async function seedCompactionEpoch(
   fixture: Fixture,
   workspaceId = "ws-dream"
 ): Promise<CompactionCompletionMetadata> {
+  const prompt = createMuxMessage("pref-1", "user", "Please remember that I prefer concise tests.");
+  await fixture.historyService.appendToHistory(workspaceId, prompt);
+  // The turn ran: its policy was recorded before this reply was appended, and
+  // the reply's request snapshot covers the prompt (uncovered user rows make
+  // the harvest refuse; see below).
   await fixture.historyService.appendToHistory(
     workspaceId,
-    createMuxMessage("pref-1", "user", "Please remember that I prefer concise tests.")
-  );
-  // The turn ran: its policy was recorded before this reply was appended
-  // (an epoch ending in unanswered user rows is refused; see below).
-  await fixture.historyService.appendToHistory(
-    workspaceId,
-    createMuxMessage("reply-1", "assistant", "Noted.")
+    createMuxMessage("reply-1", "assistant", "Noted.", {
+      requestHistorySequence: prompt.metadata?.historySequence,
+    })
   );
   await fixture.historyService.appendToHistory(
     workspaceId,
@@ -1200,21 +1201,27 @@ describe("MemoryConsolidationService", () => {
     expect(harvested?.status).toBe("completed");
   });
 
-  it("refuses to harvest an epoch whose tail is a user batch no turn ever answered", async () => {
+  it("refuses to harvest an epoch holding user rows no turn's request snapshot covers", async () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
-    // Another backend appended a turn's user rows; before that turn recorded
-    // its policy (start()), this backend compacted above them with a grant.
-    await fixture.historyService.appendToHistory(
-      "ws-dream",
-      createMuxMessage("pref-1", "user", "Please remember that I prefer concise tests.")
+    // Backend A snapshots its request through pref-1; backend B appends a
+    // read-only turn's user row BEFORE that turn records its policy; A's
+    // assistant row lands above it carrying its snapshot bound; A compacts
+    // with a grant. The later assistant is no proof for B's row.
+    const prompt = createMuxMessage(
+      "pref-1",
+      "user",
+      "Please remember that I prefer concise tests."
     );
-    await fixture.historyService.appendToHistory(
-      "ws-dream",
-      createMuxMessage("reply-1", "assistant", "Noted.")
-    );
+    await fixture.historyService.appendToHistory("ws-dream", prompt);
     await fixture.historyService.appendToHistory(
       "ws-dream",
       createMuxMessage("late-1", "user", "Read-only agent's prompt, turn not yet started")
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("reply-1", "assistant", "Noted.", {
+        requestHistorySequence: prompt.metadata?.historySequence,
+      })
     );
     await fixture.historyService.appendToHistory(
       "ws-dream",
