@@ -2476,10 +2476,28 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       const pendingGuidance = task.taskPendingGuidance ?? [];
+      const alreadyStreaming = this.aiService.isStreaming(task.id);
+      // Guidance must queue even for active tasks; generic restart nudges must not.
+      if (alreadyStreaming && pendingGuidance.length === 0) {
+        skippedRunningAlreadyStreaming += 1;
+        continue;
+      }
+      const hasBlockingActiveDescendants =
+        this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(taskIndex, task.id).length > 0;
+      if (hasBlockingActiveDescendants && pendingGuidance.length === 0) {
+        skippedRunningDueToActiveDescendants += 1;
+        continue;
+      }
+
+      // Restore compaction intent before new guidance/nudges make its tail stale.
+      // Guidance then queues behind that continuation without losing either payload.
+      const followUp = alreadyStreaming
+        ? Ok(false)
+        : await this.workspaceService.dispatchPendingCompactionFollowUp(task.id);
+      if (!followUp.success) failedRunningCount += 1;
+      else if (followUp.data && pendingGuidance.length === 0) resumedRunningCount += 1;
+      if (!followUp.success || (followUp.data && pendingGuidance.length === 0)) continue;
       if (pendingGuidance.length > 0) {
-        // Pending corrections outrank generic restart recovery and must replay even when this task
-        // still has active descendants. Otherwise the descendant gate below can strand the durable
-        // reservation forever after the in-memory queue is lost on restart.
         const pendingGuidanceIds = new Set(pendingGuidance.map((guidance) => guidance.id));
         const model = task.taskModelString ?? defaultModel;
         const agentId = resolveTaskAgentIdForResume(task);
@@ -2526,27 +2544,6 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
 
-      // The queue drain above can have launched this task already; nudging it again would queue
-      // a spurious "Xum restarted" turn behind its first stream.
-      if (this.aiService.isStreaming(task.id)) {
-        skippedRunningAlreadyStreaming += 1;
-        continue;
-      }
-
-      // Best-effort: if xum restarted mid-stream, nudge the agent to continue and report.
-      // Only do this when the task has no blocking running descendants, to avoid duplicate spawns.
-      const hasBlockingActiveDescendants =
-        this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(taskIndex, task.id).length > 0;
-      if (hasBlockingActiveDescendants) {
-        skippedRunningDueToActiveDescendants += 1;
-        continue;
-      }
-
-      // Preserve durable compaction intent before a generic nudge makes its tail stale.
-      const followUp = await this.workspaceService.dispatchPendingCompactionFollowUp(task.id);
-      if (!followUp.success) failedRunningCount += 1;
-      else if (followUp.data) resumedRunningCount += 1;
-      if (!followUp.success || followUp.data) continue;
       const isPlanLike = await this.isPlanLikeTaskWorkspace({
         projectPath: task.projectPath,
         workspace: task,

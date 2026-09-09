@@ -3334,56 +3334,72 @@ describe("TaskService", () => {
     expect(options.disableWorkspaceAgents).toBe(true);
   });
 
-  test("initialize replays and clears persisted pending task guidance", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-restart-guidance";
-    const childTaskId = "child-restart-guidance";
+  test.each([
+    { taskStatus: "running", compacted: false },
+    { taskStatus: "running", compacted: true },
+    { taskStatus: undefined, compacted: true },
+  ] as const)(
+    "initialize recovers compaction before pending guidance (%j)",
+    async ({ taskStatus, compacted }) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentWorkspaceId = "parent-restart-guidance";
+      const childTaskId = "child-restart-guidance";
 
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentWorkspaceId),
-        projectWorkspace(projectPath, "child", childTaskId, {
-          parentWorkspaceId,
-          agentId: "exec",
-          agentType: "exec",
-          taskStatus: "running",
-          taskModelString: "openai:gpt-5.2",
-          taskPendingGuidance: [
-            { id: "guidance-1", message: "First correction", queueDispatchMode: "turn-end" },
-            { id: "guidance-2", message: "Second correction", queueDispatchMode: "tool-end" },
-          ],
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentWorkspaceId),
+          projectWorkspace(projectPath, "child", childTaskId, {
+            parentWorkspaceId,
+            agentId: "exec",
+            agentType: "exec",
+            taskStatus,
+            taskModelString: "openai:gpt-5.2",
+            taskPendingGuidance: [
+              { id: "guidance-1", message: "First correction", queueDispatchMode: "turn-end" },
+              { id: "guidance-2", message: "Second correction", queueDispatchMode: "tool-end" },
+            ],
+          }),
+        ],
+        testTaskSettings()
+      );
+
+      const recovered: string[] = [];
+      const sendMessage = mock(
+        async (
+          _workspaceId: string,
+          _message: string,
+          _options: unknown,
+          internal?: { onAccepted?: () => Promise<void> | void }
+        ): Promise<Result<void>> => {
+          recovered.push("guidance");
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+      const { workspaceService } = createWorkspaceServiceMocks({
+        sendMessage,
+        dispatchPendingCompactionFollowUp: mock(() => {
+          recovered.push("compaction");
+          return Promise.resolve(Ok(compacted));
         }),
-      ],
-      testTaskSettings()
-    );
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    const sendMessage = mock(
-      async (
-        _workspaceId: string,
-        _message: string,
-        _options: unknown,
-        internal?: { onAccepted?: () => Promise<void> | void }
-      ): Promise<Result<void>> => {
-        await internal?.onAccepted?.();
-        return Ok(undefined);
-      }
-    );
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      await taskService.initialize();
 
-    await taskService.initialize();
-
-    expect(sendMessage).toHaveBeenCalledWith(
-      childTaskId,
-      expect.stringContaining("1. First correction\n\n2. Second correction"),
-      expect.objectContaining({ model: "openai:gpt-5.2", agentId: "exec" }),
-      expect.objectContaining({ synthetic: true, agentInitiated: true })
-    );
-    expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toBeUndefined();
-  });
+      expect(sendMessage).toHaveBeenCalledWith(
+        childTaskId,
+        expect.stringContaining("1. First correction\n\n2. Second correction"),
+        expect.objectContaining({ model: "openai:gpt-5.2", agentId: "exec" }),
+        expect.objectContaining({ synthetic: true, agentInitiated: true })
+      );
+      expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toBeUndefined();
+      expect(recovered).toEqual(["compaction", "guidance"]);
+    }
+  );
 
   test("initialize replays pending guidance even when the task has active descendants", async () => {
     const config = await createTestConfig(rootDir);

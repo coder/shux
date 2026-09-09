@@ -838,6 +838,28 @@ describe("AgentSession startup auto-retry recovery", () => {
     }
   });
 
+  test("does not strand a task behind crash-truncated partial JSON", async () => {
+    const workspaceId = "startup-corrupt-partial";
+    const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    await historyService.appendToHistory(workspaceId, createMuxMessage("user", "user", "Continue"));
+    await fsPromises.writeFile(
+      path.join(config.sessionsDir, workspaceId, "partial.json"),
+      '{"id":'
+    );
+    const wait = spyOn(
+      session as unknown as { waitForStartupAutoRetryRerunWindow(delay: number): Promise<void> },
+      "waitForStartupAutoRetryRerunWindow"
+    );
+    try {
+      expect(await session.isStartupRecoveryBlocked()).toBe(false);
+      expect(wait).not.toHaveBeenCalled();
+    } finally {
+      wait.mockRestore();
+      await session.dispose();
+    }
+  });
+
   test("retries a transient task blocker read without restarting the app", async () => {
     const workspaceId = "startup-transient-partial";
     const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);

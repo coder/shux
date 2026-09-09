@@ -2261,7 +2261,8 @@ export class HistoryService {
         return null;
       }
 
-      if (options?.throwOnError) throw error;
+      // Parse corruption cannot heal on retry; discard it instead of bricking task recovery.
+      if (options?.throwOnError && !(error instanceof SyntaxError)) throw error;
       log.error("Error reading partial:", error);
       return null;
     }
