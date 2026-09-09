@@ -55,7 +55,11 @@ export async function readWorkspaceMemoryDenyMarker(sessionDir: string): Promise
  * Epoch boundary: remove the marker, durable-or-throw (verified absent).
  * `notAfter` fences the clear to denies recorded up to the boundary: a deny
  * another backend recorded for the NEW epoch in the meantime must survive.
- * A marker whose timestamp cannot be read is treated as current (kept).
+ * Only a well-formed marker can claim to be newer; a truncated or malformed
+ * one is stale state from some earlier epoch (every reader already treated
+ * it as a deny for as long as it existed) and is healed here — otherwise one
+ * corrupt file would force every later epoch's accumulator to false until a
+ * destructive history clear.
  */
 export async function clearWorkspaceMemoryDenyMarker(
   sessionDir: string,
@@ -63,20 +67,19 @@ export async function clearWorkspaceMemoryDenyMarker(
 ): Promise<void> {
   const markerPath = workspaceMemoryDenyMarkerPath(sessionDir);
   if (options !== undefined) {
-    let deniedAt: number;
+    let deniedAt: number | null;
     try {
       const parsed: unknown = JSON.parse(await fsPromises.readFile(markerPath, "utf-8"));
-      deniedAt =
-        typeof parsed === "object" &&
-        parsed !== null &&
-        typeof (parsed as { deniedAt?: unknown }).deniedAt === "number"
-          ? (parsed as { deniedAt: number }).deniedAt
-          : Number.POSITIVE_INFINITY;
+      const candidate =
+        typeof parsed === "object" && parsed !== null
+          ? (parsed as { deniedAt?: unknown }).deniedAt
+          : undefined;
+      deniedAt = typeof candidate === "number" && Number.isFinite(candidate) ? candidate : null;
     } catch (error) {
       if (hasErrorCode(error, "ENOENT")) return;
-      deniedAt = Number.POSITIVE_INFINITY;
+      deniedAt = null; // unreadable/malformed: cannot be a newer deny
     }
-    if (deniedAt > options.notAfter) return;
+    if (deniedAt !== null && deniedAt > options.notAfter) return;
   }
   await fsPromises.rm(markerPath, { force: true });
   if (await readWorkspaceMemoryDenyMarker(sessionDir)) {

@@ -1320,21 +1320,34 @@ describe("MemoryService", () => {
       );
 
       // Sidecar-only changes made on a downgraded build (bytes untouched) are
-      // folded in on the next upgrade: an unpin of only-child.md under the
-      // child key reaches the owner key...
+      // folded in on the next upgrade: an unpin of half.md under the child key
+      // reaches the owner key (its recorded target still holds the bytes)...
       const freshService = () =>
         new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
-      await fixture.metaService.setPinned("workspace:ws-child:only-child.md", false);
+      await fixture.metaService.setPinned("workspace:ws-child:half.md", false);
       await freshService().listIndexEntries(fixture.ctx);
-      expect(await fixture.metaService.getPinnedKeys()).not.toContain(
-        "workspace:ws-owner:only-child.md"
-      );
+      expect(await fixture.metaService.getPinnedKeys()).not.toContain("workspace:ws-owner:half.md");
       // ...while the owner's OWN later choice is not undone by an unchanged
       // child entry on every restart.
-      await fixture.metaService.setPinned("workspace:ws-owner:only-child.md", true);
+      await fixture.metaService.setPinned("workspace:ws-owner:half.md", true);
+      await freshService().listIndexEntries(fixture.ctx);
+      expect(await fixture.metaService.getPinnedKeys()).toContain("workspace:ws-owner:half.md");
+      // only-child.md's recorded target was replaced by the shared edit: the
+      // child's pin change must not land on the owner's new content. The
+      // legacy note is placed anew (imported/) and carries the child's state.
+      await fixture.metaService.setPinned("workspace:ws-child:only-child.md", false);
       await freshService().listIndexEntries(fixture.ctx);
       expect(await fixture.metaService.getPinnedKeys()).toContain(
         "workspace:ws-owner:only-child.md"
+      );
+      expect(
+        await fsPromises.readFile(
+          path.join(ownerRoot, "imported", "ws-child", "only-child.md"),
+          "utf-8"
+        )
+      ).toBe("child notes");
+      expect(await fixture.metaService.getPinnedKeys()).not.toContain(
+        "workspace:ws-owner:imported/ws-child/only-child.md"
       );
       expect(relisted.filter((e) => e.scope === "workspace").map((e) => e.relPath)).toEqual([
         "clash.md",
@@ -1348,7 +1361,6 @@ describe("MemoryService", () => {
         "shared edit"
       );
       expect([...(await fixture.metaService.getPinnedKeys())].sort()).toEqual([
-        "workspace:ws-child:half.md",
         "workspace:ws-child:meta-only.md",
         "workspace:ws-owner:half.md",
         "workspace:ws-owner:meta-only.md",

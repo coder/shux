@@ -726,7 +726,7 @@ interface AgentSessionOptions {
     runtimeConfig: RuntimeConfig | undefined;
   }) => Promise<string | undefined>;
   /** Called when compaction completes (e.g., to clear idle compaction pending state) */
-  onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
+  onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void | Promise<void>;
   /** Called with the terminal outcome of an idle compaction (persisted success / post-stream failure) */
   onIdleCompactionOutcome?: (success: boolean) => void;
   /** Called when post-compaction context state may have changed (plan/file edits) */
@@ -1078,6 +1078,18 @@ export class AgentSession {
     return this.workspaceMemoryWritable;
   }
 
+  /** In-flight durable epoch reset started by a no-tail compaction (see the completion callback). */
+  private workspaceMemoryEpochReset: Promise<void> | undefined;
+
+  /**
+   * Resolves once the durable epoch reset of the last no-tail compaction (if
+   * any is still running) has settled, so a policy record for the new epoch
+   * never reads the closing epoch's accumulator or deny marker.
+   */
+  async settleWorkspaceMemoryPolicyEpoch(): Promise<void> {
+    await this.workspaceMemoryEpochReset;
+  }
+
   /**
    * Start a fresh policy epoch: the in-memory mirror and the durable
    * accumulator both forget the previous epoch's turns. Durable-or-throw like
@@ -1278,28 +1290,38 @@ export class AgentSession {
         this.coordinator.recordCompactionSummary(
           (metadata.preservedTailMessageCount ?? 0) > 0 ? metadata.summaryMessageId : null
         );
-        onCompactionComplete?.({
-          ...metadata,
-          ...(this.workspaceMemoryWritable !== undefined
-            ? { workspaceMemoryWritable: this.workspaceMemoryWritable }
-            : {}),
-        });
+        const closing = this.workspaceMemoryWritable;
+        const observed = Promise.resolve(
+          onCompactionComplete?.({
+            ...metadata,
+            ...(closing !== undefined ? { workspaceMemoryWritable: closing } : {}),
+          })
+        );
         // New epoch. A preserved tail copies messages produced under this
         // epoch's policy into the next one, so the fail-closed accumulator
         // carries over with them; otherwise the next normal turn restarts it.
-        // The completion callback is synchronous; the durable reset runs
-        // detached and is logged on failure (the next turn re-records the
-        // policy anyway, so a failed reset can only delay a grant, never
-        // widen one).
+        // The mirror forgets the closing epoch right here, synchronously; the
+        // durable reset runs AFTER the completion observation settled (it
+        // reads the closing epoch's marker/config) and is awaited by the next
+        // turn's policy record (settleWorkspaceMemoryPolicyEpoch), so no turn
+        // of the new epoch can AND itself with the closing epoch's stale deny.
         if ((metadata.preservedTailMessageCount ?? 0) === 0) {
-          this.resetWorkspaceMemoryWritable({ closing: this.workspaceMemoryWritable }).catch(
-            (error: unknown) => {
+          this.workspaceMemoryWritable = undefined;
+          const reset = observed
+            .catch(() => undefined)
+            .then(() => this.resetWorkspaceMemoryWritable({ closing }))
+            .catch((error: unknown) => {
               log.warn("Failed to reset the workspace memory policy epoch", {
                 workspaceId: this.workspaceId,
                 error,
               });
-            }
-          );
+            })
+            .finally(() => {
+              if (this.workspaceMemoryEpochReset === reset) {
+                this.workspaceMemoryEpochReset = undefined;
+              }
+            });
+          this.workspaceMemoryEpochReset = reset;
         }
       },
       onIdleCompactionOutcome,

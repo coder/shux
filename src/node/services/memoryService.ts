@@ -1077,11 +1077,25 @@ export class MemoryService extends EventEmitter {
           if (previous?.content === record.content && previous.sidecar === record.sidecar) {
             continue; // folded in earlier, nothing changed since
           }
-          let target: { relPath: string; write: boolean } | null;
+          let target: { relPath: string; write: boolean } | null = null;
           if (previous?.content === record.content) {
-            // Bytes already adopted: only the sidecar changed; same target.
-            target = { relPath: previous.target, write: false };
-          } else {
+            // Bytes already adopted and only the sidecar changed: the recorded
+            // target is reused only while it still holds the adopted bytes —
+            // the owner may have edited, replaced or deleted it since, and the
+            // child's pin must not land on unrelated content or a missing
+            // file. Otherwise the note is placed anew like a fresh adoption.
+            const stillAdopted =
+              (await store.assertContained(previous.target).then(
+                () => true,
+                () => false
+              )) &&
+              (await store.kind(previous.target)) === "file" &&
+              (await this.readBoundedTextFile(store, previous.target, previous.target).catch(
+                () => null
+              )) === content;
+            if (stillAdopted) target = { relPath: previous.target, write: false };
+          }
+          if (target === null) {
             target = await this.legacyImportTarget(store, childId, relPath, content);
             if (target === null) {
               skipped++;

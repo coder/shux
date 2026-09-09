@@ -67,6 +67,7 @@ import { resolveHeadlessAgentDefinition } from "@/node/services/agentDefinitions
 import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
 import type { HistoryService } from "@/node/services/historyService";
+import type { MuxMessage } from "@/common/types/message";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
@@ -311,6 +312,28 @@ function finalizeHarvestRecordForRemoval(record: MemoryHarvestRecord): MemoryHar
     attemptCount: HARVEST_MAX_ATTEMPTS,
     error: "workspace removed before the harvest could be retried; transcript no longer available",
   };
+}
+
+/** Harvest refused with a terminal record already journaled (see runHarvestAttemptEffect). */
+class HarvestRefusedError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "HarvestRefusedError";
+  }
+}
+
+/**
+ * Whether the epoch's tail is a user batch with no assistant reply: rows of a
+ * turn that never started (its policy record happens in start(), before the
+ * assistant row is appended), so nothing accounted for them.
+ */
+function epochEndsWithUnansweredUserRows(messages: readonly MuxMessage[]): boolean {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const role = messages[index].role;
+    if (role === "assistant") return false;
+    if (role === "user") return true;
+  }
+  return false;
 }
 
 export class MemoryConsolidationService extends EventEmitter {
@@ -1102,6 +1125,9 @@ export class MemoryConsolidationService extends EventEmitter {
         // channel AND defects identically.
         const journalHarvestFailure = (error: unknown): Effect.Effect<void> =>
           Effect.gen(function* () {
+            // A refusal already journaled its terminal record; re-journaling
+            // would make it retryable again.
+            if (error instanceof HarvestRefusedError) return;
             yield* self.saveHarvestRecordEffect(
               metadata.workspaceId,
               boundaryKey,
@@ -1166,6 +1192,20 @@ export class MemoryConsolidationService extends EventEmitter {
         catch: (error) => error,
       });
       if (!epoch.success) return yield* Effect.fail(new Error(epoch.error));
+      // Every scanned row must belong to a turn whose write policy was
+      // recorded. A turn records its policy in start(), BEFORE its assistant
+      // row is appended, so user rows after the epoch's last assistant reply
+      // are a turn that had not started when the summary landed above them —
+      // another backend's in-flight batch (multi-instance), or a turn refused
+      // pre-start. Their policy is unknown and the grant evaluated at
+      // completion could not have accounted for them. Terminal refusal: a
+      // retry would replay the same recorded grant.
+      if (epochEndsWithUnansweredUserRows(epoch.data.messages)) {
+        const reason =
+          "the compacted epoch ends with user rows of a turn whose memory policy was never recorded; harvest refused (fail closed)";
+        yield* Effect.promise(() => self.recordRefusedHarvest(metadata, reason));
+        return yield* Effect.fail(new HarvestRefusedError(reason));
+      }
 
       const modelString = resolveDreamModelString(self.config, metadata.workspaceId);
       const modelResult = yield* Effect.tryPromise({

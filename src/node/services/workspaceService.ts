@@ -4249,6 +4249,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   ): Promise<boolean> {
     const session =
       this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId);
+    // A no-tail compaction's durable epoch reset may still be in flight: read
+    // nothing of the closing epoch (accumulator, marker) before it settled.
+    await session?.settleWorkspaceMemoryPolicyEpoch();
     const mirror = session?.workspaceMemoryWritableMirror();
     const before = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
     // Unregistered workspace: nothing durable to update and no stale
@@ -4464,9 +4467,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           ?.workspace.workspaceMemoryWritable;
         // Third observation: the session-dir deny marker (fallback taken when
         // config.json could not record a deny; see recordWorkspaceMemoryWritable).
-        // The completion callback is synchronous and the harvest runs in the
-        // background anyway, so the marker read simply precedes the trigger.
-        readWorkspaceMemoryDenyMarker(path.join(this.config.sessionsDir, workspaceId))
+        // Returned so the session orders its epoch reset (which clears the
+        // marker) after this observation; the harvest runs in the background.
+        return readWorkspaceMemoryDenyMarker(path.join(this.config.sessionsDir, workspaceId))
           .then((denyMarker) => {
             const observed = [
               metadata.workspaceMemoryWritable,

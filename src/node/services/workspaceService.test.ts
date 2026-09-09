@@ -9365,10 +9365,14 @@ describe("WorkspaceService initialize", () => {
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
       expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
       expect(persisted()).toBe(false);
-      // Malformed marker still denies; an epoch boundary clears it and the
-      // next epoch can become writable again.
+      // Malformed marker still denies; an epoch boundary — even the fenced
+      // compaction one, since a malformed file cannot claim to be a newer
+      // deny — heals it and the next epoch can become writable again.
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
+      await clearWorkspaceMemoryDenyMarker(sessionDir, { notAfter: Date.now() - 60_000 });
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+      await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "{}");
       await clearWorkspaceMemoryDenyMarker(sessionDir);
       await realConfig.editConfig((cfg) => {
         const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
@@ -9411,6 +9415,43 @@ describe("WorkspaceService initialize", () => {
         })
       ).toBe(true);
       expect(persisted()).toBe(true);
+
+      // A record must wait for the session's in-flight epoch reset (a no-tail
+      // compaction clearing the closing epoch's accumulator/marker), or the
+      // first turn of the new epoch would AND itself with the stale deny.
+      let releaseReset!: () => void;
+      const resetInFlight = new Promise<void>((resolve) => (releaseReset = resolve));
+      const fakeSession = {
+        settleWorkspaceMemoryPolicyEpoch: () => resetInFlight,
+        workspaceMemoryWritableMirror: () => undefined,
+        recordWorkspaceMemoryWritable: () => undefined,
+      };
+      (service as unknown as { sessions: Map<string, unknown> }).sessions.set(
+        "policy-scratch",
+        fakeSession
+      );
+      await realConfig.editConfig((cfg) => {
+        findWorkspaceEntry(cfg, "policy-scratch")!.workspace.workspaceMemoryWritable = false;
+        return cfg;
+      });
+      let settled = false;
+      const pendingRecord = service
+        .recordWorkspaceMemoryWritable("policy-scratch", true, { epochHasPriorTurns: false })
+        .then((ok) => {
+          settled = true;
+          return ok;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(settled).toBe(false);
+      // The reset finishes (field cleared) and only then does the record read.
+      await realConfig.editConfig((cfg) => {
+        delete findWorkspaceEntry(cfg, "policy-scratch")!.workspace.workspaceMemoryWritable;
+        return cfg;
+      });
+      releaseReset();
+      expect(await pendingRecord).toBe(true);
+      expect(persisted()).toBe(true);
+      (service as unknown as { sessions: Map<string, unknown> }).sessions.delete("policy-scratch");
 
       // A late deny reaching the marker fallback after the workspace was
       // removed (tombstoned, session dir deleted) must not recreate the

@@ -331,6 +331,12 @@ async function seedCompactionEpoch(
     workspaceId,
     createMuxMessage("pref-1", "user", "Please remember that I prefer concise tests.")
   );
+  // The turn ran: its policy was recorded before this reply was appended
+  // (an epoch ending in unanswered user rows is refused; see below).
+  await fixture.historyService.appendToHistory(
+    workspaceId,
+    createMuxMessage("reply-1", "assistant", "Noted.")
+  );
   await fixture.historyService.appendToHistory(
     workspaceId,
     createMuxMessage("compact-request", "user", "Please compact", {
@@ -1192,6 +1198,51 @@ describe("MemoryConsolidationService", () => {
     const harvested = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
     expect(harvested?.boundaryKey).toBe(metadata.summaryMessageId);
     expect(harvested?.status).toBe("completed");
+  });
+
+  it("refuses to harvest an epoch whose tail is a user batch no turn ever answered", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    // Another backend appended a turn's user rows; before that turn recorded
+    // its policy (start()), this backend compacted above them with a grant.
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("pref-1", "user", "Please remember that I prefer concise tests.")
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("reply-1", "assistant", "Noted.")
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("late-1", "user", "Read-only agent's prompt, turn not yet started")
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("compact-request", "user", "Please compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+    });
+    await fixture.historyService.appendToHistory("ws-dream", summary);
+    const result = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    // The sweep still runs (success) while the harvest record is terminal
+    // (never completed, never retried), so recovery cannot replay the grant.
+    expect(result.success).toBe(true);
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+    expect(record?.error).toContain("never recorded");
   });
 
   it("finalizes a removed workspace's retryable harvest records so they are never retried", async () => {
