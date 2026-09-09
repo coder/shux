@@ -57,15 +57,24 @@ export function buildLeadInText(rollover: ContextWindowRollover): string {
   ].join("\n");
 }
 
-export function buildBudgetWarningText(
-  contextTokens: number,
-  maxTokens: number,
-  memoryWritable: boolean,
-  sessionHistoryAvailable: boolean,
-  final = false
-): string {
+interface ContextBudgetWarningOptions {
+  contextTokens: number;
+  maxTokens: number;
+  budgetTokens: number;
+  memoryWritable: boolean;
+  sessionHistoryAvailable: boolean;
+  final?: boolean;
+}
+
+export function buildBudgetWarningText(options: ContextBudgetWarningOptions): string {
+  const { contextTokens, maxTokens, budgetTokens, memoryWritable, sessionHistoryAvailable, final } =
+    options;
   assert(maxTokens > 0, "context budget warnings require a known positive limit");
-  const usage = `Context window ~${Math.round((contextTokens / maxTokens) * 100)}% used (${Math.ceil(contextTokens)} of ${maxTokens} tokens).`;
+  assert(
+    budgetTokens > 0 && budgetTokens <= maxTokens,
+    "context budget warnings require a positive budget within the model limit"
+  );
+  const usage = `Context budget ~${Math.round((contextTokens / budgetTokens) * 100)}% used (${Math.ceil(contextTokens)} of ${budgetTokens} tokens before this window rolls over).`;
   if (final) {
     // The final flush is only offered while memory is writable and history recovery is
     // available, so no degraded wording is needed here.
@@ -91,35 +100,20 @@ export function buildBudgetWarningText(
   }`;
 }
 
-export function createContextBudgetWarning(
-  contextTokens: number,
-  maxTokens: number,
-  memoryWritable: boolean,
-  sessionHistoryAvailable: boolean,
-  final = false
-): MuxMessage {
-  return createMuxMessage(
-    createUserMessageId(),
-    "user",
-    buildBudgetWarningText(
+export function createContextBudgetWarning(options: ContextBudgetWarningOptions): MuxMessage {
+  const { contextTokens, maxTokens, budgetTokens, final } = options;
+  return createMuxMessage(createUserMessageId(), "user", buildBudgetWarningText(options), {
+    timestamp: Date.now(),
+    synthetic: true,
+    uiVisible: true,
+    muxMetadata: {
+      type: "context-budget-warning",
       contextTokens,
       maxTokens,
-      memoryWritable,
-      sessionHistoryAvailable,
-      final
-    ),
-    {
-      timestamp: Date.now(),
-      synthetic: true,
-      uiVisible: true,
-      muxMetadata: {
-        type: "context-budget-warning",
-        contextTokens,
-        maxTokens,
-        ...(final ? { final: true as const } : {}),
-      },
-    }
-  );
+      budgetTokens,
+      ...(final ? { final: true as const } : {}),
+    },
+  });
 }
 
 export function createRolloverPrefix(rollover: ContextWindowRollover): [MuxMessage, MuxMessage] {

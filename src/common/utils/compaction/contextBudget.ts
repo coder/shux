@@ -64,6 +64,18 @@ export function getContextBudgetHardCeiling(modelContextLimit: number): number {
   );
 }
 
+/** Share the usable rollover budget so warnings do not promise the model's unreachable full window. */
+export function getContextBudgetRolloverPoint(
+  modelContextLimit: number,
+  threshold: number
+): number {
+  assert(threshold > 0 && threshold < 1, "Rollover point requires an enabled fractional threshold");
+  return Math.min(
+    getContextBudgetHardCeiling(modelContextLimit),
+    Math.floor((modelContextLimit * (threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT)) / 100)
+  );
+}
+
 /** Heuristic-only check. Provider dispatch uses the node real-encoding adapter.
  * Unknown limits are not unlimited: the caller logs that preflight could not be applied. */
 export function checkAssembledRequestBudget(
@@ -146,14 +158,13 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   // A flush opportunity means one more notes-writing step fits below the hard ceiling.
   // Use the real-encoding projection where available: it can exceed the chars/4 heuristic.
   const safeFlush = hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling;
-  const forceAt = limit * ((input.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT) / 100);
-  if (projected >= forceAt) {
+  const rolloverAt = getContextBudgetRolloverPoint(limit, input.threshold);
+  if (projected >= rolloverAt) {
     return { ...result, decision: "rollover", flushOpportunity: safeFlush };
   }
   // On small windows or high thresholds the hard ceiling, not the force buffer, is where the
   // window really ends; anchor the absolute advance floor there. Whatever the threshold, at
   // least half of the usable window stays warning-free instead of warning on the first request.
-  const rolloverAt = Math.min(forceAt, hardCeiling);
   const warnAt = Math.max(
     rolloverAt / 2,
     Math.min(

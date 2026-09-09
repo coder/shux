@@ -1294,6 +1294,7 @@ describe("AgentSession token-budget lifecycle", () => {
       (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
     );
     expect(warnings).toHaveLength(1);
+    expect(warnings[0].metadata!.muxMetadata).toMatchObject({ budgetTokens: 96_000 });
     const continuation = rows.at(-1)!;
     expect(continuation.metadata).toMatchObject({
       synthetic: true,
@@ -1336,6 +1337,36 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test.each(["step-history", "queued"] as const)(
+    "the final flush retains its triggering budget when the threshold changes during %s",
+    async (phase) => {
+      const h = await setup();
+      expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+      if (phase === "step-history") {
+        const getHistory = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);
+        spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(
+          (...args) => {
+            h.session.setAutoCompactionThreshold(0.9);
+            return getHistory(...args);
+          }
+        );
+      }
+      expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+      h.session.setAutoCompactionThreshold(0.9);
+      await h.finishAndDispatch();
+      expect(
+        warningRows(await allRows(h)).find(isFinalFlushRow)?.metadata?.muxMetadata
+      ).toMatchObject({
+        final: true,
+        budgetTokens: 96_000,
+      });
+      // Raising the slider does not cancel the already-promised reset after the flush.
+      h.settleStream(1);
+      await h.waitForRequest(3);
+      expect(rolloverRows(await allRows(h))).toHaveLength(1);
+    }
+  );
+
   test("settled rollover with headroom offers exactly one final flush step, then seals", async () => {
     const h = await setup();
     expect(
@@ -1349,7 +1380,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(rows)).toHaveLength(0);
     const finalRows = warningRows(rows);
     expect(finalRows).toHaveLength(1);
-    expect(finalRows[0].metadata?.muxMetadata).toMatchObject({ final: true });
+    expect(finalRows[0].metadata?.muxMetadata).toMatchObject({ final: true, budgetTokens: 96_000 });
     expect(rows.at(-1)?.metadata).toMatchObject({
       synthetic: true,
       uiVisible: false,
@@ -3286,7 +3317,13 @@ describe("AgentSession token-budget lifecycle", () => {
       )
     ).toBe("warn");
     await h.finishAndDispatch();
-    expect(warning).toHaveBeenCalledWith(expect.any(Number), 128_000, false, false);
+    expect(warning).toHaveBeenCalledWith(
+      expect.objectContaining({
+        maxTokens: 128_000,
+        memoryWritable: false,
+        sessionHistoryAvailable: false,
+      })
+    );
   });
 
   test.each([4096, 8192])(
