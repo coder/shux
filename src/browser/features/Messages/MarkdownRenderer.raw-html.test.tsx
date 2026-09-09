@@ -142,6 +142,48 @@ describe("MarkdownRenderer raw HTML handling", () => {
     expect(copied!.html).toContain('align="right"');
   });
 
+  test("safe raw blocks retain separate text boundaries when copied", () => {
+    const { copied } = copyRenderedMarkdown(
+      "<div>first</div><div>second</div><dl><dt>Term</dt><dd>Definition</dd></dl>"
+    );
+    const pasted = renderMarkdown(copied!.text);
+    expect(copied!.html).toContain("</div><div>");
+    expect(copied!.text).not.toContain("firstsecond");
+    expect(pasted.container.textContent).toContain("first");
+    expect(pasted.container.textContent).toContain("Definition");
+  });
+
+  test("row headers do not promote the first data row to a column header", () => {
+    const { copied } = copyRenderedMarkdown(
+      "<table><tr><th>One</th><td>A</td></tr><tr><th>Two</th><td>B</td></tr></table>"
+    );
+    const pasted = renderMarkdown(copied!.text);
+    expect(pasted.container.querySelector("thead")?.textContent?.trim()).toBe("");
+    expect(pasted.container.querySelector("tbody tr")?.textContent).toBe("OneA");
+  });
+
+  test("copying follows rendered numbering when unsupported reversed markup is stripped", () => {
+    const { view, copied } = copyRenderedMarkdown(
+      '<ol reversed start="5"><li>First</li><li>Second</li></ol>'
+    );
+    expect(view.container.querySelector("ol")?.hasAttribute("reversed")).toBe(false);
+    const pasted = renderMarkdown(copied!.text);
+    expect(pasted.container.querySelector("ol")?.start).toBe(5);
+    expect(copied!.html).toContain('start="5"');
+  });
+
+  test("right-clicking a rendered math SVG keeps the selected formula copyable", () => {
+    const { view } = copyRenderedMarkdown("$$\\sqrt{x}$$");
+    const target = view.container.querySelector(".katex svg path")!;
+    expect(target).not.toBeNull();
+    const copied = getTranscriptContextMenuMarkdown({
+      transcriptRoot: view.container,
+      target,
+      selection: window.getSelection(),
+    });
+    expect(copied?.text).toBe("$$\\sqrt{x}$$");
+  });
+
   test("closed disclosures do not copy their hidden body", () => {
     const { copied } = copyRenderedMarkdown(
       "<details><summary>Visible</summary><p>HIDDEN</p></details>"

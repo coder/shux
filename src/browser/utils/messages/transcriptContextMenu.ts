@@ -314,6 +314,10 @@ export function getTranscriptContextMenuText(
 
 // Copy only semantic formatting. Transcript content can contain untrusted repository text.
 const CLIPBOARD_TAGS = new Set([
+  "div",
+  "dl",
+  "dt",
+  "dd",
   "p",
   "br",
   "strong",
@@ -520,7 +524,7 @@ export function getTranscriptContextMenuMarkdown(
   if (
     !target ||
     !options.transcriptRoot.contains(target) ||
-    (excludedTarget && !excludedTarget.matches('.katex-html[aria-hidden="true"]'))
+    (excludedTarget && !excludedTarget.closest(".katex"))
   ) {
     return null;
   }
@@ -543,6 +547,10 @@ export function getTranscriptContextMenuMarkdown(
     ? selectedList.parentElement
     : quoteRoot;
   appendClipboardNodes(copyRoot, container, range);
+  // Drop redundant outer wrappers, but retain boundaries between adjacent raw HTML blocks.
+  while (container.childNodes.length === 1 && container.firstElementChild?.tagName === "DIV") {
+    container.replaceChildren(...container.firstElementChild.childNodes);
+  }
   const markdown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
   // Preserve literal HTML and entities as text when the copied Markdown is parsed again.
   markdown.escape = (text) =>
@@ -603,8 +611,11 @@ export function getTranscriptContextMenuMarkdown(
       );
       const width = Math.max(0, ...rows.map((row) => row.length));
       if (!width) return "";
-      if (!node.querySelector("tr th")) rows.unshift(Array<string>(width).fill(""));
       const firstRow = node.querySelector("tr");
+      // Row headers do not turn the first data record into a column header.
+      if (!firstRow || !Array.from(firstRow.cells).every((cell) => cell.tagName === "TH")) {
+        rows.unshift(Array<string>(width).fill(""));
+      }
       rows.splice(
         1,
         0,
