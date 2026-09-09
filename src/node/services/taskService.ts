@@ -2416,24 +2416,29 @@ export class TaskService implements AgentTaskIntegration {
     const awaitingReportTasks = eligible.filter((task) => task.taskStatus === "awaiting_report");
     const runningTasks = eligible.filter((task) => (task.taskStatus ?? "running") === "running");
 
+    const admitRecovery = async (task: (typeof eligible)[number], reason: string) => {
+      if (
+        !(await this.admitTaskDesktopRecovery(task.id!)) ||
+        (await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+          task.id!,
+          config,
+          reason,
+          taskIndex
+        ))
+      )
+        return false;
+      // Earlier recovery awaits can finish other candidates; verify live status at each dispatch.
+      const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), task.id!)?.workspace;
+      return latest != null && latest.taskStatus === task.taskStatus;
+    };
+
     let resumedAwaitingReportCount = 0;
     let skippedAwaitingReportDueToActiveDescendants = 0;
     let failedAwaitingReportCount = 0;
 
     for (const task of awaitingReportTasks) {
       if (!task.id) continue;
-      if (!(await this.admitTaskDesktopRecovery(task.id))) continue;
-
-      if (
-        await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-          task.id,
-          config,
-          "startup-awaiting-report",
-          taskIndex
-        )
-      ) {
-        continue;
-      }
+      if (!(await admitRecovery(task, "startup-awaiting-report"))) continue;
 
       // Avoid resuming a task while it still has blocking active descendants (it shouldn't report yet).
       const hasBlockingActiveDescendants =
@@ -2465,17 +2470,7 @@ export class TaskService implements AgentTaskIntegration {
 
     for (const task of runningTasks) {
       if (!task.id) continue;
-      if (!(await this.admitTaskDesktopRecovery(task.id))) continue;
-      if (
-        await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-          task.id,
-          config,
-          "startup-running",
-          taskIndex
-        )
-      ) {
-        continue;
-      }
+      if (!(await admitRecovery(task, "startup-running"))) continue;
 
       const pendingGuidance = task.taskPendingGuidance ?? [];
       const alreadyStreaming = this.aiService.isStreaming(task.id);

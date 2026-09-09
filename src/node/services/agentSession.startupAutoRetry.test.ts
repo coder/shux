@@ -1,3 +1,4 @@
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
@@ -1632,6 +1633,55 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(scheduledAfter).toBe(scheduledBefore + 1);
 
     await session.dispose();
+  });
+
+  test("startup compaction dispatch returns after persistence while provider work remains pending", async () => {
+    const workspaceId = "startup-background-compaction";
+    const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("summary", "assistant", "Summary", {
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Continue original work",
+            model: "openai:gpt-4o",
+            agentId: "exec",
+          },
+        },
+      })
+    );
+    const started = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    let streamFinished = false;
+    const stream = spyOn(
+      session as unknown as { streamWithHistory(): Promise<ReturnType<typeof Ok<void>>> },
+      "streamWithHistory"
+    ).mockImplementation(async () => {
+      started.resolve();
+      await finish.promise;
+      streamFinished = true;
+      return Ok(undefined);
+    });
+    const dispatch = session.dispatchPendingCompactionFollowUpIfNeeded(undefined, true);
+    try {
+      expect(await raceWithAbortAndTimeout(dispatch, { timeoutMs: 1000 })).toEqual({
+        kind: "ok",
+        value: true,
+      });
+      await started.promise;
+      expect(streamFinished).toBe(false);
+      const history = await historyService.getLastMessages(workspaceId, 1);
+      expect(history.success && history.data[0].parts).toMatchObject([
+        { type: "text", text: "Continue original work" },
+      ]);
+    } finally {
+      finish.resolve();
+      await dispatch;
+      await session.dispose();
+      stream.mockRestore();
+    }
   });
 
   test("retryActiveStream resumes the reconstructed follow-up after compaction handoff send fails", async () => {

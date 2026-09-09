@@ -11856,7 +11856,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   async dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>> {
     try {
       return Ok(
-        await this.getOrCreateSession(workspaceId).dispatchPendingCompactionFollowUpIfNeeded()
+        await this.getOrCreateSession(workspaceId).dispatchPendingCompactionFollowUpIfNeeded(
+          undefined,
+          true
+        )
       );
     } catch (error) {
       log.warn("Failed to recover pending compaction follow-up", { workspaceId, error });

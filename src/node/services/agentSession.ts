@@ -2593,10 +2593,7 @@ export class AgentSession {
     }
 
     const autoRetryEnabled = await this.loadAutoRetryEnabledPreference(isCurrent);
-    if (!isCurrent()) return "completed";
-    if (!autoRetryEnabled) {
-      return "completed";
-    }
+    if (!isCurrent() || !autoRetryEnabled) return "completed";
 
     const [partial, historyResult] = (await this.readStartupTail()) ?? [];
     if (!isCurrent()) return "completed";
@@ -9754,7 +9751,8 @@ export class AgentSession {
    */
   private async dispatchPendingFollowUp(
     summaryMessageId?: string,
-    cancelResume?: () => boolean
+    cancelResume?: () => boolean,
+    startStreamInBackground = false
   ): Promise<boolean> {
     if (this.coordinator.disposed || this.coordinator.closing) {
       return false;
@@ -10066,12 +10064,13 @@ export class AgentSession {
       persistedGoalId
     );
 
-    // Await sendMessage to ensure the follow-up is persisted before returning.
-    // This guarantees ordering: the follow-up message is written to history
+    // Startup waits for durable acceptance, not provider completion. Other callers still await fully.
+    // Either way, the follow-up message is written to history
     // before sendQueuedMessages() runs, preventing race conditions.
     // Mark as synthetic so recovery/background dispatches do not implicitly
     // re-enable auto-retry after a user explicitly opted out.
     const sendResult = await this.sendMessage(finalText, options, {
+      startStreamInBackground,
       synthetic: true,
       agentInitiated: followUp.agentInitiated,
       goalKind: persistedGoalKind,
@@ -10960,9 +10959,12 @@ export class AgentSession {
     return result;
   }
 
-  async dispatchPendingCompactionFollowUpIfNeeded(summaryMessageId?: string): Promise<boolean> {
+  async dispatchPendingCompactionFollowUpIfNeeded(
+    summaryMessageId?: string,
+    startStreamInBackground = false
+  ): Promise<boolean> {
     this.assertNotDisposed("dispatchPendingCompactionFollowUpIfNeeded");
-    return this.dispatchPendingFollowUp(summaryMessageId);
+    return this.dispatchPendingFollowUp(summaryMessageId, undefined, startStreamInBackground);
   }
 
   /**

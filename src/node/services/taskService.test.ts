@@ -3463,6 +3463,47 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toBeUndefined();
   });
 
+  test.each(["running", "awaiting_report"] as const)(
+    "startup skips tasks completed during earlier recovery (%s)",
+    async (taskStatus) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", "parent"),
+          ...["first", "later"].map((id) =>
+            projectWorkspace(projectPath, id, id, {
+              parentWorkspaceId: "parent",
+              agentId: "exec",
+              agentType: "exec",
+              taskStatus,
+              taskModelString: "openai:gpt-5.2",
+            })
+          ),
+        ],
+        testTaskSettings()
+      );
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+        dispatchPendingCompactionFollowUp: mock(async () => {
+          await config.editConfig((cfg) => {
+            const later = cfg.projects
+              .get(projectPath)
+              ?.workspaces.find((workspace) => workspace.id === "later");
+            if (later) later.taskStatus = "reported";
+            return cfg;
+          });
+          return Ok(false);
+        }),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      await taskService.recoverInterruptedTasks();
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage.mock.calls[0]?.[0]).toBe("first");
+    }
+  );
+
   test("startup does not recover a task that completed during blocker inspection", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
