@@ -787,6 +787,7 @@ describe("buildProviderOptions - OpenAI", () => {
           undefined,
           undefined,
           {
+            openai: { apiKeySet: false, isConfigured: false, isEnabled: true },
             coder: {
               apiKeySet: false,
               isConfigured: true,

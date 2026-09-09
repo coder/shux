@@ -61,6 +61,10 @@ export function openaiServiceTierAvailable(
   modelString: string,
   options?: OpenAIDirectProviderOptionsAvailability
 ): boolean {
+  // Policy-filtered configs omit denied providers, including this shared
+  // preference's write target. Do not expose Fast or inject a hidden saved tier.
+  if (options?.providersConfig != null && options.providersConfig.openai == null) return false;
+
   const prefix = modelString.split(":", 1)[0];
   const custom = options?.providersConfig?.[prefix];
   if (isCustomProviderConfig(custom)) {

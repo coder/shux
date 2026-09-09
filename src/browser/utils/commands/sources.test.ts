@@ -1324,6 +1324,7 @@ test("fast mode command is route-aware and keyboard accessible", async () => {
       } as unknown as WorkspaceState,
       getEffectiveComposerModel: () => "openai:gpt-6-astra",
       providersConfig: {
+        openai: { apiKeySet: false, isEnabled: true, isConfigured: false },
         openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
       },
       getRouteForModel: () => "openrouter",

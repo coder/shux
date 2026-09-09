@@ -65,6 +65,7 @@ describe("fast mode service tier", () => {
       getFastModeProvider(`coder:${name}/gpt-6-astra`, {
         resolvedRouteProvider: "coder",
         providersConfig: {
+          openai: { apiKeySet: false, isEnabled: true, isConfigured: false },
           coder: {
             apiKeySet: false,
             isEnabled: true,
@@ -105,6 +106,7 @@ describe("fast mode service tier", () => {
 
   test("follows a custom-named Coder instance's fallback without treating mappings as routes", () => {
     const providersConfig = {
+      openai: { apiKeySet: false, isEnabled: true, isConfigured: false },
       coder: {
         apiKeySet: false,
         isConfigured: true,
