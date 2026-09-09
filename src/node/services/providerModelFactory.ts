@@ -232,27 +232,37 @@ export function resolveOpenAIWebSocketResponsesUrl(baseURL: unknown): string | u
  * hit the upstream store=true default. Explicit request-level store wins.
  */
 function injectGrokStoreDefault(
+  model: Parameters<typeof injectProviderOptionsDefaults>[0],
+  configuredStore: unknown
+): void {
+  injectProviderOptionsDefaults(model, "xai", {
+    store: typeof configuredStore === "boolean" ? configuredStore : false,
+  });
+}
+
+/** Keep creation-time defaults on the model for callers that omit providerOptions. */
+function injectProviderOptionsDefaults(
   model: {
     doStream: (options: never) => unknown;
     doGenerate: (options: never) => unknown;
   },
-  configuredStore: unknown
+  namespace: string,
+  defaults: Record<string, unknown>
 ): void {
-  const defaultStore = typeof configuredStore === "boolean" ? configuredStore : false;
   interface CallOptions {
     providerOptions?: Record<string, unknown>;
   }
-  const injectStoreFlag = <T extends CallOptions>(options: T): T => {
-    const xaiOpts = (options.providerOptions?.xai as Record<string, unknown> | undefined) ?? {};
-    return {
-      ...options,
-      providerOptions: {
-        ...options.providerOptions,
-        // Request-level store wins; otherwise force the ZDR-safe default.
-        xai: { store: defaultStore, ...xaiOpts },
+  const injectDefaults = <T extends CallOptions>(options: T): T => ({
+    ...options,
+    providerOptions: {
+      ...options.providerOptions,
+      // Request-level values win over the model's pinned defaults.
+      [namespace]: {
+        ...defaults,
+        ...(options.providerOptions?.[namespace] as Record<string, unknown> | undefined),
       },
-    };
-  };
+    },
+  });
 
   // LanguageModelV4 method types are invariant on options; cast through a local
   // structural type so we can wrap doStream/doGenerate without dragging AI SDK
@@ -263,8 +273,8 @@ function injectGrokStoreDefault(
   };
   const originalDoStream = mutableModel.doStream.bind(mutableModel);
   const originalDoGenerate = mutableModel.doGenerate.bind(mutableModel);
-  mutableModel.doStream = (options) => originalDoStream(injectStoreFlag(options));
-  mutableModel.doGenerate = (options) => originalDoGenerate(injectStoreFlag(options));
+  mutableModel.doStream = (options) => originalDoStream(injectDefaults(options));
+  mutableModel.doGenerate = (options) => originalDoGenerate(injectDefaults(options));
 }
 
 /**
@@ -1306,6 +1316,7 @@ export class ProviderModelFactory {
   ): Effect.Effect<Result<LanguageModel, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
+    let serviceTierDefault: { namespace: string; option: string; value: string } | undefined;
     // The explicit annotation restores the contextual typing the old async
     // signature provided, so the wire-error literals below stay narrowed.
     const pipeline: Effect.Effect<Result<LanguageModel, SendMessageError>> = Effect.gen(
@@ -1431,6 +1442,11 @@ export class ProviderModelFactory {
             openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
           })
         ) {
+          serviceTierDefault = {
+            namespace: "openai",
+            option: "serviceTier",
+            value: serviceTier.data,
+          };
           muxProviderOptions ??= {};
           muxProviderOptions.openai = {
             ...muxProviderOptions.openai,
@@ -1966,6 +1982,10 @@ export class ProviderModelFactory {
 
         // Handle OpenRouter provider
         if (providerName === "openrouter") {
+          if (serviceTierDefault) {
+            serviceTierDefault.namespace = "openrouter";
+            serviceTierDefault.option = "service_tier";
+          }
           // Resolve credentials from config + env (single source of truth)
           const creds = resolveProviderCredentials("openrouter", providerConfig);
           if (!creds.isConfigured) {
@@ -2292,6 +2312,9 @@ export class ProviderModelFactory {
           log.debug(`GitHub Copilot model ${modelId} using ${apiMode} API mode`);
 
           if (apiMode === "responses") {
+            if (serviceTierDefault) {
+              serviceTierDefault.namespace = "github-copilot";
+            }
             // Copilot Codex models use a custom Responses language model
             // that handles Copilot's SSE stream quirks (rotating item_id,
             // text arriving via output_text.delta rather than inline).
@@ -2554,6 +2577,16 @@ export class ProviderModelFactory {
       }
     );
     return pipeline.pipe(
+      Effect.map((result) => {
+        if (result.success && serviceTierDefault && typeof result.data !== "string") {
+          // Headless callers may never rebuild providerOptions. Pin the validated
+          // creation-time tier on both model methods, without rereading config.
+          injectProviderOptionsDefaults(result.data, serviceTierDefault.namespace, {
+            [serviceTierDefault.option]: serviceTierDefault.value,
+          });
+        }
+        return result;
+      }),
       // Parity with the pre-Effect whole-pipeline try/catch: any throw —
       // synchronous (SDK constructors, URL parsing) or a rejected provider
       // module import — folds into the same "unknown" wire error. Defects

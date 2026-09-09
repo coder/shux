@@ -2476,14 +2476,28 @@ describe("ProviderModelFactory Coder", () => {
           });
           if (!result.success) throw new Error(result.error.type);
           const pinned = result.data;
+          // Title generation and metadata-only callers use the model without
+          // rebuilding providerOptions. Its creation-time tier must still apply.
+          const headless = await factory.createModel(
+            modelString,
+            explicitTier ? options : undefined
+          );
+          if (!headless.success) throw new Error(headless.error.type);
           const expectedTier = explicitTier ?? configTier;
           expect(pinned.optionsMuxProviderOptions.openai?.serviceTier).toBe(expectedTier);
           expect(options.openai?.serviceTier).toBe(explicitTier);
+          const metadataSnapshot = store.loadProvidersConfig() ?? {};
           // A later preference edit must not change an already-created request.
           store.saveProvidersConfig({
             ...providersConfig,
             openai: { apiKey: "test-key", serviceTier: "flex" },
           });
+          // This is the delegation used by createModelWithPinnedMetadata: the
+          // supplied snapshot must win even if disk changed before model creation.
+          const metadataOnly = await factory.createModel(modelString, undefined, {
+            providersConfig: metadataSnapshot,
+          });
+          if (!metadataOnly.success) throw new Error(metadataOnly.error.type);
           const providerOptions = buildProviderOptions(
             pinned.optionsModelString,
             "off",
@@ -2497,21 +2511,49 @@ describe("ProviderModelFactory Coder", () => {
           );
           if ("anthropic" in providerOptions)
             throw new Error("Expected OpenAI-wire provider options");
-          const before = calls.length;
-          await generateText({
-            model: pinned.model,
-            prompt: "hello",
-            providerOptions,
-            maxRetries: 0,
-          }).catch(() => undefined);
-          expect(calls.length).toBe(before + 1);
-          const body = parseSentBody(calls[before]);
-          if (modelString.startsWith("mux-gateway:")) {
-            expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
-              expectedTier
-            );
-          } else {
-            expect(body.service_tier).toBe(expectedTier);
+          const tierOverride: Record<string, Record<string, string>> = modelString.startsWith(
+            "openrouter:"
+          )
+            ? { openrouter: { service_tier: "auto" } }
+            : modelString.startsWith("github-copilot:")
+              ? { "github-copilot": { serviceTier: "auto" } }
+              : { openai: { serviceTier: "auto" } };
+          for (const { expected, ...request } of [
+            { model: pinned.model, providerOptions, expected: expectedTier },
+            { model: headless.data, expected: expectedTier },
+            { model: metadataOnly.data, expected: configTier },
+            { model: headless.data, providerOptions: tierOverride, expected: "auto" as const },
+            ...(modelString === "github-copilot:gpt-6-astra"
+              ? [
+                  {
+                    model: headless.data,
+                    providerOptions: { openai: { serviceTier: "flex" } },
+                    expected: "flex" as const,
+                  },
+                ]
+              : []),
+          ]) {
+            for (const stream of [false, true]) {
+              const before = calls.length;
+              if (stream) {
+                await streamText({ ...request, prompt: "hello", maxRetries: 0 }).consumeStream({
+                  onError: () => undefined,
+                });
+              } else {
+                await generateText({ ...request, prompt: "hello", maxRetries: 0 }).catch(
+                  () => undefined
+                );
+              }
+              expect(calls.length).toBe(before + 1);
+              const body = parseSentBody(calls[before]);
+              if (modelString.startsWith("mux-gateway:")) {
+                expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
+                  expected
+                );
+              } else {
+                expect(body.service_tier).toBe(expected);
+              }
+            }
           }
         }
       } finally {
@@ -2523,27 +2565,46 @@ describe("ProviderModelFactory Coder", () => {
   it("does not pin OpenAI tiers on OAuth or non-OpenAI Coder upstreams", async () => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, { additionalProviders: [{ name: "openai", type: "anthropic" }] });
+      const auth = {
+        type: "oauth" as const,
+        access: "test-access",
+        refresh: "test-refresh",
+        expires: Date.now() + 3_600_000,
+      };
       store.saveProvidersConfig({
         ...store.loadProvidersConfig(),
         openai: {
           serviceTier: "priority",
-          codexOauth: {
-            type: "oauth",
-            access: "test-access",
-            refresh: "test-refresh",
-            expires: Date.now() + 3_600_000,
-          },
+          codexOauth: auth,
           codexOauthDefaultAuth: "oauth",
         },
       });
       await saveRoutePriority(config, ["direct"]);
       oauth.coderOauthService = stubCoderOauthService();
-      for (const model of ["openai:gpt-6-astra", "coder:openai/gpt-6-astra"]) {
-        const result = await factory.createModelWithPinnedOptions(model, {
-          providerOptions: { openai: { serviceTier: "priority" } },
-        });
-        if (!result.success) throw new Error(result.error.type);
-        expect(result.data.optionsMuxProviderOptions.openai?.serviceTier).toBeUndefined();
+      oauth.codexOauthService = Object.create(CodexOauthService.prototype) as CodexOauthService;
+      oauth.codexOauthService.getValidAuth = () => Promise.resolve(Ok(auth));
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        for (const model of [
+          "openai:gpt-6-astra",
+          "coder:openai/gpt-6-astra",
+          "coder:google/gemini-3-pro",
+        ]) {
+          const result = await factory.createModelWithPinnedOptions(model, {
+            providerOptions: { openai: { serviceTier: "priority" } },
+          });
+          if (!result.success) throw new Error(result.error.type);
+          expect(result.data.optionsMuxProviderOptions.openai?.serviceTier).toBeUndefined();
+          const before = calls.length;
+          await generateText({ model: result.data.model, prompt: "hello", maxRetries: 0 }).catch(
+            () => undefined
+          );
+          expect(calls.length).toBe(before + 1);
+          expect(parseSentBody(calls[before])).not.toHaveProperty("service_tier");
+        }
+      } finally {
+        fetchSpy.mockRestore();
       }
     });
   });
