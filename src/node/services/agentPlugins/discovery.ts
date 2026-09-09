@@ -649,7 +649,9 @@ export async function discoverAgentPlugins(
       });
       if (plugin) {
         plugin.importedComponents =
-          imports === null ? { skills: [], mcpServers: [] } : imports?.get(entryName);
+          imports === null || (imports?.hasUnidentifiedEntries && !imports.byName.has(entryName))
+            ? { skills: [], mcpServers: [] }
+            : imports?.byName.get(entryName);
         plugins.push(plugin);
       }
     }

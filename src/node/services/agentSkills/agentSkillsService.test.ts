@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 
+import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
 import { SkillNameSchema } from "@/common/orpc/schemas";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -1388,7 +1389,7 @@ describe("agentSkillsService agent plugins", () => {
       path.join(tmp.path, "plugins.json"),
       JSON.stringify({
         plugins: [
-          { name: "a-selected", importedComponents: { skills: ["allowed"], mcpServers: [] } },
+          createTestPluginInstallEntry("a-selected", { skills: ["allowed"], mcpServers: [] }),
         ],
       })
     );
@@ -1442,7 +1443,9 @@ describe("agentSkillsService agent plugins", () => {
       await writePlugin(container, "managed", [{ name: "guarded", description: "not imported" }]);
       await fs.writeFile(
         path.join(tmp.path, "plugins.json"),
-        JSON.stringify({ plugins: [{ name: "managed", importedComponents: selection }] })
+        JSON.stringify({
+          plugins: [{ ...createTestPluginInstallEntry("managed"), importedComponents: selection }],
+        })
       );
       const runtime = new LocalRuntime(tmp.path);
       const roots = {
@@ -1488,7 +1491,7 @@ describe("agentSkillsService agent plugins", () => {
       ).toBe(true);
     }
     // A legacy row and then an unmanaged directory both retain import-all behavior.
-    for (const plugins of [[{ name: "managed" }], []]) {
+    for (const plugins of [[createTestPluginInstallEntry("managed")], []]) {
       await fs.writeFile(registryFile, JSON.stringify({ plugins }));
       expect(
         (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("guarded"), { roots }))

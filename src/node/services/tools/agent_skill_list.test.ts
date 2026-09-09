@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 import { describe, expect, it, spyOn } from "bun:test";
 
+import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentSkillListToolResult } from "@/common/types/tools";
@@ -431,7 +432,12 @@ describe("agent_skill_list", () => {
           fs.writeFile(
             path.join(xumHomeDir.path, "plugins.json"),
             JSON.stringify({
-              plugins: [{ name: "a-managed", importedComponents: { skills, mcpServers: [] } }],
+              plugins: [
+                {
+                  ...createTestPluginInstallEntry("a-managed"),
+                  importedComponents: { skills, mcpServers: [] },
+                },
+              ],
             })
           );
         await saveSelection(["selected"]);

@@ -12,6 +12,7 @@ import {
 } from "./discovery";
 import { bumpContainerMutationEpoch, MUTATION_EPOCH_FILE, STAGING_DIR_NAME } from "./journals";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { createTestPluginInstallEntry } from "./testFixtures";
 
 async function writePlugin(
   containerPath: string,
@@ -89,10 +90,78 @@ describe("discoverAgentPlugins", () => {
     expect(result.diagnostics).toEqual([]);
   });
 
+  test("unidentified registry rows isolate unknown directories without suppressing healthy imports", async () => {
+    using tmp = new DisposableTempDir("agent-plugins-row-recovery");
+    const container = path.join(tmp.path, "plugins");
+    const registryPath = path.join(tmp.path, "plugins.json");
+    for (const name of ["selected", "legacy", "unassociated"]) await writePlugin(container, name);
+    const selection = { skills: ["greet"], mcpServers: [] };
+    const healthy = [
+      createTestPluginInstallEntry("selected", selection),
+      createTestPluginInstallEntry("legacy"),
+    ];
+    for (const unidentified of [
+      null,
+      1,
+      "lost",
+      {},
+      [],
+      { name: 1 },
+      { name: "" },
+      { name: "../demo" },
+      { name: "con" },
+    ]) {
+      for (const rows of [
+        [...healthy, unidentified],
+        [unidentified, ...healthy],
+      ]) {
+        await fs.writeFile(registryPath, JSON.stringify({ plugins: rows }));
+        const { plugins } = await discoverAgentPlugins([
+          { path: container, scope: "global", registryPath },
+        ]);
+        expect(plugins).toHaveLength(3);
+        expect(plugins.find((plugin) => plugin.name === "selected")?.importedComponents).toEqual(
+          selection
+        );
+        expect(
+          plugins.find((plugin) => plugin.name === "legacy")?.importedComponents
+        ).toBeUndefined();
+        expect(
+          plugins.find((plugin) => plugin.name === "unassociated")?.importedComponents
+        ).toEqual({
+          skills: [],
+          mcpServers: [],
+        });
+      }
+    }
+    await fs.writeFile(registryPath, JSON.stringify({ plugins: healthy }));
+    const { plugins } = await discoverAgentPlugins([
+      { path: container, scope: "global", registryPath },
+    ]);
+    expect(
+      plugins.find((plugin) => plugin.name === "unassociated")?.importedComponents
+    ).toBeUndefined();
+  });
+
+  test("truncated named registry rows cannot turn a managed plugin into legacy import-all", async () => {
+    using tmp = new DisposableTempDir("agent-plugins-truncated-registry");
+    const container = path.join(tmp.path, "plugins");
+    const registryPath = path.join(tmp.path, "plugins.json");
+    await writePlugin(container, "demo");
+    await writePlugin(container, "unassociated");
+    await fs.writeFile(registryPath, JSON.stringify({ plugins: [{ name: "demo" }] }));
+    const { plugins } = await discoverAgentPlugins([
+      { path: container, scope: "global", registryPath },
+    ]);
+    expect(plugins).toHaveLength(2);
+    expect(plugins[0].importedComponents).toEqual({ skills: [], mcpServers: [] });
+    expect(plugins[1].importedComponents).toBeUndefined();
+  });
+
   test.each([
     "{",
     JSON.stringify({
-      plugins: [{ name: "shared", importedComponents: { skills: [], mcpServers: [] } }],
+      plugins: [createTestPluginInstallEntry("shared", { skills: [], mcpServers: [] })],
     }),
   ])("ignores an unmanaged global container's sibling registry (%s)", async (unmanagedRegistry) => {
     using tmp = new DisposableTempDir("agent-plugins-registry-scope");
@@ -105,7 +174,7 @@ describe("discoverAgentPlugins", () => {
     const selection = { skills: ["greet"], mcpServers: [] };
     await fs.writeFile(
       path.join(xumHome, "plugins.json"),
-      JSON.stringify({ plugins: [{ name: "shared", importedComponents: selection }] })
+      JSON.stringify({ plugins: [createTestPluginInstallEntry("shared", selection)] })
     );
     await fs.writeFile(path.join(path.dirname(universal), "plugins.json"), unmanagedRegistry);
     const containers = computeAgentPluginContainers({ xumHome, projectTrusted: false }).map(

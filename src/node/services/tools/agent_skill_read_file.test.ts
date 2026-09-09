@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { describe, it, expect } from "bun:test";
+import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
 import { AgentSkillReadFileToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { createAgentSkillReadFileTool } from "./agent_skill_read_file";
 import {
@@ -82,7 +83,7 @@ describe("agent_skill_read_file", () => {
       path.join(tmp.path, "plugins.json"),
       JSON.stringify({
         plugins: [
-          { name: "a-managed", importedComponents: { skills: ["allowed"], mcpServers: [] } },
+          createTestPluginInstallEntry("a-managed", { skills: ["allowed"], mcpServers: [] }),
         ],
       })
     );

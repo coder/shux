@@ -1,6 +1,6 @@
 import * as fsPromises from "node:fs/promises";
 import {
-  AgentPluginImportedComponentsSchema,
+  AgentPluginInstallEntrySchema,
   type AgentPluginImportedComponents,
 } from "@/common/config/schemas/agentPluginInstalls";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -80,33 +80,45 @@ export async function readPluginRegistryDocument(
 }
 
 /** Read once per managed container scan. Corruption must never become legacy import-all. */
-export async function readPluginComponentImports(
-  registryFile: string
-): Promise<Map<string, AgentPluginImportedComponents | undefined> | null> {
+export async function readPluginComponentImports(registryFile: string): Promise<{
+  byName: Map<string, AgentPluginImportedComponents | undefined>;
+  hasUnidentifiedEntries: boolean;
+} | null> {
   try {
     const { rawEntries } = await readPluginRegistryDocument(registryFile, "strict");
-    const imports = new Map<string, AgentPluginImportedComponents | undefined>();
+    const byName = new Map<string, AgentPluginImportedComponents | undefined>();
+    let hasUnidentifiedEntries = false;
     for (const raw of rawEntries) {
-      if (
-        raw === null ||
-        typeof raw !== "object" ||
-        !("name" in raw) ||
-        typeof raw.name !== "string"
-      ) {
-        throw new Error("Plugin registry entry has no name");
+      const name = AgentPluginInstallEntrySchema.shape.name.safeParse(
+        raw !== null && typeof raw === "object" && "name" in raw ? raw.name : undefined
+      );
+      if (!name.success) {
+        // An unidentified row can own an otherwise unregistered directory, but
+        // must not suppress healthy rows whose identity is still known.
+        hasUnidentifiedEntries = true;
+        continue;
       }
-      const selection = "importedComponents" in raw ? raw.importedComponents : undefined;
-      const parsed = AgentPluginImportedComponentsSchema.optional().safeParse(selection);
-      if (!parsed.success || imports.has(raw.name)) {
+      // Only a complete, valid legacy install may grant import-all. A missing
+      // selection on a truncated row is corruption, not legacy consent.
+      const parsed = AgentPluginInstallEntrySchema.safeParse(raw);
+      if (!parsed.success || byName.has(name.data)) {
         log.warn(
-          `Ignoring component imports for invalid or duplicate plugin registry entry '${raw.name}'`
+          `Ignoring component imports for invalid or duplicate plugin registry entry '${name.data}'`
         );
-        imports.set(raw.name, { skills: [], mcpServers: [] });
+        byName.set(name.data, { skills: [], mcpServers: [] });
       } else {
-        imports.set(raw.name, parsed.data);
+        byName.set(name.data, parsed.data.importedComponents);
       }
     }
-    return imports;
+    if (hasUnidentifiedEntries) {
+      log.warn(
+        "Unidentified plugin registry entries; suppressing imports for unmatched directories",
+        {
+          registryFile,
+        }
+      );
+    }
+    return { byName, hasUnidentifiedEntries };
   } catch (error) {
     log.warn("Plugin component imports unavailable; suppressing skills and MCP servers", {
       registryFile,
