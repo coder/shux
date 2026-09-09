@@ -16,12 +16,9 @@ interface ConcurrentLocalWarningProps {
 }
 
 /**
- * Returns the name of another local-project workspace that is actively streaming in the same
- * project directory, or null when there is no conflicting local stream to warn about.
+ * Counts unrelated local agents sharing this checkout, without cycling their identities.
  */
-export function useConcurrentLocalStreamingWorkspaceName(
-  props: ConcurrentLocalWarningProps
-): string | null {
+export function useConcurrentLocalAgentCount(props: ConcurrentLocalWarningProps): number {
   const isLocalProject = isLocalProjectRuntime(props.runtimeConfig);
   const { workspaceMetadata } = useWorkspaceContext();
   const store = useWorkspaceStoreRaw();
@@ -37,7 +34,7 @@ export function useConcurrentLocalStreamingWorkspaceName(
       (meta.rootWorkspaceId ?? meta.id) !== rootWorkspaceId
   );
 
-  const streamingWorkspaceId = useSyncExternalStore(
+  const streamingCount = useSyncExternalStore(
     (listener) => {
       const unsubscribers = otherLocalWorkspaces.map((meta) =>
         store.subscribeKey(meta.id, listener)
@@ -45,33 +42,34 @@ export function useConcurrentLocalStreamingWorkspaceName(
       return () => unsubscribers.forEach((unsubscribe) => unsubscribe());
     },
     () =>
-      otherLocalWorkspaces.find((meta) => {
+      otherLocalWorkspaces.filter((meta) => {
         try {
           return store.getWorkspaceSidebarState(meta.id).canInterrupt;
         } catch {
           // Workspace may not be registered yet, skip.
           return false;
         }
-      })?.id ?? null,
-    () => null
+      }).length,
+    () => 0
   );
-  const lastStreamingIdRef = useRef(streamingWorkspaceId);
-  if (streamingWorkspaceId !== null) {
-    lastStreamingIdRef.current = streamingWorkspaceId;
-  }
+  const scope = JSON.stringify([
+    rootWorkspaceId,
+    props.projectPath,
+    otherLocalWorkspaces.map((meta) => meta.id).sort(),
+  ]);
+  const heldCount = useRef({ scope, count: streamingCount });
+  if (streamingCount > 0) heldCount.current = { scope, count: streamingCount };
   const { displayPhase } = useWorkspaceStreamingStatusPhase(
-    streamingWorkspaceId === null ? null : "streaming"
+    streamingCount > 0 ? "streaming" : null
   );
 
-  // Hold brief activity handoffs only while the workspace is still a potential conflict.
-  // Resolve the held identity against current candidates rather than retaining a stale name.
-  return displayPhase === null
-    ? null
-    : (otherLocalWorkspaces.find((meta) => meta.id === lastStreamingIdRef.current)?.name ?? null);
+  // Hold brief handoffs, but clear immediately when eligibility changes rather than
+  // carrying a stale warning into another family, project, or isolated checkout.
+  return displayPhase && heldCount.current.scope === scope ? heldCount.current.count : 0;
 }
 
 interface ConcurrentLocalWarningViewProps {
-  streamingWorkspaceName: string;
+  agentCount: number;
   className?: string;
 }
 
@@ -93,9 +91,9 @@ export const ConcurrentLocalWarningDecoration: React.FC<ConcurrentLocalWarningVi
         )}
       >
         <AlertTriangle aria-hidden="true" className="text-warning size-3.5 shrink-0" />
-        <span className="min-w-0 truncate">
-          <span className="text-foreground font-medium">{props.streamingWorkspaceName}</span> is
-          also running in this project directory — agents may interfere
+        <span className="counter-nums min-w-0 truncate">
+          {props.agentCount} other local agent{props.agentCount === 1 ? "" : "s"} running — may
+          interfere
         </span>
       </div>
     </div>

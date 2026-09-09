@@ -75,7 +75,7 @@ import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import {
   ConcurrentLocalWarningDecoration,
-  useConcurrentLocalStreamingWorkspaceName,
+  useConcurrentLocalAgentCount,
 } from "../ConcurrentLocalWarning/ConcurrentLocalWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
@@ -366,7 +366,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       : null;
   const shouldShowQueuedAgentTaskPrompt =
     Boolean(queuedAgentTaskPrompt) && (workspaceState?.messages.length ?? 0) === 0;
-  const concurrentLocalStreamingWorkspaceName = useConcurrentLocalStreamingWorkspaceName({
+  const concurrentLocalAgentCount = useConcurrentLocalAgentCount({
     workspaceId,
     projectPath,
     runtimeConfig,
@@ -1741,7 +1741,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       isCompacting={isCompacting}
                       shouldShowPinnedTodoList={shouldShowPinnedTodoList}
                       shouldShowReviewsBanner={shouldShowReviewsBanner}
-                      concurrentLocalStreamingWorkspaceName={concurrentLocalStreamingWorkspaceName}
+                      concurrentLocalAgentCount={concurrentLocalAgentCount}
                       canInterrupt={canInterrupt}
                       autoCompactionResult={autoCompactionResult}
                       shouldShowCompactionWarning={shouldShowCompactionWarning}
@@ -1818,7 +1818,7 @@ interface ChatInputPaneProps {
   isTranscriptCaughtUp: boolean;
   shouldShowPinnedTodoList: boolean;
   shouldShowReviewsBanner: boolean;
-  concurrentLocalStreamingWorkspaceName: string | null;
+  concurrentLocalAgentCount: number;
   canInterrupt: boolean;
   autoCompactionResult: ReturnType<typeof checkAutoCompaction>;
   shouldShowCompactionWarning: boolean;
@@ -1913,14 +1913,10 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   // message insert above a live tail row, so bottom-lock had to correct after layout and
   // visibly flashed while another local agent was active. Pin it with composer decorations
   // instead; new transcript rows no longer move the warning.
-  if (props.concurrentLocalStreamingWorkspaceName) {
+  if (props.concurrentLocalAgentCount) {
     addDecorationEntry({
       key: "concurrent-local-warning",
-      node: (
-        <ConcurrentLocalWarningDecoration
-          streamingWorkspaceName={props.concurrentLocalStreamingWorkspaceName}
-        />
-      ),
+      node: <ConcurrentLocalWarningDecoration agentCount={props.concurrentLocalAgentCount} />,
     });
   }
 

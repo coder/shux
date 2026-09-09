@@ -8,7 +8,10 @@ import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import type { WorkspaceSidebarState, WorkspaceStore } from "@/browser/stores/WorkspaceStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { WORKSPACE_STREAMING_STATUS_TRANSITION_MS } from "@/constants/streaming";
-import { useConcurrentLocalStreamingWorkspaceName } from "./ConcurrentLocalWarning";
+import {
+  ConcurrentLocalWarningDecoration,
+  useConcurrentLocalAgentCount,
+} from "./ConcurrentLocalWarning";
 
 const subscribers = new Set<() => void>();
 const streamingWorkspaceIds = new Set<string>();
@@ -54,14 +57,18 @@ const currentWorkspaceMetadata: FrontendWorkspaceMetadata = {
 };
 const workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
 
-function WarningNameProbe(props: { workspaceId?: string }) {
-  const streamingWorkspaceName = useConcurrentLocalStreamingWorkspaceName({
+function WarningCountProbe(props: { workspaceId?: string }) {
+  const agentCount = useConcurrentLocalAgentCount({
     workspaceId: props.workspaceId ?? currentWorkspaceMetadata.id,
     projectPath: "/repo",
     runtimeConfig: { type: "local" },
   });
 
-  return streamingWorkspaceName === null ? null : <div>{streamingWorkspaceName}</div>;
+  return agentCount === 0 ? null : (
+    <div data-count={agentCount}>
+      <ConcurrentLocalWarningDecoration agentCount={agentCount} />
+    </div>
+  );
 }
 
 function notifyWorkspaceStateChanged(): void {
@@ -107,8 +114,8 @@ describe("ConcurrentLocalWarning", () => {
         parentWorkspaceId: "archived-parent",
         rootWorkspaceId: rootWorkspaceId ?? currentWorkspaceMetadata.id,
       });
-      const result = render(<WarningNameProbe />);
-      expect(result.queryByText(otherWorkspaceMetadata.name)).toBeNull();
+      const result = render(<WarningCountProbe />);
+      expect(result.queryByRole("status")).toBeNull();
       act(() => {
         streamingWorkspaceIds.clear();
         notifyWorkspaceStateChanged();
@@ -117,7 +124,7 @@ describe("ConcurrentLocalWarning", () => {
         streamingWorkspaceIds.add(otherWorkspaceMetadata.id);
         notifyWorkspaceStateChanged();
       });
-      expect(result.queryByText(otherWorkspaceMetadata.name)).toBeNull();
+      expect(result.queryByRole("status")).toBeNull();
     }
   );
 
@@ -127,8 +134,8 @@ describe("ConcurrentLocalWarning", () => {
       parentWorkspaceId: "unrelated-root",
       rootWorkspaceId: "unrelated-root",
     });
-    const result = render(<WarningNameProbe />);
-    expect(result.getByText(otherWorkspaceMetadata.name)).toBeTruthy();
+    const result = render(<WarningCountProbe />);
+    expect(result.getByRole("status")).toBeTruthy();
   });
 
   test.each([
@@ -137,8 +144,8 @@ describe("ConcurrentLocalWarning", () => {
     { runtimeConfig: { type: "local" as const, srcBaseDir: "/legacy-worktrees" } },
   ])("does not warn about an isolated or different project: %j", (override) => {
     workspaceMetadata.set(otherWorkspaceMetadata.id, { ...otherWorkspaceMetadata, ...override });
-    const result = render(<WarningNameProbe />);
-    expect(result.queryByText(otherWorkspaceMetadata.name)).toBeNull();
+    const result = render(<WarningCountProbe />);
+    expect(result.queryByRole("status")).toBeNull();
   });
 
   test("does not carry a warning into the active agent's own sub-agent", () => {
@@ -148,29 +155,84 @@ describe("ConcurrentLocalWarning", () => {
       parentWorkspaceId: otherWorkspaceMetadata.id,
       rootWorkspaceId: otherWorkspaceMetadata.id,
     });
-    const result = render(<WarningNameProbe />);
-    expect(result.getByText(otherWorkspaceMetadata.name)).toBeTruthy();
+    const result = render(<WarningCountProbe />);
+    expect(result.getByRole("status")).toBeTruthy();
 
-    result.rerender(<WarningNameProbe workspaceId="child" />);
-    expect(result.queryByText(otherWorkspaceMetadata.name)).toBeNull();
+    result.rerender(<WarningCountProbe workspaceId="child" />);
+    expect(result.queryByRole("status")).toBeNull();
+  });
+
+  test("counts multiple agents without cycling identities on handoff or metadata reordering", () => {
+    const second = { ...otherWorkspaceMetadata, id: "second", name: "second agent" };
+    const third = { ...otherWorkspaceMetadata, id: "third", name: "third agent" };
+    workspaceMetadata.set(second.id, second);
+    workspaceMetadata.set(third.id, third);
+    streamingWorkspaceIds.add(second.id);
+    const result = render(<WarningCountProbe />);
+    const status = result.getByRole("status");
+    const text = status.textContent;
+    expect(result.container.firstElementChild?.getAttribute("data-count")).toBe("2");
+    expect(text).not.toContain(otherWorkspaceMetadata.name);
+    expect(text).not.toContain(second.name);
+
+    act(() => {
+      streamingWorkspaceIds.delete(otherWorkspaceMetadata.id);
+      streamingWorkspaceIds.add(third.id);
+      notifyWorkspaceStateChanged();
+    });
+    // Same cardinality, different active identities: no visible text or node replacement.
+    expect(result.getByRole("status")).toBe(status);
+    expect(status.textContent).toBe(text);
+
+    act(() => {
+      streamingWorkspaceIds.clear();
+      notifyWorkspaceStateChanged();
+    });
+    workspaceMetadata.delete(second.id);
+    workspaceMetadata.set(second.id, { ...second, name: "renamed agent" });
+    result.rerender(<WarningCountProbe />);
+    expect(status.textContent).toBe(text);
+    expect(result.container.firstElementChild?.getAttribute("data-count")).toBe("2");
+
+    act(() => {
+      streamingWorkspaceIds.add(otherWorkspaceMetadata.id);
+      notifyWorkspaceStateChanged();
+    });
+    expect(result.getByRole("status")).toBe(status);
+    expect(result.container.firstElementChild?.getAttribute("data-count")).toBe("1");
+    expect(status.textContent).not.toBe(text);
+  });
+
+  test("clears held activity immediately when the former conflict leaves eligibility", () => {
+    workspaceMetadata.set("idle", { ...otherWorkspaceMetadata, id: "idle" });
+    const result = render(<WarningCountProbe />);
+    expect(result.getByRole("status")).toBeTruthy();
+    act(() => {
+      streamingWorkspaceIds.clear();
+      notifyWorkspaceStateChanged();
+    });
+    workspaceMetadata.delete(otherWorkspaceMetadata.id);
+    result.rerender(<WarningCountProbe />);
+    // An unrelated idle candidate must not keep stale activity alive.
+    expect(result.queryByRole("status")).toBeNull();
   });
 
   test("holds the warning across a brief activity handoff", async () => {
-    const result = render(<WarningNameProbe />);
-    expect(result.getByText("refactor-db")).toBeTruthy();
+    const result = render(<WarningCountProbe />);
+    expect(result.getByRole("status")).toBeTruthy();
 
     act(() => {
       streamingWorkspaceIds.clear();
       notifyWorkspaceStateChanged();
     });
 
-    expect(result.getByText("refactor-db")).toBeTruthy();
+    expect(result.getByRole("status")).toBeTruthy();
 
     await act(async () => {
       await new Promise((resolve) =>
         window.setTimeout(resolve, WORKSPACE_STREAMING_STATUS_TRANSITION_MS + 50)
       );
     });
-    await waitFor(() => expect(result.queryByText("refactor-db")).toBeNull());
+    await waitFor(() => expect(result.queryByRole("status")).toBeNull());
   });
 });
