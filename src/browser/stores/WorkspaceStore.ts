@@ -366,10 +366,11 @@ export interface WorkflowToolLiveRunState {
 
 interface PendingSendState {
   message: PendingSendMessage;
-  /** User echoes already in the transcript when the send began; null when begun before catch-up. */
+  /**
+   * User echoes already in the transcript when the send began; null when begun before catch-up,
+   * in which case only the request result can tell the echo apart from replayed history.
+   */
   knownUserEchoIds: Set<string> | null;
-  /** Wall clock at begin; with no baseline, only rows persisted at or after it can be the echo. */
-  beganAtMs: number;
   /** The send request succeeded, so any later replay is guaranteed to contain its echo. */
   accepted: boolean;
   /** A synthetic user row (pre-send compaction) took the turn; the echo follows that turn. */
@@ -4118,7 +4119,6 @@ export class WorkspaceStore {
               .map((echo) => echo.id)
           )
         : null,
-      beganAtMs: Date.now(),
       accepted: false,
       deferredBehindSyntheticTurn: false,
     };
@@ -4176,13 +4176,12 @@ export class WorkspaceStore {
     pending: PendingSendState
   ): boolean {
     const known = pending.knownUserEchoIds;
+    if (!known) {
+      return false;
+    }
     return aggregator
       .getAllMessages()
-      .some(
-        (message) =>
-          isUserEcho(message) &&
-          (known ? !known.has(message.id) : (message.metadata?.timestamp ?? 0) >= pending.beganAtMs)
-      );
+      .some((message) => isUserEcho(message) && !known.has(message.id));
   }
 
   /**

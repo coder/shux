@@ -5234,7 +5234,7 @@ describe("WorkspaceStore", () => {
       const replay = gate();
       mockChatStreamFor(workspaceId, async function* (signal) {
         await replay.opened;
-        yield createUserMessageEvent("user-old", "long ago", 1, Date.now() - 3_600_000);
+        yield createUserMessageEvent("user-old", "long ago", 1, 1);
         yield { type: "caught-up", replay: "full" };
         await waitForAbortSignal(signal);
       });
@@ -5253,7 +5253,7 @@ describe("WorkspaceStore", () => {
       const replay = gate();
       mockChatStreamFor(workspaceId, async function* (signal) {
         await replay.opened;
-        yield createUserMessageEvent("user-old", "long ago", 1, Date.now() - 3_600_000);
+        yield createUserMessageEvent("user-old", "long ago", 1, 1);
         yield { type: "caught-up", replay: "full" };
         await waitForAbortSignal(signal);
       });
@@ -5270,13 +5270,13 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
     });
 
-    it("retires a row begun before catch-up when the replay holds its fresh echo", async () => {
-      const workspaceId = "pending-send-hydration-fresh-echo";
+    it("keeps a row begun before catch-up until the request result even if the replay holds it", async () => {
+      const workspaceId = "pending-send-hydration-echo-in-replay";
       const replay = gate();
       mockChatStreamFor(workspaceId, async function* (signal) {
         await replay.opened;
-        yield createUserMessageEvent("user-old", "long ago", 1, Date.now() - 3_600_000);
-        yield createUserMessageEvent("user-new", "hello", 2, Date.now() + 5);
+        yield createUserMessageEvent("user-old", "long ago", 1, 1);
+        yield createUserMessageEvent("user-new", "hello", 2, 2);
         yield { type: "caught-up", replay: "full" };
         await waitForAbortSignal(signal);
       });
@@ -5287,6 +5287,9 @@ describe("WorkspaceStore", () => {
       expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
         true
       );
+      // Replayed rows cannot be told apart from the echo without a baseline; the result decides.
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+      store.markPendingSendAccepted(workspaceId, pendingSend.id);
       expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
     });
 
