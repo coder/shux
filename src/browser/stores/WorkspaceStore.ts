@@ -375,6 +375,8 @@ interface PendingSendState {
   accepted: boolean;
   /** Visible queue payload size when the send began; growth by acceptance means it was queued. */
   queueSizeAtBegin: number;
+  /** Queued card identity when the send began; a different card at equal size replaced it. */
+  queuedMessageIdAtBegin: string | null;
   /** A synthetic user row (pre-send compaction) took the turn; the echo follows that turn. */
   deferredBehindSyntheticTurn: boolean;
 }
@@ -4134,6 +4136,7 @@ export class WorkspaceStore {
         : null,
       accepted: false,
       queueSizeAtBegin: transient.queuedMessageCount,
+      queuedMessageIdAtBegin: transient.queuedMessage?.id ?? null,
       deferredBehindSyntheticTurn: false,
     };
     this.states.bump(workspaceId);
@@ -4165,9 +4168,14 @@ export class WorkspaceStore {
     }
 
     pending.accepted = true;
-    // A queue that grew since the send began (for example through a replayed snapshot) holds it.
+    // A queue that grew since the send began, or a same-size queue showing a different card
+    // (a replayed snapshot after a replacement), holds the accepted send.
+    const queued = transient.queuedMessage;
     const queuedSinceBegin =
-      transient.queuedMessage !== null && transient.queuedMessageCount > pending.queueSizeAtBegin;
+      queued !== null &&
+      (transient.queuedMessageCount > pending.queueSizeAtBegin ||
+        (transient.queuedMessageCount === pending.queueSizeAtBegin &&
+          queued.id !== pending.queuedMessageIdAtBegin));
     if (
       transient.caughtUp &&
       (pending.knownUserEchoIds === null ||

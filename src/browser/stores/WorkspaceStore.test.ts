@@ -5419,6 +5419,36 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
     });
 
+    it("retires an accepted send that replaced a same-size queue entry during a disconnect", async () => {
+      const workspaceId = "pending-send-replay-queue-replaced";
+      let attempt = 0;
+      mockChatStreamFor(workspaceId, async function* (signal) {
+        attempt += 1;
+        yield createUserMessageEvent("user-1", "earlier", 1, 1);
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: true,
+          queuedMessages: [attempt === 1 ? "earlier follow-up" : "hello"],
+          displayText: attempt === 1 ? "earlier follow-up" : "hello",
+        };
+        yield fullCaughtUpEvent(1, "user-1");
+        await waitForAbortSignal(signal);
+      });
+      createAndAddWorkspace(store, workspaceId);
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).queuedMessage !== null)
+      ).toBe(true);
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      await resubscribe(workspaceId, `${workspaceId}-other`);
+      expect(store.getWorkspaceState(workspaceId).queuedMessage?.content).toBe("hello");
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+
+      store.markPendingSendAccepted(workspaceId, pendingSend.id);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
+    });
+
     it("does not treat paginated older rows as the pending send's echo", async () => {
       const workspaceId = "pending-send-paginated-rows";
       let attempt = 0;
