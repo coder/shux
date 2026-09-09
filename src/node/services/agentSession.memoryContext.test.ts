@@ -166,7 +166,11 @@ describe("AgentSession memory context", () => {
     let ownerRemoved = false;
     const sessionRef: { current?: AgentSession } = {};
     const probeMemoryStore = mock(() => {
-      if (ownerRemoved) sessionRef.current?.invalidateMemoryContext();
+      // One-shot like the real memo invalidation: the stamp check fires once.
+      if (ownerRemoved) {
+        ownerRemoved = false;
+        sessionRef.current?.invalidateMemoryContext();
+      }
       return Promise.resolve(undefined);
     });
     const session = createSession({
@@ -182,7 +186,9 @@ describe("AgentSession memory context", () => {
       await priv.resolveMemoryContext("test-model");
       await priv.resolveMemoryContext("test-model");
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
-      expect(probeMemoryStore).toHaveBeenCalledTimes(2);
+      // A build is bracketed by two probes (before the cache read, after the
+      // build); a cache hit costs one.
+      expect(probeMemoryStore).toHaveBeenCalledTimes(3);
 
       ownerRemoved = true;
       // The probe runs before the cache read, so THIS request rebuilds.
@@ -221,6 +227,54 @@ describe("AgentSession memory context", () => {
       // Stable again: the rebuilt context is cached under the new token.
       await priv.resolveMemoryContext("test-model");
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  test("discards a snapshot whose store changed during the build instead of serving it", async () => {
+    using sessionDir = new DisposableTempDir("agent-session-memory-context-midbuild");
+    const { historyService, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+    // The owner is removed by ANOTHER backend while the build reads hot files:
+    // no in-process event, the probe flips to "revoked" only after the build
+    // started, and the snapshot built from the former owner's notes must
+    // never reach the provider.
+    let revision = "rev-1";
+    let flipDuringBuild = true;
+    const stale: MemorySessionContext = {
+      indexEntries: [{ path: "/memories/workspace/x.md", description: "" }],
+      hotMemoriesBlock: null,
+    };
+    const fresh: MemorySessionContext = { indexEntries: [], hotMemoriesBlock: null };
+    const buildMemorySessionContext = mock(() => {
+      if (flipDuringBuild) {
+        flipDuringBuild = false;
+        revision = "revoked";
+        return Promise.resolve(stale);
+      }
+      return Promise.resolve(fresh);
+    });
+    const session = createSession({
+      historyService,
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      buildMemorySessionContext,
+      probeMemoryStore: () => Promise.resolve(revision),
+      isExperimentEnabled: (id) => id === EXPERIMENT_IDS.MEMORY,
+    });
+    const priv = session as unknown as PrivateSessionAccess;
+    try {
+      expect(await priv.resolveMemoryContext("test-model")).toBe(fresh);
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
+
+      // A store that will not hold still yields no context at all (bounded
+      // retries) rather than a snapshot of unknown provenance.
+      let tick = 0;
+      buildMemorySessionContext.mockImplementation(() => {
+        revision = `rev-${++tick}`;
+        return Promise.resolve(stale);
+      });
+      expect(await priv.resolveMemoryContext("other-model")).toBeUndefined();
     } finally {
       await session.dispose();
     }

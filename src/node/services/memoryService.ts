@@ -402,14 +402,33 @@ const LEGACY_IMPORT_DIR = "imported";
  */
 const LEGACY_ADOPTION_MANIFEST_FILE_NAME = ".adopted-into-shared-store.json";
 
-/** Self-healing read of the adoption manifest: anything malformed reads as empty. */
-async function readLegacyAdoptionManifest(manifestPath: string): Promise<Record<string, string>> {
+/** One adopted legacy file: content hash, child sidecar fingerprint, owner-store relPath. */
+interface LegacyAdoptionRecord {
+  content: string;
+  sidecar: string;
+  target: string;
+}
+
+function isLegacyAdoptionRecord(value: unknown): value is LegacyAdoptionRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.content === "string" &&
+    typeof record.sidecar === "string" &&
+    typeof record.target === "string"
+  );
+}
+
+/** Self-healing read of the adoption manifest: anything malformed reads as not adopted. */
+async function readLegacyAdoptionManifest(
+  manifestPath: string
+): Promise<Record<string, LegacyAdoptionRecord>> {
   try {
     const parsed: unknown = JSON.parse(await fsPromises.readFile(manifestPath, "utf-8"));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
     return Object.fromEntries(
-      Object.entries(parsed).filter(
-        (entry): entry is [string, string] => typeof entry[1] === "string"
+      Object.entries(parsed).filter((entry): entry is [string, LegacyAdoptionRecord] =>
+        isLegacyAdoptionRecord(entry[1])
       )
     );
   } catch {
@@ -730,9 +749,10 @@ export class MemoryService extends EventEmitter {
 
   /**
    * Sub-agents whose pre-sharing private notebook was found absent or already
-   * adopted during this process lifetime (see adoptLegacyPrivateStore).
+   * adopted during this process lifetime, keyed to the owner they resolved to
+   * at the time (see adoptLegacyPrivateStore).
    */
-  private readonly legacyStoreChecked = new Set<string>();
+  private readonly legacyStoreCheckedAgainst = new Map<string, string>();
 
   /**
    * Owner of the workspace scope for this context ("" when there is no
@@ -952,13 +972,23 @@ export class MemoryService extends EventEmitter {
     store: MemoryStore
   ): Promise<void> {
     const childId = ctx.workspaceId;
-    if (childId === "" || this.legacyStoreChecked.has(childId)) return;
+    if (childId === "") return;
     const owner = this.storeOwnerWorkspaceId(store);
     assert(owner !== null, "workspace-scope stores live under sessionsDir");
-    if (owner === childId) return; // not redirected: the private store IS the store
+    // Checked once per (child, resolved owner) per process. Keyed by the owner
+    // because ownership can move: a command served while config.json was
+    // missing/malformed resolves the child to itself and writes into the
+    // legacy dir; once config recovers, the owner differs from the one this
+    // marker recorded and the fallback write is folded in on the next access.
+    if (this.legacyStoreCheckedAgainst.get(childId) === owner) return;
+    if (owner === childId) {
+      // Not redirected: the private store IS the store. Recorded so a later
+      // redirect (config recovered) is seen as an ownership change above.
+      this.legacyStoreCheckedAgainst.set(childId, owner);
+      return;
+    }
     const legacyRoot = path.join(this.config.sessionsDir, childId, "memory");
-    // One lstat per child per process (the copy below is idempotent, so a
-    // repeat after restart only re-reads unchanged files).
+    // One lstat per (child, owner) per process; the pass below is idempotent.
     const legacyRootKind = await lstatKind(legacyRoot);
     if (legacyRootKind !== "dir") {
       if (legacyRootKind === "symlink") {
@@ -967,11 +997,11 @@ export class MemoryService extends EventEmitter {
           legacyRoot,
         });
       }
-      this.legacyStoreChecked.add(childId);
+      this.legacyStoreCheckedAgainst.set(childId, owner);
       return;
     }
     // Files adopted this pass (bytes written OR only their sidecar entries
-    // copied): either changes what the shared store's readers derive from it.
+    // folded in): either changes what the shared store's readers derive from it.
     let adoptedCount = 0;
     try {
       await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
@@ -979,12 +1009,16 @@ export class MemoryService extends EventEmitter {
         if ((await lstatKind(legacyRoot)) !== "dir") return; // swapped while waiting for the lock
         const legacy = new LocalMemoryStore(legacyRoot);
         const files = await legacy.listFiles();
-        // Content hashes already folded in, kept beside the legacy files (a
-        // dotfile, so neither build lists it). Without it, an imported note
-        // later edited through the shared store would be re-imported as a
-        // stale duplicate under imported/<child>/ on every backend start.
+        // What was already folded in, kept beside the legacy files (a dotfile,
+        // so neither build lists it): per relPath the content hash, the
+        // fingerprint of the child-keyed sidecar entry, and where the copy
+        // landed. Content: without it, a note later edited through the shared
+        // store would be re-imported as a stale duplicate on every backend
+        // start. Sidecar: a downgraded build can change only a pin or usage
+        // stats, which must reach the owner key without the bytes changing.
         const manifestPath = path.join(legacyRoot, LEGACY_ADOPTION_MANIFEST_FILE_NAME);
         const adopted = await readLegacyAdoptionManifest(manifestPath);
+        const sidecarEntries = await this.metaService.getEntries();
         let manifestDirty = false;
         let imported = 0;
         let skipped = 0;
@@ -1000,47 +1034,63 @@ export class MemoryService extends EventEmitter {
             skipped++;
             continue;
           }
-          const contentHash = sha256Hex(content);
-          if (adopted[relPath] === contentHash) continue; // folded in earlier, unchanged since
-          const target = await this.legacyImportTarget(store, childId, relPath, content);
-          if (target === null) {
-            skipped++;
-            continue;
+          const childKey = memoryLogicalKey("workspace", relPath, {
+            projectPath: ctx.projectPath,
+            workspaceId: childId,
+          });
+          const childEntry = sidecarEntries.get(childKey);
+          const record: LegacyAdoptionRecord = {
+            content: sha256Hex(content),
+            sidecar: childEntry === undefined ? "" : JSON.stringify(childEntry),
+            target: "",
+          };
+          const previous = adopted[relPath];
+          if (previous?.content === record.content && previous.sidecar === record.sidecar) {
+            continue; // folded in earlier, nothing changed since
           }
-          if (target.write) {
-            await store.writeFile(target.relPath, content);
-            imported++;
+          let target: { relPath: string; write: boolean } | null;
+          if (previous?.content === record.content) {
+            // Bytes already adopted: only the sidecar changed; same target.
+            target = { relPath: previous.target, write: false };
+          } else {
+            target = await this.legacyImportTarget(store, childId, relPath, content);
+            if (target === null) {
+              skipped++;
+              continue;
+            }
+            if (target.write) {
+              await store.writeFile(target.relPath, content);
+              imported++;
+            }
           }
-          // Pins/stats were keyed by the child: fill them in under the owner
-          // key too. The child-keyed entry stays — like the legacy file, it is
-          // what a downgraded build reads. Done even when the bytes were
-          // already there, and recorded in the manifest only once it
-          // succeeded: an adoption interrupted after its writeFile (or a
-          // failing sidecar write) retries this step on the next access.
-          // copyKeys never overwrites an entry the owner already has, so a
-          // note the owner tracked independently keeps the owner's history.
-          try {
-            await this.metaService.copyKeys(
-              memoryLogicalKey("workspace", relPath, {
-                projectPath: ctx.projectPath,
-                workspaceId: childId,
-              }),
-              memoryLogicalKey("workspace", target.relPath, {
-                projectPath: ctx.projectPath,
-                workspaceId: owner,
-              })
-            );
-          } catch (error) {
-            log.warn(
-              "[MemoryService] failed to copy legacy memory stats; retrying on next access",
-              {
-                relPath,
-                error,
-              }
-            );
-            continue;
+          record.target = target.relPath;
+          // Pins/stats were keyed by the child: fold them into the owner key.
+          // The child-keyed entry stays — like the legacy file, it is what a
+          // downgraded build reads. Recorded in the manifest only once this
+          // succeeded, so an adoption interrupted after its writeFile (or a
+          // failing sidecar write) retries this step on the next access. A
+          // first adoption keeps the owner's own pin (a note the owner tracked
+          // independently); a sidecar the CHILD changed since its last
+          // adoption (downgrade-time pin/unpin) is the newer intent and wins.
+          if (childEntry !== undefined) {
+            try {
+              await this.metaService.mergeKeys(
+                childKey,
+                memoryLogicalKey("workspace", target.relPath, {
+                  projectPath: ctx.projectPath,
+                  workspaceId: owner,
+                }),
+                { pinned: previous === undefined ? "target" : "source" }
+              );
+            } catch (error) {
+              log.warn(
+                "[MemoryService] failed to fold legacy memory stats into the shared store; retrying on next access",
+                { relPath, error }
+              );
+              continue;
+            }
           }
-          adopted[relPath] = contentHash;
+          adopted[relPath] = record;
           manifestDirty = true;
           adoptedCount++;
         }
@@ -1048,8 +1098,9 @@ export class MemoryService extends EventEmitter {
           await writeFileAtomic(manifestPath, JSON.stringify(adopted), { encoding: "utf-8" });
         }
         if (adoptedCount > 0) {
-          // A metadata-only adoption (identical bytes, child pin copied) still
-          // changes the hot set other backends derive, so the clock moves too.
+          // A metadata-only adoption (identical bytes, child pin folded in)
+          // still changes the hot set other backends derive, so the clock
+          // moves too.
           await this.advanceStoreRevision(store);
           log.info(
             "[MemoryService] adopted a sub-agent's legacy workspace notebook into the shared store",
@@ -1057,7 +1108,7 @@ export class MemoryService extends EventEmitter {
           );
         }
       });
-      this.legacyStoreChecked.add(childId);
+      this.legacyStoreCheckedAgainst.set(childId, owner);
     } catch (error) {
       log.warn(
         "[MemoryService] failed to adopt a sub-agent's legacy workspace notebook; retrying on next access",

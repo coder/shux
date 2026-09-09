@@ -1318,6 +1318,24 @@ describe("MemoryService", () => {
       expect(await fixture.metaService.getPinnedKeys()).toContain(
         "workspace:ws-owner:meta-only.md"
       );
+
+      // Sidecar-only changes made on a downgraded build (bytes untouched) are
+      // folded in on the next upgrade: an unpin of only-child.md under the
+      // child key reaches the owner key...
+      const freshService = () =>
+        new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
+      await fixture.metaService.setPinned("workspace:ws-child:only-child.md", false);
+      await freshService().listIndexEntries(fixture.ctx);
+      expect(await fixture.metaService.getPinnedKeys()).not.toContain(
+        "workspace:ws-owner:only-child.md"
+      );
+      // ...while the owner's OWN later choice is not undone by an unchanged
+      // child entry on every restart.
+      await fixture.metaService.setPinned("workspace:ws-owner:only-child.md", true);
+      await freshService().listIndexEntries(fixture.ctx);
+      expect(await fixture.metaService.getPinnedKeys()).toContain(
+        "workspace:ws-owner:only-child.md"
+      );
       expect(relisted.filter((e) => e.scope === "workspace").map((e) => e.relPath)).toEqual([
         "clash.md",
         "downgrade.md",
@@ -1332,7 +1350,6 @@ describe("MemoryService", () => {
       expect([...(await fixture.metaService.getPinnedKeys())].sort()).toEqual([
         "workspace:ws-child:half.md",
         "workspace:ws-child:meta-only.md",
-        "workspace:ws-child:only-child.md",
         "workspace:ws-owner:half.md",
         "workspace:ws-owner:meta-only.md",
         "workspace:ws-owner:only-child.md",
@@ -1344,6 +1361,45 @@ describe("MemoryService", () => {
       expect(
         await pathExists(path.join(fixture.config.sessionsDir, "ws-solo", "memory", "mine.md"))
       ).toBe(true);
+    });
+
+    it("folds in a note written under a self-fallback once ownership resolves to the tree root again", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      // Shared access first: the (absent) legacy store is checked against ws-owner.
+      expect((await fixture.service.listIndexEntries(fixture.ctx)).length).toBe(0);
+      // config.json goes missing: the child resolves to itself and writes a
+      // note into its private dir.
+      const configPath = path.join(fixture.xumHome, "config.json");
+      const savedConfig = await fsPromises.readFile(configPath);
+      await fsPromises.rm(configPath);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/fallback.md",
+        "written while config was gone",
+        "agent"
+      );
+      expect(created.success).toBe(true);
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-child", "memory", "fallback.md"))
+      ).toBe(true);
+      // Config recovers: the same process must fold that note into the
+      // shared store instead of trusting its earlier "nothing to adopt".
+      await fsPromises.writeFile(configPath, savedConfig);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      // Index builds get their own context object in production (the owner
+      // cache is per context); mirror that instead of reusing the command's.
+      const listed = await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(listed.filter((e) => e.scope === "workspace").map((e) => e.relPath)).toEqual([
+        "fallback.md",
+      ]);
+      expect(
+        await fsPromises.readFile(
+          path.join(fixture.config.sessionsDir, "ws-owner", "memory", "fallback.md"),
+          "utf-8"
+        )
+      ).toBe("written while config was gone");
     });
 
     it("never imports through a symlinked legacy notebook root or escaped files", async () => {

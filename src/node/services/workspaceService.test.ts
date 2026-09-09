@@ -1,4 +1,10 @@
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import {
+  clearWorkspaceMemoryDenyMarker,
+  readWorkspaceMemoryDenyMarker,
+  workspaceMemoryDenyMarkerPath,
+  writeWorkspaceMemoryDenyMarker,
+} from "@/node/services/workspaceMemoryDenyMarker";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -9337,6 +9343,45 @@ describe("WorkspaceService initialize", () => {
       });
       expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
       expect(persisted()).toBe(false);
+
+      // New epoch again, and now config.json cannot take the deny: the turn's
+      // user row is already durable, so the deny falls back to the session
+      // dir (same durability domain) and the record still succeeds. A later
+      // writable turn — even from a fresh process with no mirror — stays
+      // denied by that marker, and it is ANDed into the compaction
+      // observation as well.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritable;
+        return cfg;
+      });
+      const sessionDir = path.join(realConfig.sessionsDir, "policy-scratch");
+      spyOn(realConfig, "editConfig").mockImplementationOnce(() =>
+        Promise.reject(new Error("disk full"))
+      );
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false)).toBe(true);
+      expect(persisted()).toBeUndefined();
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(persisted()).toBe(false);
+      // Malformed marker still denies; an epoch boundary clears it and the
+      // next epoch can become writable again.
+      await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
+      await clearWorkspaceMemoryDenyMarker(sessionDir);
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritable;
+        return cfg;
+      });
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(persisted()).toBe(true);
+      // The fenced clear (compaction boundary) keeps a deny recorded after it.
+      await writeWorkspaceMemoryDenyMarker(sessionDir);
+      await clearWorkspaceMemoryDenyMarker(sessionDir, { notAfter: Date.now() - 60_000 });
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
+      await clearWorkspaceMemoryDenyMarker(sessionDir, { notAfter: Date.now() + 60_000 });
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
     } finally {
       await cleanup();
     }
@@ -18638,6 +18683,9 @@ describe("WorkspaceService init cancellation", () => {
         sessionsDir: tempRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
+        // The metadata-less removal path resolves the shared-memory owner
+        // strictly from config; an unreadable config aborts the removal.
+        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
       };
       const workspaceService = new WorkspaceService(
         mockConfig as Config,

@@ -92,6 +92,7 @@ import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { clearWorkspaceMemoryDenyMarker } from "@/node/services/workspaceMemoryDenyMarker";
 import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
@@ -1088,7 +1089,15 @@ export class AgentSession {
   private async resetWorkspaceMemoryWritable(options?: {
     closing: boolean | undefined;
   }): Promise<void> {
+    const boundaryAt = Date.now();
     this.workspaceMemoryWritable = undefined;
+    // The session-dir deny marker (fallback for an unwritable config.json)
+    // belongs to the closing epoch too. Same fence idea as below: a deny
+    // recorded after this boundary is the new epoch's and survives.
+    await clearWorkspaceMemoryDenyMarker(
+      path.join(this.config.sessionsDir, this.workspaceId),
+      options !== undefined ? { notAfter: boundaryAt } : undefined
+    );
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
     if (entry?.workspace.workspaceMemoryWritable === undefined) return;
     await this.config.editConfig((cfg) => {
@@ -9906,48 +9915,64 @@ export class AgentSession {
       this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
-    // Store probe first: a removed owner invalidates this cache synchronously
-    // (see AIService.probeMemoryStore), so the lookup below never serves an
-    // index built from a store this workspace no longer reads; and a store
-    // revision advanced by ANOTHER backend process (no in-process change
-    // event) fails the comparison below. Read before the build so a write
-    // racing the build is caught on the next probe.
-    let storeRevision: string | undefined;
-    if (memoryEnabled && typeof this.aiService.probeMemoryStore === "function") {
-      storeRevision = await this.aiService.probeMemoryStore(this.workspaceId);
-    }
-    const cached = cache.get(modelString);
-    // Policy changes must not retain a previously injected extra (including index-only lookups).
-    if (
-      cached?.tokenBudgetActive === tokenBudgetActive &&
-      cached.memoryEnabled === memoryEnabled &&
-      cached.hotSetEnabled === hotSetEnabled &&
-      cached.storeRevision === storeRevision &&
-      (cached.includesHotMemories || !includeHotMemories)
-    ) {
-      return cached.context ?? undefined;
-    }
+    const probe = async (): Promise<string | undefined> =>
+      memoryEnabled && typeof this.aiService.probeMemoryStore === "function"
+        ? await this.aiService.probeMemoryStore(this.workspaceId)
+        : undefined;
+    // Bounded: each retry means the store changed underneath the build; a
+    // store that will not hold still yields no memory context for this
+    // request rather than a snapshot of unknown provenance.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      // Store probe first: a removed owner invalidates this cache synchronously
+      // (see AIService.probeMemoryStore), so the lookup below never serves an
+      // index built from a store this workspace no longer reads; and a store
+      // revision advanced by ANOTHER backend process (no in-process change
+      // event) fails the comparison below.
+      const storeRevision = await probe();
+      const cached = cache.get(modelString);
+      // Policy changes must not retain a previously injected extra (including index-only lookups).
+      if (
+        cached?.tokenBudgetActive === tokenBudgetActive &&
+        cached.memoryEnabled === memoryEnabled &&
+        cached.hotSetEnabled === hotSetEnabled &&
+        cached.storeRevision === storeRevision &&
+        (cached.includesHotMemories || !includeHotMemories)
+      ) {
+        return cached.context ?? undefined;
+      }
 
-    const generation = this.memoryContextGeneration;
-    // Guard for test mocks that may not implement buildMemorySessionContext.
-    const context =
-      typeof this.aiService.buildMemorySessionContext === "function"
-        ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
-            includeHotMemories,
-            tokenBudgetActive,
-          })
-        : null;
-    // Invalidated mid-build: serve this snapshot once but do not cache it.
-    if (generation !== this.memoryContextGeneration) return context ?? undefined;
-    cache.set(modelString, {
-      context,
-      includesHotMemories: includeHotMemories,
-      tokenBudgetActive,
-      memoryEnabled,
-      hotSetEnabled,
-      storeRevision,
+      const generation = this.memoryContextGeneration;
+      // Guard for test mocks that may not implement buildMemorySessionContext.
+      const context =
+        typeof this.aiService.buildMemorySessionContext === "function"
+          ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
+              includeHotMemories,
+              tokenBudgetActive,
+            })
+          : null;
+      // Invalidated mid-build — by an in-process change (generation) or by a
+      // store the build cannot observe changing under it: a removal in
+      // ANOTHER backend revokes access ("revoked") without any local event,
+      // and the readability check ran before the hot-file reads. Such a
+      // snapshot is never served: the next attempt re-probes and rebuilds
+      // (a revoked store then lists nothing).
+      if (generation !== this.memoryContextGeneration || (await probe()) !== storeRevision) {
+        continue;
+      }
+      cache.set(modelString, {
+        context,
+        includesHotMemories: includeHotMemories,
+        tokenBudgetActive,
+        memoryEnabled,
+        hotSetEnabled,
+        storeRevision,
+      });
+      return context ?? undefined;
+    }
+    log.debug("[AgentSession] memory context kept changing during its build; omitting it", {
+      workspaceId: this.workspaceId,
     });
-    return context ?? undefined;
+    return undefined;
   }
 
   /**

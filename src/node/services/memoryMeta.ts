@@ -66,6 +66,12 @@ export interface MemoryMetaEntry {
   lastWriteAt: number | null;
 }
 
+function maxTimestamp(a: number | null, b: number | null): number | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return Math.max(a, b);
+}
+
 const EMPTY_ENTRY: MemoryMetaEntry = {
   pinned: false,
   accessCount: 0,
@@ -241,24 +247,34 @@ export class MemoryMetaService {
       }),
 
     /**
-     * Duplicate a subtree's entries under a second key, keeping the source
-     * and never overwriting an entry the target already has: a legacy
-     * sub-agent note copied into the shared store stays readable by a
-     * downgraded build under its child key (so its pin/stats must too), while
-     * a note the owner already tracked keeps the owner's own history.
-     * Idempotent, so a retried adoption fills in what an interrupted one
-     * missed without disturbing anything recorded since.
+     * Fold a subtree's entries into a second key, keeping the source: a
+     * legacy sub-agent note copied into the shared store stays readable by a
+     * downgraded build under its child key, so its pin/stats must too. A
+     * missing target entry is copied; an existing one keeps the larger
+     * counters/timestamps, and its pin either stands (`pinned: "target"`, a
+     * first adoption must not override the owner's own choice) or follows the
+     * source (`pinned: "source"`, the child changed it since the last
+     * adoption — see MemoryService.adoptLegacyPrivateStore). Idempotent.
      */
-    copyKeys: (
+    mergeKeys: (
       sourceLogicalKey: string,
-      targetLogicalKey: string
+      targetLogicalKey: string,
+      options: { pinned: "target" | "source" }
     ): Effect.Effect<void, MemoryMetaWriteError> =>
       this.mutate((entries) => {
-        for (const [key, entry] of Object.entries(entries)) {
+        for (const [key, source] of Object.entries(entries)) {
           if (!keyInSubtree(key, sourceLogicalKey)) continue;
           const targetKey = `${targetLogicalKey}${key.slice(sourceLogicalKey.length)}`;
-          if (targetKey in entries) continue;
-          entries[targetKey] = { ...entry };
+          const target = entries[targetKey];
+          entries[targetKey] =
+            target === undefined
+              ? { ...source }
+              : {
+                  pinned: options.pinned === "source" ? source.pinned : target.pinned,
+                  accessCount: Math.max(target.accessCount, source.accessCount),
+                  lastAccessedAt: maxTimestamp(target.lastAccessedAt, source.lastAccessedAt),
+                  lastWriteAt: maxTimestamp(target.lastWriteAt, source.lastWriteAt),
+                };
         }
       }),
 
@@ -408,9 +424,13 @@ export class MemoryMetaService {
     await Effect.runPromise(this.effects.renameKeys(oldLogicalKey, newLogicalKey));
   }
 
-  /** Fill in a subtree's entries under `targetLogicalKey`, keeping the source and existing targets (see effects). */
-  async copyKeys(sourceLogicalKey: string, targetLogicalKey: string): Promise<void> {
-    await Effect.runPromise(this.effects.copyKeys(sourceLogicalKey, targetLogicalKey));
+  /** Fold a subtree's entries into `targetLogicalKey`, keeping the source (see effects). */
+  async mergeKeys(
+    sourceLogicalKey: string,
+    targetLogicalKey: string,
+    options: { pinned: "target" | "source" }
+  ): Promise<void> {
+    await Effect.runPromise(this.effects.mergeKeys(sourceLogicalKey, targetLogicalKey, options));
   }
 
   /**

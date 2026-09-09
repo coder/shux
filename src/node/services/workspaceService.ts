@@ -138,6 +138,10 @@ import {
   TombstoneNotDurableError,
 } from "@/node/services/workspaceRemoval";
 import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
+import {
+  readWorkspaceMemoryDenyMarker,
+  writeWorkspaceMemoryDenyMarker,
+} from "@/node/services/workspaceMemoryDenyMarker";
 import { migrateSharedMemoryRefinementRows } from "@/node/services/refinement/sharedMemoryRowMigration";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
@@ -4210,14 +4214,30 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
+   * Config snapshot for a removal's destructive step: strict load, so a
+   * transiently unreadable config.json aborts the removal (the workspace stays
+   * registered and retryable) rather than yielding the fresh-install default
+   * whose empty topology would resolve every sub-agent to itself.
+   */
+  private loadConfigForRemovalOrAbort(workspaceId: string): ProjectsConfig {
+    try {
+      return this.config.loadConfigOrDefault({ throwOnError: true });
+    } catch (error: unknown) {
+      throw new SharedMemoryRemovalAbortedError(workspaceId, { cause: error });
+    }
+  }
+
+  /**
    * TurnRequestBuilder → session: the agent's workspace-memory write policy
    * for this turn. Also persisted on the workspace config entry (only when it
    * changes) so a harvest completing in a fresh session after a restart can
    * still be gated; see onCompactionComplete. Awaited by the builder and
    * VERIFIED by reading the config back: Config swallows write failures, and
    * a stale persisted `true` would let a now read-only agent's transcript
-   * harvest into the shared notebook after a restart. Resolves false when the
-   * new value could not be confirmed durable.
+   * harvest into the shared notebook after a restart. A deny that config.json
+   * cannot hold is recorded in the session dir instead
+   * (workspaceMemoryDenyMarker.ts); resolves false only when the new value
+   * could not be confirmed durable anywhere.
    */
   async recordWorkspaceMemoryWritable(workspaceId: string, writable: boolean): Promise<boolean> {
     const session =
@@ -4242,8 +4262,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // false→true. The session additionally contributes its own mirror: a
     // deny it observed survives even if another backend's boundary reset
     // removed the durable field underneath it.
+    // A fourth input: the session-dir deny marker, the durable fallback taken
+    // when config.json could not record a deny (see below).
+    const sessionDir = path.join(this.config.sessionsDir, workspaceId);
+    const denyMarker = await readWorkspaceMemoryDenyMarker(sessionDir);
     const conjunction = (durable: boolean | undefined): boolean =>
-      (durable ?? true) && (mirror ?? true) && writable;
+      !denyMarker && (durable ?? true) && (mirror ?? true) && writable;
     // Fast path (no write): the outcome cannot differ from the stored value —
     // it is already false, or already true and this turn grants.
     const stored = before.workspace.workspaceMemoryWritable;
@@ -4252,6 +4276,28 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return true;
     }
     let effective = conjunction(stored);
+    // A deny that config.json cannot hold falls back to the session dir: the
+    // turn's user row is already durable in chat.jsonl there, so the deny
+    // must become durable in the same place or the epoch could later be
+    // harvested as writable after a restart (the mirror is process-local).
+    const denyDurableFallback = async (cause: string): Promise<boolean> => {
+      if (effective) return false;
+      try {
+        await writeWorkspaceMemoryDenyMarker(sessionDir);
+      } catch (markerError: unknown) {
+        log.error("Workspace memory deny could not be made durable anywhere", {
+          workspaceId,
+          cause,
+          error: getErrorMessage(markerError),
+        });
+        // Process-local floor: this session at least keeps refusing until
+        // the next successful persist writes the false it now mirrors.
+        session?.recordWorkspaceMemoryWritable(false);
+        return false;
+      }
+      session?.recordWorkspaceMemoryWritable(false);
+      return true;
+    };
     try {
       await this.config.editConfig((cfg) => {
         const current = findWorkspaceEntry(cfg, workspaceId);
@@ -4267,7 +4313,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         writable,
         error: getErrorMessage(error),
       });
-      return false;
+      return denyDurableFallback(getErrorMessage(error));
     }
     session?.recordWorkspaceMemoryWritable(effective);
     const persisted = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
@@ -4278,7 +4324,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         writable,
         persisted,
       });
-      return false;
+      return denyDurableFallback("config write swallowed");
     }
     return true;
   }
@@ -4383,15 +4429,30 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // the harvest fails closed.
         const persistedWritable = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)
           ?.workspace.workspaceMemoryWritable;
-        const observed = [metadata.workspaceMemoryWritable, persistedWritable].filter(
-          (value): value is boolean => value !== undefined
-        );
-        this.memoryConsolidationService?.triggerHarvestThenSweepInBackground({
-          ...metadata,
-          ...(observed.length > 0
-            ? { workspaceMemoryWritable: observed.every((value) => value) }
-            : {}),
-        });
+        // Third observation: the session-dir deny marker (fallback taken when
+        // config.json could not record a deny; see recordWorkspaceMemoryWritable).
+        // The completion callback is synchronous and the harvest runs in the
+        // background anyway, so the marker read simply precedes the trigger.
+        readWorkspaceMemoryDenyMarker(path.join(this.config.sessionsDir, workspaceId))
+          .then((denyMarker) => {
+            const observed = [
+              metadata.workspaceMemoryWritable,
+              persistedWritable,
+              ...(denyMarker ? [false] : []),
+            ].filter((value): value is boolean => value !== undefined);
+            this.memoryConsolidationService?.triggerHarvestThenSweepInBackground({
+              ...metadata,
+              ...(observed.length > 0
+                ? { workspaceMemoryWritable: observed.every((value) => value) }
+                : {}),
+            });
+          })
+          .catch((error: unknown) => {
+            log.warn("Skipping post-compaction memory harvest: deny marker unreadable", {
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
       },
       onIdleCompactionOutcome: (success) => {
         // Reports the *persisted* idle-compaction outcome (success only after the summary
@@ -5960,6 +6021,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       let parentWorkspaceId: string | null = null;
       let childTaskModelString: string | undefined;
       let childTaskThinkingLevel: ThinkingLevel | undefined;
+      // Shared-memory owner as verified by the pre-teardown handover below;
+      // the destructive step reuses it rather than re-resolving (see there).
+      let verifiedSharedMemoryOwnerId: string | null = null;
 
       const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
       if (metadataResult.success) {
@@ -6043,6 +6107,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           this.config.loadConfigOrDefault(),
           workspaceId
         );
+        verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;
         if (sharedMemoryOwnerId !== workspaceId) {
           try {
             const pinOwner = (cfg: ReturnType<Config["loadConfigOrDefault"]>): string[] => {
@@ -6474,12 +6539,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // write cannot slip between this tombstone and its commit check, and
         // run the delta pass of the refinement-row handover inside those
         // locks (rows appended since the pre-teardown pass; the phantom,
-        // metadata-less path gets its full pass here). Resolved from
-        // persisted config.
-        const memoryOwnerId = resolveWorkspaceMemoryOwnerId(
-          this.config.loadConfigOrDefault(),
-          workspaceId
-        );
+        // metadata-less path gets its full pass here). The owner verified by
+        // that earlier pass is retained: a config.json that turns missing or
+        // malformed in between would otherwise resolve the child to ITSELF
+        // here and drop the owner-store lock, letting a foreign child write
+        // admitted under the real owner lock recreate the deleted session dir.
+        // Without an earlier pass, resolve strictly — an unreadable config
+        // aborts the removal (retryable) instead of guessing the topology.
+        const memoryOwnerId =
+          verifiedSharedMemoryOwnerId ??
+          resolveWorkspaceMemoryOwnerId(this.loadConfigForRemovalOrAbort(workspaceId), workspaceId);
         const ownerSessionDir =
           memoryOwnerId === workspaceId
             ? undefined
