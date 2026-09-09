@@ -559,7 +559,9 @@ describe("useDesktopConnection control ownership", () => {
     registrations[0].queue.end();
     await waitFor(() => expect(registrations).toHaveLength(2));
     // ...when the bridge drops too. The reconnect reuses the pending replacement...
-    act(() => rfb.events.dispatchEvent(new Event("disconnect")));
+    act(() => {
+      rfb.events.dispatchEvent(new Event("disconnect"));
+    });
     await waitFor(() => expect(view.desktop.state).toBe("checking"), { timeout: 5_000 });
     // ...which fails before ready, as does the fresh registration the attempt makes instead.
     registrations[1].failure = new Error("replacement lost");
@@ -608,7 +610,7 @@ describe("useDesktopConnection control ownership", () => {
     expect(registration.signal.aborted).toBe(false);
     expect(detachViewer).not.toHaveBeenCalled();
     registration.queue.push({ type: "ready", viewerId: registration.viewerId });
-    await waitFor(() => expect(view.desktop.register()).resolves.toBe(true));
+    expect(await view.desktop.register()).toBe(true);
     expect(watchViewer).toHaveBeenCalledTimes(1);
   });
 
