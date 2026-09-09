@@ -1,13 +1,13 @@
-/**
- * Shared availability gate for OpenAI-native request options that are not
- * forwarded by gateway or Codex OAuth routes.
- */
+/** Route-aware availability for OpenAI-native request options. */
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
 import { wouldRouteOpenAIThroughCodexOauth } from "@/common/utils/providers/codexOauthRouting";
 import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
+import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 
 export interface OpenAIDirectProviderOptionsAvailability {
   /** Settings-resolved route for the canonical model ("direct" = no gateway). */
@@ -54,6 +54,48 @@ export function resolveProviderOptionsRoute(
   }
 
   return options?.resolvedRouteProvider ?? "direct";
+}
+
+/** Fast shares OpenAI's preference across gateways that forward its service tier. */
+export function openaiServiceTierAvailable(
+  modelString: string,
+  options?: OpenAIDirectProviderOptionsAvailability
+): boolean {
+  const prefix = modelString.split(":", 1)[0];
+  const custom = options?.providersConfig?.[prefix];
+  if (isCustomProviderConfig(custom)) {
+    // The generic compatible SDK does not serialize OpenAI-native service tiers.
+    return custom.providerType === "openai-responses";
+  }
+
+  const route = resolveProviderOptionsRoute(modelString, options);
+  if (route === "coder") {
+    const gatewayModelId = modelString.startsWith("coder:")
+      ? modelString.slice("coder:".length)
+      : normalizeToCanonical(modelString).replace(":", "/");
+    const wire = resolveCoderWireCanonicalModel(gatewayModelId, options?.providersConfig?.coder);
+    // Other Coder types (e.g. Google) also speak chat completions; that alone
+    // cannot establish OpenAI tier support. Unknown instances fail closed.
+    return wire?.providerType === "openai" || wire?.providerType === "openai-compat";
+  }
+
+  const normalized = modelString.startsWith("coder:")
+    ? (resolveCoderGatewayMetadataModel(modelString, options?.providersConfig) ?? modelString)
+    : normalizeToCanonical(modelString);
+  const [origin, modelId] = normalized.split(":", 2);
+  if (origin === "github-copilot") {
+    // Copilot's unscoped catalog mixes upstreams; capability mappings cannot
+    // turn Claude/Gemini into OpenAI models. Both Copilot adapters forward tiers.
+    return /^(?:gpt-\d|o[1-9](?:-|$))/.test(modelId);
+  }
+  if (origin !== "openai") return false;
+  if (route === "openrouter" || route === "mux-gateway" || route === "github-copilot") {
+    return true;
+  }
+  return openaiDirectProviderOptionsAvailable(normalized, {
+    ...options,
+    resolvedRouteProvider: route,
+  });
 }
 
 export function openaiDirectProviderOptionsAvailable(

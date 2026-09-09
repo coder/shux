@@ -1846,6 +1846,34 @@ describe("ProviderService.setConfig", () => {
     });
   });
 
+  it("persists gateway Fast preferences without configuring a direct OpenAI provider", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        openrouter: { apiKey: "gateway-key" },
+      });
+      expect(
+        (await service.setConfig("openai", ["fastModePreviousServiceTier"], "unset")).success
+      ).toBe(true);
+      expect((await service.setConfig("openai", ["serviceTier"], "priority")).success).toBe(true);
+      const reloaded = new ProviderService(config);
+      withProviderEnv({}, () => {
+        expect(reloaded.getConfig().openai).toMatchObject({
+          serviceTier: "priority",
+          fastModePreviousServiceTier: "unset",
+          isConfigured: false,
+          apiKeySet: false,
+        });
+      });
+      expect((await reloaded.setConfig("openai", ["serviceTier"], "")).success).toBe(true);
+      expect(
+        (await reloaded.setConfig("openai", ["fastModePreviousServiceTier"], "")).success
+      ).toBe(true);
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.serviceTier
+      ).toBeUndefined();
+    });
+  });
+
   it("removes OpenAI serviceTier when set to an empty string", async () => {
     await withTempConfigAsync(async (config, service) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({

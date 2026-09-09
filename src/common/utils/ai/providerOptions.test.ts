@@ -2,6 +2,7 @@
  * Tests for provider options builder
  */
 
+import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import { generateText, streamText } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -774,6 +775,56 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(openai!.serviceTier).toBe("auto");
     });
 
+    test.each(["openai", "openai-compat", "google"])(
+      "uses the Coder instance type %s rather than OpenAI-shaped wire or mapped metadata",
+      (type) => {
+        const options = buildProviderOptions(
+          "coder:openai/custom",
+          "off",
+          undefined,
+          undefined,
+          { openai: { serviceTier: "priority" } },
+          undefined,
+          undefined,
+          {
+            coder: {
+              apiKeySet: false,
+              isConfigured: true,
+              isEnabled: true,
+              discoveredProviders: [{ name: "openai", type }],
+              models: [{ id: "openai/custom", mappedToModel: "openai:gpt-6-astra" }],
+            },
+          },
+          "coder"
+        );
+        const openai = getOpenAIOptions(options);
+        expect(openai).toBeDefined();
+        expect(openai?.serviceTier).toBe(type === "google" ? undefined : "priority");
+      }
+    );
+
+    test.each([false, true])("uses native route auth when codexOauthSet=%s", (codexOauthSet) => {
+      const options = buildProviderOptions(
+        "openai:gpt-6-astra",
+        "off",
+        undefined,
+        undefined,
+        { openai: { serviceTier: "priority" } },
+        undefined,
+        undefined,
+        {
+          openai: {
+            apiKeySet: !codexOauthSet,
+            codexOauthSet,
+            isEnabled: true,
+            isConfigured: true,
+          },
+        },
+        "openai"
+      );
+      expect(getOpenAIOptions(options)?.serviceTier).toBe(codexOauthSet ? undefined : "priority");
+    });
+
     test("should include explicit non-auto serviceTier", () => {
       const result = buildProviderOptions("openai:gpt-5", "medium", undefined, undefined, {
         openai: { serviceTier: "flex" },
@@ -1051,6 +1102,65 @@ describe("buildProviderOptions - OpenAI", () => {
         },
       });
     });
+
+    test.each(["auto", "default", "flex", "priority"] as const)(
+      "preserves Copilot service tier %s when thinking is off",
+      (serviceTier) => {
+        expect(
+          buildProviderOptions(
+            "openai:gpt-5.2",
+            "off",
+            undefined,
+            undefined,
+            { openai: { serviceTier } },
+            undefined,
+            undefined,
+            undefined,
+            "github-copilot"
+          )
+        ).toEqual({ "github-copilot": { serviceTier } });
+      }
+    );
+
+    test.each(["auto", "default", "flex", "priority", undefined] as const)(
+      "preserves explicit Copilot service tier %s without adding reasoning controls",
+      (serviceTier) => {
+        for (const thinking of ["off", "medium", "max"] as const) {
+          expect(
+            buildProviderOptions(
+              "github-copilot:gpt-6-astra",
+              thinking,
+              undefined,
+              undefined,
+              { openai: { serviceTier } },
+              undefined,
+              undefined,
+              undefined,
+              "github-copilot"
+            )
+          ).toEqual(serviceTier === undefined ? {} : { "github-copilot": { serviceTier } });
+        }
+      }
+    );
+
+    test.each(["github-copilot:claude-sonnet-4.5", "github-copilot:alias"])(
+      "does not enable tiers for mapped non-OpenAI Copilot model %s",
+      (modelString) => {
+        expect(
+          buildProviderOptions(
+            modelString,
+            "medium",
+            undefined,
+            undefined,
+            { openai: { serviceTier: "priority" } },
+            undefined,
+            undefined,
+            createMockProvidersConfig({ [modelString]: "openai:gpt-6-astra" }),
+            "github-copilot"
+          )
+        ).toEqual({});
+      }
+    );
 
     test("returns no Copilot-routed OpenAI provider options when thinking is off", () => {
       const result = buildProviderOptions(
@@ -2245,6 +2355,101 @@ describe("buildProviderOptions - Z.ai", () => {
     expect(buildProviderOptions("zai:glm-4.7-flash", "high")).toEqual({});
   });
 });
+
+describe("buildProviderOptions - OpenRouter service tiers", () => {
+  test.each(["auto", "default", "flex", "priority", undefined] as const)(
+    "serializes service tier %s independently of reasoning",
+    async (serviceTier) => {
+      const capturedBodies: Array<Record<string, unknown>> = [];
+      const captureFetch: typeof fetch = Object.assign(
+        (_input: RequestInfo | URL, init?: RequestInit) => {
+          if (typeof init?.body !== "string") {
+            throw new Error("Expected a JSON request body");
+          }
+          capturedBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "chat_test",
+                object: "chat.completion",
+                created: 0,
+                model: "openai/gpt-5.2",
+                choices: [
+                  {
+                    index: 0,
+                    message: { role: "assistant", content: "ok" },
+                    finish_reason: "stop",
+                  },
+                ],
+                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+              }),
+              { headers: { "content-type": "application/json" } }
+            )
+          );
+        },
+        { preconnect: fetch.preconnect.bind(fetch) }
+      );
+      const model = createOpenRouter({ apiKey: "test", fetch: captureFetch })("openai/gpt-5.2");
+      for (const thinking of ["off", "medium"] as const) {
+        const options = buildProviderOptions(
+          "openrouter:openai/gpt-5.2",
+          thinking,
+          undefined,
+          undefined,
+          { openai: { serviceTier } },
+          undefined,
+          undefined,
+          undefined,
+          "openrouter"
+        );
+        await generateText({
+          model,
+          prompt: "Return ok.",
+          providerOptions: "openrouter" in options ? { openrouter: options.openrouter } : {},
+          maxRetries: 0,
+        });
+      }
+      expect(capturedBodies).toHaveLength(2);
+      for (const body of capturedBodies) {
+        expect(body.service_tier).toBe(serviceTier);
+        expect(body).not.toHaveProperty("serviceTier");
+        if (serviceTier === undefined) {
+          expect(body).not.toHaveProperty("service_tier");
+        }
+      }
+      expect(capturedBodies[0]).not.toHaveProperty("reasoning");
+      expect(capturedBodies[0]).not.toHaveProperty("reasoning_effort");
+      expect(capturedBodies[1].reasoning).toMatchObject({ effort: "medium" });
+    }
+  );
+});
+
+describe.each(["openrouter", "github-copilot"] as const)(
+  "buildProviderOptions - %s gateway service tiers",
+  (routeProvider) => {
+    test.each(["anthropic:claude-sonnet-4-5", "google:gemini-2.5-pro"])(
+      "does not send an OpenAI tier for %s, even when metadata maps it to OpenAI",
+      (modelString) => {
+        const config = createMockProvidersConfig({ [modelString]: "openai:gpt-5.2" });
+        for (const thinking of ["off", "medium"] as const) {
+          const build = (serviceTier?: "priority") =>
+            buildProviderOptions(
+              modelString,
+              thinking,
+              undefined,
+              undefined,
+              { openai: { serviceTier } },
+              undefined,
+              undefined,
+              config,
+              routeProvider
+            );
+          expect(build("priority")).toEqual(build());
+        }
+      }
+    );
+  }
+);
 
 describe("buildProviderOptions - OpenRouter", () => {
   test("sends the explicit max effort for OpenRouter-routed Kimi K3", () => {

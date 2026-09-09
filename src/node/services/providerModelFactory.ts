@@ -24,7 +24,8 @@ import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
 import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
+import { ServiceTierSchema, type XAIServiceTier } from "@/common/config/schemas/providersConfig";
+import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
@@ -1417,6 +1418,28 @@ export class ProviderModelFactory {
         const effectiveAnthropicCacheTtl =
           muxProviderOptions?.anthropic?.cacheTtl ?? configAnthropicCacheTtl;
 
+        // Fast is one OpenAI preference across direct and forwarding gateways.
+        // Resolve it after routing, from the model's config snapshot, so pinned
+        // requests cannot change tier midway through creation or on fallback.
+        const serviceTier = ServiceTierSchema.safeParse(
+          muxProviderOptions?.openai?.serviceTier ?? providersConfig.openai?.serviceTier
+        );
+        if (
+          serviceTier.success &&
+          openaiServiceTierAvailable(modelString, {
+            providersConfig: self.providerService.getConfig(providersConfig),
+            openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+          })
+        ) {
+          muxProviderOptions ??= {};
+          muxProviderOptions.openai = {
+            ...muxProviderOptions.openai,
+            serviceTier: serviceTier.data,
+          };
+        } else if (muxProviderOptions?.openai) {
+          delete muxProviderOptions.openai.serviceTier;
+        }
+
         // OpenAI-specific: merge global store setting into muxProviderOptions.
         // Coder instances classify by the instance's exact TYPE ("openai" =
         // the real OpenAI Responses upstream, where ZDR store applies): a
@@ -1666,25 +1689,14 @@ export class ProviderModelFactory {
             ...(creds.organization && { organization: creds.organization }),
           };
 
-          // Extract serviceTier and wireFormat from config to pass through to buildProviderOptions.
-          // Initialize muxProviderOptions if absent so config values aren't silently dropped
-          // when call sites omit options (e.g. TaskService, WorkspaceTitleGenerator).
-          const configServiceTier = providerConfig.serviceTier as string | undefined;
-          const configWireFormat = providerConfig.wireFormat as string | undefined;
-          if (configServiceTier || configWireFormat) {
+          // The stored direct wire format wins over request-level preferences.
+          const configWireFormat = providerConfig.wireFormat;
+          if (configWireFormat === "responses" || configWireFormat === "chatCompletions") {
             muxProviderOptions ??= {};
-            if (configServiceTier && muxProviderOptions.openai?.serviceTier == null) {
-              muxProviderOptions.openai = {
-                ...muxProviderOptions.openai,
-                serviceTier: configServiceTier as ServiceTier,
-              };
-            }
-            if (configWireFormat === "responses" || configWireFormat === "chatCompletions") {
-              muxProviderOptions.openai = {
-                ...muxProviderOptions.openai,
-                wireFormat: configWireFormat,
-              };
-            }
+            muxProviderOptions.openai = {
+              ...muxProviderOptions.openai,
+              wireFormat: configWireFormat,
+            };
           }
 
           // Resolve effective wireFormat once — used by both fetch wrapper and model selection.
@@ -2243,17 +2255,9 @@ export class ProviderModelFactory {
             headers.set("Authorization", `Bearer ${resolvedApiKey ?? ""}`);
             headers.set("Openai-Intent", "conversation-edits");
 
-            const urlString = getFetchInputUrl(input);
-
-            const method = (
-              init?.method ?? (input instanceof Request ? input.method : "GET")
-            ).toUpperCase();
-            // normalizeCodexResponsesBody() applies only to the stock OpenAI provider's
-            // /v1/responses path (used by Codex OAuth). The custom CopilotResponsesLanguageModel
-            // posts directly to /responses, intentionally bypassing this normalization.
-            const isResponsesRequest = /\/v1\/responses(\?|$)/.test(urlString);
-
-            let nextInit: Parameters<typeof fetch>[1] = { ...init, headers };
+            // Copilot's custom Responses serializer already builds its request.
+            // Codex OAuth pruning would strip Fast, including at custom /v1 URLs.
+            const nextInit: Parameters<typeof fetch>[1] = { ...init, headers };
 
             // Resolve request body text for billing classification.
             // Standard AI SDK path: init.body is a JSON string.
@@ -2267,20 +2271,6 @@ export class ProviderModelFactory {
                 originalBodyText = await input.clone().text();
               } catch {
                 // Fall back to undefined so classifyCopilotInitiator defaults to "user".
-              }
-            }
-
-            if (typeof originalBodyText === "string" && method === "POST" && isResponsesRequest) {
-              try {
-                const normalizedBody = normalizeCodexResponsesBody(originalBodyText);
-                headers.delete("content-length");
-                nextInit = {
-                  ...nextInit,
-                  headers,
-                  body: normalizedBody,
-                };
-              } catch {
-                // If body isn't JSON, keep the original request body for Copilot.
               }
             }
 
@@ -2319,15 +2309,33 @@ export class ProviderModelFactory {
             "github-copilot"
           );
           const provider = createOpenAI({
-            // Keep the SDK provider name aligned with buildProviderOptions() so
-            // Copilot-routed OpenAI reasoning settings land under the namespace
-            // that @ai-sdk/openai actually reads.
+            // Preserve Copilot's provider identity for usage and diagnostics.
             name: providerOptionsNamespace,
             baseURL,
             apiKey: "copilot", // placeholder, actual auth via custom fetch
             fetch: providerFetch,
           });
-          return Ok(provider.chat(outboundCopilotModelId));
+          return Ok(
+            wrapLanguageModel({
+              model: provider.chat(outboundCopilotModelId),
+              middleware: {
+                specificationVersion: "v4",
+                // OpenAI's Chat parser reads "openai" even on a named provider.
+                // Keep Copilot's public namespace, translating only at the adapter.
+                transformParams: ({ params }) =>
+                  Promise.resolve({
+                    ...params,
+                    providerOptions: {
+                      ...params.providerOptions,
+                      openai: {
+                        ...params.providerOptions?.openai,
+                        ...params.providerOptions?.[providerOptionsNamespace],
+                      },
+                    },
+                  }),
+              },
+            })
+          );
         }
 
         // Coder AI Bridge: per-origin endpoints under <deployment>/api/v2/aibridge,
