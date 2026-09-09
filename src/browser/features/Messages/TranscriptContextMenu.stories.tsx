@@ -2,20 +2,27 @@ import { useRef } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, fireEvent, fn, userEvent, waitFor, within } from "storybook/test";
 import { useTranscriptContextMenu } from "./useTranscriptContextMenu";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 
-function TranscriptSelection() {
+function TranscriptSelection(props: { markdown?: string }) {
   const root = useRef<HTMLDivElement>(null);
   const menu = useTranscriptContextMenu({ transcriptRootRef: root, onQuoteText: () => undefined });
   return (
     <div ref={root} onContextMenu={menu.onContextMenu} className="p-4">
       <div data-transcript-message>
         <div data-transcript-quote-root>
-          <p>
-            Before <strong data-testid="selection">bold selection</strong> after
-          </p>
-          <p>
-            <a href="https://example.com">Example link</a>
-          </p>
+          {props.markdown ? (
+            <MarkdownRenderer content={props.markdown} />
+          ) : (
+            <>
+              <p>
+                Before <strong data-testid="selection">bold selection</strong> after
+              </p>
+              <p>
+                <a href="https://example.com">Example link</a>
+              </p>
+            </>
+          )}
         </div>
       </div>
       {menu.menu}
@@ -35,7 +42,10 @@ export const SelectedMarkdown: Story = {
     const document = canvasElement.ownerDocument;
     const canvas = within(canvasElement);
     const body = within(document.body);
-    const selected = canvas.getByTestId("selection");
+    const selected = await canvas.findByText("bold selection", {
+      selector: 'strong, [data-streamdown="strong"]',
+    });
+    await waitFor(() => expect(selected).toBeVisible());
     const range = document.createRange();
     range.selectNodeContents(selected);
     const selection = document.getSelection()!;
@@ -97,5 +107,29 @@ export const SelectedMarkdownPhone: Story = {
     await expect(context.parameters).toMatchObject({ pixel: { matrix: { viewports: ["phone"] } } });
     await expect(context.globals).toMatchObject({ viewport: { value: "phone390" } });
     await SelectedMarkdown.play?.(context);
+  },
+};
+
+const renderedMarkdown = [
+  "Before **bold selection** after",
+  "- [x] parent\n  - [ ] child",
+  "<details open>\n<summary>Math</summary>\n\n$$x^2$$\n\n</details>",
+  "```typescript\nconst x = 1;\n```",
+  '<span class="sr-only" style="position:fixed;left:-10000px">Raw HTML cannot conceal this text.</span>',
+].join("\n\n");
+
+export const RenderedMarkdown: Story = {
+  ...SelectedMarkdown,
+  args: { markdown: renderedMarkdown },
+  play: async (context) => {
+    await SelectedMarkdown.play?.(context);
+  },
+};
+
+export const RenderedMarkdownPhone: Story = {
+  ...SelectedMarkdownPhone,
+  args: { markdown: renderedMarkdown },
+  play: async (context) => {
+    await SelectedMarkdownPhone.play?.(context);
   },
 };

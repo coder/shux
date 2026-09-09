@@ -223,10 +223,15 @@ describe("transcriptContextMenu", () => {
         )
       );
       const result = getTranscriptContextMenuMarkdown(select(root, "#first", "#last"));
-      expect(result?.text).toBe(
+      const pasted = document.createElement("div");
+      pasted.innerHTML = new MarkdownIt({ html: true }).render(result?.text ?? "");
+      expect(pasted.querySelector("details")?.open).toBe(true);
+      expect(pasted.querySelector("summary")?.textContent?.trim()).toBe("More");
+      expect(pasted.textContent).toContain("Selected");
+      expect(pasted.textContent).not.toContain("Excluded");
+      expect(result?.html).toBe(
         '<details open=""><summary>More</summary><p>Selected</p></details>'
       );
-      expect(result?.html).toBe(result?.text);
     });
 
     test("preserves the language of highlighted code", () => {
@@ -284,6 +289,52 @@ describe("transcriptContextMenu", () => {
       expect(result?.text).toBe("Before after");
       expect(result?.html).not.toContain("HIDDEN PAYLOAD");
     });
+
+    test.each([false, true])(
+      "keeps only selected task ancestry (includeParent=%s)",
+      (includeParent) => {
+        const root = createTranscriptRoot(
+          createQuoteableTranscriptMessage(
+            '<ul><li><input type="checkbox" disabled checked><span id="parent">parent</span><ul><li><input type="checkbox" disabled><span id="child">child</span></li><li><input type="checkbox" disabled checked><span id="next">next</span></li></ul></li></ul>'
+          )
+        );
+        const result = getTranscriptContextMenuMarkdown(
+          select(root, includeParent ? "#parent" : "#child", "#next")
+        );
+        const pasted = document.createElement("div");
+        pasted.innerHTML = result?.html ?? "";
+        expect(pasted.querySelectorAll("li").length).toBe(includeParent ? 3 : 2);
+        expect(result?.text).toContain("[ ] child");
+        expect(result?.text).toContain("[x] next");
+        if (includeParent) expect(result?.text).toContain("[x] parent");
+        else expect(result?.text).not.toContain("parent");
+      }
+    );
+
+    test.each([false, true])(
+      "preserves spanning-table layout without unselected text (partial=%s)",
+      (partial) => {
+        const root = createTranscriptRoot(
+          createQuoteableTranscriptMessage(
+            '<table><tr><th id="first" colspan="2">Heading</th></tr><tr><td rowspan="2">Left</td><td id="part">Selected</td></tr><tr><td id="last">Other</td></tr></table>'
+          )
+        );
+        const result = getTranscriptContextMenuMarkdown(
+          select(root, partial ? "#part" : "#first", partial ? "#part" : "#last")
+        );
+        const pasted = document.createElement("div");
+        pasted.innerHTML = new MarkdownIt({ html: true }).render(result?.text ?? "");
+        expect(pasted.querySelector("th")?.colSpan).toBe(2);
+        expect(pasted.querySelector("td")?.rowSpan).toBe(2);
+        expect(pasted.querySelectorAll("tr").length).toBe(3);
+        expect(pasted.textContent).toContain("Selected");
+        if (partial) {
+          expect(pasted.textContent?.trim()).toBe("Selected");
+          expect(result?.html).not.toContain("Heading");
+          expect(result?.html).not.toContain("Left");
+        }
+      }
+    );
 
     test("removes unsafe URLs, attributes, and active content", () => {
       const root = createTranscriptRoot(

@@ -5,10 +5,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { rawHtmlUsesOnlyAllowedTags } from "./MarkdownCore";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
 
 function renderMarkdown(content: string) {
-  return render(<MarkdownRenderer content={content} preserveLineBreaks />);
+  return render(
+    <ThemeProvider forcedTheme="dark">
+      <MarkdownRenderer content={content} preserveLineBreaks />
+    </ThemeProvider>
+  );
 }
 
 describe("MarkdownRenderer raw HTML handling", () => {
@@ -61,8 +66,17 @@ describe("MarkdownRenderer raw HTML handling", () => {
       '<span class="katex"><span>Visible</span><span style="display:none"><math><semantics><annotation encoding="application/x-tex">HIDDEN PAYLOAD</annotation></semantics></math></span></span>'
     );
     expect(view.container.querySelector(".katex")).toBeNull();
-    expect(copied?.text).toBe("Visible");
-    expect(copied?.html).not.toContain("HIDDEN PAYLOAD");
+    expect(view.container.querySelector("math, annotation")).toBeNull();
+    expect(view.container.textContent).toContain("HIDDEN PAYLOAD");
+    const pasted = renderMarkdown(copied!.text);
+    expect(pasted.container.querySelector("math, annotation, .katex")).toBeNull();
+    expect(pasted.container.textContent).toBe(view.container.textContent);
+  });
+
+  test("rendered Markdown emphasis survives copying", () => {
+    const { copied } = copyRenderedMarkdown("**bold** and *italic*");
+    expect(copied?.text).toBe("**bold** and _italic_");
+    expect(copied?.html).toBe("<p><strong>bold</strong> and <em>italic</em></p>");
   });
 
   test("genuine rendered math still copies and renders as math", () => {
@@ -73,6 +87,50 @@ describe("MarkdownRenderer raw HTML handling", () => {
     expect(
       pasted.container.querySelector('.katex annotation[encoding="application/x-tex"]')?.textContent
     ).toBe("x^2");
+  });
+
+  test.each([
+    'style="position:fixed;left:-10000px"',
+    'style="clip-path:inset(100%);opacity:0"',
+    'class="sr-only opacity-0"',
+  ])("raw CSS cannot conceal copied text: %s", (attributes) => {
+    const { view, copied } = copyRenderedMarkdown("<span " + attributes + ">Payload</span>");
+    const span = view.container.querySelector("span")!;
+    expect(span.getAttribute("style")).toBeNull();
+    expect(span.className).toBe("");
+    expect(copied?.text).toBe("Payload");
+  });
+
+  test("math inside an expanded disclosure survives copying and rendering", () => {
+    const { view, copied } = copyRenderedMarkdown(
+      "<details open>\n<summary>More</summary>\n\n$$x^2$$\n\n</details>"
+    );
+    expect(view.container.querySelector("details .katex")).not.toBeNull();
+    expect(copied?.text).not.toContain("data-clipboard-math");
+    const pasted = renderMarkdown(copied!.text);
+    expect(
+      pasted.container.querySelector('details .katex annotation[encoding="application/x-tex"]')
+        ?.textContent
+    ).toBe("x^2");
+  });
+
+  test("closed disclosures do not copy their hidden body", () => {
+    const { copied } = copyRenderedMarkdown(
+      "<details><summary>Visible</summary><p>HIDDEN</p></details>"
+    );
+    expect(copied?.text).toContain("Visible");
+    expect(copied?.text).not.toContain("HIDDEN");
+    expect(copied?.html).not.toContain("HIDDEN");
+  });
+
+  test("semantic task and code classes survive raw CSS removal", () => {
+    const view = renderMarkdown("- [x] done\n\n```typescript\nconst x = 1;\n```");
+    expect(view.container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(
+      true
+    );
+    expect(
+      view.container.querySelector(".code-block-container")?.getAttribute("data-code-language")
+    ).toBe("typescript");
   });
 
   test("keeps supported collapsible HTML on the raw HTML path", () => {

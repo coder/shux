@@ -339,6 +339,7 @@ const CLIPBOARD_TAGS = new Set([
   "table",
   "thead",
   "tbody",
+  "tfoot",
   "tr",
   "th",
   "td",
@@ -347,7 +348,7 @@ const CLIPBOARD_TAGS = new Set([
   "sub",
   "sup",
 ]);
-const CLIPBOARD_EXCLUDED_SELECTOR = `script, style, svg, img, iframe, object, .line-number, .sr-only, button, input, textarea, select, [hidden], [aria-hidden="true"], ${TRANSCRIPT_IGNORE_CONTEXT_MENU_SELECTOR}`;
+const CLIPBOARD_EXCLUDED_SELECTOR = `script, style, annotation, svg, img, iframe, object, .line-number, .sr-only, button, input, textarea, select, [hidden], [aria-hidden="true"], ${TRANSCRIPT_IGNORE_CONTEXT_MENU_SELECTOR}`;
 
 function isSafeClipboardHref(href: string): boolean {
   if (!href.trim() || href.includes("\\")) return false;
@@ -370,13 +371,43 @@ function isClipboardElementHidden(element: Element): boolean {
   );
 }
 
-function appendClipboardNodes(source: Node, destination: Node, range: Range): void {
+function hasSelectedOwnListText(item: Element, range: Range): boolean {
+  for (const child of item.childNodes) {
+    if (!range.intersectsNode(child)) continue;
+    if (child.nodeType === 3) {
+      const start = child === range.startContainer ? range.startOffset : 0;
+      const end = child === range.endContainer ? range.endOffset : child.textContent?.length;
+      if (child.textContent?.slice(start, end).trim()) return true;
+    } else if (child.nodeType === 1) {
+      const element = child as Element;
+      if (!element.matches("ul, ol, input") && hasSelectedOwnListText(element, range)) return true;
+    }
+  }
+  return false;
+}
+
+function appendClipboardNodes(
+  source: Node,
+  destination: Node,
+  range: Range,
+  preserveSpanningTable = false
+): void {
   const document = destination.ownerDocument!;
   for (const child of source.childNodes) {
     const isTaskMarker =
       child.nodeType === 1 &&
-      (child as Element).matches('li > input[type="checkbox"][disabled]:first-child');
-    if (!range.intersectsNode(child) && !isTaskMarker) {
+      (child as Element).matches('li > input[type="checkbox"][disabled]:first-child') &&
+      hasSelectedOwnListText(child.parentElement!, range);
+    const isTableStructure =
+      preserveSpanningTable &&
+      ["THEAD", "TBODY", "TFOOT", "TR", "TD", "TH"].includes(child.nodeName);
+    if (
+      source.nodeName === "DETAILS" &&
+      !(source as Element).hasAttribute("open") &&
+      child.nodeName !== "SUMMARY"
+    )
+      continue;
+    if (!range.intersectsNode(child) && !isTaskMarker && !isTableStructure) {
       // Empty cells retain column positions without copying unselected text.
       if (child.nodeName === "TH" || child.nodeName === "TD") {
         destination.appendChild(document.createElement(child.nodeName.toLowerCase()));
@@ -431,15 +462,26 @@ function appendClipboardNodes(source: Node, destination: Node, range: Range): vo
       destination.appendChild(pre);
       continue;
     }
-    const tag = element.tagName.toLowerCase();
+    // Streamdown renders Markdown bold as a styled span instead of a strong element.
+    const tag =
+      element.getAttribute("data-streamdown") === "strong"
+        ? "strong"
+        : element.tagName.toLowerCase();
     if (!CLIPBOARD_TAGS.has(tag)) {
-      appendClipboardNodes(element, destination, range);
+      appendClipboardNodes(element, destination, range, preserveSpanningTable);
       continue;
     }
     const copy = document.createElement(tag);
     if (tag === "a") {
       const href = element.getAttribute("href") ?? "";
       if (isSafeClipboardHref(href)) copy.setAttribute("href", href);
+    }
+    if (tag === "td" || tag === "th") {
+      const cell = element as HTMLTableCellElement;
+      if (/^\d+$/.test(element.getAttribute("colspan") ?? ""))
+        copy.setAttribute("colspan", String(cell.colSpan));
+      if (/^\d+$/.test(element.getAttribute("rowspan") ?? ""))
+        copy.setAttribute("rowspan", String(cell.rowSpan));
     }
     if (tag === "details" && element.hasAttribute("open")) copy.setAttribute("open", "");
     if (tag === "code") {
@@ -455,7 +497,11 @@ function appendClipboardNodes(source: Node, destination: Node, range: Range): vo
       );
       copy.setAttribute("start", String(list.start + Math.max(0, firstSelected)));
     }
-    appendClipboardNodes(element, copy, range);
+    // Keep empty spanning-table structure so partial selections retain cell positions.
+    const keepTableStructure =
+      preserveSpanningTable ||
+      (tag === "table" && element.querySelector("[rowspan], [colspan]") !== null);
+    appendClipboardNodes(element, copy, range, keepTableStructure);
     destination.appendChild(copy);
   }
 }
@@ -483,8 +529,19 @@ export function getTranscriptContextMenuMarkdown(
   )!;
   const container = options.transcriptRoot.ownerDocument.createElement("div");
   // Walk the original range so partial selections retain their formatting and list positions.
-  appendClipboardNodes(quoteRoot, container, range);
+  let selectedList = getEventTargetElement(range.startContainer)?.closest("ul, ol");
+  while (selectedList && !selectedList.contains(range.endContainer)) {
+    selectedList = selectedList.parentElement?.closest("ul, ol");
+  }
+  // A nested-item selection forms its own list, without empty unselected parent tasks.
+  const copyRoot = selectedList?.parentElement?.matches("li")
+    ? selectedList.parentElement
+    : quoteRoot;
+  appendClipboardNodes(copyRoot, container, range);
   const markdown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
+  // Preserve literal HTML and entities as text when the copied Markdown is parsed again.
+  markdown.escape = (text) =>
+    TurndownService.prototype.escape(text).replace(/&/g, "&amp;").replace(/</g, "\\<");
   markdown.addRule("selectedMathAndTasks", {
     filter: (node) =>
       node.hasAttribute("data-clipboard-math") || node.hasAttribute("data-clipboard-task"),
@@ -492,10 +549,17 @@ export function getTranscriptContextMenuMarkdown(
       node.getAttribute("data-clipboard-math") ?? node.textContent?.trimEnd() ?? "",
   });
   markdown.addRule("disclosure", {
-    filter: ["details", "sub", "sup"],
+    filter: ["details", "summary"],
+    replacement: (content, node) => {
+      const tag = node.nodeName.toLowerCase();
+      const open = tag === "details" && node.hasAttribute("open") ? " open" : "";
+      return "\n\n<" + tag + open + ">\n\n" + content.trim() + "\n\n</" + tag + ">\n\n";
+    },
+  });
+  markdown.addRule("scripts", {
+    filter: ["sub", "sup"],
     // SECURITY AUDIT: This node contains only the sanitized clipboard elements and attributes.
-    replacement: (_content, node) =>
-      node.nodeName === "DETAILS" ? "\n\n" + node.outerHTML + "\n\n" : node.outerHTML,
+    replacement: (_content, node) => node.outerHTML,
   });
   markdown.addRule("safeLink", {
     filter: (node) => node.nodeName === "A" && node.hasAttribute("href"),
@@ -511,6 +575,8 @@ export function getTranscriptContextMenuMarkdown(
   markdown.addRule("table", {
     filter: "table",
     replacement: (_content, node) => {
+      // GFM cannot represent spans. Keep sanitized HTML instead of inventing a different table layout.
+      if (node.querySelector("[rowspan], [colspan]")) return "\n\n" + node.outerHTML + "\n\n";
       const rows = Array.from(node.querySelectorAll<HTMLTableRowElement>("tr"), (row) =>
         Array.from(row.cells, (cell) =>
           markdown.turndown(cell).replace(/\|/g, "\\|").replace(/\n/g, "<br>")
