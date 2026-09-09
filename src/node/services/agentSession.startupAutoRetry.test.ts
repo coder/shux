@@ -824,8 +824,8 @@ describe("AgentSession startup auto-retry recovery", () => {
     const partialPath = path.join(config.sessionsDir, workspaceId, "partial.json");
     await fsPromises.mkdir(partialPath);
     const wait = spyOn(
-      session as unknown as { waitForStartupAutoRetryRerunWindow(delay: number): Promise<void> },
-      "waitForStartupAutoRetryRerunWindow"
+      session as unknown as { waitForStartupReadRetry(delay: number): Promise<void> },
+      "waitForStartupReadRetry"
     ).mockResolvedValue(undefined);
     try {
       expect(await session.isStartupRecoveryBlocked()).toBe(true);
@@ -848,14 +848,32 @@ describe("AgentSession startup auto-retry recovery", () => {
       '{"id":'
     );
     const wait = spyOn(
-      session as unknown as { waitForStartupAutoRetryRerunWindow(delay: number): Promise<void> },
-      "waitForStartupAutoRetryRerunWindow"
+      session as unknown as { waitForStartupReadRetry(delay: number): Promise<void> },
+      "waitForStartupReadRetry"
     );
     try {
       expect(await session.isStartupRecoveryBlocked()).toBe(false);
       expect(wait).not.toHaveBeenCalled();
     } finally {
       wait.mockRestore();
+      await session.dispose();
+    }
+  });
+
+  test("task read retries settle while a provider stream remains active", async () => {
+    const workspaceId = "startup-busy-read-retry";
+    const { session, historyService, cleanup } = await createSessionBundle(workspaceId, {
+      isStreaming: mock(() => true),
+    });
+    cleanups.push(cleanup);
+    await historyService.appendToHistory(workspaceId, createMuxMessage("user", "user", "Work"));
+    const read = spyOn(historyService, "getLastMessages").mockRejectedValueOnce(
+      new Error("busy disk")
+    );
+    try {
+      expect(await session.isStartupRecoveryBlocked()).toBe(false);
+      expect(read).toHaveBeenCalledTimes(2);
+    } finally {
       await session.dispose();
     }
   });
@@ -871,8 +889,8 @@ describe("AgentSession startup auto-retry recovery", () => {
     const partialPath = path.join(config.sessionsDir, workspaceId, "partial.json");
     await fsPromises.mkdir(partialPath);
     const wait = spyOn(
-      session as unknown as { waitForStartupAutoRetryRerunWindow(delay: number): Promise<void> },
-      "waitForStartupAutoRetryRerunWindow"
+      session as unknown as { waitForStartupReadRetry(delay: number): Promise<void> },
+      "waitForStartupReadRetry"
     ).mockImplementationOnce(() => fsPromises.rm(partialPath, { recursive: true }));
     try {
       expect(await session.isStartupRecoveryBlocked()).toBe(false);

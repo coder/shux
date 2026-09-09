@@ -3463,6 +3463,41 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toBeUndefined();
   });
 
+  test("startup does not recover a task that completed during blocker inspection", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const workspaces = [
+      projectWorkspace(projectPath, "parent", "parent"),
+      projectWorkspace(projectPath, "child", "child", {
+        parentWorkspaceId: "parent",
+        agentId: "exec",
+        taskStatus: "running",
+      }),
+    ];
+    await saveWorkspaces(config, projectPath, workspaces, testTaskSettings());
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      isStartupRecoveryBlocked: mock(async () => {
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [
+            workspaces[0],
+            {
+              ...workspaces[1],
+              taskStatus: "reported",
+            },
+          ],
+          testTaskSettings()
+        );
+        return false;
+      }),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    await taskService.recoverInterruptedTasks();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, "child")?.taskStatus).toBe("reported");
+  });
+
   test.each(["running", "awaiting_report", undefined] as const)(
     "startup honors user Stop without changing steerable task status (%s)",
     async (taskStatus) => {

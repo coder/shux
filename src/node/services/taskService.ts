@@ -2386,31 +2386,29 @@ export class TaskService implements AgentTaskIntegration {
     let interruptedInactiveWorkflowOwnerAtStartup = false;
     // Workflow cancellation is authoritative even when a child has its own Stop or question.
     for (const task of startupTasks()) {
-      if (!task.id) continue;
       if (
         await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-          task.id,
+          task.id!,
           config,
           "startup-inactive-workflow-owner-prepass",
           taskIndex,
           { scheduleQueueDrain: false }
         )
-      ) {
+      )
         interruptedInactiveWorkflowOwnerAtStartup = true;
-      }
     }
-    if (interruptedInactiveWorkflowOwnerAtStartup) {
-      // Refresh before descendant checks so a parent awaiting_report task does not stay
-      // blocked by a child that this startup pass just interrupted.
-      config = this.config.loadConfigOrDefault();
-      taskIndex = this.buildAgentTaskIndex(config);
-    }
-
+    config = this.config.loadConfigOrDefault();
     const candidates = startupTasks();
     const blocked = await Promise.all(
       candidates.map((task) => this.workspaceService.isStartupRecoveryBlocked(task.id!))
     );
-    const eligible = candidates.filter((_, index) => !blocked[index]);
+    const admitted = new Set(
+      candidates.filter((_, index) => !blocked[index]).map((task) => task.id)
+    );
+    // Reads can outlive a queued child's stream: do not recover its stale running snapshot.
+    config = this.config.loadConfigOrDefault();
+    taskIndex = this.buildAgentTaskIndex(config);
+    const eligible = startupTasks().filter((task) => admitted.has(task.id));
     const awaitingReportTasks = eligible.filter((task) => task.taskStatus === "awaiting_report");
     const runningTasks = eligible.filter((task) => (task.taskStatus ?? "running") === "running");
 

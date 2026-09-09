@@ -2681,7 +2681,7 @@ export class AgentSession {
     return "completed";
   }
 
-  private async waitForStartupAutoRetryRerunWindow(retryDelayMs = 0): Promise<void> {
+  private async waitForStartupReadRetry(retryDelayMs: number): Promise<void> {
     const delayMs = Math.max(0, Math.trunc(retryDelayMs));
     if (delayMs > 0) {
       const runner = this.streamManager.effectRunner ?? defaultEffectRunner;
@@ -2695,7 +2695,10 @@ export class AgentSession {
         this.closingSignal.removeEventListener("abort", cancel);
       }
     }
+  }
 
+  private async waitForStartupAutoRetryRerunWindow(retryDelayMs = 0): Promise<void> {
+    await this.waitForStartupReadRetry(retryDelayMs);
     while (!this.coordinator.closing) {
       await this.coordinator.waitForUnbusy(this.closingSignal);
       if (this.coordinator.closing || !this.isAiStreaming()) {
@@ -2757,7 +2760,8 @@ export class AgentSession {
         ([partial, history]) => partial === undefined || !history?.success,
         {
           signal: this.closingSignal,
-          wait: (delay) => this.waitForStartupAutoRetryRerunWindow(delay),
+          // Read backoff must not wait for a newly launched child stream to finish.
+          wait: (delay) => this.waitForStartupReadRetry(delay),
         }
       ).catch(() => undefined)) ?? [];
     if (!history?.success || partial === undefined) return true;
