@@ -1665,21 +1665,21 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   className="bg-surface-primary sticky bottom-0 z-10 mx-[-15px] break-normal whitespace-normal"
                   style={COMPOSER_DOCK_STYLE}
                 >
-                  {isHydratingTranscript &&
-                    !showTranscriptHydrationPlaceholder &&
-                    !shouldMountStreamingBarrier && (
-                      <div
-                        role="status"
-                        data-testid="transcript-loading-status"
-                        className="pointer-events-none absolute inset-x-0 top-0 z-20 h-1 overflow-hidden"
-                      >
-                        <Skeleton
-                          variant="shimmer"
-                          className="bg-muted/30 block h-full w-full rounded-none"
-                        />
-                        <span className="sr-only">Loading messages...</span>
-                      </div>
-                    )}
+                  {/* An active turn does not mean history has loaded. Keep the dock shimmer
+                      visible alongside turn controls whenever the full skeleton is absent. */}
+                  {isHydratingTranscript && !showTranscriptHydrationPlaceholder && (
+                    <div
+                      role="status"
+                      data-testid="transcript-loading-status"
+                      className="pointer-events-none absolute inset-x-0 top-0 z-20 h-1 overflow-hidden"
+                    >
+                      <Skeleton
+                        variant="shimmer"
+                        className="bg-muted/30 block h-full w-full rounded-none"
+                      />
+                      <span className="sr-only">Loading messages...</span>
+                    </div>
+                  )}
                   {!autoScroll && (
                     <button
                       onClick={handleJumpToBottom}

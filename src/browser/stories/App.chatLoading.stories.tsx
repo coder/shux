@@ -222,6 +222,22 @@ function createHydrationStory(workspaceId: string): AppStory {
         canvas.getByTestId("transcript-hydration-placeholder")
       );
       await expect(canvas.getByRole("textbox")).toBeEnabled();
+      emitChat({
+        type: "stream-lifecycle",
+        workspaceId: workspace.id,
+        phase: "preparing",
+        hadAnyOutput: false,
+      });
+      await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
+      await checkTranscriptLayout(canvasElement);
+      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+      emitChat({
+        type: "stream-lifecycle",
+        workspaceId: workspace.id,
+        phase: "idle",
+        hadAnyOutput: false,
+      });
+      await expect(await canvas.findByTestId("transcript-hydration-placeholder")).toBeVisible();
       emitChat(history);
       emitChat({
         type: "caught-up",
@@ -278,7 +294,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       }
     );
 
-    await step("Running init and stream preparation retain their active feedback", async () => {
+    await step("Active turns retain replay shimmer alongside their controls", async () => {
       emitChat({
         type: "init-start",
         hookPath: "/project/.xum/init",
@@ -306,7 +322,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         hadAnyOutput: false,
       });
       await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
-      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+      await checkTranscriptLayout(canvasElement);
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat({
         type: "stream-start",
@@ -317,7 +333,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         startTime: STABLE_TIMESTAMP,
       });
       await expect(await canvas.findByText(/streaming\.\.\./)).toBeVisible();
-      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+      await checkTranscriptLayout(canvasElement);
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat(history);
       emitChat({
@@ -336,6 +352,7 @@ function createHydrationStory(workspaceId: string): AppStory {
       });
       await expect(await canvas.findByText("Live response.")).toBeVisible();
       await expect(canvas.getByRole("log")).toHaveAttribute("aria-busy", "true");
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat({
         type: "stream-end",
@@ -352,12 +369,12 @@ function createHydrationStory(workspaceId: string): AppStory {
       });
     });
 
-    await step("A monitor barrier takes priority over the hydration skeleton", async () => {
+    await step("A monitor barrier retains replay shimmer", async () => {
       await switchWorkspace(canvasElement, monitorWorkspace.id);
       await expect(
         await canvas.findByText(/Waiting on background bash monitor/, {}, { timeout: 5000 })
       ).toBeVisible();
-      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+      await checkTranscriptLayout(canvasElement);
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
     });
 
@@ -399,6 +416,15 @@ function createHydrationStory(workspaceId: string): AppStory {
         await waitFor(() => expect(subscriptions).toBe(4));
         await checkTranscriptLayout(canvasElement);
         await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
+        // Freeze active replay so desktop and phone snapshots cover the shimmer with turn controls.
+        emitChat({
+          type: "stream-lifecycle",
+          workspaceId: workspace.id,
+          phase: "preparing",
+          hadAnyOutput: false,
+        });
+        await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
+        await checkTranscriptLayout(canvasElement);
       }
     );
   };
@@ -429,8 +455,15 @@ export const Phone: AppStory = {
       </div>
     ),
   ],
-  globals: { viewport: { value: "mobile1", isRotated: false } },
-  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+  globals: { viewport: { value: "phone", isRotated: false } },
+  parameters: {
+    pixel: { matrix: { viewports: ["phone"] } },
+    viewport: {
+      options: {
+        phone: { name: "Phone", styles: { width: "390px", height: "844px" }, type: "mobile" },
+      },
+    },
+  },
 };
 
 // Keep the first-load shimmer frozen so Pixel also captures the empty-history state.
