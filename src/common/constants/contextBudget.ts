@@ -32,7 +32,7 @@ export const FLUSH_MAX_OUTPUT_TOKENS = Math.min(
   2 * CONTEXT_NOTES_RESERVED_TOKENS
 );
 // Absolute floor on how far ahead of the rollover point the advance warning fires. The
-// percent-based advance shrinks with the window (a 15% gap is under 5k tokens at 32k), so
+// percent-based advance (WARNING_ADVANCE_PERCENT of the limit) shrinks with the window, so
 // reserve three WARNING_RESERVE_TOKENS: one notes flush plus roughly two working steps.
 export const WARNING_ADVANCE_MIN_TOKENS = 3 * WARNING_RESERVE_TOKENS;
 export const IMAGE_TOKEN_ESTIMATE = 1_024;

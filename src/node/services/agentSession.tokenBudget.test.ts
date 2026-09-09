@@ -1393,21 +1393,24 @@ describe("AgentSession token-budget lifecycle", () => {
     ).toBe(false);
   });
 
-  test("the flush request uses the bounded flush output cap; the paired continuation keeps the caller's", async () => {
+  test("the flush request uses the bounded cap and lowest thinking; the paired continuation keeps the caller's", async () => {
     const h = await setup();
-    expect(
-      (await h.session.sendMessage("Work", { ...options, maxOutputTokens: 300 })).success
-    ).toBe(true);
+    const sendOptions = { ...options, maxOutputTokens: 300, thinkingLevel: "high" as const };
+    expect((await h.session.sendMessage("Work", sendOptions)).success).toBe(true);
     expect(h.requests[0].maxOutputTokens).toBe(300);
+    expect(h.requests[0].thinkingLevel).toBe("high");
     expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
     await h.finishAndDispatch();
     expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    // Thinking floor for this model is off, so the cap needs no thinking-budget headroom.
+    expect(h.requests[1].thinkingLevel).toBe("off");
     expect(h.requests[1].maxOutputTokens).toBe(FLUSH_MAX_OUTPUT_TOKENS);
     expect(FLUSH_MAX_OUTPUT_TOKENS).toBeGreaterThan(300);
     expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
     h.settleStream(1);
     await h.waitForRequest(3);
     expect(h.requests[2].maxOutputTokens).toBe(300);
+    expect(h.requests[2].thinkingLevel).toBe("high");
   });
 
   test("a top-level workspace (no delegated correlation) still flags the flush request", async () => {

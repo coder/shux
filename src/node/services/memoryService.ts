@@ -1163,9 +1163,10 @@ export class MemoryService extends EventEmitter {
    * Preservation-turn write for one pinned file (the context-budget final flush). The agent
    * gets a single call, so the mutation must not fail on an existence verdict that went stale
    * between the prompt and the call (Memory UI or another session creating/deleting the file).
-   * Under the target mutation lock: `create` replaces an existing file, `str_replace`/`insert`
-   * create a missing file from their payload, and the actual result is capped at
-   * `maxFileBytes` (which must tighten the ordinary cap).
+   * Under the target mutation lock: `create` replaces an existing file (even one that is no longer
+   * readable as a memory file), `str_replace`/`insert` create a missing file from their payload,
+   * the per-scope file cap does not apply, and the actual result is capped at `maxFileBytes`
+   * (which must tighten the ordinary cap).
    */
   async writePinnedFile(
     ctx: MemoryScopeContext,
@@ -1190,14 +1191,20 @@ export class MemoryService extends EventEmitter {
         if (kind === "dir") {
           throw new MemoryCommandError(`${virtualPath} is a directory, not a file`);
         }
-        const current =
-          kind === null ? null : await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
-        if (current === null) {
-          const files = await store.listFiles();
-          if (files.length >= MEMORY_MAX_FILES_PER_SCOPE) {
-            throw new MemoryCommandError(
-              `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
-            );
+        // The notes slot is exempt from MEMORY_MAX_FILES_PER_SCOPE: the pinned turn cannot delete
+        // anything to make room, and a full scope must not waste the single preservation step.
+        let current: string | null = null;
+        // Inverse for the journal; a malformed existing file (over the ordinary cap, NUL bytes)
+        // keeps whatever bounded text prefix could be read.
+        let previous: string | null = null;
+        if (kind !== null) {
+          try {
+            current = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
+            previous = current;
+          } catch (error) {
+            // Only `create` replaces without reading; edits need the real contents.
+            if (mutation.command !== "create") throw error;
+            previous = await store.readFilePrefix(parsed.relPath, MEMORY_MAX_FILE_BYTES);
           }
         }
         const updated =
@@ -1220,9 +1227,9 @@ export class MemoryService extends EventEmitter {
         await this.journalRefinement(
           ctx,
           { op: mutation.command, path: toVirtualPath(scope, parsed.relPath) },
-          current === null
+          previous === null
             ? { op: "delete-files", paths: [physicalPath] }
-            : { op: "restore-files", files: [{ path: physicalPath, content: current }] },
+            : { op: "restore-files", files: [{ path: physicalPath, content: previous }] },
           actor,
           toolCallId,
           [{ path: physicalPath, content: updated }]
@@ -1231,7 +1238,7 @@ export class MemoryService extends EventEmitter {
         this.emitChange(ctx, scope, parsed.relPath, actor);
         return {
           success: true as const,
-          output: `${current === null ? "Created" : "Edited"} ${toVirtualPath(scope, parsed.relPath)}`,
+          output: `${previous === null ? "Created" : "Edited"} ${toVirtualPath(scope, parsed.relPath)}`,
         };
       });
     });

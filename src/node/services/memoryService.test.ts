@@ -597,6 +597,53 @@ describe("MemoryService", () => {
       ).toBe(true);
       expect(await read()).toBe("x\ny");
     });
+
+    it("writePinnedFile ignores the per-scope file cap and lets create replace a malformed file", async () => {
+      using fixture = await createFixture();
+      const notes = "/memories/global/notes.md";
+      const globalDir = path.join(fixture.xumHome, "memory", "global");
+      await fsPromises.mkdir(globalDir, { recursive: true });
+      await Promise.all(
+        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE }, (_, i) =>
+          fsPromises.writeFile(path.join(globalDir, `f${i}.md`), "x")
+        )
+      );
+      // The ordinary create is refused by the cap; the pinned notes slot is exempt.
+      expect((await fixture.service.create(fixture.ctx, notes, "seed", "agent")).success).toBe(
+        false
+      );
+      expect(
+        (
+          await fixture.service.writePinnedFile(
+            fixture.ctx,
+            notes,
+            { command: "insert", insertLine: 0, insertText: "seed" },
+            100,
+            "agent"
+          )
+        ).success
+      ).toBe(true);
+      // Externally corrupted notes (NUL byte) cannot be edited, but the pinned create replaces them.
+      await fsPromises.writeFile(path.join(globalDir, "notes.md"), "bad\u0000bytes");
+      const edit = await fixture.service.writePinnedFile(
+        fixture.ctx,
+        notes,
+        { command: "str_replace", oldStr: "bad", newStr: "good" },
+        100,
+        "agent"
+      );
+      expect(edit.success).toBe(false);
+      const replaced = await fixture.service.writePinnedFile(
+        fixture.ctx,
+        notes,
+        { command: "create", fileText: "repaired" },
+        100,
+        "agent"
+      );
+      expect(replaced.success).toBe(true);
+      const result = await fixture.service.readFileWithSha(fixture.ctx, notes);
+      expect(result.success && result.data.content).toBe("repaired");
+    });
   });
 
   describe("UI read/save", () => {

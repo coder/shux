@@ -116,6 +116,7 @@ import {
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import {
+  ANTHROPIC_THINKING_BUDGETS,
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
   type ThinkingLevel,
@@ -7303,6 +7304,17 @@ export class AgentSession {
       // options; the flag is request-local and never becomes the workspace-turn correlation.
       const contextBudgetFlushTurn =
         lastUserMessage?.metadata?.muxMetadata?.contextBudgetFlush === true;
+      // The flush is one mechanical memory call: run it at the lowest thinking the model allows,
+      // and size its bounded output cap above that level's Anthropic thinking budget (the API
+      // rejects a budget that is not below max_tokens), so an inherited medium/high level cannot
+      // make the only preservation step fail before its tool call.
+      const flushThinkingLevel = contextBudgetFlushTurn
+        ? enforceThinkingPolicy(modelString, "off", minThinkingLevel, providersConfig)
+        : undefined;
+      const flushMaxOutputTokens =
+        flushThinkingLevel != null
+          ? FLUSH_MAX_OUTPUT_TOKENS + ANTHROPIC_THINKING_BUDGETS[flushThinkingLevel]
+          : undefined;
       // The flush turn is bounded to one provider step. If a crash left that step's completed
       // memory call on disk (committed above), the resumed request gets no tools at all so the
       // turn can only end, after which the queued rollover seals the window.
@@ -7344,7 +7356,7 @@ export class AgentSession {
         workspaceId: this.workspaceId,
         modelString,
         abortSignal,
-        thinkingLevel: effectiveThinkingLevel,
+        thinkingLevel: flushThinkingLevel ?? effectiveThinkingLevel,
         // Orthogonal to thinking level; buildRequestHeaders gates it per model.
         reasoningMode: options?.reasoningMode,
         toolPolicy:
@@ -7356,9 +7368,7 @@ export class AgentSession {
         // The flush step gets its own bounded cap: a terse caller cap could cut the notes payload
         // short and waste the single step, while an unbounded one would let transcript-influenced
         // text run to a model-sized reply. The paired continuation keeps the caller's cap.
-        maxOutputTokens: contextBudgetFlushTurn
-          ? FLUSH_MAX_OUTPUT_TOKENS
-          : options?.maxOutputTokens,
+        maxOutputTokens: flushMaxOutputTokens ?? options?.maxOutputTokens,
         muxProviderOptions: options?.providerOptions,
         agentInitiated,
         agentId: options?.agentId,
@@ -7395,7 +7405,8 @@ export class AgentSession {
         // Mid-turn thinking overrides clamp against the same floor as the
         // send-time level above (single source of truth for the floor).
         minThinkingLevel,
-        activeTurnThinkingOverride,
+        // A mid-turn thinking raise must not push the flush's budget past its bounded cap.
+        activeTurnThinkingOverride: contextBudgetFlushTurn ? undefined : activeTurnThinkingOverride,
         onPreStartError: ({ workspaceId: _workspaceId, ...payload }) =>
           preStartErrors.push(payload),
         onStreamStarting: (messageId) => {
