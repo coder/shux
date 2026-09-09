@@ -4218,40 +4218,47 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return;
     }
 
-    const existingSession =
-      this.sessions.get(trimmed) ?? this.transientStartupRecoverySessions.get(trimmed);
-    if (existingSession) {
-      existingSession.scheduleStartupRecovery(metadata);
-      return;
-    }
-
-    const session = this.createSession(trimmed);
-    this.transientStartupRecoverySessions.set(trimmed, session);
-
-    void session
-      .runStartupRecovery(metadata)
-      .then(async () => {
-        if (this.transientStartupRecoverySessions.get(trimmed) !== session) {
-          return;
-        }
-
-        if (!this.shuttingDown && session.shouldRetainAfterStartupRecovery()) {
-          this.registerSession(trimmed, session);
-          return;
-        }
-
-        await this.disposeSession(trimmed);
-      })
-      .catch(async (error) => {
-        if (this.transientStartupRecoverySessions.get(trimmed) === session) {
-          await this.disposeSession(trimmed);
-        }
-
+    this.deferWorkspaceCleanup(async () => {
+      try {
+        await this.withStartupSession(trimmed, (session) => session.runStartupRecovery(metadata));
+      } catch (error) {
         log.warn("Failed to run startup recovery for workspace", {
           workspaceId: trimmed,
           error: getErrorMessage(error),
         });
-      });
+      }
+    });
+  }
+
+  private async withStartupSession<T>(
+    workspaceId: string,
+    run: (session: AgentSession) => Promise<T>
+  ): Promise<T> {
+    workspaceId = workspaceId.trim();
+    assert(workspaceId.length > 0, "workspaceId must not be empty");
+    const existing =
+      this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId);
+    if (existing) return run(existing);
+    const session = this.createSession(workspaceId);
+    this.transientStartupRecoverySessions.set(workspaceId, session);
+    try {
+      const result = await run(session);
+      if (
+        this.transientStartupRecoverySessions.get(workspaceId) === session &&
+        !this.shuttingDown &&
+        session.shouldRetainAfterStartupRecovery()
+      ) {
+        this.registerSession(workspaceId, session);
+      }
+      return result;
+    } finally {
+      // Adoption transfers ownership. Otherwise detach before asynchronous cleanup so a timed-out
+      // physical read cannot block startup or make a later caller adopt a closing session.
+      if (this.transientStartupRecoverySessions.get(workspaceId) === session) {
+        this.transientStartupRecoverySessions.delete(workspaceId);
+        this.deferWorkspaceCleanup(() => session.dispose());
+      }
+    }
   }
 
   private createSession(workspaceId: string): AgentSession {
@@ -4334,23 +4341,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const trimmed = workspaceId.trim();
     assert(trimmed.length > 0, "workspaceId must not be empty");
 
-    let session = this.sessions.get(trimmed);
-    if (session) {
-      return session;
-    }
-
-    session = this.transientStartupRecoverySessions.get(trimmed);
-    if (session) {
-      this.transientStartupRecoverySessions.delete(trimmed);
-      this.sessions.set(trimmed, session);
-      this.attachSessionSubscriptions(trimmed, session);
-      return session;
-    }
-
-    session = this.createSession(trimmed);
-    this.sessions.set(trimmed, session);
-    this.attachSessionSubscriptions(trimmed, session);
-
+    const existing = this.sessions.get(trimmed);
+    if (existing) return existing;
+    const session =
+      this.transientStartupRecoverySessions.get(trimmed) ?? this.createSession(trimmed);
+    this.registerSession(trimmed, session);
     return session;
   }
 
@@ -11868,9 +11863,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   async dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>> {
     try {
       return Ok(
-        await this.getOrCreateSession(workspaceId).dispatchPendingCompactionFollowUpIfNeeded(
-          undefined,
-          true
+        await this.withStartupSession(workspaceId, (session) =>
+          session.dispatchPendingCompactionFollowUpIfNeeded(undefined, true)
         )
       );
     } catch (error) {
@@ -11882,14 +11876,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   getStartupRecoveryState(
     workspaceId: string
   ): ReturnType<AgentSession["getStartupRecoveryState"]> {
-    return this.getOrCreateSession(workspaceId).getStartupRecoveryState();
+    return this.withStartupSession(workspaceId, (session) => session.getStartupRecoveryState());
   }
 
   async getStartupAutoRetryModel(workspaceId: string): Promise<Result<string | null>> {
     try {
-      const session = this.getOrCreateSession(workspaceId);
-      const model = await session.getStartupAutoRetryModelHint();
-      return Ok(model);
+      return Ok(await this.getOrCreateSession(workspaceId).getStartupAutoRetryModelHint());
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       log.error("Unexpected error in getStartupAutoRetryModel handler:", error);

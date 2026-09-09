@@ -2518,11 +2518,8 @@ export class TaskService implements AgentTaskIntegration {
             `Updated guidance from parent:\n\n${guidance.message}`,
             { ...sendOptions, queueDispatchMode: guidance.queueDispatchMode },
             {
-              synthetic: true,
-              agentInitiated: true,
-              queueDedupeKey: guidance.id,
+              ...this.taskGuidanceSendOptions(task.id, guidance.id, task.taskStatus ?? "running"),
               restoreQueued: queueOnly,
-              onAccepted: () => this.clearPendingTaskGuidance(task.id!, guidance.id),
             }
           );
           if (!sendResult.success) break;
@@ -4674,8 +4671,9 @@ export class TaskService implements AgentTaskIntegration {
           await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
             taskId
           );
+        const guidance = this.taskGuidanceSendOptions(taskId, guidanceId, previousStatus);
         const settleFailure = async (status: "interrupted" | "error", reason: string) => {
-          await this.clearPendingTaskGuidance(taskId, guidanceId, previousStatus);
+          await guidance.onCanceled();
           if (workspaceTurnMuxMetadata != null) {
             await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
               taskId,
@@ -4704,11 +4702,8 @@ export class TaskService implements AgentTaskIntegration {
             ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
           },
           {
-            synthetic: true,
-            agentInitiated: true,
-            startStreamInBackground: true,
+            ...guidance,
             workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
-            queueDedupeKey: guidanceId,
             onCanceled: (reason) => settleFailure("interrupted", reason),
             // Live target: pre-turn rows ride the send through AgentSession
             // turn admission (queued with the trigger when the target is busy).
@@ -4718,7 +4713,7 @@ export class TaskService implements AgentTaskIntegration {
             onAcceptedPreStreamFailure: (error) =>
               settleFailure("error", formatSendMessageError(error).message),
             onAccepted: async () => {
-              await this.clearPendingTaskGuidance(taskId, guidanceId);
+              await guidance.onAccepted();
               accepted = true;
             },
             // r54: persistence is signaled at the rollback horizon, not at
@@ -4729,7 +4724,7 @@ export class TaskService implements AgentTaskIntegration {
         );
 
         if (!sendResult.success) {
-          await this.clearPendingTaskGuidance(taskId, guidanceId, previousStatus);
+          await guidance.onCanceled();
           return Err({
             code: "send_failed" as const,
             message: formatSendMessageError(sendResult.error).message,
@@ -4741,26 +4736,39 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
-  private async clearPendingTaskGuidance(
+  private taskGuidanceSendOptions(
     taskId: string,
     guidanceId: string,
-    restoreStatus?: AgentTaskStatus
-  ): Promise<void> {
-    await this.editWorkspaceEntry(
-      taskId,
-      (workspace) => {
-        const remaining = (workspace.taskPendingGuidance ?? []).filter(
-          (guidance) => guidance.id !== guidanceId
-        );
-        workspace.taskPendingGuidance = remaining.length > 0 ? remaining : undefined;
-        if (restoreStatus != null && remaining.length === 0 && workspace.taskStatus === "running") {
-          workspace.taskStatus = this.aiService.isStreaming(taskId)
-            ? restoreStatus
-            : "awaiting_report";
-        }
-      },
-      { allowMissing: true }
-    );
+    previousStatus: AgentTaskStatus
+  ) {
+    const clear = async (failed = false): Promise<void> => {
+      await this.editWorkspaceEntry(
+        taskId,
+        (workspace) => {
+          const remaining = (workspace.taskPendingGuidance ?? []).filter(
+            (guidance) => guidance.id !== guidanceId
+          );
+          workspace.taskPendingGuidance = remaining.length > 0 ? remaining : undefined;
+          if (failed && remaining.length === 0 && workspace.taskStatus === "running") {
+            workspace.taskStatus = this.aiService.isStreaming(taskId)
+              ? previousStatus
+              : "awaiting_report";
+          }
+        },
+        { allowMissing: true }
+      );
+    };
+    const onCanceled = () => clear(true);
+    // Live and restored guidance must share the same handoff and settlement lifecycle.
+    return {
+      synthetic: true,
+      agentInitiated: true,
+      startStreamInBackground: true,
+      queueDedupeKey: guidanceId,
+      onAccepted: () => clear(),
+      onCanceled,
+      onAcceptedPreStreamFailure: onCanceled,
+    };
   }
 
   /**

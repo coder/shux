@@ -1,3 +1,4 @@
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { SecretsStore } from "@/node/config";
 import * as path from "path";
@@ -3368,15 +3369,17 @@ describe("TaskService", () => {
       );
 
       const recovered: string[] = [];
+      const providerTurn = Promise.withResolvers<void>();
       const sendMessage = mock(
         async (
           _workspaceId: string,
           _message: string,
           _options: unknown,
-          internal?: { onAccepted?: () => Promise<void> | void }
+          internal?: { onAccepted?: () => Promise<void> | void; startStreamInBackground?: boolean }
         ): Promise<Result<void>> => {
           recovered.push("guidance");
           await internal?.onAccepted?.();
+          if (!internal?.startStreamInBackground) await providerTurn.promise;
           return Ok(undefined);
         }
       );
@@ -3389,7 +3392,16 @@ describe("TaskService", () => {
       });
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-      await taskService.initialize();
+      const initialization = taskService.initialize();
+      try {
+        // Replay must finish accepting every ID while the provider turn is still held open.
+        expect((await raceWithAbortAndTimeout(initialization, { timeoutMs: 1_000 })).kind).toBe(
+          "ok"
+        );
+      } finally {
+        providerTurn.resolve();
+        await initialization;
+      }
 
       expect(sendMessage).toHaveBeenCalledTimes(2);
       for (const [index, mode] of ["turn-end", "tool-end"].entries()) {
@@ -3521,6 +3533,92 @@ describe("TaskService", () => {
         expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
       } finally {
         await session.dispose();
+      }
+    }
+  );
+
+  test.each(["stop", "pre-stream-failure"] as const)(
+    "restored guidance settles only its own reservation on %s",
+    async (failure) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const childId = "canceled-guidance";
+      const guidance = [
+        { id: "first", message: "First correction", queueDispatchMode: "turn-end" as const },
+        { id: "second", message: "Second correction", queueDispatchMode: "tool-end" as const },
+      ];
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", "parent"),
+          projectWorkspace(projectPath, "child", childId, {
+            parentWorkspaceId: "parent",
+            agentId: "exec",
+            agentType: "exec",
+            taskStatus: "running",
+            taskPendingGuidance: guidance,
+          }),
+        ],
+        testTaskSettings()
+      );
+      const { workspaceService } = createWorkspaceServiceMocks();
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      const { session } = await createAgentSessionHarness({
+        workspaceId: childId,
+        config,
+        historyService,
+      });
+      const settled = guidance.map(() => Promise.withResolvers<void>());
+      const internals: Array<NonNullable<Parameters<WorkspaceHost["sendMessage"]>[3]>> = [];
+      workspaceService.getStartupRecoveryState = () => Promise.resolve("question");
+      workspaceService.sendMessage = (_id, message, options, internal) => {
+        const index = internals.length;
+        assert(internal != null);
+        internals.push(internal);
+        session.queueMessage(message, options, {
+          ...internal,
+          dedupeKey: internal.queueDedupeKey,
+          onCanceled: async (reason) => {
+            await internal.onCanceled?.(reason);
+            settled[index].resolve();
+          },
+        });
+        return Promise.resolve(Ok(undefined));
+      };
+      try {
+        await taskService.initialize();
+        if (failure === "stop") {
+          session.removeQueuedMessagesByDedupeKeyPrefix("first", "Guidance canceled");
+          await settled[0].promise;
+        } else {
+          await internals[0]?.onAcceptedPreStreamFailure?.({
+            type: "unknown",
+            raw: "Startup failed",
+          });
+        }
+        expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toEqual([guidance[1]]);
+        expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
+        expect((await session.interruptStream()).success).toBe(true);
+        // WorkspaceService's user Stop restores visible input and cancels hidden guidance.
+        session.restoreQueueToInput();
+        await settled[1].promise;
+        expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toBeUndefined();
+        expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("awaiting_report");
+        await handleTaskServiceStreamEndForTest(taskService, {
+          type: "stream-end",
+          workspaceId: childId,
+          messageId: "after-user-resume",
+          metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+          parts: [{ type: "text", text: "Final response after resuming" }],
+        });
+        expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
+      } finally {
+        await session.dispose();
+        await taskService.maybeStartQueuedTasks();
+        await flushTerminalAttentionDrains(taskService);
       }
     }
   );
