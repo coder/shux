@@ -381,7 +381,12 @@ interface MemoryStore {
    * callers whose decision must not rest on a possibly partial listing.
    */
   listFiles(options?: { strict?: boolean }): Promise<string[]>;
-  kind(relPath: string): Promise<MemoryEntryKind>;
+  /**
+   * Kind of an entry, null when absent. Tolerant by default (any stat failure
+   * reads as absent); `strict` throws unless the absence is proven (ENOENT /
+   * ENOTDIR), for callers about to overwrite whatever is there.
+   */
+  kind(relPath: string, options?: { strict?: boolean }): Promise<MemoryEntryKind>;
   /**
    * Read at most `maxBytes` from the head of the file. Index/hot-set builds
    * use this so files edited outside MemoryService cannot force unbounded reads
@@ -513,13 +518,26 @@ async function legacyStoreStamp(childSessionDir: string, legacyRoot: string): Pr
   return `${revision ?? "none"}:${rootMtime}:${fileStamps.join("\u0001")}`;
 }
 
-/** Link-aware kind of a path: symlinks are reported as such, never followed. */
-async function lstatKind(absPath: string): Promise<"dir" | "symlink" | "other" | "missing"> {
+/** A stat failure that proves the path is absent (vs. one that says nothing about it). */
+function isMissingPathError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/**
+ * Link-aware kind of a path: symlinks are reported as such, never followed.
+ * "missing" only when proven (ENOENT/ENOTDIR); any other failure (EACCES,
+ * EIO) is "unreadable" — a legacy notebook whose root cannot be inspected
+ * must not read as "nothing to adopt" to a removal about to delete it.
+ */
+async function lstatKind(
+  absPath: string
+): Promise<"dir" | "symlink" | "other" | "missing" | "unreadable"> {
   try {
     const stat = await fsPromises.lstat(absPath);
     return stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "dir" : "other";
-  } catch {
-    return "missing";
+  } catch (error) {
+    return isMissingPathError(error) ? "missing" : "unreadable";
   }
 }
 
@@ -611,11 +629,12 @@ class LocalMemoryStore implements MemoryStore {
     return results.sort();
   }
 
-  async kind(relPath: string): Promise<MemoryEntryKind> {
+  async kind(relPath: string, options?: { strict?: boolean }): Promise<MemoryEntryKind> {
     try {
       const stat = await fsPromises.stat(this.abs(relPath));
       return stat.isDirectory() ? "dir" : "file";
-    } catch {
+    } catch (error) {
+      if (options?.strict === true && !isMissingPathError(error)) throw error;
       return null;
     }
   }
@@ -1289,6 +1308,12 @@ export class MemoryService extends EventEmitter {
     if (options?.force !== true && this.legacyStoreCheckedAgainst.get(childId) === checkKey) {
       return { skipped: 0 };
     }
+    // Not "nothing to adopt": a root that could not be inspected may hold the
+    // only copy of downgrade-era notes. Access-time callers log and retry;
+    // removal aborts with the session intact.
+    const unreadableRoot = (): Error =>
+      new Error(`the legacy workspace memory root of ${childId} could not be inspected`);
+    if (legacyRootKind === "unreadable") throw unreadableRoot();
     if (legacyRootKind !== "dir") {
       if (legacyRootKind === "symlink") {
         log.warn("[MemoryService] ignoring a symlinked legacy workspace memory root", {
@@ -1305,7 +1330,9 @@ export class MemoryService extends EventEmitter {
     let skipped = 0;
     const pass = async (): Promise<void> => {
       await this.assertMutationCommittable(ctx, store, undefined, toVirtualPath("workspace", ""));
-      if ((await lstatKind(legacyRoot)) !== "dir") return; // swapped while waiting for the lock
+      const rootKindUnderLock = await lstatKind(legacyRoot);
+      if (rootKindUnderLock === "unreadable") throw unreadableRoot();
+      if (rootKindUnderLock !== "dir") return; // swapped while waiting for the lock
       const legacy = new LocalMemoryStore(legacyRoot);
       // Strict: a note omitted by a partial listing would count as "nothing
       // to adopt" (skipped stays 0) and removal would then delete its only
@@ -1591,7 +1618,11 @@ export class MemoryService extends EventEmitter {
         () => false
       );
       if (!contained) continue;
-      const kind = await store.kind(candidate);
+      // Strict: a destination that merely could not be stat'ed (EACCES, EIO)
+      // is not free — declaring it so would overwrite whatever the owner
+      // keeps there once the copy runs. The failure aborts the pass instead
+      // (access-time: retried; removal: session intact).
+      const kind = await store.kind(candidate, { strict: true });
       if (kind === null) return { relPath: candidate, write: true };
       if (kind === "file") {
         const existing = await this.readBoundedTextFile(store, candidate, candidate).catch(

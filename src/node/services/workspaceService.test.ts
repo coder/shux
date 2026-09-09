@@ -9,7 +9,10 @@ import {
   workspaceRemovalTombstonePath,
   isWorkspaceRemovalTombstoned,
 } from "@/node/services/workspaceRemoval";
-import { workspaceMemoryWritableForEpoch } from "@/node/services/workspaceMemoryPolicyEpochs";
+import {
+  setWorkspaceMemoryWritableForEpoch,
+  workspaceMemoryWritableForEpoch,
+} from "@/node/services/workspaceMemoryPolicyEpochs";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
@@ -9533,6 +9536,33 @@ describe("WorkspaceService initialize", () => {
             policyEpoch
           )
         ).toBe(false);
+      }
+      // A corrupted CONTAINER (null, array, string) must not throw out of
+      // every turn start; it reads as a deny for every epoch and is healed
+      // (replaced, not spread) by the next write.
+      for (const container of [null, "false", ["-1"]]) {
+        await realConfig.editConfig((cfg) => {
+          const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace as Record<
+            string,
+            unknown
+          >;
+          entry.workspaceMemoryWritableByEpoch = container;
+          return cfg;
+        });
+        const corrupted = findWorkspaceEntry(
+          realConfig.loadConfigOrDefault(),
+          "policy-scratch"
+        )!.workspace;
+        expect(workspaceMemoryWritableForEpoch(corrupted, 60)).toBe(false);
+        expect(
+          await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+            epochHasPriorTurns: false,
+            policyEpoch: 60,
+          })
+        ).toBe(true);
+        expect(persistedFor(60)).not.toBe(true);
+        setWorkspaceMemoryWritableForEpoch(corrupted, 61, true);
+        expect(corrupted.workspaceMemoryWritableByEpoch).toEqual({ "61": true });
       }
 
       // Unknown history fails closed: no accumulator, no marker, no mirror

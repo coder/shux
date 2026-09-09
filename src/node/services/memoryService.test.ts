@@ -1942,9 +1942,52 @@ describe("MemoryService", () => {
       } finally {
         lossy.mockRestore();
       }
+      // A legacy root that cannot be inspected (EACCES) is not "nothing to
+      // adopt" either: removal must abort rather than delete it unseen.
+      const realLstat = fsPromises.lstat.bind(fsPromises);
+      const unreadableRoot = spyOn(fsPromises, "lstat").mockImplementation(((
+        target: Parameters<typeof fsPromises.lstat>[0],
+        ...rest: unknown[]
+      ) =>
+        String(target) === legacyRoot
+          ? Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))
+          : (realLstat as (...args: unknown[]) => unknown)(target, ...rest)) as never);
+      try {
+        expect(
+          await fixture.service
+            .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
+            .then(() => null, getErrorMessage)
+        ).toMatch(/could not be inspected/);
+      } finally {
+        unreadableRoot.mockRestore();
+      }
       // Space frees up; the in-lock delta pass (removal holds the owner-store
       // lock already) folds the note in without re-acquiring the lock.
       await fsPromises.rm(path.join(ownerRoot, "o0000.md"));
+      // A destination whose stat fails (not a proven absence) is not free: the
+      // pass aborts instead of overwriting whatever the owner keeps there.
+      await fsPromises.writeFile(path.join(ownerRoot, "stranded.md"), "owner's own");
+      const realStat = fsPromises.stat.bind(fsPromises);
+      const unreadableTarget = spyOn(fsPromises, "stat").mockImplementation(((
+        target: Parameters<typeof fsPromises.stat>[0],
+        ...rest: unknown[]
+      ) =>
+        String(target) === path.join(ownerRoot, "stranded.md")
+          ? Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))
+          : (realStat as (...args: unknown[]) => unknown)(target, ...rest)) as never);
+      try {
+        expect(
+          await fixture.service
+            .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
+            .then(() => null, getErrorMessage)
+        ).toMatch(/EIO/);
+      } finally {
+        unreadableTarget.mockRestore();
+      }
+      expect(await fsPromises.readFile(path.join(ownerRoot, "stranded.md"), "utf-8")).toBe(
+        "owner's own"
+      );
+      await fsPromises.rm(path.join(ownerRoot, "stranded.md"));
       await withTargetMutationLock(
         fixture.xumHome,
         memoryMutationLockKey(fixture.xumHome, ownerRoot),

@@ -105,7 +105,10 @@ import {
 import {
   carryWorkspaceMemoryDenyMarker,
   clearWorkspaceMemoryDenyMarker,
+  writeWorkspaceMemoryDenyMarker,
 } from "@/node/services/workspaceMemoryDenyMarker";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
@@ -1177,6 +1180,25 @@ export class AgentSession {
       }
       return cfg;
     });
+    // Verified read-back: Config.saveConfig swallows write failures, so the
+    // awaited edit alone does not prove the clear landed. A destructive
+    // boundary reuses epoch -1, and a surviving `-1: false` would pin the
+    // new segment to the stored-false fast path once the mirror is cleared
+    // below — so the mirror is cleared only after the durable state agrees.
+    const after = findWorkspaceEntry(
+      this.config.loadConfigOrDefault({ throwOnError: true }),
+      this.workspaceId
+    );
+    const stale =
+      after !== null &&
+      (options === undefined
+        ? after.workspace.workspaceMemoryWritableByEpoch !== undefined
+        : workspaceMemoryWritableForEpoch(after.workspace, options.closingEpoch) !== undefined);
+    if (stale) {
+      throw new Error(
+        `Workspace memory policy reset did not persist for ${this.workspaceId} (config write swallowed?)`
+      );
+    }
     this.workspaceMemoryWritable = undefined;
   }
 
@@ -1192,35 +1214,72 @@ export class AgentSession {
     closingEpoch: number,
     nextEpoch: number
   ): Promise<void> {
-    await carryWorkspaceMemoryDenyMarker(
-      this.config.rootDir,
-      path.join(this.config.sessionsDir, this.workspaceId),
-      closingEpoch,
-      nextEpoch
-    );
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
-    if (
-      entry === null ||
-      workspaceMemoryWritableForEpoch(entry.workspace, closingEpoch) === undefined
-    ) {
-      return;
-    }
-    await this.config.editConfig((cfg) => {
-      const current = findWorkspaceEntry(cfg, this.workspaceId);
-      if (current === null) return cfg;
-      const closing = workspaceMemoryWritableForEpoch(current.workspace, closingEpoch);
-      if (closing === undefined) return cfg;
-      // ANDed into a record another backend's first turn of the new epoch
-      // may already have made (its own conjunction could not see the closing
-      // value under the new key), never overwriting it.
-      const next = workspaceMemoryWritableForEpoch(current.workspace, nextEpoch);
-      setWorkspaceMemoryWritableForEpoch(
-        current.workspace,
-        nextEpoch,
-        next === undefined ? closing : next && closing
+    const sessionDir = path.join(this.config.sessionsDir, this.workspaceId);
+    await carryWorkspaceMemoryDenyMarker(this.config.rootDir, sessionDir, closingEpoch, nextEpoch);
+    // Fail closed: the carry must be PROVEN, not assumed. A tolerant load
+    // would read a transiently unreadable config.json as "no closing record"
+    // and skip the carry; Config.saveConfig swallows write failures, so the
+    // awaited edit does not prove the new-epoch record landed either. Tail
+    // copies are excluded from the prior-turn check by design, so a fresh or
+    // foreign backend's first turn of the new epoch would then grant, and
+    // output conditioned on the read-only tail would become harvestable.
+    // When a DENY cannot be shown to have reached the new epoch, the
+    // session-dir marker (the same fallback recordWorkspaceMemoryWritable
+    // takes for an unwritable config) denies the new epoch instead.
+    let carried: boolean | undefined;
+    let failure: string | undefined;
+    try {
+      const entry = findWorkspaceEntry(
+        this.config.loadConfigOrDefault({ throwOnError: true }),
+        this.workspaceId
       );
-      deleteWorkspaceMemoryWritableForEpoch(current.workspace, closingEpoch);
-      return cfg;
+      const closingBefore =
+        entry === null ? undefined : workspaceMemoryWritableForEpoch(entry.workspace, closingEpoch);
+      if (closingBefore === undefined) return;
+      await this.config.editConfig((cfg) => {
+        const current = findWorkspaceEntry(cfg, this.workspaceId);
+        if (current === null) return cfg;
+        const closing = workspaceMemoryWritableForEpoch(current.workspace, closingEpoch);
+        if (closing === undefined) return cfg;
+        // ANDed into a record another backend's first turn of the new epoch
+        // may already have made (its own conjunction could not see the closing
+        // value under the new key), never overwriting it.
+        const next = workspaceMemoryWritableForEpoch(current.workspace, nextEpoch);
+        carried = next === undefined ? closing : next && closing;
+        setWorkspaceMemoryWritableForEpoch(current.workspace, nextEpoch, carried);
+        deleteWorkspaceMemoryWritableForEpoch(current.workspace, closingEpoch);
+        return cfg;
+      });
+      // Consumed by another backend's boundary meanwhile: nothing to carry.
+      if (carried === undefined) return;
+      const after = findWorkspaceEntry(
+        this.config.loadConfigOrDefault({ throwOnError: true }),
+        this.workspaceId
+      );
+      if (
+        after === null ||
+        workspaceMemoryWritableForEpoch(after.workspace, nextEpoch) !== carried
+      ) {
+        failure = "config write swallowed";
+      }
+    } catch (error: unknown) {
+      failure = getErrorMessage(error);
+    }
+    // A grant that failed to persist leaves the new epoch without a record,
+    // which every reader treats as "grants normally" — nothing to fail
+    // closed on. A deny (or an unknown value) must be made durable somewhere.
+    if (failure === undefined || carried === true) return;
+    log.warn("Workspace memory policy carry not durable in config; recording a deny marker", {
+      workspaceId: this.workspaceId,
+      closingEpoch,
+      nextEpoch,
+      failure,
+    });
+    // Same gate as WorkspaceService.denyDurableFallback: the marker's mkdir
+    // must not recreate a session dir a concurrent remover already deleted.
+    await withTargetMutationLock(this.config.rootDir, sessionDir, async () => {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, this.workspaceId)) return;
+      await writeWorkspaceMemoryDenyMarker(sessionDir, nextEpoch);
     });
   }
 

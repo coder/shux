@@ -37,11 +37,28 @@ export function workspaceMemoryWritableForEpoch(
   entry: WorkspaceConfigEntry,
   epoch: number
 ): boolean | undefined {
-  const records: Record<string, unknown> | undefined = entry.workspaceMemoryWritableByEpoch;
+  const records = policyRecords(entry);
+  if (records === undefined) return undefined;
+  // A container of the wrong shape (null, array, string) is corruption too:
+  // fail closed for every epoch rather than throw out of every turn start
+  // (Object.hasOwn(null) would). The next write or forget heals it.
+  if (records === null) return false;
   const key = epochKey(epoch);
-  if (records === undefined || !Object.hasOwn(records, key)) return undefined;
+  if (!Object.hasOwn(records, key)) return undefined;
   const value = records[key];
   return typeof value === "boolean" ? value : false;
+}
+
+/**
+ * The persisted container: `undefined` when absent, `null` when present but
+ * not a plain object (raw JSON, no schema validation upstream).
+ */
+function policyRecords(entry: WorkspaceConfigEntry): Record<string, unknown> | null | undefined {
+  const records: unknown = entry.workspaceMemoryWritableByEpoch;
+  if (records === undefined) return undefined;
+  return typeof records === "object" && records !== null && !Array.isArray(records)
+    ? (records as Record<string, unknown>)
+    : null;
 }
 
 /** Record `writable` for `epoch`. */
@@ -50,8 +67,10 @@ export function setWorkspaceMemoryWritableForEpoch(
   epoch: number,
   writable: boolean
 ): void {
+  // A malformed container is replaced, not spread (spreading a string would
+  // persist its characters as epoch keys).
   entry.workspaceMemoryWritableByEpoch = {
-    ...entry.workspaceMemoryWritableByEpoch,
+    ...(policyRecords(entry) === null ? {} : entry.workspaceMemoryWritableByEpoch),
     [epochKey(epoch)]: writable,
   };
 }
@@ -61,11 +80,16 @@ export function deleteWorkspaceMemoryWritableForEpoch(
   entry: WorkspaceConfigEntry,
   epoch: number
 ): void {
-  const current = entry.workspaceMemoryWritableByEpoch;
+  const current = policyRecords(entry);
   if (current === undefined) return;
+  if (current === null) {
+    // Malformed container: nothing recoverable in it, heal by dropping it.
+    delete entry.workspaceMemoryWritableByEpoch;
+    return;
+  }
   const key = epochKey(epoch);
-  if (!(key in current)) return;
-  const next = { ...current };
+  if (!Object.hasOwn(current, key)) return;
+  const next = { ...entry.workspaceMemoryWritableByEpoch };
   delete next[key];
   if (Object.keys(next).length === 0) delete entry.workspaceMemoryWritableByEpoch;
   else entry.workspaceMemoryWritableByEpoch = next;
