@@ -33,7 +33,12 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
-import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
+import {
+  ProvidersConfigStore,
+  SecretsStore,
+  type Config,
+  type Workspace as WorkspaceConfigEntry,
+} from "@/node/config";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
@@ -4258,8 +4263,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   async recordWorkspaceMemoryWritable(
     workspaceId: string,
     writable: boolean,
-    options?: { epochHasPriorTurns: boolean }
+    options: { epochHasPriorTurns: boolean; policyEpoch: number }
   ): Promise<boolean> {
+    // The accumulator (config bit and deny marker alike) is bound to the
+    // compaction epoch it accumulates over — the opening boundary's history
+    // sequence, -1 before any boundary — so a value recorded under another
+    // epoch reads as absent here. Without this, a backend starting the FIRST
+    // turn of a new epoch could read the closing epoch's `false` before the
+    // compacting backend's durable reset landed (the reset is awaited only by
+    // that backend's own session) and carry it, via its mirror, through an
+    // otherwise all-writable epoch.
+    const { policyEpoch } = options;
+    assert(Number.isInteger(policyEpoch), "policyEpoch must be an integer");
     const session =
       this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId);
     // A no-tail compaction's durable epoch reset may still be in flight: read
@@ -4286,7 +4301,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // removed workspace has nothing left to harvest: recorded as done.
         const written = await withTargetMutationLock(this.config.rootDir, sessionDir, async () => {
           if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return false;
-          await writeWorkspaceMemoryDenyMarker(sessionDir);
+          await writeWorkspaceMemoryDenyMarker(sessionDir, policyEpoch);
           return true;
         });
         if (!written) {
@@ -4351,7 +4366,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // removed the durable field underneath it.
     // A fourth input: the session-dir deny marker, the durable fallback taken
     // when config.json could not record a deny (denyDurableFallback above).
-    const denyMarker = await readWorkspaceMemoryDenyMarker(sessionDir);
+    const denyMarker = await readWorkspaceMemoryDenyMarker(sessionDir, policyEpoch);
     // Unknown history fails closed, like the harvest's own unknown → closed
     // rule: with no durable accumulator, no marker and no mirror, an epoch
     // that already holds turns has a policy nobody recorded — the record was
@@ -4360,9 +4375,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // until the next boundary rather than granted by whichever turn comes
     // first. The first turn of a fresh epoch has no prior turns and grants
     // normally.
-    const stored = before.workspace.workspaceMemoryWritable;
+    const storedFor = (entry: WorkspaceConfigEntry): boolean | undefined =>
+      entry.workspaceMemoryWritableEpoch === policyEpoch
+        ? entry.workspaceMemoryWritable
+        : undefined;
+    const stored = storedFor(before.workspace);
     const unknownHistory =
-      stored === undefined && mirror === undefined && options?.epochHasPriorTurns === true;
+      stored === undefined && mirror === undefined && options.epochHasPriorTurns;
     const conjunction = (durable: boolean | undefined): boolean =>
       !denyMarker && !unknownHistory && (durable ?? true) && (mirror ?? true) && writable;
     // Fast path (no write): the outcome cannot differ from the stored value —
@@ -4376,8 +4395,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       await this.config.editConfig((cfg) => {
         const current = findWorkspaceEntry(cfg, workspaceId);
         if (current !== null) {
-          effective = conjunction(current.workspace.workspaceMemoryWritable);
+          effective = conjunction(storedFor(current.workspace));
           current.workspace.workspaceMemoryWritable = effective;
+          current.workspace.workspaceMemoryWritableEpoch = policyEpoch;
         }
         return cfg;
       });
@@ -4390,8 +4410,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return denyDurableFallback(getErrorMessage(error));
     }
     session?.recordWorkspaceMemoryWritable(effective);
-    const persisted = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
-      .workspaceMemoryWritable;
+    const persistedEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    const persisted = persistedEntry === null ? undefined : storedFor(persistedEntry.workspace);
     if (persisted !== effective) {
       log.error("Workspace memory write policy did not persist (config write swallowed?)", {
         workspaceId,
@@ -4500,14 +4520,38 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // to the completion) and the durable accumulator (which other backends
         // sharing this chat.jsonl also write) — and either deny is
         // authoritative; both unknown (fresh recovery session, field absent) →
-        // the harvest fails closed.
-        const persistedWritable = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)
-          ?.workspace.workspaceMemoryWritable;
+        // the harvest fails closed. The durable value counts only under the
+        // CLOSING epoch's key (see recordWorkspaceMemoryWritable). Strict
+        // load: an unreadable config.json would read as the empty default and
+        // silently drop another backend's persisted deny, letting this
+        // session's own writable mirror grant the harvest — skip it instead
+        // (fail closed; nothing is recorded, the epoch is simply not harvested).
+        const closingEpoch = metadata.previousBoundaryHistorySequence ?? -1;
+        let persistedWritable: boolean | undefined;
+        try {
+          const entry = findWorkspaceEntry(
+            this.config.loadConfigOrDefault({ throwOnError: true }),
+            workspaceId
+          )?.workspace;
+          persistedWritable =
+            entry?.workspaceMemoryWritableEpoch === closingEpoch
+              ? entry.workspaceMemoryWritable
+              : undefined;
+        } catch (error: unknown) {
+          log.warn("Skipping post-compaction memory harvest: config.json unreadable", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+          return;
+        }
         // Third observation: the session-dir deny marker (fallback taken when
         // config.json could not record a deny; see recordWorkspaceMemoryWritable).
         // Returned so the session orders its epoch reset (which clears the
         // marker) after this observation; the harvest runs in the background.
-        return readWorkspaceMemoryDenyMarker(path.join(this.config.sessionsDir, workspaceId))
+        return readWorkspaceMemoryDenyMarker(
+          path.join(this.config.sessionsDir, workspaceId),
+          closingEpoch
+        )
           .then((denyMarker) => {
             const observed = [
               metadata.workspaceMemoryWritable,
@@ -6650,6 +6694,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             ownerSessionDir === undefined
               ? undefined
               : async () => {
+                  // Legacy-notebook delta too (locks held: the owner store's
+                  // AND this child's own, so a self-fallback backend's late
+                  // note into <child>/memory either landed before this pass
+                  // or is refused). Throws → removal aborts, session intact.
+                  await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
+                    workspaceId,
+                    memoryOwnerId,
+                    { locksHeld: true }
+                  );
                   await migrateSharedMemoryRefinementRows({
                     childSessionDir: sessionDir,
                     childWorkspaceId: workspaceId,

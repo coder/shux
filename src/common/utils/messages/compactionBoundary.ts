@@ -72,6 +72,26 @@ export function isDurableContextBoundaryMarker(message: MuxMessage | undefined):
 }
 
 /**
+ * History sequence of the latest durable context boundary among `messages`
+ * (any kind), or undefined when there is none. Identifies the compaction
+ * epoch the rows after it belong to: compaction completion metadata carries it
+ * as `previousBoundaryHistorySequence`, and the workspace-memory policy
+ * accumulator is bound to it (WorkspaceService.recordWorkspaceMemoryWritable).
+ */
+export function latestContextBoundaryHistorySequence(
+  messages: readonly MuxMessage[]
+): number | undefined {
+  let latest: number | undefined;
+  for (const message of messages) {
+    if (!isDurableContextBoundaryMarker(message)) continue;
+    const sequence = message.metadata?.historySequence;
+    if (typeof sequence !== "number" || !Number.isInteger(sequence) || sequence < 0) continue;
+    if (latest === undefined || sequence > latest) latest = sequence;
+  }
+  return latest;
+}
+
+/**
  * Locate the latest durable context boundary in reverse chronological order.
  *
  * Returns the index of the newest message tagged with valid boundary metadata,

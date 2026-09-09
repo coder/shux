@@ -39,6 +39,7 @@ import {
 import {
   isDurableCompactedMarker,
   isDurableContextBoundaryMarker,
+  latestContextBoundaryHistorySequence,
   sliceMessagesFromLatestCompactionBoundary,
 } from "@/common/utils/messages/compactionBoundary";
 import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
@@ -300,17 +301,6 @@ function coercePersistedPostCompactionState(
 
 function isCompactedSummaryMessage(message: MuxMessage): boolean {
   return isDurableCompactedMarker(message.metadata?.compacted);
-}
-
-function getLatestBoundaryHistorySequence(messages: readonly MuxMessage[]): number | undefined {
-  let latest: number | undefined;
-  for (const message of messages) {
-    if (!isDurableContextBoundaryMarker(message)) continue;
-    const sequence = message.metadata?.historySequence;
-    if (!isNonNegativeInteger(sequence)) continue;
-    if (latest === undefined || sequence > latest) latest = sequence;
-  }
-  return latest;
 }
 
 function getNextCompactionEpoch(messages: MuxMessage[]): number {
@@ -1343,7 +1333,7 @@ export class CompactionHandler {
       summaryMessageId: boundary.id,
       summaryHistorySequence: sequence,
       compactionEpoch: epoch,
-      previousBoundaryHistorySequence: getLatestBoundaryHistorySequence(params.messages),
+      previousBoundaryHistorySequence: latestContextBoundaryHistorySequence(params.messages),
       compactionRequestMessageId: boundary.id,
       preservedTailMessageCount: copies.length,
     });
@@ -1406,7 +1396,7 @@ export class CompactionHandler {
     const nextCompactionEpoch = getNextCompactionEpoch(messages);
     assert(Number.isInteger(nextCompactionEpoch), "next compaction epoch must be an integer");
 
-    const previousBoundaryHistorySequence = getLatestBoundaryHistorySequence(messages);
+    const previousBoundaryHistorySequence = latestContextBoundaryHistorySequence(messages);
     const maxExistingHistorySequence = this.getMaxExistingHistorySequence(messages);
 
     // For idle compaction, preserve the original recency timestamp so the workspace

@@ -9316,16 +9316,26 @@ describe("WorkspaceService initialize", () => {
     const persisted = () =>
       findWorkspaceEntry(realConfig.loadConfigOrDefault(), "policy-scratch")?.workspace
         .workspaceMemoryWritable;
+    const persistedEpoch = () =>
+      findWorkspaceEntry(realConfig.loadConfigOrDefault(), "policy-scratch")?.workspace
+        .workspaceMemoryWritableEpoch;
+    const EPOCH0 = { epochHasPriorTurns: false, policyEpoch: -1 };
     try {
       // The durable bit is the epoch accumulator: the harvest reads every
       // message of the epoch, so a read-only turn denies the epoch even when
       // a writable turn follows — across restarts and backends, since the
       // conjunction lives in config.json rather than in one process.
-      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
       expect(persisted()).toBe(true);
-      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false, EPOCH0)).toBe(
+        true
+      );
       expect(persisted()).toBe(false);
-      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
       expect(persisted()).toBe(false);
 
       // New epoch (field cleared at the boundary), then ANOTHER backend records
@@ -9336,13 +9346,17 @@ describe("WorkspaceService initialize", () => {
         delete entry.workspace.workspaceMemoryWritable;
         return cfg;
       });
-      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
       expect(persisted()).toBe(true);
       await realConfig.editConfig((cfg) => {
         findWorkspaceEntry(cfg, "policy-scratch")!.workspace.workspaceMemoryWritable = false;
         return cfg;
       });
-      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
       expect(persisted()).toBe(false);
 
       // New epoch again, and now config.json cannot take the deny: the turn's
@@ -9360,17 +9374,21 @@ describe("WorkspaceService initialize", () => {
       spyOn(realConfig, "editConfig").mockImplementationOnce(() =>
         Promise.reject(new Error("disk full"))
       );
-      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false, EPOCH0)).toBe(
+        true
+      );
       expect(persisted()).toBeUndefined();
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
-      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
       expect(persisted()).toBe(false);
       // Malformed marker still denies; an epoch boundary — even the fenced
       // compaction one, since a malformed file cannot claim to be a newer
       // deny — heals it and the next epoch can become writable again.
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
-      await clearWorkspaceMemoryDenyMarker(sessionDir, { notAfter: Date.now() - 60_000 });
+      await clearWorkspaceMemoryDenyMarker(sessionDir, { closingEpoch: -1 });
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "{}");
       await clearWorkspaceMemoryDenyMarker(sessionDir);
@@ -9379,14 +9397,49 @@ describe("WorkspaceService initialize", () => {
         delete entry.workspace.workspaceMemoryWritable;
         return cfg;
       });
-      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
       expect(persisted()).toBe(true);
-      // The fenced clear (compaction boundary) keeps a deny recorded after it.
-      await writeWorkspaceMemoryDenyMarker(sessionDir);
-      await clearWorkspaceMemoryDenyMarker(sessionDir, { notAfter: Date.now() - 60_000 });
+      // The fenced clear (compaction boundary) keeps a deny recorded for the
+      // NEW epoch; readers of any other epoch ignore that deny.
+      await writeWorkspaceMemoryDenyMarker(sessionDir, 7);
+      await clearWorkspaceMemoryDenyMarker(sessionDir, { closingEpoch: -1 });
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 7)).toBe(true);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, -1)).toBe(false);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
-      await clearWorkspaceMemoryDenyMarker(sessionDir, { notAfter: Date.now() + 60_000 });
+      await clearWorkspaceMemoryDenyMarker(sessionDir, { closingEpoch: 7 });
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+
+      // The durable bit is bound to its epoch too: the closing epoch's
+      // `false` is invisible to the first turn of the next epoch on ANOTHER
+      // backend (which cannot await this backend's boundary reset), so it
+      // grants and re-binds the value to its own epoch.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritable = false;
+        entry.workspaceMemoryWritableEpoch = -1;
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 12,
+        })
+      ).toBe(true);
+      expect(persisted()).toBe(true);
+      expect(persistedEpoch()).toBe(12);
+      // ...while a turn of the closing epoch itself still sees its deny.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritable = false;
+        entry.workspaceMemoryWritableEpoch = -1;
+        return cfg;
+      });
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
+      expect(persisted()).toBe(false);
 
       // Unknown history fails closed: no accumulator, no marker, no mirror
       // (this service never recorded this epoch), yet the epoch already holds
@@ -9401,6 +9454,7 @@ describe("WorkspaceService initialize", () => {
       expect(
         await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
           epochHasPriorTurns: true,
+          policyEpoch: -1,
         })
       ).toBe(true);
       expect(persisted()).toBe(false);
@@ -9412,6 +9466,7 @@ describe("WorkspaceService initialize", () => {
       expect(
         await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
           epochHasPriorTurns: false,
+          policyEpoch: -1,
         })
       ).toBe(true);
       expect(persisted()).toBe(true);
@@ -9436,7 +9491,7 @@ describe("WorkspaceService initialize", () => {
       });
       let settled = false;
       const pendingRecord = service
-        .recordWorkspaceMemoryWritable("policy-scratch", true, { epochHasPriorTurns: false })
+        .recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)
         .then((ok) => {
           settled = true;
           return ok;
@@ -9466,11 +9521,15 @@ describe("WorkspaceService initialize", () => {
         throw new Error("config.json: unexpected token");
       };
       spyOn(realConfig, "loadConfigOrDefault").mockImplementationOnce(unreadable);
-      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(false);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        false
+      );
       expect(persisted()).toBeUndefined();
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
       spyOn(realConfig, "loadConfigOrDefault").mockImplementationOnce(unreadable);
-      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false, EPOCH0)).toBe(
+        true
+      );
       expect(persisted()).toBeUndefined();
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
       await clearWorkspaceMemoryDenyMarker(sessionDir);
@@ -9490,7 +9549,9 @@ describe("WorkspaceService initialize", () => {
       spyOn(realConfig, "editConfig").mockImplementationOnce(() =>
         Promise.reject(new Error("disk full"))
       );
-      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false, EPOCH0)).toBe(
+        true
+      );
       expect(
         await fsPromises.stat(sessionDir).then(
           () => true,

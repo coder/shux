@@ -419,28 +419,39 @@ function isLegacyAdoptionRecord(value: unknown): value is LegacyAdoptionRecord {
   );
 }
 
-/** Self-healing read of the adoption manifest: anything malformed reads as not adopted. */
+/**
+ * Self-healing read of the adoption manifest: anything malformed reads as not
+ * adopted. A Map, not a plain object: a legacy note may legitimately be named
+ * `__proto__` (any store-valid relPath), and assigning that key on an
+ * ordinary object hits the prototype setter instead of creating an entry the
+ * serialization would carry — the note would then be re-adopted (and the
+ * owner clock advanced) on every access. JSON.parse and Object.fromEntries
+ * create own properties, so the round-trip below is exact.
+ */
 async function readLegacyAdoptionManifest(
   manifestPath: string
-): Promise<Record<string, LegacyAdoptionRecord>> {
+): Promise<Map<string, LegacyAdoptionRecord>> {
   try {
     const parsed: unknown = JSON.parse(await fsPromises.readFile(manifestPath, "utf-8"));
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
-    return Object.fromEntries(
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return new Map();
+    return new Map(
       Object.entries(parsed).filter((entry): entry is [string, LegacyAdoptionRecord] =>
         isLegacyAdoptionRecord(entry[1])
       )
     );
   } catch {
-    return {};
+    return new Map();
   }
 }
 
 /**
  * Change stamp of a sub-agent's legacy private store: its store clock (any
  * MemoryService write there advances it, including a foreign backend's
- * self-fallback write) plus the root directory's mtime (top-level entry
- * changes made outside MemoryService). Missing pieces read as fixed tokens.
+ * self-fallback write), the root directory's mtime, and every listed file's
+ * size + mtime — a DOWNGRADED build editing an existing nested note moves
+ * neither the clock (it does not know it) nor the root mtime. Bounded by the
+ * per-scope file cap and paid only while a legacy directory exists. Missing
+ * pieces read as fixed tokens.
  */
 async function legacyStoreStamp(childSessionDir: string, legacyRoot: string): Promise<string> {
   const revision = await readWorkspaceMemoryRevision(childSessionDir).catch(() => null);
@@ -448,7 +459,17 @@ async function legacyStoreStamp(childSessionDir: string, legacyRoot: string): Pr
     .stat(legacyRoot)
     .then((stat) => String(stat.mtimeMs))
     .catch(() => "missing");
-  return `${revision ?? "none"}:${rootMtime}`;
+  const files = await new LocalMemoryStore(legacyRoot).listFiles().catch(() => []);
+  const fileStamps = await Promise.all(
+    files.map(async (relPath) => {
+      const stamp = await fsPromises
+        .lstat(path.join(legacyRoot, relPath), { bigint: true })
+        .then((stat) => `${stat.size}:${stat.mtimeNs}`)
+        .catch(() => "missing");
+      return `${relPath}=${stamp}`;
+    })
+  );
+  return `${revision ?? "none"}:${rootMtime}:${fileStamps.join("\u0001")}`;
 }
 
 /** Link-aware kind of a path: symlinks are reported as such, never followed. */
@@ -716,8 +737,10 @@ export class MemoryService extends EventEmitter {
     if (snapshot !== undefined) return resolveWorkspaceMemoryOwnerId(snapshot(), workspaceId);
     const stamp = this.config.configFileStamp();
     if (stamp !== this.workspaceMemoryOwnerConfigStamp) {
-      this.workspaceMemoryOwnerConfigStamp = stamp;
-      this.invalidateWorkspaceMemoryOwnerMemo();
+      // Adopt the new stamp only once its contents were actually read: a
+      // changed-but-unreadable file (see below) must be retried on the next
+      // call, not remembered as "seen".
+      if (this.invalidateWorkspaceMemoryOwnerMemo()) this.workspaceMemoryOwnerConfigStamp = stamp;
     }
     const cached = this.workspaceMemoryOwnerById.get(workspaceId);
     if (cached !== undefined) return cached;
@@ -755,12 +778,26 @@ export class MemoryService extends EventEmitter {
    * Most config edits (titles, models, task status) leave the topology alone;
    * emitting for those would make every live child rebuild its index and hot
    * set from disk on ordinary churn, so only real owner changes are reported.
-   * One parse, only when something was memoized.
+   * One parse, only when something was memoized. Returns false when the
+   * config could not be read (readable stat, unreadable/unparseable content):
+   * the memoized mappings are RETAINED rather than replaced by the empty
+   * default's self fallbacks — those would be pinned until the stamp moved,
+   * which a restored permission bit never does — and the caller keeps the old
+   * stamp so the pass is retried on the next resolution.
    */
-  private invalidateWorkspaceMemoryOwnerMemo(): void {
-    if (this.workspaceMemoryOwnerById.size === 0) return;
+  private invalidateWorkspaceMemoryOwnerMemo(): boolean {
+    if (this.workspaceMemoryOwnerById.size === 0) return true;
     // One parse and one ID index for the whole pass (O(n), not O(n²)).
-    const resolve = workspaceMemoryOwnerResolver(this.config.loadConfigOrDefault());
+    let cfg: ReturnType<Config["loadConfigOrDefault"]>;
+    try {
+      cfg = this.config.loadConfigOrDefault({ throwOnError: true });
+    } catch (error) {
+      log.debug("[MemoryService] config unreadable; keeping memoized workspace memory owners", {
+        error,
+      });
+      return false;
+    }
+    const resolve = workspaceMemoryOwnerResolver(cfg);
     const changed: string[] = [];
     for (const [workspaceId, previousOwner] of this.workspaceMemoryOwnerById) {
       const owner = resolve(workspaceId);
@@ -768,6 +805,7 @@ export class MemoryService extends EventEmitter {
       if (owner !== previousOwner) changed.push(workspaceId);
     }
     if (changed.length > 0) this.emit("ownersInvalidated", changed);
+    return true;
   }
 
   /**
@@ -1066,15 +1104,20 @@ export class MemoryService extends EventEmitter {
    * the deletion would discard its notes for good. Runs BEFORE any teardown
    * step (removal reuses the owner it verified with a strict config load), so
    * a failure aborts the removal with the workspace intact: this variant
-   * THROWS instead of deferring to a next access that will never come. Not
-   * run again under the removal locks — the owner-store lock this takes is
-   * the one removal's critical section holds, and the legacy directory is
-   * written only by downgraded builds or a self-fallback backend, neither of
-   * which the in-lock delta pass could fence anyway.
+   * THROWS instead of deferring to a next access that will never come — also
+   * when a listed note could not be represented in the owner store (shared
+   * notebook at its file cap, both destinations taken by different content,
+   * unreadable as text): the pass would count it as skipped and the deletion
+   * would take the only copy. Removal runs it twice: pre-teardown, and again
+   * inside the removal locks (`locksHeld`, the owner-store lock among them)
+   * right before the tombstone, catching a note a self-fallback backend
+   * committed into the legacy directory in between — the child's own store
+   * lock is held there too, so nothing can land after that pass.
    */
   async adoptLegacyPrivateStoreForRemoval(
     childWorkspaceId: string,
-    ownerWorkspaceId: string
+    ownerWorkspaceId: string,
+    options?: { locksHeld: boolean }
   ): Promise<void> {
     assert(childWorkspaceId.length > 0, "adoptLegacyPrivateStoreForRemoval requires a child id");
     assert(
@@ -1099,20 +1142,31 @@ export class MemoryService extends EventEmitter {
         `shared memory owner of ${childWorkspaceId} resolved to ${String(resolvedOwner)} while removal verified ${ownerWorkspaceId}`
       );
     }
-    await this.adoptLegacyPrivateStoreOrThrow(ctx, store, ownerWorkspaceId, { force: true });
+    const { skipped } = await this.adoptLegacyPrivateStoreOrThrow(ctx, store, ownerWorkspaceId, {
+      force: true,
+      locksHeld: options?.locksHeld === true,
+    });
+    if (skipped > 0) {
+      throw new Error(
+        `${skipped} legacy workspace memory note(s) of ${childWorkspaceId} could not be folded into ${ownerWorkspaceId}'s shared notebook (full, conflicting, or not text); removing the session directory would discard them`
+      );
+    }
   }
 
   /**
    * The adoption pass (see adoptLegacyPrivateStore). `force` skips the
    * per-process "already checked" memo: removal wants the pass to run against
    * the current legacy directory regardless of what an earlier access saw.
+   * `locksHeld`: the caller already holds the owner store's mutation lock
+   * (removal's in-lock delta pass), so it is not re-acquired. Returns how many
+   * listed legacy notes could NOT be represented in the owner store this pass.
    */
   private async adoptLegacyPrivateStoreOrThrow(
     ctx: MemoryScopeContext,
     store: MemoryStore,
     owner: string,
-    options?: { force: boolean }
-  ): Promise<void> {
+    options?: { force: boolean; locksHeld?: boolean }
+  ): Promise<{ skipped: number }> {
     const childId = ctx.workspaceId;
     // Checked once per (child, owner, legacy-store state) per process. The
     // owner is part of the key because ownership can move: a command served
@@ -1121,15 +1175,32 @@ export class MemoryService extends EventEmitter {
     // it because ANOTHER backend can do the same while this process's
     // resolution never changes: its self-fallback write advances the child's
     // store clock (memory.revision in the child's session dir) and replaces a
-    // root entry, so either signal re-runs the pass. Two small stats per
-    // workspace-scope access; the pass itself is idempotent.
+    // root entry, so either signal re-runs the pass — as does any listed
+    // file's size/mtime. The child-keyed sidecar entries are the fourth
+    // input: a downgraded build can change only a pin or usage counter, which
+    // the manifest reconciles (sidecar fingerprint) but no file stat shows.
+    // The pass itself is idempotent.
     const childSessionDir = path.join(this.config.sessionsDir, childId);
     const legacyRoot = path.join(childSessionDir, "memory");
     const legacyRootKind = await lstatKind(legacyRoot);
+    const childKeyPrefix = memoryLogicalKey("workspace", "", {
+      projectPath: ctx.projectPath,
+      workspaceId: childId,
+    });
+    const childSidecarFingerprint =
+      legacyRootKind === "dir"
+        ? JSON.stringify(
+            [...(await this.metaService.getEntries())]
+              .filter(([key]) => key.startsWith(childKeyPrefix))
+              .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          )
+        : "";
     const checkKey = `${owner}\u0000${legacyRootKind}\u0000${
       legacyRootKind === "dir" ? await legacyStoreStamp(childSessionDir, legacyRoot) : ""
-    }`;
-    if (options?.force !== true && this.legacyStoreCheckedAgainst.get(childId) === checkKey) return;
+    }\u0000${childSidecarFingerprint}`;
+    if (options?.force !== true && this.legacyStoreCheckedAgainst.get(childId) === checkKey) {
+      return { skipped: 0 };
+    }
     if (legacyRootKind !== "dir") {
       if (legacyRootKind === "symlink") {
         log.warn("[MemoryService] ignoring a symlinked legacy workspace memory root", {
@@ -1138,12 +1209,13 @@ export class MemoryService extends EventEmitter {
         });
       }
       this.legacyStoreCheckedAgainst.set(childId, checkKey);
-      return;
+      return { skipped: 0 };
     }
     // Files adopted this pass (bytes written OR only their sidecar entries
     // folded in): either changes what the shared store's readers derive from it.
     let adoptedCount = 0;
-    await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
+    let skipped = 0;
+    const pass = async (): Promise<void> => {
       await this.assertMutationCommittable(ctx, store, undefined, toVirtualPath("workspace", ""));
       if ((await lstatKind(legacyRoot)) !== "dir") return; // swapped while waiting for the lock
       const legacy = new LocalMemoryStore(legacyRoot);
@@ -1167,7 +1239,6 @@ export class MemoryService extends EventEmitter {
       let capacityExhausted = false;
       let manifestDirty = false;
       let imported = 0;
-      let skipped = 0;
       for (const relPath of files) {
         // Same read gates as a memory command: containment (no symlink
         // escape), size cap, and text-only (a lossy utf-8 decode cannot be
@@ -1190,7 +1261,7 @@ export class MemoryService extends EventEmitter {
           sidecar: childEntry === undefined ? "" : JSON.stringify(childEntry),
           target: "",
         };
-        const previous = adopted[relPath];
+        const previous = adopted.get(relPath);
         if (previous?.content === record.content && previous.sidecar === record.sidecar) {
           continue; // folded in earlier, nothing changed since
         }
@@ -1272,12 +1343,14 @@ export class MemoryService extends EventEmitter {
             continue;
           }
         }
-        adopted[relPath] = record;
+        adopted.set(relPath, record);
         manifestDirty = true;
         adoptedCount++;
       }
       if (manifestDirty) {
-        await writeFileAtomic(manifestPath, JSON.stringify(adopted), { encoding: "utf-8" });
+        await writeFileAtomic(manifestPath, JSON.stringify(Object.fromEntries(adopted)), {
+          encoding: "utf-8",
+        });
       }
       if (capacityExhausted) {
         log.warn(
@@ -1295,11 +1368,17 @@ export class MemoryService extends EventEmitter {
           { childId, owner, imported, skipped }
         );
       }
-    });
+    };
+    if (options?.locksHeld === true) {
+      await pass();
+    } else {
+      await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), pass);
+    }
     // Recorded against the state observed BEFORE the pass: a foreign write
     // landing during it changes the stamp and re-runs the (idempotent) pass.
     this.legacyStoreCheckedAgainst.set(childId, checkKey);
     if (adoptedCount > 0) this.emitChange(ctx, "workspace", "", "agent");
+    return { skipped };
   }
 
   /**

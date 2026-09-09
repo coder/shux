@@ -32,6 +32,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
+import { latestContextBoundaryHistorySequence } from "@/common/utils/messages/compactionBoundary";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -557,7 +558,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
     recordWorkspaceMemoryWritable(
       workspaceId: string,
       writable: boolean,
-      options: { epochHasPriorTurns: boolean }
+      options: { epochHasPriorTurns: boolean; policyEpoch: number }
     ): Promise<boolean>;
   };
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
@@ -1484,10 +1485,21 @@ export class TurnRequestBuilder {
           message.metadata?.muxMetadata?.type !== "compaction-request"
       );
     })();
+    // The compaction epoch this turn's policy accumulates over: the latest
+    // durable boundary's history sequence (any kind), -1 before any boundary
+    // — the same identity compaction completion reports as
+    // previousBoundaryHistorySequence, so the completion-side observation
+    // and every backend's turn records agree on which epoch a value belongs to.
+    const policyEpoch = latestContextBoundaryHistorySequence(messages) ?? -1;
     const persistWorkspaceMemoryWritable = async (writable: boolean): Promise<boolean> => {
       const sink = this.dependencies.bindings.workspaceMemoryPolicySink;
       if (isCompactionRequest || !sink) return true;
-      if (await sink.recordWorkspaceMemoryWritable(workspaceId, writable, { epochHasPriorTurns })) {
+      if (
+        await sink.recordWorkspaceMemoryWritable(workspaceId, writable, {
+          epochHasPriorTurns,
+          policyEpoch,
+        })
+      ) {
         return true;
       }
       if (!writable) return false;

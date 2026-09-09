@@ -109,6 +109,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Whether this workspace's agent may write /memories/workspace, as resolved on its last normal turn. Persisted so a post-compaction memory harvest that resumes in a fresh session (restart, recovery) still knows the policy; harvest fails closed when unknown.",
   }),
+  workspaceMemoryWritableEpoch: z.number().optional().meta({
+    description:
+      "Compaction epoch `workspaceMemoryWritable` accumulates over: the history sequence of the durable context boundary that opened it (-1 before any boundary). Readers ignore the value under any other epoch, so a backend starting the new epoch cannot inherit the closing epoch's value before the boundary reset lands.",
+  }),
   memoryOwnerWorkspaceId: z.string().optional().meta({
     description:
       "Memory owner pinned when an intermediate ancestor was removed while this descendant stayed alive: the parentWorkspaceId chain no longer reaches the task-tree root, so this keeps /memories/workspace bound to the root's store (memoryWorkspaceOwner.ts). Set only by workspace removal.",

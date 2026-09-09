@@ -92,7 +92,10 @@ import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
-import { clearWorkspaceMemoryDenyMarker } from "@/node/services/workspaceMemoryDenyMarker";
+import {
+  carryWorkspaceMemoryDenyMarker,
+  clearWorkspaceMemoryDenyMarker,
+} from "@/node/services/workspaceMemoryDenyMarker";
 import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
@@ -1098,17 +1101,14 @@ export class AgentSession {
    * grant is never left behind by this path — grants are re-recorded per
    * turn). Nothing to do when the field is already absent.
    */
-  private async resetWorkspaceMemoryWritable(options?: {
-    closing: boolean | undefined;
-  }): Promise<void> {
-    const boundaryAt = Date.now();
+  private async resetWorkspaceMemoryWritable(options?: { closingEpoch: number }): Promise<void> {
     this.workspaceMemoryWritable = undefined;
     // The session-dir deny marker (fallback for an unwritable config.json)
     // belongs to the closing epoch too. Same fence idea as below: a deny
-    // recorded after this boundary is the new epoch's and survives.
+    // recorded for the new epoch survives.
     await clearWorkspaceMemoryDenyMarker(
       path.join(this.config.sessionsDir, this.workspaceId),
-      options !== undefined ? { notAfter: boundaryAt } : undefined
+      options
     );
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
     if (entry?.workspace.workspaceMemoryWritable === undefined) return;
@@ -1117,13 +1117,45 @@ export class AgentSession {
       if (current === null) return cfg;
       // Fenced to the epoch being closed: another backend may already have
       // recorded the first turn of the NEW epoch between the completion and
-      // this locked write; a value different from the one this session
-      // observed at the boundary is that newer epoch's and must survive
-      // (a same-valued newer deny survives through that backend's mirror).
-      if (options !== undefined && current.workspace.workspaceMemoryWritable !== options.closing) {
+      // this locked write; a value bound to a different epoch is that newer
+      // epoch's and must survive. (Readers ignore a stale epoch's value
+      // anyway — WorkspaceService.recordWorkspaceMemoryWritable — so this
+      // delete is hygiene, not the correctness boundary.)
+      if (
+        options !== undefined &&
+        current.workspace.workspaceMemoryWritableEpoch !== options.closingEpoch
+      ) {
         return cfg;
       }
       delete current.workspace.workspaceMemoryWritable;
+      delete current.workspace.workspaceMemoryWritableEpoch;
+      return cfg;
+    });
+  }
+
+  /**
+   * Preserved-tail compaction: the tail copies were produced under the
+   * closing epoch's policy, so its accumulator carries into the new epoch —
+   * durably, by re-binding the config value and the deny marker recorded for
+   * `closingEpoch` to `nextEpoch` (another backend's first turn of the new
+   * epoch reads by epoch and would otherwise see nothing). Fenced like the
+   * reset: a value already bound to another epoch is left alone.
+   */
+  private async carryWorkspaceMemoryWritable(
+    closingEpoch: number,
+    nextEpoch: number
+  ): Promise<void> {
+    await carryWorkspaceMemoryDenyMarker(
+      path.join(this.config.sessionsDir, this.workspaceId),
+      closingEpoch,
+      nextEpoch
+    );
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
+    if (entry?.workspace.workspaceMemoryWritableEpoch !== closingEpoch) return;
+    await this.config.editConfig((cfg) => {
+      const current = findWorkspaceEntry(cfg, this.workspaceId);
+      if (current?.workspace.workspaceMemoryWritableEpoch !== closingEpoch) return cfg;
+      current.workspace.workspaceMemoryWritableEpoch = nextEpoch;
       return cfg;
     });
   }
@@ -1299,30 +1331,36 @@ export class AgentSession {
         );
         // New epoch. A preserved tail copies messages produced under this
         // epoch's policy into the next one, so the fail-closed accumulator
-        // carries over with them; otherwise the next normal turn restarts it.
-        // The mirror forgets the closing epoch right here, synchronously; the
-        // durable reset runs AFTER the completion observation settled (it
-        // reads the closing epoch's marker/config) and is awaited by the next
-        // turn's policy record (settleWorkspaceMemoryPolicyEpoch), so no turn
-        // of the new epoch can AND itself with the closing epoch's stale deny.
-        if ((metadata.preservedTailMessageCount ?? 0) === 0) {
-          this.workspaceMemoryWritable = undefined;
-          const reset = observed
-            .catch(() => undefined)
-            .then(() => this.resetWorkspaceMemoryWritable({ closing }))
-            .catch((error: unknown) => {
-              log.warn("Failed to reset the workspace memory policy epoch", {
-                workspaceId: this.workspaceId,
-                error,
-              });
-            })
-            .finally(() => {
-              if (this.workspaceMemoryEpochReset === reset) {
-                this.workspaceMemoryEpochReset = undefined;
-              }
+        // carries over with them (re-bound to the new epoch key, durably);
+        // otherwise the next normal turn restarts it. The mirror forgets the
+        // closing epoch right here, synchronously; the durable reset runs
+        // AFTER the completion observation settled (it reads the closing
+        // epoch's marker/config) and is awaited by this session's next turn
+        // (settleWorkspaceMemoryPolicyEpoch). Other backends need no such
+        // wait: every durable value is bound to its epoch, so the closing
+        // epoch's value is invisible to their new-epoch turns regardless.
+        const closingEpoch = metadata.previousBoundaryHistorySequence ?? -1;
+        const preservedTail = (metadata.preservedTailMessageCount ?? 0) > 0;
+        if (!preservedTail) this.workspaceMemoryWritable = undefined;
+        const reset = observed
+          .catch(() => undefined)
+          .then(() =>
+            preservedTail
+              ? this.carryWorkspaceMemoryWritable(closingEpoch, metadata.summaryHistorySequence)
+              : this.resetWorkspaceMemoryWritable({ closingEpoch })
+          )
+          .catch((error: unknown) => {
+            log.warn("Failed to reset the workspace memory policy epoch", {
+              workspaceId: this.workspaceId,
+              error,
             });
-          this.workspaceMemoryEpochReset = reset;
-        }
+          })
+          .finally(() => {
+            if (this.workspaceMemoryEpochReset === reset) {
+              this.workspaceMemoryEpochReset = undefined;
+            }
+          });
+        this.workspaceMemoryEpochReset = reset;
       },
       onIdleCompactionOutcome,
     });
