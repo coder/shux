@@ -2254,8 +2254,8 @@ export class HistoryService {
     try {
       const partialPath = this.getPartialPath(workspaceId);
       const data = await fs.readFile(partialPath, "utf-8");
-      const message = JSON.parse(data) as MuxMessage;
-      return normalizeLegacyMuxMetadata(message);
+      const message: unknown = JSON.parse(data);
+      return isReadableHistoryMessage(message) ? normalizeLegacyMuxMetadata(message) : null;
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return null;

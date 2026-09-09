@@ -763,7 +763,9 @@ describe("AgentSession startup auto-retry recovery", () => {
       })
     );
     try {
-      expect(await session.isStartupRecoveryBlocked()).toBe(marker.stopped);
+      expect(await session.getStartupRecoveryState()).toBe(
+        marker.stopped ? "blocked" : "interrupted"
+      );
       const history = await historyService.getLastMessages(workspaceId, 20);
       expect(history.success && history.data.map((message) => message.id)).toEqual(["user-1"]);
     } finally {
@@ -789,14 +791,14 @@ describe("AgentSession startup auto-retry recovery", () => {
       })
     );
     try {
-      expect(await session.isStartupRecoveryBlocked()).toBe(true);
+      expect(await session.getStartupRecoveryState()).toBe("blocked");
       spyOn(historyService, "getLastMessages").mockRejectedValueOnce(new Error("unreadable"));
-      expect(await session.isStartupRecoveryBlocked()).toBe(true);
+      expect(await session.getStartupRecoveryState()).toBe("blocked");
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage("notice", "user", "Snapshot", { synthetic: true })
       );
-      expect(await session.isStartupRecoveryBlocked()).toBe(true);
+      expect(await session.getStartupRecoveryState()).toBe("blocked");
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage("guidance", "user", "Continue", {
@@ -804,7 +806,7 @@ describe("AgentSession startup auto-retry recovery", () => {
           retrySendOptions: { model: "openai:gpt-4o", agentId: "exec", agentInitiated: true },
         })
       );
-      expect(await session.isStartupRecoveryBlocked()).toBe(false);
+      expect(await session.getStartupRecoveryState()).toBe("interrupted");
       expect(JSON.parse(await fsPromises.readFile(preferencePath, "utf-8"))).toMatchObject({
         startupAutoRetryAbandon: { reason: "aborted", userMessageId: "stopped-user" },
       });
@@ -828,37 +830,122 @@ describe("AgentSession startup auto-retry recovery", () => {
       "waitForStartupReadRetry"
     ).mockResolvedValue(undefined);
     try {
-      expect(await session.isStartupRecoveryBlocked()).toBe(true);
+      expect(await session.getStartupRecoveryState()).toBe("blocked");
       expect(wait).toHaveBeenCalled();
       await fsPromises.rm(partialPath, { recursive: true });
-      expect(await session.isStartupRecoveryBlocked()).toBe(false);
+      expect(await session.getStartupRecoveryState()).toBe("interrupted");
     } finally {
       wait.mockRestore();
       await session.dispose();
     }
   });
 
-  test("does not strand a task behind crash-truncated partial JSON", async () => {
-    const workspaceId = "startup-corrupt-partial";
-    const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
-    await historyService.appendToHistory(workspaceId, createMuxMessage("user", "user", "Continue"));
-    await fsPromises.writeFile(
-      path.join(config.sessionsDir, workspaceId, "partial.json"),
-      '{"id":'
-    );
-    const wait = spyOn(
-      session as unknown as { waitForStartupReadRetry(delay: number): Promise<void> },
-      "waitForStartupReadRetry"
-    );
-    try {
-      expect(await session.isStartupRecoveryBlocked()).toBe(false);
-      expect(wait).not.toHaveBeenCalled();
-    } finally {
-      wait.mockRestore();
-      await session.dispose();
+  test.each(['{"id":', "null", "{}", '{"id":"bad","role":"assistant","parts":null}'])(
+    "does not strand a task behind corrupt partial JSON (%s)",
+    async (corrupt) => {
+      const workspaceId = "startup-corrupt-partial";
+      const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user", "user", "Continue")
+      );
+      await fsPromises.writeFile(
+        path.join(config.sessionsDir, workspaceId, "partial.json"),
+        corrupt
+      );
+      const wait = spyOn(
+        session as unknown as { waitForStartupReadRetry(delay: number): Promise<void> },
+        "waitForStartupReadRetry"
+      );
+      try {
+        expect(await session.getStartupRecoveryState()).toBe("interrupted");
+        expect(wait).not.toHaveBeenCalled();
+      } finally {
+        wait.mockRestore();
+        await session.dispose();
+      }
     }
-  });
+  );
+
+  test.each(["preference", "partial", "history"] as const)(
+    "bounds a hung %s read without releasing its physical lease",
+    async (kind) => {
+      const { session, historyService, events, cleanup } = await createSessionBundle(
+        `hung-${kind}`
+      );
+      cleanups.push(cleanup);
+      const entered = Promise.withResolvers<void>();
+      const gate = Promise.withResolvers<void>();
+      const preference = session as unknown as { readAutoRetryState(): Promise<void> };
+      const readPreference = preference.readAutoRetryState.bind(session);
+      const readPartial = historyService.readPartial.bind(historyService);
+      const readHistory = historyService.getLastMessages.bind(historyService);
+      const pause = async () => {
+        entered.resolve();
+        await gate.promise;
+      };
+      const preferenceSpy =
+        kind === "preference"
+          ? spyOn(preference, "readAutoRetryState").mockImplementationOnce(async () => {
+              await pause();
+              await readPreference();
+            })
+          : undefined;
+      const partialSpy =
+        kind === "partial"
+          ? spyOn(historyService, "readPartial").mockImplementationOnce(async (...args) => {
+              await pause();
+              return readPartial(...args);
+            })
+          : undefined;
+      const historySpy =
+        kind === "history"
+          ? spyOn(historyService, "getLastMessages").mockImplementationOnce(async (...args) => {
+              await pause();
+              return readHistory(...args);
+            })
+          : undefined;
+      try {
+        const probe = session.getStartupRecoveryState(25);
+        await entered.promise;
+        expect(await probe).toBe("blocked");
+        let disposed = false;
+        const disposal = session.dispose().then(() => {
+          disposed = true;
+        });
+        await Promise.resolve();
+        expect(disposed).toBe(false);
+        gate.resolve();
+        await disposal;
+        expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+      } finally {
+        gate.resolve();
+        preferenceSpy?.mockRestore();
+        partialSpy?.mockRestore();
+        historySpy?.mockRestore();
+        await session.dispose();
+      }
+    }
+  );
+
+  test.each([false, true])(
+    "classifies completed versus interrupted assistant tails (%s)",
+    async (partial) => {
+      const workspaceId = "startup-tail-state";
+      const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("answer", "assistant", "Done", { partial })
+      );
+      try {
+        expect(await session.getStartupRecoveryState()).toBe(partial ? "interrupted" : "idle");
+      } finally {
+        await session.dispose();
+      }
+    }
+  );
 
   test("task read retries settle while a provider stream remains active", async () => {
     const workspaceId = "startup-busy-read-retry";
@@ -871,7 +958,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       new Error("busy disk")
     );
     try {
-      expect(await session.isStartupRecoveryBlocked()).toBe(false);
+      expect(await session.getStartupRecoveryState()).toBe("interrupted");
       expect(read).toHaveBeenCalledTimes(2);
     } finally {
       await session.dispose();
@@ -893,7 +980,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       "waitForStartupReadRetry"
     ).mockImplementationOnce(() => fsPromises.rm(partialPath, { recursive: true }));
     try {
-      expect(await session.isStartupRecoveryBlocked()).toBe(false);
+      expect(await session.getStartupRecoveryState()).toBe("interrupted");
       expect(wait).toHaveBeenCalledTimes(1);
     } finally {
       wait.mockRestore();
@@ -991,7 +1078,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     });
 
     await secondSession.ensureStartupAutoRetryCheck();
-    expect(await secondSession.isStartupRecoveryBlocked()).toBe(true);
+    expect(await secondSession.getStartupRecoveryState()).toBe("blocked");
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
@@ -2005,7 +2092,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       )
     );
     expect(writePartialResult.success).toBe(true);
-    expect(await session.isStartupRecoveryBlocked()).toBe(true);
+    expect(await session.getStartupRecoveryState()).toBe("blocked");
 
     await session.ensureStartupAutoRetryCheck();
 

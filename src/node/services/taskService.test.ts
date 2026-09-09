@@ -3476,7 +3476,7 @@ describe("TaskService", () => {
     ];
     await saveWorkspaces(config, projectPath, workspaces, testTaskSettings());
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
-      isStartupRecoveryBlocked: mock(async () => {
+      getStartupRecoveryState: mock(async () => {
         await saveWorkspaces(
           config,
           projectPath,
@@ -3489,7 +3489,7 @@ describe("TaskService", () => {
           ],
           testTaskSettings()
         );
-        return false;
+        return "interrupted" as const;
       }),
     });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
@@ -3508,7 +3508,7 @@ describe("TaskService", () => {
         projectPath,
         [
           projectWorkspace(projectPath, "parent", "parent"),
-          ...["stopped", "failed-follow-up", "crashed", "compacted"].map((id) =>
+          ...["stopped", "failed-follow-up", "crashed", "compacted", "settled"].map((id) =>
             projectWorkspace(projectPath, id, id, {
               parentWorkspaceId: "parent",
               agentId: "exec",
@@ -3526,12 +3526,20 @@ describe("TaskService", () => {
         )
       );
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
-        isStartupRecoveryBlocked: mock((id: string) => Promise.resolve(id === "stopped")),
+        getStartupRecoveryState: mock((id: string) =>
+          Promise.resolve(
+            id === "stopped"
+              ? ("blocked" as const)
+              : id === "crashed"
+                ? ("interrupted" as const)
+                : ("idle" as const)
+          )
+        ),
         dispatchPendingCompactionFollowUp,
       });
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       await taskService.recoverInterruptedTasks();
-      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage).toHaveBeenCalledTimes(taskStatus == null ? 1 : 2);
       expect(sendMessage.mock.calls[0]?.[0]).toBe("crashed");
       expect(findWorkspaceInConfig(config, "stopped")?.taskStatus).toBe(taskStatus);
       expect(dispatchPendingCompactionFollowUp).not.toHaveBeenCalledWith("stopped");
@@ -14645,7 +14653,7 @@ describe("TaskService", () => {
 
     const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
     const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks({
-      isStartupRecoveryBlocked: mock(() => Promise.resolve(true)),
+      getStartupRecoveryState: mock(() => Promise.resolve("blocked" as const)),
     });
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 

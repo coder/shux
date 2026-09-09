@@ -1,3 +1,4 @@
+import type { StartupRecoveryState } from "./startupRecovery";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type { ExperimentId } from "@/common/constants/experiments";
@@ -415,7 +416,7 @@ export interface WorkspaceTurnHost {
 }
 
 export interface TurnAdmissionHost {
-  isStartupRecoveryBlocked(workspaceId: string): Promise<boolean>;
+  getStartupRecoveryState(workspaceId: string): Promise<StartupRecoveryState>;
   dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>>;
   isBusyForMessage(workspaceId: string): boolean;
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;

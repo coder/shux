@@ -4,6 +4,8 @@ import {
   STARTUP_RECOVERY_READ_MAX_DELAY_MS,
 } from "@/constants/startupRecovery";
 
+export type StartupRecoveryState = "blocked" | "interrupted" | "idle";
+
 export type StartupRecoveryOutcome = "completed" | "deferred" | "retryable";
 
 interface StartupRecoveryOptions {

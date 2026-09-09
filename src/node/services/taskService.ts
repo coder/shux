@@ -2399,16 +2399,20 @@ export class TaskService implements AgentTaskIntegration {
     }
     config = this.config.loadConfigOrDefault();
     const candidates = startupTasks();
-    const blocked = await Promise.all(
-      candidates.map((task) => this.workspaceService.isStartupRecoveryBlocked(task.id!))
-    );
-    const admitted = new Set(
-      candidates.filter((_, index) => !blocked[index]).map((task) => task.id)
+    const states = new Map(
+      await Promise.all(
+        candidates.map(
+          async (task) =>
+            [task.id, await this.workspaceService.getStartupRecoveryState(task.id!)] as const
+        )
+      )
     );
     // Reads can outlive a queued child's stream: do not recover its stale running snapshot.
     config = this.config.loadConfigOrDefault();
     taskIndex = this.buildAgentTaskIndex(config);
-    const eligible = startupTasks().filter((task) => admitted.has(task.id));
+    const eligible = startupTasks().filter(
+      (task) => states.has(task.id) && states.get(task.id) !== "blocked"
+    );
     const awaitingReportTasks = eligible.filter((task) => task.taskStatus === "awaiting_report");
     const runningTasks = eligible.filter((task) => (task.taskStatus ?? "running") === "running");
 
@@ -2495,10 +2499,17 @@ export class TaskService implements AgentTaskIntegration {
       if (!followUp.success) failedRunningCount += 1;
       else if (followUp.data && pendingGuidance.length === 0) resumedRunningCount += 1;
       if (!followUp.success || (followUp.data && pendingGuidance.length === 0)) continue;
+      const model = task.taskModelString ?? defaultModel;
+      const agentId = resolveTaskAgentIdForResume(task);
+      const sendOptions = {
+        model,
+        agentId,
+        thinkingLevel: task.taskThinkingLevel,
+        reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
+        experiments: task.taskExperiments,
+      };
       if (pendingGuidance.length > 0) {
         const pendingGuidanceIds = new Set(pendingGuidance.map((guidance) => guidance.id));
-        const model = task.taskModelString ?? defaultModel;
-        const agentId = resolveTaskAgentIdForResume(task);
         const clearAcceptedPendingGuidance = async (): Promise<void> => {
           await this.editWorkspaceEntry(
             task.id!,
@@ -2517,13 +2528,7 @@ export class TaskService implements AgentTaskIntegration {
             pendingGuidance
               .map((guidance, index) => `${index + 1}. ${guidance.message}`)
               .join("\n\n"),
-          {
-            model,
-            agentId,
-            thinkingLevel: task.taskThinkingLevel,
-            reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
-            experiments: task.taskExperiments,
-          },
+          sendOptions,
           {
             synthetic: true,
             agentInitiated: true,
@@ -2542,21 +2547,22 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
 
+      // Legacy tasks lack active-status evidence. Durable compaction/guidance above still wins.
+      if (task.taskStatus == null && states.get(task.id) !== "interrupted") continue;
       const isPlanLike = await this.isPlanLikeTaskWorkspace({
         projectPath: task.projectPath,
         workspace: task,
       });
 
-      const model = task.taskModelString ?? defaultModel;
-      const agentId = resolveTaskAgentIdForResume(task);
-      log.info("[startup] Resuming running task", {
+      const logContext = {
         taskId: task.id,
         taskName: task.name,
         projectPath: task.projectPath,
         model,
         agentId,
         isPlanLike,
-      });
+      };
+      log.info("[startup] Resuming running task", logContext);
       const resumeStartedAt = Date.now();
       const restartCompletionInstruction = isPlanLike
         ? "When you have a final plan, call propose_plan exactly once."
@@ -2565,25 +2571,14 @@ export class TaskService implements AgentTaskIntegration {
         task.id,
         "Xum restarted while this task was running. Continue where you left off. " +
           restartCompletionInstruction,
-        {
-          model,
-          agentId,
-          thinkingLevel: task.taskThinkingLevel,
-          reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
-          experiments: task.taskExperiments,
-        },
+        sendOptions,
         { synthetic: true, agentInitiated: true }
       );
       const durationMs = Date.now() - resumeStartedAt;
       if (!sendResult.success) {
         failedRunningCount += 1;
         log.error("Failed to resume running task on startup", {
-          taskId: task.id,
-          taskName: task.name,
-          projectPath: task.projectPath,
-          model,
-          agentId,
-          isPlanLike,
+          ...logContext,
           durationMs,
           error: sendResult.error,
         });
@@ -2591,15 +2586,7 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       resumedRunningCount += 1;
-      log.info("[startup] Resumed running task", {
-        taskId: task.id,
-        taskName: task.name,
-        projectPath: task.projectPath,
-        model,
-        agentId,
-        isPlanLike,
-        durationMs,
-      });
+      log.info("[startup] Resumed running task", { ...logContext, durationMs });
     }
 
     if (interruptedInactiveWorkflowOwnerAtStartup) {

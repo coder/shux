@@ -1,3 +1,5 @@
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { STARTUP_RECOVERY_PROBE_TIMEOUT_MS } from "@/constants/startupRecovery";
 import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
@@ -40,7 +42,12 @@ import * as path from "path";
 import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
 import { Effect, Fiber } from "effect";
-import { StartupRecovery, retryStartupRead, type StartupRecoveryOutcome } from "./startupRecovery";
+import {
+  StartupRecovery,
+  retryStartupRead,
+  type StartupRecoveryOutcome,
+  type StartupRecoveryState,
+} from "./startupRecovery";
 import { hasErrorCode } from "./tools/skillFileUtils";
 import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
@@ -90,13 +97,15 @@ import {
 } from "@/constants/goals";
 import type { SendMessageError } from "@/common/types/errors";
 import {
-  AgentIdSchema,
   ChatMuxMessageSchema,
   SendMessageOptionsSchema,
   SkillNameSchema,
 } from "@/common/orpc/schemas";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
-import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
+import {
+  normalizePersistedAgentCandidate,
+  resolvePersistedAgentIdCandidates,
+} from "@/common/utils/agentIds";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import {
@@ -1782,7 +1791,7 @@ export class AgentSession {
    * and a write never rebuilds the file from unloaded defaults.
    */
   private loadAutoRetryState(): Promise<void> {
-    this.autoRetryStateLoad ??= this.readAutoRetryState();
+    this.autoRetryStateLoad ??= this.runStartupRecoveryStep(() => this.readAutoRetryState());
     return this.autoRetryStateLoad;
   }
 
@@ -1996,16 +2005,6 @@ export class AgentSession {
     // recovered turn through direct OpenAI instead of the selected gateway.
     const normalized = normalizeSelectedModel(model);
     return isValidModelFormat(normalized) ? normalized : undefined;
-  }
-
-  private normalizeAgentIdForRetry(agentId: unknown): string | undefined {
-    if (typeof agentId !== "string") {
-      return undefined;
-    }
-
-    const normalized = normalizeAgentId(agentId, "");
-    const parsed = AgentIdSchema.safeParse(normalized);
-    return parsed.success ? parsed.data : undefined;
   }
 
   private isPendingAskUserQuestion(message: MuxMessage | null | undefined): boolean {
@@ -2365,8 +2364,10 @@ export class AgentSession {
 
     const workspaceAgentIdCandidates = resolvePersistedAgentIdCandidates(workspaceMetadata);
     const workspaceAgentId = workspaceAgentIdCandidates[0] ?? WORKSPACE_DEFAULTS.agentId;
-    const persistedAgentId = this.normalizeAgentIdForRetry(persistedRetrySendOptions?.agentId);
-    const assistantAgentId = this.normalizeAgentIdForRetry(lastAssistantMessage?.metadata?.agentId);
+    const persistedAgentId = normalizePersistedAgentCandidate(persistedRetrySendOptions?.agentId);
+    const assistantAgentId = normalizePersistedAgentCandidate(
+      lastAssistantMessage?.metadata?.agentId
+    );
     const baseAgentId = persistedAgentId ?? assistantAgentId ?? workspaceAgentId;
     const agentSettings =
       [baseAgentId, ...workspaceAgentIdCandidates]
@@ -2554,11 +2555,8 @@ export class AgentSession {
   async getStartupAutoRetryModelHint(): Promise<string | null> {
     this.assertNotDisposed("getStartupAutoRetryModelHint");
 
-    const [partial, historyResult] = await Promise.all([
-      this.historyService.readPartial(this.workspaceId),
-      this.historyService.getLastMessages(this.workspaceId, 20),
-    ]);
-    if (!historyResult.success) {
+    const [partial, historyResult] = (await this.readStartupTail()) ?? [];
+    if (partial === undefined || !historyResult?.success) {
       return null;
     }
 
@@ -2577,10 +2575,10 @@ export class AgentSession {
     return retryRequest?.model ?? null;
   }
 
-  private async runStartupRecoveryStep(step: () => unknown): Promise<void> {
+  private async runStartupRecoveryStep<T>(step: () => T | Promise<T>): Promise<T | undefined> {
     if (this.coordinator.closing) return;
     using _execution = this.coordinator.enterExecution();
-    await step();
+    return await step();
   }
 
   private async scheduleStartupAutoRetryIfNeeded(): Promise<StartupRecoveryOutcome> {
@@ -2600,24 +2598,12 @@ export class AgentSession {
       return "completed";
     }
 
-    const reads = await Promise.allSettled([
-      this.historyService.readPartial(this.workspaceId),
-      this.historyService.getLastMessages(this.workspaceId, 20),
-    ]);
+    const [partial, historyResult] = (await this.readStartupTail()) ?? [];
     if (!isCurrent()) return "completed";
-    // A rejected read does not cancel its sibling's disk I/O. Join both before releasing
-    // this probe's physical lease, and retry only the reads rather than the recovery prefix.
-    const [partialRead, historyRead] = reads;
-    if (partialRead.status === "rejected" || historyRead.status === "rejected") {
-      return "retryable";
-    }
-    const partial = partialRead.value;
-    const historyResult = historyRead.value;
-
-    if (!historyResult.success) {
+    if (partial === undefined || !historyResult?.success) {
       log.warn("Failed to inspect history for startup auto-retry", {
         workspaceId: this.workspaceId,
-        error: historyResult.error,
+        error: historyResult?.success ? undefined : historyResult?.error,
       });
       return "retryable";
     }
@@ -2681,18 +2667,18 @@ export class AgentSession {
     return "completed";
   }
 
-  private async waitForStartupReadRetry(retryDelayMs: number): Promise<void> {
+  private async waitForStartupReadRetry(
+    retryDelayMs: number,
+    signal = this.closingSignal
+  ): Promise<void> {
     const delayMs = Math.max(0, Math.trunc(retryDelayMs));
     if (delayMs > 0) {
       const runner = this.streamManager.effectRunner ?? defaultEffectRunner;
       const sleeper = runner.runFork(Effect.sleep(delayMs));
-      const cancel = () => sleeper.interruptUnsafe();
-      this.closingSignal.addEventListener("abort", cancel, { once: true });
-      if (this.closingSignal.aborted) cancel();
       try {
-        await runner.runPromise(Fiber.await(sleeper));
+        await raceWithAbortAndTimeout(runner.runPromise(Fiber.await(sleeper)), { signal });
       } finally {
-        this.closingSignal.removeEventListener("abort", cancel);
+        sleeper.interruptUnsafe();
       }
     }
   }
@@ -2745,41 +2731,65 @@ export class AgentSession {
     }
   }
 
-  async isStartupRecoveryBlocked(): Promise<boolean> {
+  async getStartupRecoveryState(
+    timeoutMs = STARTUP_RECOVERY_PROBE_TIMEOUT_MS
+  ): Promise<StartupRecoveryState> {
+    if (this.closingSignal.aborted) return "blocked";
+    const deadline = new AbortController();
+    const signal = AbortSignal.any([this.closingSignal, deadline.signal]);
+    try {
+      // Release admission on timeout, not the original read's physical I/O lease.
+      const result = await raceWithAbortAndTimeout(this.readStartupRecoveryState(signal), {
+        signal,
+        timeoutMs,
+      });
+      return result.kind === "ok" ? result.value : "blocked";
+    } catch {
+      return "blocked";
+    } finally {
+      deadline.abort();
+    }
+  }
+
+  private readStartupTail(strictPartial = false) {
+    // A rejected read does not cancel its sibling. Keep their lease until both physically settle.
+    return this.runStartupRecoveryStep(() =>
+      Promise.all([
+        this.historyService
+          .readPartial(this.workspaceId, { throwOnError: strictPartial })
+          .catch(() => undefined),
+        this.historyService.getLastMessages(this.workspaceId, 20).catch(() => null),
+      ])
+    );
+  }
+
+  private async readStartupRecoveryState(signal: AbortSignal): Promise<StartupRecoveryState> {
     await this.loadAutoRetryState();
-    if (this.autoRetryEnabledPreference === false) return true;
+    if (signal.aborted || this.autoRetryEnabledPreference === false) return "blocked";
     const [partial, history] =
       (await retryStartupRead(
-        () =>
-          Promise.all([
-            this.historyService
-              .readPartial(this.workspaceId, { throwOnError: true })
-              .catch(() => undefined),
-            this.historyService.getLastMessages(this.workspaceId, 20).catch(() => null),
-          ]),
-        ([partial, history]) => partial === undefined || !history?.success,
-        {
-          signal: this.closingSignal,
-          // Read backoff must not wait for a newly launched child stream to finish.
-          wait: (delay) => this.waitForStartupReadRetry(delay),
-        }
+        () => this.readStartupTail(true),
+        (value) => value?.[0] === undefined || !value[1]?.success,
+        { signal, wait: (delay) => this.waitForStartupReadRetry(delay, signal) }
       ).catch(() => undefined)) ?? [];
-    if (!history?.success || partial === undefined) return true;
+    if (!history?.success || partial === undefined) return "blocked";
     if (
       this.isPendingAskUserQuestion(partial) ||
       this.isPendingAskUserQuestion(this.getLastNonSystemHistoryMessage(history.data))
     )
-      return true;
+      return "blocked";
     const abandon = this.startupAutoRetryAbandon;
-    if (abandon?.reason !== "aborted") return false;
-    if (abandon.userMessageId === undefined) return true;
-    // Accepted synthetic guidance is new intent too; snapshots/notices are not.
-    const latest = history.data.findLast(
-      (message) =>
-        this.shouldUseUserMessageForRetry(message) ||
-        (message.role === "user" && message.metadata?.retrySendOptions != null)
-    );
-    return latest === undefined || latest.id === abandon.userMessageId;
+    if (abandon?.reason === "aborted") {
+      // Accepted synthetic guidance is new intent too; snapshots/notices are not.
+      const latest = history.data.findLast(
+        (message) =>
+          this.shouldUseUserMessageForRetry(message) ||
+          (message.role === "user" && message.metadata?.retrySendOptions != null)
+      );
+      if (!abandon.userMessageId || !latest || latest.id === abandon.userMessageId)
+        return "blocked";
+    }
+    return this.hasInterruptedStartupTail(partial, history.data) ? "interrupted" : "idle";
   }
 
   ensureStartupAutoRetryCheck(): Promise<void> {

@@ -11864,8 +11864,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   }
 
-  isStartupRecoveryBlocked(workspaceId: string): Promise<boolean> {
-    return this.getOrCreateSession(workspaceId).isStartupRecoveryBlocked();
+  getStartupRecoveryState(
+    workspaceId: string
+  ): ReturnType<AgentSession["getStartupRecoveryState"]> {
+    return this.getOrCreateSession(workspaceId).getStartupRecoveryState();
   }
 
   async getStartupAutoRetryModel(workspaceId: string): Promise<Result<string | null>> {
