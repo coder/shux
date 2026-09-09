@@ -58,6 +58,9 @@ interface MockAPIClient {
 }
 
 let mockApi: MockAPIClient;
+const experimentOverriddenMock = mock<(experimentId: string, enabled: boolean) => void>(
+  () => undefined
+);
 
 const mockSelectPrimitive = (() => {
   const SelectContext = React.createContext<{
@@ -190,6 +193,7 @@ beforeAll(async () => {
     const source = await readFile(sourcePath, "utf8");
     const isolatedSource = source
       .replace('from "@/browser/contexts/API";', 'from "./API";')
+      .replace('from "@/browser/hooks/useTelemetry";', 'from "./Telemetry";')
       .replace('from "@/browser/contexts/ExperimentsContext";', 'from "./ExperimentsContext";')
       .replace('from "@/browser/components/SelectPrimitive/SelectPrimitive";', 'from "./Select";');
     expect(isolatedSource).not.toBe(source);
@@ -198,6 +202,11 @@ beforeAll(async () => {
   const selectPath = join(isolatedModuleDir, "Select.tsx");
   await writeFile(selectPath, "export {};\n");
   void mock.module(selectPath, () => mockSelectPrimitive);
+  const telemetryPath = join(isolatedModuleDir, "Telemetry.ts");
+  await writeFile(telemetryPath, "export {};\n");
+  void mock.module(telemetryPath, () => ({
+    useTelemetry: () => ({ experimentOverridden: experimentOverriddenMock }),
+  }));
   ({ APIProvider } = requireTestModule<typeof APIModule>(join(isolatedModuleDir, "API.tsx")));
   ({ ExperimentsProvider, useExperiment } = requireTestModule<typeof ExperimentsModule>(
     join(isolatedModuleDir, "ExperimentsContext.tsx")
@@ -324,6 +333,7 @@ describe("GeneralSection", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    experimentOverriddenMock.mockClear();
   });
 
   afterEach(() => {
@@ -424,6 +434,7 @@ describe("GeneralSection", () => {
           label
         );
         expect(setup.backendOverrides).toEqual(overrides);
+        expect(experimentOverriddenMock).not.toHaveBeenCalled();
         // The provider uploads explicit local values; mounting the dropdown must add no writes.
         if (source === "localOverrides") {
           for (const [experimentId, enabled] of Object.entries(overrides)) {
@@ -512,6 +523,12 @@ describe("GeneralSection", () => {
           })
         );
         expect(setup.setOverrideMock).toHaveBeenCalledTimes(2);
+        expect(experimentOverriddenMock).toHaveBeenCalledTimes(2);
+        expect(experimentOverriddenMock).toHaveBeenCalledWith(
+          EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
+          continuous
+        );
+        expect(experimentOverriddenMock).toHaveBeenCalledWith(EXPERIMENT_IDS.TOKEN_BUDGET, budget);
         expect(
           window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION))
         ).toBe(JSON.stringify(continuous));

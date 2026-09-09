@@ -10,6 +10,7 @@ import {
 import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
 import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useAPI } from "@/browser/contexts/API";
 import { useExperiment, useExperimentValue } from "@/browser/contexts/ExperimentsContext";
@@ -173,6 +174,7 @@ const isBrowserMode = typeof window !== "undefined" && !window.api;
 export function GeneralSection() {
   const { themePreference, setTheme } = useTheme();
   const { api } = useAPI();
+  const telemetry = useTelemetry();
   const [continuousCompaction, setContinuousCompaction] = useExperiment(
     EXPERIMENT_IDS.CONTINUOUS_COMPACTION
   );
@@ -220,6 +222,9 @@ export function GeneralSection() {
         return exhaustive;
       }
     }
+    // Retain the override events previously emitted by the individual experiment switches.
+    telemetry.experimentOverridden(EXPERIMENT_IDS.CONTINUOUS_COMPACTION, value === "continuous");
+    telemetry.experimentOverridden(EXPERIMENT_IDS.TOKEN_BUDGET, value === "token-budget");
   };
   const [launchBehavior, setLaunchBehavior] = usePersistedState<LaunchBehavior>(
     LAUNCH_BEHAVIOR_KEY,

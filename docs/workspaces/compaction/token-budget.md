@@ -3,7 +3,7 @@ title: Token-Budget Context Windows
 description: Start fresh context windows without automatic summaries and retrieve earlier work on demand
 ---
 
-Enable **Token-budget context windows** in **Settings → Experiments** to replace usage-triggered automatic summaries with fresh context windows. The experiment is off by default.
+Select **Token Budget** from **Compaction strategy** in **Settings → General** to replace usage-triggered automatic summaries with fresh context windows. The default strategy is **Summarize**.
 
 ## Threshold and precedence
 
