@@ -419,7 +419,8 @@ function appendClipboardNodes(
     if (child.nodeType === 3) {
       const start = child === range.startContainer ? range.startOffset : 0;
       const end = child === range.endContainer ? range.endOffset : child.textContent?.length;
-      destination.appendChild(document.createTextNode((child.textContent ?? "").slice(start, end)));
+      const selectedText = (child.textContent ?? "").slice(start, end);
+      if (selectedText) destination.appendChild(document.createTextNode(selectedText));
       continue;
     }
     if (child.nodeType !== 1) continue;
@@ -499,18 +500,29 @@ function appendClipboardNodes(
       );
       if (languageClass) copy.className = languageClass;
     }
-    if (tag === "ol") {
-      const list = element as HTMLOListElement;
-      const firstSelected = Array.from(list.children).findIndex((item) =>
-        range.intersectsNode(item)
-      );
-      copy.setAttribute("start", String(list.start + Math.max(0, firstSelected)));
-    }
     // Keep empty spanning-table structure so partial selections retain cell positions.
     const keepTableStructure =
       preserveSpanningTable ||
       (tag === "table" && element.querySelector("[rowspan], [colspan]") !== null);
     appendClipboardNodes(element, copy, range, keepTableStructure);
+    // Range intersection includes empty boundary nodes. Keep only selected content or required structure.
+    if (!copy.hasChildNodes() && !["br", "hr", "td", "th"].includes(tag)) continue;
+    if (tag === "li" && source.nodeName === "OL" && destination.nodeName === "OL") {
+      const listCopy = destination as HTMLOListElement;
+      if (!listCopy.children.length) {
+        let number = (source as HTMLOListElement).start;
+        for (const item of (source as Element).children) {
+          if (item.tagName !== "LI") continue;
+          if (/^[+-]?\d+$/.test(item.getAttribute("value") ?? ""))
+            number = (item as HTMLLIElement).value;
+          if (item === element) break;
+          number++;
+        }
+        listCopy.setAttribute("start", String(number));
+      } else if (/^[+-]?\d+$/.test(element.getAttribute("value") ?? "")) {
+        copy.setAttribute("value", String((element as HTMLLIElement).value));
+      }
+    }
     destination.appendChild(copy);
   }
 }
@@ -585,24 +597,32 @@ export function getTranscriptContextMenuMarkdown(
     filter: ["s", "del"],
     replacement: (content) => `~~${content}~~`,
   });
+  // Blank lines let Markdown parse content inside structures that GFM cannot represent.
+  const serializeStructuredHtml = (element: Element): string => {
+    const tag = element.tagName.toLowerCase();
+    const attributes = Array.from(
+      element.attributes,
+      (attribute) => " " + attribute.name + '="' + attribute.value + '"'
+    ).join("");
+    const content = element.matches("td, th, li")
+      ? markdown.turndown(element as HTMLElement)
+      : Array.from(element.children, serializeStructuredHtml).join("\n\n");
+    return "<" + tag + attributes + ">\n\n" + content + "\n\n</" + tag + ">";
+  };
+
+  markdown.addRule("numberedList", {
+    filter: (node) =>
+      node.nodeName === "OL" &&
+      (node.querySelector(":scope > li[value]") !== null ||
+        !/^\d{1,9}$/.test(node.getAttribute("start") ?? "1")),
+    replacement: (_content, node) => "\n\n" + serializeStructuredHtml(node) + "\n\n",
+  });
   markdown.addRule("table", {
     filter: "table",
     replacement: (_content, node) => {
       // GFM cannot represent spans. Keep sanitized HTML instead of inventing a different table layout.
       if (node.querySelector("[rowspan], [colspan]")) {
-        // Blank lines let Markdown parse cell content inside the span-preserving HTML.
-        const serialize = (element: Element): string => {
-          const tag = element.tagName.toLowerCase();
-          const attributes = Array.from(
-            element.attributes,
-            (attribute) => " " + attribute.name + '="' + attribute.value + '"'
-          ).join("");
-          const content = element.matches("td, th")
-            ? markdown.turndown(element as HTMLElement)
-            : Array.from(element.children, serialize).join("\n\n");
-          return "<" + tag + attributes + ">\n\n" + content + "\n\n</" + tag + ">";
-        };
-        return "\n\n" + serialize(node) + "\n\n";
+        return "\n\n" + serializeStructuredHtml(node) + "\n\n";
       }
       const rows = Array.from(node.querySelectorAll<HTMLTableRowElement>("tr"), (row) =>
         Array.from(row.cells, (cell) =>

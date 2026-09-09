@@ -78,6 +78,41 @@ describe("transcriptContextMenu", () => {
       expect(result).toEqual({ text: "Body", html: "<p>Body</p>" });
     });
 
+    test.each(["p", "li"])("omits empty %s wrappers at selection boundaries", (tag) => {
+      const blocks = `<${tag} id="before">before</${tag}><${tag} id="selected">selected</${tag}><${tag} id="after">after</${tag}>`;
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(tag === "li" ? `<ol start="4">${blocks}</ol>` : blocks)
+      );
+      const copied = getTranscriptContextMenuMarkdown(select(root, "#before", "#after", 6, 0));
+      expect(copied?.html).toBe(
+        tag === "li" ? '<ol start="5"><li>selected</li></ol>' : "<p>selected</p>"
+      );
+    });
+
+    test.each(["#first", "#second", "#third"])("preserves list value resets from %s", (start) => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<ol><li id="first" value="5">Five</li><li id="second">Six</li><li id="third" value="10">Ten</li><li id="last">Eleven</li></ol>'
+        )
+      );
+      const copied = getTranscriptContextMenuMarkdown(select(root, start, "#last"))!;
+      const pasted = document.createElement("div");
+      pasted.innerHTML = new MarkdownIt({ html: true }).render(copied.text);
+      const numbers = (container: Element) => {
+        let number = container.querySelector("ol")!.start;
+        return Array.from(container.querySelectorAll("li"), (item) => {
+          if (item.hasAttribute("value")) number = item.value;
+          return number++;
+        });
+      };
+      const rich = document.createElement("div");
+      rich.innerHTML = copied.html;
+      const expected =
+        start === "#first" ? [5, 6, 10, 11] : start === "#second" ? [6, 10, 11] : [10, 11];
+      expect(numbers(pasted)).toEqual(expected);
+      expect(numbers(rich)).toEqual(expected);
+    });
+
     test("preserves links when the selection target is an anchor", () => {
       const root = createTranscriptRoot(
         createQuoteableTranscriptMessage(
