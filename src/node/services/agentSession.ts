@@ -15,6 +15,7 @@ import { resolveMemoryAccessPolicy } from "./tools/memory";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
+  FLUSH_MAX_OUTPUT_TOKENS,
   FLUSH_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
@@ -7352,9 +7353,12 @@ export class AgentSession {
             : options?.toolPolicy,
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
-        // A terse cap chosen for the triggering request could cut the notes payload short and
-        // waste the single flush step; the paired continuation keeps the caller's cap.
-        maxOutputTokens: contextBudgetFlushTurn ? undefined : options?.maxOutputTokens,
+        // The flush step gets its own bounded cap: a terse caller cap could cut the notes payload
+        // short and waste the single step, while an unbounded one would let transcript-influenced
+        // text run to a model-sized reply. The paired continuation keeps the caller's cap.
+        maxOutputTokens: contextBudgetFlushTurn
+          ? FLUSH_MAX_OUTPUT_TOKENS
+          : options?.maxOutputTokens,
         muxProviderOptions: options?.providerOptions,
         agentInitiated,
         agentId: options?.agentId,

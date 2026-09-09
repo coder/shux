@@ -20,6 +20,7 @@ import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
+  FLUSH_MAX_OUTPUT_TOKENS,
 } from "@/common/constants/contextBudget";
 import type { AgentSessionAIService } from "./agentSession";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
@@ -1392,7 +1393,7 @@ describe("AgentSession token-budget lifecycle", () => {
     ).toBe(false);
   });
 
-  test("the flush request drops the caller's output cap; the paired continuation keeps it", async () => {
+  test("the flush request uses the bounded flush output cap; the paired continuation keeps the caller's", async () => {
     const h = await setup();
     expect(
       (await h.session.sendMessage("Work", { ...options, maxOutputTokens: 300 })).success
@@ -1401,7 +1402,8 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
     await h.finishAndDispatch();
     expect(h.requests[1].muxMetadata).toMatchObject({ contextBudgetFlush: true });
-    expect(h.requests[1].maxOutputTokens).toBeUndefined();
+    expect(h.requests[1].maxOutputTokens).toBe(FLUSH_MAX_OUTPUT_TOKENS);
+    expect(FLUSH_MAX_OUTPUT_TOKENS).toBeGreaterThan(300);
     expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
     h.settleStream(1);
     await h.waitForRequest(3);

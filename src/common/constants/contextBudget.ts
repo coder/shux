@@ -23,6 +23,14 @@ export const WARNING_RESERVE_TOKENS = 2_048;
 // pinned-tool prompt, and the context-notes preload the flush-only memory context may add even
 // when the ordinary session context had not selected the notes yet.
 export const FLUSH_RESERVE_TOKENS = WARNING_RESERVE_TOKENS + CONTEXT_NOTES_RESERVED_TOKENS;
+// Output cap for the hidden flush step, replacing the caller's: large enough for a full notes
+// file (its preload token cap, doubled for tool-call framing/escaping) yet bounded, so injected
+// transcript text cannot make the automatic, cost-exempt step emit a model-sized reply. Stays
+// within OUTPUT_RESERVE_TOKENS, which the hard ceiling already reserves for the step's output.
+export const FLUSH_MAX_OUTPUT_TOKENS = Math.min(
+  OUTPUT_RESERVE_TOKENS,
+  2 * CONTEXT_NOTES_RESERVED_TOKENS
+);
 // Absolute floor on how far ahead of the rollover point the advance warning fires. The
 // percent-based advance shrinks with the window (a 15% gap is under 5k tokens at 32k), so
 // reserve three WARNING_RESERVE_TOKENS: one notes flush plus roughly two working steps.
