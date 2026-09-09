@@ -2114,6 +2114,383 @@ describe("MCPServerManager", () => {
     expect(staleEntry.retryingTimedOutServerNames.size).toBe(0);
   });
 
+  test.each([false, true])(
+    "additive config preserves existing clients (leased: %s)",
+    async (leased) => {
+      const workspaceId = "ws-additive";
+      const pluginKey = "plugin_example_selected";
+      const configs = {
+        ordinary: stdioConfig("ordinary"),
+        plugin_existing: stdioConfig("existing"),
+      };
+      configService.listServers = mock(() => Promise.resolve({ ...configs }));
+      const started: Array<ReturnType<typeof testInstance>> = [];
+      // Keep the real startServers path; only the process boundary is injected.
+      access.startSingleServer = mock((name: unknown) => {
+        const instance = testInstance(String(name), {
+          tools: { echo: testTool() },
+          prompts: [{ name: "review" }],
+          refreshTools: mock(() => Promise.resolve()),
+        });
+        started.push(instance);
+        return Promise.resolve(instance);
+      });
+      const request = workspaceRequest(workspaceId, {
+        overrides: { enabledServers: [pluginKey] },
+      });
+      const first = await manager.getToolsForWorkspace(request);
+      expect(started.map((instance) => instance.name)).toEqual(["ordinary", "plugin_existing"]);
+      if (leased) manager.acquireLease(workspaceId);
+      try {
+        // An old enable override only takes effect once the selected server exists.
+        Object.assign(configs, { [pluginKey]: stdioConfig("selected", true) });
+        const result = await manager.getToolsForWorkspace(request);
+        expect(started.map((instance) => instance.name)).toEqual([
+          "ordinary",
+          "plugin_existing",
+          pluginKey,
+        ]);
+        expect(started[0].close).not.toHaveBeenCalled();
+        expect(started[1].close).not.toHaveBeenCalled();
+        expect(result.tools.plugin_existing_echo).toBe(first.tools.plugin_existing_echo);
+        expect(result.tools.ordinary_echo).toBe(first.tools.ordinary_echo);
+        expect(result.tools[`${pluginKey}_echo`]).toBeDefined();
+        expect(result.stats.startedServerCount).toBe(3);
+        expect(result.promptDescriptors.map((prompt) => prompt.serverName).sort()).toEqual(
+          ["ordinary", "plugin_existing", pluginKey].sort()
+        );
+        expect(started[0].refreshTools).toHaveBeenCalledTimes(1);
+        await manager.getToolsForWorkspace(request);
+        expect(started).toHaveLength(3);
+      } finally {
+        if (leased) manager.releaseLease(workspaceId);
+      }
+    }
+  );
+
+  test("additive startup preserves a concurrent timeout retry's state", async () => {
+    const request = workspaceRequest("ws-additive-retry");
+    const configs = { stable: stdioConfig("stable"), slow: stdioConfig("slow") };
+    configService.listServers = mock(() => Promise.resolve({ ...configs }));
+    const stable = testInstance("stable", { tools: { echo: testTool() } });
+    const retryStarted = Promise.withResolvers<void>();
+    const retryFinished = Promise.withResolvers<ReturnType<typeof startResult>>();
+    const startup = mock()
+      .mockResolvedValueOnce({
+        instances: new Map([["stable", stable]]),
+        failedServerNames: ["slow"],
+        timedOutServerNames: ["slow"],
+      })
+      .mockImplementationOnce(() => {
+        retryStarted.resolve();
+        return retryFinished.promise;
+      })
+      .mockResolvedValueOnce(
+        startResult([], {
+          failedServerNames: ["addedSlow", "addedBroken"],
+          timedOutServerNames: ["addedSlow"],
+        })
+      );
+    access.startServers = startup;
+    await manager.getToolsForWorkspace(request);
+    const retry = manager.getToolsForWorkspace(request);
+    await retryStarted.promise;
+    Object.assign(configs, {
+      addedSlow: stdioConfig("addedSlow"),
+      addedBroken: stdioConfig("addedBroken"),
+    });
+    await manager.getToolsForWorkspace(request);
+    retryFinished.resolve(startResult([["slow", { tools: { echo: testTool() } }]]));
+    const result = await retry;
+    expect(result.stats.enabledServerCount).toBe(4);
+    expect(result.stats.failedServerNames.sort()).toEqual(["addedBroken", "addedSlow"]);
+    expect(stable.close).not.toHaveBeenCalled();
+    expect(startup.mock.calls.map((args) => Object.keys(args[0] as object))).toEqual([
+      ["stable", "slow"],
+      ["slow"],
+      ["addedBroken", "addedSlow"],
+    ]);
+    startup.mockResolvedValueOnce(startResult([["addedSlow"]]));
+    await manager.getToolsForWorkspace(request);
+    expect(Object.keys(startup.mock.calls.at(-1)![0] as object)).toEqual(["addedSlow"]);
+  });
+
+  test("additive startup preserves a leased closed-client recovery", async () => {
+    const request = workspaceRequest("ws-additive-recovery");
+    const configs = { stable: stdioConfig("stable"), dead: stdioConfig("dead") };
+    configService.listServers = mock(() => Promise.resolve({ ...configs }));
+    const stable = testInstance("stable");
+    const dead = testInstance("dead");
+    const recoveryStarted = Promise.withResolvers<void>();
+    const recoveryFinished = Promise.withResolvers<ReturnType<typeof startResult>>();
+    access.startServers = mock()
+      .mockResolvedValueOnce({
+        instances: new Map([
+          ["stable", stable],
+          ["dead", dead],
+        ]),
+        failedServerNames: [],
+      })
+      .mockImplementationOnce(() => {
+        recoveryStarted.resolve();
+        return recoveryFinished.promise;
+      })
+      .mockResolvedValueOnce(startResult([["added", { tools: { echo: testTool() } }]]));
+    await manager.getToolsForWorkspace(request);
+    manager.acquireLease(request.workspaceId);
+    try {
+      dead.isClosed = true;
+      const recovery = manager.getToolsForWorkspace(request);
+      await recoveryStarted.promise;
+      Object.assign(configs, { added: stdioConfig("added") });
+      await manager.getToolsForWorkspace(request);
+      recoveryFinished.resolve(startResult([["dead", { tools: { echo: testTool() } }]]));
+      const result = await recovery;
+      expect(Object.keys(result.tools).sort()).toEqual(["added_echo", "dead_echo"]);
+      expect(result.stats.startedServerCount).toBe(3);
+      expect(result.stats.enabledServerCount).toBe(3);
+      expect(stable.close).not.toHaveBeenCalled();
+      expect(dead.close).toHaveBeenCalledTimes(1);
+    } finally {
+      manager.releaseLease(request.workspaceId);
+    }
+  });
+
+  test("additive requests serialize and do not roll back a newer config snapshot", async () => {
+    const request = workspaceRequest("ws-additive-concurrent");
+    const configs = { stable: stdioConfig("stable") };
+    configService.listServers = mock(() => Promise.resolve({ ...configs }));
+    const stable = testInstance("stable");
+    const startupEntered = Promise.withResolvers<void>();
+    const startupFinished = Promise.withResolvers<void>();
+    const startup = mock((servers: unknown) =>
+      Promise.resolve(startResult(Object.keys(servers as object).map((name) => [name])))
+    );
+    startup.mockResolvedValueOnce({
+      instances: new Map([["stable", stable]]),
+      failedServerNames: [],
+      timedOutServerNames: [],
+    });
+    access.startServers = startup;
+    await manager.getToolsForWorkspace(request);
+    startup.mockImplementationOnce(async (servers) => {
+      startupEntered.resolve();
+      await startupFinished.promise;
+      return startResult(Object.keys(servers as object).map((name) => [name]));
+    });
+    Object.assign(configs, { added: stdioConfig("added"), newest: stdioConfig("newest") });
+    const newer = manager.getToolsForWorkspace(request);
+    await startupEntered.promise;
+    // Park an older config read until the larger selection has published.
+    const oldReadEntered = Promise.withResolvers<void>();
+    const oldReadFinished = Promise.withResolvers<{
+      stable: ReturnType<typeof stdioConfig>;
+      added: ReturnType<typeof stdioConfig>;
+    }>();
+    configService.listServers.mockImplementationOnce(() => {
+      oldReadEntered.resolve();
+      return oldReadFinished.promise;
+    });
+    const older = manager.getToolsForWorkspace(request);
+    await oldReadEntered.promise;
+    startupFinished.resolve();
+    await newer;
+    oldReadFinished.resolve({ stable: configs.stable, added: stdioConfig("added") });
+    await older;
+    expect(startup).toHaveBeenCalledTimes(2);
+    expect(stable.close).not.toHaveBeenCalled();
+    expect((await manager.getToolsForWorkspace(request)).stats.startedServerCount).toBe(3);
+  });
+
+  test.each(["startup", "publication"])(
+    "additive startup discards clients removed during %s",
+    async (phase) => {
+      const request = workspaceRequest("ws-additive-removed");
+      const configs = { stable: stdioConfig("stable") };
+      configService.listServers = mock(() => Promise.resolve({ ...configs }));
+      const stable = testInstance("stable");
+      const added = testInstance("added");
+      access.startServers = mock().mockResolvedValueOnce({
+        instances: new Map([["stable", stable]]),
+        failedServerNames: [],
+      });
+      await manager.getToolsForWorkspace(request);
+      Object.assign(configs, { added: stdioConfig("added") });
+      let stopped: Promise<void> | undefined;
+      access.startServers = async () => {
+        const instances = new Map([["added", added]]);
+        if (phase === "startup") await manager.stopServers(request.workspaceId);
+        else {
+          const iterator = instances[Symbol.iterator].bind(instances);
+          instances[Symbol.iterator] = () => {
+            instances[Symbol.iterator] = iterator;
+            queueMicrotask(() => {
+              stopped = manager.stopServers(request.workspaceId);
+            });
+            return iterator();
+          };
+        }
+        return { instances, failedServerNames: [] };
+      };
+      const result = await manager.getToolsForWorkspace(request);
+      await stopped;
+      expect(Object.keys(result.tools)).toEqual([]);
+      expect(access.workspaceServers.has(request.workspaceId)).toBe(false);
+      expect(stable.close).toHaveBeenCalledTimes(1);
+      expect(added.close).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test("additive startup retries invalidated additions without closing unrelated clients", async () => {
+    const request = workspaceRequest("ws-additive-invalidated");
+    const pluginKey = "plugin:added:echo";
+    const configs = { stable: stdioConfig("stable") };
+    configService.listServers = mock(() => Promise.resolve({ ...configs }));
+    const stable = testInstance("stable");
+    const added = testInstance(pluginKey);
+    access.startServers = mock().mockResolvedValueOnce({
+      instances: new Map([["stable", stable]]),
+      failedServerNames: [],
+    });
+    await manager.getToolsForWorkspace(request);
+    Object.assign(configs, { [pluginKey]: stdioConfig("added") });
+    access.startServers = async () => {
+      await manager.stopServersWithKeyPrefix("plugin:added:");
+      return { instances: new Map([[pluginKey, added]]), failedServerNames: [] };
+    };
+    const result = await manager.getToolsForWorkspace(request);
+    expect(result.stats.startedServerCount).toBe(1);
+    expect(stable.close).not.toHaveBeenCalled();
+    expect(added.close).toHaveBeenCalledTimes(1);
+    const retry = mock((_servers: unknown) => Promise.resolve(startResult([[pluginKey]])));
+    access.startServers = retry;
+    expect((await manager.getToolsForWorkspace(request)).stats.startedServerCount).toBe(2);
+    expect(Object.keys(retry.mock.calls[0][0] as object)).toEqual([pluginKey]);
+  });
+
+  test("additive startup repairs prompt enablement after a concurrent disable", async () => {
+    const request = workspaceRequest("ws-additive-disable");
+    const configs = { stable: stdioConfig("stable") };
+    configService.listServers = mock(() => Promise.resolve({ ...configs }));
+    access.startServers = mock(() =>
+      Promise.resolve(startResult([["stable", { prompts: [{ name: "status" }] }]]))
+    );
+    await manager.getToolsForWorkspace(request);
+    Object.assign(configs, { added: stdioConfig("added") });
+    const refreshPrompts = mock(() => Promise.resolve([{ name: "review" }]));
+    access.startServers = async () => {
+      await manager.applyWorkspaceOverrides(request.workspaceId, { disabledServers: ["added"] });
+      return startResult([["added", { refreshPrompts }]]);
+    };
+    const result = await manager.getToolsForWorkspace(request);
+    expect(result.promptDescriptors.map((prompt) => prompt.serverName)).toEqual(["stable"]);
+    expect(refreshPrompts).not.toHaveBeenCalled();
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(manager.getPrompt(request.workspaceId, "added", "review", {})).rejects.toThrow(
+      "is disabled"
+    );
+  });
+
+  test("additive publication cannot bypass allowlists in a pending cached request", async () => {
+    const request = workspaceRequest("ws-additive-allowlist");
+    const configs = { stable: stdioConfig("stable") };
+    configService.listServers = mock(() => Promise.resolve({ ...configs }));
+    const refreshStarted = Promise.withResolvers<void>();
+    const refreshFinished = Promise.withResolvers<void>();
+    const refreshTools = mock(() => Promise.resolve());
+    access.startServers = mock(() => Promise.resolve(startResult([["stable", { refreshTools }]])));
+    await manager.getToolsForWorkspace(request);
+    refreshTools.mockImplementationOnce(() => {
+      refreshStarted.resolve();
+      return refreshFinished.promise;
+    });
+    const pending = manager.getToolsForWorkspace(request);
+    await refreshStarted.promise;
+    try {
+      Object.assign(configs, { added: { ...stdioConfig("added"), toolAllowlist: ["visible"] } });
+      access.startServers = mock(() =>
+        Promise.resolve(
+          startResult([
+            [
+              "added",
+              {
+                tools: { visible: testTool(), hidden: testTool() },
+              },
+            ],
+          ])
+        )
+      );
+      const result = await manager.getToolsForWorkspace(request);
+      expect(Object.keys(result.tools)).toEqual(["added_visible"]);
+    } finally {
+      refreshFinished.resolve();
+    }
+    const older = await pending;
+    expect(older.tools.added_hidden).toBeUndefined();
+    expect((await manager.getToolsForWorkspace(request)).tools.added_visible).toBeDefined();
+  });
+
+  test.each(["reconfigured", "removed"])(
+    "additive detection rejects a %s existing server",
+    async (change) => {
+      const request = workspaceRequest("ws-not-additive");
+      let configs: Record<string, ReturnType<typeof stdioConfig>> = {
+        stable: stdioConfig("stable"),
+        changed: stdioConfig("before"),
+      };
+      configService.listServers = mock(() => Promise.resolve(configs));
+      const started: Array<ReturnType<typeof testInstance>> = [];
+      access.startSingleServer = mock((name: unknown) => {
+        const instance = testInstance(String(name));
+        started.push(instance);
+        return Promise.resolve(instance);
+      });
+      await manager.getToolsForWorkspace(request);
+      const original = [...started];
+      configs = {
+        stable: stdioConfig("stable"),
+        added: stdioConfig("added"),
+        ...(change === "reconfigured" ? { changed: stdioConfig("after") } : {}),
+      };
+      await manager.getToolsForWorkspace(request);
+      for (const instance of original) expect(instance.close).toHaveBeenCalledTimes(1);
+      expect(started.filter((instance) => instance.name === "stable")).toHaveLength(2);
+    }
+  );
+
+  test("additive startup does not duplicate or wait for a retained background prompt refresh", async () => {
+    const request = workspaceRequest("ws-additive-prompt-refresh");
+    const configs = { stable: stdioConfig("stable") };
+    configService.listServers = mock(() => Promise.resolve({ ...configs }));
+    const refreshStarted = Promise.withResolvers<void>();
+    const refreshFinished = Promise.withResolvers<Array<{ name: string }>>();
+    const refreshPrompts = mock(() => Promise.resolve([{ name: "status" }]));
+    access.startServers = mock(() =>
+      Promise.resolve(startResult([["stable", { refreshPrompts }]]))
+    );
+    await manager.getToolsForWorkspace(request);
+    refreshPrompts.mockImplementationOnce(() => {
+      refreshStarted.resolve();
+      return refreshFinished.promise;
+    });
+    await manager.getToolsForWorkspace(request);
+    await refreshStarted.promise;
+    try {
+      Object.assign(configs, { added: stdioConfig("added") });
+      access.startServers = mock(() =>
+        Promise.resolve(startResult([["added", { prompts: [{ name: "review" }] }]]))
+      );
+      const result = await manager.getToolsForWorkspace(request);
+      expect(result.promptDescriptors.map((prompt) => prompt.serverName).sort()).toEqual([
+        "added",
+        "stable",
+      ]);
+      expect(refreshPrompts).toHaveBeenCalledTimes(2);
+    } finally {
+      refreshFinished.resolve([{ name: "updated" }]);
+    }
+  });
+
   test("getToolsForWorkspace defers restarts while leased and applies them on next request", async () => {
     const workspaceId = "ws-defer";
     let command = "cmd-1";

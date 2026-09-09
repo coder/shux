@@ -1816,6 +1816,7 @@ export class MCPServerManager {
     // point may invalidate instances this call starts (see
     // closeInvalidatedInstances).
     const startupEpoch = this.prefixInvalidationClock;
+    const signatureBeforeConfigRead = this.workspaceServers.get(workspaceId)?.configSignature;
 
     // Fetch full server info for project-level allowlists and server filtering
     const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
@@ -1855,6 +1856,16 @@ export class MCPServerManager {
     const signature = JSON.stringify(signatureEntries);
 
     const existing = this.workspaceServers.get(workspaceId);
+    if (
+      existing &&
+      signatureBeforeConfigRead !== undefined &&
+      existing.configSignature !== signatureBeforeConfigRead &&
+      existing.configSignature !== signature
+    ) {
+      // Another request published while this config read was pending. Re-read
+      // before treating its additions as removals and restarting healthy clients.
+      return this.ensureWorkspaceServers(options, refreshToolCatalogs);
+    }
     if (existing && existing.timedOutServerNames === undefined) {
       existing.timedOutServerNames = [];
     }
@@ -1963,12 +1974,12 @@ export class MCPServerManager {
                 existing.instances.set(serverName, instance);
               }
 
+              // Additive publication can extend this same entry during a retry.
+              // Update only attempted names, preserving the additions' retry markers.
               existing.timedOutServerNames = [
                 ...existing.timedOutServerNames.filter(
                   (serverName) =>
-                    enabledServerNames.has(serverName) &&
-                    !retryingServerNames.has(serverName) &&
-                    !existing.instances.has(serverName)
+                    !retryingServerNames.has(serverName) && !existing.instances.has(serverName)
                 ),
                 ...retryTimedOutNames,
                 ...invalidatedRetryKeys,
@@ -2002,13 +2013,12 @@ export class MCPServerManager {
 
           const failedServerNames = [
             ...existing.stats.failedServerNames.filter(
-              (serverName) =>
-                enabledServerNames.has(serverName) && !retryingServerNames.has(serverName)
+              (serverName) => !retryingServerNames.has(serverName)
             ),
             ...retryFailedNames,
           ];
           existing.stats = this.createWorkspaceStats(
-            enabledEntries.length,
+            existing.stats.enabledServerCount,
             existing.instances,
             failedServerNames
           );
@@ -2046,20 +2056,28 @@ export class MCPServerManager {
       }
 
       return {
-        ...this.collectTools(existing.instances, fullServerInfo, overrides),
+        // Additions may publish while a cached refresh/retry is awaiting. This
+        // snapshot lacks their allowlists, so leave them for a fresh config read.
+        ...this.collectTools(
+          new Map([...existing.instances].filter(([name]) => enabledServerNames.has(name))),
+          fullServerInfo,
+          overrides
+        ),
         stats: existing.stats,
         promptDescriptors: this.promptDescriptorsFor(existing),
       };
     }
 
-    let restartFailedNames: string[] = [];
-    let restartTimedOutNames: string[] = [];
+    const additiveServerNames = existing
+      ? this.getAdditiveServerNames(existing, signatureEntries)
+      : undefined;
 
     // If a stream is actively running, avoid closing MCP clients out from under it.
     //
     // Note: AIService may fetch tools before StreamManager interrupts an existing stream,
     // so closing servers here can hand out tool objects backed by a client that's about to close.
-    if (existing && leaseCount > 0) {
+    if (existing && leaseCount > 0 && additiveServerNames === undefined) {
+      const retainedSignature = existing.configSignature;
       existing.lastActivity = Date.now();
 
       if (hasClosedInstance) {
@@ -2113,8 +2131,6 @@ export class MCPServerManager {
           () => this.markActivity(workspaceId),
           workspaceId
         );
-        restartFailedNames = failedNames;
-        restartTimedOutNames = timedOutNames;
 
         // Drop restarted instances whose plugin tree was swapped mid-startup;
         // route them through the retry list so the entry (kept under its
@@ -2134,11 +2150,20 @@ export class MCPServerManager {
               restartOwnershipLost = true;
               return;
             }
-            restartTimedOutNames = [...restartTimedOutNames, ...invalidatedRestartKeys];
 
             for (const [serverName, instance] of restartedInstances) {
               existing.instances.set(serverName, instance);
             }
+            existing.timedOutServerNames = [
+              ...existing.timedOutServerNames.filter((name) => !closedServerNames.includes(name)),
+              ...timedOutNames,
+              ...invalidatedRestartKeys,
+            ];
+            existing.stats = this.createWorkspaceStats(
+              existing.stats.enabledServerCount,
+              existing.instances,
+              [...new Set([...existing.stats.failedServerNames, ...failedNames])]
+            );
           }
         );
         if (restartOwnershipLost) {
@@ -2167,6 +2192,12 @@ export class MCPServerManager {
         }
       }
 
+      // An addition may have published while closed-client recovery was pending.
+      // Re-read its config rather than overwriting the new entry's catalogs/stats.
+      if (existing.configSignature !== retainedSignature) {
+        return this.ensureWorkspaceServers(options, refreshToolCatalogs);
+      }
+
       log.info("[MCP] Deferring MCP server restart while stream is active", {
         workspaceId,
       });
@@ -2174,12 +2205,9 @@ export class MCPServerManager {
       // Recompute lease-visible stats from the currently enabled server set so stale
       // failures and tool metadata from newly-disabled servers do not leak into the
       // next stream while an existing lease is still active.
-      existing.timedOutServerNames = [
-        ...existing.timedOutServerNames.filter(
-          (serverName) => enabledServerNames.has(serverName) && !existing.instances.has(serverName)
-        ),
-        ...restartTimedOutNames,
-      ];
+      existing.timedOutServerNames = existing.timedOutServerNames.filter(
+        (serverName) => enabledServerNames.has(serverName) && !existing.instances.has(serverName)
+      );
 
       // Even while deferring restarts, ensure new tool lists and stats reflect the latest
       // enabled/disabled server set. We cannot revoke tools already captured by an in-flight
@@ -2187,14 +2215,9 @@ export class MCPServerManager {
       const instancesForTools = new Map(
         [...existing.instances].filter(([serverName]) => enabledServers[serverName] !== undefined)
       );
-      const failedServerNames = [
-        ...new Set([
-          ...existing.stats.failedServerNames.filter((serverName) =>
-            enabledServerNames.has(serverName)
-          ),
-          ...restartFailedNames,
-        ]),
-      ];
+      const failedServerNames = existing.stats.failedServerNames.filter((serverName) =>
+        enabledServerNames.has(serverName)
+      );
       const leasedStats = this.createWorkspaceStats(
         enabledEntries.length,
         instancesForTools,
@@ -2243,7 +2266,8 @@ export class MCPServerManager {
     // Serialize restarts so concurrent callers cannot overwrite cached servers
     // without closing discarded instances. Same-signature retries remain outside
     // this lock because their replacement path reconciles concurrent changes.
-    return this.workspaceRestartLocks.withLock(workspaceId, async () => {
+    const stopEpochAtQueue = this.workspaceStopEpochs.get(workspaceId) ?? 0;
+    const result = await this.workspaceRestartLocks.withLock(workspaceId, async () => {
       const stopEpochBefore = this.workspaceStopEpochs.get(workspaceId) ?? 0;
       const current = this.workspaceServers.get(workspaceId);
       if (current !== undefined) {
@@ -2275,10 +2299,22 @@ export class MCPServerManager {
         }
       }
 
-      if (enabledEntries.length > 0) {
+      const addedServerNames = current
+        ? this.getAdditiveServerNames(current, signatureEntries)
+        : undefined;
+      if (additiveServerNames !== undefined && addedServerNames === undefined) {
+        // A newer additive request may have won the lock. Never roll it back
+        // with this older snapshot, or revive a workspace removed while queued.
+        return undefined;
+      }
+      const retained = addedServerNames !== undefined ? current : undefined;
+      const serversToStart = addedServerNames
+        ? Object.fromEntries(enabledEntries.filter(([name]) => addedServerNames.includes(name)))
+        : enabledServers;
+      if (Object.keys(serversToStart).length > 0) {
         log.info("[MCP] Starting servers", {
           workspaceId,
-          servers: enabledEntries.map(([name]) => name),
+          servers: Object.keys(serversToStart),
         });
       }
 
@@ -2288,14 +2324,17 @@ export class MCPServerManager {
 
       // Internal restart: retain the recorded request options so getPrompt can
       // still revive servers reaped later; only workspace removal forgets them.
-      await this.stopServers(workspaceId, { retainRestartOptions: true });
+      // Selective plugin imports may honor an older enable override. Add only
+      // those new servers without disrupting already-running (also non-plugin) clients.
+      if (retained) retained.lastActivity = Date.now();
+      else await this.stopServers(workspaceId, { retainRestartOptions: true });
 
       const {
         instances,
         failedServerNames: startFailedNames,
         timedOutServerNames: startTimedOutNames = [],
       } = await this.startServers(
-        enabledServers,
+        serversToStart,
         runtime,
         projectPath,
         workspacePath,
@@ -2304,8 +2343,7 @@ export class MCPServerManager {
         workspaceId
       );
 
-      const allFailedNames = [...restartFailedNames, ...startFailedNames];
-      const stats = this.createWorkspaceStats(enabledEntries.length, instances, allFailedNames);
+      const stats = this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames);
 
       // A removal-style stop landing mid-startup found no cache entry to
       // close, so caching now would leave the removed workspace's processes
@@ -2347,11 +2385,26 @@ export class MCPServerManager {
           if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpochBefore) {
             return;
           }
+          if (retained) {
+            if (this.workspaceServers.get(workspaceId) !== retained) return;
+            for (const [name, instance] of instances) retained.instances.set(name, instance);
+            retained.configSignature = signature;
+            retained.enabledServerNames = enabledServerNames;
+            retained.timedOutServerNames.push(...startTimedOutNames, ...invalidatedKeys);
+            retained.stats = this.createWorkspaceStats(enabledEntries.length, retained.instances, [
+              ...retained.stats.failedServerNames,
+              ...startFailedNames,
+            ]);
+            retained.lastActivity = Date.now();
+            delete retained.stalePromptServerNames;
+            entry = retained;
+            return;
+          }
           entry = {
             configSignature: signature,
             instances,
             enabledServerNames,
-            stats: this.createWorkspaceStats(enabledEntries.length, instances, allFailedNames),
+            stats: this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames),
             timedOutServerNames: [...startTimedOutNames, ...invalidatedKeys],
             retryingTimedOutServerNames: new Set(),
             lastActivity: Date.now(),
@@ -2383,23 +2436,42 @@ export class MCPServerManager {
         configGenerationUsed
       );
       if (refreshToolCatalogs) {
-        await this.refreshInstancePrompts(this.promptEligibleInstances(entry));
+        if (retained) await this.refreshModernInstanceTools(retained.instances);
+        const promptInstances = this.promptEligibleInstances(entry);
+        // Retained catalogs stay stale-while-revalidate; only new servers need
+        // the initial awaited fetch. Do not wait on an old background refresh.
+        await this.refreshInstancePrompts(
+          retained
+            ? new Map([...promptInstances].filter(([name]) => instances.has(name)))
+            : promptInstances
+        );
         await this.repairEnablementAfterConcurrentMutation(
           workspaceId,
           options,
           entry,
           configGenerationUsed
         );
+        if (retained) this.refreshInstancePromptsInBackground(entry);
       }
 
       return {
-        ...this.collectTools(instances, fullServerInfo, overrides),
+        ...this.collectTools(entry.instances, fullServerInfo, overrides),
         // entry.stats, not the pre-publication `stats`: invalidated instances
         // were closed before publication and must not count as started.
         stats: entry.stats,
         promptDescriptors: this.promptDescriptorsFor(entry),
       };
     });
+    if (result !== undefined) return result;
+    if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpochAtQueue) {
+      return {
+        tools: {},
+        toolServerNames: {},
+        promptDescriptors: [],
+        stats: this.createWorkspaceStats(0, new Map(), []),
+      };
+    }
+    return this.ensureWorkspaceServers(options, refreshToolCatalogs);
   }
 
   async getPromptsForWorkspace(
@@ -2559,6 +2631,23 @@ export class MCPServerManager {
       }
     }
     return descriptors;
+  }
+
+  private getAdditiveServerNames(
+    entry: WorkspaceServers,
+    next: Record<string, unknown>
+  ): string[] | undefined {
+    if ([...entry.instances.values()].some((instance) => instance.isClosed)) return undefined;
+    // Signatures are in-process JSON of launch settings, including resolved secrets.
+    const previous = JSON.parse(entry.configSignature) as Record<string, unknown>;
+    if (Object.keys(next).length <= Object.keys(previous).length) return undefined;
+    if (
+      Object.keys(previous).some(
+        (name) => JSON.stringify(previous[name]) !== JSON.stringify(next[name])
+      )
+    )
+      return undefined;
+    return Object.keys(next).filter((name) => !Object.hasOwn(previous, name));
   }
 
   private async computeSignatureEntries(
