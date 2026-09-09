@@ -79,13 +79,17 @@ export function isDurableContextBoundaryMarker(message: MuxMessage | undefined):
  * accumulator is bound to it (WorkspaceService.recordWorkspaceMemoryWritable).
  */
 export function latestContextBoundaryHistorySequence(
-  messages: readonly MuxMessage[]
+  messages: readonly MuxMessage[],
+  options?: { before: number }
 ): number | undefined {
   let latest: number | undefined;
   for (const message of messages) {
     if (!isDurableContextBoundaryMarker(message)) continue;
     const sequence = message.metadata?.historySequence;
     if (typeof sequence !== "number" || !Number.isInteger(sequence) || sequence < 0) continue;
+    // `before`: the boundary preceding a given one (the epoch a preserved
+    // tail was copied out of).
+    if (options !== undefined && sequence >= options.before) continue;
     if (latest === undefined || sequence > latest) latest = sequence;
   }
   return latest;

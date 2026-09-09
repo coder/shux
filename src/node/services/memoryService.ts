@@ -49,6 +49,11 @@ import {
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import {
+  LEGACY_ADOPTION_MANIFEST_FILE_NAME,
+  readLegacyAdoptionManifest,
+  type LegacyAdoptionRecord,
+} from "@/node/services/memoryLegacyAdoption";
+import {
   resolveWorkspaceMemoryOwnerId,
   workspaceMemoryOwnerResolver,
 } from "@/node/services/memoryWorkspaceOwner";
@@ -414,40 +419,6 @@ interface MemoryStore {
 const LEGACY_IMPORT_DIR = "imported";
 
 /**
- * Dotfile inside a sub-agent's legacy `memory` dir recording, per relPath, the
- * sha256 of the content already copied into the shared store
- * (adoptLegacyPrivateStore). Dotfiles are invisible to every build's listing.
- */
-const LEGACY_ADOPTION_MANIFEST_FILE_NAME = ".adopted-into-shared-store.json";
-
-/**
- * One adopted legacy file: content hash, child sidecar fingerprint, owner-store
- * relPath, and whether the adoption CREATED that owner file (provenance: only
- * such a copy may be removed again when the legacy source disappears; a
- * pre-existing identical owner note is the owner's own). `pending`: written
- * BEFORE the copy lands (provenance must not depend on the copy's existence: a
- * retry finding the bytes already at the target could not tell an interrupted
- * adoption from an owner note); cleared once the sidecar fold completed.
- */
-interface LegacyAdoptionRecord {
-  content: string;
-  sidecar: string;
-  target: string;
-  created?: boolean;
-  pending?: boolean;
-}
-
-function isLegacyAdoptionRecord(value: unknown): value is LegacyAdoptionRecord {
-  if (typeof value !== "object" || value === null) return false;
-  const record = value as Record<string, unknown>;
-  return (
-    typeof record.content === "string" &&
-    typeof record.sidecar === "string" &&
-    typeof record.target === "string"
-  );
-}
-
-/**
  * Pin bit of a manifest record's child sidecar fingerprint. No child entry at
  * that adoption is the default, unpinned state (a usage entry a downgraded
  * build creates by merely viewing the note is not a pin transition); null
@@ -462,31 +433,6 @@ function legacySidecarPinned(sidecar: string): boolean | null {
       : null;
   } catch {
     return null;
-  }
-}
-
-/**
- * Self-healing read of the adoption manifest: anything malformed reads as not
- * adopted. A Map, not a plain object: a legacy note may legitimately be named
- * `__proto__` (any store-valid relPath), and assigning that key on an
- * ordinary object hits the prototype setter instead of creating an entry the
- * serialization would carry — the note would then be re-adopted (and the
- * owner clock advanced) on every access. JSON.parse and Object.fromEntries
- * create own properties, so the round-trip below is exact.
- */
-async function readLegacyAdoptionManifest(
-  manifestPath: string
-): Promise<Map<string, LegacyAdoptionRecord>> {
-  try {
-    const parsed: unknown = JSON.parse(await fsPromises.readFile(manifestPath, "utf-8"));
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return new Map();
-    return new Map(
-      Object.entries(parsed).filter((entry): entry is [string, LegacyAdoptionRecord] =>
-        isLegacyAdoptionRecord(entry[1])
-      )
-    );
-  } catch {
-    return new Map();
   }
 }
 
@@ -615,7 +561,7 @@ class LocalMemoryStore implements MemoryStore {
       });
       for (const entry of entries) {
         // Per-entry cap: a single flat directory can exceed the cap on its own.
-        if (results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
+        if (options?.strict !== true && results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
         if (entry.name.startsWith(".")) continue;
         const childRel = dirRel === "" ? entry.name : `${dirRel}/${entry.name}`;
         if (entry.isDirectory()) {

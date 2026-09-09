@@ -567,7 +567,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
     recordWorkspaceMemoryWritable(
       workspaceId: string,
       writable: boolean,
-      options: { epochHasPriorTurns: boolean; policyEpoch: number }
+      options: { epochHasPriorTurns: boolean; policyEpoch: number; carriedPolicyEpoch?: number }
     ): Promise<boolean>;
   };
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
@@ -1532,6 +1532,19 @@ export class TurnRequestBuilder {
     // previousBoundaryHistorySequence, so the completion-side observation
     // and every backend's turn records agree on which epoch a value belongs to.
     const policyEpoch = latestContextBoundaryHistorySequence(messages) ?? -1;
+    // A preserved-tail boundary (RLM keep-recent copies follow it) re-appends
+    // rows produced under the PREVIOUS epoch's policy: that epoch's
+    // accumulator is part of this one. The compacting session re-binds it to
+    // this epoch durably (AgentSession.carryWorkspaceMemoryWritable), but
+    // asynchronously — another backend's first turn here can precede that
+    // carry. Naming the carried epoch lets the sink AND its value directly
+    // (under whichever key it currently sits), so no window exists in which
+    // a read-only tail reads as writable.
+    const carriedPolicyEpoch = activeContextMessages.some(
+      (message) => message.metadata?.rlmPreservedTailCopy === true
+    )
+      ? (latestContextBoundaryHistorySequence(messages, { before: policyEpoch }) ?? -1)
+      : undefined;
     const persistWorkspaceMemoryWritable = async (writable: boolean): Promise<boolean> => {
       const sink = this.dependencies.bindings.workspaceMemoryPolicySink;
       if (isCompactionRequest || !sink) return true;
@@ -1539,6 +1552,7 @@ export class TurnRequestBuilder {
         await sink.recordWorkspaceMemoryWritable(workspaceId, writable, {
           epochHasPriorTurns,
           policyEpoch,
+          ...(carriedPolicyEpoch === undefined ? {} : { carriedPolicyEpoch }),
         })
       ) {
         return true;

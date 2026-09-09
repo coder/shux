@@ -1687,6 +1687,32 @@ describe("MemoryService", () => {
       expect(await pathExists(path.join(ownerRoot, "late.md"))).toBe(false);
     });
 
+    it("removal lists an oversized legacy notebook completely, counting every unplaceable note", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      // Owner store with one free slot; legacy notebook two notes past the
+      // per-scope cap in one flat directory. A capped walk would list cap+1
+      // notes and report cap skipped; every note beyond the cap must be
+      // listed and reported so removal cannot delete an unlisted one.
+      await Promise.all([
+        ...Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE - 1 }, (_, i) =>
+          fsPromises.writeFile(path.join(ownerRoot, `o${String(i).padStart(4, "0")}.md`), "o")
+        ),
+        ...Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE + 2 }, (_, i) =>
+          fsPromises.writeFile(path.join(legacyRoot, `n${String(i).padStart(4, "0")}.md`), "n")
+        ),
+      ]);
+      expect(
+        await fixture.service
+          .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
+          .then(() => null, getErrorMessage)
+      ).toMatch(new RegExp(`^${MEMORY_MAX_FILES_PER_SCOPE + 1} legacy workspace memory note`));
+    });
+
     it("re-adopts when a downgraded build edits a nested legacy note in place or only its pin", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

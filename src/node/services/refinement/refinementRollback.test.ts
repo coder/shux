@@ -873,6 +873,61 @@ describe("refinementRollback", () => {
     expect(await pathExists(path.join(fixture.muxHome, "memory", "global", "new.md"))).toBe(false);
   });
 
+  it("retargets pre-sharing workspace rows to the adopted owner copy, refusing unadopted ones", async () => {
+    using fixture = await createFixture();
+    // Rows journaled while the workspace owned its store address
+    // <sessionDir>/memory (the legacy private notebook after an upgrade).
+    await fixture.service.create(fixture.ctx, "/memories/workspace/note.md", "v1\n", "agent");
+    await fixture.service.strReplace(
+      fixture.ctx,
+      "/memories/workspace/note.md",
+      "v1",
+      "v2",
+      "agent"
+    );
+    const editRow = await lastRow(fixture.sessionDir);
+    await fixture.service.create(fixture.ctx, "/memories/workspace/orphan.md", "o1\n", "agent");
+    const orphanRow = await lastRow(fixture.sessionDir);
+    // The upgrade folded note.md into the task-tree owner's store (adoption
+    // manifest beside the legacy files); orphan.md could not be placed.
+    const ownerSessionDir = path.join(path.dirname(fixture.sessionDir), "ws-owner");
+    await fsPromises.mkdir(path.join(ownerSessionDir, "memory", "sub"), { recursive: true });
+    await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "sub", "note.md"), "v2\n");
+    await fsPromises.writeFile(
+      path.join(fixture.sessionDir, "memory", ".adopted-into-shared-store.json"),
+      JSON.stringify({
+        "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
+      })
+    );
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(result.success).toBe(true);
+    // The note the shared notebook serves is reverted; the hidden legacy file
+    // is left alone (it must keep matching the manifest, or the next adoption
+    // pass would re-import it as a conflicting duplicate).
+    expect(
+      await fsPromises.readFile(path.join(ownerSessionDir, "memory", "sub", "note.md"), "utf-8")
+    ).toBe("v1\n");
+    expect(
+      await fsPromises.readFile(path.join(fixture.sessionDir, "memory", "note.md"), "utf-8")
+    ).toBe("v2\n");
+    const refused = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: orphanRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(refused.success).toBe(false);
+    expect(refused.success ? "" : refused.error).toContain(
+      "not folded into the shared workspace store"
+    );
+    expect(await pathExists(path.join(fixture.sessionDir, "memory", "orphan.md"))).toBe(true);
+  });
+
   it("journals the rollback row before releasing the target locks (no durable-order inversion)", async () => {
     using fixture = await createFixture();
     const virtualPath = "/memories/global/order.md";

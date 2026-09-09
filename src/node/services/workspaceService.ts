@@ -4273,7 +4273,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   async recordWorkspaceMemoryWritable(
     workspaceId: string,
     writable: boolean,
-    options: { epochHasPriorTurns: boolean; policyEpoch: number }
+    options: { epochHasPriorTurns: boolean; policyEpoch: number; carriedPolicyEpoch?: number }
   ): Promise<boolean> {
     // The accumulator (config bit and deny marker alike) is bound to the
     // compaction epoch it accumulates over — the opening boundary's history
@@ -4283,8 +4283,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // compacting backend's durable reset landed (the reset is awaited only by
     // that backend's own session) and carry it, via its mirror, through an
     // otherwise all-writable epoch.
-    const { policyEpoch } = options;
+    const { policyEpoch, carriedPolicyEpoch } = options;
     assert(Number.isInteger(policyEpoch), "policyEpoch must be an integer");
+    assert(
+      carriedPolicyEpoch === undefined ||
+        (Number.isInteger(carriedPolicyEpoch) && carriedPolicyEpoch < policyEpoch),
+      "carriedPolicyEpoch must be an earlier epoch"
+    );
     const session =
       this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId);
     // A no-tail compaction's durable epoch reset may still be in flight: read
@@ -4375,6 +4380,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // A fourth input: the session-dir deny marker, the durable fallback taken
     // when config.json could not record a deny (denyDurableFallback above).
     const denyMarker = await readWorkspaceMemoryDenyMarker(sessionDir, policyEpoch);
+    // Preserved-tail epoch: the previous epoch's accumulator is part of this
+    // one (its rows were copied in). The compacting session's carry moves the
+    // record/marker from the carried key to this one asynchronously; reading
+    // BOTH keys (record inside the transaction below, marker here) makes the
+    // conjunction independent of that carry's timing — a deny is visible
+    // under one key or the other at every instant, never under neither.
+    const carriedDenyMarker =
+      carriedPolicyEpoch !== undefined &&
+      (await readWorkspaceMemoryDenyMarker(sessionDir, carriedPolicyEpoch));
+    const carriedFor = (entry: WorkspaceConfigEntry): boolean | undefined =>
+      carriedPolicyEpoch === undefined
+        ? undefined
+        : workspaceMemoryWritableForEpoch(entry, carriedPolicyEpoch);
     // Unknown history fails closed, like the harvest's own unknown → closed
     // rule: with no durable accumulator, no marker and no mirror, an epoch
     // that already holds turns has a policy nobody recorded — the record was
@@ -4388,20 +4406,29 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const stored = storedFor(before.workspace);
     const unknownHistory =
       stored === undefined && mirror === undefined && options.epochHasPriorTurns;
-    const conjunction = (durable: boolean | undefined): boolean =>
-      !denyMarker && !unknownHistory && (durable ?? true) && (mirror ?? true) && writable;
+    const conjunction = (durable: boolean | undefined, carried: boolean | undefined): boolean =>
+      !denyMarker &&
+      !carriedDenyMarker &&
+      !unknownHistory &&
+      (durable ?? true) &&
+      (carried ?? true) &&
+      (mirror ?? true) &&
+      writable;
     // Fast path (no write): the outcome cannot differ from the stored value —
     // it is already false, or already true and this turn grants.
-    if (stored === false || (stored === true && conjunction(stored))) {
+    if (
+      stored === false ||
+      (stored === true && conjunction(stored, carriedFor(before.workspace)))
+    ) {
       session?.recordWorkspaceMemoryWritable(stored);
       return true;
     }
-    effective = conjunction(stored);
+    effective = conjunction(stored, carriedFor(before.workspace));
     try {
       await this.config.editConfig((cfg) => {
         const current = findWorkspaceEntry(cfg, workspaceId);
         if (current !== null) {
-          effective = conjunction(storedFor(current.workspace));
+          effective = conjunction(storedFor(current.workspace), carriedFor(current.workspace));
           // Per-epoch record: never overwrites the closing epoch's value,
           // which the compacting backend may not have observed yet
           // (workspaceMemoryPolicyEpochs.ts).

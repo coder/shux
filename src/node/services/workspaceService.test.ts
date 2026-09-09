@@ -9489,6 +9489,59 @@ describe("WorkspaceService initialize", () => {
       ).toBe(true);
       expect(persistedFor(12)).toBe(true);
       expect(persisted()).toBe(false);
+      // A PRESERVED-TAIL epoch names the epoch its tail was copied out of:
+      // that epoch's deny is ANDed in directly, under whichever key it sits —
+      // the closing key (compacting backend's carry not landed yet), the new
+      // key (carry landed), or the session-dir marker — so no window exists
+      // in which the read-only tail reads as writable to another backend.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritableByEpoch = { "-1": false };
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 14,
+          carriedPolicyEpoch: -1,
+        })
+      ).toBe(true);
+      expect(persistedFor(14)).toBe(false);
+      expect(persisted()).toBe(false);
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritableByEpoch = { "16": true };
+        return cfg;
+      });
+      await writeWorkspaceMemoryDenyMarker(sessionDir, 12);
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 16,
+          carriedPolicyEpoch: 12,
+        })
+      ).toBe(true);
+      expect(persistedFor(16)).toBe(false);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: 12 });
+      // A carried grant (or no carried record at all) changes nothing.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritableByEpoch = { "-1": true };
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 18,
+          carriedPolicyEpoch: -1,
+        })
+      ).toBe(true);
+      expect(persistedFor(18)).toBe(true);
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritableByEpoch = { "-1": false, "12": true };
+        return cfg;
+      });
       // ...while a turn of the closing epoch itself still sees its deny.
       expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
         true
