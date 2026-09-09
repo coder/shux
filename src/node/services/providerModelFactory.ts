@@ -1,7 +1,7 @@
 import assert from "node:assert";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import type { LanguageModelV4CallOptions } from "@ai-sdk/provider";
+import type { LanguageModelV4, LanguageModelV4CallOptions } from "@ai-sdk/provider";
 import type { XaiProviderOptions } from "@ai-sdk/xai";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
@@ -317,6 +317,48 @@ function wrapFetchWithServiceTier(baseFetch: typeof fetch, serviceTier?: string)
   };
 
   return Object.assign(tieredFetch, baseFetch) as typeof fetch;
+}
+
+/** Preserve tiers for OpenAI-wire aliases without rewriting their routing identity. */
+function createOpenAIModelWithServiceTier(
+  createModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
+  baseFetch: typeof fetch,
+  serviceTierAvailable: boolean
+): LanguageModelV4 {
+  const model = createModel(baseFetch);
+  if (!serviceTierAvailable) return model;
+
+  const createTieredCall = (params: LanguageModelV4CallOptions) => {
+    const tier = ServiceTierSchema.optional().parse(params.providerOptions?.openai?.serviceTier);
+    if (tier == null) return undefined;
+    // The SDK drops tiers for opaque gateway aliases. Preserve the raw
+    // model/endpoint and serialize the tier after SDK capability checks.
+    // Per-call adapters keep concurrent requests' overrides independent.
+    return {
+      model: createModel(wrapFetchWithServiceTier(baseFetch, tier)),
+      params: {
+        ...params,
+        providerOptions: {
+          ...params.providerOptions,
+          openai: { ...params.providerOptions?.openai, serviceTier: undefined },
+        },
+      },
+    };
+  };
+  return wrapLanguageModel({
+    model,
+    middleware: {
+      specificationVersion: "v4",
+      wrapGenerate: ({ params, doGenerate }) => {
+        const call = createTieredCall(params);
+        return call ? call.model.doGenerate(call.params) : doGenerate();
+      },
+      wrapStream: ({ params, doStream }) => {
+        const call = createTieredCall(params);
+        return call ? call.model.doStream(call.params) : doStream();
+      },
+    },
+  });
 }
 
 type FetchWithBunExtensions = typeof fetch & {
@@ -1541,13 +1583,22 @@ export class ProviderModelFactory {
               const { createOpenAI } = yield* Effect.promise(async () =>
                 PROVIDER_REGISTRY.openai()
               );
-              const provider = createOpenAI({
-                baseURL: normalizeOpenAICompatibleBaseURL(credentials.baseURL),
-                apiKey: isolatedApiKey,
-                headers: { ...muxAttributionHeaders },
-                fetch: customAdapterFetch,
-              });
-              return Ok(provider.responses(modelId));
+              const createCustomModel = (fetch: typeof customAdapterFetch) => {
+                const provider = createOpenAI({
+                  baseURL: normalizeOpenAICompatibleBaseURL(credentials.baseURL),
+                  apiKey: isolatedApiKey,
+                  headers: { ...muxAttributionHeaders },
+                  fetch,
+                });
+                return provider.responses(modelId);
+              };
+              return Ok(
+                createOpenAIModelWithServiceTier(
+                  createCustomModel,
+                  customAdapterFetch,
+                  serviceTierAvailable
+                )
+              );
             }
             case "anthropic-messages": {
               const { createAnthropic } = yield* Effect.promise(async () =>
@@ -2524,43 +2575,8 @@ export class ProviderModelFactory {
               ? provider.responses(originModelId)
               : provider.chat(originModelId);
           };
-          const model = createCoderModel(coderFetch);
-          if (!serviceTierAvailable) return Ok(model);
-
-          const createTieredCall = (params: LanguageModelV4CallOptions) => {
-            const tier = ServiceTierSchema.optional().parse(
-              params.providerOptions?.openai?.serviceTier
-            );
-            if (tier == null) return undefined;
-            // The SDK drops tiers for opaque gateway aliases. Preserve the raw
-            // model/endpoint and serialize the tier after SDK capability checks.
-            // Per-call adapters keep concurrent requests' overrides independent.
-            return {
-              model: createCoderModel(wrapFetchWithServiceTier(coderFetch, tier)),
-              params: {
-                ...params,
-                providerOptions: {
-                  ...params.providerOptions,
-                  openai: { ...params.providerOptions?.openai, serviceTier: undefined },
-                },
-              },
-            };
-          };
           return Ok(
-            wrapLanguageModel({
-              model,
-              middleware: {
-                specificationVersion: "v4",
-                wrapGenerate: ({ params, doGenerate }) => {
-                  const call = createTieredCall(params);
-                  return call ? call.model.doGenerate(call.params) : doGenerate();
-                },
-                wrapStream: ({ params, doStream }) => {
-                  const call = createTieredCall(params);
-                  return call ? call.model.doStream(call.params) : doStream();
-                },
-              },
-            })
+            createOpenAIModelWithServiceTier(createCoderModel, coderFetch, serviceTierAvailable)
           );
         }
 

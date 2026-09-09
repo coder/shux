@@ -2431,6 +2431,9 @@ describe("ProviderModelFactory Coder", () => {
     "github-copilot:gpt-6-astra",
     "github-copilot:gpt-5.4",
     "openai:gpt-6-astra",
+    "responses-proxy:team-astra",
+    "openrouter:openai/team-astra",
+    "mux-gateway:openai/team-astra",
     "responses-proxy:gpt-6-astra",
   ])("pins and serializes the shared Fast tier through %s", async (modelString) => {
     await withTempConfig(async (config, factory, oauth, store) => {
@@ -2456,6 +2459,7 @@ describe("ProviderModelFactory Coder", () => {
         "responses-proxy": {
           providerType: "openai-responses",
           baseUrl: "https://proxy.example.com/v1",
+          models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
         },
       };
       store.saveProvidersConfig(providersConfig);
@@ -2552,7 +2556,7 @@ describe("ProviderModelFactory Coder", () => {
               }
               expect(calls.length).toBe(before + 1);
               const body = parseSentBody(calls[before]);
-              if (modelString.endsWith("/team-astra")) {
+              if (modelString.startsWith("coder:") && modelString.endsWith("/team-astra")) {
                 const instance =
                   modelString === "coder:prod-ai/team-astra" ? "prod-ai" : "chat-proxy";
                 const endpoint = instance === "prod-ai" ? "responses" : "chat/completions";
@@ -2560,6 +2564,11 @@ describe("ProviderModelFactory Coder", () => {
                 expect(calls[before].url).toBe(
                   `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/${instance}/v1/${endpoint}`
                 );
+              }
+              if (modelString === "responses-proxy:team-astra") {
+                expect(body.model).toBe("team-astra");
+                expect(new Headers(calls[before].init.headers).get("authorization")).toBeNull();
+                expect(calls[before].url).toBe("https://proxy.example.com/v1/responses");
               }
               if (modelString.startsWith("mux-gateway:")) {
                 expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
@@ -2577,33 +2586,54 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
-  it.each(["openai", "openai-compat"])(
-    "keeps concurrent tier overrides isolated for Coder %s aliases",
+  it.each(["openai", "openai-compat", "openai-responses"])(
+    "keeps concurrent tier overrides isolated for %s aliases",
     async (type) => {
-      await withTempConfig(async (config, factory, oauth) => {
-        saveCoderConfig(config, {
-          additionalProviders: [{ name: "team", type }],
-          models: [{ id: "team/astra-alias", mappedToModel: "openai:gpt-6-astra" }],
-        });
+      await withTempConfig(async (config, factory, oauth, store) => {
+        const custom = type === "openai-responses";
+        if (custom) {
+          store.saveProvidersConfig({
+            "responses-proxy": {
+              providerType: "openai-responses",
+              baseUrl: "https://proxy.example.com/v1",
+              apiKey: "custom-key",
+              models: [{ id: "astra-alias", mappedToModel: "openai:gpt-6-astra" }],
+            },
+          });
+        } else {
+          saveCoderConfig(config, {
+            additionalProviders: [{ name: "team", type }],
+            models: [{ id: "team/astra-alias", mappedToModel: "openai:gpt-6-astra" }],
+          });
+        }
         await saveRoutePriority(config, ["direct"]);
-        const authStarted = Promise.withResolvers<void>();
-        const releaseAuth = Promise.withResolvers<void>();
+        const requestStarted = Promise.withResolvers<void>();
+        const releaseRequest = Promise.withResolvers<void>();
+        let requests = 0;
+        const interleaveFirstRequest = async () => {
+          if (++requests === 1) {
+            requestStarted.resolve();
+            await releaseRequest.promise;
+          }
+        };
         const oauthService = stubCoderOauthService();
         const getAuth = oauthService.getValidAuth.bind(oauthService);
-        let authCalls = 0;
         oauthService.getValidAuth = async () => {
-          if (++authCalls === 1) {
-            authStarted.resolve();
-            await releaseAuth.promise;
-          }
+          await interleaveFirstRequest();
           return getAuth();
         };
         oauth.coderOauthService = oauthService;
         const { calls, fakeFetch } = createCapturingFetch();
-        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        const interleavedFetch = Object.assign(async (...args: Parameters<typeof fakeFetch>) => {
+          if (custom) await interleaveFirstRequest();
+          return fakeFetch(...args);
+        }, fakeFetch);
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(interleavedFetch);
         let first: Promise<unknown> | undefined;
         try {
-          const created = await factory.createModel("coder:team/astra-alias");
+          const created = await factory.createModel(
+            custom ? "responses-proxy:astra-alias" : "coder:team/astra-alias"
+          );
           if (!created.success) throw new Error(created.error.type);
           first = generateText({
             model: created.data,
@@ -2611,25 +2641,30 @@ describe("ProviderModelFactory Coder", () => {
             providerOptions: { openai: { serviceTier: "priority" } },
             maxRetries: 0,
           }).catch(() => undefined);
-          await authStarted.promise;
+          await requestStarted.promise;
           await streamText({
             model: created.data,
             prompt: "second",
             providerOptions: { openai: { serviceTier: "flex" } },
             maxRetries: 0,
           }).consumeStream({ onError: () => undefined });
-          releaseAuth.resolve();
+          releaseRequest.resolve();
           await first;
           expect(calls.map((call) => parseSentBody(call).service_tier)).toEqual([
             "flex",
             "priority",
           ]);
+          if (custom) {
+            expect(
+              calls.map((call) => new Headers(call.init.headers).get("authorization"))
+            ).toEqual(["Bearer custom-key", "Bearer custom-key"]);
+          }
           expect(calls.map((call) => parseSentBody(call).model)).toEqual([
             "astra-alias",
             "astra-alias",
           ]);
         } finally {
-          releaseAuth.resolve();
+          releaseRequest.resolve();
           await first;
           fetchSpy.mockRestore();
         }
