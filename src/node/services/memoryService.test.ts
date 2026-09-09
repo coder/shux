@@ -1467,11 +1467,35 @@ describe("MemoryService", () => {
         (await fixture.service.listIndexEntries(fixture.ctx)).filter((e) => e.scope === "workspace")
       ).toEqual([]);
 
+      // Destination side: the owner store's imported/<child> component is a
+      // symlink out of the root. A conflicting legacy note would land there;
+      // the write is refused (and nothing is written outside), the note stays
+      // in the legacy dir unrecorded.
+      await fsPromises.unlink(path.join(childSessionDir, "memory"));
+      const legacyRoot = path.join(childSessionDir, "memory");
+      await fsPromises.mkdir(legacyRoot);
+      await fsPromises.writeFile(path.join(legacyRoot, "clash.md"), "child version");
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      await fsPromises.mkdir(path.join(ownerRoot, "imported"), { recursive: true });
+      await fsPromises.writeFile(path.join(ownerRoot, "clash.md"), "owner version");
+      await fsPromises.symlink(outside, path.join(ownerRoot, "imported", "ws-child"));
+      const escaped = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
+      expect(
+        (await escaped.listIndexEntries(fixture.ctx))
+          .filter((e) => e.scope === "workspace")
+          .map((e) => e.relPath)
+      ).toEqual(["clash.md"]);
+      expect(await pathExists(path.join(outside, "clash.md"))).toBe(false);
+      expect(await pathExists(path.join(legacyRoot, ".adopted-into-shared-store.json"))).toBe(
+        false
+      );
+      await fsPromises.unlink(path.join(ownerRoot, "imported", "ws-child"));
+      await fsPromises.rm(legacyRoot, { recursive: true });
+      await fsPromises.rm(path.join(ownerRoot, "clash.md"));
+
       // Real root whose entries point outside: symlinked entries are not
       // regular files to the walk, and a symlinked subdirectory is never
       // descended into.
-      await fsPromises.unlink(path.join(childSessionDir, "memory"));
-      const legacyRoot = path.join(childSessionDir, "memory");
       await fsPromises.mkdir(legacyRoot);
       await fsPromises.symlink(path.join(outside, "secret.md"), path.join(legacyRoot, "link.md"));
       await fsPromises.symlink(outside, path.join(legacyRoot, "linked-dir"));

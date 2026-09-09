@@ -4214,10 +4214,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Config snapshot for a removal's destructive step: strict load, so a
-   * transiently unreadable config.json aborts the removal (the workspace stays
-   * registered and retryable) rather than yielding the fresh-install default
-   * whose empty topology would resolve every sub-agent to itself.
+   * Config snapshot for resolving a removal's shared-memory owner: strict
+   * load, so a transiently unreadable config.json aborts the removal (the
+   * workspace stays registered and retryable) rather than yielding the
+   * fresh-install default whose empty topology would resolve every sub-agent
+   * to itself.
    */
   private loadConfigForRemovalOrAbort(workspaceId: string): ProjectsConfig {
     try {
@@ -6117,8 +6118,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         //    lands in between is captured too; that late pass only has the
         //    few rows appended since this one, keeping the fallible work at
         //    the point of no return minimal.
+        // Strict load: a config.json that is missing or malformed right now
+        // would read as the fresh-install default and resolve this child to
+        // ITSELF — dropping the owner-store lock and the row handover at the
+        // destructive step below, which reuses this value. Nothing has been
+        // torn down yet, so aborting here leaves the workspace intact.
         const sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
-          this.config.loadConfigOrDefault(),
+          this.loadConfigForRemovalOrAbort(workspaceId),
           workspaceId
         );
         verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;

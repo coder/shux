@@ -1071,6 +1071,22 @@ export class MemoryService extends EventEmitter {
                 skipped++;
                 continue;
               }
+              // Destination containment immediately before the write (the
+              // same check a memory create runs): a symlinked component under
+              // the owner root — e.g. imported/<child> pointing elsewhere —
+              // must never let the copy land outside the store.
+              try {
+                await store.assertContained(target.relPath);
+              } catch (error) {
+                log.warn("[MemoryService] refusing to adopt a legacy note into an escaping path", {
+                  childId,
+                  relPath,
+                  target: target.relPath,
+                  error,
+                });
+                skipped++;
+                continue;
+              }
               await store.writeFile(target.relPath, content);
               remainingCapacity--;
               imported++;
@@ -1155,6 +1171,12 @@ export class MemoryService extends EventEmitter {
     content: string
   ): Promise<{ relPath: string; write: boolean } | null> {
     for (const candidate of [relPath, `${LEGACY_IMPORT_DIR}/${childId}/${relPath}`]) {
+      // Never even compare through an escaping path (the write site re-checks).
+      const contained = await store.assertContained(candidate).then(
+        () => true,
+        () => false
+      );
+      if (!contained) continue;
       const kind = await store.kind(candidate);
       if (kind === null) return { relPath: candidate, write: true };
       if (kind === "file") {
