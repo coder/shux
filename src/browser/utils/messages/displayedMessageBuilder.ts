@@ -401,7 +401,11 @@ function buildUserDisplayedMessages(options: {
         muxMeta.contextTokens >= 0 &&
         Number.isFinite(muxMeta.maxTokens) &&
         muxMeta.maxTokens > 0
-          ? { contextTokens: muxMeta.contextTokens, maxTokens: muxMeta.maxTokens }
+          ? {
+              contextTokens: muxMeta.contextTokens,
+              maxTokens: muxMeta.maxTokens,
+              final: muxMeta.final === true,
+            }
           : undefined,
       // The peer-message wake trigger is a synthetic machine row: mark it so prompt
       // navigation skips it (the envelope payload itself is a separate assistant row). When the

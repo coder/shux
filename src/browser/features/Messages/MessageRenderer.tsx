@@ -102,7 +102,11 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
           message.contextBudgetWarning != null ? (
             <CollapsibleMachineMessage
               content={message.content}
-              summary="Context budget warning"
+              summary={
+                message.contextBudgetWarning.final
+                  ? "Context window ending: notes flush"
+                  : "Context budget warning"
+              }
               icon={<AlertTriangle aria-hidden="true" className="size-3.5 shrink-0" />}
               marker="context-budget-warning"
               className={className}

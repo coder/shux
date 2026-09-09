@@ -7,7 +7,12 @@ import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
-import { MEMORY_INTUITION_MAX_USES_PER_TURN } from "@/common/constants/memory";
+import {
+  MEMORY_INTUITION_MAX_USES_PER_TURN,
+  type MemoryScopeAccess,
+} from "@/common/constants/memory";
+import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
+import { getContextBudgetFlushMaxOutputTokens } from "@/common/utils/compaction/contextBudget";
 import {
   resolveHeadlessAgentDefinition,
   resolveHeadlessAgentSettings,
@@ -237,7 +242,11 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import { isMemoryToolDisabled, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import {
+  isMemoryToolDisabled,
+  withContextBudgetFlushToolPolicy,
+  type ToolPolicy,
+} from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -284,7 +293,7 @@ export interface StreamMessageOptions {
    */
   resolveMemoryContext?: (
     modelString: string,
-    options?: { includeHotMemories?: boolean }
+    options?: { includeHotMemories?: boolean; onlyContextNotes?: boolean }
   ) => Promise<MemorySessionContext | undefined>;
   experiments?: SendMessageOptions["experiments"];
   allowAgentSetGoal?: boolean;
@@ -868,11 +877,19 @@ export class TurnRequestBuilder {
       minThinkingLevel: providedMinThinkingLevel,
     } = opts;
     let activeTurnThinkingOverride = opts.activeTurnThinkingOverride;
-    const experiments: StreamMessageOptions["experiments"] = resolveBackendGatedPtcExperiments(
+    // SECURITY: the context-budget final flush is a hidden automatic turn whose only job is
+    // writing the workspace context notes, on a transcript that may carry injected tool output.
+    // It must not gain synthesized code execution (PTC) or run repository tool hooks, and its
+    // memory writes are pinned to the notes file below.
+    const contextBudgetFlushTurn = muxMetadata?.contextBudgetFlush === true;
+    const gatedExperiments = resolveBackendGatedPtcExperiments(
       experimentsFromOptions,
       (experimentId) =>
         this.dependencies.experimentsService?.isExperimentEnabled(experimentId) === true
     );
+    const experiments: StreamMessageOptions["experiments"] = contextBudgetFlushTurn
+      ? { ...gatedExperiments, programmaticToolCalling: false }
+      : gatedExperiments;
     const combinedAbortSignal = context.abortSignal;
     const syntheticMessageId = context.syntheticMessageId;
     const startTime = context.startTime;
@@ -1324,8 +1341,13 @@ export class TurnRequestBuilder {
     // project-scope listing sees a running runtime (a stopped Docker/remote
     // workspace would yield an empty/partial context, and AgentSession caches
     // the result per model/session segment).
+    // Flush turns only ever see the context notes (index and preload): other memories must
+    // not be disclosed to, or laundered through, the hidden prompt-influenced turn.
     const memoryContext = resolveMemoryContext
-      ? await resolveMemoryContext(modelString, { includeHotMemories: false })
+      ? await resolveMemoryContext(modelString, {
+          includeHotMemories: false,
+          onlyContextNotes: contextBudgetFlushTurn,
+        })
       : undefined;
 
     const cfg = this.dependencies.config.loadConfigOrDefault();
@@ -1380,7 +1402,10 @@ export class TurnRequestBuilder {
       memoryToolAvailableForModel &&
       memoryHotSetExperimentEnabled &&
       resolveMemoryContext !== undefined
-        ? await resolveMemoryContext(modelStringForContext, { includeHotMemories: true })
+        ? await resolveMemoryContext(modelStringForContext, {
+            includeHotMemories: true,
+            onlyContextNotes: contextBudgetFlushTurn,
+          })
         : memoryContext;
     emitStartupBreadcrumb("loading_workspace_context");
     const resolveAgentForStreamStartedAt = Date.now();
@@ -1392,7 +1417,11 @@ export class TurnRequestBuilder {
       requestedAgentId: agentId,
       strictAgentResolution,
       disableWorkspaceAgents: disableWorkspaceAgents ?? false,
-      callerToolPolicy: toolPolicy,
+      // Flush turns get the memory-only ceiling here, independent of caller options, so a
+      // resumed or retried stream cannot widen the hidden turn's toolset.
+      callerToolPolicy: contextBudgetFlushTurn
+        ? withContextBudgetFlushToolPolicy(toolPolicy)
+        : toolPolicy,
       cfg,
       emitError: (event) => {
         if (!context.admissionOnly) this.dependencies.emit("error", event);
@@ -1437,10 +1466,15 @@ export class TurnRequestBuilder {
       ) &&
       !isRlmModeEnabled(experiments, isExperimentEnabled);
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
-    const memoryAccess = resolveMemoryAccessPolicy({
+    const agentMemoryAccess = resolveMemoryAccessPolicy({
       planLike: agentIsPlanLike,
       editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
     });
+    // Flush turns: keep global/project stores read-only and pin mutations to the notes file
+    // (memoryWritePath below) so injected transcript content cannot reach other memory.
+    const memoryAccess: MemoryScopeAccess = contextBudgetFlushTurn
+      ? { global: "read", project: "read", workspace: agentMemoryAccess.workspace }
+      : agentMemoryAccess;
     // Post-compaction harvest writes to /memories/workspace on the agent's
     // behalf; it must honor exactly what the memory tool enforces: the scope
     // access AND the tool's presence in the final toolset. The tool exists
@@ -1757,7 +1791,9 @@ export class TurnRequestBuilder {
     let mcpPromptRuntime: MCPPromptRuntime | undefined;
     let mcpSetupDurationMs = 0;
 
-    if (this.dependencies.bindings.mcpServerManager) {
+    // SECURITY: the memory-only flush turn filters every MCP tool out anyway, so never start
+    // repository-configured servers (with project secrets) for this hidden automatic turn.
+    if (this.dependencies.bindings.mcpServerManager && !contextBudgetFlushTurn) {
       const mcpServerManager = this.dependencies.bindings.mcpServerManager;
       const mcpToolSetupStartedAt = Date.now();
       try {
@@ -2336,6 +2372,7 @@ export class TurnRequestBuilder {
       historyService: this.dependencies.historyService,
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess,
+      ...(contextBudgetFlushTurn ? { memoryWritePath: CONTEXT_NOTES_MEMORY_PATH } : {}),
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {
         ...experiments,
@@ -2355,7 +2392,8 @@ export class TurnRequestBuilder {
       // description (same disclosure mechanic as skills).
       memoryIndexEntries: memoryContext?.indexEntries,
       // Trust gating: only run hooks/scripts when the full shared workspace runtime is trusted.
-      trusted: sharedExecutionTrusted,
+      // Flush turns never run repository tool hooks around their pinned memory write.
+      trusted: sharedExecutionTrusted && !contextBudgetFlushTurn,
     };
     const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
       if (event.type === "tool-call-start" || event.type === "tool-call-end") {
@@ -3070,15 +3108,21 @@ export class TurnRequestBuilder {
                       prepareOptions.continuation.assistantMessage
                     )
                   : messages;
-                const requestedThinkingLevel =
-                  prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel;
+                // The flush is housekeeping: it runs at the fallback model's own inherent
+                // minimum (no user floor, no mid-turn override), mirroring the primary flush
+                // request, and gets a cap sized for THAT level below.
+                const requestedThinkingLevel = contextBudgetFlushTurn
+                  ? THINKING_LEVEL_OFF
+                  : (prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel);
                 const nextSeedResult = await prepareModelSeed({
                   rawModelString: nextModelString,
                   requestedThinkingLevel,
-                  minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
-                    this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
-                    nextModelString
-                  ),
+                  minimumThinkingLevelOverride: contextBudgetFlushTurn
+                    ? undefined
+                    : lookupMinThinkingLevelOverride(
+                        this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
+                        nextModelString
+                      ),
                   enforceMinimum: true,
                 });
                 if (!nextSeedResult.success) {
@@ -3135,6 +3179,16 @@ export class TurnRequestBuilder {
                   headers: nextHeaders,
                   callSettingsOverrides: nextRequest.resolvedOverrides.standard,
                   thinkingLevel: nextRequest.effectiveThinkingLevel,
+                  // A fallback with a higher thinking minimum than the primary would be
+                  // rejected under the primary's flush cap (thinking budget must stay below
+                  // max_tokens), losing the only notes-preserving step.
+                  ...(contextBudgetFlushTurn
+                    ? {
+                        maxOutputTokens: getContextBudgetFlushMaxOutputTokens(
+                          nextRequest.effectiveThinkingLevel
+                        ),
+                      }
+                    : {}),
                   forcedFirstStepToolNames: nextRequest.forcedFirstStepToolNames,
                   rebuildProviderOptionsForThinkingLevel:
                     nextRequest.rebuildProviderOptionsForThinkingLevel,

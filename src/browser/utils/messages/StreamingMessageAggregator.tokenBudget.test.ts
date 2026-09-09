@@ -22,8 +22,19 @@ describe("token-budget replay", () => {
         uiVisible: true,
         muxMetadata: { type: "context-budget-warning", contextTokens: 800, maxTokens: 1000 },
       }),
-      createMuxMessage("reset", "assistant", "", {
+      createMuxMessage("final-flush", "user", "Write workspace notes now; the window is ending.", {
         historySequence: 3,
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata: {
+          type: "context-budget-warning",
+          contextTokens: 850,
+          maxTokens: 1000,
+          final: true,
+        },
+      }),
+      createMuxMessage("reset", "assistant", "", {
+        historySequence: 4,
         contextBoundaryKind: "reset",
         muxMetadata: {
           type: "context-window-rollover",
@@ -36,17 +47,17 @@ describe("token-budget replay", () => {
         },
       }),
       createMuxMessage("lead-in", "user", "Model-only retrieval instructions", {
-        historySequence: 4,
+        historySequence: 5,
         synthetic: true,
         muxMetadata: { type: "context-window-lead-in", rolloverId: "reset" },
       }),
-      createMuxMessage("next", "user", "Continue with the fix", { historySequence: 5 }),
+      createMuxMessage("next", "user", "Continue with the fix", { historySequence: 6 }),
       createMuxMessage("manual-reset", "assistant", "", {
-        historySequence: 6,
+        historySequence: 7,
         contextBoundaryKind: "reset",
       }),
       createMuxMessage("budget-continue", "user", "Continue", {
-        historySequence: 7,
+        historySequence: 8,
         synthetic: true,
         uiVisible: false,
         muxMetadata: { type: "normal", contextBudgetContinuation: true },
@@ -61,15 +72,19 @@ describe("token-budget replay", () => {
     expect(displayed.map((message) => message.type)).toEqual([
       "user",
       "user",
+      "user",
       "compaction-boundary",
       "user",
       "compaction-boundary",
     ]);
     expect(displayed[1]).toMatchObject({
-      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000 },
+      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000, final: false },
     });
-    expect(displayed[2]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: true });
-    expect(displayed[4]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: undefined });
+    expect(displayed[2]).toMatchObject({
+      contextBudgetWarning: { contextTokens: 850, maxTokens: 1000, final: true },
+    });
+    expect(displayed[3]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: true });
+    expect(displayed[5]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: undefined });
     expect(aggregator.getActiveStreamMessageId()).toBeUndefined();
   });
 

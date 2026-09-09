@@ -1,11 +1,8 @@
 import type React from "react";
 import { normalizeAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
-import {
-  downloadBlob,
-  downloadViaAnchor,
-  isIosStandaloneWebApp,
-} from "@/browser/utils/downloadFile";
+import { downloadBlob, downloadViaAnchor } from "@/browser/utils/downloadFile";
+import { isIosStandaloneWebApp } from "@/browser/utils/env";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 
 /**

@@ -18,6 +18,8 @@ const WORKSPACE_ID = "ws-token-budget";
 const MODEL = "google:gemini-3.1-flash-lite";
 const WARNING =
   "Save the objective and next steps to workspace/context-notes.md (up to 8 KiB) if writable.";
+const FINAL_FLUSH =
+  "Last step in this context window: write workspace/context-notes.md in a single memory call.";
 const LEAD_IN = "Model-only instructions for retrieving earlier context windows.";
 
 function setupTokenBudgetStory(inputTokens = 2400) {
@@ -39,8 +41,20 @@ function setupTokenBudgetStory(inputTokens = 2400) {
       uiVisible: true,
       muxMetadata: { type: "context-budget-warning", contextTokens: 650_000, maxTokens: 1_000_000 },
     }),
-    createMuxMessage("rollover", "assistant", "", {
+    createMuxMessage("final-flush", "user", FINAL_FLUSH, {
       historySequence: 3,
+      timestamp: STABLE_TIMESTAMP - 25_000,
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata: {
+        type: "context-budget-warning",
+        contextTokens: 690_000,
+        maxTokens: 1_000_000,
+        final: true,
+      },
+    }),
+    createMuxMessage("rollover", "assistant", "", {
+      historySequence: 4,
       timestamp: STABLE_TIMESTAMP - 20_000,
       contextBoundaryKind: "reset",
       muxMetadata: {
@@ -54,17 +68,17 @@ function setupTokenBudgetStory(inputTokens = 2400) {
       },
     }),
     createMuxMessage("lead-in", "user", LEAD_IN, {
-      historySequence: 4,
+      historySequence: 5,
       timestamp: STABLE_TIMESTAMP - 10_000,
       synthetic: true,
       muxMetadata: { type: "context-window-lead-in", rolloverId: "rollover" },
     }),
     createMuxMessage("next", "user", "Continue with the regression tests.", {
-      historySequence: 5,
+      historySequence: 6,
       timestamp: STABLE_TIMESTAMP,
     }),
     createMuxMessage("budget-continue", "user", "Continue", {
-      historySequence: 6,
+      historySequence: 7,
       timestamp: STABLE_TIMESTAMP,
       synthetic: true,
       uiVisible: false,
@@ -77,7 +91,7 @@ function setupTokenBudgetStory(inputTokens = 2400) {
     messages: [
       ...history.map((message) => ({ ...message, type: "message" as const })),
       createAssistantMessage("retrieval", "I'll retrieve the earlier decision before continuing.", {
-        historySequence: 7,
+        historySequence: 8,
         timestamp: STABLE_TIMESTAMP,
         model: MODEL,
         contextUsage: { inputTokens, outputTokens: 100 },
@@ -135,6 +149,16 @@ export const Rollover: AppStory = {
     await userEvent.click(warning);
     await waitFor(() => expect(canvas.getByText(WARNING)).toBeVisible());
     await userEvent.click(warning);
+    await expect(canvas.queryByText(FINAL_FLUSH)).not.toBeInTheDocument();
+    const finalFlush = await canvas.findByRole("button", {
+      name: /Context window ending: notes flush/,
+    });
+    await expect(
+      finalFlush.compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).not.toBe(0);
+    await userEvent.click(finalFlush);
+    await waitFor(() => expect(canvas.getByText(FINAL_FLUSH)).toBeVisible());
+    await userEvent.click(finalFlush);
     const tool = await canvas.findByText("session_history", { exact: true });
     await userEvent.click(tool);
     await expect(await canvas.findByText("Arguments", { exact: true })).toBeVisible();

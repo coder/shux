@@ -34,7 +34,7 @@ describe("MessageRenderer goal continuation rows", () => {
       historySequence: 1,
       content,
       isSynthetic: true,
-      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000 },
+      contextBudgetWarning: { contextTokens: 800, maxTokens: 1000, final: false },
     };
     const view = render(
       <TooltipProvider>
@@ -43,10 +43,30 @@ describe("MessageRenderer goal continuation rows", () => {
     );
     const toggle = view.container.querySelector("[data-context-budget-warning] button");
     expect(toggle).not.toBeNull();
+    const warningSummary = toggle!.textContent;
+    expect(warningSummary).not.toBe("");
     expect(view.queryByText(content)).toBeNull();
     fireEvent.click(toggle!);
     expect(view.getByText(content)).toBeDefined();
     fireEvent.click(toggle!);
+    expect(view.queryByText(content)).toBeNull();
+
+    // The final pre-rollover flush is the same collapsible row with an ending summary.
+    view.rerender(
+      <TooltipProvider>
+        <MessageRenderer
+          message={{
+            ...message,
+            contextBudgetWarning: { ...message.contextBudgetWarning!, final: true },
+          }}
+        />
+      </TooltipProvider>
+    );
+    const finalToggle = view.container.querySelector("[data-context-budget-warning] button")!;
+    // The final flush must be distinguishable from an ordinary warning without expanding it,
+    // and must keep hiding the machine prompt.
+    expect(finalToggle.textContent).not.toBe("");
+    expect(finalToggle.textContent).not.toBe(warningSummary);
     expect(view.queryByText(content)).toBeNull();
 
     view.rerender(

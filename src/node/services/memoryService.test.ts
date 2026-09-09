@@ -16,6 +16,7 @@ import {
   resolveMemoryProjectIdentity,
   type MemoryChangeEvent,
   type MemoryScopeContext,
+  type PinnedFileMutation,
 } from "./memoryService";
 import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
 import {
@@ -571,6 +572,89 @@ describe("MemoryService", () => {
         "agent"
       );
       expect(result.success).toBe(false);
+    });
+
+    it("writePinnedFile resolves create-or-update under the lock and caps the actual result", async () => {
+      using fixture = await createFixture();
+      const notes = "/memories/global/notes.md";
+      const write = (mutation: PinnedFileMutation) =>
+        fixture.service.writePinnedFile(fixture.ctx, notes, mutation, 100, "agent");
+      const read = async () => {
+        const result = await fixture.service.readFileWithSha(fixture.ctx, notes);
+        return result.success ? result.data.content : null;
+      };
+      // An update command on a missing file creates it from its payload.
+      expect(
+        (await write({ command: "str_replace", oldStr: "gone", newStr: "seed" })).success
+      ).toBe(true);
+      expect(await read()).toBe("seed");
+      // create replaces an existing file instead of failing on a stale existence verdict.
+      expect((await write({ command: "create", fileText: "a".repeat(60) })).success).toBe(true);
+      expect(await read()).toBe("a".repeat(60));
+      // 60 + 41 > 100: rejected against the actual contents even though the payload alone fits.
+      const grow = await write({ command: "insert", insertLine: 0, insertText: "b".repeat(40) });
+      expect(grow.success).toBe(false);
+      if (!grow.success) expect(grow.error).toContain("limited to 100 bytes");
+      expect(await read()).toBe("a".repeat(60));
+      // Replacing content that frees space fits under the same cap.
+      expect(
+        (await write({ command: "str_replace", oldStr: "a".repeat(60), newStr: "c".repeat(90) }))
+          .success
+      ).toBe(true);
+      expect(await read()).toBe("c".repeat(90));
+      // insert on a missing file ignores the line position and normalizes like insert.
+      await fixture.service.deletePath(fixture.ctx, notes, "agent");
+      expect(
+        (await write({ command: "insert", insertLine: 7, insertText: "x\ny\n" })).success
+      ).toBe(true);
+      expect(await read()).toBe("x\ny");
+    });
+
+    it("writePinnedFile ignores the per-scope file cap and lets create replace a malformed file", async () => {
+      using fixture = await createFixture();
+      const notes = "/memories/global/notes.md";
+      const globalDir = path.join(fixture.xumHome, "memory", "global");
+      await fsPromises.mkdir(globalDir, { recursive: true });
+      await Promise.all(
+        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE }, (_, i) =>
+          fsPromises.writeFile(path.join(globalDir, `f${i}.md`), "x")
+        )
+      );
+      // The ordinary create is refused by the cap; the pinned notes slot is exempt.
+      expect((await fixture.service.create(fixture.ctx, notes, "seed", "agent")).success).toBe(
+        false
+      );
+      expect(
+        (
+          await fixture.service.writePinnedFile(
+            fixture.ctx,
+            notes,
+            { command: "insert", insertLine: 0, insertText: "seed" },
+            100,
+            "agent"
+          )
+        ).success
+      ).toBe(true);
+      // Externally corrupted notes (NUL byte) cannot be edited, but the pinned create replaces them.
+      await fsPromises.writeFile(path.join(globalDir, "notes.md"), "bad\u0000bytes");
+      const edit = await fixture.service.writePinnedFile(
+        fixture.ctx,
+        notes,
+        { command: "str_replace", oldStr: "bad", newStr: "good" },
+        100,
+        "agent"
+      );
+      expect(edit.success).toBe(false);
+      const replaced = await fixture.service.writePinnedFile(
+        fixture.ctx,
+        notes,
+        { command: "create", fileText: "repaired" },
+        100,
+        "agent"
+      );
+      expect(replaced.success).toBe(true);
+      const result = await fixture.service.readFileWithSha(fixture.ctx, notes);
+      expect(result.success && result.data.content).toBe("repaired");
     });
   });
 
@@ -2564,6 +2648,50 @@ describe("MemoryService", () => {
       const index = formatMemoryIndexForToolDescription(entries);
       expect(index).not.toContain("injected-line");
       expect(index).not.toContain("pwn");
+    });
+
+    it("keeps the context notes indexed when the workspace scope exceeds the cap", async () => {
+      using fixture = await createFixture();
+      // The notes slot is exempt from the cap on write, so it must also survive the enumeration
+      // cut even when every other file sorts before it.
+      const memoryDir = path.join(fixture.xumHome, "sessions", fixture.ctx.workspaceId, "memory");
+      await fsPromises.mkdir(memoryDir, { recursive: true });
+      await Promise.all([
+        ...Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE + 5 }, (_, i) =>
+          fsPromises.writeFile(path.join(memoryDir, `a${String(i).padStart(4, "0")}.md`), "x")
+        ),
+        fsPromises.writeFile(path.join(memoryDir, "context-notes.md"), "handoff"),
+      ]);
+      const entries = (await fixture.service.listIndexEntries(fixture.ctx)).filter(
+        (entry) => entry.scope === "workspace"
+      );
+      expect(entries).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
+      expect(entries.map((entry) => entry.path)).toContain("/memories/workspace/context-notes.md");
+      expect(entries[0]?.relPath).toBe("a0000.md");
+    });
+
+    it("drops a symlinked context-notes slot from the over-cap probe", async () => {
+      using fixture = await createFixture();
+      // The direct probe must admit only what the walk's dirent filter admits: a symlink
+      // pointing outside the root would otherwise be read into the provider request.
+      const memoryDir = path.join(fixture.xumHome, "sessions", fixture.ctx.workspaceId, "memory");
+      await fsPromises.mkdir(memoryDir, { recursive: true });
+      const outside = path.join(fixture.xumHome, "outside-secret.md");
+      await fsPromises.writeFile(outside, "---\ndescription: leaked\n---\n");
+      await Promise.all([
+        ...Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE + 5 }, (_, i) =>
+          fsPromises.writeFile(path.join(memoryDir, `a${String(i).padStart(4, "0")}.md`), "x")
+        ),
+        fsPromises.symlink(outside, path.join(memoryDir, "context-notes.md")),
+      ]);
+      const entries = (await fixture.service.listIndexEntries(fixture.ctx)).filter(
+        (entry) => entry.scope === "workspace"
+      );
+      expect(entries).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
+      expect(entries.map((entry) => entry.path)).not.toContain(
+        "/memories/workspace/context-notes.md"
+      );
+      expect(entries.some((entry) => entry.description === "leaked")).toBe(false);
     });
 
     it("caps indexed files per scope to the declared limit", async () => {

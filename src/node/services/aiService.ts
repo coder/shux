@@ -78,6 +78,7 @@ import {
   resolveMemoryProjectIdentity,
   type MemorySessionContext,
 } from "@/node/services/memoryService";
+import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
 import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 
@@ -279,7 +280,12 @@ export class AIService extends EventEmitter {
   async buildMemorySessionContext(
     workspaceId: string,
     modelString: string,
-    options?: { includeHotMemories?: boolean; tokenBudgetActive?: boolean }
+    options?: {
+      includeHotMemories?: boolean;
+      tokenBudgetActive?: boolean;
+      /** Context-budget flush turns: expose only the workspace context notes. */
+      onlyContextNotes?: boolean;
+    }
   ): Promise<MemorySessionContext | null> {
     if (!this.turnRequestBuilderBindings.memoryService) return null;
     if (this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) !== true) {
@@ -298,8 +304,11 @@ export class AIService extends EventEmitter {
         // disables project memory when no single project identity exists.
         projectPath: resolveMemoryProjectIdentity(metadata),
       };
-      const indexEntries =
+      const onlyNotes = (entry: { path: string }) => entry.path === CONTEXT_NOTES_MEMORY_PATH;
+      const allIndexEntries =
         await this.turnRequestBuilderBindings.memoryService.listIndexEntries(ctx);
+      const indexEntries =
+        options?.onlyContextNotes === true ? allIndexEntries.filter(onlyNotes) : allIndexEntries;
       // Hot preloading is a sub-experiment: without it, memories stay
       // pull-based like skills (index only, contents fetched on demand).
       let hotMemoriesBlock: string | null = null;
@@ -313,11 +322,23 @@ export class AIService extends EventEmitter {
             this.providerService.getConfig()
           );
           const tokenizer = await getTokenizerForModel(modelString, metadataModel);
+          // Flush turns select the notes alone under their own caps inside the selector (a
+          // post-filter would keep an item fitted under the larger ordinary per-item budget).
           const items = await this.turnRequestBuilderBindings.memoryService.listHotMemories(ctx, {
             countTokens: (text) => tokenizer.countTokens(text),
             tokenBudgetActive: options?.tokenBudgetActive === true,
+            onlyContextNotes: options?.onlyContextNotes === true,
           });
-          hotMemoriesBlock = items.length === 0 ? null : formatHotMemoriesBlock(items);
+          assert(
+            options?.onlyContextNotes !== true || items.every(onlyNotes),
+            "flush turns must preload only the context notes"
+          );
+          hotMemoriesBlock =
+            items.length === 0
+              ? null
+              : formatHotMemoriesBlock(items, {
+                  flushPreload: options?.onlyContextNotes === true,
+                });
         } catch (error) {
           // Hot preloading is best-effort context. Preserve the pull-based
           // memory index when tokenizer setup or ranked selection fails.

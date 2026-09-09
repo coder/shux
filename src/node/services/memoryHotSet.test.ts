@@ -157,6 +157,34 @@ describe("additive context notes", () => {
     }
   );
 
+  it("onlyContextNotes re-fits even a pinned notes file to the notes caps and drops the rest", async () => {
+    const content = "x".repeat(12_000);
+    const candidates = [
+      candidate({ path: notesPath, pinned: true }),
+      candidate({ path: "/memories/global/a.md", pinned: true }),
+    ];
+    const args = { candidates, readFile: () => Promise.resolve(content), countTokens, now: NOW };
+    // Ordinary pass: the pinned notes ride the larger per-item budget untruncated.
+    const ordinary = await selectHotMemories({ ...args, tokenBudgetActive: true });
+    expect(ordinary.find((item) => item.path === notesPath)).toMatchObject({
+      truncated: false,
+      content,
+    });
+    const flush = await selectHotMemories({ ...args, onlyContextNotes: true });
+    expect(flush.map((item) => item.path)).toEqual([notesPath]);
+    expect(flush[0].truncated).toBe(true);
+    const rendered = formatHotMemoriesBlock(flush, { flushPreload: true });
+    expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_BYTES);
+    expect(await countTokens(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_TOKENS);
+    // The flush rendering variant differs only in how a truncated item is annotated (the pinned
+    // tool has no `view` to point at); untruncated items render identically in both variants.
+    expect(rendered).not.toBe(formatHotMemoriesBlock(flush));
+    const untruncated = [{ ...flush[0], truncated: false }];
+    expect(formatHotMemoriesBlock(untruncated, { flushPreload: true })).toBe(
+      formatHotMemoriesBlock(untruncated)
+    );
+  });
+
   it("does not take any of the base byte/token allowance, including wrapper costs", async () => {
     const baseCandidate = candidate({ path: "/memories/global/pin.md", pinned: true });
     const readFile = (path: string) =>

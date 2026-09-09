@@ -23,6 +23,7 @@ import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 import YAML from "yaml";
 import assert from "@/common/utils/assert";
+import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
 import {
   MEMORY_HOT_SET_MAX_ITEM_BYTES,
   MEMORY_INDEX_DESCRIPTION_MAX_CHARS,
@@ -234,6 +235,11 @@ async function assertRenameDestinationOutsideDirSource(args: {
  * Parse + validate a virtual memory path. Throws MemoryCommandError with a
  * model-recoverable message on invalid input.
  */
+/** Host-local root of one workspace's memory scope (<sessionDir>/memory). */
+export function workspaceMemoryStorePath(sessionsDir: string, workspaceId: string): string {
+  return path.join(sessionsDir, workspaceId, "memory");
+}
+
 export function parseMemoryPath(virtualPath: string): ParsedMemoryPath {
   const trimmed = virtualPath.trim();
   if (!trimmed.startsWith(MEMORY_VIRTUAL_ROOT)) {
@@ -687,6 +693,19 @@ export function extractMemoryDescription(content: string): string {
 // Service
 // ---------------------------------------------------------------------------
 
+/** The conventional context-notes file, kept visible even when a scope exceeds its file cap. */
+const CONTEXT_NOTES = parseMemoryPath(CONTEXT_NOTES_MEMORY_PATH);
+assert(
+  CONTEXT_NOTES.scope !== null && CONTEXT_NOTES.relPath !== "",
+  "context notes must be a file inside a memory scope"
+);
+
+/** One pinned-file mutation for {@link MemoryService.writePinnedFile}. */
+export type PinnedFileMutation =
+  | { command: "create"; fileText: string }
+  | { command: "str_replace"; oldStr: string; newStr: string }
+  | { command: "insert"; insertLine: number; insertText: string };
+
 export class MemoryService extends EventEmitter {
   /**
    * Canonical key into the process-wide target mutation registry: mutating
@@ -991,7 +1010,7 @@ export class MemoryService extends EventEmitter {
           );
         }
         return new LocalMemoryStore(
-          path.join(this.config.sessionsDir, this.ownerWorkspaceIdFor(ctx), "memory")
+          workspaceMemoryStorePath(this.config.sessionsDir, this.ownerWorkspaceIdFor(ctx))
         );
       }
     }
@@ -2092,6 +2111,94 @@ export class MemoryService extends EventEmitter {
    * mutation lock is taken (the state can change between staging and apply,
    * where the real command re-validates authoritatively).
    */
+  /**
+   * Preservation-turn write for one pinned file (the context-budget final flush). The agent
+   * gets a single call, so the mutation must not fail on an existence verdict that went stale
+   * between the prompt and the call (Memory UI or another session creating/deleting the file).
+   * Under the target mutation lock: `create` replaces an existing file (even one that is no longer
+   * readable as a memory file), `str_replace`/`insert` create a missing file from their payload,
+   * the per-scope file cap does not apply, and the actual result is capped at `maxFileBytes`
+   * (which must tighten the ordinary cap).
+   */
+  async writePinnedFile(
+    ctx: MemoryScopeContext,
+    virtualPath: string,
+    mutation: PinnedFileMutation,
+    maxFileBytes: number,
+    actor: MemoryActor,
+    toolCallId?: string,
+    abortSignal?: AbortSignal
+  ): Promise<MemoryCommandResult> {
+    return this.runCommand(ctx, async () => {
+      const parsed = parseMemoryPath(virtualPath);
+      const scope = this.requireFilePath(parsed, virtualPath);
+      if (mutation.command === "str_replace" && mutation.oldStr.length === 0) {
+        throw new MemoryCommandError("old_str must not be empty");
+      }
+      const store = await this.resolveStore(ctx, scope, parsed.relPath);
+      return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
+        // Root materialized only inside the lock and after the removal check
+        // (r62), like create(): for a sub-agent this is the OWNER's store.
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
+        await store.ensureRoot();
+        const kind = await store.kind(parsed.relPath);
+        if (kind === "dir") {
+          throw new MemoryCommandError(`${virtualPath} is a directory, not a file`);
+        }
+        // The notes slot is exempt from MEMORY_MAX_FILES_PER_SCOPE: the pinned turn cannot delete
+        // anything to make room, and a full scope must not waste the single preservation step.
+        let current: string | null = null;
+        // Inverse for the journal; a malformed existing file (over the ordinary cap, NUL bytes)
+        // keeps whatever bounded text prefix could be read.
+        let previous: string | null = null;
+        if (kind !== null) {
+          try {
+            current = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
+            previous = current;
+          } catch (error) {
+            // Only `create` replaces without reading; edits need the real contents.
+            if (mutation.command !== "create") throw error;
+            previous = await store.readFilePrefix(parsed.relPath, MEMORY_MAX_FILE_BYTES);
+          }
+        }
+        const updated =
+          mutation.command === "create"
+            ? mutation.fileText
+            : mutation.command === "str_replace"
+              ? current === null
+                ? mutation.newStr
+                : computeStrReplaceUpdate(current, mutation.oldStr, mutation.newStr, virtualPath)
+              : computeInsertUpdate(
+                  current ?? "",
+                  current === null ? 0 : mutation.insertLine,
+                  mutation.insertText
+                ).updated;
+        assertWithinFileSizeCap(updated, maxFileBytes);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
+        await store.writeFile(parsed.relPath, updated);
+        const physicalPath = store.physicalPath(parsed.relPath);
+        // Usage stats before the row (store clock); row before ack.
+        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
+        await this.journalRefinement(
+          ctx,
+          store,
+          { op: mutation.command, path: toVirtualPath(scope, parsed.relPath) },
+          previous === null
+            ? { op: "delete-files", paths: [physicalPath] }
+            : { op: "restore-files", files: [{ path: physicalPath, content: previous }] },
+          actor,
+          toolCallId,
+          [{ path: physicalPath, content: updated }]
+        );
+        this.emitChange(ctx, scope, parsed.relPath, actor);
+        return {
+          success: true as const,
+          output: `${previous === null ? "Created" : "Edited"} ${toVirtualPath(scope, parsed.relPath)}`,
+        };
+      });
+    });
+  }
+
   async validateMutation(
     ctx: MemoryScopeContext,
     command:
@@ -2507,9 +2614,23 @@ export class MemoryService extends EventEmitter {
         if (files.length > MEMORY_MAX_FILES_PER_SCOPE) {
           // Files can be edited outside MemoryService; honor the cap at
           // enumeration so a degenerate directory cannot force thousands of
-          // per-file reads on stream startup.
+          // per-file reads on stream startup. The context-notes slot is exempt
+          // from the cap on write (writePinnedFile), so it must survive the cut
+          // too or the flush handoff would vanish from the next window's index.
           log.debug("[MemoryService] truncating memory index to the per-scope cap", { scope });
-          files.length = MEMORY_MAX_FILES_PER_SCOPE;
+          // The bounded walk may have stopped before reaching the notes: probe them
+          // directly. lstat (not store.kind, which follows symlinks) so the probe
+          // admits exactly what the walk's dirent filter would: a regular file. A
+          // symlinked notes slot must not smuggle an out-of-root file into the index.
+          const keepNotes =
+            scope === CONTEXT_NOTES.scope &&
+            (await fsPromises
+              .lstat(store.physicalPath(CONTEXT_NOTES.relPath))
+              .then((stat) => stat.isFile())
+              .catch(() => false));
+          files.length = MEMORY_MAX_FILES_PER_SCOPE - (keepNotes ? 1 : 0);
+          if (keepNotes && !files.includes(CONTEXT_NOTES.relPath))
+            files.push(CONTEXT_NOTES.relPath);
         }
         for (const relPath of files) {
           // Filenames are attacker-controlled: only index paths the memory tool
@@ -2550,7 +2671,11 @@ export class MemoryService extends EventEmitter {
    */
   async listHotMemories(
     ctx: MemoryScopeContext,
-    options: { countTokens: (text: string) => Promise<number>; tokenBudgetActive?: boolean }
+    options: {
+      countTokens: (text: string) => Promise<number>;
+      tokenBudgetActive?: boolean;
+      onlyContextNotes?: boolean;
+    }
   ): Promise<MemoryHotSetItem[]> {
     const entries = await this.listIndexEntries(ctx);
     const meta = await this.metaService.getEntries();
@@ -2568,6 +2693,7 @@ export class MemoryService extends EventEmitter {
       candidates,
       countTokens: options.countTokens,
       tokenBudgetActive: options.tokenBudgetActive,
+      onlyContextNotes: options.onlyContextNotes,
       readFile: (virtualPath) => {
         const parsed = parseMemoryPath(virtualPath);
         const scope = this.requireFilePath(parsed, virtualPath);
@@ -2723,8 +2849,24 @@ function computeInsertUpdate(
   return { updated: lines.join("\n"), insertedLineCount: insertedLines.length };
 }
 
-function assertWithinFileSizeCap(content: string): void {
+/**
+ * `maxFileBytes` tightens the cap for one file (writePinnedFile caps the context notes at
+ * their preload size); callers check it against the actual updated content INSIDE the target
+ * mutation lock, so a concurrent edit cannot slip an oversized result past it.
+ */
+function assertWithinFileSizeCap(content: string, maxFileBytes?: number): void {
   const bytes = Buffer.byteLength(content, "utf-8");
+  if (maxFileBytes !== undefined) {
+    assert(
+      Number.isInteger(maxFileBytes) && maxFileBytes > 0 && maxFileBytes <= MEMORY_MAX_FILE_BYTES,
+      "maxFileBytes must tighten the memory file cap"
+    );
+    if (bytes > maxFileBytes) {
+      throw new MemoryCommandError(
+        `This file is limited to ${maxFileBytes} bytes in total (got ${bytes}); shorten or replace content (essential state first)`
+      );
+    }
+  }
   if (bytes > MEMORY_MAX_FILE_BYTES) {
     throw new MemoryCommandError(
       `Memory files are limited to ${MEMORY_MAX_FILE_BYTES} bytes (got ${bytes}); split the content into smaller files`

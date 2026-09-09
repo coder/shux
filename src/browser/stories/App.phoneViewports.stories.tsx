@@ -13,11 +13,16 @@ import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
+import {
+  LEFT_SIDEBAR_COLLAPSED_KEY,
+  getPinnedTodoExpandedKey,
+  getSubAgentTasksExpandedKey,
+} from "@/common/constants/storage";
 import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
+import { createTodoWriteTool } from "./mocks/tools";
 import { STABLE_TIMESTAMP, createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { clearWorkspaceSelection, collapseRightSidebar, expandProjects } from "./helpers/uiState";
@@ -288,6 +293,123 @@ export const IPhone17ProMax: AppStory = {
   },
   play: async ({ canvasElement }) => {
     await stabilizePhoneViewportStory(canvasElement);
+  },
+};
+
+const COMPOSER_DECORATIONS_WORKSPACE_ID = "ws-iphone-16e-composer-decorations";
+
+/**
+ * Neither Pixel nor the test-runner matches `pointer: coarse`, so read the shipped rule instead
+ * of the rendered height: the min-height `selector` receives inside a coarse-pointer media rule.
+ */
+function coarsePointerMinHeight(selector: string): number | null {
+  const visit = (rules: CSSRuleList, inCoarse: boolean): number | null => {
+    for (const rule of rules) {
+      if (rule instanceof CSSStyleRule) {
+        if (inCoarse && rule.selectorText === selector && rule.style.minHeight) {
+          return Number.parseFloat(rule.style.minHeight);
+        }
+      } else if (rule instanceof CSSGroupingRule) {
+        const coarse =
+          inCoarse ||
+          (rule instanceof CSSMediaRule && rule.conditionText.includes("pointer: coarse"));
+        const found = visit(rule.cssRules, coarse);
+        if (found !== null) return found;
+      }
+    }
+    return null;
+  };
+  for (const sheet of document.styleSheets) {
+    const found = visit(sheet.cssRules, false);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+/**
+ * Every collapsible decoration stacked above the composer at once (TODO, sub-agents, background
+ * bash). Pixel captures the collapsed stack at phone width; the play assertion covers the touch
+ * floor these rows opt into, which the snapshot cannot.
+ */
+export const IPhone16eComposerDecorations: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        updatePersistedState(getPinnedTodoExpandedKey(COMPOSER_DECORATIONS_WORKSPACE_ID), false);
+        updatePersistedState(getSubAgentTasksExpandedKey(COMPOSER_DECORATIONS_WORKSPACE_ID), false);
+        return setupSimpleChatStory({
+          workspaceId: COMPOSER_DECORATIONS_WORKSPACE_ID,
+          workspaceName: "mobile-decorations",
+          projectName: "mux",
+          projectPath: "/home/user/projects/mux",
+          messages: [
+            MESSAGES[0],
+            createAssistantMessage("msg-2", "Tracking the remaining work in the TODO list.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 110_000,
+              toolCalls: [
+                createTodoWriteTool("call-todo-1", [
+                  { content: "Audit phone layout", status: "completed" },
+                  { content: "Tighten decoration rows", status: "in_progress" },
+                  { content: "Verify on device", status: "pending" },
+                ]),
+              ],
+            }),
+          ],
+          additionalWorkspaces: [
+            createWorkspace({
+              id: "ws-iphone-16e-composer-decorations-subagent",
+              name: "agent_explore_layout",
+              title: "Check narrow layout",
+              projectName: "mux",
+              projectPath: "/home/user/projects/mux",
+              parentWorkspaceId: COMPOSER_DECORATIONS_WORKSPACE_ID,
+              taskStatus: "reported",
+            }),
+          ],
+          backgroundProcesses: [
+            {
+              id: "bg-dev-server",
+              pid: 4242,
+              script: "bun run dev",
+              displayName: "dev server",
+              startTime: STABLE_TIMESTAMP - 90_000,
+              status: "running",
+            },
+          ],
+        });
+      }}
+    />
+  ),
+  decorators: [IPhone16eDecorator],
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await stabilizePhoneViewportStory(canvasElement);
+
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitFor(() => {
+      const rows = storyRoot.querySelectorAll(
+        '[data-component="ChatInputDecorationStack"] .mobile-touch-row'
+      );
+      if (rows.length < 3) {
+        throw new Error(`Expected TODO, sub-agent, and background bash rows, found ${rows.length}`);
+      }
+    });
+
+    const rowFloor = coarsePointerMinHeight(".mobile-touch-row");
+    if (rowFloor === null || rowFloor >= MOBILE_TOUCH_TARGET_PX) {
+      throw new Error(
+        `Decoration rows should sit below the ${MOBILE_TOUCH_TARGET_PX}px touch floor on coarse pointers, got ${String(rowFloor)}`
+      );
+    }
   },
 };
 

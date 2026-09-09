@@ -4,7 +4,8 @@ import { z } from "zod";
 import {
   IMAGE_TOKEN_ESTIMATE,
   OUTPUT_RESERVE_TOKENS,
-  WARNING_RESERVE_TOKENS,
+  WARNING_ADVANCE_MIN_TOKENS,
+  FLUSH_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
@@ -56,6 +57,26 @@ describe("step budget decisions", () => {
     expect(evaluate({ contextTokens: 75_000, warningEmitted: true }).decision).toBe("rollover");
   });
 
+  test("rollover flush opportunity requires reserve headroom below the hard ceiling", () => {
+    const hardCeiling = 100_000 - OUTPUT_RESERVE_TOKENS;
+    expect(evaluate({ contextTokens: hardCeiling - FLUSH_RESERVE_TOKENS - 1 })).toMatchObject({
+      decision: "rollover",
+      flushOpportunity: true,
+    });
+    expect(evaluate({ contextTokens: hardCeiling - FLUSH_RESERVE_TOKENS })).toMatchObject({
+      decision: "rollover",
+      flushOpportunity: false,
+    });
+    // Real-encoding tool tokens can exceed the chars/4 heuristic and consume the reserve.
+    expect(
+      evaluate({
+        contextTokens: hardCeiling - FLUSH_RESERVE_TOKENS - 100,
+        toolResultChars: 4,
+        toolResultTokens: 100,
+      })
+    ).toMatchObject({ decision: "rollover", flushOpportunity: false });
+  });
+
   test("hard ceiling overrides a higher configured threshold", () => {
     const hardCeiling = 100_000 - OUTPUT_RESERVE_TOKENS;
     expect(evaluate({ contextTokens: hardCeiling, threshold: 0.99 })).toMatchObject({
@@ -68,7 +89,7 @@ describe("step budget decisions", () => {
   });
 
   test("warning must fit strictly below the hard ceiling", () => {
-    const contextTokens = 100_000 - OUTPUT_RESERVE_TOKENS - WARNING_RESERVE_TOKENS;
+    const contextTokens = 100_000 - OUTPUT_RESERVE_TOKENS - FLUSH_RESERVE_TOKENS;
     expect(evaluate({ contextTokens, threshold: 0.99 })).toMatchObject({
       decision: "rollover",
       flushOpportunity: false,
@@ -197,6 +218,60 @@ describe("small-model context budgets", () => {
       });
     }
   );
+});
+
+describe("absolute warning advance floor", () => {
+  test("large windows keep the percent-based warning point", () => {
+    expect(evaluate({ modelContextLimit: 128_000, contextTokens: 76_799 }).decision).toBe(
+      "continue"
+    );
+    expect(evaluate({ modelContextLimit: 128_000, contextTokens: 76_800 }).decision).toBe("warn");
+  });
+
+  test("small windows warn at least the floor ahead of the ceiling-anchored rollover", () => {
+    // For this window hardCeiling (limit - OUTPUT_RESERVE_TOKENS) coincides with forceAt, so it
+    // is the rollover point; the warning fires WARNING_ADVANCE_MIN_TOKENS ahead of it instead of
+    // at the later percent-based point.
+    const warnAt = 24_576 - WARNING_ADVANCE_MIN_TOKENS;
+    expect(evaluate({ modelContextLimit: 32_768, contextTokens: warnAt - 1 }).decision).toBe(
+      "continue"
+    );
+    expect(evaluate({ modelContextLimit: 32_768, contextTokens: warnAt })).toMatchObject({
+      decision: "warn",
+      flushOpportunity: true,
+    });
+  });
+
+  test("the hard ceiling anchors the floor when it precedes the force point", () => {
+    // At this threshold forceAt reaches the whole limit, so hardCeiling (limit -
+    // OUTPUT_RESERVE_TOKENS) anchors the floor; the percent rule alone would warn later than
+    // WARNING_ADVANCE_MIN_TOKENS ahead of the ceiling.
+    const warnAt = 55_808 - WARNING_ADVANCE_MIN_TOKENS;
+    expect(
+      evaluate({ modelContextLimit: 64_000, threshold: 0.95, contextTokens: warnAt - 1 }).decision
+    ).toBe("continue");
+    expect(
+      evaluate({ modelContextLimit: 64_000, threshold: 0.95, contextTokens: warnAt }).decision
+    ).toBe("warn");
+  });
+
+  test("a low threshold still keeps the first half of the usable window warning-free", () => {
+    // Low threshold: the percent rule would warn from the first request; rolloverAt = forceAt
+    // (threshold + FORCE_COMPACTION_BUFFER_PERCENT) and the floor clamps to half of it.
+    expect(evaluate({ threshold: 0.1, contextTokens: 7_499 }).decision).toBe("continue");
+    expect(evaluate({ threshold: 0.1, contextTokens: 7_500 }).decision).toBe("warn");
+  });
+
+  test("a tiny window keeps its first half usable and then rolls over without a flush", () => {
+    // hardCeiling (limit - OUTPUT_RESERVE_TOKENS) is below WARNING_ADVANCE_MIN_TOKENS: the floor
+    // is clamped to half the rollover point, where FLUSH_RESERVE_TOKENS no longer fits, so the
+    // outcome is rollover.
+    expect(evaluate({ modelContextLimit: 4_000, contextTokens: 1_499 }).decision).toBe("continue");
+    expect(evaluate({ modelContextLimit: 4_000, contextTokens: 1_500 })).toMatchObject({
+      decision: "rollover",
+      flushOpportunity: false,
+    });
+  });
 });
 
 test("measured dense tool tokens enforce the hard ceiling while ordinary proactive estimates remain conservative", () => {

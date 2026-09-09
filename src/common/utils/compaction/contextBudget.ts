@@ -9,12 +9,45 @@ import {
   MAX_FALLBACK_SYSTEM_FLOOR_CONTEXT_RATIO,
   OUTPUT_RESERVE_TOKENS,
   SYSTEM_FLOOR_TOKENS_ESTIMATE,
-  WARNING_RESERVE_TOKENS,
+  WARNING_ADVANCE_MIN_TOKENS,
+  FLUSH_RESERVE_TOKENS,
+  FLUSH_MAX_OUTPUT_TOKENS,
 } from "@/common/constants/contextBudget";
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { ANTHROPIC_THINKING_BUDGETS, type ThinkingLevel } from "@/common/types/thinking";
+import { enforceThinkingPolicy, resolveMinimumThinkingLevel } from "@/common/utils/thinking/policy";
 
 export type ContextBudgetExceeded = Extract<SendMessageError, { type: "context_budget_exceeded" }>;
+
+/**
+ * Output cap for the hidden flush step at a given thinking level: the notes-sized cap plus that
+ * level's Anthropic thinking budget (the API rejects a budget that is not strictly below
+ * max_tokens). Every model that may run the flush — the primary and each refusal fallback —
+ * must derive its cap from its OWN resolved level, not inherit the primary's.
+ */
+export function getContextBudgetFlushMaxOutputTokens(level: ThinkingLevel): number {
+  return FLUSH_MAX_OUTPUT_TOKENS + ANTHROPIC_THINKING_BUDGETS[level];
+}
+
+/**
+ * Thinking and output cap for the hidden flush step on one model. It is housekeeping, so the
+ * user's configured thinking floor does not apply — only the model's inherent minimum. Shared by
+ * admission (headroom) and the stream request so both agree.
+ */
+export function resolveContextBudgetFlushThinking(
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null
+): { level: ThinkingLevel; maxOutputTokens: number } {
+  const level = enforceThinkingPolicy(
+    modelString,
+    "off",
+    resolveMinimumThinkingLevel(modelString, undefined, providersConfig),
+    providersConfig
+  );
+  return { level, maxOutputTokens: getContextBudgetFlushMaxOutputTokens(level) };
+}
 
 /** Keep output headroom without making supported small context windows unusable. */
 export function getContextBudgetHardCeiling(modelContextLimit: number): number {
@@ -110,15 +143,27 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     };
   }
   if (input.threshold >= 1) return result;
-  if (projected >= limit * ((input.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT) / 100)) {
-    return { ...result, decision: "rollover", flushOpportunity: projected < hardCeiling };
+  // A flush opportunity means one more notes-writing step fits below the hard ceiling.
+  // Use the real-encoding projection where available: it can exceed the chars/4 heuristic.
+  const safeFlush = hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling;
+  const forceAt = limit * ((input.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT) / 100);
+  if (projected >= forceAt) {
+    return { ...result, decision: "rollover", flushOpportunity: safeFlush };
   }
-  if (
-    !input.warningEmitted &&
-    projected >= limit * ((input.threshold * 100 - WARNING_ADVANCE_PERCENT) / 100)
-  ) {
+  // On small windows or high thresholds the hard ceiling, not the force buffer, is where the
+  // window really ends; anchor the absolute advance floor there. Whatever the threshold, at
+  // least half of the usable window stays warning-free instead of warning on the first request.
+  const rolloverAt = Math.min(forceAt, hardCeiling);
+  const warnAt = Math.max(
+    rolloverAt / 2,
+    Math.min(
+      limit * ((input.threshold * 100 - WARNING_ADVANCE_PERCENT) / 100),
+      rolloverAt - WARNING_ADVANCE_MIN_TOKENS
+    )
+  );
+  if (!input.warningEmitted && projected >= warnAt) {
     // Never spend the last usable context tokens telling the agent to flush notes.
-    return projected + WARNING_RESERVE_TOKENS < hardCeiling
+    return safeFlush
       ? { ...result, decision: "warn", flushOpportunity: true }
       : { ...result, decision: "rollover" };
   }

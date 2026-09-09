@@ -399,6 +399,12 @@ interface PreparedModelFallback {
   headers?: Record<string, string | undefined>;
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   thinkingLevel?: string;
+  /**
+   * Output cap for the fallback attempt when it must differ from the source request's (the
+   * context-budget flush sizes its cap for each model's own thinking level). Otherwise the
+   * original cap carries over.
+   */
+  maxOutputTokens?: number;
   /** Route attribution corrections (routedThroughGateway, routeProvider, costsIncluded). */
   initialMetadataPatch?: Partial<MuxMetadata>;
   /**
@@ -3573,7 +3579,7 @@ export class StreamManager {
       system: prepared.data.system,
       tools: prepared.data.tools,
       providerOptions: prepared.data.providerOptions,
-      maxOutputTokens: fallbackState.original.maxOutputTokens,
+      maxOutputTokens: prepared.data.maxOutputTokens ?? fallbackState.original.maxOutputTokens,
       callSettingsOverrides: prepared.data.callSettingsOverrides,
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
