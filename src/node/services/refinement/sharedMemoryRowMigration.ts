@@ -5,7 +5,10 @@ import {
   RefinementEvidenceSchema,
   RefinementInverseSchema,
   RefinementPostStateSchema,
+  RollbackRefinementActionSchema,
+  type MemoryRefinementAction,
   type RefinementInverse,
+  type RollbackRefinementAction,
 } from "@/common/types/refinement";
 import { log } from "@/node/services/log";
 import type { BlobQuotaEntry } from "@/node/utils/journal/blobReclamation";
@@ -39,8 +42,17 @@ function isInside(root: string, filePath: string): boolean {
  * store into the OWNER's journal, copying the inverse blob payloads. The
  * edits themselves already live in the owner's store; without this their
  * audit trail and rollback IDs would vanish with the child's journal. Rows
- * already rolled back (or rollback rows themselves) and rows targeting other
- * roots (global/project) are left alone — they die with the child as before.
+ * already rolled back and rows targeting other roots (global/project) are
+ * left alone — they die with the child as before.
+ *
+ * Rollback rows travel too, but only when their target has an owner copy,
+ * with `rollbackOf` remapped to that copy: removal runs this in two passes
+ * (pre-teardown, then a delta pass under the removal locks), and another
+ * backend can roll a row back in between. Its copy is already in the owner
+ * journal by then; without the rollback row following it, the owner journal
+ * would claim an edit whose inverse was already applied is still live and
+ * rollbackable. A row rolled back before its FIRST copy is simply dead and
+ * stays behind with its whole lineage.
  *
  * A row whose payload cannot be reconstructed (evicted blob, unparseable
  * action) is skipped with a log line — nothing durable exists to preserve.
@@ -111,19 +123,41 @@ export async function migrateSharedMemoryRefinementRows(args: {
   // than once per row. Rows already copied are identified by their source
   // identity on the owner side.
   await ownerJournal.withBlobLock(async () => {
-    const alreadyMigrated = new Set(
-      (await listRefinements(args.ownerSessionDir))
-        .map((row) => row.data.migratedFrom)
-        .filter((id): id is string => id !== undefined)
+    const ownerRows = await listRefinements(args.ownerSessionDir);
+    // Source identity → owner-journal id of its copy (earlier passes and this one).
+    const ownerIdBySource = new Map<string, string>();
+    for (const ownerRow of ownerRows) {
+      if (ownerRow.data.migratedFrom !== undefined) {
+        ownerIdBySource.set(ownerRow.data.migratedFrom, ownerRow.id);
+      }
+    }
+    // Owner rows already rolled back (by anyone): a second rollback row for
+    // the same target would corrupt the lineage the rollback engine walks.
+    const ownerRollbackTargets = new Set(
+      ownerRows.map((ownerRow) => ownerRow.data.rollbackOf).filter((id) => id !== undefined)
     );
     for (const row of rows) {
-      if (row.data.kind !== "memory" || row.data.rollbackOf !== undefined) continue;
-      if (isLive(row.id) !== true) continue;
+      if (row.data.kind !== "memory") continue;
       const migratedFrom = `${args.childWorkspaceId}:${row.id}`;
-      if (alreadyMigrated.has(migratedFrom)) continue;
+      if (ownerIdBySource.has(migratedFrom)) continue;
+      let action: MemoryRefinementAction | RollbackRefinementAction;
+      let rollbackOf: string | undefined;
+      if (row.data.rollbackOf === undefined) {
+        if (isLive(row.id) !== true) continue;
+        const parsed = MemoryRefinementActionSchema.safeParse(row.data.action);
+        if (!parsed.success) continue;
+        action = parsed.data;
+      } else {
+        // Child journal order puts a rollback row after its target, so the
+        // target's copy (from an earlier pass or this loop) is known here.
+        rollbackOf = ownerIdBySource.get(`${args.childWorkspaceId}:${row.data.rollbackOf}`);
+        if (rollbackOf === undefined || ownerRollbackTargets.has(rollbackOf)) continue;
+        const parsed = RollbackRefinementActionSchema.safeParse(row.data.action);
+        if (!parsed.success) continue;
+        action = { ...parsed.data, of: rollbackOf };
+      }
       const inverse = RefinementInverseSchema.safeParse(row.data.inverse);
-      const action = MemoryRefinementActionSchema.safeParse(row.data.action);
-      if (!inverse.success || !action.success) continue;
+      if (!inverse.success) continue;
       if (!inversePaths(inverse.data).every((p) => isInside(ownerMemoryRoot, p))) continue;
 
       let draft: RefinementInverseDraft;
@@ -157,28 +191,30 @@ export async function migrateSharedMemoryRefinementRows(args: {
       const evidence = RefinementEvidenceSchema.safeParse(row.data.evidence);
       const postState = RefinementPostStateSchema.safeParse(row.data.postState);
       // Throws: this is the only durable copy once the child's journal goes.
-      publishedBlobs.push(
-        ...(await appendRefinementEventUnderBlobLock(ownerJournal, {
-          sessionDir: args.ownerSessionDir,
-          workspaceId: args.ownerWorkspaceId,
-          kind: "memory",
-          action: action.data,
-          inverse: draft,
-          evidence: {
-            toolName: evidence.success ? evidence.data.toolName : "memory",
-            ...(evidence.success && evidence.data.toolCallId !== undefined
-              ? { toolCallId: evidence.data.toolCallId }
-              : {}),
-            ...(evidence.success && evidence.data.actor !== undefined
-              ? { actor: evidence.data.actor }
-              : {}),
-          },
-          ...(postState.success ? { postState: postState.data } : {}),
-          migratedFrom,
-          sourceTs: row.data.sourceTs ?? row.ts,
-          ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),
-        }))
-      );
+      const appended = await appendRefinementEventUnderBlobLock(ownerJournal, {
+        sessionDir: args.ownerSessionDir,
+        workspaceId: args.ownerWorkspaceId,
+        kind: "memory",
+        action,
+        inverse: draft,
+        evidence: {
+          toolName: evidence.success ? evidence.data.toolName : "memory",
+          ...(evidence.success && evidence.data.toolCallId !== undefined
+            ? { toolCallId: evidence.data.toolCallId }
+            : {}),
+          ...(evidence.success && evidence.data.actor !== undefined
+            ? { actor: evidence.data.actor }
+            : {}),
+        },
+        ...(postState.success ? { postState: postState.data } : {}),
+        migratedFrom,
+        ...(rollbackOf !== undefined ? { rollbackOf } : {}),
+        sourceTs: row.data.sourceTs ?? row.ts,
+        ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),
+      });
+      publishedBlobs.push(...appended.publishedBlobs);
+      ownerIdBySource.set(migratedFrom, appended.rowId);
+      if (rollbackOf !== undefined) ownerRollbackTargets.add(rollbackOf);
       migrated++;
     }
   });

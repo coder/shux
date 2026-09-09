@@ -26,6 +26,7 @@ import {
   type RefinementEvidence,
   type RefinementInverse,
   type RefinementPostState,
+  type RollbackRefinementAction,
   type SkillRefinementAction,
 } from "@/common/types/refinement";
 import type { BlobStore } from "@/node/utils/journal/blobStore";
@@ -61,7 +62,7 @@ export interface RefinementEmitArgs {
   sessionDir: string;
   workspaceId: string;
   kind: "memory" | "skill";
-  action: MemoryRefinementAction | SkillRefinementAction;
+  action: MemoryRefinementAction | SkillRefinementAction | RollbackRefinementAction;
   inverse: RefinementInverseDraft;
   evidence: { toolName: string; toolCallId?: string; actor?: string };
   /**
@@ -78,6 +79,13 @@ export interface RefinementEmitArgs {
   postState?: RefinementPostState;
   /** Source identity of a row copied from a removed sub-agent's journal (see durableEvent.ts). */
   migratedFrom?: string;
+  /**
+   * For a migrated ROLLBACK row: the owner-journal id of the row it rolled
+   * back (the copy of its source target), so the lineage stays intact on the
+   * owner side. Only shared-memory row migration sets this; the rollback
+   * engine appends its own rows directly.
+   */
+  rollbackOf?: string;
   /**
    * Cross-journal order key (see durableEvent.ts): the shared store's clock
    * for a workspace-scope mutation (workspaceMemoryRevision.ts), or the
@@ -285,7 +293,7 @@ export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Pr
   // Inverse blob puts and the append referencing them run under the journal
   // blob lock: a concurrent reclamation pass must never observe the
   // put→append window (see DurableEventJournal.withBlobLock).
-  const publishedBlobs = await journal.withBlobLock(() =>
+  const { publishedBlobs } = await journal.withBlobLock(() =>
     appendRefinementEventUnderBlobLock(journal, args)
   );
   // Live rows may carry a store-clock `sourceTs` too (MemoryService); only
@@ -308,7 +316,7 @@ export async function appendRefinementEventOrThrow(args: RefinementEmitArgs): Pr
 export async function appendRefinementEventUnderBlobLock(
   journal: DurableEventJournal,
   args: RefinementEmitArgs
-): Promise<BlobQuotaEntry[]> {
+): Promise<{ rowId: string; publishedBlobs: BlobQuotaEntry[] }> {
   assert(args.workspaceId.length > 0, "refinement journal requires a workspace id");
   await journal.assertBlobLockOwned();
   const resolved = await resolveRefinementInverse(journal.blobs, args.inverse);
@@ -330,7 +338,7 @@ export async function appendRefinementEventUnderBlobLock(
           })),
         }
       : args.postState;
-  await journal.append({
+  const row = await journal.append({
     workspaceId: args.workspaceId,
     kind: "refinement",
     data: {
@@ -340,11 +348,12 @@ export async function appendRefinementEventUnderBlobLock(
       evidence,
       ...(postState !== undefined ? { postState } : {}),
       ...(args.migratedFrom !== undefined ? { migratedFrom: args.migratedFrom } : {}),
+      ...(args.rollbackOf !== undefined ? { rollbackOf: args.rollbackOf } : {}),
       ...(args.sourceTs !== undefined ? { sourceTs: args.sourceTs } : {}),
       ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
     },
   });
-  return resolved.publishedBlobs;
+  return { rowId: row.id, publishedBlobs: resolved.publishedBlobs };
 }
 
 /**

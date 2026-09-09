@@ -921,16 +921,18 @@ describe("MemoryService", () => {
       expect(solo.success).toBe(false);
 
       // Change events name the owner so the owner's Memory tab (and every
-      // tree member's) refreshes; sidecar stats are keyed by the owner too.
-      expect(events).toEqual([
-        {
+      // tree member's) refreshes — the create and each shared read (the two
+      // views re-rank the shared hot set); sidecar stats are keyed by the
+      // owner too.
+      expect(events).toEqual(
+        Array.from({ length: 3 }, () => ({
           scope: "workspace",
           path: "/memories/workspace/context-notes.md",
           actor: "agent",
           workspaceId: "ws-owner",
           projectPath: FIXTURE_PROJECT_PATH,
-        },
-      ]);
+        }))
+      );
       const meta = await fixture.metaService.getEntries();
       expect(
         meta.get(
@@ -1116,9 +1118,33 @@ describe("MemoryService", () => {
         "v2",
         "agent"
       );
+      const afterEdit = await foreign.workspaceMemoryRevision("ws-owner");
+      expect(Number(afterEdit)).toBeGreaterThan(Number(afterPin));
+      // A read-side access (view / recall) re-ranks the shared hot set through
+      // the owner-keyed usage stats: it advances the clock and announces the
+      // owner's store like a pin does, so the rest of the tree (and other
+      // backends) drop their cached hot set too.
+      const events: MemoryChangeEvent[] = [];
+      fixture.service.on("change", (event: MemoryChangeEvent) => events.push(event));
+      expect(
+        (await fixture.service.view(fixture.ctx, "/memories/workspace/shared.md")).success
+      ).toBe(true);
+      const afterView = await foreign.workspaceMemoryRevision("ws-owner");
+      expect(Number(afterView)).toBeGreaterThan(Number(afterEdit));
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        scope: "workspace",
+        path: "/memories/workspace/shared.md",
+        workspaceId: "ws-owner",
+      });
+      await fixture.service.recordRecall(fixture.ctx, "/memories/workspace/shared.md");
       expect(Number(await foreign.workspaceMemoryRevision("ws-owner"))).toBeGreaterThan(
-        Number(afterPin)
+        Number(afterView)
       );
+      expect(events).toHaveLength(2);
+      // Global reads have no store clock and stay silent.
+      expect((await fixture.service.view(fixture.ctx, "/memories/global/g.md")).success).toBe(true);
+      expect(events).toHaveLength(2);
     });
 
     it("refuses to commit into a self-fallback store once config.json has recovered", async () => {
@@ -1424,6 +1450,42 @@ describe("MemoryService", () => {
         "b.md",
         "c.md",
       ]);
+    });
+
+    it("adopts the legacy notebook for removal without any prior access, and throws instead of deferring", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "only-child.md"), "child notes");
+      // No workspace-memory entry point ever served ws-child in this process:
+      // removal's handover must fold the notes in by itself.
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      expect(await fsPromises.readFile(path.join(ownerRoot, "only-child.md"), "utf-8")).toBe(
+        "child notes"
+      );
+      // Idempotent: a retried removal re-runs the pass (the per-process memo
+      // is bypassed) and finds nothing new.
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      // A removal that verified a different owner than the store now resolves
+      // to must not adopt into the wrong notebook.
+      expect(
+        await fixture.service
+          .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-other")
+          .then(() => null, getErrorMessage)
+      ).toMatch(/resolved to ws-owner/);
+      // Failures surface (the access-time pass only logs and retries later).
+      spyOn(fixture.metaService, "getEntries").mockImplementationOnce(() =>
+        Promise.reject(new Error("sidecar unreadable"))
+      );
+      await fsPromises.writeFile(path.join(legacyRoot, "late.md"), "written later");
+      expect(
+        await fixture.service
+          .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
+          .then(() => null, getErrorMessage)
+      ).toMatch(/sidecar unreadable/);
+      expect(await pathExists(path.join(ownerRoot, "late.md"))).toBe(false);
     });
 
     it("folds in a note written under a self-fallback once ownership resolves to the tree root again", async () => {
@@ -1784,22 +1846,31 @@ describe("MemoryService", () => {
           ownerSessionDir,
           ownerWorkspaceId: "ws-owner",
         });
-      expect(await migrate()).toBe(3);
+      // Three live edits plus redone.md's full rollback lineage (rollback and
+      // its re-apply); undone.md's dead lineage stays behind.
+      expect(await migrate()).toBe(5);
       // Idempotent: a retried removal migrates nothing twice.
       expect(await migrate()).toBe(0);
       const ownerRows = await readRefinementEvents(ownerSessionDir);
       expect(
         ownerRows.map((row) => [
           (row.data.action as { op: string }).op,
-          (row.data.action as { path: string }).path,
+          (row.data.action as { path?: string }).path,
           (row.data.evidence as { workspaceId: string }).workspaceId,
         ])
       ).toEqual([
         ["create", "/memories/workspace/keep.md", "ws-owner"],
         ["str_replace", "/memories/workspace/keep.md", "ws-owner"],
         ["create", "/memories/workspace/redone.md", "ws-owner"],
+        ["rollback", undefined, "ws-owner"],
+        ["rollback", undefined, "ws-owner"],
       ]);
       expect(ownerRows.every((row) => row.data.migratedFrom?.startsWith("ws-child:"))).toBe(true);
+      // The copied rollback rows point at the owner-side copies, not at
+      // child ids that no longer exist anywhere.
+      expect(ownerRows[3].data.rollbackOf).toBe(ownerRows[2].id);
+      expect((ownerRows[3].data.action as { of: string }).of).toBe(ownerRows[2].id);
+      expect(ownerRows[4].data.rollbackOf).toBe(ownerRows[3].id);
 
       // The child is gone; the owner rolls the edit back from its own journal
       // (payload blobs were copied, postState hashes preserved).
@@ -1812,6 +1883,69 @@ describe("MemoryService", () => {
       });
       expect(undo.success).toBe(true);
       expect(await fsPromises.readFile(keep, "utf-8")).toBe("v1");
+    });
+
+    it("follows a row rolled back between the two handover passes with its rollback row", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/keep.md", "v1", "agent");
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/workspace/keep.md",
+        "v1",
+        "v2",
+        "agent"
+      );
+      const migrate = () =>
+        migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        });
+      // Pre-teardown pass copies the live edit...
+      expect(await migrate()).toBe(2);
+      // ...then another backend rolls it back in the child journal before the
+      // in-lock delta pass runs.
+      const edit = (await readRefinementEvents(childSessionDir)).find(
+        (row) => (row.data.action as { op: string }).op === "str_replace"
+      )!;
+      const undone = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        id: edit.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(undone.success).toBe(true);
+      const keep = path.join(ownerSessionDir, "memory", "keep.md");
+      expect(await fsPromises.readFile(keep, "utf-8")).toBe("v1");
+      // The delta pass copies exactly the rollback row, remapped onto the
+      // owner-side copy of the edit.
+      expect(await migrate()).toBe(1);
+      await fsPromises.rm(childSessionDir, { recursive: true, force: true });
+      const ownerRows = await readRefinementEvents(ownerSessionDir);
+      const editCopy = ownerRows.find((row) => row.data.migratedFrom === `ws-child:${edit.id}`)!;
+      const rollbackCopy = ownerRows.find((row) => row.data.rollbackOf !== undefined)!;
+      expect(rollbackCopy.data.rollbackOf).toBe(editCopy.id);
+      // The owner journal knows the edit is no longer live: rolling it back
+      // again is refused instead of re-applying an inverse that already ran.
+      const again = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: editCopy.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(again.success).toBe(false);
+      expect(await fsPromises.readFile(keep, "utf-8")).toBe("v1");
+      // Rolling back the copied rollback (re-apply) works from the owner journal.
+      const redo = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: rollbackCopy.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(redo.success).toBe(true);
+      expect(await fsPromises.readFile(keep, "utf-8")).toBe("v2");
     });
 
     it("concurrent migrations of the same child copy each row exactly once", async () => {

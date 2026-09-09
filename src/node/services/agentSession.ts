@@ -4481,32 +4481,49 @@ export class AgentSession {
         );
       }
       if (await cancelBeforeAcceptance()) return Ok(undefined);
-    } else if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
-      const batchAppendResult = await this.historyService.appendManyToHistory(this.workspaceId, [
-        ...internal.preTurnMessages,
-        userMessage,
-      ]);
-      if (!batchAppendResult.success) {
-        await rollbackPersistedTurnRows();
-        return Err(createUnknownSendMessageError(batchAppendResult.error));
-      }
-      persistedCancelableMessageIds.push(
-        ...internal.preTurnMessages.map((message) => message.id),
-        userMessage.id
-      );
-      if (await cancelBeforeAcceptance()) {
-        return Ok(undefined);
-      }
     } else if (!autoCompactionMessage) {
       // When on-send compaction triggers, the user message is NOT persisted to
       // history (it's sent as follow-up after compaction). Otherwise, persist
-      // normally.
-      const appendResult = await this.historyService.appendToHistory(this.workspaceId, userMessage);
-      if (!appendResult.success) {
-        await rollbackPersistedTurnRows();
-        return Err(createUnknownSendMessageError(appendResult.error));
+      // normally. The snapshot rows appended above and the pre-turn payloads
+      // are this turn's request prelude; recorded on the user row exactly as
+      // the token-budget path does, so the post-compaction harvest gate can
+      // tell the turn's own batch from a row another backend interleaved
+      // (epochHasUncoveredUserRows matches prelude rows by id, never by
+      // adjacency) and the builder's unknown-history rule does not count the
+      // turn's own snapshots as turns nobody recorded.
+      const requestPreludeMessageIds = [
+        ...(snapshotResult?.snapshotMessage ? [snapshotResult.snapshotMessage] : []),
+        ...skillSnapshotMessages,
+        ...mcpPromptSnapshotMessages,
+        ...(internal?.preTurnMessages ?? []),
+      ].map((row) => row.id);
+      if (requestPreludeMessageIds.length > 0) {
+        userMessage.metadata = { ...userMessage.metadata, requestPreludeMessageIds };
       }
-      persistedCancelableMessageIds.push(userMessage.id);
+      if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
+        const batchAppendResult = await this.historyService.appendManyToHistory(this.workspaceId, [
+          ...internal.preTurnMessages,
+          userMessage,
+        ]);
+        if (!batchAppendResult.success) {
+          await rollbackPersistedTurnRows();
+          return Err(createUnknownSendMessageError(batchAppendResult.error));
+        }
+        persistedCancelableMessageIds.push(
+          ...internal.preTurnMessages.map((message) => message.id),
+          userMessage.id
+        );
+      } else {
+        const appendResult = await this.historyService.appendToHistory(
+          this.workspaceId,
+          userMessage
+        );
+        if (!appendResult.success) {
+          await rollbackPersistedTurnRows();
+          return Err(createUnknownSendMessageError(appendResult.error));
+        }
+        persistedCancelableMessageIds.push(userMessage.id);
+      }
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }

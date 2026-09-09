@@ -9453,6 +9453,28 @@ describe("WorkspaceService initialize", () => {
       expect(persisted()).toBe(true);
       (service as unknown as { sessions: Map<string, unknown> }).sessions.delete("policy-scratch");
 
+      // An unreadable config.json (missing/malformed while the turn starts)
+      // must not make the still-registered workspace look unregistered: the
+      // deny takes the session-dir fallback instead of being reported durable
+      // without a record anywhere, and a grant is reported unpersisted (the
+      // harvest stays closed) rather than "done".
+      await realConfig.editConfig((cfg) => {
+        delete findWorkspaceEntry(cfg, "policy-scratch")!.workspace.workspaceMemoryWritable;
+        return cfg;
+      });
+      const unreadable = () => {
+        throw new Error("config.json: unexpected token");
+      };
+      spyOn(realConfig, "loadConfigOrDefault").mockImplementationOnce(unreadable);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true)).toBe(false);
+      expect(persisted()).toBeUndefined();
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+      spyOn(realConfig, "loadConfigOrDefault").mockImplementationOnce(unreadable);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false)).toBe(true);
+      expect(persisted()).toBeUndefined();
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
+      await clearWorkspaceMemoryDenyMarker(sessionDir);
+
       // A late deny reaching the marker fallback after the workspace was
       // removed (tombstoned, session dir deleted) must not recreate the
       // session dir as an orphan; nothing is left to harvest, so it is done.

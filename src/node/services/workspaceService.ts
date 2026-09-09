@@ -144,6 +144,13 @@ import {
   writeWorkspaceMemoryDenyMarker,
 } from "@/node/services/workspaceMemoryDenyMarker";
 import { migrateSharedMemoryRefinementRows } from "@/node/services/refinement/sharedMemoryRowMigration";
+import type { MemoryService } from "@/node/services/memoryService";
+
+/** MemoryService methods removal needs (see MemoryService.adoptLegacyPrivateStoreForRemoval). */
+type SharedWorkspaceMemoryStoreForRemoval = Pick<
+  MemoryService,
+  "adoptLegacyPrivateStoreForRemoval"
+>;
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
@@ -2742,6 +2749,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
     finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   };
+  /** Narrow MemoryService surface for removal's shared-memory handover; wired by coreServices. */
+  private sharedWorkspaceMemoryStore?: SharedWorkspaceMemoryStoreForRemoval;
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
   private agentTaskIntegration?: AgentTaskIntegration;
   private workspaceGoalService?: WorkspaceGoalService;
@@ -3087,6 +3096,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   }): void {
     this.memoryConsolidationService = service;
+  }
+
+  setSharedWorkspaceMemoryStore(store: SharedWorkspaceMemoryStoreForRemoval): void {
+    this.sharedWorkspaceMemoryStore = store;
   }
 
   setWorkspaceLifecycleHooks(hooks: WorkspaceLifecycleHooks): void {
@@ -4253,53 +4266,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // nothing of the closing epoch (accumulator, marker) before it settled.
     await session?.settleWorkspaceMemoryPolicyEpoch();
     const mirror = session?.workspaceMemoryWritableMirror();
-    const before = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-    // Unregistered workspace: nothing durable to update and no stale
-    // permission to invalidate (harvests fail closed on the missing value).
-    if (before === null) {
-      session?.recordWorkspaceMemoryWritable((mirror ?? true) && writable);
-      return true;
-    }
-    // The persisted bit is the epoch accumulator, fail-closed: the harvest
-    // reads every message of the compaction epoch, so one read-only turn
-    // denies the whole epoch even if writable turns follow. Durable so it
-    // survives a restart mid-epoch AND so backends sharing one chat.jsonl
-    // (multi-instance) contribute to the same conjunction; it restarts at
-    // context boundaries (AgentSession.resetWorkspaceMemoryWritable). The
-    // conjunction is computed INSIDE the config transaction (registration
-    // lock, cross-process) from the value current at write time — two
-    // backends reading an absent bit concurrently could otherwise publish
-    // false→true. The session additionally contributes its own mirror: a
-    // deny it observed survives even if another backend's boundary reset
-    // removed the durable field underneath it.
-    // A fourth input: the session-dir deny marker, the durable fallback taken
-    // when config.json could not record a deny (see below).
     const sessionDir = path.join(this.config.sessionsDir, workspaceId);
-    const denyMarker = await readWorkspaceMemoryDenyMarker(sessionDir);
-    // Unknown history fails closed, like the harvest's own unknown → closed
-    // rule: with no durable accumulator, no marker and no mirror, an epoch
-    // that already holds turns has a policy nobody recorded — the record was
-    // lost (a deny that could not be made durable anywhere before this
-    // process died, an upgrade mid-epoch) — so this epoch's harvest is denied
-    // until the next boundary rather than granted by whichever turn comes
-    // first. The first turn of a fresh epoch has no prior turns and grants
-    // normally.
-    const stored = before.workspace.workspaceMemoryWritable;
-    const unknownHistory =
-      stored === undefined && mirror === undefined && options?.epochHasPriorTurns === true;
-    const conjunction = (durable: boolean | undefined): boolean =>
-      !denyMarker && !unknownHistory && (durable ?? true) && (mirror ?? true) && writable;
-    // Fast path (no write): the outcome cannot differ from the stored value —
-    // it is already false, or already true and this turn grants.
-    if (stored === false || (stored === true && conjunction(stored))) {
-      session?.recordWorkspaceMemoryWritable(stored);
-      return true;
-    }
-    let effective = conjunction(stored);
     // A deny that config.json cannot hold falls back to the session dir: the
     // turn's user row is already durable in chat.jsonl there, so the deny
     // must become durable in the same place or the epoch could later be
     // harvested as writable after a restart (the mirror is process-local).
+    // `effective` is what the caller computed for the epoch so far; a grant
+    // never takes the fallback (harvest stays closed on the unpersisted bit).
+    let effective = false;
     const denyDurableFallback = async (cause: string): Promise<boolean> => {
       if (effective) return false;
       try {
@@ -4334,6 +4308,70 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       session?.recordWorkspaceMemoryWritable(false);
       return true;
     };
+    // Strict load: a config.json that is missing or malformed right now reads
+    // as the fresh-install default, in which this still-registered workspace
+    // is absent — the "unregistered" shortcut below would then report a deny
+    // as durable without persisting anything, while another backend keeps a
+    // prior durable grant. Treat an unreadable config like a failed config
+    // write: the deny takes the session-dir fallback (tombstone-gated, so a
+    // genuinely deregistered workspace still skips), a grant leaves the
+    // harvest closed.
+    let before: ReturnType<typeof findWorkspaceEntry>;
+    try {
+      before = findWorkspaceEntry(
+        this.config.loadConfigOrDefault({ throwOnError: true }),
+        workspaceId
+      );
+    } catch (error: unknown) {
+      log.error("Workspace memory write policy: config unreadable", {
+        workspaceId,
+        writable,
+        error: getErrorMessage(error),
+      });
+      effective = writable;
+      return denyDurableFallback(`config unreadable: ${getErrorMessage(error)}`);
+    }
+    // Unregistered workspace: nothing durable to update and no stale
+    // permission to invalidate (harvests fail closed on the missing value).
+    if (before === null) {
+      session?.recordWorkspaceMemoryWritable((mirror ?? true) && writable);
+      return true;
+    }
+    // The persisted bit is the epoch accumulator, fail-closed: the harvest
+    // reads every message of the compaction epoch, so one read-only turn
+    // denies the whole epoch even if writable turns follow. Durable so it
+    // survives a restart mid-epoch AND so backends sharing one chat.jsonl
+    // (multi-instance) contribute to the same conjunction; it restarts at
+    // context boundaries (AgentSession.resetWorkspaceMemoryWritable). The
+    // conjunction is computed INSIDE the config transaction (registration
+    // lock, cross-process) from the value current at write time — two
+    // backends reading an absent bit concurrently could otherwise publish
+    // false→true. The session additionally contributes its own mirror: a
+    // deny it observed survives even if another backend's boundary reset
+    // removed the durable field underneath it.
+    // A fourth input: the session-dir deny marker, the durable fallback taken
+    // when config.json could not record a deny (denyDurableFallback above).
+    const denyMarker = await readWorkspaceMemoryDenyMarker(sessionDir);
+    // Unknown history fails closed, like the harvest's own unknown → closed
+    // rule: with no durable accumulator, no marker and no mirror, an epoch
+    // that already holds turns has a policy nobody recorded — the record was
+    // lost (a deny that could not be made durable anywhere before this
+    // process died, an upgrade mid-epoch) — so this epoch's harvest is denied
+    // until the next boundary rather than granted by whichever turn comes
+    // first. The first turn of a fresh epoch has no prior turns and grants
+    // normally.
+    const stored = before.workspace.workspaceMemoryWritable;
+    const unknownHistory =
+      stored === undefined && mirror === undefined && options?.epochHasPriorTurns === true;
+    const conjunction = (durable: boolean | undefined): boolean =>
+      !denyMarker && !unknownHistory && (durable ?? true) && (mirror ?? true) && writable;
+    // Fast path (no write): the outcome cannot differ from the stored value —
+    // it is already false, or already true and this turn grants.
+    if (stored === false || (stored === true && conjunction(stored))) {
+      session?.recordWorkspaceMemoryWritable(stored);
+      return true;
+    }
+    effective = conjunction(stored);
     try {
       await this.config.editConfig((cfg) => {
         const current = findWorkspaceEntry(cfg, workspaceId);
@@ -6175,6 +6213,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
                 throw new Error(`memory owner pin for descendant ${id} did not persist`);
               }
             }
+            // A pre-sharing build kept this child's notebook in its OWN
+            // session dir (<sessionsDir>/<child>/memory); access-time adoption
+            // may never have run for a child removed right after the upgrade,
+            // and the deletion below would take those notes with it.
+            await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
+              workspaceId,
+              sharedMemoryOwnerId
+            );
             await migrateSharedMemoryRefinementRows({
               childSessionDir: path.join(this.config.sessionsDir, workspaceId),
               childWorkspaceId: workspaceId,

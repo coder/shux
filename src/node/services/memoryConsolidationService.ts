@@ -67,7 +67,8 @@ import { resolveHeadlessAgentDefinition } from "@/node/services/agentDefinitions
 import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
 import type { HistoryService } from "@/node/services/historyService";
-import type { MuxMessage } from "@/common/types/message";
+import { isTokenBudgetInternalMessage, type MuxMessage } from "@/common/types/message";
+import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
@@ -323,28 +324,48 @@ class HarvestRefusedError extends Error {
 }
 
 /**
- * Whether some user row of the epoch is covered by no assistant row's request
- * snapshot. An assistant row records `requestHistorySequence` — the last
- * history sequence its turn's request was built from — and that turn recorded
- * its write policy in start(), before the row was appended. A user row above
- * every such snapshot belongs to a turn nobody accounted for: another
- * backend's batch appended between a turn's snapshot and its assistant row
- * (multi-instance), or a turn refused pre-start. A later assistant row is no
- * proof by itself; only its snapshot bound is. Assistant rows without the
- * field cover nothing (fail closed).
+ * Whether some user row of the epoch belongs to no turn that recorded its
+ * write policy. A turn records that policy in start(), before its assistant
+ * row is appended, and the assistant row carries `requestHistorySequence` —
+ * the last history sequence its request was built from. The turn's own batch
+ * is the LAST user row at or below that bound (the request's latest user
+ * message) plus the snapshot/payload rows that row lists in
+ * `requestPreludeMessageIds`. Only that batch is covered — not every user row
+ * below the bound: with several backends on one chat.jsonl, another
+ * backend's read-only batch can land between this turn's user row and its
+ * request snapshot while that backend's deny has not been recorded yet; the
+ * snapshot would then include the foreign row (making it this turn's latest
+ * user message) and this turn's own row would be left without a turn of its
+ * own — which is exactly what surfaces here as uncovered. Rows are matched by
+ * exact id, never by adjacency, so no interleaved foreign row can ride along.
+ * Assistant rows without the bound cover nothing (fail closed). Token-budget
+ * control rows (rollover lead-in, budget warning) need no turn: backend
+ * template text appended in the same durable batch as the turn they precede,
+ * carrying neither agent nor repository content.
  */
 function epochHasUncoveredUserRows(messages: readonly MuxMessage[]): boolean {
-  let coverage = -1;
+  const userRows: Array<{ message: MuxMessage; sequence: number }> = [];
+  for (const message of messages) {
+    const sequence = message.metadata?.historySequence;
+    if (message.role === "user" && typeof sequence === "number")
+      userRows.push({ message, sequence });
+  }
+  const covered = new Set<string>();
   for (const message of messages) {
     if (message.role !== "assistant") continue;
     const bound = message.metadata?.requestHistorySequence;
-    if (typeof bound === "number" && bound > coverage) coverage = bound;
+    if (typeof bound !== "number") continue;
+    const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;
+    if (anchor === undefined) continue;
+    covered.add(anchor.id);
+    for (const id of getRequestPreludeMessageIds(anchor.metadata?.requestPreludeMessageIds)) {
+      covered.add(id);
+    }
   }
-  return messages.some((message) => {
-    if (message.role !== "user") return false;
-    const sequence = message.metadata?.historySequence;
-    return typeof sequence !== "number" || sequence > coverage;
-  });
+  return messages.some(
+    (message) =>
+      message.role === "user" && !covered.has(message.id) && !isTokenBudgetInternalMessage(message)
+  );
 }
 
 export class MemoryConsolidationService extends EventEmitter {

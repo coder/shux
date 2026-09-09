@@ -1252,6 +1252,136 @@ describe("MemoryConsolidationService", () => {
     expect(record?.error).toContain("never recorded");
   });
 
+  it("covers only a turn's own batch: a foreign row inside the request snapshot leaves the turn's own row uncovered", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    // Backend B (read-only) appends late-1 and pauses before its deny lands;
+    // backend A then snapshots THROUGH late-1 (its request's latest user row
+    // is now B's), records writable and replies. A's bound covers late-1 as
+    // A's batch — so pref-1, A's own row, belongs to no turn at all.
+    const prompt = createMuxMessage(
+      "pref-1",
+      "user",
+      "Please remember that I prefer concise tests."
+    );
+    await fixture.historyService.appendToHistory("ws-dream", prompt);
+    const foreign = createMuxMessage(
+      "late-1",
+      "user",
+      "Read-only agent's prompt, deny not recorded"
+    );
+    await fixture.historyService.appendToHistory("ws-dream", foreign);
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("reply-1", "assistant", "Noted.", {
+        requestHistorySequence: foreign.metadata?.historySequence,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("compact-request", "user", "Please compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+    });
+    await fixture.historyService.appendToHistory("ws-dream", summary);
+    const result = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    expect(result.success).toBe(true);
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.error).toContain("never recorded");
+  });
+
+  it("covers a turn's request prelude rows by id, not by adjacency", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    let previousBoundaryHistorySequence: number | undefined;
+    const harvest = async (ids: { listed: string[]; summary: string; leadIn?: boolean }) => {
+      // Two synthetic snapshot rows precede the user row; only the listed
+      // ones are the turn's own prelude. The reply snapshots through the
+      // user row, so every user row lies below its bound.
+      if (ids.leadIn) {
+        // Token-budget control row (backend template text, same durable batch
+        // as the turn): needs no listing.
+        await fixture.historyService.appendToHistory(
+          "ws-dream",
+          createMuxMessage(`${ids.summary}-lead-in`, "user", "A context window rollover started.", {
+            synthetic: true,
+            muxMetadata: { type: "context-window-lead-in", rolloverId: "r1" },
+          })
+        );
+      }
+      const snapshots = [`${ids.summary}-snap-a`, `${ids.summary}-snap-b`].map((id) =>
+        createMuxMessage(id, "user", "Snapshot content", { synthetic: true })
+      );
+      for (const snapshot of snapshots) {
+        await fixture.historyService.appendToHistory("ws-dream", snapshot);
+      }
+      const prompt = createMuxMessage(
+        `${ids.summary}-pref`,
+        "user",
+        "Remember I prefer concise tests.",
+        {
+          requestPreludeMessageIds: ids.listed,
+        }
+      );
+      await fixture.historyService.appendToHistory("ws-dream", prompt);
+      await fixture.historyService.appendToHistory(
+        "ws-dream",
+        createMuxMessage(`${ids.summary}-reply`, "assistant", "Noted.", {
+          requestHistorySequence: prompt.metadata?.historySequence,
+        })
+      );
+      await fixture.historyService.appendToHistory(
+        "ws-dream",
+        createMuxMessage(`${ids.summary}-compact`, "user", "Please compact", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        })
+      );
+      const summary = createMuxMessage(ids.summary, "assistant", "Summary.", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+      });
+      await fixture.historyService.appendToHistory("ws-dream", summary);
+      const result = await fixture.service.maybeHarvestThenSweep({
+        workspaceId: "ws-dream",
+        workspaceMemoryWritable: true,
+        summaryMessageId: ids.summary,
+        summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+        compactionEpoch: 1,
+        compactionRequestMessageId: `${ids.summary}-compact`,
+        ...(previousBoundaryHistorySequence !== undefined
+          ? { previousBoundaryHistorySequence }
+          : {}),
+      });
+      expect(result.success).toBe(true);
+      previousBoundaryHistorySequence = summary.metadata?.historySequence;
+      return (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    };
+    // Only one of the two adjacent snapshot rows is listed: the other is a
+    // foreign row that merely sits next to the batch.
+    const partial = await harvest({ listed: ["s1-snap-a"], summary: "s1" });
+    expect(partial?.status).toBe("failed");
+    expect(partial?.error).toContain("never recorded");
+    // Both listed: the whole batch is the turn's own and harvests.
+    const complete = await harvest({
+      listed: ["s2-snap-a", "s2-snap-b"],
+      summary: "s2",
+      leadIn: true,
+    });
+    expect(complete?.status).toBe("completed");
+  });
+
   it("finalizes a removed workspace's retryable harvest records so they are never retried", async () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
     await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
