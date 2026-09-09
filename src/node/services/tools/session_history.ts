@@ -27,15 +27,21 @@ export type SessionHistoryResult = z.infer<typeof TOOL_DEFINITIONS.session_histo
 
 /** Traverse serialized tool payloads too: PTC records can contain nested history
  * calls or media. Do not recursively amplify a previous history-tool response.
+ *
+ * Tool names are collected from the same traversal so a tool_name filter can
+ * only match canonical tool records (top-level parts and nestedCalls entries)
+ * that survive sanitization; a `toolName` key inside ordinary input/output
+ * JSON or an omitted history response never supplies a match.
  */
-function historicalText(message: MuxMessage): string {
+function projectHistory(message: MuxMessage): { text: string; toolNames: Set<string> } {
+  const toolNames = new Set<string>();
   if (
     message.metadata?.contextBudgetRejected ||
     message.metadata?.muxMetadata?.type === "compaction-request" ||
     (message.metadata?.synthetic && !message.metadata.uiVisible) ||
     message.metadata?.rlmPreservedTailCopy
   )
-    return "";
+    return { text: "", toolNames };
   const sanitize = (
     value: unknown,
     depth: number,
@@ -48,6 +54,7 @@ function historicalText(message: MuxMessage): string {
     const object = value as Record<string, unknown>;
     if (object.toolName === "session_history") return "[session_history result omitted]";
     if (object.type === "reasoning") return "[reasoning omitted]";
+    if (kind === "tool" && typeof object.toolName === "string") toolNames.add(object.toolName);
     // Only canonical tool-output attachments have recursive media semantics.
     // SDK-looking JSON and data URLs in ordinary tool arguments/results are text.
     if (kind === "output" && (isMediaPart(value) || isDisplayOnlyFilePart(value)))
@@ -74,7 +81,7 @@ function historicalText(message: MuxMessage): string {
         ])
     );
   };
-  return message.parts
+  const text = message.parts
     .flatMap((part) => {
       if (!part || typeof part !== "object") return [];
       if (part.type === "reasoning") return [];
@@ -83,7 +90,13 @@ function historicalText(message: MuxMessage): string {
       return [JSON.stringify(sanitize(part, 0, "tool"))];
     })
     .join("\n");
+  return { text, toolNames };
 }
+
+const FILTERABLE_ACTIONS: ReadonlySet<SessionHistoryArgs["action"]> = new Set([
+  "list_items",
+  "search",
+]);
 
 function surrogateSafeOffset(text: string, offset: number): number {
   const previous = text.charCodeAt(offset - 1);
@@ -116,6 +129,17 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           exhausted: false,
           skipped_oversized_rows: 0,
         };
+      // Reject rather than silently ignore filters on actions that cannot honor them.
+      if (
+        !FILTERABLE_ACTIONS.has(args.action) &&
+        (args.role != null || args.tool_name != null || args.max_chars_per_item != null)
+      )
+        return {
+          success: false,
+          error: "filters_unsupported",
+          exhausted: false,
+          skipped_oversized_rows: 0,
+        };
       const binding = {
         workspaceId,
         action: args.action,
@@ -126,6 +150,9 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               args.window_id ?? null,
               args.item_id ?? null,
               args.offset_chars ?? 0,
+              args.role ?? null,
+              args.tool_name ?? null,
+              args.max_chars_per_item ?? null,
             ])
           )
           .digest("hex"),
@@ -188,28 +215,34 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               args.item_id !== legacyItemId
             )
               return true;
+            if (args.role != null && message.role !== args.role) return true;
+            const projected = projectHistory(message);
             // Same-length replacements keep UTF-16 offsets stable for already
             // damaged source strings without emitting unpaired surrogates.
-            const text = historicalText(message).replace(
+            const text = projected.text.replace(
               /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
               "\uFFFD"
             );
             if (!text) return true;
+            if (args.tool_name != null && !projected.toolNames.has(args.tool_name)) return true;
             const match = search ? (search.exec(text)?.index ?? -1) : 0;
             if (match < 0) return true;
             if (items.length >= limit) return false;
+            const requested =
+              args.action === "read_item"
+                ? (args.limit_chars ?? SESSION_HISTORY_DEFAULT_READ_CHARS)
+                : (args.max_chars_per_item ?? SESSION_HISTORY_SEARCH_SNIPPET_CHARS);
+            // Lead-in context before a match never spends more than half of a
+            // short snippet allowance, so the matched substring stays visible.
+            const leadIn = Math.min(120, Math.floor(requested / 2));
             // Manual offsets inside a pair round back to include that character.
             const start = surrogateSafeOffset(
               text,
               Math.min(
                 text.length,
-                args.action === "read_item" ? (args.offset_chars ?? 0) : Math.max(0, match - 120)
+                args.action === "read_item" ? (args.offset_chars ?? 0) : Math.max(0, match - leadIn)
               )
             );
-            const requested =
-              args.action === "read_item"
-                ? (args.limit_chars ?? SESSION_HISTORY_DEFAULT_READ_CHARS)
-                : SESSION_HISTORY_SEARCH_SNIPPET_CHARS;
             let end = surrogateSafeOffset(text, Math.min(text.length, start + requested));
             // A one-unit limit at an astral character must still make progress.
             if (end === start && start < text.length) end = start + 2;

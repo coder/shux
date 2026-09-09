@@ -66,7 +66,7 @@ const CursorSchema = z
   .object({
     version: z.literal(1),
     workspaceId: z.string(),
-    action: z.enum(["list_windows", "search", "read_item"]),
+    action: z.enum(["list_windows", "list_items", "search", "read_item"]),
     query: z.string(),
     scan: HistoryScanStateSchema,
   })

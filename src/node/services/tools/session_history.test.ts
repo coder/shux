@@ -2868,3 +2868,196 @@ describe("session_history real disk recovery", () => {
     expect(all.flatMap((page) => page.items ?? []).length).toBe(30);
   });
 });
+
+describe("session_history item listing and filters", () => {
+  const toolPart = (
+    toolName: string,
+    extra?: {
+      input?: unknown;
+      output?: unknown;
+      nestedCalls?: Array<{ toolCallId: string; toolName: string; state: "output-available" }>;
+    }
+  ): MuxMessage["parts"][number] => {
+    const part: MuxMessage["parts"][number] = {
+      type: "dynamic-tool",
+      toolCallId: `${toolName}-call`,
+      toolName,
+      state: "output-available",
+      input: extra?.input ?? {},
+      output: extra?.output ?? { ok: true },
+      nestedCalls: extra?.nestedCalls,
+    };
+    return part;
+  };
+
+  test("unfiltered listing pages rows in persisted order and every ID round-trips", async () => {
+    const user = createMuxMessage("ask", "user", "please list");
+    expect((await fixture.historyService.appendToHistory(workspaceId, user)).success).toBe(true);
+    await append("reply", "listed");
+    await append("reset", "", { contextBoundaryKind: "reset", synthetic: true });
+    await append("after", "post reset");
+    const all = (await pages({ action: "list_items", limit: 1 })).flatMap(
+      (page) => page.items ?? []
+    );
+    // "first" is seeded by beforeEach; the manual reset hides everything before it.
+    expect(all.map((item) => item.text)).toEqual(["post reset"]);
+    const rooted = (await pages({ action: "list_items", window_id: "w:0", limit: 1 })).flatMap(
+      (page) => page.items ?? []
+    );
+    expect(rooted).toEqual([]);
+    for (const item of all) {
+      const read = await call({ action: "read_item", item_id: item.itemId });
+      expect(read.items?.[0]).toMatchObject({ itemId: item.itemId, role: item.role });
+    }
+  });
+
+  test("listing preserves order and roles without a reset", async () => {
+    const user = createMuxMessage("ask", "user", "please list");
+    expect((await fixture.historyService.appendToHistory(workspaceId, user)).success).toBe(true);
+    await append("reply", "listed");
+    const all = (await pages({ action: "list_items", limit: 2 })).flatMap(
+      (page) => page.items ?? []
+    );
+    expect(all.map((item) => [item.role, item.text])).toEqual([
+      ["assistant", "opening facts"],
+      ["user", "please list"],
+      ["assistant", "listed"],
+    ]);
+  });
+
+  test("role, exact tool name, nested tool and query filters combine with AND semantics", async () => {
+    const user = createMuxMessage("ask", "user", "run bash now");
+    expect((await fixture.historyService.appendToHistory(workspaceId, user)).success).toBe(true);
+    await append("bash-row", "ran bash", undefined, [
+      { type: "text", text: "ran bash" },
+      toolPart("bash"),
+    ]);
+    await append("bashful-row", "ran other", undefined, [toolPart("bash_extra")]);
+    await append("nested-row", "nested", undefined, [
+      toolPart("code_execution", {
+        nestedCalls: [{ toolCallId: "n1", toolName: "file_read", state: "output-available" }],
+      }),
+    ]);
+    await append("decoy-row", "decoy", undefined, [
+      toolPart("bash_other", {
+        input: { toolName: "file_read" },
+        output: { nestedCalls: [{ toolName: "file_read" }], value: '{"toolName":"file_read"}' },
+      }),
+    ]);
+    await append("history-row", "", undefined, [toolPart("session_history")]);
+    await append("hidden-row", "", { synthetic: true }, [toolPart("bash")]);
+    const texts = async (input: SessionHistoryArgs) =>
+      (await pages(input)).flatMap((page) => page.items ?? []).map((item) => item.text);
+    expect(await texts({ action: "list_items", role: "user" })).toEqual(["run bash now"]);
+    expect(await texts({ action: "list_items", role: "system" })).toEqual([]);
+    const bashRows = await texts({ action: "list_items", tool_name: "bash" });
+    expect(bashRows).toHaveLength(1);
+    expect(bashRows[0]).toContain("ran bash");
+    const nestedRows = await texts({ action: "list_items", tool_name: "file_read" });
+    expect(nestedRows).toHaveLength(1);
+    expect(nestedRows[0]).toContain("code_execution");
+    expect(await texts({ action: "list_items", tool_name: "session_history" })).toEqual([]);
+    expect(await texts({ action: "list_items", tool_name: "bash", role: "user" })).toEqual([]);
+    const searchedBash = await texts({ action: "search", query: "bash", tool_name: "bash" });
+    expect(searchedBash).toHaveLength(1);
+    expect(searchedBash[0]).toContain("ran bash");
+    expect(await texts({ action: "search", query: "bash", role: "user" })).toEqual([
+      "run bash now",
+    ]);
+    expect(await texts({ action: "search", query: "nested", tool_name: "bash" })).toEqual([]);
+  });
+
+  test("max_chars_per_item bounds snippets, keeps matches visible, and continues via read_item", async () => {
+    const row = await append("long", `${"a".repeat(300)}NEEDLE${"b".repeat(300)}`);
+    const listed = await call({ action: "list_items", max_chars_per_item: 10 });
+    expect(listed.items?.map((item) => item.text)).toEqual(["opening fa", "a".repeat(10)]);
+    expect(listed.items?.[1]?.nextCharOffset).toBe(10);
+    const searched = await call({ action: "search", query: "needle", max_chars_per_item: 8 });
+    expect(searched.items).toHaveLength(1);
+    expect(searched.items![0].text).toBe("aaaaNEED");
+    expect(searched.items![0].nextCharOffset).toBe(304);
+    const wide = await call({ action: "search", query: "needle" });
+    expect(wide.items![0].text.indexOf("NEEDLE")).toBe(120);
+    await append("emoji", "😀".repeat(4));
+    // A one-unit allowance at an astral character still returns the whole pair.
+    const paired = await call({ action: "list_items", max_chars_per_item: 1 });
+    expect(paired.items?.map((item) => item.text)).toEqual(["o", "a", "😀"]);
+    expect(paired.items?.at(-1)?.nextCharOffset).toBe(2);
+    const rest = await call({
+      action: "read_item",
+      item_id: String(row.metadata!.historySequence),
+      offset_chars: 10,
+      limit_chars: 290,
+    });
+    expect(rest.items?.[0]?.text).toBe("a".repeat(290));
+    expect(rest.items?.[0]?.nextCharOffset).toBe(300);
+  });
+
+  test("filters are rejected on actions that cannot honor them", async () => {
+    for (const input of [
+      { action: "list_windows", role: "user" },
+      { action: "list_windows", max_chars_per_item: 5 },
+      { action: "read_item", item_id: "1", tool_name: "bash" },
+      { action: "read_item", item_id: "1", max_chars_per_item: 5 },
+    ] as SessionHistoryArgs[]) {
+      expect(await call(input)).toMatchObject({ success: false, error: "filters_unsupported" });
+    }
+    expect(() =>
+      TOOL_DEFINITIONS.session_history.schema.parse({ action: "list_items", tool_name: "" })
+    ).toThrow();
+    expect(() =>
+      TOOL_DEFINITIONS.session_history.schema.parse({ action: "list_items", role: "tool" })
+    ).toThrow();
+  });
+
+  test("cursors bind filters and snippet size; sparse filters page without materializing", async () => {
+    const rows = Array.from({ length: 1200 }, (_, i) =>
+      createMuxMessage(`row-${i}`, i === 1150 ? "user" : "assistant", `row ${i}`, {
+        historySequence: 100 + i,
+      })
+    );
+    await appendTrackedHistory(
+      chatPath,
+      rows.map((message) => JSON.stringify(message)).join("\n") + "\n"
+    );
+    const results = await pages({ action: "list_items", role: "user" });
+    expect(results.length).toBeGreaterThan(1);
+    expect(results.slice(0, -1).some((page) => page.items?.length === 0)).toBe(true);
+    expect(results.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
+      "row 1150",
+    ]);
+    expect(results.at(-1)?.exhausted).toBe(true);
+    const first = await call({ action: "list_items", role: "assistant", limit: 1 });
+    const cursor = first.nextCursor;
+    expect(cursor).toBeString();
+    expect((await call({ action: "list_items", role: "user", cursor })).error).toBe(
+      "invalid_cursor"
+    );
+    expect((await call({ action: "list_items", tool_name: "bash", cursor })).error).toBe(
+      "invalid_cursor"
+    );
+    expect(
+      (await call({ action: "list_items", role: "assistant", max_chars_per_item: 5, cursor })).error
+    ).toBe("invalid_cursor");
+    expect((await call({ action: "search", query: "row", cursor })).error).toBe("invalid_cursor");
+    // Resuming with the identical binding delivers rows in order; bounded pages
+    // (floor discovery over 1200 rows) may be empty progress pages in between.
+    const nextItem = async (from: string | undefined) => {
+      let page = await call({ action: "list_items", role: "assistant", limit: 1, cursor: from });
+      for (let hops = 0; page.items?.length === 0 && page.nextCursor; hops++) {
+        expect(hops).toBeLessThan(10);
+        page = await call({
+          action: "list_items",
+          role: "assistant",
+          limit: 1,
+          cursor: page.nextCursor,
+        });
+      }
+      expect(page.success).toBe(true);
+      return { text: page.items?.[0]?.text, cursor: page.nextCursor };
+    };
+    const opening = await nextItem(cursor);
+    const second = await nextItem(opening.cursor);
+    expect([opening.text, second.text]).toEqual(["opening facts", "row 0"]);
+  });
+});
