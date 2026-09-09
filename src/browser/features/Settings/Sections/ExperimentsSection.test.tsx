@@ -1,6 +1,20 @@
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
+import * as ActualAPIModule from "@/browser/contexts/API";
+import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
+import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
+
+// Snapshot values, not Bun's live module namespaces, before installing overrides.
+const actualAPI = { ...ActualAPIModule };
+const actualExperiments = { ...ActualExperimentsModule };
+const actualTelemetry = { ...ActualTelemetryModule };
+
+afterAll(() => {
+  void mock.module("@/browser/contexts/API", () => actualAPI);
+  void mock.module("@/browser/contexts/ExperimentsContext", () => actualExperiments);
+  void mock.module("@/browser/hooks/useTelemetry", () => actualTelemetry);
+});
 
 type PrereqStatus =
   | { available: true }
@@ -46,6 +60,7 @@ let experimentEnabled = false;
 let experimentValues: Record<string, boolean> = {};
 
 void mock.module("@/browser/contexts/API", () => ({
+  ...actualAPI,
   useAPI: () => ({
     api: mockApi,
     status: "connected" as const,
@@ -56,6 +71,7 @@ void mock.module("@/browser/contexts/API", () => ({
 }));
 
 void mock.module("@/browser/contexts/ExperimentsContext", () => ({
+  ...actualExperiments,
   useExperiment: (experimentId: string) => [
     experimentValues[experimentId] ?? experimentEnabled,
     (enabled: boolean) => {
@@ -66,6 +82,7 @@ void mock.module("@/browser/contexts/ExperimentsContext", () => ({
 }));
 
 void mock.module("@/browser/hooks/useTelemetry", () => ({
+  ...actualTelemetry,
   useTelemetry: () => ({
     experimentOverridden: mock(() => undefined),
   }),
@@ -165,6 +182,32 @@ describe("PortableDesktopExperimentWarning", () => {
     globalThis.setInterval = originalSetInterval;
     globalThis.clearInterval = originalClearInterval;
   });
+
+  test.each([false, true])(
+    "hides compaction switches even when their stored flags are %s",
+    (enabled) => {
+      experimentEnabled = false;
+      experimentValues = {
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: enabled,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: enabled,
+      };
+      const view = render(<ExperimentsSection />);
+      expect(view.queryByLabelText("Toggle Continuous Compaction")).toBeNull();
+      expect(view.queryByLabelText("Toggle Token-budget context windows")).toBeNull();
+      for (const name of [
+        "Programmatic Tool Calling",
+        "Agent Memory",
+        "Multi-project workspaces",
+        "Workspace Heartbeats",
+      ]) {
+        expect(view.getByRole("switch", { name: `Toggle ${name}` })).toBeTruthy();
+      }
+      expect(experimentValues).toEqual({
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: enabled,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: enabled,
+      });
+    }
+  );
 
   test("shows heartbeat defaults inline only when its experiment is enabled", async () => {
     // Goal defaults moved out of ExperimentsSection into the Goal tab

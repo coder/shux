@@ -1,8 +1,18 @@
 import React from "react";
-import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { requireTestModule } from "@/browser/testUtils";
+import type * as APIModule from "@/browser/contexts/API";
+import type * as ExperimentsModule from "@/browser/contexts/ExperimentsContext";
+import type * as GeneralModule from "./GeneralSection";
+import {
+  EXPERIMENT_IDS,
+  getExperimentKey,
+  type ExperimentId,
+} from "@/common/constants/experiments";
 import { installDom } from "../../../../../tests/ui/dom";
 import { BASH_COLLAPSED_SUMMARY_MODE_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
 import {
@@ -21,7 +31,13 @@ interface MockConfig {
   llmDebugLogs: boolean;
 }
 
+type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
+
 interface MockAPIClient {
+  experiments: {
+    getOverrides: () => Promise<ExperimentOverrides>;
+    setOverride: (input: { experimentId: ExperimentId; enabled: boolean }) => Promise<void>;
+  };
   config: {
     getConfig: () => Promise<MockConfig>;
     updateCoderPrefs: (input: {
@@ -43,7 +59,7 @@ interface MockAPIClient {
 
 let mockApi: MockAPIClient;
 
-void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => {
+const mockSelectPrimitive = (() => {
   const SelectContext = React.createContext<{
     value?: string;
     disabled?: boolean;
@@ -153,28 +169,72 @@ void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => {
     SelectContent,
     SelectItem,
   };
+})();
+
+let APIProvider: typeof APIModule.APIProvider;
+let ExperimentsProvider: typeof ExperimentsModule.ExperimentsProvider;
+let useExperiment: typeof ExperimentsModule.useExperiment;
+let GeneralSection: typeof GeneralModule.GeneralSection;
+let isolatedModuleDir: string;
+
+beforeAll(async () => {
+  // Isolate the real provider and its consumer from other suites' global hook mocks.
+  const root = join(process.cwd(), ".tmp");
+  await mkdir(root, { recursive: true });
+  isolatedModuleDir = await mkdtemp(join(root, "general-section-test-"));
+  await copyFile("src/browser/contexts/API.tsx", join(isolatedModuleDir, "API.tsx"));
+  for (const [sourcePath, filename] of [
+    ["src/browser/contexts/ExperimentsContext.tsx", "ExperimentsContext.tsx"],
+    ["src/browser/features/Settings/Sections/GeneralSection.tsx", "GeneralSection.tsx"],
+  ]) {
+    const source = await readFile(sourcePath, "utf8");
+    const isolatedSource = source
+      .replace('from "@/browser/contexts/API";', 'from "./API";')
+      .replace('from "@/browser/contexts/ExperimentsContext";', 'from "./ExperimentsContext";')
+      .replace('from "@/browser/components/SelectPrimitive/SelectPrimitive";', 'from "./Select";');
+    expect(isolatedSource).not.toBe(source);
+    await writeFile(join(isolatedModuleDir, filename), isolatedSource);
+  }
+  const selectPath = join(isolatedModuleDir, "Select.tsx");
+  await writeFile(selectPath, "export {};\n");
+  void mock.module(selectPath, () => mockSelectPrimitive);
+  ({ APIProvider } = requireTestModule<typeof APIModule>(join(isolatedModuleDir, "API.tsx")));
+  ({ ExperimentsProvider, useExperiment } = requireTestModule<typeof ExperimentsModule>(
+    join(isolatedModuleDir, "ExperimentsContext.tsx")
+  ));
+  ({ GeneralSection } = requireTestModule<typeof GeneralModule>(
+    join(isolatedModuleDir, "GeneralSection.tsx")
+  ));
 });
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+afterAll(async () => {
+  await rm(isolatedModuleDir, { recursive: true, force: true });
+});
 
-import { GeneralSection } from "./GeneralSection";
+function TestProviders(props: { children: React.ReactNode }) {
+  return (
+    <APIProvider client={mockApi as APIModule.APIClient}>
+      <ExperimentsProvider>
+        <ThemeProvider forcedTheme="dark">{props.children}</ThemeProvider>
+      </ExperimentsProvider>
+    </APIProvider>
+  );
+}
 
 interface RenderGeneralSectionOptions {
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
   worktreeArchiveBehavior?: WorktreeArchiveBehavior;
   chatTranscriptFullWidth?: boolean;
+  localOverrides?: ExperimentOverrides;
+  backendOverrides?: ExperimentOverrides;
+  children?: React.ReactNode;
 }
 
 interface MockAPISetup {
   api: MockAPIClient;
+  backendOverrides: ExperimentOverrides;
+  setOverrideMock: ReturnType<typeof mock<MockAPIClient["experiments"]["setOverride"]>>;
+  getOverridesMock: ReturnType<typeof mock<MockAPIClient["experiments"]["getOverrides"]>>;
   getConfigMock: ReturnType<typeof mock<() => Promise<MockConfig>>>;
   updateCoderPrefsMock: ReturnType<
     typeof mock<
@@ -189,7 +249,18 @@ interface MockAPISetup {
   >;
 }
 
-function createMockAPI(configOverrides: Partial<MockConfig> = {}): MockAPISetup {
+function createMockAPI(
+  configOverrides: Partial<MockConfig> = {},
+  experimentOverrides: ExperimentOverrides = {}
+): MockAPISetup {
+  const backendOverrides = { ...experimentOverrides };
+  const getOverridesMock = mock(() => Promise.resolve({ ...backendOverrides }));
+  const setOverrideMock = mock(
+    ({ experimentId, enabled }: { experimentId: ExperimentId; enabled: boolean }) => {
+      backendOverrides[experimentId] = enabled;
+      return Promise.resolve();
+    }
+  );
   const config: MockConfig = {
     coderWorkspaceArchiveBehavior: DEFAULT_CODER_ARCHIVE_BEHAVIOR,
     worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
@@ -219,6 +290,7 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}): MockAPISetup 
 
   return {
     api: {
+      experiments: { getOverrides: getOverridesMock, setOverride: setOverrideMock },
       config: {
         getConfig: getConfigMock,
         updateCoderPrefs: updateCoderPrefsMock,
@@ -238,6 +310,9 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}): MockAPISetup 
         setDefaultProjectDir: mock((_input: { path: string }) => Promise.resolve()),
       },
     },
+    backendOverrides,
+    setOverrideMock,
+    getOverridesMock,
     getConfigMock,
     updateCoderPrefsMock,
     updateChatTranscriptFullWidthMock,
@@ -254,29 +329,32 @@ describe("GeneralSection", () => {
   afterEach(() => {
     cleanup();
     mock.restore();
-    void mock.module(
-      "@/browser/components/SelectPrimitive/SelectPrimitive",
-      () => ActualSelectPrimitiveModule
-    );
     cleanupDom?.();
     cleanupDom = null;
   });
 
   function renderGeneralSection(options: RenderGeneralSectionOptions = {}) {
-    const { api, updateCoderPrefsMock, updateChatTranscriptFullWidthMock } = createMockAPI({
-      chatTranscriptFullWidth: options.chatTranscriptFullWidth,
-      coderWorkspaceArchiveBehavior: options.coderWorkspaceArchiveBehavior,
-      worktreeArchiveBehavior: options.worktreeArchiveBehavior,
-    });
-    mockApi = api;
+    for (const [id, enabled] of Object.entries(options.localOverrides ?? {})) {
+      window.localStorage.setItem(getExperimentKey(id as ExperimentId), JSON.stringify(enabled));
+    }
+    const setup = createMockAPI(
+      {
+        chatTranscriptFullWidth: options.chatTranscriptFullWidth,
+        coderWorkspaceArchiveBehavior: options.coderWorkspaceArchiveBehavior,
+        worktreeArchiveBehavior: options.worktreeArchiveBehavior,
+      },
+      options.backendOverrides
+    );
+    mockApi = setup.api;
 
     const view = render(
-      <ThemeProvider forcedTheme="dark">
+      <TestProviders>
         <GeneralSection />
-      </ThemeProvider>
+        {options.children}
+      </TestProviders>
     );
 
-    return { updateCoderPrefsMock, updateChatTranscriptFullWidthMock, view };
+    return { ...setup, view };
   }
 
   function getSelectTrigger(view: ReturnType<typeof render>, label: string): HTMLElement {
@@ -318,6 +396,170 @@ describe("GeneralSection", () => {
       expect(trigger.textContent).toContain(optionText);
     });
   }
+
+  const legacyStrategies = [
+    { continuous: false, budget: false, label: "Summarize" },
+    { continuous: true, budget: false, label: "Continuous" },
+    { continuous: false, budget: true, label: "Token Budget" },
+    { continuous: true, budget: true, label: "Continuous" },
+  ];
+
+  async function hydrateExperiments(setup: MockAPISetup) {
+    await act(async () => {
+      await waitFor(() => expect(setup.getOverridesMock).toHaveBeenCalledTimes(1));
+    });
+  }
+
+  for (const source of ["localOverrides", "backendOverrides"] as const) {
+    test.each(legacyStrategies)(
+      `displays ${source} continuous=$continuous budget=$budget without normalizing on mount`,
+      async ({ continuous, budget, label }) => {
+        const overrides = {
+          [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: continuous,
+          [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
+        };
+        const setup = renderGeneralSection({ [source]: overrides });
+        await hydrateExperiments(setup);
+        expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
+          label
+        );
+        expect(setup.backendOverrides).toEqual(overrides);
+        // The provider uploads explicit local values; mounting the dropdown must add no writes.
+        if (source === "localOverrides") {
+          for (const [experimentId, enabled] of Object.entries(overrides)) {
+            expect(setup.setOverrideMock).toHaveBeenCalledWith({ experimentId, enabled });
+          }
+        }
+        expect(setup.setOverrideMock).toHaveBeenCalledTimes(source === "localOverrides" ? 2 : 0);
+        for (const [id, enabled] of Object.entries(overrides)) {
+          expect(window.localStorage.getItem(getExperimentKey(id as ExperimentId))).toBe(
+            source === "localOverrides" ? JSON.stringify(enabled) : null
+          );
+        }
+      }
+    );
+  }
+
+  test("defaults to Summarize without persisting an implicit choice", async () => {
+    const setup = renderGeneralSection();
+    await hydrateExperiments(setup);
+    expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
+      "Summarize"
+    );
+    expect(setup.setOverrideMock).not.toHaveBeenCalled();
+    expect(setup.backendOverrides).toEqual({});
+    expect(
+      window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION))
+    ).toBeNull();
+    expect(window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET))).toBeNull();
+  });
+
+  test.each([
+    {
+      local: { [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: false },
+      backend: {
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: true,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
+      },
+      label: "Token Budget",
+    },
+    {
+      local: { [EXPERIMENT_IDS.TOKEN_BUDGET]: false },
+      backend: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true },
+      label: "Summarize",
+    },
+    {
+      local: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true },
+      backend: { [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: true },
+      label: "Continuous",
+    },
+  ])(
+    "resolves local overrides before backend values and defaults ($label)",
+    async ({ local, backend, label }) => {
+      const setup = renderGeneralSection({ localOverrides: local, backendOverrides: backend });
+      await hydrateExperiments(setup);
+      expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
+        label
+      );
+      expect(setup.backendOverrides).toEqual({ ...backend, ...local });
+      expect(setup.setOverrideMock).toHaveBeenCalledTimes(Object.keys(local).length);
+    }
+  );
+
+  for (const initial of legacyStrategies) {
+    test.each(legacyStrategies.slice(0, 3).filter((next) => next.label !== initial.label))(
+      `selecting $label from continuous=${initial.continuous} budget=${initial.budget} persists both flags only`,
+      async ({ continuous, budget, label }) => {
+        const unrelated = {
+          [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
+          [EXPERIMENT_IDS.RLM]: true,
+          [EXPERIMENT_IDS.MEMORY]: true,
+        };
+        const setup = renderGeneralSection({
+          backendOverrides: {
+            ...unrelated,
+            [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: initial.continuous,
+            [EXPERIMENT_IDS.TOKEN_BUDGET]: initial.budget,
+          },
+        });
+        await hydrateExperiments(setup);
+        await chooseSelectOption(setup.view, "Compaction strategy", label);
+        await waitFor(() =>
+          expect(setup.backendOverrides).toEqual({
+            ...unrelated,
+            [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: continuous,
+            [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
+          })
+        );
+        expect(setup.setOverrideMock).toHaveBeenCalledTimes(2);
+        expect(
+          window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION))
+        ).toBe(JSON.stringify(continuous));
+        expect(window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET))).toBe(
+          JSON.stringify(budget)
+        );
+        expect(Boolean(setup.view.queryByRole("status"))).toBe(label === "Token Budget");
+      }
+    );
+  }
+
+  test("keeps Token Budget selectable and tracks live PTC/RLM conflicts without changing the strategy", async () => {
+    function ConflictToggles() {
+      const [ptc, setPtc] = useExperiment(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+      const [rlm, setRlm] = useExperiment(EXPERIMENT_IDS.RLM);
+      return (
+        <>
+          <button onClick={() => setPtc(!ptc)}>Toggle PTC fixture</button>
+          <button onClick={() => setRlm(!rlm)}>Toggle RLM fixture</button>
+        </>
+      );
+    }
+    const setup = renderGeneralSection({ children: <ConflictToggles /> });
+    await hydrateExperiments(setup);
+    await chooseSelectOption(setup.view, "Compaction strategy", "Token Budget");
+    const trigger = setup.view.getByRole("combobox", { name: "Compaction strategy" });
+    expect(setup.view.queryByRole("status")).toBeNull();
+    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
+    expect(setup.view.queryByRole("status")).toBeNull();
+    fireEvent.click(setup.view.getByRole("button", { name: "Toggle PTC fixture" }));
+    const warning = setup.view.getByRole("status");
+    expect(trigger.getAttribute("aria-describedby")).toBe(warning.id);
+    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
+    expect(setup.view.queryByRole("status")).toBeNull();
+    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
+    expect(setup.view.getByRole("status")).toBeTruthy();
+    fireEvent.click(setup.view.getByRole("button", { name: "Toggle PTC fixture" }));
+    expect(setup.view.queryByRole("status")).toBeNull();
+    expect(trigger.textContent).toBe("Token Budget");
+    await waitFor(() =>
+      expect(setup.backendOverrides).toEqual({
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: false,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
+        [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: false,
+        [EXPERIMENT_IDS.RLM]: true,
+      })
+    );
+  });
 
   test("persists flat chat list mode from the Sidebar group", () => {
     const { view } = renderGeneralSection();
@@ -428,9 +670,9 @@ describe("GeneralSection", () => {
     mockApi = api;
 
     const view = render(
-      <ThemeProvider forcedTheme="dark">
+      <TestProviders>
         <GeneralSection />
-      </ThemeProvider>
+      </TestProviders>
     );
 
     await waitFor(() => {
@@ -479,9 +721,9 @@ describe("GeneralSection", () => {
     mockApi = api;
 
     const view = render(
-      <ThemeProvider forcedTheme="dark">
+      <TestProviders>
         <GeneralSection />
-      </ThemeProvider>
+      </TestProviders>
     );
 
     await waitFor(() => {
@@ -522,9 +764,9 @@ describe("GeneralSection", () => {
     mockApi = api;
 
     const view = render(
-      <ThemeProvider forcedTheme="dark">
+      <TestProviders>
         <GeneralSection />
-      </ThemeProvider>
+      </TestProviders>
     );
 
     await waitFor(() => {

@@ -103,7 +103,8 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     description:
       "Start fresh context windows instead of automatic summaries, with session_history for retrieval. Requires session_history; continuous compaction and RLM take precedence.",
     enabledByDefault: false,
-    showInSettings: true,
+    // Configured together with Continuous Compaction in Settings → General.
+    showInSettings: false,
   },
   [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: {
     id: EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
@@ -118,7 +119,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Continuous Compaction",
     description: "Compact older context between turns while preserving recent messages verbatim",
     enabledByDefault: false,
-    showInSettings: true,
+    showInSettings: false,
   },
   [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: {
     id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
