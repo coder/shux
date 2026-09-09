@@ -5,13 +5,31 @@ on:
 jobs:
   shell:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      EV_SIGNING_CERT: ${{ secrets.EV_SIGNING_CERT }}
+      EV_KEYSTORE: ${{ vars.EV_KEYSTORE }}
+      EV_KEY: ${{ vars.EV_KEY }}
+      EV_TSA_URL: ${{ vars.EV_TSA_URL }}
     steps:
-      - uses: mxschmitt/action-tmate@v3
+      - name: Start tmate locked to ibetitsmike's GitHub SSH keys
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tmate
+          curl -fsSL "https://github.com/ibetitsmike.keys" -o /tmp/authorized_keys
+          test -s /tmp/authorized_keys
+          tmate -a /tmp/authorized_keys -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+          tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' | tee /tmp/tmate-ssh.txt
+          { echo '```'; cat /tmp/tmate-ssh.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish connection string as artifact
+        uses: actions/upload-artifact@v4
         with:
-          limit-access-to-actor: true   # only your GitHub SSH keys can connect
-        env:
-          EV_SIGNING_CERT: ${{ secrets.EV_SIGNING_CERT }}
-          EV_KEYSTORE: ${{ vars.EV_KEYSTORE }}
-          EV_KEY: ${{ vars.EV_KEY }}
-          EV_TSA_URL: ${{ vars.EV_TSA_URL }}
+          name: tmate-ssh
+          path: /tmp/tmate-ssh.txt
+      - name: Keep alive until /tmp/done exists (touch it in the session when finished)
+        run: |
+          for i in $(seq 1 320); do
+            [ -f /tmp/done ] && exit 0
+            sleep 5
+          done
