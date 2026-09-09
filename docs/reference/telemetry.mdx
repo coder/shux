@@ -38,13 +38,15 @@ All telemetry events include basic system information:
 
 ## Disabling telemetry
 
-To disable telemetry, set `XUM_DISABLE_TELEMETRY` before starting the app:
+Toggle **Usage Telemetry** off in **Settings → General**. The change applies immediately (no restart) and persists as `telemetryEnabled: false` in the active Xum home's `config.json` — `~/.xum` by default, or the directory `XUM_ROOT` / an existing legacy `~/.mux` install points at. Opting out also drops a `telemetry_opt_out` marker file next to `config.json`, so the choice survives running an older Xum build whose settings writer doesn't know the field; toggling telemetry back on removes it. Builds that predate this toggle only honor the environment variable — if you opt out and plan to keep running such a build, also set `XUM_DISABLE_TELEMETRY=1`; the marker restores your choice for current builds once you upgrade again.
+
+Alternatively, set `XUM_DISABLE_TELEMETRY` to exactly `1` before starting the app (other values like `true` are ignored):
 
 ```bash
 XUM_DISABLE_TELEMETRY=1 xum
 ```
 
-This disables telemetry collection at the backend level.
+The environment variable is a hard override: when set to `1`, telemetry stays off regardless of the Settings toggle, and the toggle renders disabled with a note saying so. Both switches disable collection at the backend level.
 
 ## Source code
 

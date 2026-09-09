@@ -154,6 +154,12 @@ export const AppConfigOnDiskSchema = z
     chatTranscriptFullWidth: z.boolean().optional(),
     muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),
+    /**
+     * Anonymous usage telemetry opt-out (Settings → General). Absent/true =
+     * enabled; false = disabled. MUX_DISABLE_TELEMETRY=1 also hard-disables
+     * regardless of this field.
+     */
+    telemetryEnabled: z.boolean().optional(),
     heartbeatDefaultPrompt: z.string().optional(),
     heartbeatDefaultIntervalMs: z
       .number()

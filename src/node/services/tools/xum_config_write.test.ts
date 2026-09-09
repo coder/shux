@@ -169,6 +169,50 @@ describe("mux_config_write", () => {
     });
   });
 
+  it("refuses to change telemetryEnabled through the generic writer", async () => {
+    using xumHome = new TestTempDir("mux-config-write");
+
+    const tool = await createWriteTool(xumHome.path, GLOBAL_WORKSPACE_ID);
+    // The telemetry preference is a two-record transaction (config field +
+    // opt-out marker) owned by Config.setTelemetryEnabledPersisted; a direct
+    // document write would split the records (no marker sync, no lock).
+    const result = (await tool.execute!(
+      {
+        file: "config",
+        operations: [{ op: "set", path: ["telemetryEnabled"], value: false }],
+        confirm: true,
+      },
+      mockToolCallOptions
+    )) as XumConfigWriteResult;
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(String(result.error)).toContain("telemetryEnabled");
+    }
+    // Nothing persisted: neither the field nor a stray marker.
+    let written: { telemetryEnabled?: unknown } = {};
+    try {
+      written = JSON.parse(await fs.readFile(path.join(xumHome.path, "config.json"), "utf-8")) as {
+        telemetryEnabled?: unknown;
+      };
+    } catch {
+      // Missing file is equally "not persisted".
+    }
+    expect(written.telemetryEnabled).toBeUndefined();
+
+    // Unrelated fields still write while the field merely rides along
+    // UNCHANGED (absent -> absent).
+    const unrelated = (await tool.execute!(
+      {
+        file: "config",
+        operations: [{ op: "set", path: ["defaultModel"], value: "anthropic:claude-opus-5" }],
+        confirm: true,
+      },
+      mockToolCallOptions
+    )) as XumConfigWriteResult;
+    expect(unrelated.success).toBe(true);
+  });
+
   it("preserves unknown nested fields when mutating unrelated key", async () => {
     using xumHome = new TestTempDir("mux-config-write");
 

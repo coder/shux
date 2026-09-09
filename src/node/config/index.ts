@@ -89,9 +89,11 @@ import { getContainerName as getDockerContainerName } from "@/node/runtime/Docke
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
 import {
   type ProjectRegistrationLockHandle,
+  projectRegistrationLockFilePath,
   tryProjectRegistrationFileLock,
   withProjectRegistrationFileLock,
 } from "@/node/config/projectRegistrationLock";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
@@ -285,6 +287,22 @@ function parseOptionalEnvBoolean(value: unknown): boolean | undefined {
 function parseOptionalBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
+
+/**
+ * Privacy opt-outs fail CLOSED on corruption: a present-but-invalid
+ * telemetryEnabled (valid JSON, wrong type — "false", 0, null) must read as
+ * disabled, not as an absent opt-out that silently resumes telemetry. Only a
+ * genuinely absent field keeps the enabled-by-default semantics.
+ */
+function parseTelemetryEnabled(value: unknown): boolean | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return value === true;
+}
+
+/** Startup budget for the telemetry marker reconciliation's registration-lock wait. */
+const TELEMETRY_RECONCILE_LOCK_TIMEOUT_MS = 2_000;
 
 function parseUpdateChannel(value: unknown): UpdateChannel | undefined {
   if (value === "stable" || value === "nightly" || value === "npm") {
@@ -1840,6 +1858,7 @@ export class Config {
           chatTranscriptFullWidth: parseOptionalBoolean(parsed.chatTranscriptFullWidth),
           muxGatewayEnabled,
           llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
+          telemetryEnabled: parseTelemetryEnabled(parsed.telemetryEnabled),
           heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
           heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
             parsed.heartbeatDefaultIntervalMs
@@ -1979,6 +1998,11 @@ export class Config {
       const llmDebugLogs = parseOptionalBoolean(config.llmDebugLogs);
       if (llmDebugLogs !== undefined) {
         data.llmDebugLogs = llmDebugLogs;
+      }
+
+      const telemetryEnabled = parseOptionalBoolean(config.telemetryEnabled);
+      if (telemetryEnabled !== undefined) {
+        data.telemetryEnabled = telemetryEnabled;
       }
 
       const heartbeatDefaultPrompt = parseOptionalNonEmptyString(config.heartbeatDefaultPrompt);
@@ -2820,6 +2844,306 @@ export class Config {
 
   getLlmDebugLogsEnabled(): boolean {
     return this.loadConfigOrDefault().llmDebugLogs === true;
+  }
+
+  /**
+   * Settings → General telemetry opt-out; absent means enabled.
+   *
+   * Fail CLOSED: when the persisted state cannot be read, report disabled —
+   * corrupted or inaccessible state must not silently override an opt-out. A
+   * genuinely missing file is not an error (fresh install ⇒ enabled), but
+   * existsSync() masks traversal failures (EACCES on ~/.xum) as "missing", so
+   * stat explicitly to tell ENOENT apart from every other failure. Callers
+   * stay non-fatal either way.
+   */
+  isTelemetryDisabledByConfig(): boolean {
+    // Downgrade backstop first: older builds' whitelist-based saveConfig drops
+    // the (to them unknown) telemetryEnabled field, so opt out -> downgrade ->
+    // change any setting -> upgrade would silently re-enable telemetry. The
+    // sidecar marker survives that round-trip (old builds never touch unknown
+    // files in the config dir, and they have no toggle that could legitimately
+    // re-enable), so its presence reads as disabled regardless of the field.
+    try {
+      fs.lstatSync(this.telemetryOptOutMarkerFile);
+      return true;
+    } catch (error) {
+      // Only a provably absent entry means "no marker". After a downgrade
+      // round-trip the marker can be the ONLY record of the opt-out, so a
+      // transient lookup failure (EIO, ESTALE, a dangling symlink's target)
+      // must fail closed rather than fall through to the now-absent field
+      // and resume telemetry. lstat keeps a dangling symlink reading as
+      // present.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return true;
+      }
+    }
+    try {
+      fs.statSync(this.configFile);
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+    try {
+      return this.loadConfigOrDefault({ throwOnError: true }).telemetryEnabled === false;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Sidecar marker for the telemetry opt-out (`telemetry_opt_out` next to
+   * config.json). config.json stays the primary, write-verified record; the
+   * marker only exists so the opt-out survives an upgrade↔downgrade round
+   * trip (see isTelemetryDisabledByConfig).
+   */
+  private get telemetryOptOutMarkerFile(): string {
+    return path.join(this.rootDir, "telemetry_opt_out");
+  }
+
+  /**
+   * Persist the telemetry toggle: config.json field write, strict
+   * verification, and sidecar-marker sync as ONE guarded sequence. Any
+   * failure rolls the field back (best-effort) and throws, so success is only
+   * reported when both persisted records agree. The whole sequence runs under
+   * one hold of the project registration file lock — the cross-process lock
+   * every editConfig save already commits under — so concurrent toggles from
+   * peer processes sharing this Xum home cannot interleave the field write
+   * and the marker sync into a divergent final state (config says enabled,
+   * marker says disabled). The nested edits pass the hold explicitly: the
+   * lock is not reentrant, and an edit issued inside the window must commit
+   * under the window's hold instead of waiting for it to end.
+   */
+  async setTelemetryEnabledPersisted(enabled: boolean): Promise<void> {
+    await withProjectRegistrationFileLock(this.rootDir, async (lock) => {
+      const withinRegistrationLock = { withinRegistrationLock: lock };
+      // Prior EFFECTIVE state so failures below can restore it — marker-aware:
+      // after a downgrade round trip, or with a malformed marker (a directory,
+      // a symlink) and no field, the marker is the only record of the opt-out.
+      // Snapshotting just the field would read "enabled", and once the marker
+      // sync has quarantined that entry, a failed toggle's rollback would
+      // delete the field too — a failed opt-out request silently enabling
+      // collection. The fail-closed read (unreadable ⇒ disabled) is the right
+      // bias for a rollback target.
+      const previousDisabled = this.isTelemetryDisabledByConfig();
+      const rollBackTelemetryState = async (): Promise<void> => {
+        try {
+          // Rollback writes are mutations under the lock like the forward
+          // ones: a displaced holder must not restore over a peer's newer
+          // toggle (editConfig asserts before its save; the marker needs the
+          // same check).
+          await lock.assertStillOwned();
+          await this.editConfig((config) => {
+            if (previousDisabled) {
+              config.telemetryEnabled = false;
+            } else {
+              delete config.telemetryEnabled;
+            }
+            return config;
+          }, withinRegistrationLock);
+          // The awaited edit is a displacement window of its own: re-validate
+          // before this second mutation, or a stale rollback could recreate a
+          // marker over a peer's newer enable (or remove its downgrade backstop).
+          await lock.assertStillOwned();
+          // Restore the downgrade backstop the marker sync may have
+          // quarantined or removed.
+          this.setTelemetryOptOutMarker(previousDisabled);
+        } catch {
+          // Best-effort rollback: the thrown error already reports the toggle
+          // as not applied, and any residual mismatch reads fail-closed
+          // (disabled), which is the privacy-safe direction.
+        }
+      };
+
+      await this.editConfig((config) => {
+        // Persist the choice EXPLICITLY in both directions (no sparsify-on-
+        // enable): a crash between this verified write and the marker sync
+        // must leave a field the startup reconciliation can repair FROM — an
+        // absent field with a stale marker is indistinguishable from the
+        // downgrade-survivor state and would restart opted out despite a
+        // successful re-enable. Absent still means enabled-by-default for
+        // configs that never touched the toggle.
+        config.telemetryEnabled = enabled;
+        return config;
+      }, withinRegistrationLock);
+
+      // saveConfig swallows write errors (a full disk still resolves), but a
+      // privacy opt-out must not report success while the persisted state says
+      // "enabled" — the choice would silently un-apply on next launch. Re-read
+      // the disk STRICTLY and fail loudly, before touching the live client.
+      // isTelemetryDisabledByConfig() is deliberately not used here: its
+      // fail-closed read (unreadable ⇒ disabled) is right for enablement
+      // checks but would let a failed write + failed read masquerade as a
+      // confirmed opt-out.
+      let persistedDisabled: boolean;
+      try {
+        persistedDisabled =
+          this.loadConfigOrDefault({ throwOnError: true }).telemetryEnabled === false;
+      } catch {
+        // The atomic write may have LANDED before this read failed: without a
+        // rollback, a persisted opt-out with no marker would survive as a
+        // field a downgrade save then silently drops.
+        await rollBackTelemetryState();
+        throw new Error(
+          "Could not verify the telemetry preference was persisted to config.json; the setting was not changed."
+        );
+      }
+      if (persistedDisabled !== !enabled) {
+        await rollBackTelemetryState();
+        throw new Error(
+          "Failed to persist the telemetry preference to config.json; the setting was not changed."
+        );
+      }
+
+      // The marker mutation is irreversible work under the lock, like the
+      // field save (which asserts inside editConfig): on platforms without
+      // process birth identity a holder stalled past the lease can have been
+      // displaced by a peer that already completed a newer toggle, and
+      // recreating or removing the peer's marker would undo it. Re-validate
+      // ownership immediately before touching the marker.
+      try {
+        await lock.assertStillOwned();
+      } catch {
+        await rollBackTelemetryState();
+        throw new Error(
+          "Lost the configuration lock before the telemetry opt-out marker could be updated; re-open Settings to confirm the current value."
+        );
+      }
+      // Sync the downgrade-surviving sidecar marker only after the config
+      // write verified: the marker is a backstop, never the primary record.
+      // The two records must agree before we report success — a lost marker
+      // breaks the downgrade guarantee for an opt-out, and a stale marker
+      // overrides an explicit re-enable.
+      try {
+        this.setTelemetryOptOutMarker(!enabled);
+      } catch {
+        await rollBackTelemetryState();
+        throw new Error(
+          "Could not update the telemetry opt-out marker file; the setting was not changed."
+        );
+      }
+      // The nested field edit already notified, but that event fired BEFORE
+      // the marker sync — a peer client reading marker-aware getConfig() on it
+      // could still see the old effective state (stale marker). Emit again now
+      // that the full field/marker transaction is complete.
+      this.notifyConfigChanged();
+    });
+  }
+
+  /**
+   * Startup reconciliation for a crash that split the telemetry records — the
+   * process dying between the verified field write and the marker sync in
+   * setTelemetryEnabledPersisted. The marker follows an EXPLICIT field:
+   * telemetryEnabled: false recreates a missing marker (this also durably
+   * codifies a hand-edited opt-out), and an explicit true removes a stale one
+   * (a hand-declared re-enable). An ABSENT field with a marker present is
+   * left alone: that state is exactly the downgrade round-trip the marker
+   * exists to survive, a crash-mid-enable is indistinguishable from it, and
+   * failing closed (disabled) is the privacy-safe direction — the next
+   * explicit toggle repairs it. Best-effort by contract: startup
+   * initialization must never crash the app.
+   */
+  async reconcileTelemetryOptOutMarker(): Promise<void> {
+    try {
+      // Startup critical path: a bounded wait for the registration lock, not
+      // the full 60s budget a peer's restore window may legitimately hold it
+      // for. Not a single attempt either — the load-time migration persist
+      // takes the same lock in the background of this process, and a
+      // reconciliation that gave up on that brief hold would silently skip
+      // on most first launches. A timeout leaves the records as they are:
+      // telemetry safely stays fail-closed meanwhile, and the next explicit
+      // toggle (or restart) reconciles.
+      await using lock = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(this.rootDir),
+        timeoutMs: TELEMETRY_RECONCILE_LOCK_TIMEOUT_MS,
+        label: "project registration lock",
+      });
+      const field = this.loadConfigOrDefault().telemetryEnabled;
+      if (field === false || field === true) {
+        // The field read is a displacement window too: a holder frozen past
+        // the lease can be reclaimed by a peer that completes a newer toggle,
+        // and mutating the marker afterwards would undo it — a removed opt-out
+        // marker is lost for good once an old build's save drops the field.
+        await lock.assertStillOwned();
+        this.setTelemetryOptOutMarker(field === false);
+      }
+    } catch {
+      // Best-effort: an unwritable home leaves the records as they were; the
+      // next explicit toggle runs the full verified transaction.
+    }
+  }
+
+  /**
+   * Throws on filesystem failure: the two persisted records must agree before
+   * the caller reports success — a lost marker silently breaks the downgrade
+   * guarantee for an opt-out, and a stale marker overrides an explicit
+   * re-enable. setTelemetryEnabledPersisted rolls the config field back when
+   * this throws.
+   */
+  setTelemetryOptOutMarker(disabled: boolean): void {
+    this.quarantineMalformedTelemetryOptOutMarker();
+    if (disabled) {
+      // Create a NEW inode and rename it over the marker path. Whatever sits
+      // there is replaced, never truncated in place: a hard link to another
+      // file (which lstat reports as a plain file and O_NOFOLLOW cannot
+      // catch) or a symlink planted after the quarantine check can therefore
+      // never lead the marker text into someone else's file. O_EXCL and
+      // O_NOFOLLOW (where the platform has it) guard the temp path itself.
+      const tempPath = `${this.telemetryOptOutMarkerFile}.tmp-${process.pid}-${Date.now()}`;
+      const fd = fs.openSync(
+        tempPath,
+        fs.constants.O_WRONLY |
+          fs.constants.O_CREAT |
+          fs.constants.O_EXCL |
+          ((fs.constants.O_NOFOLLOW as number | undefined) ?? 0)
+      );
+      try {
+        fs.writeSync(
+          fd,
+          "Usage telemetry is disabled while this file exists (Settings → General).\n"
+        );
+      } finally {
+        fs.closeSync(fd);
+      }
+      try {
+        fs.renameSync(tempPath, this.telemetryOptOutMarkerFile);
+      } catch (error) {
+        fs.rmSync(tempPath, { force: true });
+        throw error;
+      }
+    } else {
+      fs.rmSync(this.telemetryOptOutMarkerFile, { force: true });
+    }
+  }
+
+  /**
+   * Self-heal a marker path occupied by anything but a regular file. A
+   * directory (corrupted state, a stray mkdir) makes writeFileSync and rmSync
+   * fail with EISDIR, so every toggle would roll its field back while the
+   * entry keeps reading as an opt-out — the Settings control could never
+   * re-enable telemetry without manual filesystem repair. A symlink is worse:
+   * the marker write would follow it and truncate whatever the link points
+   * at. Rename the entry aside (never delete unknown content; renaming a link
+   * moves the link, not its target) so the marker write or removal proceeds
+   * on a path we own.
+   */
+  private quarantineMalformedTelemetryOptOutMarker(): void {
+    let stats: fs.Stats;
+    try {
+      stats = fs.lstatSync(this.telemetryOptOutMarkerFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return;
+      }
+      throw error;
+    }
+    if (stats.isFile()) {
+      return;
+    }
+    const quarantinePath = `${this.telemetryOptOutMarkerFile}.malformed-${Date.now()}`;
+    fs.renameSync(this.telemetryOptOutMarkerFile, quarantinePath);
+    log.warn("Quarantined malformed telemetry opt-out marker", {
+      markerPath: this.telemetryOptOutMarkerFile,
+      quarantinePath,
+    });
   }
 
   async setUpdateChannel(channel: UpdateChannel): Promise<void> {

@@ -94,6 +94,7 @@ export const CommandIds = {
   // Settings commands
   settingsOpen: () => "settings:open" as const,
   settingsOpenSection: (section: string) => `settings:open:${section}` as const,
+  telemetryToggle: () => "settings:telemetry:toggle" as const,
   coderDisconnect: () => "providers:coder:disconnect" as const,
   coderRefreshModels: () => "providers:coder:refresh-models" as const,
 

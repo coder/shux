@@ -78,6 +78,28 @@ export const createXumConfigWriteTool: ToolFactory = (config: ToolConfiguration)
             };
           }
 
+          // The telemetry opt-out is a two-record transaction (the config field
+          // plus the downgrade-surviving telemetry_opt_out marker) that
+          // Config.setTelemetryEnabledPersisted runs under this same lock. This
+          // generic document writer has no marker sync, so a field change here
+          // could report success while the marker — and the live collector —
+          // disagree. Refuse the change and point at the real control. The
+          // compare runs under the registration hold, so a toggle cannot
+          // complete between the source read above and the save below.
+          if (args.file === "config") {
+            const before = (currentDocument as { telemetryEnabled?: unknown } | null)
+              ?.telemetryEnabled;
+            const after = (mutationResult.document as { telemetryEnabled?: unknown })
+              .telemetryEnabled;
+            if (!Object.is(before, after)) {
+              return {
+                success: false,
+                error:
+                  'Refusing to change "telemetryEnabled" through the generic config writer: the telemetry preference is a two-record transaction (config field + opt-out marker). Ask the user to toggle Usage Telemetry in Settings → General instead.',
+              };
+            }
+          }
+
           await lock?.assertStillOwned();
           await writeConfigDocument(xumHome, args.file, mutationResult.document);
           return {

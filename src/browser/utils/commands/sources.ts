@@ -230,6 +230,13 @@ const getAnalyticsRebuildDatabase = (
   return typeof rebuildDatabase === "function" ? rebuildDatabase : null;
 };
 
+// Serializes Toggle Usage Telemetry read-modify-writes: palette invocations
+// start actions without awaiting them, so two rapid toggles would otherwise
+// both read the same value and write the same inverse, collapsing two
+// requested transitions into one. Each queued run observes its predecessor's
+// persisted result.
+let telemetryTogglePending: Promise<void> = Promise.resolve();
+
 const showCommandFeedbackToast = (feedback: {
   type: "success" | "error";
   message: string;
@@ -1993,6 +2000,57 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             },
           ] satisfies CommandAction[])
         : []),
+    ]);
+  }
+
+  // Telemetry toggle: keyboard-reachable twin of the Settings -> General
+  // switch (every user operation must be invocable from the palette). Calls
+  // the RPC directly so it works even when the Settings pane never opened.
+  if (p.api) {
+    const apiForTelemetry = p.api;
+    actions.push(() => [
+      {
+        id: CommandIds.telemetryToggle(),
+        title: "Toggle Usage Telemetry",
+        subtitle: "Anonymous usage analytics (Settings -> General)",
+        section: section.settings,
+        keywords: ["telemetry", "analytics", "privacy", "usage", "tracking", "opt out"],
+        run: () => {
+          const task = telemetryTogglePending.then(async () => {
+            // Read fresh backend truth instead of any cached UI state: the
+            // palette can run with Settings closed, and a privacy toggle must
+            // flip the real persisted value.
+            const cfg = await apiForTelemetry.config.getConfig();
+            if (cfg.telemetryDisabledByEnv === true) {
+              showCommandFeedbackToast({
+                type: "error",
+                message:
+                  "Telemetry is hard-disabled by the environment (XUM_DISABLE_TELEMETRY, CI, or tests); the toggle has no effect.",
+              });
+              return;
+            }
+            const next = cfg.telemetryEnabled === false;
+            await apiForTelemetry.config.updateTelemetryEnabled({ enabled: next });
+            showCommandFeedbackToast({
+              type: "success",
+              message: next ? "Usage telemetry enabled." : "Usage telemetry disabled.",
+            });
+          });
+          telemetryTogglePending = task.then(
+            () => undefined,
+            () => {
+              // A privacy control must never fail silently: without feedback
+              // the user cannot tell whether collection state changed. The
+              // coerced chain stays usable for the next invocation.
+              showCommandFeedbackToast({
+                type: "error",
+                message: "Could not toggle usage telemetry - the backend is unreachable.",
+              });
+            }
+          );
+          return telemetryTogglePending;
+        },
+      },
     ]);
   }
 

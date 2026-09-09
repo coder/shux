@@ -2588,6 +2588,11 @@ export const config = {
       muxGovernorEnrolled: z.boolean(),
       chatTranscriptFullWidth: z.boolean(),
       llmDebugLogs: z.boolean(),
+      telemetryEnabled: z.boolean(),
+      // True when the environment (MUX_DISABLE_TELEMETRY, CI, tests) hard-disables
+      // telemetry regardless of the config toggle — the UI renders the switch
+      // disabled instead of pretending it controls anything.
+      telemetryDisabledByEnv: z.boolean(),
       heartbeatDefaultPrompt: z.string().optional(),
       heartbeatDefaultIntervalMs: z.number().optional(),
       goalDefaults: GoalDefaultsConfigSchema,
@@ -2676,6 +2681,7 @@ export const config = {
   },
   updateChatTranscriptFullWidth: booleanToggleRoute,
   updateLlmDebugLogs: booleanToggleRoute,
+  updateTelemetryEnabled: booleanToggleRoute,
   updateHeartbeatDefaultPrompt: {
     input: z
       .object({

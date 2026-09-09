@@ -88,11 +88,19 @@ export interface TelemetryEnablementContext {
   env: NodeJS.ProcessEnv;
   isElectron: boolean;
   isPackaged: boolean | null;
+  /** User opt-out persisted in config.json (Settings → General). */
+  disabledByConfig?: boolean;
 }
 
 export function shouldEnableTelemetry(context: TelemetryEnablementContext): boolean {
   // Telemetry is disabled by explicit env vars, CI, or test environments
   if (isTelemetryDisabledByEnv(context.env)) {
+    return false;
+  }
+
+  // User opt-out via config.json (telemetryEnabled: false). The env var and
+  // config switch are both hard-off; absence of both means enabled.
+  if (context.disabledByConfig === true) {
     return false;
   }
 
@@ -134,23 +142,50 @@ export class TelemetryService {
   private distinctId: string | null = null;
   private featureFlagVariants: Record<string, string | boolean> = {};
   private readonly xumHome: string;
+  private readonly isDisabledByConfig?: () => boolean;
+  private initInFlight: Promise<void> | null = null;
+  private configApplyChain: Promise<void> = Promise.resolve();
+  // Set once by shutdown() at final app teardown and never cleared: the lazy
+  // capture()-path and initializeOnce()'s post-await re-check must refuse to
+  // install a client during or after teardown. Runtime opt-outs
+  // (setConfigEnabled(false)) deliberately do NOT set this — a peer process
+  // re-enabling the shared config must be able to lazily re-init this one,
+  // and the per-event config gate keeps capture() off in the meantime.
+  private terminalShutdown = false;
+  /** Rate limit for capture()'s lazy cross-process re-enable initialization. */
+  private static readonly LAZY_INIT_RETRY_MS = 30_000;
+  private lastLazyInitAttemptMs = 0;
 
   /**
-   * Check if telemetry is enabled.
-   * Returns true only after initialize() completes and telemetry was not disabled.
+   * Check if telemetry is effectively enabled.
+   * A live client alone is not the truth: a peer process (or a manual shared
+   * config edit) can opt out while this process still holds an initialized
+   * client — capture() already gates per event, and status surfaces must
+   * agree with it. The env gate needs no re-check here: the environment is
+   * fixed for the process lifetime, and an env-disabled process never
+   * creates a client in the first place.
    */
   isEnabled(): boolean {
-    return this.client !== null;
+    return this.client !== null && this.isDisabledByConfig?.() !== true;
   }
 
   /**
-   * Check if telemetry was explicitly disabled by the user via XUM_DISABLE_TELEMETRY=1.
-   * This is different from isEnabled() which also returns false in dev mode.
-   * Used to gate features like link sharing that should only be hidden when
-   * the user explicitly opts out of xum services.
+   * Check if telemetry was explicitly disabled by the user — either via
+   * XUM_DISABLE_TELEMETRY=1 or the Settings → General opt-out. This is
+   * different from isEnabled() which also returns false in test/CI contexts.
+   * Consumers gating on explicit opt-out must treat both switches the same;
+   * the docs present them as equivalent.
    */
   isExplicitlyDisabled(): boolean {
-    return resolveXumEnvironmentValue("DISABLE_TELEMETRY", process.env) === "1";
+    return (
+      resolveXumEnvironmentValue("DISABLE_TELEMETRY", process.env) === "1" ||
+      this.isDisabledByConfig?.() === true
+    );
+  }
+
+  /** The environment gate alone (env var, CI, tests) — surfaced to the UI so the Settings toggle can render as hard-disabled. */
+  isDisabledByEnv(): boolean {
+    return isTelemetryDisabledByEnv(process.env);
   }
 
   /**
@@ -180,15 +215,71 @@ export class TelemetryService {
 
     this.featureFlagVariants[key] = variant;
   }
-  constructor(xumHome?: string) {
+  constructor(xumHome?: string, isDisabledByConfig?: () => boolean) {
     this.xumHome = xumHome ?? getXumHome();
+    this.isDisabledByConfig = isDisabledByConfig;
+  }
+
+  /**
+   * Apply the Settings → General telemetry toggle at runtime: disabling shuts
+   * the PostHog client down (capture() no-ops on a null client), enabling
+   * re-runs initialize(), which re-checks every enablement gate.
+   *
+   * Applies are serialized across ALL callers: the desktop Settings pane and
+   * API-server clients drive the same router in one process with no shared
+   * frontend chain, and an unserialized shutdown/initialize interleaving can
+   * resurrect a capturing client after an opt-out, kill telemetry while the
+   * switch shows on, or orphan an unflushed client.
+   */
+  async setConfigEnabled(enabled: boolean): Promise<void> {
+    const next = this.configApplyChain.then(() => {
+      // Concurrent toggles can reorder persistence vs application across
+      // RPCs: A persists false and pauses, B persists AND applies true, then
+      // A applies its stale false — config says enabled while the client is
+      // down. Re-read the persisted truth at APPLY time so queued applies
+      // converge on the last persisted state instead of replaying their
+      // caller's intent. Without a config reader (bare constructions) the
+      // caller's value is the only truth available.
+      const effectiveEnabled =
+        this.isDisabledByConfig != null ? !this.isDisabledByConfig() : enabled;
+      if (effectiveEnabled) {
+        return this.initialize();
+      }
+      // Runtime opt-out, not the terminal latch: tear the client down but
+      // leave lazy re-init armed, so a later re-enable — from this process or
+      // a peer writing the shared config — can bring telemetry back without a
+      // restart. While the config stays disabled, capture()'s per-event gate
+      // keeps events off regardless.
+      return this.teardownClient();
+    });
+    // Keep the chain usable after a failed apply.
+    this.configApplyChain = next.then(
+      () => undefined,
+      () => undefined
+    );
+    return next;
   }
 
   /**
    * Initialize the PostHog client.
    * Should be called once on app startup.
+   *
+   * Re-entrancy-safe: the null-client guard and the client assignment are
+   * separated by awaits, so two concurrent initializes would otherwise both
+   * pass the guard and orphan a live client.
    */
   async initialize(): Promise<void> {
+    if (this.initInFlight) {
+      return this.initInFlight;
+    }
+    const run = this.initializeOnce().finally(() => {
+      this.initInFlight = null;
+    });
+    this.initInFlight = run;
+    return run;
+  }
+
+  private async initializeOnce(): Promise<void> {
     if (this.client) {
       return;
     }
@@ -202,13 +293,22 @@ export class TelemetryService {
 
     const isElectron = typeof process.versions.electron === "string";
     const isPackaged = await getElectronIsPackaged(isElectron);
+    const disabledByConfig = this.isDisabledByConfig?.() === true;
 
-    if (!shouldEnableTelemetry({ env, isElectron, isPackaged })) {
+    if (!shouldEnableTelemetry({ env, isElectron, isPackaged, disabledByConfig })) {
       return;
     }
 
     // Load or generate distinct ID
     this.distinctId = await this.loadOrCreateDistinctId();
+
+    // Terminal teardown may have started while the awaits above ran — the
+    // startup initialize() does not ride configApplyChain, so shutdown()'s
+    // queued teardown can complete before we get here. Installing the client
+    // now would leave a live PostHog past the final flush.
+    if (this.terminalShutdown) {
+      return;
+    }
 
     this.client = new PostHog(DEFAULT_POSTHOG_KEY, {
       host: DEFAULT_POSTHOG_HOST,
@@ -269,7 +369,45 @@ export class TelemetryService {
    * Events are silently ignored when disabled.
    */
   capture(payload: TelemetryEventPayload): void {
-    if (isTelemetryDisabledByEnv(process.env) || !this.client || !this.distinctId) {
+    // The config opt-out is re-checked per event, not just at initialize():
+    // a second mux process sharing ~/.mux/config.json (mux server alongside
+    // the desktop app) must stop capturing when the user opts out in the
+    // other process. Event volume is low (discrete user actions), so the
+    // config read is acceptable here for a privacy control.
+    if (isTelemetryDisabledByEnv(process.env) || this.isDisabledByConfig?.() === true) {
+      return;
+    }
+
+    if (!this.client || !this.distinctId) {
+      // Cross-process re-enable: this process may have started while the
+      // shared config said opted-out (client never created) and another
+      // process has since re-enabled. Kick a lazy, serialized initialize —
+      // rate-limited because every enablement gate (dev mode, packaging)
+      // still applies and may legitimately keep the client null. The current
+      // event is dropped; the process converges for subsequent ones.
+      const now = Date.now();
+      if (now - this.lastLazyInitAttemptMs > TelemetryService.LAZY_INIT_RETRY_MS) {
+        this.lastLazyInitAttemptMs = now;
+        // Serialized with toggle applies, and latched off once shutdown
+        // begins: an unserialized initialize() here could install a fresh
+        // client while shutdown() is still awaiting the PostHog flush,
+        // leaving telemetry live after teardown. The queued task re-checks
+        // every gate when it actually runs.
+        this.configApplyChain = this.configApplyChain
+          .then(async () => {
+            if (this.terminalShutdown || this.client != null) {
+              return;
+            }
+            if (isTelemetryDisabledByEnv(process.env) || this.isDisabledByConfig?.() === true) {
+              return;
+            }
+            await this.initialize();
+          })
+          .then(
+            () => undefined,
+            () => undefined
+          );
+      }
       return;
     }
 
@@ -288,19 +426,44 @@ export class TelemetryService {
 
   /**
    * Shutdown telemetry and flush any pending events.
-   * Should be called on app close.
+   * Should be called on app close — this is the terminal teardown, distinct
+   * from the runtime opt-out (setConfigEnabled(false)): it latches lazy
+   * re-init off permanently.
    */
   async shutdown(): Promise<void> {
-    if (!this.client) {
+    // Latch first (synchronously): any lazy re-init task that runs from this
+    // instant on refuses at its terminalShutdown re-check, and initializeOnce
+    // re-checks after its awaits.
+    this.terminalShutdown = true;
+    // Ride the apply chain so an in-flight initialize() — a lazy task that
+    // passed the latch check and is awaiting the Electron import or
+    // telemetry-ID I/O — settles BEFORE the flush. A direct teardown here
+    // could observe a null client, return, and leak the client that task
+    // installs moments later; queued behind it, the teardown disposes
+    // whatever state it left.
+    const next = this.configApplyChain.then(() => this.teardownClient());
+    this.configApplyChain = next.then(
+      () => undefined,
+      () => undefined
+    );
+    return next;
+  }
+
+  /** Null the client immediately (capture() no-ops), then flush it. */
+  private async teardownClient(): Promise<void> {
+    // Null BEFORE flushing: capture() must no-op the instant a teardown
+    // begins, and a concurrent initialize() must never observe the stale
+    // client and skip re-initialization.
+    const client = this.client;
+    this.client = null;
+    if (!client) {
       return;
     }
 
     try {
-      await this.client.shutdown();
+      await client.shutdown();
     } catch {
       // Silently ignore shutdown errors
     }
-
-    this.client = null;
   }
 }

@@ -282,7 +282,16 @@ export const router = (authToken?: string) => {
         .output(schemas.config.getConfig.output)
         .handler(
           handlerGen(function* ({ context }) {
-            return yield* Effect.sync(() => context.config.getClientConfig());
+            return yield* Effect.sync(() => ({
+              ...context.config.getClientConfig(),
+              // Marker-aware effective state: after a downgrade round-trip dropped
+              // the config field, the sidecar marker still holds the opt-out — the
+              // UI must mirror what capture() enforces. The env hard-off rides
+              // along so the switch can render as disabled (Config cannot reach
+              // the telemetry service; the route composes the two).
+              telemetryEnabled: !context.config.isTelemetryDisabledByConfig(),
+              telemetryDisabledByEnv: context.telemetryService.isDisabledByEnv(),
+            }));
           })
         ),
       // Event-iterator subscription: stays on the plain handler until the Effect
@@ -398,6 +407,26 @@ export const router = (authToken?: string) => {
         .handler(
           handlerGen(function* ({ context }, input) {
             yield* atomicPromise(async () => context.config.updateLlmDebugLogs(input.enabled));
+          })
+        ),
+      updateTelemetryEnabled: t
+        .input(schemas.config.updateTelemetryEnabled.input)
+        .output(schemas.config.updateTelemetryEnabled.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            // Field write, strict verification, marker sync, and failure
+            // rollbacks live in Config behind a cross-process lock so the two
+            // persisted records (telemetryEnabled + the sidecar marker) can
+            // never diverge under concurrent toggles from peer processes.
+            // Persistence and the live application are ONE uninterruptible
+            // section: a client abort while the write is pending must not
+            // leave the records changed and the running client untouched.
+            yield* atomicPromise(async () => {
+              await context.config.setTelemetryEnabledPersisted(input.enabled);
+              // Apply immediately: disabling shuts the client down mid-session,
+              // enabling re-runs the full enablement check (env vars still win).
+              await context.telemetryService.setConfigEnabled(input.enabled);
+            });
           })
         ),
       updateHeartbeatDefaultPrompt: t

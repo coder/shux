@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-unsafe-argument, @typescript-eslint/require-await, local/no-sync-fs-methods */
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createRouterClient, ORPCError } from "@orpc/server";
 import * as fs from "fs";
 import * as os from "os";
@@ -217,19 +217,37 @@ describe("router agent skill routes", () => {
 describe("router config transcript mutation", () => {
   let tempDir: string;
   let config: Config;
+  let setConfigEnabledMock: ReturnType<typeof mock<(enabled: boolean) => Promise<void>>>;
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-router-test-"));
     config = new Config(tempDir);
+    setConfigEnabledMock = mock((_enabled: boolean) => Promise.resolve());
   });
 
   afterEach(() => {
+    // The write-failure test locks the dir; restore perms so cleanup succeeds.
+    try {
+      fs.chmodSync(tempDir, 0o700);
+    } catch {
+      // Already removed or never locked.
+    }
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
   function createContext(): ORPCContext {
-    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- Only Config is used by this route.
-    return { config } as ORPCContext;
+    // These config-route tests touch Config, TaskService, and (via getConfig /
+    // updateTelemetryEnabled) TelemetryService; stub the rest of the container.
+    return {
+      config,
+      taskService: {
+        maybeStartQueuedTasks: () => Promise.resolve(undefined),
+      },
+      telemetryService: {
+        isDisabledByEnv: () => false,
+        setConfigEnabled: setConfigEnabledMock,
+      },
+    } as unknown as ORPCContext;
   }
 
   test("persists the full-width chat transcript config flag", async () => {
@@ -292,4 +310,169 @@ describe("router config transcript mutation", () => {
     await call;
     expect(inFlightProcedureCount()).toBe(0);
   });
+
+  // chmod-based error injection is meaningless where permission bits don't
+  // bind: root bypasses them (common in containerized CI) and Windows ACLs
+  // ignore POSIX modes entirely.
+  const permissionBitsEnforced =
+    process.platform !== "win32" && typeof process.getuid === "function" && process.getuid() !== 0;
+
+  test("updateTelemetryEnabled persists explicitly in both directions and applies the toggle", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+
+    await client.config.updateTelemetryEnabled({ enabled: false });
+
+    expect(config.loadConfigOrDefault().telemetryEnabled).toBe(false);
+    expect(setConfigEnabledMock).toHaveBeenLastCalledWith(false);
+    // The downgrade-surviving sidecar marker tracks the opt-out.
+    expect(fs.existsSync(path.join(tempDir, "telemetry_opt_out"))).toBe(true);
+
+    await client.config.updateTelemetryEnabled({ enabled: true });
+
+    // Re-enabling stores an EXPLICIT true (not a sparse delete): a crash
+    // before the marker removal must leave a field the startup
+    // reconciliation can repair from, or the app restarts opted out despite
+    // a successful re-enable.
+    expect(config.loadConfigOrDefault().telemetryEnabled).toBe(true);
+    expect(setConfigEnabledMock).toHaveBeenLastCalledWith(true);
+    expect(fs.existsSync(path.join(tempDir, "telemetry_opt_out"))).toBe(false);
+  });
+
+  test("updateTelemetryEnabled applies the runtime toggle even when the client aborts mid-persist", async () => {
+    // Persistence and the live application are one uninterruptible section:
+    // a client abort while the field/marker write is pending must not leave
+    // the records changed and the running client untouched.
+    let started!: () => void;
+    const persistStarted = new Promise<void>((resolve) => (started = resolve));
+    let finish!: () => void;
+    const persist = new Promise<void>((resolve) => (finish = resolve));
+    const persistSpy = spyOn(config, "setTelemetryEnabledPersisted").mockImplementation(() => {
+      started();
+      return persist;
+    });
+    try {
+      const client = createRouterClient(router(), { context: createContext() });
+      const controller = new AbortController();
+      const call = client.config
+        .updateTelemetryEnabled({ enabled: false }, { signal: controller.signal })
+        .catch((error: unknown) => error);
+      await persistStarted;
+      controller.abort();
+      finish();
+      await call;
+    } finally {
+      persistSpy.mockRestore();
+    }
+    expect(setConfigEnabledMock).toHaveBeenCalledWith(false);
+  });
+
+  test("updateTelemetryEnabled rolls the config field back when verification cannot read it", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+
+    // The atomic write can LAND before a transient read failure hits the
+    // strict verification. Reporting failure while leaving the field persisted
+    // (with no marker) would strand an opt-out that the next downgrade save
+    // silently drops — the route must restore the prior state instead.
+    const original = config.loadConfigOrDefault.bind(config);
+    let threwOnce = false;
+    const loadSpy = spyOn(config, "loadConfigOrDefault").mockImplementation(((options?: {
+      throwOnError?: boolean;
+    }) => {
+      if (options?.throwOnError && !threwOnce) {
+        threwOnce = true;
+        throw new Error("transient read failure");
+      }
+      return original(options);
+    }) as typeof config.loadConfigOrDefault);
+    try {
+      await expect(client.config.updateTelemetryEnabled({ enabled: false })).rejects.toThrow(
+        /verify the telemetry preference/
+      );
+    } finally {
+      loadSpy.mockRestore();
+    }
+
+    expect(config.loadConfigOrDefault().telemetryEnabled).toBeUndefined();
+    expect(fs.existsSync(path.join(tempDir, "telemetry_opt_out"))).toBe(false);
+    expect(setConfigEnabledMock).not.toHaveBeenCalled();
+  });
+
+  test("updateTelemetryEnabled rolls the config field back when the marker sync fails", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+
+    // Both persisted records must agree before the RPC reports success: a
+    // verified config write with a lost marker would silently break the
+    // downgrade guarantee, so the route must restore the prior field state
+    // and reject.
+    const markerSpy = spyOn(config, "setTelemetryOptOutMarker").mockImplementationOnce(() => {
+      throw new Error("disk full");
+    });
+    try {
+      await expect(client.config.updateTelemetryEnabled({ enabled: false })).rejects.toThrow(
+        /opt-out marker/
+      );
+    } finally {
+      markerSpy.mockRestore();
+    }
+
+    expect(config.loadConfigOrDefault().telemetryEnabled).toBeUndefined();
+    expect(fs.existsSync(path.join(tempDir, "telemetry_opt_out"))).toBe(false);
+    expect(setConfigEnabledMock).not.toHaveBeenCalled();
+  });
+
+  test.skipIf(!permissionBitsEnforced)(
+    "updateTelemetryEnabled fails loudly when the config write does not land",
+    async () => {
+      const client = createRouterClient(router(), { context: createContext() });
+
+      // saveConfig writes atomically (temp file + rename in the config dir), so a
+      // read-only dir makes the write fail. saveConfig swallows that error; the
+      // route must detect it anyway rather than report success for a privacy
+      // setting that will silently revert on next launch. The registration
+      // lock lives in locks/ — pre-create it writable so the transaction gets
+      // past lock acquisition to the write this test is about.
+      fs.mkdirSync(path.join(tempDir, "locks"), { recursive: true });
+      fs.chmodSync(tempDir, 0o500);
+      try {
+        await expect(client.config.updateTelemetryEnabled({ enabled: false })).rejects.toThrow(
+          /persist the telemetry preference/
+        );
+      } finally {
+        fs.chmodSync(tempDir, 0o700);
+      }
+
+      expect(config.loadConfigOrDefault().telemetryEnabled).toBeUndefined();
+      expect(setConfigEnabledMock).not.toHaveBeenCalled();
+    }
+  );
+
+  test.skipIf(!permissionBitsEnforced)(
+    "updateTelemetryEnabled fails when persistence cannot be verified",
+    async () => {
+      const client = createRouterClient(router(), { context: createContext() });
+
+      // Materialize config.json, then make it unreadable AND the dir unwritable:
+      // the disable write is swallowed and the verification read fails. A read
+      // failure must fail the RPC — it must not masquerade as a confirmed
+      // opt-out (the fail-closed enablement read would report disabled here).
+      // The exact rejection depends on which guard fires first (Config's
+      // corrupt-config backup protection can reject the write before the
+      // route's verification read); either way the RPC must reject.
+      await client.config.updateChatTranscriptFullWidth({ enabled: true });
+      const configFile = path.join(tempDir, "config.json");
+      fs.chmodSync(configFile, 0o000);
+      // Keep the registration lock acquirable (see the read-only-dir test above).
+      fs.mkdirSync(path.join(tempDir, "locks"), { recursive: true });
+      fs.chmodSync(tempDir, 0o500);
+      try {
+        await expect(client.config.updateTelemetryEnabled({ enabled: false })).rejects.toThrow();
+      } finally {
+        fs.chmodSync(tempDir, 0o700);
+        fs.chmodSync(configFile, 0o600);
+      }
+
+      expect(config.loadConfigOrDefault().telemetryEnabled).toBeUndefined();
+      expect(setConfigEnabledMock).not.toHaveBeenCalled();
+    }
+  );
 });

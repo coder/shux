@@ -369,7 +369,15 @@ export class ServiceContainer {
    */
   private readonly startupCoreSteps: readonly StartupStep[] = [
     { name: "extensionMetadata.initialize", run: () => this.extensionMetadata.initialize() },
-    { name: "telemetryService.initialize", run: () => this.telemetryService.initialize() },
+    {
+      name: "telemetryService.initialize",
+      run: async () => {
+        // Repair a crash-split telemetry preference (field written, marker sync
+        // lost) before the enablement gates read either record.
+        await this.config.reconcileTelemetryOptOutMarker();
+        await this.telemetryService.initialize();
+      },
+    },
     // Startup gating
     { name: "policyService.initialize", run: () => this.policyService.initialize() },
     { name: "experimentsService.initialize", run: () => this.experimentsService.initialize() },
