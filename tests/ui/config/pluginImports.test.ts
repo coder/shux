@@ -215,6 +215,44 @@ describeIntegration("Selective plugin imports", () => {
     120000
   );
 
+  test("same-SHA local file edits refresh inventory and require explicit reselection", async () => {
+    const { canvas, user } = await openPreview(app, remote);
+    await user.click(canvas.getByRole("checkbox", { name: "research" }));
+    await user.click(canvas.getByRole("checkbox", { name: "reference" }));
+    await user.click(canvas.getByRole("button", { name: "Install" }));
+    await canvas.findByText(/1 of 2 skills imported/, {}, { timeout: 10000 });
+    await user.click(canvas.getByRole("button", { name: "Add components to review-tools" }));
+    await user.click(await canvas.findByRole("checkbox", { name: "research" }));
+    const before = await inventory(app);
+    const skillFile = path.join(
+      app.env.config.rootDir,
+      "plugins",
+      "review-tools",
+      "skills",
+      "research",
+      "SKILL.md"
+    );
+    await fs.appendFile(skillFile, "Changed local skill instructions\n");
+    await user.click(canvas.getByRole("button", { name: "Import selected" }));
+    await waitFor(() => {
+      expect(canvas.getByRole("checkbox", { name: "research" }).getAttribute("aria-checked")).toBe(
+        "false"
+      );
+      expect(canvas.getByRole("button", { name: "Import selected" }).hasAttribute("disabled")).toBe(
+        true
+      );
+    });
+    expect(await canvas.findByRole("alert")).toBeDefined();
+    const refreshed = await inventory(app);
+    expect(refreshed.lockedSha).toBe(before.lockedSha);
+    expect(refreshed.contentHash).not.toBe(before.contentHash);
+    expect(refreshed.importedComponents?.skills).toEqual(["review"]);
+    await user.click(canvas.getByRole("checkbox", { name: "research" }));
+    await user.click(canvas.getByRole("button", { name: "Import selected" }));
+    await canvas.findByText(/2 of 2 skills imported/);
+    expect((await inventory(app)).importedComponents?.skills).toEqual(["research", "review"]);
+  }, 120000);
+
   test("accepted new previews reset choices; inventory retries and stale versions require reselection after an update", async () => {
     const { canvas, user } = await openPreview(app, remote);
     await user.click(canvas.getByRole("checkbox", { name: "review" }));

@@ -306,6 +306,7 @@ describe("AgentPluginInstallService", () => {
       await service.addComponents({
         name: "demo-plugin",
         expectedLockedSha: preview.lockedSha,
+        expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
         skills: [],
         mcpServers: ["later"],
       });
@@ -320,6 +321,7 @@ describe("AgentPluginInstallService", () => {
       await service.addComponents({
         name: "demo-plugin",
         expectedLockedSha: preview.lockedSha,
+        expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
         skills: [],
         mcpServers: ["excluded"],
       });
@@ -337,6 +339,99 @@ describe("AgentPluginInstallService", () => {
       manager.dispose();
     }
   }, 20_000);
+
+  test.each([
+    "skill body",
+    "skill description",
+    "MCP command",
+    "MCP args",
+    "MCP env",
+    "MCP URL",
+    "referenced binary",
+    "executable",
+    "symlink",
+  ])("component consent rejects same-SHA local edits until reviewed again: %s", async (edit) => {
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "greet", "reference.bin"),
+      Buffer.from([0xfe, 0xff])
+    );
+    await fsPromises.writeFile(path.join(remoteDir, "server.js"), "// first\n");
+    await fsPromises.symlink("reference.bin", path.join(remoteDir, "skills", "greet", "link"));
+    if (edit === "MCP URL") {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: { echo: { type: "streamable-http", url: "https://old.example.test/mcp" } },
+        })
+      );
+    }
+    await commitAll(remoteDir, "content receipt fixture");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: { skills: [], mcpServers: [] },
+    });
+    const root = path.join(pluginsDir(), "demo-plugin");
+    const binaryFile = path.join(root, "skills", "greet", "reference.bin");
+    // Same-size non-UTF8 edits with restored mtime must invalidate consent too.
+    await fsPromises.utimes(binaryFile, 1_600_000_000, 1_600_000_000);
+    const reviewed = await service.getComponents({ name: "demo-plugin" });
+    const before = await fsPromises.readFile(registryFile(), "utf8");
+    if (edit.startsWith("MCP")) {
+      const configPath = path.join(root, "mcp.json");
+      const doc = JSON.parse(await fsPromises.readFile(configPath, "utf8")) as {
+        mcpServers: Record<string, Record<string, unknown>>;
+      };
+      const server = doc.mcpServers.echo;
+      if (edit === "MCP command") server.command = "python3";
+      if (edit === "MCP args") server.args = ["${PLUGIN_ROOT}/server.js", "--new-behavior"];
+      if (edit === "MCP env") server.env = { NODE_OPTIONS: "--require=changed.js" };
+      if (edit === "MCP URL") server.url = "https://new.example.test/mcp";
+      await fsPromises.writeFile(configPath, JSON.stringify(doc));
+    } else if (edit === "referenced binary") {
+      await fsPromises.writeFile(binaryFile, Buffer.from([0xff, 0xfe]));
+      await fsPromises.utimes(binaryFile, 1_600_000_000, 1_600_000_000);
+      expect((await fsPromises.stat(binaryFile)).mtimeMs).toBe(1_600_000_000_000);
+      expect((await fsPromises.stat(binaryFile)).size).toBe(2);
+    } else if (edit === "executable") {
+      await fsPromises.writeFile(path.join(root, "server.js"), "// other\n");
+    } else if (edit === "symlink") {
+      const link = path.join(root, "skills", "greet", "link");
+      await fsPromises.unlink(link);
+      await fsPromises.symlink("../../server.js", link);
+    } else {
+      const skillFile = path.join(root, "skills", "greet", "SKILL.md");
+      const body = await fsPromises.readFile(skillFile, "utf8");
+      await fsPromises.writeFile(
+        skillFile,
+        edit === "skill body"
+          ? body.replace("Say hi.", "Run me.")
+          : body.replace("Greets people", "Different description")
+      );
+    }
+    const request = {
+      name: "demo-plugin",
+      expectedLockedSha: reviewed.lockedSha,
+      expectedContentHash: reviewed.contentHash,
+      skills: ["greet"],
+      mcpServers: ["echo"],
+    };
+    expect((await service.addComponentsResult(request)).success).toBe(false);
+    expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(before);
+    const refreshed = await service.getComponents({ name: "demo-plugin" });
+    expect(refreshed.lockedSha).toBe(reviewed.lockedSha);
+    expect(refreshed.contentHash).not.toBe(reviewed.contentHash);
+    const accepted = await service.addComponents({
+      ...request,
+      expectedContentHash: refreshed.contentHash,
+    });
+    expect(accepted.importedComponents).toEqual({ skills: ["greet"], mcpServers: ["echo"] });
+    expect(
+      await service.addComponents({ ...request, expectedContentHash: refreshed.contentHash })
+    ).toEqual(accepted);
+  });
 
   test("explicit imports reject unknown directory IDs, mismatched frontmatter and an unreviewed SHA", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "skills", "other"));
@@ -402,7 +497,11 @@ describe("AgentPluginInstallService", () => {
       })
     );
     const other = new AgentPluginInstallService(config, { isEnabled: () => true });
-    const args = { name: "demo-plugin", expectedLockedSha: preview.lockedSha };
+    const args = {
+      name: "demo-plugin",
+      expectedLockedSha: preview.lockedSha,
+      expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
+    };
     const epoch = await fsPromises.readFile(path.join(stagingDir(), "mutation-epoch"), "utf8");
     await Promise.all([
       service.addComponents({ ...args, skills: ["greet", "greet"], mcpServers: [] }),
@@ -467,6 +566,7 @@ describe("AgentPluginInstallService", () => {
       importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
     });
     const saved = await fsPromises.readFile(registryFile(), "utf8");
+    const contentHash = (await service.getComponents({ name: "demo-plugin" })).contentHash;
     const [entry] = (await registry()) as Array<Record<string, unknown>>;
     for (const malformed of [
       "{",
@@ -484,6 +584,7 @@ describe("AgentPluginInstallService", () => {
           await service.addComponentsResult({
             name: "demo-plugin",
             expectedLockedSha: preview.lockedSha,
+            expectedContentHash: contentHash,
             skills: [],
             mcpServers: ["echo"],
           })
@@ -543,6 +644,7 @@ describe("AgentPluginInstallService", () => {
       service.addComponents({
         name: "demo-plugin",
         expectedLockedSha: preview.lockedSha,
+        expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
         skills: ["greet"],
         mcpServers: [],
       }),
@@ -571,6 +673,7 @@ describe("AgentPluginInstallService", () => {
     const args = {
       name: "demo-plugin",
       expectedLockedSha: preview.lockedSha,
+      expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
       skills: ["greet"],
       mcpServers: ["echo"],
     };
@@ -629,6 +732,7 @@ describe("AgentPluginInstallService", () => {
         await service.addComponentsResult({
           name: "demo-plugin",
           expectedLockedSha: preview.lockedSha,
+          expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
           skills: [],
           mcpServers: ["echo"],
         })
@@ -644,6 +748,7 @@ describe("AgentPluginInstallService", () => {
     const updated = await service.addComponents({
       name: "demo-plugin",
       expectedLockedSha: preview.lockedSha,
+      expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
       skills: ["greet"],
       mcpServers: [],
     });

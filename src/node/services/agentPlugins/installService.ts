@@ -70,6 +70,7 @@ import {
 } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
 import type { AgentPluginManifest } from "./manifest";
+import { hashPluginTree } from "./treeHash";
 import {
   buildPluginServerKey,
   computePluginInstanceId,
@@ -2678,15 +2679,21 @@ export class AgentPluginInstallService {
   private async readInstalledComponents(
     entry: AgentPluginInstallEntry
   ): Promise<AgentPluginComponents> {
-    const { plugin } = await discoverAgentPluginAt({
-      pluginDir: this.targetPathFor(entry.name),
-      scope: "global",
-    });
+    const pluginDir = this.targetPathFor(entry.name);
+    const contentHash = await hashPluginTree(pluginDir, this.stagingQuota());
+    const { plugin } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
     if (plugin === null || plugin.name !== entry.name)
       throw new Error(`Installed plugin '${entry.name}' is missing or invalid.`);
+    const components = await this.collectComponents(plugin);
+    if ((await hashPluginTree(pluginDir, this.stagingQuota())) !== contentHash) {
+      throw new Error(
+        "Installed plugin files changed during component review. Refresh the component inventory."
+      );
+    }
     return {
       lockedSha: entry.lockedSha,
-      ...(await this.collectComponents(plugin)),
+      contentHash,
+      ...components,
       ...(entry.importedComponents !== undefined
         ? { importedComponents: entry.importedComponents }
         : {}),
@@ -2703,7 +2710,11 @@ export class AgentPluginInstallService {
   }
 
   async addComponents(
-    args: AgentPluginImportedComponents & { name: string; expectedLockedSha: string }
+    args: AgentPluginImportedComponents & {
+      name: string;
+      expectedLockedSha: string;
+      expectedContentHash: string;
+    }
   ): Promise<AgentPluginInstallEntry> {
     this.assertEnabled();
     return this.runExclusive(async () => {
@@ -2714,7 +2725,13 @@ export class AgentPluginInstallService {
       if (entry === undefined) throw new Error(`No readable managed plugin named '${args.name}'.`);
       if (entry.lockedSha !== args.expectedLockedSha)
         throw new Error("Plugin changed since component review. Refresh the component inventory.");
-      const added = this.validateComponentImports(args, await this.readInstalledComponents(entry));
+      const inventory = await this.readInstalledComponents(entry);
+      if (inventory.contentHash !== args.expectedContentHash) {
+        throw new Error(
+          "Plugin files changed since component review. Refresh the component inventory."
+        );
+      }
+      const added = this.validateComponentImports(args, inventory);
       // Legacy installs already import everything; do not silently convert their update behavior.
       if (entry.importedComponents === undefined) return entry;
       const importedComponents = {

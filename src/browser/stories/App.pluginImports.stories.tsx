@@ -88,7 +88,11 @@ function setupPluginSettings(installed = false) {
   client.agentPlugins.getComponents = () =>
     Promise.resolve({
       success: true,
-      data: { ...preview, importedComponents: entry.importedComponents },
+      data: {
+        ...preview,
+        contentHash: "fixture-content-hash",
+        importedComponents: entry.importedComponents,
+      },
     });
   client.agentPlugins.install = (input) => {
     installed = true;

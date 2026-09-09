@@ -29,6 +29,8 @@ export const AgentPluginPreviewMcpServerSchema = z.object({
 /** Offline full inventory of the locked installed tree, separate from its saved imports. */
 export const AgentPluginComponentsSchema = z.object({
   lockedSha: z.string(),
+  /** Full installed-tree content receipt; lockedSha alone does not detect local edits. */
+  contentHash: z.string(),
   skills: z.array(AgentPluginPreviewSkillSchema),
   mcpServers: z.array(AgentPluginPreviewMcpServerSchema),
   importedComponents: AgentPluginImportedComponentsSchema.optional(),

@@ -212,6 +212,7 @@ const AddComponentsPanel: React.FC<{
       const result = await api.agentPlugins.addComponents({
         name,
         expectedLockedSha: inventory.lockedSha,
+        expectedContentHash: inventory.contentHash,
         ...selected,
       });
       if (!result.success) throw new Error(result.error);
@@ -226,11 +227,15 @@ const AddComponentsPanel: React.FC<{
       // against a different installed version without another explicit selection.
       try {
         const current = await api.agentPlugins.getComponents({ name });
-        if (current.success && current.data.lockedSha !== inventory.lockedSha) {
+        if (
+          current.success &&
+          (current.data.lockedSha !== inventory.lockedSha ||
+            current.data.contentHash !== inventory.contentHash)
+        ) {
           setInventory(current.data);
           setSelected({ skills: [], mcpServers: [] });
           setError(
-            "The installed version changed. Inventory refreshed; select components again before confirming."
+            "The installed plugin changed. Inventory refreshed; select components again before confirming."
           );
         }
       } catch {

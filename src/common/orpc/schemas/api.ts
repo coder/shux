@@ -1087,6 +1087,7 @@ export const agentPlugins = {
     input: AgentPluginImportedComponentsSchema.extend({
       name: z.string(),
       expectedLockedSha: z.string(),
+      expectedContentHash: z.string(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
   },

@@ -111,6 +111,7 @@ function unwrap<T>(result: Result<T, string>): T {
         await env.orpc.agentPlugins.addComponents({
           name,
           expectedLockedSha: "outdated",
+          expectedContentHash: inventory.contentHash,
           skills: ["selective-second"],
           mcpServers: ["selective-second"],
         })
@@ -127,6 +128,7 @@ function unwrap<T>(result: Result<T, string>): T {
       const addition = {
         name,
         expectedLockedSha: inventory.lockedSha,
+        expectedContentHash: inventory.contentHash,
         skills: ["selective-second", "selective-second"],
         mcpServers: ["selective-second"],
       };
@@ -171,6 +173,7 @@ function unwrap<T>(result: Result<T, string>): T {
         await env.orpc.agentPlugins.addComponents({
           name,
           expectedLockedSha: inventory.lockedSha,
+          expectedContentHash: inventory.contentHash,
           skills: ["selective-third"],
           mcpServers: [],
         })
@@ -180,6 +183,8 @@ function unwrap<T>(result: Result<T, string>): T {
       await env.orpc.agentPlugins.addComponents({
         name,
         expectedLockedSha: updated.lockedSha,
+        expectedContentHash: unwrap(await env.orpc.agentPlugins.getComponents({ name }))
+          .contentHash,
         skills: ["selective-third"],
         mcpServers: [],
       })
