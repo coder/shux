@@ -288,6 +288,8 @@ async function buildScanCandidates(
   containment: ProjectSkillContainment
 ): Promise<AgentSkillScanCandidate[]> {
   const globalRuntime = resolveGlobalRuntime(runtime, workspacePath);
+  // Both scans can encounter the configured home, e.g. a project rooted at the user's home.
+  const managedHome = roots.globalRoot ? path.dirname(roots.globalRoot) : undefined;
 
   // Plugin skills sit at the lowest precedence within each scope, after the
   // standard (and .claude compat) roots of that scope.
@@ -295,6 +297,7 @@ async function buildScanCandidates(
     containers: roots.projectPluginRoots ?? [],
     scope: "project",
     workspacePath,
+    managedHome,
     // Project plugin roots ALWAYS keep the repo-symlink posture: even callers
     // without project containment (UI list/get default discovery) must not
     // resolve a committed .xum/plugins/<name> symlink outside the checkout —
@@ -308,8 +311,7 @@ async function buildScanCandidates(
     containers: roots.globalPluginRoots ?? [],
     scope: "global",
     workspacePath,
-    // The global skills root identifies the configured Xum home; universal roots are unmanaged.
-    ...(roots.globalRoot ? { managedHome: path.dirname(roots.globalRoot) } : {}),
+    managedHome,
   });
 
   return [

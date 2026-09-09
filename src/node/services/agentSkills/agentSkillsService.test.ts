@@ -1376,6 +1376,66 @@ describe("agentSkillsService agent plugins", () => {
     return pluginDir;
   }
 
+  test.each([".xum", ".mux"])(
+    "project-only skill scans retain managed import policy for %s overlap",
+    async (metadataDir) => {
+      using home = new DisposableTempDir("plugin-skill-container-overlap");
+      const xumHome = path.join(home.path, metadataDir);
+      const container = path.join(xumHome, "plugins");
+      await writePlugin(container, "managed", [
+        { name: "allowed", description: "imported" },
+        { name: "blocked", description: "not imported" },
+      ]);
+      const unmanaged = path.join(home.path, ".agents", "plugins");
+      await writePlugin(unmanaged, "project-only", [
+        { name: "unmanaged", description: "unmanaged project" },
+      ]);
+      const registryPath = path.join(xumHome, "plugins.json");
+      await fs.writeFile(
+        registryPath,
+        JSON.stringify({
+          plugins: [
+            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+          ],
+        })
+      );
+      const runtime = new LocalRuntime(home.path);
+      // No global plugin scan exists here: this separately catches missing managedHome
+      // propagation to the project builder even if combined-container dedupe is fixed.
+      const roots = {
+        projectRoot: "",
+        globalRoot: path.join(xumHome, "skills"),
+        universalRoot: "",
+        projectPluginRoots: [container, unmanaged],
+        globalPluginRoots: [],
+      };
+      const options = { roots };
+      const skills = await discoverAgentSkills(runtime, home.path, options);
+      expect(skills.find((skill) => skill.name === "allowed")?.scope).toBe("project");
+      expect(skills.some((skill) => skill.name === "blocked")).toBe(false);
+      expect(skills.some((skill) => skill.name === "unmanaged")).toBe(true);
+      expect(
+        (await discoverAgentSkillsDiagnostics(runtime, home.path, options)).skills.some(
+          (skill) => skill.name === "blocked"
+        )
+      ).toBe(false);
+      await expect(
+        readAgentSkill(runtime, home.path, SkillNameSchema.parse("blocked"), options)
+      ).rejects.toThrow("not found");
+      expect(
+        (await readAgentSkill(runtime, home.path, SkillNameSchema.parse("allowed"), options))
+          .package.scope
+      ).toBe("project");
+      await fs.writeFile(registryPath, "{");
+      const corrupted = await discoverAgentSkills(runtime, home.path, options);
+      expect(corrupted.some((skill) => ["allowed", "blocked"].includes(skill.name))).toBe(false);
+      expect(corrupted.some((skill) => skill.name === "unmanaged")).toBe(true);
+      await expect(
+        readAgentSkill(runtime, home.path, SkillNameSchema.parse("allowed"), options)
+      ).rejects.toThrow("not found");
+    }
+  );
+
   test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {
     using tmp = new DisposableTempDir("plugin-selected-skills");
     const container = path.join(tmp.path, "plugins");
@@ -1467,6 +1527,10 @@ describe("agentSkillsService agent plugins", () => {
     using tmp = new DisposableTempDir("plugin-corrupt-imports");
     const container = path.join(tmp.path, "plugins");
     await writePlugin(container, "managed", [{ name: "guarded", description: "valid skill" }]);
+    const projectContainer = path.join(tmp.path, ".agents", "plugins");
+    await writePlugin(projectContainer, "project-only", [
+      { name: "guarded", description: "unmanaged project skill" },
+    ]);
     const registryFile = path.join(tmp.path, "plugins.json");
     const runtime = new LocalRuntime(tmp.path);
     const roots = {
@@ -1483,7 +1547,11 @@ describe("agentSkillsService agent plugins", () => {
       await expect(
         readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("guarded"), { roots })
       ).rejects.toThrow("not found");
-      const projectRoots = { ...roots, globalPluginRoots: [], projectPluginRoots: [container] };
+      const projectRoots = {
+        ...roots,
+        globalPluginRoots: [],
+        projectPluginRoots: [projectContainer],
+      };
       expect(
         (await discoverAgentSkills(runtime, tmp.path, { roots: projectRoots })).some(
           (s) => s.name === "guarded"

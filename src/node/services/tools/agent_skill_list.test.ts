@@ -473,6 +473,63 @@ describe("agent_skill_list", () => {
     });
   });
 
+  it.each([".xum", ".mux"])(
+    "combined tool-list containers retain managed imports when the project overlaps %s",
+    async (metadataDir) => {
+      using home = new TestTempDir("plugin-tool-list-overlap");
+      const xumHome = path.join(home.path, metadataDir);
+      await withHomeDir(home.path, async () => {
+        await withMuxRoot(xumHome, async () => {
+          await writePlugin(path.join(xumHome, "plugins"), "managed", [
+            { name: "allowed", description: "imported" },
+            { name: "blocked", description: "not imported" },
+          ]);
+          await writePlugin(path.join(home.path, ".agents", "plugins"), "project-only", [
+            { name: "unmanaged", description: "unmanaged project" },
+          ]);
+          const registryPath = path.join(xumHome, "plugins.json");
+          await fs.writeFile(
+            registryPath,
+            JSON.stringify({
+              plugins: [
+                createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+              ],
+            })
+          );
+          const tool = createAgentSkillListTool({
+            ...createTestToolConfig(home.path, {
+              xumScope: {
+                type: "project",
+                xumHome,
+                projectRoot: home.path,
+                projectStorageAuthority: "host-local",
+              },
+            }),
+            experiments: { agentPlugins: true },
+          });
+          const list = async () => {
+            const result = (await tool.execute!(
+              {},
+              mockToolCallOptions
+            )) as AgentSkillListToolResult;
+            if (!result.success) throw new Error(result.error);
+            return result.skills;
+          };
+          const initial = await list();
+          expect(getSkill(initial, "allowed").scope).toBe("project");
+          expect(initial.some((skill) => skill.name === "blocked")).toBe(false);
+          expect(initial.some((skill) => skill.name === "unmanaged")).toBe(true);
+          await fs.writeFile(registryPath, "{");
+          const corrupted = await list();
+          expect(corrupted.some((skill) => ["allowed", "blocked"].includes(skill.name))).toBe(
+            false
+          );
+          expect(corrupted.some((skill) => skill.name === "unmanaged")).toBe(true);
+        });
+      });
+    }
+  );
+
   it("lists checkout-level plugin skills when the workspace executes in a subproject", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-plugins-subproject-home");
     using checkout = new TestTempDir("test-agent-skill-list-plugins-subproject-checkout");

@@ -7,6 +7,10 @@ import { describe, expect, spyOn, test } from "bun:test";
 import type { MCPStdioServerInfo } from "@/common/types/mcp";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { Config } from "@/node/config";
+import { MCPConfigService } from "@/node/services/mcpConfigService";
+import { MCPServerManager } from "@/node/services/mcpServerManager";
+import { createTestPluginInstallEntry } from "./testFixtures";
 import type { AgentPluginInfo } from "./discovery";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import {
@@ -647,6 +651,67 @@ async function writeDiscoverablePlugin(
 }
 
 describe("createAgentPluginsMcpProvider", () => {
+  test.each([".xum", ".mux"])(
+    "overlapping %s project containers cannot bypass managed MCP imports via overrides",
+    async (metadataDir) => {
+      using home = new DisposableTempDir("plugin-mcp-container-overlap");
+      await withHomeDir(home.path, async () => {
+        const xumHome = path.join(home.path, metadataDir);
+        await writeDiscoverablePlugin(
+          path.join(xumHome, "plugins"),
+          "managed",
+          mcpDoc({
+            allowed: STDIO_ENTRY,
+            blocked: STDIO_ENTRY,
+          })
+        );
+        await writeDiscoverablePlugin(
+          path.join(home.path, ".agents", "plugins"),
+          "project-only",
+          mcpDoc({ unmanaged: STDIO_ENTRY })
+        );
+        const provider = createAgentPluginsMcpProvider({ xumHome, isEnabled: () => true });
+        const context = { projectRoot: home.path, projectKey: home.path };
+        const unfiltered = await provider({ ...context, trusted: true });
+        const keyFor = (name: string) => {
+          const key = Object.entries(unfiltered).find(
+            ([, info]) => info.plugin?.serverName === name
+          )?.[0];
+          if (key === undefined) throw new Error(`Fixture server ${name} missing`);
+          return key;
+        };
+        const overrides = { enabledServers: Object.keys(unfiltered) };
+        const registryPath = path.join(xumHome, "plugins.json");
+        await fs.writeFile(
+          registryPath,
+          JSON.stringify({
+            plugins: [
+              createTestPluginInstallEntry("managed", { skills: [], mcpServers: ["allowed"] }),
+            ],
+          })
+        );
+        const manager = new MCPServerManager(
+          new MCPConfigService(new Config(xumHome), { agentPluginsMcpProvider: provider })
+        );
+        try {
+          const servers = await manager.listServers(home.path, overrides, true, context);
+          expect(Object.keys(servers).sort()).toEqual(
+            [keyFor("allowed"), keyFor("unmanaged")].sort()
+          );
+          const loaded = await provider({ ...context, trusted: true });
+          expect(loaded[keyFor("allowed")]?.plugin?.sourceScope).toBe("project");
+          expect(loaded[keyFor("blocked")]).toBeUndefined();
+          await fs.writeFile(registryPath, "{");
+          expect(
+            Object.keys(await manager.listServers(home.path, overrides, true, context))
+          ).toEqual([keyFor("unmanaged")]);
+        } finally {
+          manager.dispose();
+        }
+      });
+    }
+  );
+
   test("returns no servers when the experiment is disabled", async () => {
     using home = new DisposableTempDir("plugin-provider-home");
     using xumHome = new DisposableTempDir("plugin-provider-mux");

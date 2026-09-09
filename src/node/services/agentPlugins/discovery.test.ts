@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
@@ -89,6 +89,35 @@ describe("discoverAgentPlugins", () => {
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, "mcp.json"));
     expect(result.diagnostics).toEqual([]);
   });
+
+  test.each([".xum", ".mux"])(
+    "overlapping %s containers keep the first scope but read the later registry association once",
+    async (metadataDir) => {
+      using home = new DisposableTempDir("plugin-discovery-overlap");
+      const xumHome = path.join(home.path, metadataDir);
+      const managed = path.join(xumHome, "plugins");
+      const registryPath = path.join(xumHome, "plugins.json");
+      await writePlugin(managed, "managed");
+      const selection = { skills: ["allowed"], mcpServers: [] };
+      await fs.writeFile(
+        registryPath,
+        JSON.stringify({ plugins: [createTestPluginInstallEntry("managed", selection)] })
+      );
+      const reads = spyOn(fs, "readFile");
+      try {
+        const { plugins } = await discoverAgentPlugins(
+          computeAgentPluginContainers({ xumHome, projectRoot: home.path, projectTrusted: true })
+        );
+        const matches = plugins.filter((plugin) => plugin.containerPath === managed);
+        expect(matches).toHaveLength(1);
+        expect(matches[0].scope).toBe("project");
+        expect(matches[0].importedComponents).toEqual(selection);
+        expect(reads.mock.calls.filter(([file]) => file === registryPath)).toHaveLength(1);
+      } finally {
+        reads.mockRestore();
+      }
+    }
+  );
 
   test("unidentified registry rows isolate unknown directories without suppressing healthy imports", async () => {
     using tmp = new DisposableTempDir("agent-plugins-row-recovery");

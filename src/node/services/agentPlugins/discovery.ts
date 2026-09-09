@@ -606,6 +606,13 @@ export async function discoverAgentPlugins(
   let plugins: AgentPluginInfo[] = [];
   let diagnostics: AgentPluginDiagnostic[] = [];
 
+  // Registry ownership belongs to the path, even when an earlier project
+  // occurrence wins scope/precedence over the marked global occurrence.
+  const registryPaths = new Map<string, string>();
+  for (const container of containers) {
+    if (container.registryPath !== undefined)
+      registryPaths.set(container.path, container.registryPath);
+  }
   const canonicalProjectPluginNames = new Set<string>();
   const seenContainers = new Set<string>();
   for (const container of containers) {
@@ -627,10 +634,9 @@ export async function discoverAgentPlugins(
       continue;
     }
 
+    const registryPath = registryPaths.get(container.path);
     const imports =
-      container.registryPath !== undefined
-        ? await readPluginComponentImports(container.registryPath)
-        : undefined;
+      registryPath !== undefined ? await readPluginComponentImports(registryPath) : undefined;
     const projectMetadataIndex =
       container.scope === "project"
         ? PROJECT_METADATA_DIR_NAMES.findIndex(

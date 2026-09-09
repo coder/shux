@@ -110,6 +110,66 @@ describe("agent_skill_read_file", () => {
     });
   });
 
+  it.each([".xum", ".mux"])(
+    "overlapping %s project roots enforce managed sibling-file read imports",
+    async (metadataDir) => {
+      using home = new TestTempDir("plugin-read-file-overlap");
+      const xumHome = path.join(home.path, metadataDir);
+      const pluginRoot = path.join(xumHome, "plugins", "managed");
+      await fs.mkdir(pluginRoot, { recursive: true });
+      await fs.writeFile(
+        path.join(pluginRoot, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: "managed",
+        })
+      );
+      for (const name of ["allowed", "blocked"]) {
+        const skillDir = path.join(pluginRoot, "skills", name);
+        await fs.mkdir(skillDir, { recursive: true });
+        await fs.writeFile(
+          path.join(skillDir, "SKILL.md"),
+          `---\nname: ${name}\ndescription: fixture\n---\nBody\n`
+        );
+        await fs.writeFile(path.join(skillDir, "data.txt"), name);
+      }
+      const registryPath = path.join(xumHome, "plugins.json");
+      await fs.writeFile(
+        registryPath,
+        JSON.stringify({
+          plugins: [
+            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+          ],
+        })
+      );
+      const tool = createAgentSkillReadFileTool({
+        ...createTestToolConfig(home.path, {
+          xumScope: {
+            type: "project",
+            xumHome,
+            projectRoot: home.path,
+            projectStorageAuthority: "host-local",
+          },
+        }),
+        experiments: { agentPlugins: true },
+      });
+      expect(await executeReadFile(tool, { name: "blocked", filePath: "data.txt" })).toMatchObject({
+        success: false,
+      });
+      expect(
+        await executeReadFile(tool, { name: "allowed", filePath: "../blocked/data.txt" })
+      ).toMatchObject({ success: false });
+      expect(await executeReadFile(tool, { name: "allowed", filePath: "data.txt" })).toMatchObject({
+        success: true,
+        content: "1\tallowed",
+      });
+      await fs.writeFile(registryPath, "{");
+      expect(await executeReadFile(tool, { name: "allowed", filePath: "data.txt" })).toMatchObject({
+        success: false,
+      });
+    }
+  );
+
   it("allows reading built-in skill files", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-file-global-scope");
     const baseConfig = createTestToolConfig(tempDir.path, {
