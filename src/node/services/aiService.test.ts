@@ -2285,21 +2285,30 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     await fs.mkdir(directory, { recursive: true });
     await fs.writeFile(path.join(directory, "context-notes.md"), "resume here");
     await fs.writeFile(path.join(directory, "private.md"), "secret detail");
-    // Ranking is not under test: stub the hot set so a private memory is definitely selected.
-    spyOn(memoryService, "listHotMemories").mockResolvedValue([
-      {
-        path: "/memories/workspace/private.md",
-        pinned: true,
-        truncated: false,
-        content: "secret detail",
-      },
-      {
-        path: "/memories/workspace/context-notes.md",
-        pinned: false,
-        truncated: false,
-        content: "resume here",
-      },
-    ]);
+    // Ranking is not under test: stub the hot set so a private memory is definitely selected
+    // unless the flush-only selection is requested (that selection is tested in memoryHotSet).
+    const notesItem = {
+      path: "/memories/workspace/context-notes.md",
+      pinned: false,
+      truncated: false,
+      content: "resume here",
+    };
+    const listHotMemories = spyOn(memoryService, "listHotMemories").mockImplementation(
+      (_ctx, options) =>
+        Promise.resolve(
+          options.onlyContextNotes
+            ? [notesItem]
+            : [
+                {
+                  path: "/memories/workspace/private.md",
+                  pinned: true,
+                  truncated: false,
+                  content: "secret detail",
+                },
+                notesItem,
+              ]
+        )
+    );
     const build = (options?: Parameters<AIService["buildMemorySessionContext"]>[2]) =>
       service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2", options);
     const full = await build({ tokenBudgetActive: true });
@@ -2314,6 +2323,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     ]);
     expect(narrowed?.hotMemoriesBlock).toContain("resume here");
     expect(narrowed?.hotMemoriesBlock).not.toContain("secret detail");
+    expect(listHotMemories.mock.calls.at(-1)?.[1]).toMatchObject({ onlyContextNotes: true });
   });
 
   it("preserves the memory index when hot-memory selection fails", async () => {
