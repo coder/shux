@@ -32,7 +32,6 @@ import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
-import { WORKSPACE_MEMORY_POLICY_EPOCHS_RETAINED } from "@/node/services/workspaceMemoryPolicyEpochs";
 
 export const WORKSPACE_MEMORY_DENY_MARKER_FILE_NAME = "memory-policy-deny.json";
 
@@ -50,6 +49,9 @@ export async function writeWorkspaceMemoryDenyMarker(
   const markerPath = workspaceMemoryDenyMarkerPath(sessionDir);
   await fsPromises.mkdir(sessionDir, { recursive: true });
   const record = await readMarkerRecord(markerPath);
+  if (record === "unreadable") {
+    throw new Error(`Workspace memory deny marker is unreadable at ${markerPath}`);
+  }
   // A malformed marker was a deny for EVERY epoch's reader while it existed,
   // possibly the only evidence of some other backend's read-only turn in
   // the closing epoch. This writer, recording a deny for its own epoch,
@@ -70,9 +72,9 @@ async function writeMarkerRecord(
   epochs: readonly number[],
   wildcard: boolean
 ): Promise<void> {
-  const retained = [...epochs]
-    .sort((a, b) => b - a)
-    .slice(0, WORKSPACE_MEMORY_POLICY_EPOCHS_RETAINED);
+  // Entries are removed only by the boundary observation that consumes them
+  // (clear/carry), never by count — see workspaceMemoryPolicyEpochs.ts.
+  const retained = [...new Set(epochs)].sort((a, b) => b - a);
   await writeFileAtomic(
     markerPath,
     JSON.stringify({ deniedAt: Date.now(), epochs: retained, wildcard }),
@@ -80,12 +82,23 @@ async function writeMarkerRecord(
   );
 }
 
-/** Parsed marker, or null when it is unreadable/malformed (which readers treat as a deny). */
+/**
+ * Parsed marker; "absent" on a proven ENOENT; null when the content is
+ * malformed (readers deny; a boundary clear heals it); "unreadable" when the
+ * file could not be read at all (EACCES, I/O) — readers deny, and mutators
+ * throw rather than replace or delete epoch state they could not see.
+ */
 async function readMarkerRecord(
   markerPath: string
-): Promise<{ epochs: number[]; wildcard: boolean } | "absent" | null> {
+): Promise<{ epochs: number[]; wildcard: boolean } | "absent" | "unreadable" | null> {
+  let raw: string;
   try {
-    const parsed: unknown = JSON.parse(await fsPromises.readFile(markerPath, "utf-8"));
+    raw = await fsPromises.readFile(markerPath, "utf-8");
+  } catch (error) {
+    return hasErrorCode(error, "ENOENT") ? "absent" : "unreadable";
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null) return null;
     const { epochs, wildcard } = parsed as { epochs?: unknown; wildcard?: unknown };
     if (
@@ -97,8 +110,8 @@ async function readMarkerRecord(
       return null;
     }
     return { epochs, wildcard: wildcard === true };
-  } catch (error) {
-    return hasErrorCode(error, "ENOENT") ? "absent" : null;
+  } catch {
+    return null;
   }
 }
 
@@ -114,7 +127,7 @@ export async function readWorkspaceMemoryDenyMarker(
 ): Promise<boolean> {
   const record = await readMarkerRecord(workspaceMemoryDenyMarkerPath(sessionDir));
   if (record === "absent") return false;
-  if (record === null || epoch === undefined) return true;
+  if (record === null || record === "unreadable" || epoch === undefined) return true;
   return record.wildcard || record.epochs.includes(epoch);
 }
 
@@ -145,6 +158,12 @@ export async function clearWorkspaceMemoryDenyMarker(
     if (options !== undefined) {
       const record = await readMarkerRecord(markerPath);
       if (record === "absent") return;
+      // Unreadable is not malformed: the file may hold a newer epoch's deny
+      // (possibly the only durable record of a read-only turn). Refuse; the
+      // caller's reset fails and is retried rather than deleting unknown state.
+      if (record === "unreadable") {
+        throw new Error(`Workspace memory deny marker is unreadable at ${markerPath}`);
+      }
       if (record !== null) {
         // This boundary observed the closing epoch (deny included): the
         // epoch-less wildcard, if any, is consumed with it.
@@ -183,6 +202,11 @@ export async function carryWorkspaceMemoryDenyMarker(
   await withTargetMutationLock(rootDir, sessionDir, async () => {
     const markerPath = workspaceMemoryDenyMarkerPath(sessionDir);
     const record = await readMarkerRecord(markerPath);
+    if (record === "unreadable") {
+      throw new Error(
+        `Workspace memory deny marker is unreadable at ${workspaceMemoryDenyMarkerPath(sessionDir)}`
+      );
+    }
     if (record === "absent" || record === null) return;
     if (!record.wildcard && !record.epochs.includes(closingEpoch)) return;
     // The wildcard denied the closing epoch; carried as the new epoch's deny.

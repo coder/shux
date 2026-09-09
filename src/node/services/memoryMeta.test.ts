@@ -92,6 +92,35 @@ describe("MemoryMetaService", () => {
     );
   });
 
+  it("does not serve a cached first-run view when the sidecar stat itself fails", async () => {
+    using tempDir = new TestTempDir("test-memory-meta");
+    const service = new MemoryMetaService(tempDir.path);
+    // Cached "missing" (normal first run in this process)...
+    expect(await service.getPinnedKeys()).toEqual(new Set());
+    // ...then another backend creates the sidecar.
+    await new MemoryMetaService(tempDir.path).setPinned("global:prefs.md", true);
+    // A transient stat failure must not read as "still missing": the stale
+    // empty cache would otherwise be written over the foreign pins.
+    const stat = spyOn(fsPromises, "stat").mockImplementationOnce((() =>
+      Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))) as never);
+    try {
+      const failure = await service.setPinned("workspace:ws-1:scratch.md", true).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(failure).toBeInstanceOf(MemoryMetaWriteError);
+    } finally {
+      stat.mockRestore();
+    }
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md"])
+    );
+    await service.setPinned("workspace:ws-1:scratch.md", true);
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md", "workspace:ws-1:scratch.md"])
+    );
+  });
+
   it("persists pins across instances via the sidecar file", async () => {
     using tempDir = new TestTempDir("test-memory-meta");
     const service = new MemoryMetaService(tempDir.path);

@@ -314,7 +314,9 @@ export class MemoryMetaService {
     const self = this;
     return Effect.gen(function* () {
       const stamp = yield* Effect.promise(() => self.fileStamp());
-      if (self.cache !== null && stamp === self.cacheStamp) {
+      // A failed stat (null) never matches: another backend may have written
+      // the file since the cached "missing" was taken.
+      if (stamp !== null && self.cache !== null && stamp === self.cacheStamp) {
         return { meta: self.cache, readFailed: false };
       }
       let readFailed = false;
@@ -348,17 +350,21 @@ export class MemoryMetaService {
       // under the file's unchanged stamp would keep serving it once readable
       // again — and the next mutation would write the pins and stats away.
       self.cacheStamp = readFailed ? null : stamp;
-      return { meta: self.cache, readFailed };
+      return { meta: self.cache, readFailed: readFailed || stamp === null };
     });
   }
 
-  /** Cheap change signal for the sidecar (same scheme as Config.configFileStamp). */
-  private async fileStamp(): Promise<string> {
+  /**
+   * Cheap change signal for the sidecar (same scheme as Config.configFileStamp).
+   * "missing" only on a proven ENOENT (the normal first run); null when the
+   * stat itself failed — not cacheable, and a mutation must not proceed on it.
+   */
+  private async fileStamp(): Promise<string | null> {
     try {
       const st = await fsPromises.stat(this.metaPath, { bigint: true });
       return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
-    } catch {
-      return "missing";
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : null;
     }
   }
 

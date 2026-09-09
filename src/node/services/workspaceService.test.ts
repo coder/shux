@@ -9,6 +9,7 @@ import {
   workspaceRemovalTombstonePath,
   isWorkspaceRemovalTombstoned,
 } from "@/node/services/workspaceRemoval";
+import { workspaceMemoryWritableForEpoch } from "@/node/services/workspaceMemoryPolicyEpochs";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
@@ -9424,6 +9425,22 @@ describe("WorkspaceService initialize", () => {
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
       await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: -1 });
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+      // Unreadable is not malformed: a marker that cannot be read may hold a
+      // newer epoch's deny, so the fenced clear refuses instead of deleting it.
+      await writeWorkspaceMemoryDenyMarker(sessionDir, 9);
+      const unreadableMarker = spyOn(fsPromises, "readFile").mockImplementationOnce((() =>
+        Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))) as never);
+      const refusedClear = await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, {
+        closingEpoch: -1,
+      }).then(
+        () => null,
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+      expect(refusedClear).toContain("unreadable");
+      unreadableMarker.mockRestore();
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 9)).toBe(true);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: 9 });
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "{}");
       await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
       await realConfig.editConfig((cfg) => {
@@ -9475,7 +9492,9 @@ describe("WorkspaceService initialize", () => {
       );
       expect(persisted()).toBe(false);
       expect(persistedFor(12)).toBe(true);
-      // Only the newest few epochs are retained.
+      // Records are never pruned by count: a suspended compacting backend
+      // must still find its closing epoch's record however many epochs
+      // others opened meanwhile.
       for (const policyEpoch of [20, 30, 40]) {
         expect(
           await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
@@ -9489,7 +9508,32 @@ describe("WorkspaceService initialize", () => {
           findWorkspaceEntry(realConfig.loadConfigOrDefault(), "policy-scratch")!.workspace
             .workspaceMemoryWritableByEpoch!
         ).sort()
-      ).toEqual(["20", "30", "40"]);
+      ).toEqual(["-1", "12", "20", "30", "40"]);
+      // Raw config is not schema-validated: a corrupted non-boolean record
+      // reads as a deny, never as a grant.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        (entry.workspaceMemoryWritableByEpoch as Record<string, unknown>)["50"] = "false";
+        (entry.workspaceMemoryWritableByEpoch as Record<string, unknown>)["51"] = null;
+        return cfg;
+      });
+      for (const policyEpoch of [50, 51]) {
+        expect(
+          await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+            epochHasPriorTurns: false,
+            policyEpoch,
+          })
+        ).toBe(true);
+        // The deny stands (no grant written over the corrupted value)...
+        expect(persistedFor(policyEpoch)).not.toBe(true);
+        // ...and every reader sees it as false.
+        expect(
+          workspaceMemoryWritableForEpoch(
+            findWorkspaceEntry(realConfig.loadConfigOrDefault(), "policy-scratch")!.workspace,
+            policyEpoch
+          )
+        ).toBe(false);
+      }
 
       // Unknown history fails closed: no accumulator, no marker, no mirror
       // (this service never recorded this epoch), yet the epoch already holds

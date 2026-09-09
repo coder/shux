@@ -196,6 +196,18 @@ export async function removeSessionDirUnderMemoryLocks(args: {
   );
   assert(args.attemptId.length > 0, "removeSessionDirUnderMemoryLocks requires an attemptId");
   let tombstonePublishedUnderLocks = args.tombstoneSealed === true;
+  // A sealed tombstone is not rewritten: the redundant write could fail
+  // (storage read-only/full after the checkout deletion) and would then abort
+  // a removal whose durable marker is already in place.
+  const publish = async (): Promise<void> => {
+    if (
+      args.tombstoneSealed === true &&
+      (await isWorkspaceRemovalTombstoned(args.rootDir, args.workspaceId))
+    ) {
+      return;
+    }
+    await publishRemovalTombstone(args);
+  };
   try {
     await withRemovalLocks(args, async () => {
       await args.beforeTombstone?.();
@@ -203,7 +215,7 @@ export async function removeSessionDirUnderMemoryLocks(args: {
       // re-checks it pre-commit (inside its own lock) and refuses, so the
       // deleted directory cannot be recreated by a late mutation or
       // journal append.
-      await publishRemovalTombstone(args);
+      await publish();
       tombstonePublishedUnderLocks = true;
       await fsPromises.rm(args.sessionDir, { recursive: true, force: true });
     });
@@ -226,7 +238,7 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     // because the directory is not deleted: a writer mid-commit lands in
     // the orphan, and every later mutation observes the tombstone.
     try {
-      await publishRemovalTombstone(args);
+      await publish();
     } catch (publishError) {
       // No durable marker could be written at all (r63, e.g. ENOSPC):
       // deregistering now would leave the orphan writable again the moment

@@ -24,6 +24,7 @@ import writeFileAtomic from "write-file-atomic";
 import YAML from "yaml";
 import assert from "@/common/utils/assert";
 import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import {
   MEMORY_HOT_SET_MAX_ITEM_BYTES,
   MEMORY_INDEX_DESCRIPTION_MAX_CHARS,
@@ -1443,6 +1444,15 @@ export class MemoryService extends EventEmitter {
       const listed = new Set(files);
       for (const [relPath, previous] of adopted) {
         if (listed.has(relPath)) continue;
+        // Absence from the listing is not proof: LocalMemoryStore.listFiles
+        // tolerates readdir failures (a partial list). Only a provable ENOENT
+        // on the source itself counts; any other outcome keeps the entry
+        // (and the copy) for a later pass.
+        const sourceGone = await fsPromises.lstat(path.join(legacyRoot, relPath)).then(
+          () => false,
+          (error: unknown) => hasErrorCode(error, "ENOENT")
+        );
+        if (!sourceGone) continue;
         if (previous.created === true) {
           const current =
             (await store.assertContained(previous.target).then(
@@ -1455,13 +1465,17 @@ export class MemoryService extends EventEmitter {
               : null;
           const unchanged = current !== null && sha256Hex(current) === previous.content;
           if (unchanged) {
-            await store.remove(previous.target);
+            // Metadata first: a sidecar failure then aborts the pass with the
+            // file and manifest entry intact, so the retry repeats both;
+            // the reverse order would strand the owner-key pin/usage once
+            // the file was gone and the entry dropped.
             await this.metaService.removeKeys(
               memoryLogicalKey("workspace", previous.target, {
                 projectPath: ctx.projectPath,
                 workspaceId: owner,
               })
             );
+            await store.remove(previous.target);
             adoptedCount++;
             log.info("[MemoryService] removed an adopted legacy note deleted on the old build", {
               childId,

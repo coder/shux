@@ -1786,6 +1786,22 @@ describe("MemoryService", () => {
         .map((entry) => entry.relPath)
         .sort();
       expect(again).toEqual(relisted);
+      // A lossy legacy listing (readdir failure tolerated by listFiles) is not
+      // proof of deletion: the copies stay while the sources provably exist.
+      await fsPromises.writeFile(path.join(legacyRoot, "renamed.md"), "to be renamed (v2)");
+      const lossy = spyOn(fsPromises, "readdir").mockImplementationOnce((() =>
+        Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))) as never);
+      try {
+        await fixture.service.listIndexEntries({ ...fixture.ctx });
+      } finally {
+        lossy.mockRestore();
+      }
+      expect(
+        (await fixture.service.listIndexEntries({ ...fixture.ctx }))
+          .filter((entry) => entry.scope === "workspace")
+          .map((entry) => entry.relPath)
+          .sort()
+      ).toEqual(["edited.md", "imported/ws-child/renamed.md", "renamed.md", "same.md"]);
     });
 
     it("keeps the owner's pin when a downgraded build only viewed the adopted note", async () => {

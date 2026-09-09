@@ -9,42 +9,51 @@
  * boundary and that backend's completion-side read of the CLOSING epoch's
  * value. A single slot would be overwritten by the new epoch's grant, dropping
  * a deny recorded for the closing epoch — and the compacting backend's own
- * mirror (writable) would then grant the harvest of a read-only turn. Epochs
- * are history sequences (-1 before any boundary), so the newest few are kept
- * and older ones garbage-collected: a closing epoch is observed at its
- * boundary, before more than a couple of further boundaries can exist.
+ * mirror (writable) would then grant the harvest of a read-only turn. A
+ * record is removed only by the observation that consumes it — the
+ * compacting session's boundary reset/carry (AgentSession) or a destructive
+ * boundary — never by count: a backend suspended between persisting its
+ * boundary and observing the closing policy must still find the record
+ * however many epochs other backends opened meanwhile. Records of a boundary
+ * whose observer never ran (crash in between) linger until the next
+ * destructive boundary; that residue is bounded by such crashes.
  */
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import assert from "@/common/utils/assert";
-
-/** The closing epoch plus the next ones that can be opened before it is observed. */
-export const WORKSPACE_MEMORY_POLICY_EPOCHS_RETAINED = 3;
 
 function epochKey(epoch: number): string {
   assert(Number.isInteger(epoch), "workspace memory policy epoch must be an integer");
   return String(epoch);
 }
 
+/**
+ * The recorded policy for `epoch`: `undefined` when none was recorded. Config
+ * entries are loaded from raw JSON without schema validation, so anything
+ * present that is not an actual boolean (a corrupted `"false"` or `null`)
+ * reads as a DENY — a truthy string or a null-coalesced default would
+ * otherwise turn corrupted deny state into a grant.
+ */
 export function workspaceMemoryWritableForEpoch(
   entry: WorkspaceConfigEntry,
   epoch: number
 ): boolean | undefined {
-  return entry.workspaceMemoryWritableByEpoch?.[epochKey(epoch)];
+  const records: Record<string, unknown> | undefined = entry.workspaceMemoryWritableByEpoch;
+  const key = epochKey(epoch);
+  if (records === undefined || !Object.hasOwn(records, key)) return undefined;
+  const value = records[key];
+  return typeof value === "boolean" ? value : false;
 }
 
-/** Record `writable` for `epoch`; drops the oldest records beyond the retained window. */
+/** Record `writable` for `epoch`. */
 export function setWorkspaceMemoryWritableForEpoch(
   entry: WorkspaceConfigEntry,
   epoch: number,
   writable: boolean
 ): void {
-  const next: Record<string, boolean> = {
+  entry.workspaceMemoryWritableByEpoch = {
     ...entry.workspaceMemoryWritableByEpoch,
     [epochKey(epoch)]: writable,
   };
-  const keys = Object.keys(next).sort((a, b) => Number(b) - Number(a));
-  for (const key of keys.slice(WORKSPACE_MEMORY_POLICY_EPOCHS_RETAINED)) delete next[key];
-  entry.workspaceMemoryWritableByEpoch = next;
 }
 
 /** Forget `epoch`'s record; removes the field once no record is left. */
