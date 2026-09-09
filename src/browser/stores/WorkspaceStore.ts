@@ -373,6 +373,8 @@ interface PendingSendState {
   knownUserEchoIds: Set<string> | null;
   /** The send request succeeded, so any later replay is guaranteed to contain its echo. */
   accepted: boolean;
+  /** Visible queue payload size when the send began; growth by acceptance means it was queued. */
+  queueSizeAtBegin: number;
   /** A synthetic user row (pre-send compaction) took the turn; the echo follows that turn. */
   deferredBehindSyntheticTurn: boolean;
 }
@@ -2703,6 +2705,15 @@ export class WorkspaceStore {
           mode: "append",
           skipDerivedState: true,
         });
+        // Older rows predate any pending send; never let a later replay mistake them for its echo.
+        const known = this.chatTransientState.get(workspaceId)?.pendingSend?.knownUserEchoIds;
+        if (known) {
+          for (const message of historicalMessages) {
+            if (isUserEcho(message)) {
+              known.add(message.id);
+            }
+          }
+        }
         this.consumerManager.scheduleCalculation(workspaceId, aggregator);
       }
 
@@ -4122,6 +4133,7 @@ export class WorkspaceStore {
           )
         : null,
       accepted: false,
+      queueSizeAtBegin: transient.queuedMessageCount,
       deferredBehindSyntheticTurn: false,
     };
     this.states.bump(workspaceId);
@@ -4153,9 +4165,14 @@ export class WorkspaceStore {
     }
 
     pending.accepted = true;
+    // A queue that grew since the send began (for example through a replayed snapshot) holds it.
+    const queuedSinceBegin =
+      transient.queuedMessage !== null && transient.queuedMessageCount > pending.queueSizeAtBegin;
     if (
       transient.caughtUp &&
-      (pending.knownUserEchoIds === null || this.settleUnseenUserEchoes(transient, aggregator))
+      (pending.knownUserEchoIds === null ||
+        queuedSinceBegin ||
+        this.settleUnseenUserEchoes(transient, aggregator))
     ) {
       transient.pendingSend = null;
       this.states.bump(workspaceId);

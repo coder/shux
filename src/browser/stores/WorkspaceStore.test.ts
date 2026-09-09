@@ -5386,6 +5386,71 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
     });
 
+    it("retires an accepted send that a replayed queue snapshot already holds", async () => {
+      const workspaceId = "pending-send-replay-queued-snapshot";
+      let attempt = 0;
+      mockChatStreamFor(workspaceId, async function* (signal) {
+        attempt += 1;
+        yield createUserMessageEvent("user-1", "earlier", 1, 1);
+        if (attempt === 2) {
+          // The reconnect replay already shows the in-flight send sitting in the queue.
+          yield {
+            type: "queued-message-changed",
+            workspaceId,
+            hasQueuedMessages: true,
+            queuedMessages: ["hello"],
+            displayText: "hello",
+          };
+        }
+        yield fullCaughtUpEvent(1, "user-1");
+        await waitForAbortSignal(signal);
+      });
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      await resubscribe(workspaceId, `${workspaceId}-other`);
+      expect(store.getWorkspaceState(workspaceId).queuedMessage?.content).toBe("hello");
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+
+      store.markPendingSendAccepted(workspaceId, pendingSend.id);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
+    });
+
+    it("does not treat paginated older rows as the pending send's echo", async () => {
+      const workspaceId = "pending-send-paginated-rows";
+      let attempt = 0;
+      mockChatStreamFor(workspaceId, async function* (signal) {
+        attempt += 1;
+        yield createHistoryMessageEvent("msg-newer", 5);
+        if (attempt === 2) {
+          yield createHistoryMessageEvent("msg-older", 3);
+        }
+        yield { type: "caught-up", hasOlderHistory: attempt === 1, replay: "full" };
+        await waitForAbortSignal(signal);
+      });
+      mockHistoryLoadMore.mockResolvedValueOnce({
+        messages: [createHistoryMessageEvent("msg-older", 3)],
+        nextCursor: null,
+        hasOlder: false,
+      });
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      await store.loadOlderHistory(workspaceId);
+      expect(
+        store.getWorkspaceState(workspaceId).muxMessages.some((m) => m.id === "msg-older")
+      ).toBe(true);
+      await resubscribe(workspaceId, `${workspaceId}-other`);
+
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+    });
+
     it("keeps a pending row begun before the first replay of an empty new workspace", async () => {
       const workspaceId = "pending-send-new-workspace";
       const replay = gate();
