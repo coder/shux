@@ -1,6 +1,6 @@
 {
   "name": "@coder/xum",
-  "version": "0.28.4",
+  "version": "0.28.5",
   "desktopName": "xum.desktop",
   "description": "xum - coding agent multiplexer",
   "author": "Coder",

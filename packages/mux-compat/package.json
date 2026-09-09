@@ -1,6 +1,6 @@
 {
   "name": "mux",
-  "version": "0.28.4",
+  "version": "0.28.5",
   "description": "Compatibility package forwarding the legacy mux command to @coder/xum",
   "bin": {
     "mux": "bin/mux.js"
@@ -10,7 +10,7 @@
     "README.md"
   ],
   "dependencies": {
-    "@coder/xum": "0.28.4"
+    "@coder/xum": "0.28.5"
   },
   "repository": {
     "type": "git",
