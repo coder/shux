@@ -3457,7 +3457,7 @@ describe("TaskService", () => {
         projectPath,
         [
           projectWorkspace(projectPath, "parent", "parent"),
-          ...["stopped", "crashed", "compacted"].map((id) =>
+          ...["stopped", "failed-follow-up", "crashed", "compacted"].map((id) =>
             projectWorkspace(projectPath, id, id, {
               parentWorkspaceId: "parent",
               agentId: "exec",
@@ -3470,10 +3470,12 @@ describe("TaskService", () => {
         testTaskSettings()
       );
       const dispatchPendingCompactionFollowUp = mock((id: string) =>
-        Promise.resolve(id === "compacted")
+        Promise.resolve(
+          id === "failed-follow-up" ? Err("unreadable follow-up") : Ok(id === "compacted")
+        )
       );
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
-        isStartupRecoveryStopped: mock((id: string) => Promise.resolve(id === "stopped")),
+        isStartupRecoveryBlocked: mock((id: string) => Promise.resolve(id === "stopped")),
         dispatchPendingCompactionFollowUp,
       });
       const { taskService } = createTaskServiceHarness(config, { workspaceService });

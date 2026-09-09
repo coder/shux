@@ -2387,7 +2387,7 @@ export class TaskService implements AgentTaskIntegration {
         (task) => task.id && ["running", "awaiting_report"].includes(task.taskStatus ?? "running")
       );
       const stopped = await Promise.all(
-        candidates.map((task) => this.workspaceService.isStartupRecoveryStopped(task.id!))
+        candidates.map((task) => this.workspaceService.isStartupRecoveryBlocked(task.id!))
       );
       const active = candidates.filter((_, index) => !stopped[index]);
       return {
@@ -2447,7 +2447,10 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
 
-      if (await this.workspaceService.dispatchPendingCompactionFollowUp(task.id)) continue;
+      const followUp = await this.workspaceService.dispatchPendingCompactionFollowUp(task.id);
+      if (!followUp.success) failedAwaitingReportCount += 1;
+      else if (followUp.data) resumedAwaitingReportCount += 1;
+      if (!followUp.success || followUp.data) continue;
       const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
         reason: "startup",
       });
@@ -2546,7 +2549,10 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       // Preserve durable compaction intent before a generic nudge makes its tail stale.
-      if (await this.workspaceService.dispatchPendingCompactionFollowUp(task.id)) continue;
+      const followUp = await this.workspaceService.dispatchPendingCompactionFollowUp(task.id);
+      if (!followUp.success) failedRunningCount += 1;
+      else if (followUp.data) resumedRunningCount += 1;
+      if (!followUp.success || followUp.data) continue;
       const isPlanLike = await this.isPlanLikeTaskWorkspace({
         projectPath: task.projectPath,
         workspace: task,

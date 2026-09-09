@@ -9159,6 +9159,22 @@ describe("WorkspaceService initialize", () => {
     });
   });
 
+  test("contains pending-compaction recovery failures as per-task results", async () => {
+    const session = {
+      dispatchPendingCompactionFollowUpIfNeeded: mock(() =>
+        Promise.reject(new Error("provider unavailable"))
+      ),
+    } as unknown as AgentSession;
+    const getSession = spyOn(workspaceService, "getOrCreateSession").mockReturnValue(session);
+    try {
+      expect(await workspaceService.dispatchPendingCompactionFollowUp("task")).toEqual(
+        Err("provider unavailable")
+      );
+    } finally {
+      getSession.mockRestore();
+    }
+  });
+
   test("schedules startup recovery for non-task, non-archived chats", async () => {
     const liveWorkspace = createFrontendWorkspaceMetadata({
       id: "live-ws",

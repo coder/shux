@@ -2245,8 +2245,12 @@ export class HistoryService {
 
   /**
    * Read the partial message for a workspace, if it exists.
+   * Startup admission must distinguish unreadable state from an absent partial.
    */
-  async readPartial(workspaceId: string): Promise<MuxMessage | null> {
+  async readPartial(
+    workspaceId: string,
+    options?: { throwOnError?: boolean }
+  ): Promise<MuxMessage | null> {
     try {
       const partialPath = this.getPartialPath(workspaceId);
       const data = await fs.readFile(partialPath, "utf-8");
@@ -2257,6 +2261,7 @@ export class HistoryService {
         return null;
       }
 
+      if (options?.throwOnError) throw error;
       log.error("Error reading partial:", error);
       return null;
     }

@@ -763,7 +763,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       })
     );
     try {
-      expect(await session.isStartupRecoveryStopped()).toBe(marker.stopped);
+      expect(await session.isStartupRecoveryBlocked()).toBe(marker.stopped);
       const history = await historyService.getLastMessages(workspaceId, 20);
       expect(history.success && history.data.map((message) => message.id)).toEqual(["user-1"]);
     } finally {
@@ -789,17 +789,44 @@ describe("AgentSession startup auto-retry recovery", () => {
       })
     );
     try {
-      expect(await session.isStartupRecoveryStopped()).toBe(true);
+      expect(await session.isStartupRecoveryBlocked()).toBe(true);
       spyOn(historyService, "getLastMessages").mockRejectedValueOnce(new Error("unreadable"));
-      expect(await session.isStartupRecoveryStopped()).toBe(true);
+      expect(await session.isStartupRecoveryBlocked()).toBe(true);
       await historyService.appendToHistory(
         workspaceId,
-        createMuxMessage("new-user", "user", "Continue")
+        createMuxMessage("notice", "user", "Snapshot", { synthetic: true })
       );
-      expect(await session.isStartupRecoveryStopped()).toBe(false);
+      expect(await session.isStartupRecoveryBlocked()).toBe(true);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("guidance", "user", "Continue", {
+          synthetic: true,
+          retrySendOptions: { model: "openai:gpt-4o", agentId: "exec", agentInitiated: true },
+        })
+      );
+      expect(await session.isStartupRecoveryBlocked()).toBe(false);
       expect(JSON.parse(await fsPromises.readFile(preferencePath, "utf-8"))).toMatchObject({
         startupAutoRetryAbandon: { reason: "aborted", userMessageId: "stopped-user" },
       });
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  test("blocks task recovery on a real partial-file read error but not a missing partial", async () => {
+    const workspaceId = "startup-unreadable-partial";
+    const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user", "user", "Pending work")
+    );
+    const partialPath = path.join(config.sessionsDir, workspaceId, "partial.json");
+    await fsPromises.mkdir(partialPath);
+    try {
+      expect(await session.isStartupRecoveryBlocked()).toBe(true);
+      await fsPromises.rm(partialPath, { recursive: true });
+      expect(await session.isStartupRecoveryBlocked()).toBe(false);
     } finally {
       await session.dispose();
     }
@@ -895,6 +922,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     });
 
     await secondSession.ensureStartupAutoRetryCheck();
+    expect(await secondSession.isStartupRecoveryBlocked()).toBe(true);
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
@@ -1908,6 +1936,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       )
     );
     expect(writePartialResult.success).toBe(true);
+    expect(await session.isStartupRecoveryBlocked()).toBe(true);
 
     await session.ensureStartupAutoRetryCheck();
 

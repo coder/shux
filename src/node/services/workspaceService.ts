@@ -11853,12 +11853,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   }
 
-  dispatchPendingCompactionFollowUp(workspaceId: string): Promise<boolean> {
-    return this.getOrCreateSession(workspaceId).dispatchPendingCompactionFollowUpIfNeeded();
+  async dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>> {
+    try {
+      return Ok(
+        await this.getOrCreateSession(workspaceId).dispatchPendingCompactionFollowUpIfNeeded()
+      );
+    } catch (error) {
+      log.warn("Failed to recover pending compaction follow-up", { workspaceId, error });
+      return Err(getErrorMessage(error));
+    }
   }
 
-  isStartupRecoveryStopped(workspaceId: string): Promise<boolean> {
-    return this.getOrCreateSession(workspaceId).isStartupRecoveryStopped();
+  isStartupRecoveryBlocked(workspaceId: string): Promise<boolean> {
+    return this.getOrCreateSession(workspaceId).isStartupRecoveryBlocked();
   }
 
   async getStartupAutoRetryModel(workspaceId: string): Promise<Result<string | null>> {

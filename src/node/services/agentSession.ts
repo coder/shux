@@ -1776,10 +1776,7 @@ export class AgentSession {
         ? parsed.userMessageId
         : undefined;
 
-    return {
-      reason: parsed.reason,
-      ...(userMessageId ? { userMessageId } : {}),
-    };
+    return { reason: parsed.reason, userMessageId };
   }
 
   /**
@@ -2028,15 +2025,14 @@ export class AgentSession {
   }
 
   private isPendingAskUserQuestion(message: MuxMessage | null | undefined): boolean {
-    if (!message || message.role !== "assistant") {
-      return false;
-    }
-
-    return message.parts.some(
-      (part) =>
-        part.type === "dynamic-tool" &&
-        part.toolName === "ask_user_question" &&
-        part.state === "input-available"
+    return (
+      message?.role === "assistant" &&
+      message.parts.some(
+        (part) =>
+          part.type === "dynamic-tool" &&
+          part.toolName === "ask_user_question" &&
+          part.state === "input-available"
+      )
     );
   }
 
@@ -2281,19 +2277,8 @@ export class AgentSession {
   }
 
   private async getWorkspaceMetadataForRetry(): Promise<WorkspaceMetadata | undefined> {
-    const aiService = this.aiService as Partial<
-      Pick<AgentSessionAIService, "getWorkspaceMetadata">
-    >;
-    if (typeof aiService.getWorkspaceMetadata !== "function") {
-      return undefined;
-    }
-
-    const metadataResult = await aiService.getWorkspaceMetadata(this.workspaceId);
-    if (!metadataResult.success) {
-      return undefined;
-    }
-
-    return metadataResult.data;
+    const metadata = await this.aiService.getWorkspaceMetadata?.(this.workspaceId);
+    return metadata?.success ? metadata.data : undefined;
   }
 
   private isVisibleCompletedSubagentReportMessage(message: MuxMessage): boolean {
@@ -2773,19 +2758,31 @@ export class AgentSession {
     }
   }
 
-  async isStartupRecoveryStopped(): Promise<boolean> {
+  async isStartupRecoveryBlocked(): Promise<boolean> {
     await this.loadAutoRetryState();
+    if (this.autoRetryEnabledPreference === false) return true;
+    const [partial, history] = await Promise.all([
+      this.historyService
+        .readPartial(this.workspaceId, { throwOnError: true })
+        .catch(() => undefined),
+      this.historyService.getLastMessages(this.workspaceId, 20).catch(() => null),
+    ]);
+    if (!history?.success || partial === undefined) return true;
+    if (
+      this.isPendingAskUserQuestion(partial) ||
+      this.isPendingAskUserQuestion(this.getLastNonSystemHistoryMessage(history.data))
+    )
+      return true;
     const abandon = this.startupAutoRetryAbandon;
     if (abandon?.reason !== "aborted") return false;
     if (abandon.userMessageId === undefined) return true;
-    // Preserve known Stop intent if history cannot establish a newer user turn.
-    const history = await this.historyService
-      .getLastMessages(this.workspaceId, 20)
-      .catch(() => null);
-    const latestUserId = history?.success
-      ? this.findLastRetryUserMessage(history.data)?.id
-      : undefined;
-    return latestUserId === undefined || latestUserId === abandon.userMessageId;
+    // Accepted synthetic guidance is new intent too; snapshots/notices are not.
+    const latest = history.data.findLast(
+      (message) =>
+        this.shouldUseUserMessageForRetry(message) ||
+        (message.role === "user" && message.metadata?.retrySendOptions != null)
+    );
+    return latest === undefined || latest.id === abandon.userMessageId;
   }
 
   ensureStartupAutoRetryCheck(): Promise<void> {
