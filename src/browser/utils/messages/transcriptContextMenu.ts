@@ -342,8 +342,21 @@ const CLIPBOARD_TAGS = new Set([
   "tr",
   "th",
   "td",
+  "details",
+  "summary",
 ]);
 const CLIPBOARD_EXCLUDED_SELECTOR = `script, style, svg, img, iframe, object, .line-number, button, input, textarea, select, [hidden], [aria-hidden="true"], ${TRANSCRIPT_IGNORE_CONTEXT_MENU_SELECTOR}`;
+
+function isSafeClipboardHref(href: string): boolean {
+  if (!href.trim() || href.includes("\\")) return false;
+  try {
+    // Resolve relative paths only for protocol validation. Keep the original destination when copying.
+    const url = new URL(href, "https://clipboard.invalid/");
+    return ["http:", "https:", "mailto:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
 
 function appendClipboardNodes(source: Node, destination: Node, range: Range): void {
   const document = destination.ownerDocument!;
@@ -363,11 +376,33 @@ function appendClipboardNodes(source: Node, destination: Node, range: Range): vo
     }
     if (child.nodeType !== 1) continue;
     const element = child as Element;
+    if (element.matches('input[type="checkbox"][disabled]')) {
+      const marker = document.createElement("span");
+      marker.setAttribute("data-clipboard-task", "true");
+      marker.textContent = (element as HTMLInputElement).checked ? "[x] " : "[ ] ";
+      destination.appendChild(marker);
+      continue;
+    }
     if (element.matches(CLIPBOARD_EXCLUDED_SELECTOR)) continue;
+    if (element.matches(".katex")) {
+      const tex = element.querySelector('annotation[encoding="application/x-tex"]')?.textContent;
+      if (tex != null) {
+        // Rendered math has duplicate accessibility text. Treat each selected formula as one unit.
+        const math = document.createElement("span");
+        math.textContent = element.closest(".katex-display")
+          ? "$$\n" + tex + "\n$$"
+          : "$" + tex + "$";
+        math.setAttribute("data-clipboard-math", math.textContent);
+        destination.appendChild(math);
+        continue;
+      }
+    }
     // Highlighted code uses a grid, not semantic pre/code elements. Exclude its line numbers.
     if (element.matches(".code-block-container")) {
       const pre = document.createElement("pre");
       const code = document.createElement("code");
+      const language = element.getAttribute("data-code-language") ?? "";
+      if (/^[\w.+#-]+$/.test(language)) code.className = `language-${language}`;
       const lines: string[] = [];
       for (const line of element.querySelectorAll(".code-line")) {
         if (!range.intersectsNode(line)) continue;
@@ -388,7 +423,14 @@ function appendClipboardNodes(source: Node, destination: Node, range: Range): vo
     const copy = document.createElement(tag);
     if (tag === "a") {
       const href = element.getAttribute("href") ?? "";
-      if (/^(https?:|mailto:)/i.test(href)) copy.setAttribute("href", href);
+      if (isSafeClipboardHref(href)) copy.setAttribute("href", href);
+    }
+    if (tag === "details" && element.hasAttribute("open")) copy.setAttribute("open", "");
+    if (tag === "code") {
+      const languageClass = Array.from(element.classList).find((name) =>
+        /^language-[\w.+#-]+$/.test(name)
+      );
+      if (languageClass) copy.className = languageClass;
     }
     if (tag === "ol") {
       const list = element as HTMLOListElement;
@@ -407,10 +449,11 @@ export function getTranscriptContextMenuMarkdown(
   options: TranscriptContextMenuTextOptions
 ): FormattedClipboardContent | null {
   const target = getEventTargetElement(options.target);
+  const excludedTarget = target?.closest(CLIPBOARD_EXCLUDED_SELECTOR);
   if (
     !target ||
     !options.transcriptRoot.contains(target) ||
-    target.closest(CLIPBOARD_EXCLUDED_SELECTOR)
+    (excludedTarget && !excludedTarget.matches('.katex-html[aria-hidden="true"]'))
   ) {
     return null;
   }
@@ -426,6 +469,17 @@ export function getTranscriptContextMenuMarkdown(
   // Walk the original range so partial selections retain their formatting and list positions.
   appendClipboardNodes(quoteRoot, container, range);
   const markdown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
+  markdown.addRule("selectedMathAndTasks", {
+    filter: (node) =>
+      node.hasAttribute("data-clipboard-math") || node.hasAttribute("data-clipboard-task"),
+    replacement: (_content, node) =>
+      node.getAttribute("data-clipboard-math") ?? node.textContent?.trimEnd() ?? "",
+  });
+  markdown.addRule("disclosure", {
+    filter: "details",
+    // SECURITY AUDIT: This node contains only the sanitized clipboard elements and attributes.
+    replacement: (_content, node) => "\n\n" + node.outerHTML + "\n\n",
+  });
   markdown.addRule("strikethrough", {
     filter: ["s", "del"],
     replacement: (content) => `~~${content}~~`,

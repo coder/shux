@@ -223,7 +223,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     <div
       className={`code-block-wrapper${isSingleLine ? " code-block-single-line" : ""}${showRunButton ? " code-block-runnable" : ""}`}
     >
-      <div className="code-block-container">
+      <div className="code-block-container" data-code-language={language}>
         {lines.map((content, idx) => (
           <React.Fragment key={idx}>
             <div className="line-number">{idx + 1}</div>

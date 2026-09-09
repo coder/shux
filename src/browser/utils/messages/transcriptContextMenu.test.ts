@@ -147,6 +147,93 @@ describe("transcriptContextMenu", () => {
       expect(result?.html).not.toContain("Excluded");
     });
 
+    test.each([
+      "src/main.ts",
+      "../my file.ts",
+      "#usage",
+      "/docs",
+      "https://example.com",
+      "mailto:team@example.com",
+    ])("preserves a safe link destination: %s", (href) => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage('<p><a id="part">Link</a></p>')
+      );
+      root.querySelector("a")!.setAttribute("href", href);
+      const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
+      expect(result?.html).toContain('href="' + href + '"');
+      expect(result?.text).toContain("[Link](");
+    });
+
+    test.each([
+      "javascript:alert(1)",
+      "java\tscript:alert(1)",
+      "data:text/html,bad",
+      "vbscript:bad",
+      "\\evil.example",
+    ])("excludes an unsafe link destination: %s", (href) => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage('<p><a id="part">Link</a></p>')
+      );
+      root.querySelector("a")!.setAttribute("href", href);
+      expect(getTranscriptContextMenuMarkdown(select(root, "#part"))?.html).toBe(
+        "<p><a>Link</a></p>"
+      );
+    });
+
+    test("preserves task state without copying interactive inputs", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<p id="first">Tasks</p><ul><li><input type="checkbox" checked disabled> done</li><li><input type="checkbox" disabled> pending</li><li><input type="checkbox" checked> interactive</li></ul><p id="last">End</p>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#first", "#last"));
+      expect(result?.text).toContain("*   [x] done");
+      expect(result?.text).toContain("*   [ ] pending");
+      expect(result?.text).toContain("*   interactive");
+      expect(result?.html).not.toContain("<input");
+    });
+
+    test.each([false, true])(
+      "copies one TeX source for selected rendered math (display=%s)",
+      (display) => {
+        const math =
+          '<span class="katex"><span class="katex-mathml"><math><semantics><mrow>x2</mrow><annotation encoding="application/x-tex">x^2</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span id="part">x2</span></span></span>';
+        const root = createTranscriptRoot(
+          createQuoteableTranscriptMessage(
+            display ? '<span class="katex-display">' + math + "</span>" : math
+          )
+        );
+        const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
+        expect(result?.text).toBe(display ? "$$\nx^2\n$$" : "$x^2$");
+        expect(result?.html).not.toContain("x2");
+        expect(result?.html).not.toContain("<math");
+      }
+    );
+
+    test("retains sanitized disclosure structure", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<details open ontoggle="alert(1)"><summary id="first">More</summary><p id="last">Selected</p><p>Excluded</p></details>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#first", "#last"));
+      expect(result?.text).toBe(
+        '<details open=""><summary>More</summary><p>Selected</p></details>'
+      );
+      expect(result?.html).toBe(result?.text);
+    });
+
+    test("preserves the language of highlighted code", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<div class="code-block-container" data-code-language="typescript"><div class="line-number">1</div><div class="code-line"><span id="part">const x = 1;</span></div></div>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
+      expect(result?.text).toBe(["```typescript", "const x = 1;", "```"].join("\n"));
+      expect(result?.html).toBe('<pre><code class="language-typescript">const x = 1;</code></pre>');
+    });
+
     test("removes unsafe URLs, attributes, and active content", () => {
       const root = createTranscriptRoot(
         createQuoteableTranscriptMessage(
