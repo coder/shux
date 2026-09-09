@@ -23,6 +23,7 @@ import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 import YAML from "yaml";
 import assert from "@/common/utils/assert";
+import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
 import {
   MEMORY_HOT_SET_MAX_ITEM_BYTES,
   MEMORY_INDEX_DESCRIPTION_MAX_CHARS,
@@ -567,6 +568,13 @@ export function extractMemoryDescription(content: string): string {
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
+
+/** The conventional context-notes file, kept visible even when a scope exceeds its file cap. */
+const CONTEXT_NOTES = parseMemoryPath(CONTEXT_NOTES_MEMORY_PATH);
+assert(
+  CONTEXT_NOTES.scope !== null && CONTEXT_NOTES.relPath !== "",
+  "context notes must be a file inside a memory scope"
+);
 
 /** One pinned-file mutation for {@link MemoryService.writePinnedFile}. */
 export type PinnedFileMutation =
@@ -1643,9 +1651,16 @@ export class MemoryService extends EventEmitter {
         if (files.length > MEMORY_MAX_FILES_PER_SCOPE) {
           // Files can be edited outside MemoryService; honor the cap at
           // enumeration so a degenerate directory cannot force thousands of
-          // per-file reads on stream startup.
+          // per-file reads on stream startup. The context-notes slot is exempt
+          // from the cap on write (writePinnedFile), so it must survive the cut
+          // too or the flush handoff would vanish from the next window's index.
           log.debug("[MemoryService] truncating memory index to the per-scope cap", { scope });
-          files.length = MEMORY_MAX_FILES_PER_SCOPE;
+          // The bounded walk may have stopped before reaching the notes: probe them directly.
+          const keepNotes =
+            scope === CONTEXT_NOTES.scope && (await store.kind(CONTEXT_NOTES.relPath)) === "file";
+          files.length = MEMORY_MAX_FILES_PER_SCOPE - (keepNotes ? 1 : 0);
+          if (keepNotes && !files.includes(CONTEXT_NOTES.relPath))
+            files.push(CONTEXT_NOTES.relPath);
         }
         for (const relPath of files) {
           // Filenames are attacker-controlled: only index paths the memory tool

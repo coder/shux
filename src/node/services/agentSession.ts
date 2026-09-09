@@ -17,6 +17,7 @@ import {
   CONTEXT_WARNING_DEDUPE_KEY,
   FLUSH_MAX_OUTPUT_TOKENS,
   FLUSH_RESERVE_TOKENS,
+  OUTPUT_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
@@ -5081,6 +5082,25 @@ export class AgentSession {
   }
 
   /**
+   * Thinking and output cap for the hidden flush step. It is housekeeping, so the user's
+   * configured thinking floor does not apply — only the model's inherent minimum — and the cap
+   * sits above that level's Anthropic thinking budget (the API rejects a budget that is not below
+   * max_tokens). Shared by admission (headroom) and the stream request so both agree.
+   */
+  private resolveFlushThinking(
+    modelString: string,
+    providersConfig: ProvidersConfigMap | null
+  ): { level: ThinkingLevel; maxOutputTokens: number } {
+    const level = enforceThinkingPolicy(
+      modelString,
+      "off",
+      resolveMinimumThinkingLevel(modelString, undefined, providersConfig),
+      providersConfig
+    );
+    return { level, maxOutputTokens: FLUSH_MAX_OUTPUT_TOKENS + ANTHROPIC_THINKING_BUDGETS[level] };
+  }
+
+  /**
    * Drop a pending reset (intent, pinned snapshot, flush claim) without touching queued
    * continuations: used when rollover can no longer seal the window but a paired "Continue"
    * must still dispatch as an ordinary continuation.
@@ -5751,9 +5771,16 @@ export class AgentSession {
     // with on-send numbers; degrade to an ordinary continuation when any no longer holds.
     if (userMessage.metadata?.muxMetadata?.contextBudgetFlush === true) {
       const rolloverEnabled = this.compactionMonitor.getThreshold() < 1;
+      // The hard ceiling reserves OUTPUT_RESERVE_TOKENS for the step's output; a model whose
+      // inherent thinking minimum needs a larger flush cap must find that extra room too.
+      const flushOutputBeyondReserve = Math.max(
+        0,
+        this.resolveFlushThinking(options.model, providersConfig).maxOutputTokens -
+          OUTPUT_RESERVE_TOKENS
+      );
       const flushStillSafe =
         decision.hardCeiling !== undefined &&
-        decision.projected + FLUSH_RESERVE_TOKENS < decision.hardCeiling;
+        decision.projected + FLUSH_RESERVE_TOKENS + flushOutputBeyondReserve < decision.hardCeiling;
       // The prompt promises that the next message seals the window, so require the same
       // admission the rollover itself needs (history access, toolset-preserving middleware).
       // Threshold 100% disables automatic rollover: a flush promising a sealed window would lie.
@@ -7304,17 +7331,12 @@ export class AgentSession {
       // options; the flag is request-local and never becomes the workspace-turn correlation.
       const contextBudgetFlushTurn =
         lastUserMessage?.metadata?.muxMetadata?.contextBudgetFlush === true;
-      // The flush is one mechanical memory call: run it at the lowest thinking the model allows,
-      // and size its bounded output cap above that level's Anthropic thinking budget (the API
-      // rejects a budget that is not below max_tokens), so an inherited medium/high level cannot
-      // make the only preservation step fail before its tool call.
-      const flushThinkingLevel = contextBudgetFlushTurn
-        ? enforceThinkingPolicy(modelString, "off", minThinkingLevel, providersConfig)
+      // The flush is one mechanical memory call: lowest thinking the model allows (the user's
+      // configured floor is for real work) and a bounded cap sized for that level, so an
+      // inherited medium/high level cannot make the only preservation step fail or overrun.
+      const flushThinking = contextBudgetFlushTurn
+        ? this.resolveFlushThinking(modelString, providersConfig)
         : undefined;
-      const flushMaxOutputTokens =
-        flushThinkingLevel != null
-          ? FLUSH_MAX_OUTPUT_TOKENS + ANTHROPIC_THINKING_BUDGETS[flushThinkingLevel]
-          : undefined;
       // The flush turn is bounded to one provider step. If a crash left that step's completed
       // memory call on disk (committed above), the resumed request gets no tools at all so the
       // turn can only end, after which the queued rollover seals the window.
@@ -7356,7 +7378,7 @@ export class AgentSession {
         workspaceId: this.workspaceId,
         modelString,
         abortSignal,
-        thinkingLevel: flushThinkingLevel ?? effectiveThinkingLevel,
+        thinkingLevel: flushThinking?.level ?? effectiveThinkingLevel,
         // Orthogonal to thinking level; buildRequestHeaders gates it per model.
         reasoningMode: options?.reasoningMode,
         toolPolicy:
@@ -7368,7 +7390,7 @@ export class AgentSession {
         // The flush step gets its own bounded cap: a terse caller cap could cut the notes payload
         // short and waste the single step, while an unbounded one would let transcript-influenced
         // text run to a model-sized reply. The paired continuation keeps the caller's cap.
-        maxOutputTokens: flushMaxOutputTokens ?? options?.maxOutputTokens,
+        maxOutputTokens: flushThinking?.maxOutputTokens ?? options?.maxOutputTokens,
         muxProviderOptions: options?.providerOptions,
         agentInitiated,
         agentId: options?.agentId,

@@ -1413,6 +1413,55 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.requests[2].thinkingLevel).toBe("high");
   });
 
+  test("the flush ignores the user's thinking floor, which the continuation keeps", async () => {
+    const h = await setup();
+    const loadConfig = h.config.loadConfigOrDefault.bind(h.config);
+    spyOn(h.config, "loadConfigOrDefault").mockImplementation(() => ({
+      ...loadConfig(),
+      minThinkingLevelByModel: { [model]: "high" },
+    }));
+    expect(
+      (await h.session.sendMessage("Work", { ...options, thinkingLevel: "off" })).success
+    ).toBe(true);
+    expect(h.requests[0].thinkingLevel).toBe("high");
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await h.finishAndDispatch();
+    // Housekeeping runs at the model's inherent minimum, so the cap needs no thinking headroom.
+    expect(h.requests[1].thinkingLevel).toBe("off");
+    expect(h.requests[1].maxOutputTokens).toBe(FLUSH_MAX_OUTPUT_TOKENS);
+    expect(await h.requests[1].onStepSettled?.(step(112_000))).toBe("rollover");
+    h.settleStream(1);
+    await h.waitForRequest(3);
+    expect(h.requests[2].thinkingLevel).toBe("high");
+  });
+
+  test.each([
+    // gpt-5.2 cannot go below medium thinking: its flush cap must exceed a 10k budget, i.e. it
+    // needs room beyond OUTPUT_RESERVE_TOKENS that a near-ceiling window no longer has.
+    ["openai:gpt-5.2", false],
+    [model, true],
+  ])(
+    "dispatch-time headroom accounts for the flush cap the model's thinking minimum requires (%s)",
+    async (sendModel, admitted) => {
+      const h = await setup();
+      spyOn(contextLimits, "getEffectiveContextLimit").mockReturnValue(128_000);
+      expect((await h.session.sendMessage("Work", { ...options, model: sendModel })).success).toBe(
+        true
+      );
+      expect(await h.requests[0].onStepSettled?.(step(110_000, { model: sendModel }))).toBe(
+        "rollover"
+      );
+      expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(true);
+      // Usage reported at stream end drives the dispatch-time admission.
+      h.settleStream(0, { contextUsage: { inputTokens: 110_000 } });
+      await h.waitForRequest(2);
+      const rows = await allRows(h);
+      expect(warningRows(rows)).toHaveLength(admitted ? 1 : 0);
+      expect(rolloverRows(rows)).toHaveLength(admitted ? 0 : 1);
+      expect(h.requests[1].muxMetadata?.contextBudgetFlush === true).toBe(admitted);
+    }
+  );
+
   test("a top-level workspace (no delegated correlation) still flags the flush request", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);

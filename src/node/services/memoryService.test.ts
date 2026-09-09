@@ -990,6 +990,26 @@ describe("MemoryService", () => {
       expect(index).not.toContain("pwn");
     });
 
+    it("keeps the context notes indexed when the workspace scope exceeds the cap", async () => {
+      using fixture = await createFixture();
+      // The notes slot is exempt from the cap on write, so it must also survive the enumeration
+      // cut even when every other file sorts before it.
+      const memoryDir = path.join(fixture.xumHome, "sessions", fixture.ctx.workspaceId, "memory");
+      await fsPromises.mkdir(memoryDir, { recursive: true });
+      await Promise.all([
+        ...Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE + 5 }, (_, i) =>
+          fsPromises.writeFile(path.join(memoryDir, `a${String(i).padStart(4, "0")}.md`), "x")
+        ),
+        fsPromises.writeFile(path.join(memoryDir, "context-notes.md"), "handoff"),
+      ]);
+      const entries = (await fixture.service.listIndexEntries(fixture.ctx)).filter(
+        (entry) => entry.scope === "workspace"
+      );
+      expect(entries).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
+      expect(entries.map((entry) => entry.path)).toContain("/memories/workspace/context-notes.md");
+      expect(entries[0]?.relPath).toBe("a0000.md");
+    });
+
     it("caps indexed files per scope to the declared limit", async () => {
       using fixture = await createFixture();
       // Files edited outside MemoryService can bypass the write-time per-scope
