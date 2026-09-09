@@ -1880,6 +1880,20 @@ describe("MemoryService", () => {
           .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
           .then(() => null, getErrorMessage)
       ).toMatch(/could not be folded/);
+      // A legacy listing that cannot be completed (readdir failure) is no
+      // "nothing to adopt": removal must abort rather than delete a note it
+      // never saw.
+      const lossy = spyOn(fsPromises, "readdir").mockImplementation((() =>
+        Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))) as never);
+      try {
+        expect(
+          await fixture.service
+            .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
+            .then(() => null, getErrorMessage)
+        ).toMatch(/EIO/);
+      } finally {
+        lossy.mockRestore();
+      }
       // Space frees up; the in-lock delta pass (removal holds the owner-store
       // lock already) folds the note in without re-acquiring the lock.
       await fsPromises.rm(path.join(ownerRoot, "o0000.md"));

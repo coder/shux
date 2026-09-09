@@ -374,7 +374,12 @@ interface MemoryStore {
   /** assertRootSafe + create the root if missing (write paths only). */
   ensureRoot(): Promise<void>;
   /** Relative paths of all non-dotfile files under the root, sorted. */
-  listFiles(): Promise<string[]>;
+  /**
+   * Files under the root. Tolerant by default (self-healing: an unreadable
+   * directory lists as empty); `strict` throws on any traversal failure, for
+   * callers whose decision must not rest on a possibly partial listing.
+   */
+  listFiles(options?: { strict?: boolean }): Promise<string[]>;
   kind(relPath: string): Promise<MemoryEntryKind>;
   /**
    * Read at most `maxBytes` from the head of the file. Index/hot-set builds
@@ -555,7 +560,7 @@ class LocalMemoryStore implements MemoryStore {
     await fsPromises.mkdir(this.physicalRoot, { recursive: true });
   }
 
-  async listFiles(): Promise<string[]> {
+  async listFiles(options?: { strict?: boolean }): Promise<string[]> {
     const results: string[] = [];
     const walk = async (dirRel: string): Promise<void> => {
       // Bounded walk: files may have been edited outside MemoryService. +1 lets
@@ -564,7 +569,12 @@ class LocalMemoryStore implements MemoryStore {
       let entries;
       try {
         entries = await fsPromises.readdir(this.abs(dirRel), { withFileTypes: true });
-      } catch {
+      } catch (error) {
+        // Strict callers (removal's legacy handover) must not take a partial
+        // listing for the whole; a missing ROOT is the genuine empty case.
+        if (options?.strict === true && !(dirRel === "" && hasErrorCode(error, "ENOENT"))) {
+          throw error;
+        }
         return; // Self-healing: missing/unreadable dirs list as empty.
       }
       // Iterate in path-string order — directories key as "name/" so the DFS
@@ -1289,7 +1299,11 @@ export class MemoryService extends EventEmitter {
       await this.assertMutationCommittable(ctx, store, undefined, toVirtualPath("workspace", ""));
       if ((await lstatKind(legacyRoot)) !== "dir") return; // swapped while waiting for the lock
       const legacy = new LocalMemoryStore(legacyRoot);
-      const files = await legacy.listFiles();
+      // Strict: a note omitted by a partial listing would count as "nothing
+      // to adopt" (skipped stays 0) and removal would then delete its only
+      // copy. A traversal failure fails the pass instead (access-time:
+      // retried on the next access; removal: aborted, session intact).
+      const files = await legacy.listFiles({ strict: true });
       // What was already folded in, kept beside the legacy files (a dotfile,
       // so neither build lists it): per relPath the content hash, the
       // fingerprint of the child-keyed sidecar entry, and where the copy

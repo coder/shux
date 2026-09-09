@@ -1126,7 +1126,12 @@ export class AgentSession {
    * turn). Nothing to do when the field is already absent.
    */
   private async resetWorkspaceMemoryWritable(options?: { closingEpoch: number }): Promise<void> {
-    this.workspaceMemoryWritable = undefined;
+    // Compaction (closing epoch given): the completion callback already
+    // forgot the mirror synchronously. Destructive boundary: the mirror is
+    // forgotten only once the durable clear below completed — a reset that
+    // reports success while the persisted `-1` deny survives would pin the
+    // whole new segment to the stored-false fast path.
+    if (options !== undefined) this.workspaceMemoryWritable = undefined;
     // The session-dir deny marker (fallback for an unwritable config.json)
     // belongs to the closing epoch too. Same fence idea as below: a deny
     // recorded for the new epoch survives.
@@ -1135,8 +1140,19 @@ export class AgentSession {
       path.join(this.config.sessionsDir, this.workspaceId),
       options
     );
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
-    if (entry?.workspace.workspaceMemoryWritableByEpoch === undefined) return;
+    // Strict load: an unreadable config.json would read as the empty default,
+    // in which this workspace has no records to clear — the reset would
+    // report success and leave the stale records behind. Throwing makes the
+    // boundary a retryable partial failure instead. (A genuinely absent file
+    // holds no records and is the empty default for real.)
+    const entry = findWorkspaceEntry(
+      this.config.loadConfigOrDefault({ throwOnError: true }),
+      this.workspaceId
+    );
+    if (entry?.workspace.workspaceMemoryWritableByEpoch === undefined) {
+      this.workspaceMemoryWritable = undefined;
+      return;
+    }
     if (
       options !== undefined &&
       workspaceMemoryWritableForEpoch(entry.workspace, options.closingEpoch) === undefined
@@ -1161,6 +1177,7 @@ export class AgentSession {
       }
       return cfg;
     });
+    this.workspaceMemoryWritable = undefined;
   }
 
   /**
