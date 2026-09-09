@@ -47,6 +47,24 @@ function setupPluginSettings(installed = false) {
     installedAt: "2026-09-01T00:00:00.000Z",
     importedComponents: { skills: ["review"], mcpServers: [] },
   };
+  // The full app mounts its composer before Settings, including plugin command discovery.
+  client.workspace.plugins = {
+    slashCommands: { list: () => Promise.resolve([]) },
+    composition: {
+      get: () =>
+        Promise.resolve({
+          agentPluginsEnabled: true,
+          plugins: [],
+          diagnostics: [],
+          skills: [],
+          agents: [],
+          workflows: [],
+          mcpServers: [],
+          slashCommands: [],
+          hooks: [],
+        }),
+    },
+  };
   client.agentPlugins.preview = () => Promise.resolve({ success: true, data: preview });
   client.agentPlugins.checkUpdates = () => Promise.resolve({ success: true, data: [] });
   client.agentPlugins.list = () =>
@@ -133,6 +151,10 @@ export const PreviewDesktop: AppStory = {
 
 export const PreviewPhone: AppStory = {
   ...PreviewDesktop,
+  play: async (context) => {
+    await expect(context.parameters.pixel.matrix.viewports).toContain("phone");
+    await PreviewDesktop.play?.(context);
+  },
   globals: { viewport: { value: "mobile1", isRotated: false } },
   parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
 };
@@ -155,6 +177,10 @@ export const AddComponentsDesktop: AppStory = {
 
 export const AddComponentsPhone: AppStory = {
   ...AddComponentsDesktop,
+  play: async (context) => {
+    await expect(context.parameters.pixel.matrix.viewports).toContain("phone");
+    await AddComponentsDesktop.play?.(context);
+  },
   globals: { viewport: { value: "mobile1", isRotated: false } },
   parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
 };
