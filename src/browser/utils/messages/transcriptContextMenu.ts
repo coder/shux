@@ -620,8 +620,12 @@ export function getTranscriptContextMenuMarkdown(
   markdown.addRule("table", {
     filter: "table",
     replacement: (_content, node) => {
-      // GFM cannot represent spans. Keep sanitized HTML instead of inventing a different table layout.
-      if (node.querySelector("[rowspan], [colspan]")) {
+      // GFM cannot represent spans or block content inside cells. Preserve their HTML structure.
+      if (
+        node.querySelector(
+          "[rowspan], [colspan], :is(td, th) :is(pre, p, div, ul, ol, dl, blockquote, h1, h2, h3, h4, h5, h6, details, table, hr)"
+        )
+      ) {
         return "\n\n" + serializeStructuredHtml(node) + "\n\n";
       }
       const rows = Array.from(node.querySelectorAll<HTMLTableRowElement>("tr"), (row) =>

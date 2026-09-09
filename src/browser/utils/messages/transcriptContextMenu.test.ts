@@ -113,6 +113,20 @@ describe("transcriptContextMenu", () => {
       expect(numbers(rich)).toEqual(expected);
     });
 
+    test("table cells preserve selected code blocks and their language", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<table><tr><td><pre><code class="language-ts" id="part">const x = 1;\n  x++;</code></pre></td></tr></table>'
+        )
+      );
+      const copied = getTranscriptContextMenuMarkdown(select(root, "#part"))!;
+      const pasted = document.createElement("div");
+      pasted.innerHTML = new MarkdownIt({ html: true }).render(copied.text);
+      const code = pasted.querySelector("td pre code");
+      expect(code?.className).toBe("language-ts");
+      expect(code?.textContent?.trimEnd()).toBe("const x = 1;\n  x++;");
+    });
+
     test("preserves links when the selection target is an anchor", () => {
       const root = createTranscriptRoot(
         createQuoteableTranscriptMessage(
