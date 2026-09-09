@@ -79,7 +79,7 @@ export async function readPluginRegistryDocument(
   };
 }
 
-/** Read once per global container scan. Corruption must never become legacy import-all. */
+/** Read once per managed container scan. Corruption must never become legacy import-all. */
 export async function readPluginComponentImports(
   registryFile: string
 ): Promise<Map<string, AgentPluginImportedComponents | undefined> | null> {

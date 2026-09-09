@@ -182,7 +182,9 @@ describe("AgentPluginInstallService", () => {
       await pathExists(path.join(pluginsDir(), "demo-plugin", "skills", "greet", "SKILL.md"))
     ).toBe(true);
     expect(await pathExists(path.join(pluginsDir(), "demo-plugin", "mcp.json"))).toBe(true);
-    const { plugins } = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    const { plugins } = await discoverAgentPlugins([
+      { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+    ]);
     expect(plugins).toHaveLength(1);
     const { servers } = await loadPluginMcpServers(plugins[0], { xumHome: muxRoot });
     expect(Object.keys(servers)).toHaveLength(importedComponents?.mcpServers.length ?? 1);
@@ -471,7 +473,9 @@ describe("AgentPluginInstallService", () => {
       JSON.stringify({ plugins: [{ ...entry, importedComponents: { mcpServers: ["echo"] } }] }),
     ]) {
       await fsPromises.writeFile(registryFile(), malformed);
-      const { plugins } = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+      const { plugins } = await discoverAgentPlugins([
+        { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+      ]);
       expect(plugins).toHaveLength(1);
       expect((await loadPluginMcpServers(plugins[0], { xumHome: muxRoot })).servers).toEqual({});
       expect((await service.getComponentsResult({ name: "demo-plugin" })).success).toBe(false);
@@ -488,7 +492,9 @@ describe("AgentPluginInstallService", () => {
       expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(malformed);
     }
     await fsPromises.writeFile(registryFile(), saved);
-    const { plugins } = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    const { plugins } = await discoverAgentPlugins([
+      { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+    ]);
     expect(
       Object.keys((await loadPluginMcpServers(plugins[0], { xumHome: muxRoot })).servers)
     ).toHaveLength(1);
@@ -512,7 +518,11 @@ describe("AgentPluginInstallService", () => {
     const reads = spyOn(fsPromises, "readFile");
     try {
       expect(
-        (await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }])).plugins
+        (
+          await discoverAgentPlugins([
+            { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+          ])
+        ).plugins
       ).toHaveLength(3);
       expect(reads.mock.calls.filter(([file]) => file === registryFile())).toHaveLength(1);
     } finally {
@@ -573,7 +583,9 @@ describe("AgentPluginInstallService", () => {
       expect(await fsPromises.readFile(path.join(stagingDir(), "mutation-epoch"), "utf8")).toBe(
         epoch
       );
-      const { plugins } = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+      const { plugins } = await discoverAgentPlugins([
+        { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+      ]);
       expect((await loadPluginMcpServers(plugins[0], { xumHome: muxRoot })).servers).toEqual({});
     } finally {
       writeSpy.mockRestore();
@@ -1638,7 +1650,9 @@ describe("AgentPluginInstallService", () => {
     // The barrier makes a discovery scan issued IMMEDIATELY after
     // construction wait for the recovery pass, so the orphan can never
     // surface — its hooks/servers would otherwise load on the next request.
-    const { plugins } = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    const { plugins } = await discoverAgentPlugins([
+      { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+    ]);
     expect(plugins.find((plugin) => plugin.dirName === "demo-plugin")).toBeUndefined();
 
     expect(await pathExists(targetPath)).toBe(false);
@@ -1713,7 +1727,9 @@ describe("AgentPluginInstallService", () => {
     await fsPromises.writeFile(registryFile(), "{ not json");
 
     const freshService = new AgentPluginInstallService(config, { isEnabled: () => true });
-    const suppressed = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    const suppressed = await discoverAgentPlugins([
+      { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+    ]);
     expect(suppressed.plugins).toEqual([]);
     expect(
       suppressed.diagnostics.some((diagnostic) => diagnostic.message.includes("crash recovery"))
@@ -1723,7 +1739,9 @@ describe("AgentPluginInstallService", () => {
     // re-opens the container for discovery.
     await fsPromises.writeFile(registryFile(), goodRegistry);
     await freshService.list();
-    const reopened = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    const reopened = await discoverAgentPlugins([
+      { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+    ]);
     expect(reopened.plugins.map((plugin) => plugin.dirName)).toEqual(["demo-plugin"]);
   });
 
@@ -1905,7 +1923,9 @@ describe("AgentPluginInstallService", () => {
     // And the unconsumed journal keeps the discovery gate CLOSED: recovery
     // "succeeding" while a journal is retained would scan the managed
     // container over the unresolved collision.
-    const suppressed = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    const suppressed = await discoverAgentPlugins([
+      { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+    ]);
     expect(suppressed.plugins).toEqual([]);
     expect(
       suppressed.diagnostics.some((diagnostic) => diagnostic.message.includes("crash recovery"))
@@ -1994,7 +2014,9 @@ describe("AgentPluginInstallService", () => {
     const journalPath = path.join(stagingDir(), "promotion-demo-plugin.json");
     expect(await pathExists(journalPath)).toBe(true);
     expect(await pathExists(targetPath)).toBe(true);
-    const suppressed = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+    const suppressed = await discoverAgentPlugins([
+      { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+    ]);
     expect(suppressed.plugins).toEqual([]);
 
     // Once the lock clears, reconciliation identifies the orphan by nonce,
@@ -2026,7 +2048,9 @@ describe("AgentPluginInstallService", () => {
       const freshService = new AgentPluginInstallService(config, { isEnabled: () => true });
       await (freshService as unknown as { reconciliationState: Promise<boolean> })
         .reconciliationState;
-      const suppressed = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+      const suppressed = await discoverAgentPlugins([
+        { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+      ]);
       expect(suppressed.plugins).toEqual([]);
       expect(
         suppressed.diagnostics.some((diagnostic) => diagnostic.message.includes("crash recovery"))
@@ -2052,7 +2076,9 @@ describe("AgentPluginInstallService", () => {
     );
     setAgentPluginDiscoveryGate(journalDerivedDiscoveryGate);
     try {
-      const suppressed = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+      const suppressed = await discoverAgentPlugins([
+        { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+      ]);
       expect(suppressed.plugins).toEqual([]);
       expect(
         suppressed.diagnostics.some((diagnostic) => diagnostic.message.includes("crash recovery"))
@@ -2060,7 +2086,9 @@ describe("AgentPluginInstallService", () => {
 
       // Without journals the default gate suppresses nothing.
       await fsPromises.rm(journalPath);
-      const reopened = await discoverAgentPlugins([{ path: pluginsDir(), scope: "global" }]);
+      const reopened = await discoverAgentPlugins([
+        { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+      ]);
       expect(reopened.plugins.map((plugin) => plugin.dirName)).toEqual(["demo-plugin"]);
     } finally {
       // The next test's beforeEach constructs a fresh service, which

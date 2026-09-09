@@ -42,9 +42,11 @@ import { getBuiltInSkillByName, getBuiltInSkillDescriptors } from "./builtInSkil
 import type { ProjectSkillContainment } from "./skillStorageContext";
 import {
   discoverAgentPlugins,
+  type AgentPluginContainer,
   readPluginFileWithinRootCapped,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
 } from "@/node/services/agentPlugins/discovery";
+import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   getCanonicalProjectMetadataRelativePath,
@@ -214,6 +216,7 @@ interface AgentSkillScanCandidate {
 async function buildPluginScanCandidates(args: {
   containers: string[];
   scope: "project" | "global";
+  managedHome?: string;
   workspacePath: string;
   /**
    * Project scope: plugin roots must additionally stay inside the project
@@ -227,13 +230,19 @@ async function buildPluginScanCandidates(args: {
   }
 
   const localRuntime = new LocalRuntime(args.workspacePath);
-  const resolvedContainers: Array<{ path: string; scope: "project" | "global" }> = [];
+  const managedHome =
+    args.managedHome !== undefined ? await localRuntime.resolvePath(args.managedHome) : undefined;
+  const resolvedContainers: AgentPluginContainer[] = [];
   for (const container of args.containers) {
     try {
       // Container paths may be tilde-form (e.g. ~/.agents/plugins).
+      const resolvedPath = await localRuntime.resolvePath(container);
       resolvedContainers.push({
-        path: await localRuntime.resolvePath(container),
+        path: resolvedPath,
         scope: args.scope,
+        ...(managedHome !== undefined && resolvedPath === path.join(managedHome, "plugins")
+          ? { registryPath: path.join(managedHome, PLUGIN_REGISTRY_FILE_NAME) }
+          : {}),
       });
     } catch (err) {
       log.warn(`Failed to resolve plugin container ${container}: ${getErrorMessage(err)}`);
@@ -299,6 +308,8 @@ async function buildScanCandidates(
     containers: roots.globalPluginRoots ?? [],
     scope: "global",
     workspacePath,
+    // The global skills root identifies the configured Xum home; universal roots are unmanaged.
+    ...(roots.globalRoot ? { managedHome: path.dirname(roots.globalRoot) } : {}),
   });
 
   return [

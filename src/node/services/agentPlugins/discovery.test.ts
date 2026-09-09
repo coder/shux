@@ -89,6 +89,51 @@ describe("discoverAgentPlugins", () => {
     expect(result.diagnostics).toEqual([]);
   });
 
+  test.each([
+    "{",
+    JSON.stringify({
+      plugins: [{ name: "shared", importedComponents: { skills: [], mcpServers: [] } }],
+    }),
+  ])("ignores an unmanaged global container's sibling registry (%s)", async (unmanagedRegistry) => {
+    using tmp = new DisposableTempDir("agent-plugins-registry-scope");
+    const xumHome = path.join(tmp.path, "xum");
+    const managed = path.join(xumHome, "plugins");
+    const universal = path.join(tmp.path, ".agents", "plugins");
+    for (const container of [managed, universal]) {
+      await writePlugin(container, "shared", { skills: ["greet"], mcpJson: "{}" });
+    }
+    const selection = { skills: ["greet"], mcpServers: [] };
+    await fs.writeFile(
+      path.join(xumHome, "plugins.json"),
+      JSON.stringify({ plugins: [{ name: "shared", importedComponents: selection }] })
+    );
+    await fs.writeFile(path.join(path.dirname(universal), "plugins.json"), unmanagedRegistry);
+    const containers = computeAgentPluginContainers({ xumHome, projectTrusted: false }).map(
+      (container) => ({ ...container, path: container.path === managed ? managed : universal })
+    );
+    const { plugins } = await discoverAgentPlugins(containers);
+    expect(plugins).toHaveLength(2);
+    expect(plugins.find((plugin) => plugin.containerPath === managed)?.importedComponents).toEqual(
+      selection
+    );
+    expect(
+      plugins.find((plugin) => plugin.containerPath === universal)?.importedComponents
+    ).toBeUndefined();
+
+    await fs.writeFile(path.join(xumHome, "plugins.json"), "{");
+    const corrupted = await discoverAgentPlugins(containers);
+    expect(corrupted.plugins).toHaveLength(2);
+    expect(
+      corrupted.plugins.find((plugin) => plugin.containerPath === managed)?.importedComponents
+    ).toEqual({
+      skills: [],
+      mcpServers: [],
+    });
+    expect(
+      corrupted.plugins.find((plugin) => plugin.containerPath === universal)?.importedComponents
+    ).toBeUndefined();
+  });
+
   test("discovers agents/ and workflows/ component directories", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");

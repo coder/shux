@@ -154,6 +154,8 @@ export interface AgentPluginContainer {
   /** Absolute host path of the container directory (e.g. `<projectRoot>/.xum/plugins`). */
   path: string;
   scope: AgentPluginScope;
+  /** Only Xum's managed container owns an install registry; other global roots do not. */
+  registryPath?: string;
 }
 
 export interface AgentPluginInfo {
@@ -436,7 +438,11 @@ export function computeAgentPluginContainers(args: {
       { path: path.join(args.projectRoot, ".agents", "plugins"), scope: "project" }
     );
   }
-  containers.push({ path: path.join(args.xumHome, "plugins"), scope: "global" });
+  containers.push({
+    path: path.join(args.xumHome, "plugins"),
+    scope: "global",
+    registryPath: path.join(args.xumHome, PLUGIN_REGISTRY_FILE_NAME),
+  });
   containers.push({ path: path.join(os.homedir(), ".agents", "plugins"), scope: "global" });
   return containers;
 }
@@ -622,10 +628,8 @@ export async function discoverAgentPlugins(
     }
 
     const imports =
-      container.scope === "global"
-        ? await readPluginComponentImports(
-            path.join(path.dirname(container.path), PLUGIN_REGISTRY_FILE_NAME)
-          )
+      container.registryPath !== undefined
+        ? await readPluginComponentImports(container.registryPath)
         : undefined;
     const projectMetadataIndex =
       container.scope === "project"

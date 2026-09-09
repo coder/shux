@@ -2769,7 +2769,7 @@ export class AgentPluginInstallService {
 
     const registry = await this.readRegistry("lenient");
     const containers: AgentPluginContainer[] = [
-      { path: this.containerDir, scope: "global" },
+      { path: this.containerDir, scope: "global", registryPath: this.registryFile },
       { path: path.join(os.homedir(), ".agents", "plugins"), scope: "global" },
     ];
     const { plugins } = await discoverAgentPlugins(containers);

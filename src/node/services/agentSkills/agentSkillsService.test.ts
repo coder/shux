@@ -1392,14 +1392,23 @@ describe("agentSkillsService agent plugins", () => {
         ],
       })
     );
+    const universal = path.join(tmp.path, ".agents", "plugins");
+    await writePlugin(universal, "unmanaged", [{ name: "universal", description: "unmanaged" }]);
+    await fs.writeFile(path.join(path.dirname(universal), "plugins.json"), "{");
     const runtime = new LocalRuntime(tmp.path);
     const roots = {
       projectRoot: "",
-      globalRoot: "",
+      // This directory need not exist for the sibling managed plugin imports to be enforced.
+      globalRoot: path.join(tmp.path, "skills"),
       universalRoot: "",
-      globalPluginRoots: [container],
+      globalPluginRoots: [container, universal],
     };
     const skills = await discoverAgentSkills(runtime, tmp.path, { roots });
+    expect(skills.find((s) => s.name === "universal")?.description).toBe("unmanaged");
+    expect(
+      (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("universal"), { roots }))
+        .package.frontmatter.description
+    ).toBe("unmanaged");
     expect(skills.find((s) => s.name === "allowed")?.description).toBe("selected");
     expect(skills.find((s) => s.name === "blocked")).toBeUndefined();
     expect(skills.find((s) => s.name === "shared")?.description).toBe("fallback");
@@ -1438,7 +1447,7 @@ describe("agentSkillsService agent plugins", () => {
       const runtime = new LocalRuntime(tmp.path);
       const roots = {
         projectRoot: "",
-        globalRoot: "",
+        globalRoot: path.join(tmp.path, "skills"),
         universalRoot: "",
         globalPluginRoots: [container],
       };
@@ -1459,7 +1468,7 @@ describe("agentSkillsService agent plugins", () => {
     const runtime = new LocalRuntime(tmp.path);
     const roots = {
       projectRoot: "",
-      globalRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
       universalRoot: "",
       globalPluginRoots: [container],
     };

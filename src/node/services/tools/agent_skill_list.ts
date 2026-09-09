@@ -16,6 +16,7 @@ import type { AgentSkillListToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
 import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
 import {
   discoverAgentSkills,
@@ -286,7 +287,11 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
                   },
                 ]
               : []),
-            { path: path.join(xumScope.xumHome, "plugins"), scope: "global" as const },
+            {
+              path: path.join(xumScope.xumHome, "plugins"),
+              scope: "global" as const,
+              registryPath: path.join(xumScope.xumHome, PLUGIN_REGISTRY_FILE_NAME),
+            },
             { path: path.join(userHome, ".agents", "plugins"), scope: "global" as const },
           ];
           const { plugins } = await discoverAgentPlugins(pluginContainers);
