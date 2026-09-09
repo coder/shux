@@ -1536,9 +1536,20 @@ describe("AgentSession token-budget lifecycle", () => {
       Promise.resolve(null)
     );
     const noop = () => Promise.resolve();
+    const previewStreamAccounting = mock(() => Promise.resolve(null));
+    const usageDelta = async () => {
+      h.aiEmitter.emit("usage-delta", {
+        type: "usage-delta",
+        workspaceId,
+        messageId: `assistant-${h.requests.length}`,
+        usage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+      });
+      // The forwarded handler awaits usage bookkeeping before previewing.
+      for (let i = 0; i < 3; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    };
     Reflect.set(h.session, "workspaceGoalService", {
       recordStreamAccounting,
-      previewStreamAccounting: noop,
+      previewStreamAccounting,
       recordStreamStarted: noop,
       recordUserStoppedStream: noop,
       applyPendingAfterStreamEnd: noop,
@@ -1557,6 +1568,8 @@ describe("AgentSession token-budget lifecycle", () => {
         })
       ).success
     ).toBe(true);
+    await usageDelta();
+    expect(previewStreamAccounting).toHaveBeenCalledTimes(1);
     expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
     await h.finishAndDispatch();
     expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
@@ -1566,6 +1579,9 @@ describe("AgentSession token-budget lifecycle", () => {
     // The flush row keeps the goal attribution (a restart re-derives the paired continuation's
     // goalKind/goalId from it), but the housekeeping stream itself is not goal work.
     expect((await allRows(h)).at(-1)?.metadata).toMatchObject({ kind: GOAL_CONTINUATION_KIND });
+    // Neither the live preview nor the final accounting sees the flush stream's usage.
+    await usageDelta();
+    expect(previewStreamAccounting).toHaveBeenCalledTimes(1);
     h.settleStream(1, { finishReason: "stop" });
     await h.waitForRequest(3);
     expect(completeGoal).not.toHaveBeenCalled();

@@ -418,6 +418,17 @@ describe("memory tool", () => {
       ).toBe(true);
     });
 
+    it("describes the pinned contract instead of the generic scopes/commands", async () => {
+      using pinned = await createFixture({ memoryWritePath: notes });
+      using generic = await createFixture();
+      const pinnedDescription = pinned.tool.description ?? "";
+      expect(pinnedDescription).not.toBe(generic.tool.description);
+      expect(pinnedDescription).toContain(notes);
+      // The generic contract's scope list and destructive commands do not apply in pinned mode.
+      expect(pinnedDescription).not.toContain("/memories/global/...");
+      expect(pinnedDescription).not.toMatch(/^- (delete|rename):/m);
+    });
+
     it("never fails on a stale existence verdict: create replaces, updates create", async () => {
       using fixture = await createFixture({ memoryWritePath: notes });
       // The prompt may have said "does not exist" while another writer created it meanwhile.

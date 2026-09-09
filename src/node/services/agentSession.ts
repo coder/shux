@@ -7855,6 +7855,11 @@ export class AgentSession {
     if (!this.workspaceGoalService) {
       return;
     }
+    // Housekeeping flush turns are excluded from goal accounting (see
+    // recordGoalAccountingFromUsage); their usage must not leak into the live preview either.
+    if (this.activeStreamContext?.contextBudgetFlushTurn === true) {
+      return;
+    }
     const displayUsage = createDisplayUsage(
       input.usage,
       input.model,

@@ -53,7 +53,20 @@ export function resolveMemoryAccessPolicy(options: {
  * to the base description when no snapshot was resolved.
  */
 function buildMemoryDescription(config: ToolConfiguration): string {
-  const baseDescription = TOOL_DEFINITIONS.memory.description;
+  // Pinned mode (context-budget final flush) inverts the generic contract: one path, one write,
+  // `create` replaces, updates create a missing file, no delete/rename. The model must not be
+  // told the opposite during its only preservation step.
+  const baseDescription =
+    config.memoryWritePath != null
+      ? `Persistent memory, pinned for this preservation step to ${config.memoryWritePath}: only that file may be viewed or written, and this request allows exactly one write. ` +
+        "Commands:\n" +
+        "- view: show the file with line numbers (offset/limit supported)\n" +
+        "- create: write the complete file (REPLACES existing contents)\n" +
+        "- str_replace: replace a unique occurrence of old_str with new_str (creates the file with new_str if it is missing)\n" +
+        "- insert: insert insert_text after line insert_line (0 = top; creates the file if it is missing)\n" +
+        "delete, rename, and every other path are refused. " +
+        `The resulting file is limited to ${CONTEXT_NOTES_RESERVED_BYTES} bytes (essential state first).`
+      : TOOL_DEFINITIONS.memory.description;
   if (config.memoryIndexEntries == null) {
     return baseDescription;
   }

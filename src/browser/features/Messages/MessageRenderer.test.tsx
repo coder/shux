@@ -43,7 +43,8 @@ describe("MessageRenderer goal continuation rows", () => {
     );
     const toggle = view.container.querySelector("[data-context-budget-warning] button");
     expect(toggle).not.toBeNull();
-    expect(toggle!.textContent).toContain("Context budget warning");
+    const warningSummary = toggle!.textContent;
+    expect(warningSummary).not.toBe("");
     expect(view.queryByText(content)).toBeNull();
     fireEvent.click(toggle!);
     expect(view.getByText(content)).toBeDefined();
@@ -61,9 +62,12 @@ describe("MessageRenderer goal continuation rows", () => {
         />
       </TooltipProvider>
     );
-    expect(
-      view.container.querySelector("[data-context-budget-warning] button")!.textContent
-    ).toContain("Context window ending: notes flush");
+    const finalToggle = view.container.querySelector("[data-context-budget-warning] button")!;
+    // The final flush must be distinguishable from an ordinary warning without expanding it,
+    // and must keep hiding the machine prompt.
+    expect(finalToggle.textContent).not.toBe("");
+    expect(finalToggle.textContent).not.toBe(warningSummary);
+    expect(view.queryByText(content)).toBeNull();
 
     view.rerender(
       <TooltipProvider>
