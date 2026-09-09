@@ -730,10 +730,14 @@ export class MemoryService extends EventEmitter {
     // Local edits notify here; edits by ANOTHER backend (multi-instance) are
     // caught by the config-file stamp check in resolveWorkspaceMemoryOwnerId.
     // The notification fires after the file write, so adopting the new stamp
-    // here keeps the next resolve from repeating the invalidation.
+    // here keeps the next resolve from repeating the invalidation — but only
+    // once the memo was actually rebuilt from the file: an unreadable file at
+    // notification time (a swallowed late write failure, an EACCES interval)
+    // keeps the old stamp so the next resolve retries, exactly like the
+    // stamp check in resolveWorkspaceMemoryOwnerId.
     this.config.onConfigChanged(() => {
-      this.workspaceMemoryOwnerConfigStamp = this.config.configFileStamp();
-      this.invalidateWorkspaceMemoryOwnerMemo();
+      const stamp = this.config.configFileStamp();
+      if (this.invalidateWorkspaceMemoryOwnerMemo()) this.workspaceMemoryOwnerConfigStamp = stamp;
     });
   }
 

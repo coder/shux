@@ -1198,6 +1198,32 @@ describe("MemoryService", () => {
       expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
     });
 
+    it("keeps the owner memo retryable when a local config edit notifies while the file is unreadable", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      // A local edit removes the owner. The change notification fires while
+      // the file cannot be read (a swallowed late write failure): the memo
+      // must not be stamped as current, or the stale mapping survives until
+      // an unrelated rewrite once readability returns without a stamp change.
+      const real = fixture.config.loadConfigOrDefault.bind(fixture.config);
+      const unreadable = spyOn(fixture.config, "loadConfigOrDefault").mockImplementation(
+        (options?: { throwOnError?: boolean }) => {
+          if (options?.throwOnError) throw new Error("EACCES: permission denied");
+          return { ...real(), projects: new Map() };
+        }
+      );
+      await fixture.config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          project.workspaces = project.workspaces.filter((ws) => ws.id !== "ws-owner");
+        }
+        return cfg;
+      });
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      unreadable.mockRestore();
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+    });
+
     it("advances the owner store's revision token on shared writes, visible to another backend", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
