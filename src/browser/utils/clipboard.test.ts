@@ -1,13 +1,16 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import { GlobalWindow } from "happy-dom";
 import { copyFormattedToClipboard } from "./clipboard";
 
 const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
 const originalClipboardItem = Object.getOwnPropertyDescriptor(globalThis, "ClipboardItem");
 
 afterEach(() => {
   for (const [key, descriptor] of [
     ["navigator", originalNavigator],
     ["ClipboardItem", originalClipboardItem],
+    ["document", originalDocument],
   ] as const) {
     if (descriptor) Object.defineProperty(globalThis, key, descriptor);
     else Reflect.deleteProperty(globalThis, key);
@@ -52,14 +55,70 @@ describe("copyFormattedToClipboard", () => {
     expect(writeText).toHaveBeenCalledWith("**selected**");
   });
 
-  test("reports a clipboard rejection instead of silently losing formatting", async () => {
+  test.each(["constructor", "write"])(
+    "falls back after a rich clipboard %s rejection",
+    async (stage) => {
+      const { write, writeText } = setup();
+      if (stage === "write") write.mockRejectedValueOnce(new Error("Permission denied"));
+      else
+        Object.defineProperty(globalThis, "ClipboardItem", {
+          configurable: true,
+          value: class {
+            constructor() {
+              throw new Error("Unsupported MIME type");
+            }
+          },
+        });
+      await copyFormattedToClipboard({ text: "**selected**", html: "<strong>selected</strong>" });
+      expect(writeText).toHaveBeenCalledWith("**selected**");
+    }
+  );
+
+  test("propagates a terminal plain-text rejection", async () => {
     const { write, writeText } = setup();
-    write.mockRejectedValueOnce(new Error("Permission denied"));
+    write.mockRejectedValueOnce(new Error("Rich write failed"));
+    writeText.mockRejectedValueOnce(new Error("Plain write failed"));
     const error = await copyFormattedToClipboard({
       text: "selected",
       html: "<p>selected</p>",
     }).catch((error: unknown) => error);
-    expect(error).toEqual(new Error("Permission denied"));
-    expect(writeText).not.toHaveBeenCalled();
+    expect(error).toEqual(new Error("Plain write failed"));
+    expect(writeText).toHaveBeenCalledWith("selected");
   });
+
+  test("uses writeText when write is unavailable", async () => {
+    const { writeText } = setup();
+    Reflect.deleteProperty(navigator.clipboard, "write");
+    await copyFormattedToClipboard({ text: "selected", html: "<p>selected</p>" });
+    expect(writeText).toHaveBeenCalledWith("selected");
+  });
+
+  test.each(["success", "false", "throw"])(
+    "legacy fallback reports %s and removes its textarea",
+    async (result) => {
+      setup();
+      Reflect.deleteProperty(navigator, "clipboard");
+      const document = new GlobalWindow().document;
+      Object.defineProperty(globalThis, "document", { configurable: true, value: document });
+      const copy = mock(() => {
+        expect(document.querySelector("textarea")?.value).toBe("**selected**");
+        if (result === "throw") throw new Error("Legacy copy failed");
+        return result === "success";
+      });
+      Object.defineProperty(document, "execCommand", { configurable: true, value: copy });
+      const copying = copyFormattedToClipboard({
+        text: "**selected**",
+        html: "<strong>selected</strong>",
+      });
+      if (result === "success") await copying;
+      else {
+        const error = await copying.catch((error: unknown) => error);
+        expect(error).toEqual(
+          new Error(result === "throw" ? "Legacy copy failed" : "Clipboard copy failed")
+        );
+      }
+      expect(copy).toHaveBeenCalledWith("copy");
+      expect(document.querySelector("textarea")).toBeNull();
+    }
+  );
 });

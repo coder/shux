@@ -1,10 +1,12 @@
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { StreamingContext } from "./StreamingContext";
 import { Mermaid, sanitizeMermaidSvg } from "./Mermaid";
 import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
 import MarkdownIt from "markdown-it";
+import { MarkdownRenderer } from "./MarkdownRenderer";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 
 const DEFAULT_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" /></svg>';
@@ -114,6 +116,61 @@ describe("Mermaid layout stability", () => {
     expect(parsed.querySelector("p")?.textContent).toBe("Before");
     expect(parsed.querySelector("code.language-mermaid")?.textContent?.trim()).toBe(chart);
     expect(parsed.textContent).not.toContain("After");
+  });
+
+  test("copies the displayed chart during pending and invalid streaming updates", async () => {
+    const first = "graph TD\nA-->B";
+    const next = "graph TD\nB-->C";
+    const renderContent = (chart: string) => (
+      <ThemeProvider forcedTheme="dark">
+        <StreamingContext.Provider value={{ isStreaming: true }}>
+          <div data-transcript-message>
+            <div data-transcript-quote-root>
+              <MarkdownRenderer content={"```mermaid\n" + chart + "\n```"} />
+            </div>
+          </div>
+        </StreamingContext.Provider>
+      </ThemeProvider>
+    );
+    const view = render(renderContent(first));
+    const copySource = () => {
+      const diagram = view.container.querySelector(".mermaid-container")!;
+      const range = document.createRange();
+      range.selectNodeContents(diagram);
+      const selection = window.getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const copied = getTranscriptContextMenuMarkdown({
+        transcriptRoot: view.container,
+        selection,
+        target: diagram,
+      })!;
+      const parsed = document.createElement("div");
+      parsed.innerHTML = new MarkdownIt().render(copied.text);
+      return parsed.querySelector("code.language-mermaid")?.textContent?.trim();
+    };
+    await waitFor(() => expect(view.container.querySelector("svg")).not.toBeNull());
+    expect(copySource()).toBe(first);
+    const pending = Promise.withResolvers<void>();
+    mermaidParse.mockImplementation(() => pending.promise);
+    view.rerender(renderContent(next));
+    expect(copySource()).toBe(first);
+    await waitFor(() => expect(mermaidParse).toHaveBeenCalledWith(next + "\n"));
+    expect(copySource()).toBe(first);
+    await act(async () => {
+      pending.reject(new Error("Incomplete diagram"));
+      await pending.promise.catch(() => undefined);
+    });
+    expect(copySource()).toBe(first);
+
+    mermaidParse.mockImplementation(() => Promise.resolve());
+    const third = "graph TD\nC-->D";
+    view.rerender(renderContent(third));
+    await waitFor(() => expect(copySource()).toBe(third));
+    const pasted = render(renderContent(copySource()!));
+    await waitFor(() =>
+      expect(pasted.container.querySelector(".mermaid-container svg")).not.toBeNull()
+    );
   });
 
   test("guest Escape cannot close an expanded host diagram", async () => {

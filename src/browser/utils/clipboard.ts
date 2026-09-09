@@ -17,8 +17,11 @@ export async function copyToClipboard(text: string): Promise<void> {
   textarea.style.opacity = "0";
   document.body.appendChild(textarea);
   textarea.select();
-  document.execCommand("copy");
-  document.body.removeChild(textarea);
+  try {
+    if (!document.execCommand("copy")) throw new Error("Clipboard copy failed");
+  } finally {
+    document.body.removeChild(textarea);
+  }
 }
 
 export interface FormattedClipboardContent {
@@ -29,13 +32,18 @@ export interface FormattedClipboardContent {
 /** Copy Markdown and rich text together so formatted paste works in Slack. */
 export async function copyFormattedToClipboard(content: FormattedClipboardContent): Promise<void> {
   if (navigator.clipboard?.write && typeof ClipboardItem !== "undefined") {
-    await navigator.clipboard.write([
-      new ClipboardItem({
-        "text/plain": new Blob([content.text], { type: "text/plain" }),
-        "text/html": new Blob([content.html], { type: "text/html" }),
-      }),
-    ]);
-    return;
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/plain": new Blob([content.text], { type: "text/plain" }),
+          "text/html": new Blob([content.html], { type: "text/html" }),
+        }),
+      ]);
+      return;
+    } catch {
+      // Some browsers expose rich clipboard APIs but reject their MIME types or permissions.
+      // Keep the selected Markdown available through the plain-text path.
+    }
   }
 
   await copyToClipboard(content.text);

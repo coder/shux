@@ -286,8 +286,11 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   const modalContainerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [svg, setSvg] = useState<string>("");
-  const lastValidSvgRef = useRef<string>("");
+  // Keep the source and SVG together while a newer chart is pending or invalid.
+  const [renderedDiagram, setRenderedDiagram] = useState<{ svg: string; chart: string } | null>(
+    null
+  );
+  const svg = renderedDiagram?.svg ?? "";
   const stableId = useId();
 
   // Debounce chart changes to avoid flickering during streaming
@@ -341,8 +344,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           throw new Error("Mermaid returned invalid SVG output");
         }
 
-        lastValidSvgRef.current = sanitizedSvg;
-        setSvg(sanitizedSvg);
+        setRenderedDiagram({ svg: sanitizedSvg, chart: debouncedChart });
         setError(null);
       } catch (err) {
         if (cancelled) return;
@@ -387,7 +389,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   // Keep one stable diagram frame while streaming or while the async Mermaid render is pending.
   // When no SVG has rendered yet, reserve the normal minimum diagram height so the transcript
   // doesn't expand from a short placeholder to a full diagram after debounce/parse/render.
-  const displaySvg = svg || (isStreaming ? lastValidSvgRef.current : "");
+  const displaySvg = svg;
   const showPendingPlaceholder = !displaySvg;
 
   return (
@@ -429,7 +431,9 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
         <div
           className="mermaid-container"
           ref={(element) => {
-            if (element) transcriptMermaidSources.set(element, chart);
+            if (!element) return;
+            if (renderedDiagram) transcriptMermaidSources.set(element, renderedDiagram.chart);
+            else transcriptMermaidSources.delete(element);
           }}
           style={{
             maxWidth: "70%",

@@ -104,15 +104,38 @@ describe("MarkdownRenderer raw HTML handling", () => {
     expect(pasted.container.querySelector("li .katex annotation")?.textContent).toBe("x^2");
   });
 
-  test("rendered Mermaid fences survive copying and parsing", () => {
-    const chart = "graph TD\nA-->B";
-    const { copied } = copyRenderedMarkdown("```mermaid\n" + chart + "\n```");
+  test.each([true, false])("footnote selection ends at visible text (complete=%s)", (complete) => {
+    const { view } = copyRenderedMarkdown("Text[^note].\n\n[^note]: Definition **content**");
+    const quoteRoot = view.container.querySelector<HTMLElement>("[data-transcript-quote-root]")!;
+    const end = quoteRoot.querySelector('li [data-streamdown="strong"]')!.firstChild!;
+    const range = document.createRange();
+    range.setStart(quoteRoot, 0);
+    range.setEnd(end, end.textContent!.length - (complete ? 0 : 1));
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const copied = getTranscriptContextMenuMarkdown({
+      transcriptRoot: view.container,
+      target: quoteRoot,
+      selection,
+    })!;
     const rich = document.createElement("div");
-    rich.innerHTML = copied!.html;
-    expect(rich.querySelector("pre code.language-mermaid")?.textContent?.trim()).toBe(chart);
-    const pasted = renderMarkdown(copied!.text);
-    expect(pasted.container.querySelector(".mermaid-container")).not.toBeNull();
-    expect(pasted.container.querySelector(".code-block-container")).toBeNull();
+    rich.innerHTML = copied.html;
+    const pasted = renderMarkdown(copied.text);
+    for (const root of [rich, pasted.container]) {
+      const reference = root.querySelector("sup a[href]");
+      if (complete) {
+        const definition = Array.from(root.querySelectorAll("[id]")).find(
+          (element) => "#" + element.id === reference?.getAttribute("href")
+        );
+        expect(definition?.textContent).toContain("Definition content");
+        expect(definition?.querySelector("a")?.getAttribute("href")).toBe("#" + reference!.id);
+      } else {
+        expect(reference).toBeNull();
+        expect(root.textContent).toContain("Definition conten");
+        expect(root.textContent).not.toContain("Definition content");
+      }
+    }
   });
 
   test("forged Mermaid metadata cannot replace selected visible text", () => {

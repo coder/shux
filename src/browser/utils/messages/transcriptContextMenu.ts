@@ -415,7 +415,8 @@ function appendClipboardNodes(
   source: Node,
   destination: Node,
   range: Range,
-  preserveSpanningTable = false
+  preserveSpanningTable = false,
+  collectFootnotes = true
 ): void {
   const document = destination.ownerDocument!;
   for (const child of source.childNodes) {
@@ -492,7 +493,7 @@ function appendClipboardNodes(
       for (const line of element.querySelectorAll(".code-line")) {
         if (!range.intersectsNode(line) || isClipboardElementHidden(line)) continue;
         const selectedLine = document.createElement("div");
-        appendClipboardNodes(line, selectedLine, range);
+        appendClipboardNodes(line, selectedLine, range, false, collectFootnotes);
         lines.push(selectedLine.textContent ?? "");
       }
       code.textContent = lines.join("\n");
@@ -511,17 +512,23 @@ function appendClipboardNodes(
       !CLIPBOARD_TAGS.has(tag) ||
       (tag === "details" && (!summary || !range.intersectsNode(summary)))
     ) {
-      appendClipboardNodes(element, destination, range, preserveSpanningTable);
+      appendClipboardNodes(element, destination, range, preserveSpanningTable, collectFootnotes);
       continue;
     }
     const copy = document.createElement(tag);
     // Carry selected footnote candidates until both sides of each relationship are known.
-    if ((tag === "li" && element.id) || element.hasAttribute("data-footnote-ref")) {
+    if (
+      collectFootnotes &&
+      ((tag === "li" && element.id) || element.hasAttribute("data-footnote-ref"))
+    ) {
+      // Generated backlinks and trailing whitespace do not belong to the definition selection.
       const contents = document.createRange();
       contents.selectNodeContents(element);
-      const fullySelected =
-        range.compareBoundaryPoints(range.START_TO_START, contents) <= 0 &&
-        range.compareBoundaryPoints(range.END_TO_END, contents) >= 0;
+      const fullCopy = document.createElement("div");
+      const selectedCopy = document.createElement("div");
+      appendClipboardNodes(element, fullCopy, contents, false, false);
+      appendClipboardNodes(element, selectedCopy, range, false, false);
+      const fullySelected = fullCopy.textContent?.trim() === selectedCopy.textContent?.trim();
       if (tag === "li" && fullySelected) copy.setAttribute("data-clipboard-source-id", element.id);
       if (tag === "a")
         copy.setAttribute(
@@ -553,7 +560,7 @@ function appendClipboardNodes(
     const keepTableStructure =
       preserveSpanningTable ||
       (tag === "table" && element.querySelector("[rowspan], [colspan]") !== null);
-    appendClipboardNodes(element, copy, range, keepTableStructure);
+    appendClipboardNodes(element, copy, range, keepTableStructure, collectFootnotes);
     // Range intersection includes empty boundary nodes. Keep only selected content or required structure.
     if (!copy.hasChildNodes() && !["br", "hr", "td", "th"].includes(tag)) continue;
     if (tag === "li" && source.nodeName === "OL" && destination.nodeName === "OL") {
