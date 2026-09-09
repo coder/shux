@@ -260,7 +260,13 @@ export function subscribeMemoryChanges(
           )
             return;
           if (event.scope === "project" && event.projectPath !== projectPath) return;
-          if (event.scope === "workspace") refreshStoreRevision();
+          // The token read below is asynchronous: it may absorb a foreign
+          // backend's write that landed after the client already refetched for
+          // this event, and the interval probe would then never announce it.
+          // Announcing the token once read (as the baseline handshake does)
+          // orders one more client refresh behind whatever the token saw; the
+          // cost is a redundant listing refetch per local mutation.
+          if (event.scope === "workspace") refreshStoreRevision({ announce: true });
           emit.push(event);
         };
         const onStatusChange = (event: MemoryConsolidationStatusChangeEventPayload) =>

@@ -91,6 +91,16 @@ test("memory subscriptions match workspace-scope events on the shared memory own
     memoryService.emit("change", marker);
     expect((await first).value).toEqual({ ...base, workspaceId: "ws-owner" });
     expect((await stream.next()).value).toEqual(marker);
+    // A workspace-scope event re-reads the store token asynchronously; the
+    // token is announced once read so a foreign write it may have absorbed is
+    // refetched too (see refreshStoreRevision in subscribeMemoryChanges).
+    expect((await stream.next()).value).toEqual({
+      scope: "workspace",
+      path: "/memories/workspace",
+      actor: "agent",
+      workspaceId: "ws-owner",
+      projectPath: "",
+    });
 
     // Ownership change for THIS workspace (owner removed): synthesized
     // root-addressed refresh + status refresh, now addressed to the new owner.

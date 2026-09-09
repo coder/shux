@@ -375,8 +375,9 @@ interface MemoryStore {
   ensureRoot(): Promise<void>;
   /** Relative paths of all non-dotfile files under the root, sorted. */
   /**
-   * Files under the root. Tolerant by default (self-healing: an unreadable
-   * directory lists as empty); `strict` throws on any traversal failure, for
+   * Files under the root. Tolerant and bounded by default (self-healing: an
+   * unreadable directory lists as empty; the walk stops past the per-scope
+   * cap); `strict` throws on any traversal failure and is unbounded, for
    * callers whose decision must not rest on a possibly partial listing.
    */
   listFiles(options?: { strict?: boolean }): Promise<string[]>;
@@ -418,13 +419,17 @@ const LEGACY_ADOPTION_MANIFEST_FILE_NAME = ".adopted-into-shared-store.json";
  * One adopted legacy file: content hash, child sidecar fingerprint, owner-store
  * relPath, and whether the adoption CREATED that owner file (provenance: only
  * such a copy may be removed again when the legacy source disappears; a
- * pre-existing identical owner note is the owner's own).
+ * pre-existing identical owner note is the owner's own). `pending`: written
+ * BEFORE the copy lands (provenance must not depend on the copy's existence: a
+ * retry finding the bytes already at the target could not tell an interrupted
+ * adoption from an owner note); cleared once the sidecar fold completed.
  */
 interface LegacyAdoptionRecord {
   content: string;
   sidecar: string;
   target: string;
   created?: boolean;
+  pending?: boolean;
 }
 
 function isLegacyAdoptionRecord(value: unknown): value is LegacyAdoptionRecord {
@@ -564,8 +569,11 @@ class LocalMemoryStore implements MemoryStore {
     const results: string[] = [];
     const walk = async (dirRel: string): Promise<void> => {
       // Bounded walk: files may have been edited outside MemoryService. +1 lets
-      // callers detect overflow (e.g. the index logs its truncation).
-      if (results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
+      // callers detect overflow (e.g. the index logs its truncation). Strict
+      // callers need the COMPLETE set (an omitted file would silently count
+      // as "nothing to adopt" and could lose its only copy), so the bound
+      // does not apply to them.
+      if (options?.strict !== true && results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
       let entries;
       try {
         entries = await fsPromises.readdir(this.abs(dirRel), { withFileTypes: true });
@@ -1323,6 +1331,10 @@ export class MemoryService extends EventEmitter {
       let capacityExhausted = false;
       let manifestDirty = false;
       let imported = 0;
+      const writeManifest = () =>
+        writeFileAtomic(manifestPath, JSON.stringify(Object.fromEntries(adopted)), {
+          encoding: "utf-8",
+        });
       for (const relPath of files) {
         // Same read gates as a memory command: containment (no symlink
         // escape), size cap, and text-only (a lossy utf-8 decode cannot be
@@ -1347,7 +1359,11 @@ export class MemoryService extends EventEmitter {
           created: false,
         };
         const previous = adopted.get(relPath);
-        if (previous?.content === record.content && previous.sidecar === record.sidecar) {
+        if (
+          previous?.content === record.content &&
+          previous.sidecar === record.sidecar &&
+          previous.pending !== true
+        ) {
           continue; // folded in earlier, nothing changed since
         }
         let target: { relPath: string; write: boolean } | null = null;
@@ -1399,6 +1415,18 @@ export class MemoryService extends EventEmitter {
               skipped++;
               continue;
             }
+            // Provenance BEFORE the copy: interrupted here (crash, or the
+            // sidecar fold below failing), the retry finds the owner file
+            // already identical and takes the no-write path — without this
+            // record it would read as the owner's own note, and a legacy
+            // deletion could then never follow it out of the shared store.
+            adopted.set(relPath, {
+              ...record,
+              target: target.relPath,
+              created: true,
+              pending: true,
+            });
+            await writeManifest();
             await store.writeFile(target.relPath, content);
             remainingCapacity--;
             imported++;
@@ -1418,7 +1446,11 @@ export class MemoryService extends EventEmitter {
         // changes its usage counters, which must not drag the owner's pin
         // back to the child's unchanged value.
         if (childEntry !== undefined) {
-          const priorPinned = previous === undefined ? null : legacySidecarPinned(previous.sidecar);
+          // A pending record's fold never ran: still a first adoption.
+          const priorPinned =
+            previous === undefined || previous.pending === true
+              ? null
+              : legacySidecarPinned(previous.sidecar);
           // Only an actual boolean transition of the child's pin overrides
           // the owner's; an unknown prior state never does.
           const childPinChanged = priorPinned !== null && priorPinned !== childEntry.pinned;
@@ -1502,11 +1534,7 @@ export class MemoryService extends EventEmitter {
         adopted.delete(relPath);
         manifestDirty = true;
       }
-      if (manifestDirty) {
-        await writeFileAtomic(manifestPath, JSON.stringify(Object.fromEntries(adopted)), {
-          encoding: "utf-8",
-        });
-      }
+      if (manifestDirty) await writeManifest();
       if (capacityExhausted) {
         log.warn(
           "[MemoryService] shared workspace notebook is full; legacy notes left in the sub-agent's private directory until space frees up",
@@ -1912,10 +1940,22 @@ export class MemoryService extends EventEmitter {
     // stamps (root mtime, per-file size + mtime; bounded by the per-scope
     // file cap): stat fingerprints are cache hints — enough to make a cached
     // context miss — never proof that authorizes any mutation.
+    // The owner-keyed sidecar entries (pins, usage) rank the shared hot set
+    // and are written by every backend; a pin whose revision write then
+    // failed (advanceStoreRevision is best-effort) is still visible here.
+    const ownerKeyPrefix = memoryLogicalKey("workspace", "", {
+      projectPath: "",
+      workspaceId: owner,
+    });
+    const ownerSidecar = JSON.stringify(
+      [...(await this.metaService.getEntries())]
+        .filter(([key]) => key.startsWith(ownerKeyPrefix))
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    );
     const token = `${revision === null ? "missing" : String(revision)}\u0000${await legacyStoreStamp(
       ownerSessionDir,
       workspaceMemoryStorePath(this.config.sessionsDir, owner)
-    )}`;
+    )}\u0000${ownerSidecar}`;
     // A redirected sub-agent's token also tracks its legacy private notebook
     // (see legacyAdoptionCheckKey): its next store access adopts the change,
     // so the cached context must miss as soon as the legacy state moves.

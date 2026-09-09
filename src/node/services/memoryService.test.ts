@@ -1278,6 +1278,16 @@ describe("MemoryService", () => {
       await fixture.service.setPinned(fixture.ctx, "/memories/workspace/shared.md", true);
       const afterPin = await foreign.workspaceMemoryRevision("ws-owner");
       expect(clockOf(afterPin)).toBeGreaterThan(clockOf(afterCreate));
+      // ...and an owner-keyed sidecar change whose clock write was lost (the
+      // revision write is best-effort; a downgraded build toggling the pin
+      // moves no clock either) still changes the token.
+      await fixture.metaService.setPinned(
+        memoryLogicalKey("workspace", "shared.md", { projectPath: "", workspaceId: "ws-owner" }),
+        false
+      );
+      const afterSidecarOnly = await foreign.workspaceMemoryRevision("ws-owner");
+      expect(afterSidecarOnly).not.toBe(afterPin);
+      expect(clockOf(afterSidecarOnly)).toBe(clockOf(afterPin));
       // ...while every shared-store mutation advances it.
       await fixture.service.strReplace(
         fixture.ctx,
@@ -1837,6 +1847,44 @@ describe("MemoryService", () => {
       await fixture.metaService.setPinned(childKey, true);
       await fixture.service.listIndexEntries({ ...fixture.ctx });
       expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+    });
+
+    it("keeps adoption provenance when the pass is interrupted between copy and manifest", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "child notes");
+      await fixture.metaService.setPinned(
+        memoryLogicalKey("workspace", "note.md", { projectPath: "", workspaceId: "ws-child" }),
+        true
+      );
+      // The copy lands, then the sidecar fold fails before the manifest
+      // records the adoption as complete.
+      const failing = spyOn(fixture.metaService, "mergeKeys").mockImplementationOnce(() =>
+        Promise.reject(new Error("sidecar unavailable"))
+      );
+      try {
+        await fixture.service.listIndexEntries({ ...fixture.ctx });
+      } finally {
+        failing.mockRestore();
+      }
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe(
+        "child notes"
+      );
+      // The retry finds identical bytes at the target (no-write path) and must
+      // still know this adoption created the copy...
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const manifest = JSON.parse(
+        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+      ) as Record<string, { created?: boolean; pending?: boolean }>;
+      expect(manifest["note.md"]).toMatchObject({ created: true });
+      expect(manifest["note.md"].pending).toBeUndefined();
+      // ...so a deletion on the downgraded build still follows it out.
+      await fsPromises.rm(path.join(legacyRoot, "note.md"));
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await pathExists(path.join(ownerRoot, "note.md"))).toBe(false);
     });
 
     it("keeps adopting a legacy note named __proto__ exactly once", async () => {
