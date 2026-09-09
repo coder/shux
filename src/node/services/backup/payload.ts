@@ -15,6 +15,8 @@ import {
   hasCredentialUrlParameters,
   isWindowsUnusableSegment,
   sanitizeBackupGitRemote,
+  type BackupContentFlag,
+  type BackupContents,
   type BackupProjectBundleEntry,
   type BackupProjectBundleManifest,
 } from "@/common/config/schemas/settingsBackup";
@@ -123,6 +125,7 @@ export interface BackupPayload {
 
 export interface CreateBackupPayloadOptions {
   muxRoot: string;
+  contents: BackupContents;
   preferences?: UserPreferences;
   muxVersion: string;
   sourceLabel: string;
@@ -138,6 +141,7 @@ export interface CreateBackupPayloadOptions {
 
 export interface RestoreBackupPayloadOptions {
   muxRoot: string;
+  contents: BackupContents;
   payload: BackupPayload;
   approvedCommandTokens?: readonly string[];
 }
@@ -200,12 +204,24 @@ function isOwnerOnlyPayloadPath(relativePath: string): boolean {
   return relativePath === "mcp.jsonc";
 }
 
+/** The content flag that selects a core payload path, or undefined when the path is not allowlisted. */
+function payloadPathContentFlag(relativePath: string): BackupContentFlag | undefined {
+  if (relativePath === "AGENTS.md") return "includeInstructions";
+  if (relativePath === "mcp.jsonc") return "includeMcp";
+  if (relativePath === "preferences.json") return "includePreferences";
+  if (/^agents\/[^/]+\.md$/.test(relativePath)) return "includeAgents";
+  if (/^skills\/.+/.test(relativePath)) return "includeSkills";
+  if (/^memory\/global\/.+/.test(relativePath)) return "includeGlobalMemory";
+  return undefined;
+}
+
 function isAllowedPayloadPath(relativePath: string): boolean {
-  if (relativePath === "AGENTS.md" || relativePath === "mcp.jsonc") return true;
-  if (relativePath === "preferences.json") return true;
-  if (/^agents\/[^/]+\.md$/.test(relativePath)) return true;
-  if (/^skills\/.+/.test(relativePath)) return true;
-  return /^memory\/global\/.+/.test(relativePath);
+  return payloadPathContentFlag(relativePath) !== undefined;
+}
+
+function isSelectedPayloadPath(relativePath: string, contents: BackupContents): boolean {
+  const flag = payloadPathContentFlag(relativePath);
+  return flag !== undefined && contents[flag];
 }
 
 function backupPathSegments(relativePath: string): string[] {
@@ -835,20 +851,24 @@ function createBackupFileCollector(root: BackupRoot) {
   };
 }
 
-export async function collectAllowlistedFiles(muxRoot: string): Promise<BackupFile[]> {
+/** The local files in the selected categories, for export and for the restore's local view. */
+export async function collectAllowlistedFiles(
+  muxRoot: string,
+  contents: BackupContents
+): Promise<BackupFile[]> {
   const root = await resolveRoot(muxRoot);
   const collector = createBackupFileCollector(root);
 
-  for (const relativePath of ["AGENTS.md", "mcp.jsonc"]) {
-    await collector.collectNamedFile(relativePath);
+  if (contents.includeInstructions) await collector.collectNamedFile("AGENTS.md");
+  if (contents.includeMcp) await collector.collectNamedFile("mcp.jsonc");
+  if (contents.includeAgents) {
+    await collector.collectDirectory(
+      "agents",
+      (relativePath, entry) => entry.isDirectory() || /^agents\/[^/]+\.md$/.test(relativePath)
+    );
   }
-
-  await collector.collectDirectory(
-    "agents",
-    (relativePath, entry) => entry.isDirectory() || /^agents\/[^/]+\.md$/.test(relativePath)
-  );
-  await collector.collectDirectory("skills", () => true);
-  await collector.collectDirectory("memory/global", () => true);
+  if (contents.includeSkills) await collector.collectDirectory("skills", () => true);
+  if (contents.includeGlobalMemory) await collector.collectDirectory("memory/global", () => true);
   collector.assertHardLinksContained();
   return collector.files.sort((a, b) => a.path.localeCompare(b.path));
 }
@@ -1151,10 +1171,9 @@ function isUnsupportedServerMap(value: unknown): boolean {
 /**
  * Fields Xum itself reads (`McpConfigService.normalizeEntry`), with the type it reads them as.
  * Anything else in the document, at any depth, is replaced with the marker: `normalizeEntry`
- * ignores an unrecognised field such as `env` or `args`, so nobody here can say whether its
- * value is a credential, and `{ "API_KEY": "hunter2" }` is not something a scanner can catch.
- * Restore puts the local value back at that exact path, so a field only Xum ignores is not
- * lost from a machine that already has it.
+ * ignores an unrecognised field such as `env` or `args`, so backing it up would publish a
+ * value nothing here uses. Restore puts the local value back at that exact path, so a field
+ * only Xum ignores is not lost from a machine that already has it.
  */
 const PORTABLE_SERVER_FIELDS: Record<string, (value: unknown) => boolean> = {
   command: (value) => typeof value === "string",
@@ -1164,6 +1183,39 @@ const PORTABLE_SERVER_FIELDS: Record<string, (value: unknown) => boolean> = {
   disabled: (value) => typeof value === "boolean",
   toolAllowlist: (value) => Array.isArray(value) && value.every((tool) => typeof tool === "string"),
 };
+
+/** The header shapes `normalizeEntry` reads: a literal value or a project-secret reference. */
+function isReadableHeaderValue(value: unknown): boolean {
+  return typeof value === "string" || isPortableReference(value);
+}
+
+/**
+ * The credential-bearing MCP fields the user can leave out of a backup. An excluded value is
+ * replaced with the marker rather than deleted, so a restore knows to keep the local value.
+ */
+export interface McpProjectionOptions {
+  includeHeaders: boolean;
+  includeCommands: boolean;
+}
+
+export function mcpProjectionOptions(contents: BackupContents): McpProjectionOptions {
+  return {
+    includeHeaders: contents.includeMcpHeaders,
+    includeCommands: contents.includeMcpCommands,
+  };
+}
+
+/** Refused rather than redacted: restore rejects this shape on every machine, including the one that wrote it. */
+function assertExportableMcpServers(content: Buffer): void {
+  const { parsed } = parseJsoncObjectWithTree(content.toString("utf-8"), "mcp.jsonc");
+  if (isUnsupportedServerMap(readOwn(parsed, "servers"))) {
+    throw new BackupInvalidPayloadError(
+      new Error(
+        "Cannot back up: mcp.jsonc lists servers as something other than an object. Fix the local file, then back up again."
+      )
+    );
+  }
+}
 
 /**
  * A jsonc edit keeps every comment, and a comment is prose the projection cannot inspect, so a
@@ -1198,7 +1250,10 @@ function valueHasRedactionAtPath(
   return typeof value === "string" && containsRedaction(value);
 }
 
-function redactMcpConfig(content: Buffer): {
+function redactMcpConfig(
+  content: Buffer,
+  options: McpProjectionOptions
+): {
   content: Buffer;
   redactionPaths: BackupRedactionPath[];
 } {
@@ -1231,24 +1286,16 @@ function redactMcpConfig(content: Buffer): {
     if (key !== "servers") redact([key]);
   }
 
-  const servers = readOwn(root, "servers");
-  // Refused rather than redacted: restore rejects this shape on every machine, including the
-  // one that wrote it, so redacting here would report a successful push for a backup that can
-  // never be restored.
-  if (isUnsupportedServerMap(servers)) {
-    throw new BackupInvalidPayloadError(
-      new Error(
-        "Cannot back up: mcp.jsonc lists servers as something other than an object. Fix the local file, then back up again."
-      )
-    );
-  }
-  const serverRecord = readRecord(servers);
+  const serverRecord = readRecord(readOwn(root, "servers"));
   if (!serverRecord) return finish();
 
   for (const serverName of objectKeyNames(tree, ["servers"])) {
     const rawServer = readOwn(serverRecord, serverName);
     // A bare string entry is the stdio command itself (`McpConfigService.normalizeEntry`).
-    if (typeof rawServer === "string") continue;
+    if (typeof rawServer === "string") {
+      if (!options.includeCommands) redact(["servers", serverName]);
+      continue;
+    }
     const server = readRecord(rawServer);
     if (!server) {
       redact(["servers", serverName]);
@@ -1264,24 +1311,28 @@ function redactMcpConfig(content: Buffer): {
       if (isPortableField) {
         // Read as the wrong type, `normalizeEntry` ignores it, which makes it another place
         // to hide a value nobody reads.
-        if (!isPortableField(value)) redact(fieldPath);
+        if (!isPortableField(value) || (field === "command" && !options.includeCommands)) {
+          redact(fieldPath);
+        }
         continue;
       }
       if (field === "headers") {
         const headers = readRecord(value);
-        if (!headers) {
+        // One marker for the whole object when headers are left out, so a restore puts the
+        // local headers back as a unit instead of only the names this backup happened to list.
+        if (!headers || !options.includeHeaders) {
           redact(fieldPath);
           continue;
         }
         for (const headerName of objectKeyNames(tree, fieldPath)) {
-          if (!isPortableReference(readOwn(headers, headerName))) {
+          if (!isReadableHeaderValue(readOwn(headers, headerName))) {
             redact([...fieldPath, headerName]);
           }
         }
         continue;
       }
-      // Xum ignores every other field, so its value may carry credentials under a shape this
-      // projection cannot classify. Restore uses only the local value at that exact path.
+      // Xum ignores every other field, so backing it up would only publish a value nothing
+      // reads. Restore uses the local value at that exact path.
       redact(fieldPath);
     }
   }
@@ -1404,7 +1455,13 @@ function urlHasCredentialComponents(rawUrl: string): boolean {
   );
 }
 
-function mcpConfigRequiresPublishApproval(content: string): boolean {
+/**
+ * The MCP values that commonly hold credentials and are published verbatim when selected: a
+ * stdio command (tokens in arguments or an env prefix), a URL with credential components, or a
+ * literal header value. A category the export left out holds only markers, so it is not
+ * reviewed; a `{secret: NAME}` reference names a secret without carrying it.
+ */
+function mcpConfigRequiresPublishApproval(content: string, options: McpProjectionOptions): boolean {
   const errors: jsonc.ParseError[] = [];
   const parsed = readRecord(jsonc.parse(content, errors));
   if (errors.length > 0 || !parsed) return false;
@@ -1414,10 +1471,20 @@ function mcpConfigRequiresPublishApproval(content: string): boolean {
     const serverRecord = readRecord(server);
     const command =
       typeof server === "string" ? server : serverRecord && readOwn(serverRecord, "command");
-    if (typeof command === "string" && command.trim() !== "") return true;
+    if (options.includeCommands && typeof command === "string" && command.trim() !== "") {
+      return true;
+    }
     if (!serverRecord) continue;
     const url = readOwn(serverRecord, "url");
     if (typeof url === "string" && urlHasCredentialComponents(url)) return true;
+    const headers = readRecord(readOwn(serverRecord, "headers"));
+    if (
+      options.includeHeaders &&
+      headers &&
+      Object.values(headers).some((value) => typeof value === "string")
+    ) {
+      return true;
+    }
   }
   return false;
 }
@@ -1436,12 +1503,18 @@ function isRecursivelyCollected(filePath: string): boolean {
  * Files a push must not publish until the user approves this exact payload. Not all of them
  * hold a secret: the structural cases are suspicion rather than detection.
  */
-export function scanBackupFilesForSecrets(files: readonly BackupFile[]): string[] {
+export function scanBackupFilesForSecrets(
+  files: readonly BackupFile[],
+  contents: BackupContents
+): string[] {
+  const mcpOptions = mcpProjectionOptions(contents);
   return files
     .filter((file) => {
       const content = file.content.toString("utf-8");
       if (SECRET_PATTERNS.some((pattern) => pattern.test(content))) return true;
-      if (file.path === "mcp.jsonc" && mcpConfigRequiresPublishApproval(content)) return true;
+      if (file.path === "mcp.jsonc" && mcpConfigRequiresPublishApproval(content, mcpOptions)) {
+        return true;
+      }
       // Every collected file, not just the recursive ones: `agents/` is collected by name and
       // its `.md` filter would otherwise auto-publish `agents/api-key.md`.
       if (hasCredentialPathHint(file.path)) return true;
@@ -1474,18 +1547,22 @@ export function backupSecretApprovalDigest(
 export async function createBackupPayload(
   options: CreateBackupPayloadOptions
 ): Promise<BackupPayload> {
-  const files = await collectAllowlistedFiles(options.muxRoot);
+  const files = await collectAllowlistedFiles(options.muxRoot, options.contents);
   const mcpRedactionPaths: BackupRedactionPath[] = [];
   const mcpFile = files.find((file) => file.path === "mcp.jsonc");
   if (mcpFile && options.keepLocalSecrets !== true) {
-    const redacted = redactMcpConfig(mcpFile.content);
+    // Redacting this shape would report a successful push for a backup no machine can restore.
+    assertExportableMcpServers(mcpFile.content);
+    const redacted = redactMcpConfig(mcpFile.content, mcpProjectionOptions(options.contents));
     mcpFile.content = redacted.content;
     mcpRedactionPaths.push(...redacted.redactionPaths);
   }
-  files.push({
-    path: "preferences.json",
-    content: serializeBackupPreferences(options.preferences),
-  });
+  if (options.contents.includePreferences) {
+    files.push({
+      path: "preferences.json",
+      content: serializeBackupPreferences(options.preferences),
+    });
+  }
   // Count and complexity only: this payload may be a local snapshot, whose names keep
   // current-filesystem forms that portable validation would refuse. Collection already
   // validated each name under local rules; publication re-checks with portable rules.
@@ -1494,7 +1571,7 @@ export async function createBackupPayload(
   files.sort((a, b) => a.path.localeCompare(b.path));
 
   if (options.reportSecrets !== true) {
-    const secretFiles = scanBackupFilesForSecrets(files);
+    const secretFiles = scanBackupFilesForSecrets(files, options.contents);
     if (secretFiles.length > 0) {
       throw new Error(`Backup contains possible secrets in: ${secretFiles.join(", ")}`);
     }
@@ -1852,6 +1929,45 @@ async function readBackupPayloadUnchecked(
     files,
     redactions: parsedMcp ? findMcpRedactionPaths(parsedMcp.tree).map(redactionPathLabel) : [],
   };
+}
+
+/**
+ * The part of a checked-out backup the current selection restores. Files outside the selected
+ * categories are left alone on this machine, and when MCP is selected without its headers or
+ * commands, the backup's `mcp.jsonc` gets the markers an export with this selection would
+ * carry, so the restore keeps this machine's values for them. Preview, approvals, and the
+ * restore all read the selected payload, so none of them can promise a different result.
+ */
+export function selectBackupContents(
+  payload: BackupPayload,
+  contents: BackupContents
+): BackupPayload {
+  const files = payload.files.filter((file) => isSelectedPayloadPath(file.path, contents));
+  const manifest: BackupManifest = {
+    ...payload.manifest,
+    files: payload.manifest.files.filter((file) => isSelectedPayloadPath(file.path, contents)),
+  };
+  let redactions = payload.redactions;
+  const mcpFile = files.find((file) => file.path === "mcp.jsonc");
+  const projection = mcpProjectionOptions(contents);
+  if (mcpFile && !(projection.includeHeaders && projection.includeCommands)) {
+    // A manifest without the list is read by marker text; listing the markers it already has
+    // keeps that reading once this pass adds paths of its own and the file is read by path.
+    const listed =
+      manifest.mcpRedactions ??
+      findMcpRedactionPaths(
+        parseJsoncObjectWithTree(mcpFile.content.toString("utf-8"), "backup mcp.jsonc").tree
+      );
+    const redacted = redactMcpConfig(mcpFile.content, projection);
+    files[files.indexOf(mcpFile)] = { ...mcpFile, content: redacted.content };
+    const merged = new Map<string, BackupRedactionPath>();
+    for (const jsonPath of [...listed, ...redacted.redactionPaths]) {
+      merged.set(redactionPathKey(jsonPath), jsonPath);
+    }
+    manifest.mcpRedactions = [...merged.values()];
+    redactions = manifest.mcpRedactions.map(redactionPathLabel);
+  }
+  return { manifest, files, redactions };
 }
 
 function containsRedaction(value: string): boolean {
@@ -2304,21 +2420,21 @@ function resolveRestoredCommands(
 }
 
 /**
- * A restored header value is only ever the local value at that exact path, or nothing.
+ * A literal header value the backup carries is restored as written: the user chose to back
+ * headers up, and anyone who can edit the repository could already read the value, so sending
+ * it to a url they chose exposes nothing new.
  *
- * `MCPServerManager.resolveHeaders` resolves both a literal header and a `{secret: NAME}`
- * reference against local data, then sends the result to whatever `url` the entry carries.
- * Deciding per value shape which ones are safe to carry over from a backup does not work:
- * a marker, a marker standing in for the whole `headers` object, a bare reference in a
- * marker-free file, and a reference the backup adds next to a url it chose are all the same
- * defect. So nothing the backup writes under `headers` survives unless the local file
- * already holds it at the same path, which makes the shape irrelevant.
+ * Everything else under `headers` resolves to the local value at that exact path, or nothing.
+ * `MCPServerManager.resolveHeaders` resolves a `{secret: NAME}` reference against local
+ * secrets, then sends the result to whatever `url` the entry carries, so a reference the
+ * backup adds next to a url it chose would exfiltrate a secret the repository never held. A
+ * marker stands for a value the backup left out. Neither survives unless the local file already
+ * holds that header, and only when the restored entry still points at the endpoint the local
+ * config sends it to; otherwise the header is dropped, leaving an entry that cannot
+ * authenticate rather than one that authenticates somewhere the user never approved.
  *
- * A local value is only put back when the restored entry still points at the endpoint the
- * local config already sends that header to. Otherwise the header is dropped, leaving an
- * entry that cannot authenticate rather than one that authenticates somewhere the user never
- * approved. Only header names the backup itself lists are considered, so a restore never
- * introduces a local header the backup did not have.
+ * A marker standing for the whole `headers` object (an export that left headers out) puts the
+ * entire local object back under the same endpoint rule.
  *
  * Returns the paths handled here so the generic redaction walk leaves them alone.
  */
@@ -2347,30 +2463,47 @@ function resolveRestoredHeaders(
     // by a path this function did not decide on.
     handled.add(headersPath.join("\u0000"));
 
-    const headers = readRecord(rawHeaders);
     const endpointMatches =
       restoredServerUrl(entry, localServer, name, redactedPaths) === readUrl(localServer);
-    if (!headers || !endpointMatches) {
+    const localHeaders = endpointMatches ? readRecord(localServer?.headers) : undefined;
+    if (
+      typeof rawHeaders === "string" &&
+      isRedactedBackupValue(rawHeaders, headersPath, redactedPaths)
+    ) {
+      edits.push({ path: headersPath, value: localHeaders });
+      continue;
+    }
+    const headers = readRecord(rawHeaders);
+    if (!headers) {
       edits.push({ path: headersPath, value: undefined });
       continue;
     }
 
-    const localHeaders = readRecord(localServer?.headers) ?? {};
     // Names come from the document, not the parsed object, because `jsonc.parse` drops a
     // `__proto__` key while the text keeps it. Enumerating the parse result would leave that
     // header, and its marker, untouched in the restored file.
-    const names = objectKeyNames(backupTree, ["servers", name, "headers"]);
+    const names = objectKeyNames(backupTree, headersPath);
     const restored: Record<string, unknown> = {};
     for (const headerName of names) {
-      if (!Object.hasOwn(localHeaders, headerName)) continue;
-      restored[headerName] = localHeaders[headerName];
+      const value = readOwn(headers, headerName);
+      if (
+        typeof value === "string" &&
+        !isRedactedBackupValue(value, [...headersPath, headerName], redactedPaths)
+      ) {
+        restored[headerName] = value;
+      } else if (localHeaders && Object.hasOwn(localHeaders, headerName)) {
+        restored[headerName] = localHeaders[headerName];
+      }
     }
 
     if (names.length !== Object.keys(restored).length) {
       // Something has to go: a header with no local counterpart, a duplicate key, or a name
       // the parser hides. Replacing the whole value is the only edit that reliably removes
       // it, since `jsonc.modify` cannot address a key it cannot see.
-      edits.push({ path: headersPath, value: restored });
+      edits.push({
+        path: headersPath,
+        value: Object.keys(restored).length > 0 ? restored : undefined,
+      });
       continue;
     }
     for (const [headerName, value] of Object.entries(restored)) {
@@ -2587,7 +2720,7 @@ export async function restoreBackupPayload(
   options: RestoreBackupPayloadOptions
 ): Promise<RestoreBackupPayloadResult> {
   const localPaths = new Set(
-    (await collectAllowlistedFiles(options.muxRoot)).map((file) => file.path)
+    (await collectAllowlistedFiles(options.muxRoot, options.contents)).map((file) => file.path)
   );
   const restoredPaths = new Set(
     options.payload.files

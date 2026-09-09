@@ -268,10 +268,71 @@ export type BackupProjectBundleEntry = z.infer<typeof BackupProjectBundleEntrySc
 export type BackupProjectBundleManifest = z.infer<typeof BackupProjectBundleManifestSchema>;
 
 /**
+ * What a backup carries, and what a restore writes; one selection governs both directions.
+ * Every flag is optional in config so an older config.json still loads; `resolveBackupContents`
+ * applies the defaults. Categories the user does not select are simply absent from the
+ * export and never written by a restore, which is how credential-bearing MCP fields (header
+ * values, stdio commands) stay out of a repository other people may read.
+ */
+const BackupContentFlagsSchema = z.object({
+  /** `AGENTS.md` */
+  includeInstructions: z.boolean().optional(),
+  /** `agents/*.md` */
+  includeAgents: z.boolean().optional(),
+  /** `skills/` */
+  includeSkills: z.boolean().optional(),
+  /** `memory/global/` */
+  includeGlobalMemory: z.boolean().optional(),
+  /** `mcp.jsonc`, limited to the fields Xum reads. */
+  includeMcp: z.boolean().optional(),
+  /** HTTP header values inside `mcp.jsonc`; excluded ones stay local. */
+  includeMcpHeaders: z.boolean().optional(),
+  /** stdio commands inside `mcp.jsonc`; excluded ones stay local. */
+  includeMcpCommands: z.boolean().optional(),
+  /** The portable subset of user preferences. */
+  includePreferences: z.boolean().optional(),
+  /**
+   * The project list and per-project memories as a `project-bundle/` sidecar, and restores
+   * of project content. Off by default, unlike the rest: project memories are private working
+   * notes and the project list reveals local paths.
+   */
+  includeProjects: z.boolean().optional(),
+});
+
+export type BackupContentFlag = keyof z.infer<typeof BackupContentFlagsSchema>;
+export type BackupContents = Record<BackupContentFlag, boolean>;
+
+export const BACKUP_CONTENT_DEFAULTS: BackupContents = {
+  includeInstructions: true,
+  includeAgents: true,
+  includeSkills: true,
+  includeGlobalMemory: true,
+  includeMcp: true,
+  includeMcpHeaders: true,
+  includeMcpCommands: true,
+  includePreferences: true,
+  includeProjects: false,
+};
+
+export const BACKUP_CONTENT_FLAGS: readonly BackupContentFlag[] =
+  BackupContentFlagsSchema.keyof().options;
+
+export function resolveBackupContents(
+  flags: Partial<Record<BackupContentFlag, boolean | undefined>>
+): BackupContents {
+  const resolved = { ...BACKUP_CONTENT_DEFAULTS };
+  for (const flag of BACKUP_CONTENT_FLAGS) {
+    const value = flags[flag];
+    if (typeof value === "boolean") resolved[flag] = value;
+  }
+  return resolved;
+}
+
+/**
  * The persisted schema extends the IPC input schema so config.json cannot hold a value
  * the `getSettings` response rejects, leaving the Backup screen unable to load saved settings.
  */
-export const SettingsBackupInputSchema = z.object({
+export const SettingsBackupInputSchema = BackupContentFlagsSchema.extend({
   repoUrl: z
     .string()
     .trim()
@@ -291,12 +352,6 @@ export const SettingsBackupInputSchema = z.object({
     .trim()
     .min(1, { message: "Enter a subdirectory inside the repository" })
     .refine(isValidBackupPath, { message: "Enter a subdirectory inside the repository" }),
-  /**
-   * Opt-in: also back up the project list and per-project memories as a `project-bundle/`
-   * sidecar, and allow restores to write project content. Off by default because project
-   * memories are private working notes and the project list reveals local paths.
-   */
-  includeProjects: z.boolean().optional(),
 });
 
 export const SettingsBackupSchema = SettingsBackupInputSchema.extend({
