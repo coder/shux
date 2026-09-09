@@ -741,6 +741,7 @@ export class MemoryConsolidationService extends EventEmitter {
           acceptedCandidates: 0,
           skippedCandidates: 0,
           error: reason,
+          refused: true,
         },
         projectPath
       )
@@ -1116,6 +1117,11 @@ export class MemoryConsolidationService extends EventEmitter {
       const boundaryKey = metadata.summaryMessageId;
       const sidecar = yield* self.loadEffect();
       const existing = sidecar.harvestsByWorkspace[metadata.workspaceId]?.[boundaryKey];
+      // An epoch refused earlier (terminal record) stays refused on every
+      // later trigger — recovery, a duplicate completion — sweep included.
+      if (existing?.refused === true) {
+        return Err(existing.error ?? "harvest of this epoch was refused (fail closed)");
+      }
       const existingAttemptCount = existing?.attemptCount ?? 0;
       const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
 
@@ -1160,11 +1166,19 @@ export class MemoryConsolidationService extends EventEmitter {
         // completed-record save rejecting — journals a failed record and
         // still falls through to the sweep, so the fold handles the error
         // channel AND defects identically.
+        // A refusal (policy never recorded for some turn of the epoch)
+        // already journaled its terminal record; re-journaling would make it
+        // retryable again. It also ends the run here, WITHOUT the owner sweep:
+        // the reasons the harvest is refused (an unaccounted turn, a stale
+        // grant) are exactly the reasons a model-driven Dream pass over the
+        // owner's shared notebook must not run on this epoch's behalf either.
+        const refused = { reason: null as string | null };
         const journalHarvestFailure = (error: unknown): Effect.Effect<void> =>
           Effect.gen(function* () {
-            // A refusal already journaled its terminal record; re-journaling
-            // would make it retryable again.
-            if (error instanceof HarvestRefusedError) return;
+            if (error instanceof HarvestRefusedError) {
+              refused.reason = error.message;
+              return;
+            }
             yield* self.saveHarvestRecordEffect(
               metadata.workspaceId,
               boundaryKey,
@@ -1196,6 +1210,7 @@ export class MemoryConsolidationService extends EventEmitter {
             removalSignal,
           })
           .pipe(Effect.catch(journalHarvestFailure), Effect.catchDefect(journalHarvestFailure));
+        if (refused.reason !== null) return Err(refused.reason);
       }
 
       // A sub-agent's inbox lives in the owner's store: wait on and run the

@@ -27,6 +27,7 @@ import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 
 export const WORKSPACE_MEMORY_DENY_MARKER_FILE_NAME = "memory-policy-deny.json";
 
@@ -95,19 +96,27 @@ export async function readWorkspaceMemoryDenyMarker(
  * accumulator to false until a destructive history clear.
  */
 export async function clearWorkspaceMemoryDenyMarker(
+  rootDir: string,
   sessionDir: string,
   options?: { closingEpoch: number }
 ): Promise<void> {
   const markerPath = workspaceMemoryDenyMarkerPath(sessionDir);
-  if (options !== undefined) {
-    const record = await readMarkerRecord(markerPath);
-    if (record === "absent") return;
-    if (record !== null && record.epoch !== null && record.epoch !== options.closingEpoch) return;
-  }
-  await fsPromises.rm(markerPath, { force: true });
-  if (await readWorkspaceMemoryDenyMarker(sessionDir)) {
-    throw new Error(`Workspace memory deny marker could not be removed at ${markerPath}`);
-  }
+  // Read-check-delete under the session-dir target lock the writer holds
+  // (WorkspaceService.recordWorkspaceMemoryWritable's fallback), so the fence
+  // cannot go stale between the read and the rm: a new-epoch deny written in
+  // that gap — possibly the only durable record of it — would otherwise be
+  // deleted right after its writer verified it.
+  await withTargetMutationLock(rootDir, sessionDir, async () => {
+    if (options !== undefined) {
+      const record = await readMarkerRecord(markerPath);
+      if (record === "absent") return;
+      if (record !== null && record.epoch !== null && record.epoch !== options.closingEpoch) return;
+    }
+    await fsPromises.rm(markerPath, { force: true });
+    if (await readWorkspaceMemoryDenyMarker(sessionDir)) {
+      throw new Error(`Workspace memory deny marker could not be removed at ${markerPath}`);
+    }
+  });
 }
 
 /**
@@ -115,14 +124,18 @@ export async function clearWorkspaceMemoryDenyMarker(
  * one (the tail copies were produced under it): a deny marker recorded for
  * `closingEpoch` is re-stamped with `nextEpoch` so readers of the new epoch
  * keep seeing it. Markers of other epochs and absent markers are left alone;
- * a malformed one stays a deny for every reader regardless.
+ * a malformed one stays a deny for every reader regardless. Same lock as the
+ * clear, for the same read→write reason.
  */
 export async function carryWorkspaceMemoryDenyMarker(
+  rootDir: string,
   sessionDir: string,
   closingEpoch: number,
   nextEpoch: number
 ): Promise<void> {
-  const record = await readMarkerRecord(workspaceMemoryDenyMarkerPath(sessionDir));
-  if (record === "absent" || record?.epoch !== closingEpoch) return;
-  await writeWorkspaceMemoryDenyMarker(sessionDir, nextEpoch);
+  await withTargetMutationLock(rootDir, sessionDir, async () => {
+    const record = await readMarkerRecord(workspaceMemoryDenyMarkerPath(sessionDir));
+    if (record === "absent" || record?.epoch !== closingEpoch) return;
+    await writeWorkspaceMemoryDenyMarker(sessionDir, nextEpoch);
+  });
 }

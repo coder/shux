@@ -1245,13 +1245,29 @@ describe("MemoryConsolidationService", () => {
       compactionEpoch: 1,
       compactionRequestMessageId: "compact-request",
     });
-    // The sweep still runs (success) while the harvest record is terminal
-    // (never completed, never retried), so recovery cannot replay the grant.
-    expect(result.success).toBe(true);
+    // Refused end to end: no sweep either (the Dream pass writes the shared
+    // notebook too), and the harvest record is terminal (never completed,
+    // never retried), so recovery cannot replay the grant.
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("never recorded");
+    expect(fixture.modelCalls).toHaveLength(0);
     const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
     expect(record?.status).toBe("failed");
     expect(record?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
     expect(record?.error).toContain("never recorded");
+    expect(record?.refused).toBe(true);
+    // A later trigger for the same boundary (recovery, duplicate completion)
+    // finds the terminal refusal and does not fall through to the sweep.
+    const again = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    expect(again.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
   });
 
   it("covers only a turn's own batch: a foreign row inside the request snapshot leaves the turn's own row uncovered", async () => {
@@ -1299,7 +1315,8 @@ describe("MemoryConsolidationService", () => {
       compactionEpoch: 1,
       compactionRequestMessageId: "compact-request",
     });
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
     const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
     expect(record?.status).toBe("failed");
     expect(record?.error).toContain("never recorded");
@@ -1339,7 +1356,8 @@ describe("MemoryConsolidationService", () => {
       compactionEpoch: 1,
       compactionRequestMessageId: "compact-request",
     });
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
     const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
     expect(record?.status).toBe("failed");
     expect(record?.error).toContain("never recorded");
@@ -1408,22 +1426,27 @@ describe("MemoryConsolidationService", () => {
           ? { previousBoundaryHistorySequence }
           : {}),
       });
-      expect(result.success).toBe(true);
       previousBoundaryHistorySequence = summary.metadata?.historySequence;
-      return (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+      return {
+        result,
+        record: (await fixture.service.getStatus("ws-dream")).latestHarvestRecord,
+      };
     };
     // Only one of the two adjacent snapshot rows is listed: the other is a
     // foreign row that merely sits next to the batch.
     const partial = await harvest({ listed: ["s1-snap-a"], summary: "s1" });
-    expect(partial?.status).toBe("failed");
-    expect(partial?.error).toContain("never recorded");
+    expect(partial.result.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
+    expect(partial.record?.status).toBe("failed");
+    expect(partial.record?.error).toContain("never recorded");
     // Both listed: the whole batch is the turn's own and harvests.
     const complete = await harvest({
       listed: ["s2-snap-a", "s2-snap-b"],
       summary: "s2",
       leadIn: true,
     });
-    expect(complete?.status).toBe("completed");
+    expect(complete.result.success).toBe(true);
+    expect(complete.record?.status).toBe("completed");
   });
 
   it("finalizes a removed workspace's retryable harvest records so they are never retried", async () => {

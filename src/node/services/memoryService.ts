@@ -419,6 +419,19 @@ function isLegacyAdoptionRecord(value: unknown): value is LegacyAdoptionRecord {
   );
 }
 
+/** Pin bit of a manifest record's child sidecar fingerprint (null when none was recorded). */
+function legacySidecarPinned(sidecar: string): boolean | null {
+  if (sidecar === "") return null;
+  try {
+    const parsed: unknown = JSON.parse(sidecar);
+    return typeof parsed === "object" && parsed !== null
+      ? ((parsed as { pinned?: unknown }).pinned ?? false) === true
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Self-healing read of the adoption manifest: anything malformed reads as not
  * adopted. A Map, not a plain object: a legacy note may legitimately be named
@@ -1323,9 +1336,14 @@ export class MemoryService extends EventEmitter {
         // succeeded, so an adoption interrupted after its writeFile (or a
         // failing sidecar write) retries this step on the next access. A
         // first adoption keeps the owner's own pin (a note the owner tracked
-        // independently); a sidecar the CHILD changed since its last
-        // adoption (downgrade-time pin/unpin) is the newer intent and wins.
+        // independently); a PIN the CHILD toggled since its last adoption
+        // (downgrade-time pin/unpin) is the newer intent and wins. Only the
+        // pin bit counts for that: a downgraded build merely viewing the note
+        // changes its usage counters, which must not drag the owner's pin
+        // back to the child's unchanged value.
         if (childEntry !== undefined) {
+          const childPinChanged =
+            previous !== undefined && legacySidecarPinned(previous.sidecar) !== childEntry.pinned;
           try {
             await this.metaService.mergeKeys(
               childKey,
@@ -1333,7 +1351,7 @@ export class MemoryService extends EventEmitter {
                 projectPath: ctx.projectPath,
                 workspaceId: owner,
               }),
-              { pinned: previous === undefined ? "target" : "source" }
+              { pinned: childPinChanged ? "source" : "target" }
             );
           } catch (error) {
             log.warn(

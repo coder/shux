@@ -1107,6 +1107,7 @@ export class AgentSession {
     // belongs to the closing epoch too. Same fence idea as below: a deny
     // recorded for the new epoch survives.
     await clearWorkspaceMemoryDenyMarker(
+      this.config.rootDir,
       path.join(this.config.sessionsDir, this.workspaceId),
       options
     );
@@ -1146,6 +1147,7 @@ export class AgentSession {
     nextEpoch: number
   ): Promise<void> {
     await carryWorkspaceMemoryDenyMarker(
+      this.config.rootDir,
       path.join(this.config.sessionsDir, this.workspaceId),
       closingEpoch,
       nextEpoch

@@ -1573,6 +1573,37 @@ describe("MemoryService", () => {
       ).toBe(true);
     });
 
+    it("keeps the owner's pin when a downgraded build only viewed the adopted note", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      const childKey = memoryLogicalKey("workspace", "note.md", {
+        projectPath: "",
+        workspaceId: "ws-child",
+      });
+      const ownerKey = memoryLogicalKey("workspace", "note.md", {
+        projectPath: "",
+        workspaceId: "ws-owner",
+      });
+      // Child had viewed it once on the old build (unpinned); adopted.
+      await fixture.metaService.recordAccess(childKey, { write: false });
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      // The owner pins the shared copy...
+      await fixture.metaService.setPinned(ownerKey, true);
+      // ...then the downgraded build merely views the legacy note again: the
+      // child sidecar changes (usage), its pin bit does not.
+      await fixture.metaService.recordAccess(childKey, { write: false });
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      // A pin the child actually toggles on the old build is the newer intent.
+      await fixture.metaService.setPinned(ownerKey, false);
+      await fixture.metaService.setPinned(childKey, true);
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+    });
+
     it("keeps adopting a legacy note named __proto__ exactly once", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

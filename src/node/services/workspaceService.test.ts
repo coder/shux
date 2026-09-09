@@ -6,6 +6,7 @@ import {
   writeWorkspaceMemoryDenyMarker,
 } from "@/node/services/workspaceMemoryDenyMarker";
 import { workspaceRemovalTombstonePath } from "@/node/services/workspaceRemoval";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -213,6 +214,23 @@ function createMockAIService(overrides: Partial<AIService> = {}): AIService {
   } as unknown as AIService;
 }
 
+/**
+ * Mock configs model no file on disk. Production requires an EXISTING
+ * config.json for removal's shared-memory handover and the memory policy
+ * accumulator (Config.loadExistingConfigOrThrow); for a mock that only
+ * provides loadConfigOrDefault, treat that snapshot as the existing file.
+ */
+function withExistingConfigLoader<T extends Partial<Config>>(config: T): T {
+  if (
+    typeof config.loadExistingConfigOrThrow !== "function" &&
+    typeof config.loadConfigOrDefault === "function"
+  ) {
+    const load = config.loadConfigOrDefault.bind(config);
+    return { ...config, loadExistingConfigOrThrow: () => load({ throwOnError: true }) };
+  }
+  return config;
+}
+
 function createWorkspaceServiceForTest(options: {
   config:
     | (Partial<Config> & { getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"] })
@@ -234,7 +252,7 @@ function createWorkspaceServiceForTest(options: {
   // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
   const defaultHistoryService: HistoryService = {} as HistoryService;
   return new WorkspaceService(
-    options.config as Config,
+    withExistingConfigLoader(options.config as Partial<Config>) as Config,
     options.historyService ?? defaultHistoryService,
     options.aiService ?? createMockAIService(),
     options.initStateManager ?? (mockInitStateManager as InitStateManager),
@@ -7376,7 +7394,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       getInitState: mock(() => null),
     } as unknown as InitStateManager;
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       aiService,
       initStateManager,
@@ -9388,10 +9406,10 @@ describe("WorkspaceService initialize", () => {
       // deny — heals it and the next epoch can become writable again.
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
-      await clearWorkspaceMemoryDenyMarker(sessionDir, { closingEpoch: -1 });
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: -1 });
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "{}");
-      await clearWorkspaceMemoryDenyMarker(sessionDir);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
       await realConfig.editConfig((cfg) => {
         const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
         delete entry.workspace.workspaceMemoryWritable;
@@ -9404,11 +9422,11 @@ describe("WorkspaceService initialize", () => {
       // The fenced clear (compaction boundary) keeps a deny recorded for the
       // NEW epoch; readers of any other epoch ignore that deny.
       await writeWorkspaceMemoryDenyMarker(sessionDir, 7);
-      await clearWorkspaceMemoryDenyMarker(sessionDir, { closingEpoch: -1 });
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: -1 });
       expect(await readWorkspaceMemoryDenyMarker(sessionDir, 7)).toBe(true);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir, -1)).toBe(false);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
-      await clearWorkspaceMemoryDenyMarker(sessionDir, { closingEpoch: 7 });
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: 7 });
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
 
       // The durable bit is bound to its epoch too: the closing epoch's
@@ -9532,7 +9550,25 @@ describe("WorkspaceService initialize", () => {
       );
       expect(persisted()).toBeUndefined();
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
-      await clearWorkspaceMemoryDenyMarker(sessionDir);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
+      // A MISSING config.json (mid-rewrite by another backend) is not a fresh
+      // install either: strict mode alone would read it as one and take the
+      // "unregistered" shortcut. Same fallback as unreadable.
+      const configFile = path.join(realConfig.rootDir, "config.json");
+      await fsPromises.rename(configFile, `${configFile}.parked`);
+      try {
+        expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+          false
+        );
+        expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false, EPOCH0)).toBe(
+          true
+        );
+        expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
+      } finally {
+        await fsPromises.rename(`${configFile}.parked`, configFile);
+      }
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
+      expect(persisted()).toBeUndefined();
 
       // A late deny reaching the marker fallback after the workspace was
       // removed (tombstoned, session dir deleted) must not recreate the
@@ -9558,6 +9594,34 @@ describe("WorkspaceService initialize", () => {
           () => false
         )
       ).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("the fenced deny-marker clear cannot delete a new-epoch deny written under the lock", async () => {
+    const { config: realConfig, cleanup } = await createTestHistoryService();
+    try {
+      const sessionDir = path.join(realConfig.sessionsDir, "policy-lock");
+      await writeWorkspaceMemoryDenyMarker(sessionDir, -1);
+      // Another backend's deny writer holds the session-dir lock while the
+      // boundary reset starts its read-check-delete: the reset must queue
+      // behind it and then see (and keep) the new epoch's marker.
+      let cleared = false;
+      let clear: Promise<void> | undefined;
+      await withTargetMutationLock(realConfig.rootDir, sessionDir, async () => {
+        clear = clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, {
+          closingEpoch: -1,
+        }).then(() => {
+          cleared = true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(cleared).toBe(false);
+        await writeWorkspaceMemoryDenyMarker(sessionDir, 5);
+      });
+      await clear;
+      expect(cleared).toBe(true);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 5)).toBe(true);
     } finally {
       await cleanup();
     }
@@ -11317,7 +11381,7 @@ describe("WorkspaceService pending auto-title", () => {
     };
 
     workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       aiService,
       mockInitStateManager as InitStateManager,
@@ -14256,7 +14320,7 @@ describe("WorkspaceService remove timing rollup", () => {
       };
 
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         aiService,
         mockInitStateManager as InitStateManager,
@@ -14683,7 +14747,7 @@ describe("WorkspaceService metadata listeners", () => {
     };
 
     new WorkspaceService(
-      mockConfig as Config,
+      withExistingConfigLoader(mockConfig) as Config,
       historyService,
       aiService,
       mockInitStateManager as InitStateManager,
@@ -14746,7 +14810,7 @@ describe("WorkspaceService metadata listeners", () => {
     };
 
     new WorkspaceService(
-      mockConfig as Config,
+      withExistingConfigLoader(mockConfig) as Config,
       historyService,
       aiService,
       mockInitStateManager as InitStateManager,
@@ -16599,7 +16663,7 @@ describe("WorkspaceService archive init cancellation", () => {
     } as unknown as AIService;
 
     const workspaceService = new WorkspaceService(
-      mockConfig as Config,
+      withExistingConfigLoader(mockConfig) as Config,
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -18773,7 +18837,7 @@ describe("WorkspaceService init cancellation", () => {
 
     try {
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager as InitStateManager,
@@ -18864,7 +18928,7 @@ describe("WorkspaceService init cancellation", () => {
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
       };
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager,
@@ -18940,7 +19004,7 @@ describe("WorkspaceService init cancellation", () => {
         findWorkspace: mock(() => null),
       };
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager,
@@ -19012,7 +19076,7 @@ describe("WorkspaceService init cancellation", () => {
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
       };
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager as InitStateManager,
@@ -19092,7 +19156,7 @@ describe("WorkspaceService init cancellation", () => {
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
       };
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager as InitStateManager,
@@ -19459,7 +19523,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -19589,7 +19653,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -19708,7 +19772,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -19821,7 +19885,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -19932,7 +19996,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -20042,7 +20106,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -20388,7 +20452,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
     const mockBackgroundProcessManager = {};
     const { historyService } = await createTestHistoryService();
     return new WorkspaceService(
-      mockConfig as Config,
+      withExistingConfigLoader(mockConfig) as Config,
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -20521,7 +20585,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       };
       const { historyService } = await createTestHistoryService();
       const service = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager as InitStateManager,
@@ -20755,7 +20819,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       const mockExtensionMetadataService = {};
       const mockBackgroundProcessManager = {};
       return new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager as InitStateManager,
@@ -21837,6 +21901,10 @@ describe("WorkspaceService disposal ownership", () => {
     async (externalRemoval) => {
       const h = await createAgentSessionHarness({ workspaceId: "leased-removal" });
       const workspaceId = "leased-removal";
+      // Removal requires an EXISTING config.json (an absent one reads as
+      // mid-rewrite, not as a fresh install); this workspace is simply not
+      // registered in it, exercising the phantom (metadata-less) path.
+      await h.config.editConfig((cfg) => cfg);
       const service = createWorkspaceServiceForTest({
         config: h.config,
         historyService: h.historyService,

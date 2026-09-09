@@ -116,6 +116,12 @@ export const MemoryHarvestRecordSchema = z.object({
   acceptedCandidates: z.number(),
   skippedCandidates: z.number(),
   error: z.string().optional(),
+  /**
+   * Terminal refusal (policy unknown/read-only, or a turn of the epoch never
+   * recorded its policy): unlike an exhausted failure, the epoch's owner
+   * notebook must not be swept on its behalf either.
+   */
+  refused: z.boolean().optional(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),
 });

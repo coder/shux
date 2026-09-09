@@ -1325,6 +1325,24 @@ export class Config {
     return { ids, hasWorkspaceEntriesWithoutIds };
   }
 
+  /**
+   * Strict load that additionally REQUIRES config.json to exist. The strict
+   * mode of loadConfigOrDefault still treats ENOENT as a fresh install (an
+   * empty, valid config), which fail-closed callers — workspace removal's
+   * shared-memory handover, the workspace-memory policy accumulator — must
+   * not mistake for "this workspace is not registered" while the file is
+   * merely mid-rewrite. Stat before and after the read: a file present at
+   * both is taken as present during it.
+   */
+  loadExistingConfigOrThrow(): ProjectsConfig {
+    const before = this.configFileStamp();
+    const config = this.loadConfigOrDefault({ throwOnError: true });
+    if (before === "missing" || this.configFileStamp() === "missing") {
+      throw new Error(`config.json is absent at ${this.configFile}`);
+    }
+    return config;
+  }
+
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {
     // Read as a Buffer and hand the same snapshot to the failure handler: backing up via a
     // second read could preserve a concurrent writer's replacement instead of the bytes that

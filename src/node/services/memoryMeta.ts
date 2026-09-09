@@ -306,6 +306,7 @@ export class MemoryMetaService {
     return Effect.gen(function* () {
       const stamp = yield* Effect.promise(() => self.fileStamp());
       if (self.cache !== null && stamp === self.cacheStamp) return self.cache;
+      let readFailed = false;
       const parsed = yield* Effect.tryPromise({
         try: async (): Promise<unknown> =>
           JSON.parse(await fsPromises.readFile(self.metaPath, "utf-8")),
@@ -315,12 +316,18 @@ export class MemoryMetaService {
           // Missing file is the normal first-run case; anything else is healed to empty.
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
             log.debug("[MemoryMetaService] healing unreadable sidecar", { error });
+            readFailed = true;
           }
           return Effect.succeed<unknown>(null);
         })
       );
       self.cache = sanitizeMetaFile(parsed);
-      self.cacheStamp = stamp;
+      // The stamp is remembered only for a real read (or a genuinely absent
+      // file): a transiently unreadable sidecar (EACCES interval, a writer
+      // mid-swap) heals to empty for THIS call, but caching that empty view
+      // under the file's unchanged stamp would keep serving it once readable
+      // again — and the next mutation would write the pins and stats away.
+      self.cacheStamp = readFailed ? null : stamp;
       return self.cache;
     });
   }

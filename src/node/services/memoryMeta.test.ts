@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, spyOn } from "bun:test";
 import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
@@ -45,6 +45,25 @@ describe("memoryLogicalKey", () => {
 });
 
 describe("MemoryMetaService", () => {
+  it("does not cache an empty view taken while the sidecar was unreadable", async () => {
+    using tempDir = new TestTempDir("test-memory-meta");
+    const service = new MemoryMetaService(tempDir.path);
+    await service.setPinned("global:prefs.md", true);
+    // Transient read failure (EACCES interval) with the file's stamp unchanged:
+    // this read heals to empty, but the next one must retry the file — not
+    // serve the empty view and then write it back over the real pins.
+    const reader = spyOn(fsPromises, "readFile").mockImplementationOnce((() =>
+      Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))) as never);
+    const reloaded = new MemoryMetaService(tempDir.path);
+    expect(await reloaded.getPinnedKeys()).toEqual(new Set());
+    reader.mockRestore();
+    expect(await reloaded.getPinnedKeys()).toEqual(new Set(["global:prefs.md"]));
+    await reloaded.setPinned("workspace:ws-1:scratch.md", true);
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md", "workspace:ws-1:scratch.md"])
+    );
+  });
+
   it("persists pins across instances via the sidecar file", async () => {
     using tempDir = new TestTempDir("test-memory-meta");
     const service = new MemoryMetaService(tempDir.path);

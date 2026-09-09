@@ -4242,7 +4242,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    */
   private loadConfigForRemovalOrAbort(workspaceId: string): ProjectsConfig {
     try {
-      return this.config.loadConfigOrDefault({ throwOnError: true });
+      // Existing file required: strict mode alone reads ENOENT as a fresh
+      // install, which would verify this child as its own owner mid-rewrite.
+      return this.config.loadExistingConfigOrThrow();
     } catch (error: unknown) {
       throw new SharedMemoryRemovalAbortedError(workspaceId, { cause: error });
     }
@@ -4323,20 +4325,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       session?.recordWorkspaceMemoryWritable(false);
       return true;
     };
-    // Strict load: a config.json that is missing or malformed right now reads
-    // as the fresh-install default, in which this still-registered workspace
-    // is absent — the "unregistered" shortcut below would then report a deny
-    // as durable without persisting anything, while another backend keeps a
-    // prior durable grant. Treat an unreadable config like a failed config
-    // write: the deny takes the session-dir fallback (tombstone-gated, so a
-    // genuinely deregistered workspace still skips), a grant leaves the
-    // harvest closed.
+    // Strict load of an EXISTING file: a config.json that is missing (strict
+    // mode alone reads ENOENT as a fresh install) or malformed right now
+    // reads as the fresh-install default, in which this still-registered
+    // workspace is absent — the "unregistered" shortcut below would then
+    // report a deny as durable without persisting anything, while another
+    // backend keeps a prior durable grant. Treat an unreadable config like a
+    // failed config write: the deny takes the session-dir fallback
+    // (tombstone-gated, so a genuinely deregistered workspace still skips), a
+    // grant leaves the harvest closed.
     let before: ReturnType<typeof findWorkspaceEntry>;
     try {
-      before = findWorkspaceEntry(
-        this.config.loadConfigOrDefault({ throwOnError: true }),
-        workspaceId
-      );
+      before = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), workspaceId);
     } catch (error: unknown) {
       log.error("Workspace memory write policy: config unreadable", {
         workspaceId,
@@ -4530,7 +4530,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         let persistedWritable: boolean | undefined;
         try {
           const entry = findWorkspaceEntry(
-            this.config.loadConfigOrDefault({ throwOnError: true }),
+            this.config.loadExistingConfigOrThrow(),
             workspaceId
           )?.workspace;
           persistedWritable =
