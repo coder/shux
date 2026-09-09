@@ -89,14 +89,38 @@ export function DesktopViewer(props: {
   workspaceId: string;
   onDetach?: () => void;
   onBringBack?: () => void;
-  attach?: (disconnect: () => void, disconnectAndWait: () => Promise<void>) => () => void;
+  attach?: (desktop: UseDesktopConnectionResult) => () => void;
   onStartupError?: () => void;
+  /** See UseDesktopConnectionOptions.nativeWindowCleanup. */
+  nativeWindowCleanup?: boolean;
+  /** See UseDesktopConnectionOptions.unmountKeepsGrace. */
+  unmountKeepsGrace?: () => boolean;
+  /**
+   * Mounted while the desktop is shown in a popout: do not connect; the popout coordinator
+   * registers the pane once it has confirmed a live child and resumes the connection when the
+   * desktop comes back.
+   */
+  suspended?: boolean;
+  /**
+   * Mounted while the popout coordinator is still reconciling (Electron `checking`): register
+   * as a viewer right away, without connecting. The manager lookup is a round trip during which
+   * nothing else would mark the pane attached, and an agent-driven archive could close the
+   * desktop the user just opened; a popout found meanwhile keeps this registration (a suspended
+   * inline pane behind a live child is attached too), and no popout resumes into it.
+   */
+  reserve?: boolean;
+  hidden?: boolean;
 }) {
-  const desktop = useDesktopConnection(props.workspaceId);
+  const desktop = useDesktopConnection(props.workspaceId, {
+    nativeWindowCleanup: props.nativeWindowCleanup,
+    unmountKeepsGrace: props.unmountKeepsGrace,
+  });
 
   useEffect(() => {
-    const detach = props.attach?.(desktop.disconnect, desktop.disconnectAndWait);
-    desktop.connect();
+    const detach = props.attach?.(desktop);
+    if (!props.suspended) desktop.connect();
+    // register() never rejects; it reports whether a lease exists, which nothing awaits here.
+    else if (props.reserve) void desktop.register();
     return detach;
     // disconnect handled by hook's own cleanup
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -108,7 +132,10 @@ export function DesktopViewer(props: {
   }, [desktop.state, onStartupError]);
 
   return (
-    <div className="bg-background @container flex h-full min-h-0 min-w-0 flex-col">
+    <div
+      className="bg-background @container flex h-full min-h-0 min-w-0 flex-col"
+      hidden={props.hidden}
+    >
       {desktop.sharedDesktop && (
         <div className="text-muted-foreground border-border shrink-0 truncate border-b px-3 py-1.5 text-xs">
           Shared desktop · {desktop.sharedDesktop.ownerName}
@@ -163,7 +190,7 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
   };
   const bringBack = () => {
     setActionError(null);
-    popout.bringBack();
+    popout.bringBack().catch(reportError);
   };
   const recover = () => {
     setActionError(null);
@@ -177,13 +204,26 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
           {snapshot.error ?? actionError}
         </p>
       ) : null}
-      {inline ? (
-        <DesktopViewer
-          workspaceId={props.workspaceId}
-          attach={(disconnect) => popout.attach(disconnect)}
-          onDetach={detach}
-        />
-      ) : (
+      {/* The viewer stays mounted (hidden) while detached so its viewer registration keeps the
+          pane attached across the inline↔popout handoff; otherwise nothing would mark the
+          desktop as in use between the source disconnecting and the destination registering,
+          and an agent-driven archive could close it mid-handoff. It also mounts while the
+          coordinator is still checking for a popout, reserving the pane (see `reserve`). */}
+      <DesktopViewer
+        workspaceId={props.workspaceId}
+        attach={(desktop) =>
+          popout.attach(desktop.suspend, desktop.connect, !inline, desktop.register)
+        }
+        // Unmounting while a popout is opening (or a confirmed child shows the desktop) is not
+        // this pane giving the desktop up: the child takes over, so leave the grace for the
+        // gap. A reservation abandoned while still checking for a popout is given up for good.
+        unmountKeepsGrace={() => popout.handoffInProgress()}
+        onDetach={detach}
+        suspended={!inline}
+        reserve={snapshot.state === "checking"}
+        hidden={!inline}
+      />
+      {inline ? null : (
         <div
           className="text-muted-foreground flex h-full flex-col items-center justify-center gap-3 p-4 text-center"
           onKeyDown={(event) => {

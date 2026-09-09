@@ -1,4 +1,7 @@
+import * as RealMarkdownCore from "./MarkdownCore";
+import * as RealSmoothStreaming from "@/browser/hooks/useSmoothStreamingText";
 import { cleanup, fireEvent, render } from "@testing-library/react";
+import { ReasoningMessage } from "./ReasoningMessage";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type React from "react";
 import { installDom } from "../../../../tests/ui/dom";
@@ -12,23 +15,33 @@ import type { AutoExpandPrefs } from "./useStickyExpand";
 // Streaming reasoning uses TypewriterMarkdown → useSmoothStreamingText, which drives
 // a RAF loop. happy-dom doesn't ship requestAnimationFrame, and we only care about
 // the reasoning collapse/transition behavior here, so stub the smooth engine out.
-void mock.module("@/browser/hooks/useSmoothStreamingText", () => ({
-  useSmoothStreamingText: (options: UseSmoothStreamingTextOptions) => ({
-    visibleText: options.fullText,
-    isCaughtUp: !options.isStreaming,
-  }),
-}));
+// Scope module mocks to each test so renderer assertions use the real pipeline.
+const realModules: Array<[string, Record<string, unknown>]> = [
+  ["./MarkdownCore", { ...RealMarkdownCore }],
+  ["@/browser/hooks/useSmoothStreamingText", { ...RealSmoothStreaming }],
+];
 
-// Streamdown's async markdown pipeline is heavy and not what we're testing here —
-// the layout-stability contract is independent of how the inner content is rendered.
-// A stand-in MarkdownCore keeps the text queryable and render times bounded.
-void mock.module("./MarkdownCore", () => ({
-  MarkdownCore: (props: { content: string }) => (
-    <div data-testid="markdown-core-stub">{props.content}</div>
-  ),
-}));
+async function installModuleMocks() {
+  await mock.module("@/browser/hooks/useSmoothStreamingText", () => ({
+    useSmoothStreamingText: (options: UseSmoothStreamingTextOptions) => ({
+      visibleText: options.fullText,
+      isCaughtUp: !options.isStreaming,
+    }),
+  }));
 
-import { ReasoningMessage } from "./ReasoningMessage";
+  // Streamdown's async markdown pipeline is heavy and not what we're testing here —
+  // the layout-stability contract is independent of how the inner content is rendered.
+  // A stand-in MarkdownCore keeps the text queryable and render times bounded.
+  await mock.module("./MarkdownCore", () => ({
+    MarkdownCore: (props: { content: string }) => (
+      <div data-testid="markdown-core-stub">{props.content}</div>
+    ),
+  }));
+}
+
+async function restoreModuleMocks() {
+  for (const [path, exports] of realModules) await mock.module(path, () => exports);
+}
 
 function createReasoningMessage(
   content: string,
@@ -60,12 +73,14 @@ function makeWrapper(workspaceId: string) {
 describe("ReasoningMessage", () => {
   let cleanupDom: (() => void) | null = null;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    await installModuleMocks();
     cleanupDom = installDom();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     cleanup();
+    await restoreModuleMocks();
     cleanupDom?.();
     cleanupDom = null;
   });

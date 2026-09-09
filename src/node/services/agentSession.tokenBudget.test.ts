@@ -1279,6 +1279,32 @@ describe("AgentSession token-budget lifecycle", () => {
     estimate: 127_000,
     hardCeiling: 119_808,
   };
+  test("an edited request can recover its own pre-handle budget overflow", async () => {
+    const h = await setup({ failure: (attempt) => (attempt === 1 ? exceeded : undefined) });
+    await seedHistory(h, 20_000);
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("edit-target", "user", "Original request")
+    );
+
+    expect(
+      (
+        await h.session.sendMessage("Edited request", {
+          ...options,
+          editMessageId: "edit-target",
+        })
+      ).success
+    ).toBe(true);
+    const retry = await h.secondRequest.promise;
+    expect(h.requests).toHaveLength(2);
+    const active = sliceMessagesForProviderFromLatestContextBoundary(retry.messages);
+    expect(
+      active.filter((row) => row.role === "user" && !row.metadata?.synthetic).map(text)
+    ).toEqual(["Edited request"]);
+    expect(active.some((row) => row.id === "old-answer")).toBe(false);
+    expect(rolloverRows(await allRows(h))).toHaveLength(1);
+  });
+
   test.each(
     (["file", "skill", "deduped-skill", "family"] as const).flatMap((kind) =>
       [false, true].flatMap((asyncFailure) =>

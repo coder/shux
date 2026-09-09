@@ -286,6 +286,9 @@ export const WorkspaceMetadataSchema = z.object({
 });
 
 export const FrontendWorkspaceMetadataSchema = WorkspaceMetadataSchema.extend({
+  rootWorkspaceId: z.string().optional().meta({
+    description: "Task-family root derived from complete metadata, including archived ancestors.",
+  }),
   namedWorkspacePath: z
     .string()
     .meta({ description: "Worktree path (uses workspace name as directory)" }),
@@ -389,4 +392,15 @@ export const GitStatusSchema = z.object({
   /** Line deltas for changes that exist on origin's primary branch but not locally */
   incomingAdditions: z.number(),
   incomingDeletions: z.number(),
+});
+
+export const WorkspaceRemovalDescendantSchema = z.object({
+  workspaceId: z.string(),
+  title: z.string(),
+  active: z.boolean(),
+});
+export const WorkspaceRemoveResultSchema = z.object({
+  success: z.boolean(),
+  error: z.string().optional(),
+  descendants: z.array(WorkspaceRemovalDescendantSchema).optional(),
 });

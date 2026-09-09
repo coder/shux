@@ -1,9 +1,12 @@
 import * as path from "path";
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
+import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createTestHistoryService } from "./testHistoryService";
+import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { updateSubagentTranscriptArtifactsFile } from "./subagentTranscriptArtifacts";
@@ -11,7 +14,9 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
+import * as atomicWrite from "write-file-atomic";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
+import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import {
   historyWriteLockPath,
   workspaceRemovalTombstonePath,
@@ -1033,7 +1038,7 @@ describe("HistoryService", () => {
       return service.rejectContextBudgetRequest(ws, latest.data[0]);
     }
 
-    async function capturePublication() {
+    async function capturePublication(effectiveThinkingLevel: "off" | "high" = "off") {
       const store = service.getContinuousCompactionJournal(ws);
       const journal: ContinuousCompactionJournal = {
         version: 1,
@@ -1054,7 +1059,7 @@ describe("HistoryService", () => {
         preparation: {
           modelString: "anthropic:claude-sonnet-4-5",
           providerForMessages: "anthropic",
-          effectiveThinkingLevel: "off",
+          effectiveThinkingLevel,
           effectiveAgentId: "exec",
           toolNamesForSentinel: [],
         },
@@ -1075,7 +1080,899 @@ describe("HistoryService", () => {
       return { store, receipt };
     }
 
+    async function deleteErroredPlaceholder(messageId: string) {
+      const history = await service.getHistoryFromLatestBoundary(ws);
+      assert(history.success);
+      const message = history.data.find((entry) => entry.id === messageId);
+      assert(message);
+      assert(
+        (
+          await service.writePartial(ws, {
+            ...message,
+            parts: [],
+            metadata: { ...message.metadata, error: "stream failed" },
+          })
+        ).success
+      );
+      return service.commitPartial(ws, messageId);
+    }
+
+    async function seedDeletionHistory(archive: MuxMessage[], chat: MuxMessage[]) {
+      assert((await service.appendManyToHistory(ws, [...archive, ...chat])).success);
+      // Complete lazy rotation, then model legacy layouts where the archive
+      // still contributes provider context, or chat retains sealed duplicates.
+      assert((await service.getHistoryFromLatestBoundary(ws)).success);
+      const chatPath = path.join(config.sessionsDir, ws, "chat.jsonl");
+      const archivePath = path.join(config.sessionsDir, ws, "chat-archive.jsonl");
+      const bytes = (messages: MuxMessage[]) =>
+        Buffer.from(messages.map((message) => messageLine(ws, message) + "\n").join(""));
+      await fs.writeFile(chatPath, bytes(chat));
+      await fs.writeFile(archivePath, bytes(archive));
+      return { chatPath, archivePath, bytes };
+    }
+
+    it.each(
+      ["user", "system"].flatMap((role) =>
+        ["single", "batch", "archive"].flatMap((method) =>
+          [
+            { newerFloor: "none", tail: false },
+            { newerFloor: "none", tail: true },
+            { newerFloor: "boundary", tail: true },
+            { newerFloor: "raw reset", tail: true },
+          ].map((scenario) => ({ role, method, ...scenario }))
+        )
+      )
+    )(
+      "$method deletion fences a readable $role reset floor (newer: $newerFloor, tail: $tail)",
+      async ({ role, method, newerFloor, tail }) => {
+        assert(role === "user" || role === "system");
+        const floor: MuxMessage = { ...reset(), role };
+        const source = [row("old"), floor];
+        const suffix = [
+          ...(newerFloor === "boundary" ? [boundary()] : []),
+          ...(tail ? [row("fresh")] : []),
+        ];
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(
+          method === "archive" ? source : [],
+          [...(method === "archive" ? [] : source), ...suffix]
+        );
+        if (newerFloor === "raw reset") {
+          await fs.writeFile(
+            chatPath,
+            Buffer.concat([
+              bytes(method === "archive" ? [] : source),
+              Buffer.from('{"metadata":{"contextBoundaryKind":"reset"}\n'),
+              bytes(suffix),
+            ])
+          );
+        }
+        const before = await service.getHistoryFromLatestBoundary(ws);
+        assert(before.success);
+        expect(before.data.map((message) => message.id)).toEqual(
+          suffix.map((message) => message.id)
+        );
+        const { store, receipt } = await capturePublication();
+        const untouchedPath = method === "archive" ? chatPath : archivePath;
+        const untouched = await fs.readFile(untouchedPath);
+        const result =
+          method === "batch"
+            ? await service.deleteMessages(ws, [floor.id])
+            : await service.deleteMessage(ws, floor.id);
+        expect(result.success).toBe(true);
+        expect(await fs.readFile(untouchedPath)).toEqual(untouched);
+        const after = await service.getHistoryFromLatestBoundary(ws);
+        assert(after.success);
+        expect(after.data.map((message) => message.id)).toEqual([
+          ...(newerFloor === "none" ? ["old"] : []),
+          ...suffix.map((message) => message.id),
+        ]);
+        const changed = newerFloor === "none";
+        expect((await store.captureGeneration()) !== receipt.publicationGeneration).toBe(changed);
+        const foreign = new HistoryService(config).getContinuousCompactionJournal(ws);
+        expect(
+          (await foreign.recordFallbackPrefix(
+            receipt,
+            { modelString: "anthropic:next", prefix },
+            () => true
+          )) !== null
+        ).toBe(!changed);
+      }
+    );
+
+    it.each(
+      ["contiguous", "token-separated"].flatMap((variant) =>
+        [false, true].map((readableDuplicate) => ({ variant, readableDuplicate }))
+      )
+    )(
+      "single deletion preserves an active protected $variant reset ID shared with archive (readable duplicate: $readableDuplicate)",
+      async ({ variant, readableDuplicate }) => {
+        const floor = {
+          ...(variant === "contiguous" ? reset() : createMuxMessage("reset", "assistant", "")),
+          contextBoundaryKind: 0,
+          padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES),
+          candidate: "reset",
+        };
+        const placeholder = createMuxMessage(floor.id, "assistant", "");
+        const fresh = row("fresh");
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(
+          [row(floor.id)],
+          [floor, ...(readableDuplicate ? [placeholder] : []), fresh]
+        );
+        const beforeChat = await fs.readFile(chatPath);
+        const beforeArchive = await fs.readFile(archivePath);
+        const { store, receipt } = await capturePublication();
+        expect((await service.deleteMessage(ws, floor.id)).success).toBe(readableDuplicate);
+        expect(await fs.readFile(chatPath)).toEqual(
+          readableDuplicate ? bytes([floor, fresh]) : beforeChat
+        );
+        expect(await fs.readFile(archivePath)).toEqual(beforeArchive);
+        expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+        expect(await store.read()).toEqual(receipt);
+      }
+    );
+
+    it.each(
+      ["oversized", "ambiguous"].flatMap((variant) =>
+        [false, true].flatMap((keepTargetMessage) =>
+          ["protected", "readable", "archive"].map((targetKind) => ({
+            variant,
+            keepTargetMessage,
+            targetKind,
+          }))
+        )
+      )
+    )(
+      "truncation keeps protected active identity ($variant, $targetKind, keep=$keepTargetMessage)",
+      async ({ variant, keepTargetMessage, targetKind }) => {
+        const target = row("target");
+        const floor = {
+          ...createMuxMessage(
+            targetKind === "archive" ? "other-protected" : target.id,
+            "assistant",
+            "",
+            variant === "oversized" ? { contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET } : {}
+          ),
+          ...(variant === "oversized" && { padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES) }),
+        };
+        const placeholder = createMuxMessage(target.id, "assistant", "");
+        const fresh = row("fresh");
+        const archive = [row("archive-before"), target, row("archive-after")];
+        const activeTail = [...(targetKind === "readable" ? [placeholder] : []), fresh];
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(archive, [
+          floor,
+          ...activeTail,
+        ]);
+        // Preserve duplicate metadata keys as raw evidence; parsing alone loses the reset.
+        const floorLine = messageLine(ws, floor) + "\n";
+        const rawFloor = Buffer.from(
+          variant === "ambiguous"
+            ? floorLine.replace(
+                '"metadata":',
+                '"metadata":{"contextBoundaryKind":"reset"},"metadata":'
+              )
+            : floorLine
+        );
+        await fs.writeFile(chatPath, Buffer.concat([rawFloor, bytes(activeTail)]));
+        const beforeChat = await fs.readFile(chatPath);
+        const beforeArchive = await fs.readFile(archivePath);
+        const { store, receipt } = await capturePublication();
+        const result = await service.truncateAfterMessage(ws, target.id, { keepTargetMessage });
+
+        expect(result.success).toBe(targetKind !== "protected");
+        if (targetKind === "protected") {
+          expect(await fs.readFile(chatPath)).toEqual(beforeChat);
+          expect(await fs.readFile(archivePath)).toEqual(beforeArchive);
+          expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+          expect(await store.read()).toEqual(receipt);
+        } else {
+          const retainedArchive =
+            targetKind === "archive" ? archive.slice(0, keepTargetMessage ? 2 : 1) : [];
+          const retainedActive =
+            targetKind === "readable" && keepTargetMessage ? [placeholder] : [];
+          expect(await fs.readFile(chatPath)).toEqual(
+            Buffer.concat([bytes(retainedArchive), rawFloor, bytes(retainedActive)])
+          );
+          if (targetKind === "archive") {
+            const archiveStat = await fs.stat(archivePath).catch((error: unknown) => error);
+            expect(archiveStat).toMatchObject({ code: "ENOENT" });
+          } else {
+            expect(await fs.readFile(archivePath)).toEqual(beforeArchive);
+          }
+          expect(await store.captureGeneration()).not.toBe(receipt.publicationGeneration);
+        }
+      }
+    );
+
+    it.each(
+      ["single", "batch", "archive"].flatMap((method) => [0, 1].map((extra) => ({ method, extra })))
+    )(
+      "$method deletion counts JSON bytes without the LF at the reset limit (+$extra)",
+      async ({ method, extra }) => {
+        const old = row("old");
+        const floor = { ...reset(), padding: "" };
+        const fresh = row("fresh");
+        const source = [old, floor, fresh];
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(
+          method === "archive" ? source : [],
+          method === "archive" ? [] : source
+        );
+        floor.padding = "x".repeat(
+          SESSION_HISTORY_MAX_LINE_BYTES + extra - Buffer.byteLength(messageLine(ws, floor))
+        );
+        expect(Buffer.byteLength(messageLine(ws, floor))).toBe(
+          SESSION_HISTORY_MAX_LINE_BYTES + extra
+        );
+        const targetPath = method === "archive" ? archivePath : chatPath;
+        const beforeBytes = bytes(source);
+        await fs.writeFile(targetPath, beforeBytes);
+        const before = await service.getHistoryFromLatestBoundary(ws);
+        assert(before.success);
+        expect(before.data.map((message) => message.id)).toEqual(
+          extra === 0 ? [floor.id, fresh.id] : [fresh.id]
+        );
+        const { store, receipt } = await capturePublication();
+        const result =
+          method === "batch"
+            ? await service.deleteMessages(ws, [floor.id])
+            : await service.deleteMessage(ws, floor.id);
+        expect(result.success).toBe(extra === 0);
+        expect(await fs.readFile(targetPath)).toEqual(
+          extra === 0 ? bytes([old, fresh]) : beforeBytes
+        );
+        const after = await service.getHistoryFromLatestBoundary(ws);
+        assert(after.success);
+        expect(after.data.map((message) => message.id)).toEqual(
+          extra === 0 ? [old.id, fresh.id] : [fresh.id]
+        );
+        expect((await store.captureGeneration()) !== receipt.publicationGeneration).toBe(
+          extra === 0
+        );
+      }
+    );
+
+    it.each(
+      [
+        "single delete",
+        "batch delete",
+        "archive delete",
+        "active truncation",
+        "archive truncation",
+        "prefix truncation",
+        "rename",
+        "protected-only rename",
+        "clear",
+      ].flatMap((method) => ["chat", "archive"].map((artifact) => ({ method, artifact })))
+    )(
+      "$method accounts for a retained protected sequence in $artifact after restart",
+      async ({ method, artifact }) => {
+        const target = row("target");
+        const fresh = row("fresh");
+        const floor = {
+          ...createMuxMessage("floor", "assistant", ""),
+          contextBoundaryKind: 0,
+          padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES),
+          candidate: "reset",
+        };
+        const archivedTarget = method.startsWith("archive");
+        const protectedOnly = method === "protected-only rename";
+        const archive = [
+          ...(archivedTarget ? [target] : []),
+          ...(artifact === "archive" ? [floor] : []),
+        ];
+        const chat = [
+          ...(!protectedOnly && !archivedTarget ? [target] : []),
+          ...(artifact === "chat" ? [floor] : []),
+          ...(protectedOnly ? [] : [fresh]),
+        ];
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(archive, chat);
+        floor.metadata = { ...floor.metadata, historySequence: 100 };
+        await fs.writeFile(
+          artifact === "chat" ? chatPath : archivePath,
+          bytes(artifact === "chat" ? chat : archive)
+        );
+        const floorBytes = bytes([floor]);
+        const restarted = new HistoryService(config);
+        let nextWorkspace = ws;
+        const result =
+          method === "single delete" || method === "archive delete"
+            ? await restarted.deleteMessage(ws, target.id)
+            : method === "batch delete"
+              ? await restarted.deleteMessages(ws, [target.id])
+              : method === "active truncation" || method === "archive truncation"
+                ? await restarted.truncateAfterMessage(ws, target.id, { keepTargetMessage: true })
+                : method === "prefix truncation"
+                  ? await restarted.truncateHistory(ws, 0.1)
+                  : method === "clear"
+                    ? await restarted.clearHistory(ws)
+                    : await (async () => {
+                        nextWorkspace = `${ws}-renamed`;
+                        await fs.rename(
+                          path.dirname(chatPath),
+                          path.join(config.sessionsDir, nextWorkspace)
+                        );
+                        return restarted.migrateWorkspaceId(ws, nextWorkspace);
+                      })();
+        expect(result.success).toBe(true);
+        const retainedBytes = Buffer.concat(
+          await Promise.all(
+            ["chat.jsonl", "chat-archive.jsonl"].map((file) =>
+              fs
+                .readFile(path.join(config.sessionsDir, nextWorkspace, file))
+                .catch(() => Buffer.alloc(0))
+            )
+          )
+        );
+        expect(retainedBytes.includes(floorBytes)).toBe(method !== "clear");
+        // The rewrite must publish a counter consistent with retained bytes immediately;
+        // the append path's disk refresh must not be needed to repair its bookkeeping.
+        const counters = restarted as unknown as { sequenceCounters: Map<string, number> };
+        const cachedNext = counters.sequenceCounters.get(nextWorkspace);
+        const next = row("next");
+        expect((await restarted.appendToHistory(nextWorkspace, next)).success).toBe(true);
+        expect(next.metadata?.historySequence).toBe(method === "clear" ? 0 : 101);
+        const reloaded = new HistoryService(config);
+        const later = row("later");
+        expect((await reloaded.appendToHistory(nextWorkspace, later)).success).toBe(true);
+        expect(later.metadata?.historySequence).toBe(method === "clear" ? 1 : 102);
+        if (method !== "archive delete") {
+          expect(cachedNext).toBe(method === "clear" ? 0 : 101);
+        }
+      }
+    );
+
+    it.each(["single", "batch", "archive", "partial"])(
+      "%s deletion preserves oversized token-separated raw reset evidence",
+      async (method) => {
+        const floor = {
+          ...createMuxMessage("floor", "assistant", ""),
+          contextBoundaryKind: 0,
+          padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES),
+          candidate: "reset",
+        };
+        const placeholder =
+          method === "partial" ? [createMuxMessage("floor", "assistant", "")] : [];
+        const source = [row("old"), floor, ...placeholder, row("fresh")];
+        const { chatPath, archivePath } = await seedDeletionHistory(
+          method === "archive" ? source : [],
+          method === "archive" ? [] : source
+        );
+        const targetPath = method === "archive" ? archivePath : chatPath;
+        const beforeBytes = await fs.readFile(targetPath);
+        const before = await service.getHistoryFromLatestBoundary(ws);
+        assert(before.success);
+        expect(before.data.map((message) => message.id)).toEqual([
+          ...placeholder.map((message) => message.id),
+          "fresh",
+        ]);
+        const { store, receipt } = await capturePublication();
+        const result =
+          method === "partial"
+            ? await deleteErroredPlaceholder("floor")
+            : method === "batch"
+              ? await service.deleteMessages(ws, ["floor"])
+              : await service.deleteMessage(ws, "floor");
+        const after = await service.getHistoryFromLatestBoundary(ws);
+        assert(after.success);
+        expect(after.data.map((message) => message.id)).toEqual(["fresh"]);
+        expect(result.success).toBe(method === "partial");
+        expect(await fs.readFile(targetPath)).toEqual(
+          method === "partial"
+            ? Buffer.from(
+                beforeBytes.toString("utf8").replace(messageLine(ws, placeholder[0]) + "\n", "")
+              )
+            : beforeBytes
+        );
+        expect(await store.read()).toEqual(receipt);
+        expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+      }
+    );
+
+    it.each(["single", "batch", "archive", "partial"])(
+      "%s deletion fences provider-preserved reasoning-only context",
+      async (method) => {
+        const reasoning: MuxMessage = {
+          ...createMuxMessage("reasoning", "assistant", ""),
+          parts: [{ type: "reasoning", text: "Preserved provider reasoning" }],
+        };
+        const placeholder =
+          method === "partial" ? [createMuxMessage("reasoning", "assistant", "")] : [];
+        const source = [row("old"), reasoning, ...placeholder, row("fresh")];
+        await seedDeletionHistory(
+          method === "archive" ? source : [],
+          method === "archive" ? [] : source
+        );
+        const before = await service.getHistoryFromLatestBoundary(ws);
+        assert(before.success);
+        expect(
+          prepareProviderRequestMessages(
+            before.data,
+            "anthropic",
+            "high"
+          ).providerRequestMessages.map((message) => message.id)
+        ).toEqual(["old", "reasoning", "fresh"]);
+        const { receipt } = await capturePublication("high");
+        if (method === "partial") {
+          assert(
+            (
+              await service.writePartial(ws, {
+                ...placeholder[0],
+                metadata: { ...placeholder[0].metadata, error: "stream failed" },
+              })
+            ).success
+          );
+        }
+        const result =
+          method === "partial"
+            ? await service.commitPartial(ws, "reasoning")
+            : method === "batch"
+              ? await service.deleteMessages(ws, ["reasoning"])
+              : await service.deleteMessage(ws, "reasoning");
+        expect(result.success).toBe(true);
+        const foreign = new HistoryService(config).getContinuousCompactionJournal(ws);
+        expect(
+          await foreign.recordFallbackPrefix(
+            receipt,
+            { modelString: "anthropic:next", prefix },
+            () => true
+          )
+        ).toBeNull();
+        expect(await foreign.captureGeneration()).not.toBe(receipt.publicationGeneration);
+      }
+    );
+
+    it.each(
+      [
+        {
+          name: "empty placeholder",
+          archive: [],
+          chat: [createMuxMessage("target", "assistant", "")],
+          changed: false,
+        },
+        {
+          name: "display-only row",
+          archive: [],
+          chat: [{ ...display(), id: "target" }],
+          changed: false,
+        },
+        {
+          name: "sealed active row",
+          archive: [],
+          chat: [row("target"), boundary()],
+          changed: false,
+        },
+        {
+          name: "sealed active boundary",
+          archive: [],
+          chat: [{ ...reset(), id: "target" }, boundary()],
+          changed: false,
+        },
+        {
+          name: "sealed archive row",
+          archive: [row("target")],
+          chat: [boundary()],
+          changed: false,
+        },
+        {
+          name: "sealed archive boundary",
+          archive: [{ ...boundary(), id: "target" }],
+          chat: [reset()],
+          changed: false,
+        },
+        ...[false, true].map((archived) => {
+          const reasoning: MuxMessage = {
+            ...createMuxMessage("target", "assistant", ""),
+            parts: [{ type: "reasoning", text: "Sealed reasoning" }],
+          };
+          return {
+            name: `${archived ? "archive" : "active"} sealed reasoning`,
+            archive: archived ? [reasoning] : [],
+            chat: [...(archived ? [] : [reasoning]), boundary()],
+            changed: false,
+          };
+        }),
+        ...[
+          {
+            name: "ordinary oversized row",
+            padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES),
+            candidate: "ordinary",
+          },
+          { name: "readable reset-token payload", padding: "small", candidate: "reset" },
+        ].map(({ name, ...payload }) => ({
+          name,
+          archive: [],
+          chat: [
+            { ...createMuxMessage("target", "assistant", ""), contextBoundaryKind: 0, ...payload },
+          ],
+          changed: false,
+        })),
+        {
+          name: "active-first duplicate",
+          archive: [row("target")],
+          chat: [createMuxMessage("target", "assistant", ""), row("later")],
+          changed: false,
+        },
+        {
+          name: "duplicate active occurrences",
+          archive: [],
+          chat: [row("target"), boundary(), row("target"), row("later")],
+          changed: true,
+        },
+        {
+          name: "duplicate archive context",
+          archive: [row("target"), row("target")],
+          chat: [row("later")],
+          changed: true,
+        },
+        {
+          name: "archive duplicate sealed content",
+          archive: [row("target"), boundary(), createMuxMessage("target", "assistant", "")],
+          chat: [row("later")],
+          changed: false,
+        },
+        ...[reset(), reset(true), { ...boundary(), parts: [] }].map((message, index) => ({
+          name: `archive boundary ${index}`,
+          archive: [row("old"), { ...message, id: "target" }],
+          chat: [row("later")],
+          changed: true,
+        })),
+        {
+          name: "oversized reset evidence",
+          archive: [],
+          chat: [
+            row("old"),
+            { ...reset(), id: "target", padding: " ".repeat(SESSION_HISTORY_MAX_LINE_BYTES) },
+          ],
+          changed: false,
+          refused: true,
+        },
+      ].flatMap((testCase) =>
+        ["single", "batch"].map((method) => ({ refused: false, ...testCase, method }))
+      )
+    )(
+      "$method deletion classifies $name by removed occurrences",
+      async ({ archive, chat, changed, method, refused }) => {
+        const { chatPath, archivePath } = await seedDeletionHistory(
+          structuredClone(archive),
+          structuredClone(chat)
+        );
+        const beforeChat = await fs.readFile(chatPath);
+        const beforeArchive = await fs.readFile(archivePath);
+        const { store, receipt } = await capturePublication();
+        const inChat = chat.some((message) => message.id === "target");
+        const admitted = !refused && (method === "single" || inChat);
+        const advance = spyOn(store, "advanceGenerationUnderHistoryLock");
+        try {
+          const result =
+            method === "single"
+              ? await service.deleteMessage(ws, "target")
+              : await service.deleteMessages(ws, ["target"]);
+          expect(result).toMatchObject({ success: admitted });
+          expect(advance).toHaveBeenCalledTimes(admitted && changed ? 1 : 0);
+          if (!admitted) {
+            expect(await fs.readFile(chatPath)).toEqual(beforeChat);
+            expect(await fs.readFile(archivePath)).toEqual(beforeArchive);
+          } else {
+            // Active-first deletion must retain archive duplicates verbatim.
+            expect(await fs.readFile(inChat ? archivePath : chatPath)).toEqual(
+              inChat ? beforeArchive : beforeChat
+            );
+            const retained = await collectFullHistory(service, ws);
+            expect(retained.filter((message) => message.id === "target")).toHaveLength(
+              inChat ? archive.filter((message) => message.id === "target").length : 0
+            );
+          }
+          if (admitted && changed) {
+            expect(await store.captureGeneration()).not.toBe(receipt.publicationGeneration);
+            expect(await store.read()).toBeNull();
+          } else {
+            expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+            expect(
+              await store.recordFallbackPrefix(
+                receipt,
+                { modelString: "anthropic:next", prefix },
+                () => true
+              )
+            ).not.toBeNull();
+          }
+        } finally {
+          advance.mockRestore();
+        }
+      }
+    );
+
+    it.each([
+      "single missing",
+      "batch missing",
+      "batch refused",
+      "duplicate batch IDs",
+      "partial placeholder",
+    ])("%s deletion leaves generation and unrelated history unchanged", async (method) => {
+      const { chatPath, archivePath } = await seedDeletionHistory(
+        [],
+        [row("target"), createMuxMessage("empty", "assistant", "")]
+      );
+      const before = await fs.readFile(chatPath);
+      const { store, receipt } = await capturePublication();
+      if (method === "duplicate batch IDs") {
+        expect(
+          await service.deleteMessages(ws, ["target", "target"]).catch((error: unknown) => error)
+        ).toBeInstanceOf(Error);
+      } else {
+        const result =
+          method === "partial placeholder"
+            ? await deleteErroredPlaceholder("empty")
+            : method === "single missing"
+              ? await service.deleteMessage(ws, "missing")
+              : await service.deleteMessages(
+                  ws,
+                  method === "batch refused" ? ["target", "missing"] : ["missing"]
+                );
+        expect(result.success).toBe(method === "partial placeholder");
+      }
+      if (method !== "partial placeholder") expect(await fs.readFile(chatPath)).toEqual(before);
+      expect(await fs.readFile(archivePath)).toEqual(Buffer.alloc(0));
+      expect(await store.captureGeneration()).toBe(receipt.publicationGeneration);
+      expect(await store.read()).toEqual(receipt);
+    });
+
+    it.each(
+      ["chat", "archive"].flatMap((artifact) =>
+        ["single", "batch"].flatMap((method) =>
+          [false, true].map((active) => ({ artifact, method, active }))
+        )
+      )
+    )(
+      "$method deletion preserves raw floors in $artifact (active cut: $active)",
+      async ({ artifact, method, active }) => {
+        const old = row("target");
+        const fresh = row(active ? "target" : "fresh");
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(
+          artifact === "archive" ? [old, fresh] : [],
+          artifact === "chat" ? [old, fresh] : [row("tail")]
+        );
+        const raw = Buffer.concat([
+          Buffer.from(' {\n"contextBoundaryKind"\n:\n"reset"\n'),
+          Buffer.from([0xff]),
+          Buffer.from("\n}\n"),
+        ]);
+        const targetPath = artifact === "chat" ? chatPath : archivePath;
+        await fs.writeFile(targetPath, Buffer.concat([bytes([old]), raw, bytes([fresh])]));
+        const { store, receipt } = await capturePublication();
+        const result =
+          method === "single"
+            ? await service.deleteMessage(ws, "target")
+            : await service.deleteMessages(ws, ["target"]);
+        const admitted = method === "single" || artifact === "chat";
+        expect(result.success).toBe(admitted);
+        expect(await fs.readFile(targetPath)).toEqual(
+          Buffer.concat([
+            ...(admitted ? [] : [bytes([old])]),
+            raw,
+            ...(admitted && active ? [] : [bytes([fresh])]),
+          ])
+        );
+        expect((await store.captureGeneration()) !== receipt.publicationGeneration).toBe(
+          admitted && active
+        );
+        const provider = await service.getHistoryFromLatestBoundary(ws);
+        assert(provider.success);
+        expect(provider.data.map((message) => message.id)).toEqual([
+          ...(admitted && active ? [] : [fresh.id]),
+          ...(artifact === "archive" ? ["tail"] : []),
+        ]);
+      }
+    );
+
+    it.each([
+      ...["single", "batch", "partial", "archive"].map((method) => ({ method, variant: "new" })),
+      ...[
+        "retained boundary",
+        "existing reset",
+        "retained separator",
+        "missing token",
+        "escaped junk",
+      ].map((variant) => ({ method: "single", variant })),
+    ])(
+      "$method deletion classifies joining malformed fragments ($variant)",
+      async ({ method, variant }) => {
+        const old = row("old");
+        const separator = createMuxMessage("separator", "assistant", "");
+        const fresh = row("fresh");
+        const retained =
+          variant === "retained separator" ? [createMuxMessage("retained", "assistant", "")] : [];
+        const suffix = variant === "retained boundary" ? [boundary()] : [];
+        const source = [old, separator, ...retained, fresh, ...suffix];
+        const { chatPath, archivePath, bytes } = await seedDeletionHistory(
+          method === "archive" ? source : [],
+          method === "archive" ? [] : source
+        );
+        const targetPath = method === "archive" ? archivePath : chatPath;
+        const left = Buffer.from(
+          variant === "existing reset"
+            ? '{"metadata":{"contextBoundaryKind":"reset"},broken\n'
+            : '{"metadata":{"contextBoundaryKind"\n'
+        );
+        const right =
+          variant === "escaped junk"
+            ? Buffer.concat([
+                Buffer.from("?junk"),
+                Buffer.from([0xff]),
+                Buffer.from(':"res\\u0065t"}}\n'),
+              ])
+            : Buffer.from(variant === "missing token" ? ':"other"}}\n' : ':"reset"}}\n');
+        const tail = Buffer.concat([bytes(retained), right, bytes([fresh, ...suffix])]);
+        await fs.writeFile(
+          targetPath,
+          Buffer.concat([bytes([old]), left, bytes([separator]), tail])
+        );
+        const before = await service.getHistoryFromLatestBoundary(ws);
+        assert(before.success);
+        expect(before.data.map((message) => message.id)).toEqual(
+          variant === "retained boundary"
+            ? ["sealed"]
+            : [
+                ...(variant === "existing reset" ? [] : ["old"]),
+                "separator",
+                ...retained.map((message) => message.id),
+                "fresh",
+              ]
+        );
+        const { store, receipt } = await capturePublication();
+        const result =
+          method === "partial"
+            ? await deleteErroredPlaceholder("separator")
+            : method === "batch"
+              ? await service.deleteMessages(ws, ["separator"])
+              : await service.deleteMessage(ws, "separator");
+        expect(result.success).toBe(true);
+        expect(await fs.readFile(targetPath)).toEqual(Buffer.concat([bytes([old]), left, tail]));
+        const after = await service.getHistoryFromLatestBoundary(ws);
+        assert(after.success);
+        const fenced = variant === "new" || variant === "escaped junk";
+        expect(after.data.map((message) => message.id)).toEqual(
+          variant === "retained boundary"
+            ? ["sealed"]
+            : [
+                ...(fenced || variant === "existing reset" ? [] : ["old"]),
+                ...retained.map((message) => message.id),
+                "fresh",
+              ]
+        );
+        expect((await store.captureGeneration()) !== receipt.publicationGeneration).toBe(fenced);
+        if (!fenced) {
+          expect(await store.read()).toEqual(receipt);
+          return;
+        }
+        const foreignHistory = new HistoryService(config);
+        const foreign = foreignHistory.getContinuousCompactionJournal(ws);
+        expect(
+          await foreign.recordFallbackPrefix(
+            receipt,
+            { modelString: "anthropic:next", prefix },
+            () => true
+          )
+        ).toBeNull();
+        expect(
+          (
+            await foreignHistory.persistBoundaryWithTailCopies(
+              ws,
+              structuredClone(receipt.boundary),
+              [],
+              false,
+              () => true,
+              {
+                publication: { generation: receipt.publicationGeneration, journal: receipt },
+                onCommitted: () => undefined,
+              }
+            )
+          ).success
+        ).toBe(false);
+        expect(await foreign.read()).toBeNull();
+        expect(await foreign.write(receipt, prefix, () => true)).toBeNull();
+        expect(
+          await foreign.write(
+            { ...receipt, publicationGeneration: await foreign.captureGeneration() },
+            prefix,
+            () => true
+          )
+        ).not.toBeNull();
+      }
+    );
+
+    it.each(
+      ["single", "batch", "archive", "partial"].flatMap((method) =>
+        ["generation", "history"].map((stage) => ({ method, stage }))
+      )
+    )(
+      "$method deletion handles a $stage write failure without changing history or counters",
+      async ({ method, stage }) => {
+        const target = method === "partial" ? reset() : row("target");
+        const { chatPath, archivePath } = await seedDeletionHistory(
+          method === "archive" ? [target] : [],
+          method === "archive" ? [] : [target]
+        );
+        const beforeChat = await fs.readFile(chatPath);
+        const beforeArchive = await fs.readFile(archivePath);
+        const { store, receipt } = await capturePublication();
+        const counters = service as unknown as { sequenceCounters: Map<string, number> };
+        const counter = counters.sequenceCounters.get(ws);
+        const failedPath =
+          stage === "generation"
+            ? path.join(config.sessionsDir, ws, CONTINUOUS_COMPACTION_GENERATION_FILE)
+            : method === "archive"
+              ? archivePath
+              : chatPath;
+        const atomic = atomicWrite.default;
+        let injected = false;
+        const failure = spyOn(atomicWrite, "default").mockImplementation(
+          new Proxy(atomic, {
+            apply(target, _thisArg, args: Parameters<typeof atomic>) {
+              // Generation publication writes a staging sibling before renaming it into place.
+              const matches =
+                stage === "generation"
+                  ? typeof args[0] === "string" && args[0].startsWith(`${failedPath}.continuous-`)
+                  : args[0] === failedPath;
+              if (matches) {
+                injected = true;
+                return Promise.reject(new Error("disk unavailable"));
+              }
+              return target(...args);
+            },
+          })
+        );
+        try {
+          const result =
+            method === "partial"
+              ? await deleteErroredPlaceholder(target.id)
+              : method === "batch"
+                ? await service.deleteMessages(ws, [target.id])
+                : await service.deleteMessage(ws, target.id);
+          expect(injected).toBe(true);
+          expect(result.success).toBe(false);
+          expect(await fs.readFile(chatPath)).toEqual(beforeChat);
+          expect(await fs.readFile(archivePath)).toEqual(beforeArchive);
+          expect(counters.sequenceCounters.get(ws)).toBe(counter);
+          expect((await store.captureGeneration()) !== receipt.publicationGeneration).toBe(
+            stage === "history"
+          );
+          expect(await store.read()).toEqual(stage === "history" ? null : receipt);
+          if (method === "partial") expect(await service.readPartial(ws)).not.toBeNull();
+        } finally {
+          failure.mockRestore();
+        }
+      }
+    );
+
     const destructiveCases = [
+      {
+        name: "single provider-row deletion",
+        rows: [row("old"), row("tail")],
+        mutate: () => service.deleteMessage(ws, "old"),
+        expected: ["tail"],
+      },
+      {
+        name: "batch provider-row deletion",
+        rows: [row("old"), row("tail"), row("later")],
+        mutate: () => service.deleteMessages(ws, ["old", "tail"]),
+        expected: ["later"],
+      },
+      ...[
+        { name: "reset", message: reset() },
+        { name: "rollover", message: reset(true) },
+        { name: "empty compaction", message: { ...boundary(), parts: [] } },
+      ].flatMap(({ name, message }) =>
+        ["single", "batch", "partial"].map((method) => ({
+          name: `${method} deletion of ${name} boundary`,
+          rows: [row("old"), message],
+          mutate: () =>
+            method === "partial"
+              ? deleteErroredPlaceholder(message.id)
+              : method === "batch"
+                ? service.deleteMessages(ws, [message.id])
+                : service.deleteMessage(ws, message.id),
+          expected: ["old"],
+        }))
+      ),
       ...[false, true].flatMap((rollover) =>
         [false, true].map((batch) => ({
           name: `${rollover ? "rollover" : "reset"} ${batch ? "batch" : "single"}`,
@@ -1257,14 +2154,23 @@ describe("HistoryService", () => {
       }
     );
 
-    it("holds the history file lock from generation advancement through deletion", async () => {
-      assert((await service.appendToHistory(ws, row("old"))).success);
+    it.each(
+      ["clear", "single", "batch", "partial", "archive"].flatMap((method) =>
+        ["initial", "fallback", "boundary"].map((publication) => ({ method, publication }))
+      )
+    )("$method deletion fences foreign $publication", async (testCase) => {
+      const { method, publication } = testCase;
+      const target = method === "partial" ? reset() : row("old");
+      const { chatPath, archivePath } = await seedDeletionHistory(
+        method === "archive" ? [target] : [],
+        method === "archive" ? [] : [target]
+      );
       const store = service.getContinuousCompactionJournal(ws);
       // Exercise an existing durable generation too, rather than only legacy absence.
       await store.advanceGeneration();
       const { receipt } = await capturePublication();
-      await store.clear(receipt);
-      const historyPath = path.join(config.sessionsDir, ws, "chat.jsonl");
+      if (publication === "initial") await store.clear(receipt);
+      const historyPath = method === "archive" ? archivePath : chatPath;
       const before = await fs.readFile(historyPath, "utf8");
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
@@ -1277,36 +2183,82 @@ describe("HistoryService", () => {
           await release.promise;
         }
       );
-      const clearing = service.clearHistory(ws);
-      const foreign = new HistoryService(config).getContinuousCompactionJournal(ws);
+      const deleting =
+        method === "clear"
+          ? service.clearHistory(ws)
+          : method === "partial"
+            ? deleteErroredPlaceholder(target.id)
+            : method === "batch"
+              ? service.deleteMessages(ws, [target.id])
+              : service.deleteMessage(ws, target.id);
+      const foreignHistory = new HistoryService(config);
+      const foreign = foreignHistory.getContinuousCompactionJournal(ws);
+      const publish = async (candidate: ContinuousCompactionJournal) => {
+        if (publication === "boundary")
+          return (
+            await foreignHistory.persistBoundaryWithTailCopies(
+              ws,
+              structuredClone(candidate.boundary),
+              [],
+              false,
+              () => true,
+              {
+                publication: { generation: candidate.publicationGeneration, journal: candidate },
+                onCommitted: () => undefined,
+              }
+            )
+          ).success;
+        return (
+          (publication === "fallback"
+            ? await foreign.recordFallbackPrefix(
+                candidate,
+                { modelString: "anthropic:next", prefix },
+                () => true
+              )
+            : await foreign.write(candidate, prefix, () => true)) !== null
+        );
+      };
       const capture = spyOn(foreign, "captureGenerationUnderHistoryLock");
       const acquire = fileLock.acquireProcessFileLock;
       const attempted = Promise.withResolvers<void>();
       let acquiring:
         | ReturnType<typeof spyOn<typeof fileLock, "acquireProcessFileLock">>
         | undefined;
-      let writing: ReturnType<typeof foreign.write> | undefined;
+      let writing: Promise<boolean> | undefined;
+      const queued = spyOn(workspaceFileLocks, "withLock");
       try {
         await entered.promise;
         acquiring = spyOn(fileLock, "acquireProcessFileLock").mockImplementation((options) => {
           attempted.resolve();
           return acquire(options);
         });
-        writing = foreign.write(receipt, prefix, () => true);
-        await attempted.promise;
+        writing = publish(receipt);
+        // Boundary writes first queue on the shared in-process mutex; journal
+        // publications go straight to the same cross-process history lock.
+        if (publication === "boundary") expect(queued).toHaveBeenCalled();
+        else await attempted.promise;
         expect(capture).not.toHaveBeenCalled();
         expect(await fs.readFile(historyPath, "utf8")).toBe(before);
         release.resolve();
-        expect((await clearing).success).toBe(true);
-        expect(await writing).toBeNull();
+        expect((await deleting).success).toBe(true);
+        expect(await writing).toBe(false);
         expect(await foreign.captureGeneration()).not.toBe(receipt.publicationGeneration);
         expect(await collectFullHistory(new HistoryService(config), ws)).toEqual([]);
+        expect(await foreign.read()).toBeNull();
+        const fresh = await foreign.write(
+          { ...receipt, publicationGeneration: await foreign.captureGeneration() },
+          prefix,
+          () => true
+        );
+        assert(fresh);
+        if (publication !== "initial") expect(await publish(fresh)).toBe(true);
       } finally {
         release.resolve();
-        await Promise.all([clearing, writing]);
+        await Promise.all([deleting, writing]);
         acquiring?.mockRestore();
         capture.mockRestore();
         advancing.mockRestore();
+        queued.mockRestore();
       }
     });
 

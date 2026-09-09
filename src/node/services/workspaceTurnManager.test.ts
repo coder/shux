@@ -24,6 +24,7 @@ import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/messag
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { QueueCutAttributionSnapshot } from "@/node/services/taskWorkspaceSeam";
 import type { InitStateManager } from "@/node/services/initStateManager";
+import { waitForCondition } from "@/node/services/testDispatchHelpers";
 import assert from "node:assert";
 import {
   createAIServiceMocks,
@@ -381,6 +382,9 @@ describe("WorkspaceTurnManager", () => {
       unarchive?: ReturnType<typeof mock>;
       preflightArchive?: ReturnType<typeof mock>;
       listLiveWorkspaceActivity?: ReturnType<typeof mock>;
+      getStoppablePreparingWorkspaceTurn?: ReturnType<typeof mock>;
+      acquirePreInterruptionArchiveHold?: ReturnType<typeof mock>;
+      waitForIdle?: ReturnType<typeof mock>;
       hasRunningBackgroundBashProcesses?: ReturnType<typeof mock>;
       isSnapshotArchiveEligibilityMutationSensitive?: ReturnType<typeof mock>;
       hasUntrackableExternalAppOpen?: ReturnType<typeof mock>;
@@ -1301,7 +1305,7 @@ describe("WorkspaceTurnManager", () => {
     const listLiveWorkspaceActivity = mock(() => ({
       streaming: true,
       terminalSessions: true,
-      desktopSession: false,
+      desktopViewers: false,
     }));
     const { parentId, taskService, archive } = await createWorkspaceLifecycleHarness({
       listLiveWorkspaceActivity,
@@ -1567,7 +1571,7 @@ describe("WorkspaceTurnManager", () => {
       streaming: false,
       queuedMessages: true,
       terminalSessions: false,
-      desktopSession: false,
+      desktopViewers: false,
     }));
     const harness = await createWorkspaceLifecycleHarness({ listLiveWorkspaceActivity });
 
@@ -1584,6 +1588,115 @@ describe("WorkspaceTurnManager", () => {
     expect(data?.status).toBe("active");
     expect(data?.status === "active" ? (data.note ?? "") : "").toContain("queued messages");
     expect(harness.archive).not.toHaveBeenCalled();
+  });
+
+  test("workspace lifecycle interrupts a delegated turn whose send is still PREPARING", async () => {
+    // A fresh delegated turn's handle already reads "running" while the target session is
+    // PREPARING, which listLiveWorkspaceActivity reports as queued messages. The exemption
+    // must bind to the exact correlation of the collected turn, not to PREPARING alone.
+    const preparingTurn = {
+      taskHandleId: "wst_running",
+      ownerWorkspaceId: "",
+      turnId: "turn-running",
+    };
+    const getStoppablePreparingWorkspaceTurn = mock(() => preparingTurn);
+    const acquirePreInterruptionArchiveHold = mock(() => Ok({ [Symbol.dispose]: () => undefined }));
+    const harness = await createWorkspaceLifecycleHarness({
+      listLiveWorkspaceActivity: mock(() => ({
+        streaming: false,
+        queuedMessages: true,
+        backgroundBashProcesses: false,
+        terminalSessions: false,
+        desktopSession: false,
+      })),
+      getStoppablePreparingWorkspaceTurn,
+      acquirePreInterruptionArchiveHold,
+    });
+    preparingTurn.ownerWorkspaceId = harness.parentId;
+    await harness.taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(harness.parentId, "childworkspace", "wst_running", "running", {
+        turnId: "turn-running",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      })
+    );
+    markWorkspaceTurnActive(harness.taskService, "childworkspace", "wst_running", harness.parentId);
+
+    // A PREPARING send correlated to some other turn (the collected turn ended and a
+    // different delegated turn, or none, took the session) is not explained by the
+    // collected handle: still user-shaped work, still refused.
+    getStoppablePreparingWorkspaceTurn.mockReturnValueOnce({
+      ...preparingTurn,
+      turnId: "turn-other",
+    });
+    const mismatched = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      { interruptActive: true }
+    );
+    expect(mismatched.success).toBe(true);
+    const mismatchedData = mismatched.success ? mismatched.data : undefined;
+    expect(mismatchedData?.status).toBe("active");
+    expect(mismatchedData?.status === "active" ? (mismatchedData.note ?? "") : "").toContain(
+      "queued messages"
+    );
+    expect(harness.archive).not.toHaveBeenCalled();
+
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      { interruptActive: true }
+    );
+
+    expect(result).toEqual(
+      Ok({
+        status: "archived",
+        action: "archive",
+        workspaceId: "childworkspace",
+        displayName: "Child workspace",
+      })
+    );
+    // The hold binds the interruptible turn by correlation so a stream that starts for it
+    // between the gate and interruption is still recognized as the delegated turn.
+    expect(acquirePreInterruptionArchiveHold).toHaveBeenLastCalledWith("childworkspace", {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [preparingTurn],
+    });
+    expect(harness.archive).toHaveBeenCalledTimes(1);
+    const record = await harness.taskHandleStore.getWorkspaceTurn(harness.parentId, "wst_running");
+    expect(record?.status).toBe("interrupted");
+  });
+
+  test("workspace lifecycle waits for interrupted turns to settle before the archive sink", async () => {
+    // stopStream resolves before the target session leaves PREPARING/COMPLETING; entering
+    // the sink on that residue would refuse with the turns already destroyed.
+    const settled = Promise.withResolvers<void>();
+    const waitForIdle = mock(() => settled.promise);
+    const harness = await createWorkspaceLifecycleHarness({ waitForIdle });
+    await harness.taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(harness.parentId, "childworkspace", "wst_running", "running", {
+        turnId: "turn-running",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      })
+    );
+    markWorkspaceTurnActive(harness.taskService, "childworkspace", "wst_running", harness.parentId);
+
+    const archivePromise = harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      { interruptActive: true }
+    );
+    await waitForCondition(() => waitForIdle.mock.calls.length === 1);
+    expect(waitForIdle).toHaveBeenCalledWith("childworkspace");
+    const record = await harness.taskHandleStore.getWorkspaceTurn(harness.parentId, "wst_running");
+    expect(record?.status).toBe("interrupted");
+    expect(harness.archive).not.toHaveBeenCalled();
+
+    settled.resolve();
+    const result = await archivePromise;
+    expect(result.success ? result.data.status : result.error).toBe("archived");
+    expect(harness.archive).toHaveBeenCalledTimes(1);
   });
 
   test("workspace lifecycle refuses archive of a dedicated Coder workspace under the delete policy", async () => {

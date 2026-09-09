@@ -105,6 +105,45 @@ export const AgentPluginUpdateCheckSchema = z.object({
   message: z.string().optional(),
 });
 
+/**
+ * One consent-relevant difference between the installed tree and a staged
+ * update (see installService capabilitySurface). `before`/`after` carry the
+ * human-readable value on each side so the user can judge the change instead
+ * of only being told that something changed; additions have no `before`.
+ */
+export const AgentPluginCapabilityChangeSchema = z.object({
+  summary: z.string(),
+  before: z.string().optional(),
+  after: z.string().optional(),
+});
+
+/** Ties an update confirmation to the exact trees the user reviewed. */
+export const AgentPluginUpdateConsentSchema = z.object({
+  /** lockedSha of the install the review compared against. */
+  fromSha: z.string(),
+  /** Commit the review staged; update installs exactly this commit. */
+  toSha: z.string(),
+});
+
+/**
+ * Update review: what applying the pending update would change in the
+ * plugin's capability surface. Empty `changes` means the update applies
+ * without re-consent.
+ */
+export const AgentPluginUpdateReviewSchema = z.object({
+  name: z.string(),
+  fromSha: z.string(),
+  toSha: z.string(),
+  /** Staged manifest version, when declared. */
+  version: z.string().optional(),
+  changes: z.array(AgentPluginCapabilityChangeSchema),
+  /** Manifest warnings + component diagnostics from validating the staged clone. */
+  warnings: z.array(z.string()),
+});
+
+export type AgentPluginCapabilityChange = z.infer<typeof AgentPluginCapabilityChangeSchema>;
+export type AgentPluginUpdateConsent = z.infer<typeof AgentPluginUpdateConsentSchema>;
+export type AgentPluginUpdateReview = z.infer<typeof AgentPluginUpdateReviewSchema>;
 export type AgentPluginPreviewSkill = z.infer<typeof AgentPluginPreviewSkillSchema>;
 export type AgentPluginPreviewMcpServer = z.infer<typeof AgentPluginPreviewMcpServerSchema>;
 export type AgentPluginPreviewHook = z.infer<typeof AgentPluginPreviewHookSchema>;

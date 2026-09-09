@@ -14,6 +14,7 @@ const api = {
     getWindow,
     watchViewer: watchDesktopViewerFixture,
     acknowledgeViewerRelease: () => Promise.resolve(),
+    detachViewer: () => Promise.resolve(),
   },
 };
 void mock.module("@/browser/contexts/API", () => ({
@@ -124,6 +125,36 @@ describe("DesktopPanel binding", () => {
     }
   );
 
+  test("the Electron pane registers as a viewer while the popout check is still pending", async () => {
+    Object.defineProperty(window, "api", { configurable: true, value: {} });
+    const watchViewer = mock(watchDesktopViewerFixture);
+    api.desktop.watchViewer = watchViewer;
+    let resolveLookup!: (value: null) => void;
+    getWindow.mockImplementationOnce(
+      () =>
+        new Promise<null>((resolve) => {
+          resolveLookup = resolve;
+        })
+    );
+    try {
+      render(<DesktopPanel workspaceId="electron-reserve" />);
+      // The manager lookup is a round trip during which nothing else would mark the pane
+      // attached; the pane reserves itself first, without connecting.
+      await waitFor(() => expect(watchViewer).toHaveBeenCalledTimes(1));
+      expect(getBootstrap).not.toHaveBeenCalled();
+      expect(FakeRfb.instances).toHaveLength(0);
+      await act(async () => {
+        resolveLookup(null);
+        await Promise.resolve();
+      });
+      // No popout: the pane connects, reusing the reservation rather than registering again.
+      await connectedViewer();
+      expect(watchViewer).toHaveBeenCalledTimes(1);
+    } finally {
+      api.desktop.watchViewer = watchDesktopViewerFixture;
+    }
+  });
+
   test.each(["native", "synchronous"])(
     "browser detach opens before the click returns with %s queueMicrotask",
     async (scheduling) => {
@@ -149,8 +180,13 @@ describe("DesktopPanel binding", () => {
   test("shows bootstrap binding while connecting with the caller's bridge and token", async () => {
     const view = render(<DesktopPanel workspaceId="caller" />);
     const viewer = await connectedViewer();
-    expect(getBootstrap).toHaveBeenCalledWith({ workspaceId: "caller" });
-    expect(getBootstrap).not.toHaveBeenCalledWith({ workspaceId: "owner" });
+    expect(getBootstrap).toHaveBeenCalledWith({
+      workspaceId: "caller",
+      viewerId: expect.any(String) as string,
+    });
+    expect(getBootstrap).not.toHaveBeenCalledWith(
+      expect.objectContaining({ workspaceId: "owner" })
+    );
     expect(viewer.url).toBe("ws://localhost/desktop/ws/caller?token=caller-token");
     expect(view.getByText(/Original desktop/)).toBeTruthy();
   });
@@ -200,7 +236,10 @@ describe("DesktopPanel binding", () => {
     expect(view.queryByText(/Original desktop/)).toBeNull();
     expect(previousViewer.disconnected).toBe(true);
     await waitFor(() => expect(FakeRfb.instances).toHaveLength(2));
-    expect(getBootstrap).toHaveBeenLastCalledWith({ workspaceId: "isolated" });
+    expect(getBootstrap).toHaveBeenLastCalledWith({
+      workspaceId: "isolated",
+      viewerId: expect.any(String) as string,
+    });
     expect(FakeRfb.instances[1].url).toBe(
       "ws://localhost/desktop/ws/isolated?token=isolated-token"
     );
@@ -211,6 +250,14 @@ describe("DesktopPanel binding", () => {
     const pending = Promise.withResolvers<Bootstrap>();
     getBootstrap.mockReturnValueOnce(pending.promise);
     const view = render(<DesktopPanel workspaceId="caller" />);
+    // Bootstrap follows the viewer registration, so wait for the caller's request to be in
+    // flight before switching workspaces underneath it.
+    await waitFor(() =>
+      expect(getBootstrap).toHaveBeenCalledWith({
+        workspaceId: "caller",
+        viewerId: expect.any(String) as string,
+      })
+    );
     getBootstrap.mockResolvedValue({ ...sharedBootstrap, capability: ownCapability });
     view.rerender(<DesktopPanel workspaceId="isolated" />);
     await connectedViewer();
@@ -220,6 +267,9 @@ describe("DesktopPanel binding", () => {
     });
     expect(FakeRfb.instances).toHaveLength(1);
     expect(view.queryByText(/Original desktop/)).toBeNull();
-    expect(getBootstrap).toHaveBeenLastCalledWith({ workspaceId: "isolated" });
+    expect(getBootstrap).toHaveBeenLastCalledWith({
+      workspaceId: "isolated",
+      viewerId: expect.any(String) as string,
+    });
   });
 });

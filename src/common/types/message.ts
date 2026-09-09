@@ -855,6 +855,17 @@ export function parseWorkspaceTurnTaskCorrelation(
   return { taskHandleId, ownerWorkspaceId, turnId };
 }
 
+export function isSameWorkspaceTurnTaskCorrelation(
+  first: WorkspaceTurnTaskCorrelation,
+  second: WorkspaceTurnTaskCorrelation
+): boolean {
+  return (
+    first.taskHandleId === second.taskHandleId &&
+    first.ownerWorkspaceId === second.ownerWorkspaceId &&
+    first.turnId === second.turnId
+  );
+}
+
 export function getCompactionFollowUpContent(
   metadata?: MuxMessageMetadata
 ): CompactionRequestData["followUpContent"] | undefined {

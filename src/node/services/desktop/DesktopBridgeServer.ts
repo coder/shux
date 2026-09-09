@@ -19,6 +19,8 @@ interface BridgePair {
   tcp: net.Socket | null;
   requesterWorkspaceId: string;
   ownerWorkspaceId: string;
+  /** The requesting pane's viewer registration, when it bootstrapped with one. */
+  viewerId: string | null;
   sessionId: string;
   vncPort: number;
   connectAbort: AbortController;
@@ -30,7 +32,8 @@ export interface DesktopBridgeServerOptions {
   desktopSessionManager: Pick<
     DesktopSessionManager,
     "getLiveSessionConnection" | "onWorkspaceClose" | "watchWorkspaceConfig"
-  >;
+  > &
+    Partial<Pick<DesktopSessionManager, "noteDetached">>;
   desktopTokenManager: Pick<DesktopTokenManager, "validate">;
 }
 
@@ -105,7 +108,8 @@ export class DesktopBridgeServer {
   private readonly desktopSessionManager: Pick<
     DesktopSessionManager,
     "getLiveSessionConnection" | "onWorkspaceClose" | "watchWorkspaceConfig"
-  >;
+  > &
+    Partial<Pick<DesktopSessionManager, "noteDetached">>;
   private readonly desktopTokenManager: Pick<DesktopTokenManager, "validate">;
   private readonly wss: WebSocketServer;
   private readonly activePairs = new Set<BridgePair>();
@@ -127,6 +131,37 @@ export class DesktopBridgeServer {
 
   public ensureReady(): void {
     assert(this.wss, "DesktopBridgeServer WebSocketServer must be initialized");
+  }
+
+  /**
+   * Whether a VNC bridge WebSocket is attached for this workspace, as requester or as owner of
+   * a shared desktop. Every viewer surface (inline browser pane, inline Electron pane, popout
+   * windows) reaches the desktop through this bridge, so it is the ground truth that someone is
+   * watching; the browser viewer registry alone misses the inline Electron pane, which skips
+   * watchViewer. Pairs are registered synchronously with their admission lookup (which honors
+   * the archive guard), so an archive gate observing no pair cannot be beaten by a connection
+   * admitted earlier.
+   */
+  hasActiveBridge(
+    workspaceId: string,
+    // The owner captured at admission goes stale when a borrower is rebound before the config
+    // watcher revalidates the pair; the manager re-resolves it so the new owner counts as
+    // attached (and the old one no longer does) from the moment the binding changes.
+    resolveOwner: (requesterWorkspaceId: string, capturedOwnerWorkspaceId: string) => string = (
+      _requester,
+      capturedOwner
+    ) => capturedOwner
+  ): boolean {
+    assert(workspaceId.length > 0, "hasActiveBridge requires a workspaceId");
+    for (const pair of this.activePairs) {
+      if (
+        pair.requesterWorkspaceId === workspaceId ||
+        resolveOwner(pair.requesterWorkspaceId, pair.ownerWorkspaceId) === workspaceId
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
@@ -236,6 +271,7 @@ export class DesktopBridgeServer {
       tcp: null,
       requesterWorkspaceId: payload.workspaceId,
       ownerWorkspaceId: liveSession.ownerWorkspaceId,
+      viewerId: payload.viewerId,
       sessionId: liveSession.sessionId,
       vncPort: liveSession.vncPort,
       connectAbort: new AbortController(),
@@ -520,6 +556,18 @@ export class DesktopBridgeServer {
 
     pair.closed = true;
     this.activePairs.delete(pair);
+    // An established bridge was a known attachment: let the manager's archive gate keep the
+    // requester and owner attached for the bounded grace while the client reconnects or hands
+    // off. A pair that never reached VNC (admission/TCP/revalidation failure) never showed a
+    // desktop, so its loss is not evidence of a viewer. Attributed to the pane's viewer
+    // registration so a pane that gives that registration up definitively retracts this too.
+    if (pair.tcp !== null) {
+      this.desktopSessionManager.noteDetached?.(
+        pair.requesterWorkspaceId,
+        pair.ownerWorkspaceId,
+        pair.viewerId ?? undefined
+      );
+    }
     if (this.activePairs.size === 0) {
       const stopConfigWatch = this.stopConfigWatch;
       this.stopConfigWatch = undefined;

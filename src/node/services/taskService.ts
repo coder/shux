@@ -107,7 +107,11 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { runtimeModeSupportsSharedTaskWorkspace, type RuntimeConfig } from "@/common/types/runtime";
-import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
+import type {
+  ProjectRef,
+  WorkspaceMetadata,
+  WorkspaceRemovalDescendant,
+} from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import { SendMessageOptionsSchema, ToolPolicySchema } from "@/common/orpc/schemas/stream";
@@ -1195,7 +1199,9 @@ function buildWorkflowTimeoutFinalizationPrompt(
 
 export class TaskService implements AgentTaskIntegration {
   // Serialize stream-end processing per workspace to avoid races when
-  // finalizing reported tasks and cleanup state transitions.
+  // finalizing reported tasks and cleanup state transitions. Lock order: acquired BEFORE the
+  // task-tree lifecycle lock. Stream-end finalization and cleanup rechecks hold this lock while
+  // remove() takes the tree lock, so any path needing both nests event -> task-tree.
   private readonly workspaceEventLocks = new MutexMap<string>();
   // Separate parent-scoped lock for deferred best-of fallback/finalization. This path can run
   // concurrently from multiple child stream-end handlers for the same parent, and it must remain
@@ -4552,8 +4558,10 @@ export class TaskService implements AgentTaskIntegration {
       return Ok(queuedUpdateResult.data);
     }
 
-    return this.withTaskTreeLifecycleLock(taskId, async () =>
-      this.workspaceEventLocks.withLock(taskId, async () => {
+    // Event lock first, then the task-tree lock: the order every path holding both follows (see
+    // workspaceEventLocks). The reverse nesting deadlocked against reported-task cleanup.
+    return this.workspaceEventLocks.withLock(taskId, async () =>
+      this.withTaskTreeLifecycleLock(taskId, async () => {
         const cfg = this.config.loadConfigOrDefault();
         const entry = findWorkspaceEntry(cfg, taskId);
         if (!entry) {
@@ -9159,88 +9167,160 @@ export class TaskService implements AgentTaskIntegration {
     assert(ownerWorkspaceId.length > 0, "removeInactiveDescendantAgentTask requires owner");
     assert(taskId.length > 0, "removeInactiveDescendantAgentTask requires taskId");
 
-    return await this.withTaskTreeLifecycleLock(taskId, async () => {
-      const config = this.config.loadConfigOrDefault();
-      const entry = findWorkspaceEntry(config, taskId);
-      if (entry == null) {
-        const wasOwned =
-          (await this.hasRemovedAgentTaskTombstone(ownerWorkspaceId, taskId)) ||
-          (await this.filterDescendantAgentTaskIds(ownerWorkspaceId, [taskId])).includes(taskId);
-        return Ok(
-          wasOwned
-            ? { status: "already_removed", action: "remove", taskId, workspaceId: taskId }
-            : { status: "invalid_scope", action: "remove", taskId }
-        );
-      }
+    return await this.withTaskTreeLifecycleLock(taskId, () =>
+      this.removeInactiveDescendantAgentTaskWhileTaskTreeLocked(ownerWorkspaceId, taskId)
+    );
+  }
 
-      const index = this.buildAgentTaskIndex(config);
-      if (!this.isDescendantAgentTaskUsingParentById(index.parentById, ownerWorkspaceId, taskId)) {
-        return Ok({ status: "invalid_scope", action: "remove", taskId });
-      }
+  private async removeInactiveDescendantAgentTaskWhileTaskTreeLocked(
+    ownerWorkspaceId: string,
+    taskId: string
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    const config = this.config.loadConfigOrDefault();
+    const entry = findWorkspaceEntry(config, taskId);
+    if (entry == null) {
+      const wasOwned =
+        (await this.hasRemovedAgentTaskTombstone(ownerWorkspaceId, taskId)) ||
+        (await this.filterDescendantAgentTaskIds(ownerWorkspaceId, [taskId])).includes(taskId);
+      return Ok(
+        wasOwned
+          ? { status: "already_removed", action: "remove", taskId, workspaceId: taskId }
+          : { status: "invalid_scope", action: "remove", taskId }
+      );
+    }
 
-      const displayName = coerceNonEmptyString(entry.workspace.title) ?? entry.workspace.name;
-      const target = {
-        taskId,
-        workspaceId: taskId,
-        ...(displayName != null ? { displayName } : {}),
-      };
-      const descendantTaskIds = this.listDescendantAgentTasks(taskId).map((task) => task.taskId);
-      if (descendantTaskIds.length > 0) {
-        return Ok({
-          status: "error",
-          action: "remove",
-          ...target,
-          descendantTaskIds,
-          error: "Cannot remove a sub-agent while descendant sub-agents remain.",
-        });
-      }
+    const index = this.buildAgentTaskIndex(config);
+    if (!this.isDescendantAgentTaskUsingParentById(index.parentById, ownerWorkspaceId, taskId)) {
+      return Ok({ status: "invalid_scope", action: "remove", taskId });
+    }
 
-      if (
-        this.isActiveAgentTaskEntry({ ...entry.workspace, projectPath: entry.projectPath }) ||
-        this.aiService.isStreaming(taskId)
-      ) {
-        return Ok({
-          status: "active",
-          action: "remove",
-          ...target,
-          activeTaskIds: [taskId],
-          note: "Stop the sub-agent before removing it.",
-        });
-      }
-
-      return await this.gitPatchArtifactService.withOperationLock(taskId, async () => {
-        // The task can become inactive before its background format-patch job finishes. Wait for the
-        // in-process job, then refuse removal if a restart left a durable pending marker behind; the
-        // child worktree is the source needed to recover that artifact.
-        await this.gitPatchArtifactService.waitForGeneration(taskId);
-        const parentWorkspaceId = entry.workspace.parentWorkspaceId;
-        if (parentWorkspaceId) {
-          const patchArtifact = await readSubagentGitPatchArtifact(
-            path.join(this.config.sessionsDir, parentWorkspaceId),
-            taskId
-          );
-          if (patchArtifact?.status === "pending") {
-            return Ok({
-              status: "error",
-              action: "remove",
-              ...target,
-              error: "Cannot remove the sub-agent while its git patch artifact is still pending.",
-            });
-          }
-        }
-
-        const tombstoneResult = await this.persistRemovedAgentTaskTombstones(taskId);
-        if (!tombstoneResult.success) {
-          return Ok({ status: "error", action: "remove", ...target, error: tombstoneResult.error });
-        }
-        const result = await this.workspaceService.removeWhileTaskTreeLocked(taskId, true);
-        return Ok(
-          result.success
-            ? { status: "removed", action: "remove", ...target }
-            : { status: "error", action: "remove", ...target, error: result.error }
-        );
+    const displayName = coerceNonEmptyString(entry.workspace.title) ?? entry.workspace.name;
+    const target = {
+      taskId,
+      workspaceId: taskId,
+      ...(displayName != null ? { displayName } : {}),
+    };
+    const descendantTaskIds = this.listDescendantAgentTasks(taskId).map((task) => task.taskId);
+    if (descendantTaskIds.length > 0) {
+      return Ok({
+        status: "error",
+        action: "remove",
+        ...target,
+        descendantTaskIds,
+        error: "Cannot remove a sub-agent while descendant sub-agents remain.",
       });
+    }
+
+    if (
+      this.isActiveAgentTaskEntry({ ...entry.workspace, projectPath: entry.projectPath }) ||
+      this.aiService.isStreaming(taskId)
+    ) {
+      return Ok({
+        status: "active",
+        action: "remove",
+        ...target,
+        activeTaskIds: [taskId],
+        note: "Stop the sub-agent before removing it.",
+      });
+    }
+
+    return await this.gitPatchArtifactService.withOperationLock(taskId, async () => {
+      // The task can become inactive before its background format-patch job finishes. Wait for the
+      // in-process job, then refuse removal if a restart left a durable pending marker behind; the
+      // child worktree is the source needed to recover that artifact.
+      await this.gitPatchArtifactService.waitForGeneration(taskId);
+      const parentWorkspaceId = entry.workspace.parentWorkspaceId;
+      if (parentWorkspaceId) {
+        const patchArtifact = await readSubagentGitPatchArtifact(
+          path.join(this.config.sessionsDir, parentWorkspaceId),
+          taskId
+        );
+        if (patchArtifact?.status === "pending") {
+          return Ok({
+            status: "error",
+            action: "remove",
+            ...target,
+            error: "Cannot remove the sub-agent while its git patch artifact is still pending.",
+          });
+        }
+      }
+
+      const tombstoneResult = await this.persistRemovedAgentTaskTombstones(taskId);
+      if (!tombstoneResult.success) {
+        return Ok({ status: "error", action: "remove", ...target, error: tombstoneResult.error });
+      }
+      const result = await this.workspaceService.removeWhileTaskTreeLocked(taskId, true);
+      return Ok(
+        result.success
+          ? { status: "removed", action: "remove", ...target }
+          : { status: "error", action: "remove", ...target, error: result.error }
+      );
     });
+  }
+
+  listWorkspaceRemovalDescendants(workspaceId: string): WorkspaceRemovalDescendant[] {
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const taskIds = this.listDescendantAgentTaskIdsFromIndex(index, workspaceId);
+    taskIds.sort(
+      (a, b) =>
+        this.getTaskDepthFromParentById(index.parentById, b) -
+        this.getTaskDepthFromParentById(index.parentById, a)
+    );
+    return taskIds.map((taskId) => {
+      const entry = index.byId.get(taskId)!;
+      return {
+        workspaceId: taskId,
+        title: coerceNonEmptyString(entry.title) ?? entry.name ?? taskId,
+        active: this.isActiveAgentTaskEntry(entry) || this.aiService.isStreaming(taskId),
+      };
+    });
+  }
+
+  async removeAcknowledgedDescendantsWhileTaskTreeLocked(
+    workspaceId: string,
+    acknowledgedIds: string[]
+  ): Promise<Result<void>> {
+    const descendants = this.listWorkspaceRemovalDescendants(workspaceId);
+    const acknowledged = new Set(acknowledgedIds);
+    const current = new Set(descendants.map((descendant) => descendant.workspaceId));
+    if (descendants.some((descendant) => !acknowledged.has(descendant.workspaceId))) {
+      return Err("The descendant scope changed. Confirm the current descendants before removal.");
+    }
+    for (const taskId of acknowledged) {
+      // Only a durable removal record permits an absent ID during a partial retry.
+      if (
+        !current.has(taskId) &&
+        (this.config.findWorkspace(taskId) != null ||
+          !(await this.hasRemovedAgentTaskTombstone(workspaceId, taskId)))
+      ) {
+        return Err("The acknowledged descendant scope does not match this workspace.");
+      }
+    }
+    // Check the full scope before removal. Force does not grant consent to stop children.
+    if (descendants.some((descendant) => descendant.active)) {
+      return Err("Stop active descendant sub-agents before removing this workspace.");
+    }
+    for (const descendant of descendants) {
+      const failure = (error: string) =>
+        Err(`Cannot remove ${descendant.title} (${descendant.workspaceId}): ${error}`);
+      try {
+        const result = await this.removeInactiveDescendantAgentTaskWhileTaskTreeLocked(
+          workspaceId,
+          descendant.workspaceId
+        );
+        if (!result.success) return failure(result.error);
+        if (result.data.status !== "removed" && result.data.status !== "already_removed") {
+          return failure(
+            "error" in result.data
+              ? (result.data.error ?? "Descendant removal failed.")
+              : "Descendant removal failed."
+          );
+        }
+      } catch (error) {
+        return failure(getErrorMessage(error));
+      }
+    }
+    return Ok(undefined);
   }
 
   private removedAgentTaskTombstonePath(ownerWorkspaceId: string, taskId: string): string {
@@ -12512,123 +12592,31 @@ export class TaskService implements AgentTaskIntegration {
       };
     }
 
-    // Notify clients immediately even if we can't delete the workspace yet.
-    await this.editWorkspaceEntry(
-      childWorkspaceId,
-      (ws) => {
-        ws.taskStatus = "reported";
-        ws.reportedAt = getIsoNow();
-        // Successful completion resets the persisted recovery circuit breaker.
-        delete ws.taskRecoveryAttempts;
-      },
-      { allowMissing: true }
-    );
-    // Drop queued incremental updates synchronously with the terminal commit: while they sit at
-    // the parent's queue head as tool-end entries, the parent's stream stops at its next step
-    // boundary for them, and a dispatch refused as superseded cannot restore that cut turn.
-    // skipCancelCallbacks: a parent running as a delegated workspace turn queues each report with
-    // continuation-failure callbacks; superseding the report must not interrupt that live turn.
-    const progressParentWorkspaceId = latestEntryBeforeReport?.workspace.parentWorkspaceId;
-    if (progressParentWorkspaceId) {
-      const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
-        progressParentWorkspaceId,
-        agentReportProgressDedupePrefix(childWorkspaceId),
-        { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON, skipCancelCallbacks: true }
-      );
-      if (!queuedProgressRemoval.success) {
-        log.warn("Failed to remove queued incremental sub-agent reports", {
-          parentWorkspaceId: progressParentWorkspaceId,
-          childWorkspaceId,
-          error: queuedProgressRemoval.error,
-        });
-      }
-    }
-    eventSpine.emit("task.reported", { workspaceId: childWorkspaceId, taskId: childWorkspaceId });
-
-    await this.emitWorkspaceMetadata(childWorkspaceId);
-
-    // NOTE: Stream continues — we intentionally do NOT abort it.
-    // Deterministic termination is enforced by StreamManager stopWhen logic that
-    // waits for an agent_report tool result where output.success === true at the
-    // step boundary (preserving usage accounting). recordSessionUsage runs when
-    // the stream ends naturally.
-
-    const cfgAfterReport = this.config.loadConfigOrDefault();
-    const latestChildEntry = findWorkspaceEntry(cfgAfterReport, childWorkspaceId) ?? childEntry;
-    const parentWorkspaceId = latestChildEntry?.workspace.parentWorkspaceId;
-    if (!parentWorkspaceId) {
-      const reason = latestChildEntry
-        ? "missing parentWorkspaceId"
-        : "workspace not found in config";
-      log.debug("Ignoring agent_report: workspace is not an agent task", {
+    // A best-of sibling's status flip and artifact write must not interleave with the grouped
+    // assembly that runs under this lock (deliverReportToParent, startup recovery): an assembly
+    // that read the old artifact of a sibling already marked reported would finalize the parent
+    // on the report this publication is replacing.
+    const bestOfParentWorkspaceId =
+      latestEntryBeforeReport != null &&
+      (this.getEffectiveTaskGroup(childWorkspaceId, latestEntryBeforeReport.workspace)?.total ??
+        1) > 1
+        ? latestEntryBeforeReport.workspace.parentWorkspaceId
+        : undefined;
+    const publish = () =>
+      this.publishAgentTaskReport(
         childWorkspaceId,
-        reason,
-      });
-      // Best-effort: resolve any foreground waiters even if we can't deliver to a parent.
-      this.resolveWaiters(childWorkspaceId, reportArgs);
-      void this.maybeStartQueuedTasks();
+        childEntry,
+        latestEntryBeforeReport,
+        reportArgs
+      );
+    const published =
+      bestOfParentWorkspaceId != null
+        ? await this.deferredBestOfLocks.withLock(bestOfParentWorkspaceId, publish)
+        : await publish();
+    if (!published) {
       return { finalized: true };
     }
-
-    const reportTitle = coerceNonEmptyString(reportArgs.title);
-    this.timelineRecorder.record(parentWorkspaceId, {
-      kind: "task.reported",
-      // Background reports are also injected into parent history, which the timeline maps; keying
-      // both on the task keeps one row per report.
-      source: { system: "task", key: subagentReportSourceKey(childWorkspaceId) },
-      status: "completed",
-      anchor: { taskId: childWorkspaceId, childWorkspaceId },
-      data: {
-        ...(reportTitle ? { title: reportTitle } : {}),
-        digest: reportArgs.reportMarkdown,
-      },
-    });
-
-    const isWorkflowOwnedChildReport = latestChildEntry?.workspace.workflowTask != null;
-
-    const indexAfterReport = this.buildAgentTaskIndex(cfgAfterReport);
-    const ancestorWorkspaceIds = this.listAncestorWorkspaceIdsUsingParentById(
-      indexAfterReport.parentById,
-      childWorkspaceId
-    );
-    const workflowOwnedAncestorWorkspaceIds = ancestorWorkspaceIds.filter(
-      (ancestorWorkspaceId) =>
-        this.getWorkflowOwnedDescendantAgentTaskUsingIndex(
-          indexAfterReport,
-          ancestorWorkspaceId,
-          childWorkspaceId
-        ) === true
-    );
-
-    // Persist the completed report in the session dirs of all ancestors so `task_await` can
-    // retrieve it after cleanup/restart (even if the task workspace itself is deleted).
-    const persistedAtMs = Date.now();
-    for (const ancestorWorkspaceId of ancestorWorkspaceIds) {
-      try {
-        const ancestorSessionDir = path.join(this.config.sessionsDir, ancestorWorkspaceId);
-        await upsertSubagentReportArtifact({
-          workspaceId: ancestorWorkspaceId,
-          workspaceSessionDir: ancestorSessionDir,
-          childTaskId: childWorkspaceId,
-          parentWorkspaceId,
-          ancestorWorkspaceIds,
-          workflowOwnedAncestorWorkspaceIds,
-          reportMarkdown: reportArgs.reportMarkdown,
-          model: latestChildEntry?.workspace.taskModelString,
-          thinkingLevel: latestChildEntry?.workspace.taskThinkingLevel,
-          title: reportArgs.title,
-          planFilePath: reportArgs.planFilePath,
-          structuredOutput: reportArgs.structuredOutput,
-          nowMs: persistedAtMs,
-        });
-      } catch (error: unknown) {
-        log.error("Failed to persist subagent report artifact", {
-          workspaceId: ancestorWorkspaceId,
-          childTaskId: childWorkspaceId,
-          error,
-        });
-      }
-    }
+    const { parentWorkspaceId, latestChildEntry, isWorkflowOwnedChildReport } = published;
 
     // Goal attribution is informational; if it throws (permissions failure,
     // disk-full, corrupted extensionMetadata.json in pushSnapshot), execution
@@ -12744,6 +12732,149 @@ export class TaskService implements AgentTaskIntegration {
     });
 
     return { finalized: true };
+  }
+
+  /**
+   * Marks the child reported and persists its report artifact in every ancestor session dir.
+   * Returns null when the child is not an agent task (no parent to deliver to).
+   */
+  private async publishAgentTaskReport(
+    childWorkspaceId: string,
+    childEntry: { projectPath: string; workspace: WorkspaceConfigEntry } | null | undefined,
+    latestEntryBeforeReport:
+      | { projectPath: string; workspace: WorkspaceConfigEntry }
+      | null
+      | undefined,
+    reportArgs: {
+      reportMarkdown: string;
+      title?: string;
+      structuredOutput?: unknown;
+      planFilePath?: string;
+    }
+  ): Promise<{
+    parentWorkspaceId: string;
+    latestChildEntry: { projectPath: string; workspace: WorkspaceConfigEntry } | null | undefined;
+    isWorkflowOwnedChildReport: boolean;
+  } | null> {
+    // Notify clients immediately even if we can't delete the workspace yet.
+    await this.editWorkspaceEntry(
+      childWorkspaceId,
+      (ws) => {
+        ws.taskStatus = "reported";
+        ws.reportedAt = getIsoNow();
+        // Successful completion resets the persisted recovery circuit breaker.
+        delete ws.taskRecoveryAttempts;
+      },
+      { allowMissing: true }
+    );
+    // Drop queued incremental updates synchronously with the terminal commit: while they sit at
+    // the parent's queue head as tool-end entries, the parent's stream stops at its next step
+    // boundary for them, and a dispatch refused as superseded cannot restore that cut turn.
+    // skipCancelCallbacks: a parent running as a delegated workspace turn queues each report with
+    // continuation-failure callbacks; superseding the report must not interrupt that live turn.
+    const progressParentWorkspaceId = latestEntryBeforeReport?.workspace.parentWorkspaceId;
+    if (progressParentWorkspaceId) {
+      const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
+        progressParentWorkspaceId,
+        agentReportProgressDedupePrefix(childWorkspaceId),
+        { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON, skipCancelCallbacks: true }
+      );
+      if (!queuedProgressRemoval.success) {
+        log.warn("Failed to remove queued incremental sub-agent reports", {
+          parentWorkspaceId: progressParentWorkspaceId,
+          childWorkspaceId,
+          error: queuedProgressRemoval.error,
+        });
+      }
+    }
+    eventSpine.emit("task.reported", { workspaceId: childWorkspaceId, taskId: childWorkspaceId });
+
+    await this.emitWorkspaceMetadata(childWorkspaceId);
+
+    // NOTE: Stream continues — we intentionally do NOT abort it.
+    // Deterministic termination is enforced by StreamManager stopWhen logic that
+    // waits for an agent_report tool result where output.success === true at the
+    // step boundary (preserving usage accounting). recordSessionUsage runs when
+    // the stream ends naturally.
+
+    const cfgAfterReport = this.config.loadConfigOrDefault();
+    const latestChildEntry = findWorkspaceEntry(cfgAfterReport, childWorkspaceId) ?? childEntry;
+    const parentWorkspaceId = latestChildEntry?.workspace.parentWorkspaceId;
+    if (!parentWorkspaceId) {
+      const reason = latestChildEntry
+        ? "missing parentWorkspaceId"
+        : "workspace not found in config";
+      log.debug("Ignoring agent_report: workspace is not an agent task", {
+        childWorkspaceId,
+        reason,
+      });
+      // Best-effort: resolve any foreground waiters even if we can't deliver to a parent.
+      this.resolveWaiters(childWorkspaceId, reportArgs);
+      void this.maybeStartQueuedTasks();
+      return null;
+    }
+
+    const reportTitle = coerceNonEmptyString(reportArgs.title);
+    this.timelineRecorder.record(parentWorkspaceId, {
+      kind: "task.reported",
+      // Background reports are also injected into parent history, which the timeline maps; keying
+      // both on the task keeps one row per report.
+      source: { system: "task", key: subagentReportSourceKey(childWorkspaceId) },
+      status: "completed",
+      anchor: { taskId: childWorkspaceId, childWorkspaceId },
+      data: {
+        ...(reportTitle ? { title: reportTitle } : {}),
+        digest: reportArgs.reportMarkdown,
+      },
+    });
+
+    const isWorkflowOwnedChildReport = latestChildEntry?.workspace.workflowTask != null;
+
+    const indexAfterReport = this.buildAgentTaskIndex(cfgAfterReport);
+    const ancestorWorkspaceIds = this.listAncestorWorkspaceIdsUsingParentById(
+      indexAfterReport.parentById,
+      childWorkspaceId
+    );
+    const workflowOwnedAncestorWorkspaceIds = ancestorWorkspaceIds.filter(
+      (ancestorWorkspaceId) =>
+        this.getWorkflowOwnedDescendantAgentTaskUsingIndex(
+          indexAfterReport,
+          ancestorWorkspaceId,
+          childWorkspaceId
+        ) === true
+    );
+
+    // Persist the completed report in the session dirs of all ancestors so `task_await` can
+    // retrieve it after cleanup/restart (even if the task workspace itself is deleted).
+    const persistedAtMs = Date.now();
+    for (const ancestorWorkspaceId of ancestorWorkspaceIds) {
+      try {
+        const ancestorSessionDir = path.join(this.config.sessionsDir, ancestorWorkspaceId);
+        await upsertSubagentReportArtifact({
+          workspaceId: ancestorWorkspaceId,
+          workspaceSessionDir: ancestorSessionDir,
+          childTaskId: childWorkspaceId,
+          parentWorkspaceId,
+          ancestorWorkspaceIds,
+          workflowOwnedAncestorWorkspaceIds,
+          reportMarkdown: reportArgs.reportMarkdown,
+          model: latestChildEntry?.workspace.taskModelString,
+          thinkingLevel: latestChildEntry?.workspace.taskThinkingLevel,
+          title: reportArgs.title,
+          planFilePath: reportArgs.planFilePath,
+          structuredOutput: reportArgs.structuredOutput,
+          nowMs: persistedAtMs,
+        });
+      } catch (error: unknown) {
+        log.error("Failed to persist subagent report artifact", {
+          workspaceId: ancestorWorkspaceId,
+          childTaskId: childWorkspaceId,
+          error,
+        });
+      }
+    }
+
+    return { parentWorkspaceId, latestChildEntry, isWorkflowOwnedChildReport };
   }
 
   private enforceCompletedReportCacheLimit(): void {
@@ -13065,17 +13196,48 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * A reported sibling that a client reawakened (workspace-turn continuation) or that is streaming
-   * still owns its previous report artifact. Finalizing the parent on that artifact would freeze the
-   * grouped result on a report the child is replacing, so its group waits for the new report.
+   * A reported sibling that a client reawakened (workspace-turn continuation), that a resume put
+   * back to running (its re-run may be between streams or past stream-end but before its
+   * publication), or that is streaming still owns its previous report artifact. Finalizing the
+   * parent on that artifact would freeze the grouped result on a report the child is replacing,
+   * so its group waits for the new report.
    */
   private isBestOfSiblingExecutingAgain(sibling: {
     taskId: string;
+    taskStatus?: WorkspaceConfigEntry["taskStatus"];
     taskExecutionStatus?: WorkspaceConfigEntry["taskExecutionStatus"];
   }): boolean {
     return (
+      sibling.taskStatus === "running" ||
+      sibling.taskStatus === "awaiting_report" ||
       isActiveWorkspaceTurnTaskStatus(sibling.taskExecutionStatus) ||
       this.aiService.isStreaming(sibling.taskId)
+    );
+  }
+
+  /**
+   * Synchronous so the partial-commit transform can re-run it with no await between the check and
+   * the write: every sibling the grouped output was assembled from must still be the group and
+   * none may be executing again.
+   */
+  private areBestOfSiblingsStillSettled(params: {
+    parentWorkspaceId: string;
+    groupId: string;
+    assembledTaskIds: readonly string[];
+    reportingTaskId?: string;
+  }): boolean {
+    const liveSiblings = this.listBestOfSiblingTasks({
+      parentWorkspaceId: params.parentWorkspaceId,
+      groupId: params.groupId,
+    });
+    return (
+      liveSiblings.length === params.assembledTaskIds.length &&
+      liveSiblings.every(
+        (sibling, index) =>
+          sibling.taskId === params.assembledTaskIds[index] &&
+          (sibling.taskId === params.reportingTaskId ||
+            !this.isBestOfSiblingExecutingAgain(sibling))
+      )
     );
   }
 
@@ -13147,23 +13309,23 @@ export class TaskService implements AgentTaskIntegration {
 
     // The artifact reads above awaited disk I/O, during which a client can reawaken a sibling
     // whose old report is already in `reports`; re-read live state once more before handing out.
-    const liveSiblings = this.listBestOfSiblingTasks({
-      parentWorkspaceId: params.parentWorkspaceId,
-      groupId: params.groupId,
-    });
+    // The commit transform repeats this check so a resume landing after this point cannot slip
+    // between it and the partial write either.
+    const taskIds = siblings.map((sibling) => sibling.taskId);
     if (
-      liveSiblings.length !== siblings.length ||
-      liveSiblings.some(
-        (sibling) =>
-          sibling.taskId !== params.reportingTaskId && this.isBestOfSiblingExecutingAgain(sibling)
-      )
+      !this.areBestOfSiblingsStillSettled({
+        parentWorkspaceId: params.parentWorkspaceId,
+        groupId: params.groupId,
+        assembledTaskIds: taskIds,
+        reportingTaskId: params.reportingTaskId,
+      })
     ) {
       return null;
     }
 
     const output = {
       status: "completed" as const,
-      taskIds: siblings.map((sibling) => sibling.taskId),
+      taskIds,
       reports,
     };
     const parsed = TaskToolResultSchema.safeParse(output);
@@ -13244,8 +13406,6 @@ export class TaskService implements AgentTaskIntegration {
       return (
         sibling.taskStatus === "queued" ||
         sibling.taskStatus === "starting" ||
-        sibling.taskStatus === "running" ||
-        sibling.taskStatus === "awaiting_report" ||
         this.isBestOfSiblingExecutingAgain(sibling)
       );
     });
@@ -13504,25 +13664,27 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     let finalizedOutput: z.infer<typeof TaskToolResultSchema> = parsedOutput.data;
+    let areGroupSiblingsStillSettled: (() => boolean) | undefined;
     if (parsedInput.groupCount > 1) {
+      const bestOf =
+        childEntry?.workspace.bestOf ?? this.config.getLegacyTaskVariantGroup(childWorkspaceId);
+      if (!bestOf) {
+        return { kind: "failed" };
+      }
+
       const hasGroupedCompletedOutput =
         Array.isArray(parsedOutput.data.taskIds) &&
         "reports" in parsedOutput.data &&
         Array.isArray(parsedOutput.data.reports);
-      if (hasGroupedCompletedOutput) {
-        finalizedOutput = parsedOutput.data;
-      } else {
-        const bestOf =
-          childEntry?.workspace.bestOf ?? this.config.getLegacyTaskVariantGroup(childWorkspaceId);
-        if (!bestOf) {
-          return { kind: "failed" };
-        }
-
+      // A caller-assembled grouped output (deferred delivery) names no reporting sibling, so
+      // every sibling must be settled at commit time.
+      const reportingTaskId = hasGroupedCompletedOutput ? undefined : childWorkspaceId;
+      if (!hasGroupedCompletedOutput) {
         const groupedOutput = await this.buildBestOfCompletedTaskToolOutput({
           parentWorkspaceId: workspaceId,
           groupId: bestOf.groupId,
           total: bestOf.total,
-          reportingTaskId: childWorkspaceId,
+          reportingTaskId,
         });
         if (!groupedOutput) {
           return { kind: "not_ready" };
@@ -13530,17 +13692,32 @@ export class TaskService implements AgentTaskIntegration {
 
         finalizedOutput = groupedOutput;
       }
+      const assembledTaskIds = finalizedOutput.taskIds ?? [];
+      areGroupSiblingsStillSettled = () =>
+        this.areBestOfSiblingsStillSettled({
+          parentWorkspaceId: workspaceId,
+          groupId: bestOf.groupId,
+          assembledTaskIds,
+          reportingTaskId,
+        });
     }
 
     // The grouped output above was assembled from disk reads that a parent turn can overtake:
     // its commitPartial moves this partial into history and its stream writes a fresh one under a
     // new message id. Apply the finalization only while the partial is still this message with
-    // this call pending, and never under a stream that has already started.
+    // this call pending, and never under a stream that has already started. A sibling resumed
+    // during those reads is about to replace the artifact already assembled here; the transform
+    // runs with no await before the write, so this is the last point that can still see it.
+    let groupSiblingResumed = false;
     const writeResult = await this.historyService.updatePartialIfMessageIdMatches(
       workspaceId,
       partial.id,
       (current) => {
         if (this.aiService.isStreaming(workspaceId)) return null;
+        if (areGroupSiblingsStillSettled != null && !areGroupSiblingsStillSettled()) {
+          groupSiblingResumed = true;
+          return null;
+        }
         const stillPending = current.parts.some(
           (part) =>
             isDynamicToolPart(part) &&
@@ -13569,6 +13746,9 @@ export class TaskService implements AgentTaskIntegration {
       return { kind: "failed" };
     }
     if (!writeResult.data) {
+      if (groupSiblingResumed) {
+        return { kind: "not_ready" };
+      }
       log.debug("tryFinalizePendingTaskToolCallInPartial: partial superseded before finalization", {
         workspaceId,
         messageId: partial.id,
@@ -13714,9 +13894,9 @@ export class TaskService implements AgentTaskIntegration {
       // Deletion is decided on live state inside the task-tree lifecycle lock that remove()
       // holds: reactivation, re-parenting, and task_stop all mutate under that lock, so a task
       // confirmed eligible there cannot change underneath the removal. remove() is the only lock
-      // acquisition on this path: runtime callers reach it under the workspace event lock
-      // (stream-end finalization, cleanup rechecks), nesting event -> task-tree, the inverse of
-      // the send path's task-tree -> event. That nesting predates the live recheck.
+      // acquisition on this path; callers that already hold a lock hold the workspace event lock
+      // (stream-end finalization, cleanup rechecks), nesting event -> task-tree, the order every
+      // path holding both locks follows (see workspaceEventLocks).
       let confirmed: { ok: true; parentWorkspaceId: string } | undefined;
       const removeResult = await this.workspaceService.remove(targetWorkspaceId, true, {
         beforeRemove: async () => {

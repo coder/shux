@@ -51,7 +51,9 @@ function createDeferred<T>(): Deferred<T> {
 
 function createBridgeServer(options: {
   onWorkspaceClose?: (listener: (workspaceId: string | null) => void) => () => void;
-  validate?: (token: string) => { workspaceId: string; sessionId: string } | null;
+  validate?: (
+    token: string
+  ) => { workspaceId: string; sessionId: string; viewerId: string | null } | null;
   getLiveSessionConnection?:
     | ((workspaceId: string) => { sessionId: string; vncPort: number } | null)
     | (() => { sessionId: string; vncPort: number } | null);
@@ -62,7 +64,7 @@ function createBridgeServer(options: {
         options.validate ??
         mock((token: string) =>
           token === VALID_TOKEN
-            ? { workspaceId: VALID_WORKSPACE_ID, sessionId: VALID_SESSION_ID }
+            ? { workspaceId: VALID_WORKSPACE_ID, sessionId: VALID_SESSION_ID, viewerId: null }
             : null
         ),
     },
@@ -778,11 +780,15 @@ describe("DesktopBridgeServer", () => {
   test("shared tokens authorize the requester and bind its owner's session", async () => {
     const tcpHarness = await listenTcpServer();
     const tokens = new DesktopTokenManager();
-    const token = tokens.mint("child", "owner-session");
+    // Minted for the requesting pane's viewer registration, so the bridge is attributed to it.
+    const token = tokens.mint("child", "owner-session", "viewer-child");
     const getLiveSessionConnection = mock((workspaceId: string) =>
       workspaceId === "child"
         ? { ownerWorkspaceId: "owner", sessionId: "owner-session", vncPort: tcpHarness.port }
         : null
+    );
+    const noteDetached = mock(
+      (_requester: string, _owner: string, _viewerId?: string) => undefined
     );
     const bridgeServer = new DesktopBridgeServer({
       desktopTokenManager: tokens,
@@ -790,16 +796,41 @@ describe("DesktopBridgeServer", () => {
         getLiveSessionConnection,
         onWorkspaceClose: () => () => undefined,
         watchWorkspaceConfig: () => () => undefined,
+        noteDetached,
       },
     });
     const upgradeHarness = await listenUpgradeServer(bridgeServer);
     let ws: WebSocket | null = null;
     try {
+      expect(bridgeServer.hasActiveBridge("child")).toBe(false);
       ws = new WebSocket(`ws://127.0.0.1:${upgradeHarness.port}/?token=${token}&workspaceId=owner`);
       await waitForWebSocketOpen(ws);
       const tcpSocket = await tcpHarness.connectionPromise;
       ws.send(Buffer.from([1, 2, 3]));
       expect(await waitForTcpData(tcpSocket)).toEqual(Buffer.from([1, 2, 3]));
+      // The attached bridge counts for the requester and the owner whose desktop it shows,
+      // but not for unrelated workspaces.
+      expect(bridgeServer.hasActiveBridge("child")).toBe(true);
+      expect(bridgeServer.hasActiveBridge("owner")).toBe(true);
+      expect(bridgeServer.hasActiveBridge("isolated")).toBe(false);
+      // The owner is re-resolved on request: a borrower rebound before the config watcher
+      // revalidates the pair already attaches its new owner, not the one captured at admission.
+      const reboundToGrand = (requester: string, captured: string) =>
+        requester === "child" ? "grand" : captured;
+      expect(bridgeServer.hasActiveBridge("grand", reboundToGrand)).toBe(true);
+      expect(bridgeServer.hasActiveBridge("owner", reboundToGrand)).toBe(false);
+      expect(bridgeServer.hasActiveBridge("child", reboundToGrand)).toBe(true);
+      await closeWebSocket(ws);
+      ws = null;
+      // The client's close event can land before the server finishes its own close handling.
+      for (let attempt = 0; attempt < 50 && bridgeServer.hasActiveBridge("child"); attempt++) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+      expect(bridgeServer.hasActiveBridge("child")).toBe(false);
+      expect(bridgeServer.hasActiveBridge("owner")).toBe(false);
+      // The closed bridge hands requester and owner to the manager's bounded attachment grace,
+      // attributed to the viewer registration the token was minted for.
+      expect(noteDetached).toHaveBeenCalledWith("child", "owner", "viewer-child");
       expect(getLiveSessionConnection.mock.calls.map((call) => call[0])).toEqual([
         "child",
         "child",
@@ -956,7 +987,11 @@ describe("DesktopBridgeServer", () => {
 
     for (const scenario of scenarios) {
       const bridgeServer = createBridgeServer({
-        validate: mock(() => ({ workspaceId: VALID_WORKSPACE_ID, sessionId: VALID_SESSION_ID })),
+        validate: mock(() => ({
+          workspaceId: VALID_WORKSPACE_ID,
+          sessionId: VALID_SESSION_ID,
+          viewerId: null,
+        })),
         getLiveSessionConnection: mock(() => scenario.liveSession),
       });
       const upgradeHarness = await listenUpgradeServer(bridgeServer);
@@ -973,13 +1008,50 @@ describe("DesktopBridgeServer", () => {
     }
   });
 
+  test("a bridge that never reached VNC leaves no attachment grace", async () => {
+    const noteDetached = mock((_requester: string, _owner: string) => undefined);
+    const bridgeServer = new DesktopBridgeServer({
+      desktopTokenManager: {
+        validate: () => ({
+          workspaceId: VALID_WORKSPACE_ID,
+          sessionId: VALID_SESSION_ID,
+          viewerId: null,
+        }),
+      },
+      desktopSessionManager: {
+        // An unreachable VNC port: the upgrade is admitted but TCP never connects.
+        getLiveSessionConnection: () => ({
+          ownerWorkspaceId: VALID_WORKSPACE_ID,
+          sessionId: VALID_SESSION_ID,
+          vncPort: 1,
+        }),
+        onWorkspaceClose: () => () => undefined,
+        watchWorkspaceConfig: () => () => undefined,
+        noteDetached,
+      },
+    });
+    const upgradeHarness = await listenUpgradeServer(bridgeServer);
+    try {
+      const ws = new WebSocket(`ws://127.0.0.1:${upgradeHarness.port}/?token=${VALID_TOKEN}`);
+      expect((await waitForWebSocketClose(ws)).code).toBe(4003);
+      expect(noteDetached).not.toHaveBeenCalled();
+    } finally {
+      await upgradeHarness.close();
+      await bridgeServer.stop();
+    }
+  });
+
   test("closes with 4003 when the VNC endpoint cannot be reached", async () => {
     const deadServer = await listenTcpServer();
     const deadPort = deadServer.port;
     await deadServer.close();
 
     const bridgeServer = createBridgeServer({
-      validate: mock(() => ({ workspaceId: VALID_WORKSPACE_ID, sessionId: VALID_SESSION_ID })),
+      validate: mock(() => ({
+        workspaceId: VALID_WORKSPACE_ID,
+        sessionId: VALID_SESSION_ID,
+        viewerId: null,
+      })),
       getLiveSessionConnection: mock(() => ({
         sessionId: VALID_SESSION_ID,
         vncPort: deadPort,
@@ -1001,7 +1073,11 @@ describe("DesktopBridgeServer", () => {
   test("stop closes active connections and is idempotent", async () => {
     const tcpHarness = await listenTcpServer();
     const bridgeServer = createBridgeServer({
-      validate: mock(() => ({ workspaceId: VALID_WORKSPACE_ID, sessionId: VALID_SESSION_ID })),
+      validate: mock(() => ({
+        workspaceId: VALID_WORKSPACE_ID,
+        sessionId: VALID_SESSION_ID,
+        viewerId: null,
+      })),
       getLiveSessionConnection: mock(() => ({
         sessionId: VALID_SESSION_ID,
         vncPort: tcpHarness.port,
@@ -1061,7 +1137,11 @@ describe("DesktopBridgeServer", () => {
   test("ignores text frames without breaking later binary traffic", async () => {
     const tcpHarness = await listenTcpServer();
     const bridgeServer = createBridgeServer({
-      validate: mock(() => ({ workspaceId: VALID_WORKSPACE_ID, sessionId: VALID_SESSION_ID })),
+      validate: mock(() => ({
+        workspaceId: VALID_WORKSPACE_ID,
+        sessionId: VALID_SESSION_ID,
+        viewerId: null,
+      })),
       getLiveSessionConnection: mock(() => ({
         sessionId: VALID_SESSION_ID,
         vncPort: tcpHarness.port,

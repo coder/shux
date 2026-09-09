@@ -178,6 +178,19 @@ function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMess
   }
 }
 
+/** Use the provider reader's probe when rewrites join previously separated unreadable rows. */
+export function hasUnreadableHistoryResetEvidence(rows: readonly Buffer[]): boolean {
+  const probe: HistoryResetProbe = { resetProbe: "", resetStage: 0, possibleReset: false };
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const raw = rows[i].at(-1) === 10 ? rows[i].subarray(0, -1) : rows[i];
+    addHistoryResetProbe(probe, raw, true);
+    if (raw.length <= SESSION_HISTORY_MAX_LINE_BYTES)
+      classifyHistoryScanRow(raw.toString("utf8"), probe);
+    if (probe.possibleReset) return true;
+  }
+  return false;
+}
+
 function historyFileStamp(
   stat: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number } | undefined
 ): string {
@@ -192,7 +205,8 @@ type ProviderHistoryStart =
 async function findProviderHistoryStart(
   handle: fs.FileHandle,
   fileSize: number,
-  skip: number
+  skip: number,
+  includeReadableResetFloor: boolean
 ): Promise<ProviderHistoryStart> {
   const probe: HistoryResetProbe = { resetProbe: "", resetStage: 0, possibleReset: false };
   let parts: Buffer[] = [];
@@ -221,7 +235,8 @@ async function findProviderHistoryStart(
     const durableBoundary = message !== null && isDurableContextBoundaryMarker(message);
     if (isManualHistoryReset(message, probe.possibleReset)) {
       // Retain readable reset markers, but never count them as skippable boundaries.
-      if (durableBoundary) return start;
+      // Deletion also needs readable malformed-role floors that provider requests exclude.
+      if (durableBoundary || (includeReadableResetFloor && message)) return start;
       // A fragmented marker may end several rows to the right of the key that
       // completed recognition. Never return any of that unreadable evidence.
       return unreadableRunEnd ?? rowEnd;
@@ -266,7 +281,8 @@ async function findProviderHistoryStart(
 async function readHistoryProjectionFromLatestBoundary<Row>(
   paths: Record<HistoryArtifact, string>,
   skip: number,
-  project: (value: unknown) => Row | null
+  project: (value: unknown) => Row | null,
+  includeReadableResetFloor = false
 ): Promise<Row[]> {
   assert(Number.isSafeInteger(skip) && skip >= 0, "provider boundary skip must be non-negative");
   const files = new Map<HistoryArtifact, { handle: fs.FileHandle; size: number; stamp: string }>();
@@ -290,7 +306,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
     ): Promise<ProviderHistoryStart> => {
       const file = files.get(artifact);
       return file
-        ? findProviderHistoryStart(file.handle, file.size, skipCount)
+        ? findProviderHistoryStart(file.handle, file.size, skipCount, includeReadableResetFloor)
         : Promise.resolve({ kind: "exhausted", oldestBoundary: null, boundaryCount: 0 });
     };
     const readTail = async (artifact: HistoryArtifact, offset: number): Promise<Row[]> => {
@@ -348,10 +364,17 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
 
 export function readProviderHistoryFromLatestBoundary(
   paths: Record<HistoryArtifact, string>,
-  skip: number
+  skip: number,
+  options?: {
+    /** Mutation classification needs the excluded floor itself; provider requests leave this off. */
+    includeReadableResetFloor?: boolean;
+  }
 ): Promise<MuxMessage[]> {
-  return readHistoryProjectionFromLatestBoundary(paths, skip, (value) =>
-    isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null
+  return readHistoryProjectionFromLatestBoundary(
+    paths,
+    skip,
+    (value) => (isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null),
+    options?.includeReadableResetFloor
   );
 }
 

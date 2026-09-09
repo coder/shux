@@ -70,6 +70,12 @@ export async function listWorkspaceMcpPrompts(
   workspaceId: string,
   signal?: AbortSignal
 ) {
+  // Archive admission pairing (see WorkspaceService.acquireMcpPromptDiscoveryAdmission): held
+  // through ensureReady and server startup below, both of which would otherwise re-wake a
+  // stopped Coder workspace or start stdio servers inside a checkout the archive is removing.
+  // Discovery degrades to an empty catalog instead of erroring, like file completions.
+  using admission = context.workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId);
+  if (admission === undefined) return [];
   await context.initStateManager.waitForInit(workspaceId, signal);
   const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
   if (!metadataResult.success) throw new Error(metadataResult.error);
@@ -86,7 +92,9 @@ export async function listWorkspaceMcpPrompts(
       ? mergeMultiProjectSecrets(metadata, context.secretsStore)
       : context.secretsStore.getEffectiveSecrets(metadata.projectPath)
   );
-  return context.mcpServerManager.getPromptsForWorkspace(
+  // `return await`, not `return`: `using` disposes at block exit, and a bare returned promise
+  // would release the admission before server startup settles.
+  return await context.mcpServerManager.getPromptsForWorkspace(
     {
       workspaceId,
       projectPath: metadata.projectPath,

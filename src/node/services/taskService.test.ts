@@ -12,6 +12,7 @@ import {
 } from "@/constants/terminationTimeouts";
 import { Config, type ProjectsConfig, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
+import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import * as subagentGitPatchArtifacts from "@/node/services/subagentGitPatchArtifacts";
 import {
   getSubagentGitPatchMboxPath,
@@ -3729,6 +3730,90 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, newParentId)).toBeUndefined();
     expect(findWorkspaceInConfig(config, oldParentId)).toBeDefined();
   });
+
+  test("reported-task cleanup and task_send_message never deadlock on the event and task-tree locks", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-cleanup-send-lock-order";
+    const childTaskId = "child-cleanup-send-lock-order";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "reported",
+          reportedAt: "2026-08-10T00:00:00.000Z",
+          taskModelString: "openai:gpt-5.2",
+          workflowTask: { runId: "wfr_cleanup_send_lock_order", stepId: "explore" },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // Mirror WorkspaceService.remove(): confirm and delete under the task-tree lifecycle lock.
+    // Hold the call open between cleanup taking the child's event lock and remove() taking the
+    // tree lock, so the send can be parked on its own lock acquisition inside that window.
+    let releaseRemove!: () => void;
+    const removeGate = new Promise<void>((resolve) => {
+      releaseRemove = resolve;
+    });
+    let removeEntered!: () => void;
+    const removeStarted = new Promise<void>((resolve) => {
+      removeEntered = resolve;
+    });
+    const remove = mock(
+      async (
+        workspaceId: string,
+        _force?: boolean,
+        options?: { beforeRemove?: () => Promise<boolean> }
+      ): Promise<Result<void>> => {
+        removeEntered();
+        await removeGate;
+        return await taskService.withTaskTreeLifecycleLock(workspaceId, async () => {
+          if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+            return Ok(undefined);
+          }
+          await removeWorkspaceFromTestConfig(config, workspaceId);
+          return Ok(undefined);
+        });
+      }
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const internals = taskService as unknown as {
+      requestReportedTaskCleanupRecheck: (workspaceId: string) => Promise<void>;
+    };
+
+    const cleanup = internals.requestReportedTaskCleanupRecheck(childTaskId);
+    await removeStarted;
+    const send = taskService.sendMessageToDescendantAgentTask(
+      parentWorkspaceId,
+      childTaskId,
+      "steer the reported child",
+      "tool-end"
+    );
+    // One macrotask turn: the send's pre-lock section is microtask-only, so by now it is parked
+    // on its first lock acquisition while cleanup still holds the child's event lock.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseRemove();
+
+    let deadlockTimer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      Promise.all([cleanup, send]).then(() => "settled" as const),
+      new Promise<"deadlocked">((resolve) => {
+        deadlockTimer = setTimeout(() => resolve("deadlocked"), 5_000);
+      }),
+    ]);
+    clearTimeout(deadlockTimer);
+    expect(outcome).toBe("settled");
+    expect(await send).toEqual(Err({ code: "not_found" }));
+    expect(findWorkspaceInConfig(config, childTaskId)).toBeUndefined();
+  }, 10_000);
 
   test("bare compaction stream-end resumes the pre-compaction parent identity", async () => {
     const config = await createTestConfig(rootDir);
@@ -13025,6 +13110,76 @@ describe("TaskService", () => {
     );
   });
 
+  test("acknowledged removal preflights activity and scope and retries deepest-first", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parent = "ack-parent";
+    const child = "ack-child";
+    const grandchild = "ack-grandchild";
+    const workspaces = [
+      projectWorkspace(projectPath, "parent", parent),
+      projectWorkspace(projectPath, "child", child, {
+        parentWorkspaceId: parent,
+        taskStatus: "reported",
+      }),
+      projectWorkspace(projectPath, "grandchild", grandchild, {
+        parentWorkspaceId: child,
+        taskStatus: "running",
+        taskIsolation: "none",
+      }),
+    ];
+    await saveWorkspaces(config, projectPath, workspaces, testTaskSettings());
+    let fail = true;
+    const remove = mock(async (workspaceId: string): Promise<Result<void>> => {
+      if (workspaceId === child && fail) return Err("runtime failure");
+      await removeWorkspaceFromTestConfig(config, workspaceId);
+      return Ok(undefined);
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    let streaming = false;
+    const { aiService } = createAIServiceMocks(config, {
+      isStreaming: mock((id: string) => streaming && id === grandchild),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+    const removeScope = (ids: string[]) =>
+      taskService.withTaskTreeLifecycleLock(parent, () =>
+        taskService.removeAcknowledgedDescendantsWhileTaskTreeLocked(parent, ids)
+      );
+    expect(taskService.listWorkspaceRemovalDescendants(parent)).toContainEqual({
+      workspaceId: grandchild,
+      title: "grandchild",
+      active: true,
+    });
+    expect((await removeScope([child, grandchild])).success).toBe(false);
+    expect(remove).not.toHaveBeenCalled();
+    workspaces[2].taskStatus = "reported";
+    await saveWorkspaces(config, projectPath, workspaces, testTaskSettings());
+    streaming = true;
+    expect((await removeScope([child, grandchild])).success).toBe(false);
+    expect(remove).not.toHaveBeenCalled();
+    streaming = false;
+    expect((await removeScope([child])).success).toBe(false);
+    expect((await removeScope([child, grandchild, "unrelated"])).success).toBe(false);
+    expect(remove).not.toHaveBeenCalled();
+    expect(
+      taskService.listWorkspaceRemovalDescendants(parent).map((entry) => entry.workspaceId)
+    ).toEqual([grandchild, child]);
+    const failure = await removeScope([child, grandchild]);
+    expect(failure.success).toBe(false);
+    if (!failure.success) {
+      expect(failure.error).toContain(child);
+      expect(failure.error).toContain("runtime failure");
+    }
+    expect(
+      taskService.listWorkspaceRemovalDescendants(parent).map((entry) => entry.workspaceId)
+    ).toEqual([child]);
+    expect(config.findWorkspace(parent)).not.toBeNull();
+    fail = false;
+    expect(await removeScope([child, grandchild])).toEqual(Ok(undefined));
+    expect(remove.mock.calls.map((call) => call[0])).toEqual([grandchild, child, child]);
+    expect(await removeScope([child, grandchild])).toEqual(Ok(undefined));
+  });
+
   test("removeInactiveDescendantAgentTask enforces scope, leaf order, and idempotency", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
@@ -16827,6 +16982,113 @@ describe("TaskService", () => {
     expect(remainingTaskIds).toContain(childTwoId);
   });
 
+  test("best-of finalization never ships a report a resumed sibling is replacing", async () => {
+    const parentId = "parent-best-of-resumed-sibling";
+    const childOneId = "child-best-of-resumed-sibling-1";
+    const childTwoId = "child-best-of-resumed-sibling-2";
+    const bestOf = { groupId: "best-of-resumed-sibling", index: 0, total: 2 } as const;
+
+    const { config, historyService, partialService, taskService } =
+      await createBestOfTaskServiceTestHarness({
+        parentId,
+        children: [
+          {
+            id: childOneId,
+            name: "agent_explore_child_1",
+            taskStatus: "running",
+            bestOf,
+          },
+          {
+            // Reported once, then its re-run was stopped: the user resume below replaces its report.
+            id: childTwoId,
+            name: "agent_explore_child_2",
+            taskStatus: "interrupted",
+            bestOf: { ...bestOf, index: 1 },
+          },
+        ],
+      });
+
+    await writePendingBestOfParentPartial({
+      partialService,
+      parentId,
+      messageId: "assistant-parent-best-of-resumed-sibling",
+      toolCallId: "task-best-of-resumed-sibling-call",
+      title: "Best of 2",
+      n: 2,
+      timestamp: Date.now(),
+    });
+    await upsertTestSubagentReports({
+      config,
+      parentId,
+      reports: [
+        {
+          childTaskId: childTwoId,
+          reportMarkdown: "Report from child two (pre-continuation)",
+          title: "Option two (stale)",
+        },
+      ],
+    });
+
+    // Barrier at the commit of child one's grouped output: its assembly has already read child
+    // two's old artifact. Resume child two and let its replacement report race the commit. The
+    // replacement is started, not awaited (awaiting it under the assembly's lock would deadlock);
+    // the barrier lifts once child two asks for the group lock, so it has run as far as the lock
+    // lets it: blocked before publishing, or, were publication unserialized, already published
+    // and queueing for delivery.
+    const groupLocks = (taskService as unknown as { deferredBestOfLocks: MutexMap<string> })
+      .deferredBestOfLocks;
+    const withGroupLock = groupLocks.withLock.bind(groupLocks);
+    let onGroupLockRequested: (() => void) | undefined;
+    spyOn(groupLocks, "withLock").mockImplementation(((
+      key: string,
+      operation: () => Promise<unknown>
+    ) => {
+      if (key === parentId) onGroupLockRequested?.();
+      return withGroupLock(key, operation);
+    }) as typeof groupLocks.withLock);
+    const updatePartial = historyService.updatePartialIfMessageIdMatches.bind(historyService);
+    let replacementReport: Promise<void> | undefined;
+    spyOn(historyService, "updatePartialIfMessageIdMatches").mockImplementationOnce(
+      async (workspaceId, messageId, updater) => {
+        expect(await taskService.markInterruptedTaskRunning(childTwoId)).toBe(true);
+        const groupLockRequested = new Promise<void>((resolve) => {
+          onGroupLockRequested = resolve;
+        });
+        replacementReport = finalizeReportedChildTaskForTest({
+          historyService,
+          partialService,
+          taskService,
+          childId: childTwoId,
+          reportMarkdown: "Report from child two (continuation)",
+          title: "Option two",
+        });
+        await groupLockRequested;
+        return updatePartial(workspaceId, messageId, updater);
+      }
+    );
+
+    await finalizeReportedChildTaskForTest({
+      historyService,
+      partialService,
+      taskService,
+      childId: childOneId,
+      reportMarkdown: "Report from child one",
+      title: "Option one",
+    });
+    expect(replacementReport).toBeDefined();
+    await replacementReport;
+    await flushTerminalAttentionDrains(taskService);
+
+    const toolPart = getTaskToolPart(await partialService.readPartial(parentId));
+    expect(toolPart?.state).toBe("output-available");
+    const serializedOutput = JSON.stringify(toolPart?.output);
+    expect(serializedOutput).toContain("Report from child one");
+    expect(serializedOutput).toContain("Report from child two (continuation)");
+    expect(serializedOutput).not.toContain("pre-continuation");
+    const parentHistory = await collectFullHistory(historyService, parentId);
+    expect(JSON.stringify(parentHistory)).not.toContain("pre-continuation");
+  });
+
   test("agent_report recovers a pending legacy variants task call", async () => {
     const parentId = "parent-legacy-variants";
     const childOneId = "child-legacy-variant-1";
@@ -17050,9 +17312,11 @@ describe("TaskService", () => {
             bestOf,
           },
           {
+            // Already reported (artifact seeded below) and then stopped; its late stream-end
+            // below re-delivers the same report.
             id: childTwoId,
             name: "agent_explore_child_2",
-            taskStatus: "running",
+            taskStatus: "interrupted",
             bestOf: { ...bestOf, index: 1 },
           },
         ],

@@ -7,8 +7,8 @@ import {
   describe,
   expect,
   mock,
-  spyOn,
   test,
+  type Mock,
 } from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
@@ -66,10 +66,13 @@ describe("useDesktopConnection control ownership", () => {
     bridgePath: "/desktop/ws",
     token: "test-token",
   };
-  let getBootstrap = mock(() => Promise.resolve(bootstrap));
+  let getBootstrap: Mock<APIClient["desktop"]["getBootstrap"]> = mock(() =>
+    Promise.resolve(bootstrap)
+  );
 
   const watchViewer = mock<APIClient["desktop"]["watchViewer"]>();
   const acknowledgeViewerRelease = mock<APIClient["desktop"]["acknowledgeViewerRelease"]>();
+  const detachViewer = mock<APIClient["desktop"]["detachViewer"]>();
   let autoReady = true;
   const registrations: Array<{
     queue: ReturnType<typeof createAsyncMessageQueue<DesktopViewerEvent>>;
@@ -94,13 +97,19 @@ describe("useDesktopConnection control ownership", () => {
     autoReady = true;
     acknowledgeViewerRelease.mockReset();
     acknowledgeViewerRelease.mockResolvedValue(undefined);
+    detachViewer.mockReset();
+    detachViewer.mockResolvedValue(undefined);
     watchViewer.mockReset();
-    watchViewer.mockImplementation((_input, { signal } = {}) => {
+    watchViewer.mockImplementation((input, { signal } = {}) => {
       if (!signal) throw new Error("Viewer registration must be abortable");
+      // The pane names its registration up front (a fresh UUID per attempt).
+      if (typeof input.viewerId !== "string" || input.viewerId.length === 0) {
+        throw new Error("Viewer registration must be named by the pane");
+      }
       const registration = {
         queue: createAsyncMessageQueue<DesktopViewerEvent>(),
         signal,
-        viewerId: `viewer-${registrations.length}`,
+        viewerId: input.viewerId,
         failure: null as Error | null,
       };
       registrations.push(registration);
@@ -119,14 +128,14 @@ describe("useDesktopConnection control ownership", () => {
     Object.assign(globalThis, originals);
   });
 
-  function mountConnection() {
+  function mountConnection(options?: DesktopModule.UseDesktopConnectionOptions) {
     let desktop!: DesktopModule.UseDesktopConnectionResult;
     function Harness() {
-      desktop = useDesktopConnection("workspace-1");
+      desktop = useDesktopConnection("workspace-1", options);
       return <div ref={desktop.containerRef} />;
     }
     const client: RecursivePartial<APIClient> = {
-      desktop: { getBootstrap, watchViewer, acknowledgeViewerRelease },
+      desktop: { getBootstrap, watchViewer, acknowledgeViewerRelease, detachViewer },
     };
     const view = render(
       <APIContext.Provider
@@ -325,6 +334,44 @@ describe("useDesktopConnection control ownership", () => {
     expect(registration.signal.aborted).toBe(false);
   });
 
+  test("registers the viewer before bootstrap so the pane is attached before the desktop starts", async () => {
+    autoReady = false;
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(registrations).toHaveLength(1));
+    // Bootstrap clears the backend's startup reservation; it must not run until the pane is
+    // registered, or an agent-driven archive could close the desktop in between.
+    expect(getBootstrap).not.toHaveBeenCalled();
+    const registration = registrations[0];
+    registration.queue.push({ type: "ready", viewerId: registration.viewerId });
+    await waitFor(() => expect(view.desktop.state).toBe("connected"));
+    expect(getBootstrap).toHaveBeenCalledTimes(1);
+  });
+
+  test("a release during bootstrap ACKs and prevents the pending bootstrap from connecting", async () => {
+    let resolveBootstrap!: (value: typeof bootstrap) => void;
+    getBootstrap = mock(
+      () =>
+        new Promise<typeof bootstrap>((done) => {
+          resolveBootstrap = done;
+        })
+    );
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(getBootstrap).toHaveBeenCalledTimes(1));
+    const registration = registrations[0];
+    registration.queue.push({ type: "release", viewerId: registration.viewerId });
+    await waitFor(() =>
+      expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: registration.viewerId })
+    );
+    await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
+    await act(async () => {
+      resolveBootstrap(bootstrap);
+      await Promise.resolve();
+    });
+    expect(DesktopRfbFixture.instances).toHaveLength(0);
+  });
+
   test.each(["disconnect", "unmount"])("%s cancels registration before ready", async (action) => {
     autoReady = false;
     const view = mountConnection();
@@ -343,30 +390,37 @@ describe("useDesktopConnection control ownership", () => {
     expect(DesktopRfbFixture.instances).toHaveLength(0);
   });
 
-  test("a late subscription from a superseded generation cannot construct another RFB", async () => {
+  test("a reconnect while the first registration is still pending reuses it instead of superseding it", async () => {
     const pending =
       Promise.withResolvers<Awaited<ReturnType<APIClient["desktop"]["watchViewer"]>>>();
     watchViewer.mockReturnValueOnce(pending.promise);
     const view = mountConnection();
     act(() => view.desktop.connect());
     await waitFor(() => expect(watchViewer).toHaveBeenCalledTimes(1));
-    const oldSignal = watchViewer.mock.calls[0][1]?.signal;
-    const replacement = await connect(view);
-    expect(oldSignal?.aborted).toBe(true);
+    const [input, init] = watchViewer.mock.calls[0];
+    // Superseding the pending registration would give it up definitively before a successor is
+    // ready; the new attempt waits for it instead.
+    act(() => view.desktop.connect());
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+    expect(init?.signal?.aborted).toBe(false);
+    expect(detachViewer).not.toHaveBeenCalled();
     const events = wrapAsyncIterator(
       (async function* () {
-        yield await Promise.resolve({ type: "ready" as const, viewerId: "stale" });
+        yield await Promise.resolve({ type: "ready" as const, viewerId: input.viewerId ?? "" });
+        await new Promise<void>((resolve) => {
+          init?.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
       })(),
       {}
     );
-    const close = spyOn(events, "return");
     await act(async () => {
       pending.resolve(events);
       await pending.promise;
     });
-    expect(close).toHaveBeenCalledTimes(1);
-    expect(DesktopRfbFixture.instances).toEqual([replacement]);
-    expect(replacement.disconnectCount).toBe(0);
+    await waitFor(() => expect(view.desktop.state).toBe("connected"));
+    expect(DesktopRfbFixture.instances).toHaveLength(1);
+    expect(watchViewer).toHaveBeenCalledTimes(1);
   });
 
   test.each([false, true])(
@@ -417,34 +471,302 @@ describe("useDesktopConnection control ownership", () => {
     expect(getBootstrap).toHaveBeenCalledTimes(1);
   });
 
-  test.each([
-    [false, "end"],
-    [false, "error"],
-    [true, "end"],
-    [true, "error"],
-  ] as const)("subscription loss releases any socket (ready=%s, %s)", async (ready, failure) => {
-    autoReady = ready;
+  test.each(["end", "error"])(
+    "subscription loss before ready fails the connection and releases the registration (%s)",
+    async (failure) => {
+      autoReady = false;
+      const view = mountConnection();
+      act(() => view.desktop.connect());
+      await waitFor(() => expect(registrations).toHaveLength(1));
+      const registration = registrations[0];
+      if (failure === "error") registration.failure = new Error("Stream failed");
+      registration.queue.end();
+      await waitFor(() => expect(view.desktop.state).toBe("error"));
+      expect(registration.signal.aborted).toBe(true);
+      expect(DesktopRfbFixture.instances).toHaveLength(0);
+      expect(getBootstrap).not.toHaveBeenCalled();
+      expect(acknowledgeViewerRelease).not.toHaveBeenCalled();
+    }
+  );
+
+  test.each(["end", "error"])(
+    "subscription loss after ready drops control, keeps the bridge, and re-registers (%s)",
+    async (failure) => {
+      const view = mountConnection();
+      const rfb = await connect(view);
+      act(() => view.desktop.setControlling(true));
+      holdKeysAndDrag(rfb);
+      const registration = registrations[0];
+      // The replacement registers immediately; hold its ready so the unregistered window is
+      // observable.
+      autoReady = false;
+      if (failure === "error") registration.failure = new Error("Stream failed");
+      registration.queue.end();
+      // The server can no longer ask for a release, so held input is released proactively...
+      await waitFor(() => expect(rfb.viewOnly).toBe(true));
+      expect(rfb.input.filter((event) => event.type === "keyup")).toHaveLength(2);
+      expect(rfb.input.filter((event) => event.type === "mouseup")).toHaveLength(1);
+      expect(registration.signal.aborted).toBe(true);
+      // ...but the healthy VNC bridge stays up (it still marks the pane as attached) and the
+      // pane re-registers in the background instead of tearing the connection down.
+      expect(rfb.disconnectCount).toBe(0);
+      expect(view.desktop.state).toBe("connected");
+      await waitFor(() => expect(registrations).toHaveLength(2));
+      expect(rfb.disconnectCount).toBe(0);
+      expect(DesktopRfbFixture.instances).toHaveLength(1);
+      // Control cannot be re-taken without a release channel.
+      act(() => view.desktop.setControlling(true));
+      expect(view.desktop.controlling).toBe(false);
+      expect(rfb.viewOnly).toBe(true);
+      // Once the replacement is ready, control is available again...
+      const replacement = registrations[1];
+      replacement.queue.push({ type: "ready", viewerId: replacement.viewerId });
+      await waitFor(() => {
+        act(() => view.desktop.setControlling(true));
+        expect(view.desktop.controlling).toBe(true);
+      });
+      // ...and the replacement registration still delivers cooperative release.
+      replacement.queue.push({ type: "release", viewerId: replacement.viewerId });
+      await waitFor(() =>
+        expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: replacement.viewerId })
+      );
+      expect(rfb.disconnectCount).toBe(1);
+    }
+  );
+
+  test("a failed reconnect attempt keeps the ready registration through the backoff", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    const registration = registrations[0];
+    getBootstrap.mockImplementationOnce(() => Promise.reject(new Error("backend hiccup")));
+    rfb.events.dispatchEvent(new Event("disconnect"));
+    // First retry fails at bootstrap; the pane is still mounted and must stay attached.
+    await waitFor(() => expect(getBootstrap).toHaveBeenCalledTimes(2), { timeout: 5_000 });
+    await waitFor(() => expect(view.desktop.state).toBe("disconnected"));
+    expect(registration.signal.aborted).toBe(false);
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+    // The next retry reuses it and reconnects.
+    await waitFor(() => expect(view.desktop.state).toBe("connected"), { timeout: 10_000 });
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+    expect(registration.signal.aborted).toBe(false);
+  });
+
+  test("a failed reconnect attempt with no ready registration keeps the earlier graces", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    // The release stream drops after ready; its replacement is still awaiting ready...
+    autoReady = false;
+    registrations[0].queue.end();
+    await waitFor(() => expect(registrations).toHaveLength(2));
+    // ...when the bridge drops too. The reconnect reuses the pending replacement...
+    act(() => {
+      rfb.events.dispatchEvent(new Event("disconnect"));
+    });
+    await waitFor(() => expect(view.desktop.state).toBe("checking"), { timeout: 5_000 });
+    // ...which fails before ready, as does the fresh registration the attempt makes instead.
+    registrations[1].failure = new Error("replacement lost");
+    registrations[1].queue.end();
+    await waitFor(() => expect(registrations).toHaveLength(3));
+    registrations[2].failure = new Error("registration lost");
+    registrations[2].queue.end();
+    await waitFor(() => expect(view.desktop.state).toBe("disconnected"));
+    // A retry is scheduled, so the graces the earlier attachments left are all that keeps the
+    // pane attached through the backoff: nothing may retract them.
+    expect(detachViewer).not.toHaveBeenCalled();
+  });
+
+  test("suspend keeps the ready registration and a later connect reuses it", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    const registration = registrations[0];
+    act(() => view.desktop.suspend());
+    expect(view.desktop.state).toBe("idle");
+    expect(rfb.disconnectCount).toBe(1);
+    // Suspended (desktop shown in a popout): the pane stays attached...
+    expect(registration.signal.aborted).toBe(false);
+    // ...and still honors a release while suspended.
+    await connect(view);
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+    expect(DesktopRfbFixture.instances).toHaveLength(2);
+    act(() => view.desktop.suspend());
+    registration.queue.push({ type: "release", viewerId: registration.viewerId });
+    await waitFor(() =>
+      expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: registration.viewerId })
+    );
+    await waitFor(() => expect(registration.signal.aborted).toBe(true));
+    act(() => view.desktop.connect());
+    expect(getBootstrap).toHaveBeenCalledTimes(2);
+  });
+
+  test("suspend keeps a registration that is still awaiting ready instead of detaching it", async () => {
+    autoReady = false;
     const view = mountConnection();
     act(() => view.desktop.connect());
     await waitFor(() => expect(registrations).toHaveLength(1));
-    if (ready) {
-      await waitFor(() => expect(view.desktop.state).toBe("connected"));
-      act(() => view.desktop.setControlling(true));
-      holdKeysAndDrag(DesktopRfbFixture.instances[0]);
-    }
     const registration = registrations[0];
-    if (failure === "error") registration.failure = new Error("Stream failed");
-    registration.queue.end();
-    await waitFor(() => expect(view.desktop.state).toBe(ready ? "disconnected" : "error"));
+    // The popout child registers only once granted; the pending inline registration stays the
+    // pane's lease through the handoff rather than being given up definitively.
+    act(() => view.desktop.suspend());
+    expect(registration.signal.aborted).toBe(false);
+    expect(detachViewer).not.toHaveBeenCalled();
+    registration.queue.push({ type: "ready", viewerId: registration.viewerId });
+    expect(await view.desktop.register()).toBe(true);
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+  });
+
+  test("register attaches without bootstrapping and connect reuses the registration", async () => {
+    const view = mountConnection();
+    let ready: Promise<boolean> | undefined;
+    act(() => {
+      ready = view.desktop.register();
+    });
+    await waitFor(() => expect(registrations).toHaveLength(1));
+    // Resolves once the backend reported the registration ready, so a handoff can wait for it.
+    expect(await ready).toBe(true);
+    expect(getBootstrap).not.toHaveBeenCalled();
+    expect(view.desktop.state).toBe("idle");
+    await connect(view);
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+  });
+
+  test("a terminal unavailable bootstrap gives the viewer up definitively", async () => {
+    getBootstrap.mockImplementationOnce(() =>
+      Promise.resolve({ ...bootstrap, capability: { available: false, reason: "disabled" } })
+    );
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
+    expect(registrations).toHaveLength(1);
+    // Definitive detach first (no attachment grace on the backend), then the abort.
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registrations[0].viewerId });
+    expect(registrations[0].signal.aborted).toBe(true);
+  });
+
+  test("a terminal outcome also gives up the registrations it superseded during bootstrap", async () => {
+    let resolveBootstrap!: (value: Awaited<ReturnType<typeof getBootstrap>>) => void;
+    getBootstrap = mock(
+      () =>
+        new Promise<Awaited<ReturnType<typeof getBootstrap>>>((done) => {
+          resolveBootstrap = done;
+        })
+    );
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(getBootstrap).toHaveBeenCalledTimes(1));
+    // The ready subscription drops while bootstrap is pending: the backend stamps a grace for
+    // it and the pane re-registers at once.
+    registrations[0].queue.end();
+    await waitFor(() => expect(registrations).toHaveLength(2));
+    await act(async () => {
+      resolveBootstrap({ ...bootstrap, capability: { available: false, reason: "disabled" } });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
+    // Both the replacement and the superseded registration are detached definitively, so the
+    // superseded one's grace cannot keep a pane that shows nothing attached.
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registrations[1].viewerId });
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registrations[0].viewerId });
+  });
+
+  test("a security failure before the first connect is terminal and gives the viewer up", async () => {
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(DesktopRfbFixture.instances).toHaveLength(1));
+    const rfb = DesktopRfbFixture.instances[0];
+    act(() => {
+      rfb.events.dispatchEvent(
+        new window.CustomEvent("securityfailure", { detail: { status: 1, reason: "expired" } })
+      );
+    });
+    await waitFor(() => expect(view.desktop.state).toBe("error"));
+    // Definitive detach (no backend grace) precedes the abort, and nothing re-registers.
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registrations[0].viewerId });
+    expect(registrations[0].signal.aborted).toBe(true);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(registrations).toHaveLength(1);
+  });
+
+  test("a security failure on a reconnect stays terminal through noVNC's follow-up disconnect", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    act(() => {
+      rfb.events.dispatchEvent(
+        new window.CustomEvent("securityfailure", { detail: { status: 1, reason: "expired" } })
+      );
+    });
+    await waitFor(() => expect(view.desktop.state).toBe("error"));
+    // noVNC emits disconnect after the security failure; it must not clear the error or
+    // schedule a reconnect after the pane detached definitively.
+    act(() => {
+      rfb.events.dispatchEvent(new window.CustomEvent("disconnect", { detail: { clean: true } }));
+    });
+    expect(view.desktop.state).toBe("error");
+    expect(view.desktop.reason).toMatch(/security checks: expired/);
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_500));
+    expect(DesktopRfbFixture.instances).toHaveLength(1);
+    expect(view.desktop.state).toBe("error");
+  });
+
+  test("bootstrap names the ready registration so the bridge is attributed to it", async () => {
+    const view = mountConnection();
+    await connect(view);
+    expect(getBootstrap).toHaveBeenCalledWith({
+      workspaceId: "workspace-1",
+      viewerId: registrations[0].viewerId,
+    });
+  });
+
+  test("an explicit disconnect gives the registration up definitively before aborting it", async () => {
+    const view = mountConnection();
+    await connect(view);
+    const registration = registrations[0];
+    const abortedAtDetach: boolean[] = [];
+    detachViewer.mockImplementationOnce(() => {
+      abortedAtDetach.push(registration.signal.aborted);
+      return Promise.resolve();
+    });
+    act(() => view.desktop.disconnect());
+    // The pane will not reconnect: the backend learns that before the abort and the bridge
+    // close can stamp attachment graces.
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registration.viewerId });
+    expect(abortedAtDetach).toEqual([false]);
+    await waitFor(() => expect(registration.signal.aborted).toBe(true));
+  });
+
+  test("a pane that unmounts before ready still gives its named registration up definitively", async () => {
+    autoReady = false;
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(registrations).toHaveLength(1));
+    const registration = registrations[0];
+    act(() => view.unmount());
+    // The backend registered the pane before ready reached it: the id the pane chose is detached
+    // before the abort, so no dropped-viewer grace is left behind.
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: registration.viewerId });
     expect(registration.signal.aborted).toBe(true);
-    if (ready) {
-      const rfb = DesktopRfbFixture.instances[0];
-      expect(rfb.disconnectCount).toBe(1);
-      expect(rfb.viewOnly).toBe(true);
-      expect(rfb.input.filter((event) => event.type === "keyup")).toHaveLength(2);
-      expect(rfb.input.filter((event) => event.type === "mouseup")).toHaveLength(1);
-    } else expect(DesktopRfbFixture.instances).toHaveLength(0);
-    expect(acknowledgeViewerRelease).not.toHaveBeenCalled();
+  });
+
+  test("a close that keeps the grace aborts the registration without a definitive detach", async () => {
+    const view = mountConnection();
+    await connect(view);
+    const registration = registrations[0];
+    // A popout closing on its own may be handing off to an inline pane whose lease is still in
+    // flight: the bounded grace the abort leaves behind is wanted, so nothing retracts it.
+    await act(() => view.desktop.disconnectAndWait({ keepGrace: true }));
+    expect(detachViewer).not.toHaveBeenCalled();
+    expect(registration.signal.aborted).toBe(true);
+  });
+
+  test("unmount keeps the grace when the pane's desktop is handing off to a popout", async () => {
+    let handingOff = false;
+    const view = mountConnection({ unmountKeepsGrace: () => handingOff });
+    await connect(view);
+    handingOff = true;
+    act(() => view.unmount());
+    // The popup exists but connects only after ready/grant: the abort's bounded grace covers
+    // the gap, so nothing retracts it.
+    expect(detachViewer).not.toHaveBeenCalled();
+    expect(registrations[0].signal.aborted).toBe(true);
   });
 
   test("normal unmount unregisters after releasing held input", async () => {
@@ -463,11 +785,71 @@ describe("useDesktopConnection control ownership", () => {
     expect(aborted).toHaveBeenCalledTimes(1);
   });
 
-  test("Electron retains its native-window cleanup path without a browser registration", async () => {
+  test("the Electron popout window relies on native cleanup instead of a viewer registration", async () => {
     Object.defineProperty(window, "api", { value: {} });
-    const view = mountConnection();
+    const view = mountConnection({ nativeWindowCleanup: true });
     await connect(view);
     expect(watchViewer).not.toHaveBeenCalled();
+    // It still names its bridge, and gives that name up when the window's cleanup disconnects,
+    // so the bridge's detachment grace is retracted like a registered pane's.
+    const call = getBootstrap.mock.calls[0]?.[0];
+    expect(typeof call?.viewerId).toBe("string");
+    expect(call?.viewerId?.length).toBeGreaterThan(0);
+    act(() => view.desktop.disconnect());
+    expect(detachViewer).toHaveBeenCalledWith({ viewerId: call?.viewerId });
+  });
+
+  test.each([
+    ["Electron inline", false],
+    ["browser popout", true],
+  ])(
+    "the %s pane registers a viewer (nativeWindowCleanup=%s only skips in Electron)",
+    async (surface, nativeWindowCleanup) => {
+      if (surface === "Electron inline") Object.defineProperty(window, "api", { value: {} });
+      const view = mountConnection({ nativeWindowCleanup });
+      await connect(view);
+      expect(watchViewer).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test("a transient transport drop keeps the viewer registered through the reconnect backoff", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    const registration = registrations[0];
+    // Simulate the bridge socket dropping: the pane stays mounted and schedules a reconnect.
+    rfb.events.dispatchEvent(new Event("disconnect"));
+    await waitFor(() => expect(view.desktop.state).toBe("disconnected"));
+    expect(registration.signal.aborted).toBe(false);
+    // The reconnect reuses the ready registration rather than re-registering.
+    await waitFor(() => expect(view.desktop.state).toBe("connected"), { timeout: 5_000 });
+    expect(watchViewer).toHaveBeenCalledTimes(1);
+    expect(registration.signal.aborted).toBe(false);
+    expect(DesktopRfbFixture.instances).toHaveLength(2);
+    // A release after the reconnect is still honored by the retained registration.
+    registration.queue.push({ type: "release", viewerId: registration.viewerId });
+    await waitFor(() =>
+      expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: registration.viewerId })
+    );
+    await waitFor(() => expect(registration.signal.aborted).toBe(true));
+    expect(DesktopRfbFixture.instances[1].disconnectCount).toBe(1);
+  });
+
+  test("a release during the reconnect backoff disconnects, ACKs, and stops reconnecting", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    const registration = registrations[0];
+    rfb.events.dispatchEvent(new Event("disconnect"));
+    await waitFor(() => expect(view.desktop.state).toBe("disconnected"));
+    registration.queue.push({ type: "release", viewerId: registration.viewerId });
+    await waitFor(() =>
+      expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: registration.viewerId })
+    );
+    await waitFor(() => expect(registration.signal.aborted).toBe(true));
+    await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
+    // The pending backoff timer must not resurrect the connection after the release.
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_200));
+    expect(DesktopRfbFixture.instances).toHaveLength(1);
+    expect(getBootstrap).toHaveBeenCalledTimes(1);
   });
 
   test("unmount prevents a pending bootstrap from creating a connection", async () => {
@@ -481,6 +863,7 @@ describe("useDesktopConnection control ownership", () => {
     const view = mountConnection();
     act(() => view.desktop.connect());
     expect(view.desktop.state).toBe("checking");
+    await waitFor(() => expect(getBootstrap).toHaveBeenCalledTimes(1));
     view.unmount();
     await act(async () => {
       resolve(bootstrap);

@@ -301,6 +301,9 @@ export const DesktopBridgeLive: Layer.Layer<
       desktopSessionManager,
       desktopTokenManager,
     });
+    desktopSessionManager.setBridgeConnectionProbe((workspaceId, resolveOwner) =>
+      desktopBridgeServer.hasActiveBridge(workspaceId, resolveOwner)
+    );
     return Context.empty().pipe(
       Context.add(DesktopSessionManagerTag, desktopSessionManager),
       Context.add(DesktopTokenManagerTag, desktopTokenManager),

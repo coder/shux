@@ -13,7 +13,9 @@ interface NestedToolsContainerProps {
 
 /**
  * Renders nested tool calls as a list.
- * Parent component provides the container styling (dashed border).
+ * The parent owns the border and padding. Preserve that inset for every nested
+ * tool: cancelling it with negative margins makes bordered cards touch the frame
+ * and forces each new tool renderer to work around the nesting layout.
  */
 export const NestedToolsContainer: React.FC<NestedToolsContainerProps> = ({
   calls,
@@ -24,7 +26,7 @@ export const NestedToolsContainer: React.FC<NestedToolsContainerProps> = ({
   if (calls.length === 0) return null;
 
   return (
-    <div className="-mx-3 space-y-3">
+    <div className="space-y-3">
       {calls.map((call) => {
         const status = getNestedToolStatus(
           call.state,

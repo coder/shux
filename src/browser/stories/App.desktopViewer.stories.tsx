@@ -43,6 +43,7 @@ function setupDesktopStory(state: DesktopStoryState, sidebarWidth = 640) {
   client.desktop = {
     watchViewer: watchDesktopViewerFixture,
     acknowledgeViewerRelease: () => Promise.resolve(),
+    detachViewer: () => Promise.resolve(),
     openWindow: ({ instanceId }) => Promise.resolve({ instanceId }),
     closeWindow: () => Promise.resolve(),
     getWindow: () => Promise.resolve(null),

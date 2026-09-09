@@ -59,10 +59,13 @@ import {
 } from "@/common/types/backgroundWorkAttention";
 import {
   createMuxMessage,
+  isSameWorkspaceTurnTaskCorrelation,
   parseWorkspaceTurnTaskCorrelation,
   type MuxMessage,
   type MuxMessageMetadata,
 } from "@/common/types/message";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import {
   createTaskFailureMessageId,
   createTaskReportMessageId,
@@ -3384,25 +3387,51 @@ export class WorkspaceTurnManager {
           }
 
           // Live activity with no delegated workspace-turn handle (a user-initiated stream,
-          // queued messages, terminal PTYs, or a desktop session) is user work: the archive path
-          // would silently terminate it, so refuse — interrupt_active covers delegated turns only.
+          // queued messages, terminal PTYs, or an attached desktop viewer/popout) is user work:
+          // the archive path would silently terminate it, so refuse — interrupt_active covers
+          // delegated turns only. An idle desktop process with nobody attached is not user
+          // work; the sink closes it like the user-driven archive does.
           const liveActivity = this.workspaceService.listLiveWorkspaceActivity(
             resolved.workspaceId
           );
-          const hasRunningDelegatedStream = activeTurns.some(
-            (turn) => turn.workspaceId === resolved.workspaceId && turn.status === "running"
+          const targetTurns = activeTurns.filter(
+            (turn) => turn.workspaceId === resolved.workspaceId
           );
-          // A queued delegated follow-up also surfaces as a queued message; only unexplained
-          // queue entries are treated as user work. Mixed queues (user + delegated entries)
-          // conservatively fail closed at the sink's admission-hold recheck instead.
-          const hasQueuedDelegatedTurn = activeTurns.some(
-            (turn) => turn.workspaceId === resolved.workspaceId && turn.status === "queued"
+          const hasRunningDelegatedStream = targetTurns.some((turn) => turn.status === "running");
+          // A queued delegated follow-up also surfaces as a queued message, and so does a
+          // delegated turn whose send is still PREPARING (its handle already reads running);
+          // only unexplained queue entries are treated as user work. The PREPARING exemption
+          // is bound to the exact correlation of a collected non-queued turn, so a user send
+          // preparing behind an ended delegated turn stays user work. Mixed queues (user +
+          // delegated entries) conservatively fail closed at the sink's admission-hold
+          // recheck instead.
+          const hasQueuedDelegatedTurn = targetTurns.some((turn) => turn.status === "queued");
+          const preparingTurn = this.workspaceService.getStoppablePreparingWorkspaceTurn(
+            resolved.workspaceId
           );
+          const hasPreparingDelegatedTurn =
+            preparingTurn != null &&
+            targetTurns.some(
+              (turn) =>
+                turn.status !== "queued" &&
+                isSameWorkspaceTurnTaskCorrelation(
+                  {
+                    taskHandleId: turn.handleId,
+                    ownerWorkspaceId: turn.ownerWorkspaceId,
+                    turnId: turn.turnId,
+                  },
+                  preparingTurn
+                )
+            );
           const nonTurnActivity: string[] = [];
           if (liveActivity.streaming && !hasRunningDelegatedStream) {
             nonTurnActivity.push("an active stream");
           }
-          if (liveActivity.queuedMessages && !hasQueuedDelegatedTurn) {
+          if (
+            liveActivity.queuedMessages &&
+            !hasQueuedDelegatedTurn &&
+            !hasPreparingDelegatedTurn
+          ) {
             nonTurnActivity.push("queued messages");
           }
           // Detached background bash outlives its spawning turn: interruption does not stop it,
@@ -3413,7 +3442,7 @@ export class WorkspaceTurnManager {
             nonTurnActivity.push("running background bash processes");
           }
           if (liveActivity.terminalSessions) nonTurnActivity.push("open terminal sessions");
-          if (liveActivity.desktopSession) nonTurnActivity.push("a desktop session");
+          if (liveActivity.desktopViewers) nonTurnActivity.push("an open desktop viewer or popout");
           if (nonTurnActivity.length > 0) {
             return Ok({
               status: "active",
@@ -3587,6 +3616,27 @@ export class WorkspaceTurnManager {
                 activeTurns
               );
               if (interruptFailure != null) return Ok(interruptFailure);
+              // stopStream resolves once the engine has aborted, but the target session's turn
+              // unwinds asynchronously: a canceled PREPARING send still reads PREPARING until
+              // its aborted handle reaches turn policy, and the sink's synchronous live-activity
+              // gate would refuse on that residue with the turns already destroyed. Wait for the
+              // session to settle first; the hold keeps admission frozen meanwhile, so nothing
+              // new can claim the session. The bound is a hang guard for a turn whose abort
+              // never lands, not a grace period.
+              const settled = await raceWithAbortAndTimeout(
+                this.workspaceService.waitForIdle(resolved.workspaceId),
+                { timeoutMs: TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS }
+              );
+              if (settled.kind !== "ok") {
+                return Ok({
+                  status: "error",
+                  action: "archive",
+                  ...this.lifecycleTargetFields(resolved),
+                  activeTaskIds: activeTurns.map((turn) => turn.handleId),
+                  error:
+                    "The interrupted turns did not settle in time, so the workspace was not archived. Wait for them to stop, then archive again.",
+                });
+              }
             }
 
             // WhileTaskTreeLocked: the tree lock is already held for the whole lifecycle operation

@@ -44,6 +44,13 @@ async function checkLoadingLayout(canvasElement: HTMLElement) {
     const statusRect = status!.getBoundingClientRect();
     const dockRect = dock.getBoundingClientRect();
     const composerRect = composer.getBoundingClientRect();
+    const transcript = within(canvasElement).getByRole("log");
+    const transcriptContentBottom =
+      transcript.getBoundingClientRect().bottom -
+      Number.parseFloat(getComputedStyle(transcript).paddingBottom);
+    // The badge must stay inside the permanent gutter, even when the final row
+    // has no extra margin (e.g. a compact tool or reasoning row).
+    await expect(statusRect.top).toBeGreaterThanOrEqual(transcriptContentBottom);
     await expect(statusRect.bottom).toBeLessThanOrEqual(composerRect.top);
     await expect(Math.abs(dockRect.left - composerRect.left)).toBeLessThan(1);
     await expect(Math.abs(dockRect.right - composerRect.right)).toBeLessThan(1);
@@ -52,6 +59,35 @@ async function checkLoadingLayout(canvasElement: HTMLElement) {
       canvasElement.getBoundingClientRect().right
     );
   });
+}
+
+// Catch-up must not change dock height or move already-visible rows, including
+// bottom-pinned transcripts whose scroll position follows content size changes.
+async function finishReplayWithoutLayoutShift(
+  canvasElement: HTMLElement,
+  finishReplay: () => void
+) {
+  const canvas = within(canvasElement);
+  const dock = canvas.getByTestId("chat-composer-dock");
+  const message = canvas.getByText("Previously loaded response.");
+  const scrollport = canvas.getByTestId("message-window");
+  const before = {
+    dockHeight: dock.getBoundingClientRect().height,
+    messageTop: message.getBoundingClientRect().top,
+    scrollHeight: scrollport.scrollHeight,
+  };
+  finishReplay();
+  await waitFor(() => expect(getLoadingStatus(canvasElement)).toBeNull());
+  // Let layout and the native scroll/resize observers process the removal.
+  await new Promise<void>((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+  );
+  await expect(dock.getBoundingClientRect().height).toBe(before.dockHeight);
+  const replayedMessage = await canvas.findByText("Previously loaded response.");
+  await expect(replayedMessage.getBoundingClientRect().top, "cached message position").toBe(
+    before.messageTop
+  );
+  await expect(scrollport.scrollHeight).toBe(before.scrollHeight);
 }
 
 function createHydrationStory(workspaceId: string): AppStory {
@@ -77,9 +113,14 @@ function createHydrationStory(workspaceId: string): AppStory {
     transcriptOnly: true,
   });
   const workspaces = [workspace, otherWorkspace, monitorWorkspace, transcriptWorkspace];
-  const history = createAssistantMessage("history", "Previously loaded response.", {
-    historySequence: 1,
-  });
+  // Exercise real bottom-pinning, not only a short transcript with spare space.
+  const history = createAssistantMessage(
+    "history",
+    Array.from({ length: 20 }, (_, index) => `Earlier response paragraph ${index + 1}.`).join(
+      "\n\n"
+    ) + "\n\nPreviously loaded response.",
+    { historySequence: 1 }
+  );
   let emitChat: (event: WorkspaceChatMessage) => void;
   let subscriptions = 0;
   let transcriptSubscriptions = 0;
@@ -184,6 +225,31 @@ function createHydrationStory(workspaceId: string): AppStory {
         await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
         await expect(exposedStatuses()).toHaveLength(1);
         await expect(exposedStatuses()[0]).toBe(getLoadingStatus(canvasElement));
+        // The loading badge must yield to navigation instead of overlapping it on phones.
+        const scrollport = canvas.getByTestId("message-window");
+        await expect(scrollport.scrollHeight).toBeGreaterThan(scrollport.clientHeight);
+        scrollport.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
+        scrollport.scrollTop = 0;
+        scrollport.dispatchEvent(new Event("scroll"));
+        const jumpToBottom = await canvas.findByRole("button", { name: /Jump to bottom/ });
+        await expect(getLoadingStatus(canvasElement)).toBeNull();
+        await userEvent.click(jumpToBottom);
+        await checkLoadingLayout(canvasElement);
+        await finishReplayWithoutLayoutShift(canvasElement, () => {
+          emitChat(history);
+          emitChat({
+            type: "caught-up",
+            replay: "since",
+            hasOlderHistory: false,
+            cursor: { history: { messageId: history.id, historySequence: 1 } },
+          });
+        });
+        // Re-enter catch-up for the competing progress-state checks below.
+        await switchWorkspace(canvasElement, otherWorkspace.id);
+        await expect(await canvas.findByText("Another workspace response.")).toBeVisible();
+        await switchWorkspace(canvasElement, workspace.id);
+        await waitFor(() => expect(subscriptions).toBe(3));
+        await checkLoadingLayout(canvasElement);
       }
     );
 
@@ -275,12 +341,14 @@ function createHydrationStory(workspaceId: string): AppStory {
       await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       await expect(canvas.queryByRole("textbox")).toBeNull();
-      emitTranscript(history);
-      emitTranscript({
-        type: "caught-up",
-        replay: "since",
-        hasOlderHistory: false,
-        cursor: { history: { messageId: history.id, historySequence: 1 } },
+      await finishReplayWithoutLayoutShift(canvasElement, () => {
+        emitTranscript(history);
+        emitTranscript({
+          type: "caught-up",
+          replay: "since",
+          hasOlderHistory: false,
+          cursor: { history: { messageId: history.id, historySequence: 1 } },
+        });
       });
       await waitFor(() => expect(getLoadingStatus(canvasElement)).toBeNull());
       await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
@@ -294,7 +362,7 @@ function createHydrationStory(workspaceId: string): AppStory {
           await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
         ).toBeVisible();
         await switchWorkspace(canvasElement, workspace.id);
-        await waitFor(() => expect(subscriptions).toBe(3));
+        await waitFor(() => expect(subscriptions).toBe(4));
         await checkLoadingLayout(canvasElement);
         await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
       }

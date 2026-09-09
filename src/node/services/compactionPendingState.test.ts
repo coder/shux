@@ -434,6 +434,8 @@ describe("unactivated compaction pending-file protocol", () => {
         .getContinuousCompactionJournal(workspaceId)
         .captureGeneration();
       const b = await prepare("b");
+      const historyPath = path.join(h.config.sessionsDir, workspaceId, CHAT_FILE_NAME);
+      const beforeHeartbeat = await fs.readFile(historyPath);
       expect(
         (
           await h.historyService.appendToHistory(
@@ -446,10 +448,10 @@ describe("unactivated compaction pending-file protocol", () => {
           )
         ).success
       ).toBe(true);
-      // The ordered fixture supplies an already-completed deletion; the real adapter's
-      // exact-delete proof is tested separately. A later boundary cannot revoke that fact.
-      const deleted = await h.historyService.deleteMessage(workspaceId, "b");
-      expect(deleted.success).toBe(true);
+      // Model an already-completed exact rollback with real history bytes. Generic deletion
+      // advances the generation and would hide the same-generation boundary regression here;
+      // production activation owns the exact rollback transaction and its proof.
+      await fs.writeFile(historyPath, beforeHeartbeat);
       const foreign = new HistoryService(h.config);
       if (replacement === "unreadable-reset") boundaryOverride = { kind: "unreadable-reset" };
       if (replacement === "identified") {
@@ -471,7 +473,7 @@ describe("unactivated compaction pending-file protocol", () => {
       );
       const expected = replacement === "none" ? ["/legacy.ts"] : undefined;
       expect((await restart().load(() => true))?.attachments.readFiles).toEqual(expected);
-      expect(await store.rollback(b, () => deleted.success)).toBe(true);
+      expect(await store.rollback(b, () => true)).toBe(true);
       expect((await restart().load(() => true))?.attachments.readFiles).toEqual(expected);
     }
   );

@@ -141,6 +141,21 @@ else:
                         cache=data if cached else None,
                     )
 
+    def test_security_headings_do_not_hide_findings(self):
+        clean = FIXTURES["security_no_findings"]["body"]
+        for header in (
+            "### 🛡️ Codex Security Review\n\n",
+            "### 🛡️ Codex Security Review · _Automatically triggered_\n\n",
+        ):
+            for body, expected in (
+                (clean, 0),
+                (clean + "\n\n[P1] A security issue still needs fixing.", 1),
+                ("Security review completed. Found a P1 credential disclosure.", 1),
+                (header + clean, 1),
+            ):
+                with self.subTest(header=header, body=body):
+                    self.assert_gate(expected, snapshot([comment(header + body)]))
+
     def test_summary_completion_requires_metadata_and_every_review_row(self):
         completed = FIXTURES["summary"]["body"]
         completed_pr_opened = (
@@ -248,7 +263,24 @@ else:
                 result = self.run_gate(
                     snapshot([request, comment(fixture["body"])]), "wait_pr_codex.sh"
                 )
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                # Completed informational envelopes keep polling for approval;
+                # unfinished/unknown reports remain failures under the CI policy.
+                expected = 10 if fixture["expected_exit_code"] == 0 else 1
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_informational_comments_do_not_hide_findings_or_account_errors(self):
+        request = comment("@codex review", "maintainer", REQUEST)
+        for name in ("summary", "security_no_findings"):
+            comments = [request, comment(FIXTURES[name]["body"])]
+            for extra_comments, threads in (
+                ([comment("[P1] Fix authorization")], []),
+                ([], [thread("[P1] Fix authorization")]),
+                ([comment("Please create a Codex account to review.")], []),
+            ):
+                with self.subTest(name=name, comments=extra_comments, threads=threads):
+                    self.assert_gate(
+                        1, snapshot(comments + extra_comments, threads), "wait_pr_codex.sh"
+                    )
 
     def test_only_authenticated_codex_authors_get_protocol_exemptions(self):
         comments = [
@@ -279,8 +311,8 @@ else:
     def test_approval_requires_the_real_bot_and_fresh_signal(self):
         request = comment("@codex review", "maintainer", REQUEST)
         for author, created_at, expected in (
-            (BOT, BEFORE, 1),
-            ("human-reviewer", AFTER, 1),
+            (BOT, BEFORE, 10),
+            ("human-reviewer", AFTER, 10),
             (BOT, AFTER, 0),
         ):
             with self.subTest(author=author, created_at=created_at):

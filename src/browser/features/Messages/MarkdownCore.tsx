@@ -59,30 +59,7 @@ const sanitizeSchema = {
   ...defaultSchema,
   tagNames: [
     ...(defaultSchema.tagNames ?? []),
-    // KaTeX MathML elements
-    "math",
-    "mrow",
-    "mi",
-    "mo",
-    "mn",
-    "msup",
-    "msub",
-    "mfrac",
-    "munder",
-    "mover",
-    "mtable",
-    "mtr",
-    "mtd",
-    "mspace",
-    "mtext",
-    "semantics",
-    "annotation",
-    "munderover",
-    "msqrt",
-    "mroot",
-    "mpadded",
-    "mphantom",
-    "menclose",
+    // MathML comes only from rehypeKatex after sanitization, never from raw HTML.
     // Collapsible sections (GitHub-style)
     "details",
     "summary",
@@ -93,13 +70,9 @@ const sanitizeSchema = {
   },
   attributes: {
     ...defaultSchema.attributes,
-    // KaTeX uses style for coloring and positioning
-    span: [...(defaultSchema.attributes?.span ?? []), "style"],
-    // MathML elements need various attributes
-    math: ["xmlns", "display"],
-    annotation: ["encoding"],
-    // Allow class on all elements for styling
-    "*": [...(defaultSchema.attributes?.["*"] ?? []), "className", "class"],
+    // SECURITY AUDIT: Raw CSS can conceal copied text. Only semantic Markdown classes are allowed.
+    // KaTeX adds its trusted classes and styles after sanitization.
+    code: [["className", /^language-./, "math-inline", "math-display"]],
   },
 };
 
@@ -175,10 +148,28 @@ const rehypePreserveUnknownRawHtml: Plugin<[], Root> = () => {
   };
 };
 
+// Sanitization prefixes IDs. Keep generated footnote links paired with those safe IDs.
+const rehypeFootnoteLinks: Plugin<[], Root> = () => (tree) => {
+  const visit = (node: Root | RootContent) => {
+    if (
+      node.type === "element" &&
+      node.tagName === "a" &&
+      (node.properties.dataFootnoteRef != null || node.properties.dataFootnoteBackref != null) &&
+      typeof node.properties.href === "string" &&
+      node.properties.href.startsWith("#")
+    ) {
+      node.properties.href = "#" + defaultSchema.clobberPrefix + node.properties.href.slice(1);
+    }
+    if ("children" in node) node.children.forEach(visit);
+  };
+  visit(tree);
+};
+
 const REHYPE_PLUGINS: Pluggable[] = [
   rehypePreserveUnknownRawHtml,
   rehypeRaw, // Parse HTML elements first
   [rehypeSanitize, sanitizeSchema], // Sanitize HTML to prevent XSS (strips dangerous elements/attributes)
+  rehypeFootnoteLinks,
   [
     harden, // Additional URL filtering for links and images
     {

@@ -11,7 +11,7 @@ import {
   type SetStateAction,
 } from "react";
 import { useLocation } from "react-router-dom";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { FrontendWorkspaceMetadata, WorkspaceRemoveResult } from "@/common/types/workspace";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { WorkspaceSelection } from "@/browser/components/ProjectSidebar/ProjectSidebar";
@@ -462,8 +462,8 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
   }>;
   removeWorkspace: (
     workspaceId: string,
-    options?: { force?: boolean }
-  ) => Promise<{ success: boolean; error?: string }>;
+    options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
+  ) => Promise<WorkspaceRemoveResult>;
   updateWorkspaceTitle: (
     workspaceId: string,
     newTitle: string
@@ -1354,16 +1354,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
               ? wasInActiveMap // was active, now archived
               : !wasInActiveMap && meta !== null; // was absent (archived), now active (unarchived)
 
-            // Also reload when:
-            // 1. Workspace is deleted in another session
-            // 2. New workspace appears (e.g., from fork)
-            // 3. Workspace transitions from initializing to ready (init completed)
-            if (
-              meta === null ||
-              isNewWorkspace ||
-              (wasInitializing && isNowReady) ||
-              archiveStateChanged
-            ) {
+            // Config notifications refresh deleted workspace lists once after a cascade.
+            // Keep metadata refreshes for new workspaces and completed initialization.
+            if (isNewWorkspace || (wasInitializing && isNowReady) || archiveStateChanged) {
               void refreshProjects();
             }
 
@@ -1480,8 +1473,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const removeWorkspace = useCallback(
     async (
       workspaceId: string,
-      options?: { force?: boolean }
-    ): Promise<{ success: boolean; error?: string }> => {
+      options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
+    ): Promise<WorkspaceRemoveResult> => {
       if (!api) return { success: false, error: "API not connected" };
 
       // Capture state before the async operation.
@@ -1523,7 +1516,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           return { success: true };
         } else {
           console.error("Failed to remove workspace:", result.error);
-          return { success: false, error: result.error };
+          return result;
         }
       } catch (error) {
         const errorMessage = getErrorMessage(error);

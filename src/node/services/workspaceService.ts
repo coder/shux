@@ -184,6 +184,7 @@ import type {
   ProjectRef,
   WorkspaceActivitySnapshot,
   WorkspaceMetadata,
+  WorkspaceRemovalDescendant,
 } from "@/common/types/workspace";
 import { isDynamicToolPart } from "@/common/types/toolParts";
 import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestionSummary";
@@ -195,6 +196,7 @@ import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
   getCompactionFollowUpContent,
+  isSameWorkspaceTurnTaskCorrelation,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
   type CompactionFollowUpRequest,
@@ -2264,6 +2266,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   // re-wake a stopped Coder workspace). See acquirePreflightAdmission.
   private readonly preflightStagingCounts = new Map<string, number>();
   private readonly preflightFileCompletionCounts = new Map<string, number>();
+  // Same pairing for renderer MCP prompt discovery (workspace.mcp.prompts.list): it readies the
+  // runtime (which can re-wake a stopped Coder workspace) and starts cached stdio servers inside
+  // the checkout. See acquireMcpPromptDiscoveryAdmission.
+  private readonly preflightMcpPromptDiscoveryCounts = new Map<string, number>();
   /**
    * In-flight forks counted per SOURCE workspace. A fork clones the source checkout and (for
    * SSH/Coder runtimes) shares its remote workspace, so a model-driven archive admitted
@@ -3397,6 +3403,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
     // Archiving hides workspace UI; do not leave terminal PTYs running headless.
     this.terminalService?.closeWorkspaceSessions(workspaceId);
+
+    // Cached MCP servers outlive the stream that started them, and stdio ones run inside the
+    // checkout a snapshot archive is about to delete. Removal-style stop (no
+    // retainRestartOptions): its stop-epoch bump makes a startup already in flight close its late
+    // clients instead of publishing them; servers restart lazily on the first MCP use after
+    // unarchive.
+    await this.mcpServerManager?.stopServers(workspaceId);
   }
 
   /**
@@ -5725,13 +5738,40 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   async remove(
     workspaceId: string,
     force = false,
-    options?: { beforeRemove?: () => Promise<boolean> }
-  ): Promise<Result<void>> {
+    options?: { beforeRemove?: () => Promise<boolean>; acknowledgedDescendantIds?: string[] }
+  ): Promise<Result<void> & { descendants?: WorkspaceRemovalDescendant[] }> {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
-      if (options?.beforeRemove != null && !(await options.beforeRemove())) {
-        return Ok(undefined);
-      }
-      return await this.removeUnlocked(workspaceId, force);
+      const operation = async () => {
+        if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+          return Ok(undefined);
+        }
+        const failure = (error: string) => {
+          const descendants =
+            this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId);
+          return { ...Err(error), ...(descendants?.length ? { descendants } : {}) };
+        };
+        try {
+          if (options?.acknowledgedDescendantIds != null) {
+            if (this.agentTaskIntegration == null) {
+              return failure("Task lifecycle service is unavailable.");
+            }
+            const descendantsResult =
+              await this.agentTaskIntegration.removeAcknowledgedDescendantsWhileTaskTreeLocked(
+                workspaceId,
+                options.acknowledgedDescendantIds
+              );
+            if (!descendantsResult.success) return failure(descendantsResult.error);
+          }
+          const result = await this.removeUnlocked(workspaceId, force);
+          return result.success ? result : failure(result.error);
+        } catch (error) {
+          return failure(getErrorMessage(error));
+        }
+      };
+      // Defer the project-list refresh until the complete descendant cascade ends.
+      return options?.acknowledgedDescendantIds != null
+        ? await this.config.withDeferredChangeNotifications(operation)
+        : await operation();
     });
   }
 
@@ -8407,7 +8447,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       backgroundBashProcesses:
         this.backgroundProcessManager.hasRunningBackgroundProcesses(workspaceId),
       terminalSessions: this.terminalService?.hasWorkspaceSessions(workspaceId) === true,
-      desktopSession: this.desktopSessionManager?.has(workspaceId) === true,
+      desktopViewers: this.desktopSessionManager?.hasAttachedViewers(workspaceId) === true,
     };
   }
 
@@ -8425,8 +8465,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * (active streams, the delegated queue entries themselves) is intentionally NOT checked:
    * the caller is about to interrupt those turns, and the sink's admission-hold recheck
    * re-validates queue emptiness after interruption. Queue entries beyond
-   * queuedDelegatedTurnCount — or any entry already dispatching (PREPARING) — fail closed
-   * here instead.
+   * queuedDelegatedTurnCount — or any dispatching (PREPARING) entry other than a collected
+   * delegated turn that stopStream can still cancel — fail closed here instead.
    *
    * The sink adds/removes the same Set entry around its own gate; both operations are
    * idempotent, and by the time the sink's finally removes it either archivedAt is
@@ -8484,11 +8524,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       );
       const streamIsExpectedDelegatedTurn =
         streamCorrelation != null &&
-        options.expectedDelegatedTurnCorrelations.some(
-          (expected) =>
-            expected.taskHandleId === streamCorrelation.taskHandleId &&
-            expected.ownerWorkspaceId === streamCorrelation.ownerWorkspaceId &&
-            expected.turnId === streamCorrelation.turnId
+        options.expectedDelegatedTurnCorrelations.some((expected) =>
+          isSameWorkspaceTurnTaskCorrelation(expected, streamCorrelation)
         );
       if (!streamIsExpectedDelegatedTurn) {
         activityLabels.push("an active stream not attributable to the delegated turns");
@@ -8505,6 +8542,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
     if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
       activityLabels.push("a fork of this workspace in progress");
+    }
+    if ((this.preflightMcpPromptDiscoveryCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("an MCP prompt discovery in progress");
     }
     // In-flight native-terminal/editor opens passed their own archive guards before this
     // hold armed and surface only through the pending-open counters until their durable
@@ -8525,19 +8565,35 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if (this.terminalService?.hasWorkspaceSessions(workspaceId) === true) {
       activityLabels.push("open terminal sessions");
     }
-    if (this.desktopSessionManager?.has(workspaceId) === true) {
-      activityLabels.push("a desktop session");
+    if (this.desktopSessionManager?.hasAttachedViewers(workspaceId) === true) {
+      activityLabels.push("an open desktop viewer or popout");
     }
     // Narrow PREPARING/auto-retry check, NOT hasPendingQueuedOrPreparingTurn: that predicate
     // also reports plain queued messages, which would refuse every interrupt_active on a
     // queued delegated turn before the entry-count comparison below could attribute it.
     // (Queued entries cannot dispatch into PREPARING after this check: the turn-admission
     // hold above freezes queue dispatch for the hold's lifetime.)
-    if (session.isPreparingTurn() || session.hasPendingAutoRetry()) {
-      // A dispatching (PREPARING) entry has left the queue but not yet registered a
-      // stream, so the queue comparison below cannot attribute it — fail closed.
+    // A PREPARING send is exempt only when it IS one of the collected active delegated turns
+    // (exact correlation) and has handed its startup to the engine, so interruptWorkspaceTurn's
+    // stopStream cancels it. Any other PREPARING entry has left the queue without registering
+    // a stream, so the queue comparison below cannot attribute it — fail closed. The same
+    // correlation binding as the stream check above keeps a user send that replaced an ended
+    // delegated turn, or a delegated turn still holding a queued handle, out of the exemption.
+    const preparingTurn = session.getStoppablePreparingWorkspaceTurn();
+    const preparingIsExpectedDelegatedTurn =
+      preparingTurn != null &&
+      options.expectedDelegatedTurnCorrelations.some((expected) =>
+        isSameWorkspaceTurnTaskCorrelation(expected, preparingTurn)
+      );
+    if (
+      (session.isPreparingTurn() && !preparingIsExpectedDelegatedTurn) ||
+      session.hasPendingAutoRetry()
+    ) {
       activityLabels.push("a message dispatching");
-    } else if (session.queuedMessageEntryCount() > options.queuedDelegatedTurnCount) {
+    }
+    // Checked even while an exempt delegated turn is PREPARING: user entries queued behind it
+    // are still user work the archive would silently drop.
+    if (session.queuedMessageEntryCount() > options.queuedDelegatedTurnCount) {
       activityLabels.push("queued messages beyond the delegated turns");
     }
     if (activityLabels.length > 0) {
@@ -8617,12 +8673,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
           activityLabels.push("a fork of this workspace in progress");
         }
+        if ((this.preflightMcpPromptDiscoveryCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("an MCP prompt discovery in progress");
+        }
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
         if (liveActivity.backgroundBashProcesses) {
           activityLabels.push("running background bash processes");
         }
         if (liveActivity.terminalSessions) activityLabels.push("open terminal sessions");
-        if (liveActivity.desktopSession) activityLabels.push("a desktop session");
+        if (liveActivity.desktopViewers) activityLabels.push("an open desktop viewer or popout");
         // Workflow admissions pair with this gate (see workflowArchiveAdmission): an admission
         // whose synchronous entry ran first is counted here; one entering later observes the
         // archivingWorkspaces guard registered in the constructor and refuses.
@@ -10780,6 +10839,30 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     };
   }
 
+  /**
+   * Archive admission pairing for MCP prompt discovery (workspace.mcp.prompts.list), which
+   * readies the runtime and starts cached stdio servers outside any stream. The guard check and
+   * the counter increment run in one synchronous block, mirroring executeBash: a discovery
+   * admitted first holds the archive gate open until the caller disposes the admission, and one
+   * entering after the gate armed (or against an archived workspace) is refused with undefined.
+   */
+  acquireMcpPromptDiscoveryAdmission(workspaceId: string): Disposable | undefined {
+    if (this.archivingWorkspaces.has(workspaceId)) {
+      return undefined;
+    }
+    const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (
+      workspaceEntry != null &&
+      isWorkspaceArchived(
+        workspaceEntry.workspace.archivedAt,
+        workspaceEntry.workspace.unarchivedAt
+      )
+    ) {
+      return undefined;
+    }
+    return this.acquirePreflightAdmission(this.preflightMcpPromptDiscoveryCounts, workspaceId);
+  }
+
   async stageAttachment(input: {
     workspaceId: string;
     filename: string;
@@ -12349,6 +12432,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined {
     const session = this.sessions.get(workspaceId.trim());
     return session?.getQueueCutCutter();
+  }
+
+  /** See AgentSession.getStoppablePreparingWorkspaceTurn. */
+  getStoppablePreparingWorkspaceTurn(
+    workspaceId: string
+  ): WorkspaceTurnTaskCorrelation | undefined {
+    return this.sessions.get(workspaceId.trim())?.getStoppablePreparingWorkspaceTurn();
   }
 
   /**

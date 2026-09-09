@@ -170,51 +170,54 @@ export function ProjectProvider(props: { children: ReactNode }) {
   });
   const workspaceModalProjectRef = useRef<string | null>(null);
 
-  // Used to guard against refreshProjects() races.
-  //
-  // Example: the initial refresh (on mount) can start before a workspace fork, then
-  // resolve after a fork-triggered refresh. Without this guard, the stale response
-  // could overwrite the newer project list and make the forked workspace disappear
-  // from the sidebar again.
-  const projectsRefreshSeqRef = useRef(0);
-  const latestAppliedProjectsRefreshSeqRef = useRef(0);
+  const projectsRefreshRef = useRef<{
+    api: typeof api;
+    pending: boolean;
+    promise: Promise<void> | null;
+  }>({ api, pending: false, promise: null });
 
-  const refreshProjects = useCallback(async () => {
+  const refreshProjects = useCallback((): Promise<void> => {
+    const refresh = projectsRefreshRef.current;
+    if (refresh.api !== api) return Promise.resolve();
     if (!api) {
       setLoaded(false);
       setLoadError("API not connected");
-      return;
+      return Promise.resolve();
     }
 
-    const refreshSeq = projectsRefreshSeqRef.current + 1;
-    projectsRefreshSeqRef.current = refreshSeq;
-
-    try {
-      const projectsList = await api.projects.list();
-
-      // Ignore out-of-date refreshes so an older response can't clobber a newer success.
-      if (refreshSeq < latestAppliedProjectsRefreshSeqRef.current) {
-        return;
+    // Cascade events share one request. Later invalidations require a trailing request.
+    refresh.pending = true;
+    refresh.promise ??= Promise.resolve().then(async () => {
+      try {
+        while (refresh.pending && refresh.api) {
+          refresh.pending = false;
+          const requestApi = refresh.api;
+          try {
+            const projectsList = await requestApi.projects.list();
+            if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
+            setAllProjectsInternal(new Map(projectsList));
+            setLoaded(true);
+            setLoadError(null);
+          } catch (error) {
+            if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
+            // Keep successful data when a later refresh fails.
+            console.error("Failed to load projects:", error);
+            setLoadError(getErrorMessage(error));
+          }
+        }
+      } finally {
+        refresh.promise = null;
       }
-
-      latestAppliedProjectsRefreshSeqRef.current = refreshSeq;
-      setAllProjectsInternal(new Map(projectsList));
-      setLoaded(true);
-      setLoadError(null);
-    } catch (error) {
-      // Ignore out-of-date refreshes so an older error can't clobber a newer success.
-      if (refreshSeq < latestAppliedProjectsRefreshSeqRef.current) {
-        return;
-      }
-
-      // Keep the previous project list on error so scoped user preferences are not pruned.
-      console.error("Failed to load projects:", error);
-      setLoadError(getErrorMessage(error));
-    }
+    });
+    // All callers await the trailing request, not only the response already in flight.
+    return refresh.promise;
   }, [api]);
 
   useEffect(() => {
     let cancelled = false;
+    // A disconnected transport must not block the replacement client.
+    const refresh: typeof projectsRefreshRef.current = { api, pending: false, promise: null };
+    projectsRefreshRef.current = refresh;
     setLoading(true);
 
     const initialRefresh = async () => {
@@ -234,8 +237,10 @@ export function ProjectProvider(props: { children: ReactNode }) {
 
     return () => {
       cancelled = true;
+      refresh.api = null;
+      refresh.pending = false;
     };
-  }, [refreshProjects]);
+  }, [api, refreshProjects]);
 
   useEffect(() => {
     const onConfigChanged = api?.config?.onConfigChanged;

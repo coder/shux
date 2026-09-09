@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { APIProvider } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { DesktopViewer } from "@/browser/features/desktop/DesktopPanel";
+import type { DesktopDisconnectOptions } from "@/browser/features/desktop/useDesktopConnection";
 import {
   desktopPopoutChannel,
   isDesktopPopoutMessage,
@@ -17,18 +18,25 @@ import "./styles/globals.css";
 
 function DesktopWindow(props: { workspaceId: string; instanceId: string }) {
   const [granted, setGranted] = useState(false);
+  const grantedRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  const disconnectRef = useRef<(() => Promise<void>) | null>(null);
+  const disconnectRef = useRef<((options?: DesktopDisconnectOptions) => Promise<void>) | null>(
+    null
+  );
   const disconnectNowRef = useRef<(() => void) | null>(null);
   const finishingRef = useRef<Promise<void> | null>(null);
   const channelRef = useRef<BroadcastChannel | null>(null);
   const finishedRef = useRef(false);
-  const finish = (failed = false): Promise<void> => {
+  // `requested`: the parent asked for this close (bring-back, direct close request) and leased
+  // its inline pane first, so giving the attachment up is definitive. A close this window
+  // initiates itself (titlebar/pagehide, its own Bring back, a startup failure) may still be a
+  // handoff to an inline pane whose lease is in flight, so it keeps the bounded grace.
+  const finish = (failed = false, requested = false): Promise<void> => {
     if (finishingRef.current) return finishingRef.current;
     finishedRef.current = true;
     const closing = (async () => {
       // Wait for the transport close before acknowledging cleanup or destroying this renderer.
-      await disconnectRef.current?.();
+      await disconnectRef.current?.({ keepGrace: !requested });
       setGranted(false);
       channelRef.current?.postMessage({
         type: failed ? "failed" : "closed",
@@ -39,8 +47,8 @@ function DesktopWindow(props: { workspaceId: string; instanceId: string }) {
     finishingRef.current = closing;
     return closing;
   };
-  const requestFinish = (failed = false) => {
-    finish(failed).catch((error: unknown) => setError(getErrorMessage(error)));
+  const requestFinish = (failed = false, requested = false) => {
+    finish(failed, requested).catch((error: unknown) => setError(getErrorMessage(error)));
   };
 
   useEffect(() => {
@@ -67,15 +75,20 @@ function DesktopWindow(props: { workspaceId: string; instanceId: string }) {
       if (event.data.type === "grant") {
         clearTimeout(deadline);
         setError(null);
+        grantedRef.current = true;
         setGranted(true);
         channel.postMessage({ type: "opened", instanceId: props.instanceId });
-      } else if (event.data.type === "bring-back") requestFinish();
+      } else if (event.data.type === "bring-back") requestFinish(false, true);
+      else if (event.data.type === "ping" && grantedRef.current) {
+        // A reloaded parent only holds a persisted hint; confirm this window is still live.
+        channel.postMessage({ type: "opened", instanceId: props.instanceId });
+      }
     };
     const onDirectClose = (event: Event) => {
       const request = (event as CustomEvent<DesktopPopoutCloseRequest | undefined>).detail;
       if (!request || request.instanceId !== props.instanceId) return;
       request.handled = true;
-      request.completion = finish();
+      request.completion = finish(false, request.leased === true);
       request.completion.catch((error: unknown) => setError(getErrorMessage(error)));
     };
     window.addEventListener(DESKTOP_POPOUT_CLOSE_EVENT, onDirectClose);
@@ -97,9 +110,10 @@ function DesktopWindow(props: { workspaceId: string; instanceId: string }) {
   return granted ? (
     <DesktopViewer
       workspaceId={props.workspaceId}
-      attach={(disconnect, disconnectAndWait) => {
-        disconnectNowRef.current = disconnect;
-        disconnectRef.current = disconnectAndWait;
+      nativeWindowCleanup
+      attach={(desktop) => {
+        disconnectNowRef.current = desktop.disconnect;
+        disconnectRef.current = desktop.disconnectAndWait;
         return () => {
           disconnectRef.current = null;
           disconnectNowRef.current = null;

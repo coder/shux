@@ -53,6 +53,7 @@ describe("DesktopTokenManager", () => {
       expect(manager.validate(token)).toEqual({
         workspaceId: "workspace-1",
         sessionId: "session-1",
+        viewerId: null,
       });
     } finally {
       manager.dispose();
@@ -68,6 +69,7 @@ describe("DesktopTokenManager", () => {
       expect(manager.validate(token)).toEqual({
         workspaceId: "workspace-1",
         sessionId: "session-1",
+        viewerId: null,
       });
       expect(manager.validate(token)).toBeNull();
     } finally {

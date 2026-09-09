@@ -1,10 +1,22 @@
-import React, { useCallback, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Clipboard, Link as LinkIcon, TextQuote } from "lucide-react";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
-import { copyToClipboard } from "@/browser/utils/clipboard";
+import {
+  copyToClipboard,
+  copyFormattedToClipboard,
+  type FormattedClipboardContent,
+} from "@/browser/utils/clipboard";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
+import {
+  isEditableElement,
+  KEYBINDS,
+  matchesKeybind,
+  formatKeybind,
+} from "@/browser/utils/ui/keybinds";
 import {
   formatTranscriptTextAsQuote,
   getTranscriptContextMenuLink,
+  getTranscriptContextMenuMarkdown,
   getTranscriptContextMenuText,
 } from "@/browser/utils/messages/transcriptContextMenu";
 import {
@@ -28,6 +40,16 @@ interface UseTranscriptContextMenuReturn {
   menu: React.ReactNode;
 }
 
+async function handleCopyMarkdown(markdown: FormattedClipboardContent | null, close: () => void) {
+  if (!markdown) return;
+  close();
+  try {
+    await copyFormattedToClipboard(markdown);
+  } catch (error) {
+    console.error("Failed to copy Markdown:", error);
+  }
+}
+
 export function useTranscriptContextMenu(
   options: UseTranscriptContextMenuOptions
 ): UseTranscriptContextMenuReturn {
@@ -37,6 +59,7 @@ export function useTranscriptContextMenu(
   // Mode drives which menu items render; use state so the menu re-renders
   // to reflect link vs text actions when it opens.
   const [mode, setMode] = useState<TranscriptContextMenuMode | null>(null);
+  const [markdown, setMarkdown] = useState<FormattedClipboardContent | null>(null);
   const hasInputTarget = options.hasInputTarget ?? true;
 
   const handleTranscriptContextMenu = useCallback(
@@ -45,6 +68,14 @@ export function useTranscriptContextMenu(
       if (!transcriptRoot) {
         return;
       }
+
+      const selection = typeof window === "undefined" ? null : window.getSelection();
+      const selectedMarkdown = getTranscriptContextMenuMarkdown({
+        transcriptRoot,
+        target: event.target,
+        selection,
+      });
+      setMarkdown(selectedMarkdown);
 
       // Links get priority: right-clicking an anchor should offer "Copy link"
       // rather than falling through to text quote/copy actions. Electron has
@@ -61,19 +92,18 @@ export function useTranscriptContextMenu(
         return;
       }
 
-      const selection = typeof window === "undefined" ? null : window.getSelection();
       const text = getTranscriptContextMenuText({
         transcriptRoot,
         target: event.target,
         selection,
       });
 
-      if (!text) {
+      if (!text && !selectedMarkdown) {
         transcriptMenu.close();
         return;
       }
 
-      transcriptMenuTextRef.current = text;
+      transcriptMenuTextRef.current = text ?? selectedMarkdown!.text;
       transcriptMenuLinkRef.current = "";
       setMode({ kind: "text" });
       transcriptMenu.onContextMenu(event);
@@ -103,6 +133,19 @@ export function useTranscriptContextMenu(
     transcriptMenu.close();
   }, [options, transcriptMenu]);
 
+  useEffect(() => {
+    if (!transcriptMenu.isOpen || !markdown) return;
+    // Right-click menus can leave focus on the transcript instead of the menu.
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!matchesKeybind(event, KEYBINDS.COPY_MARKDOWN) || isEditableElement(event.target)) return;
+      event.preventDefault();
+      stopKeyboardPropagation(event);
+      handleCopyMarkdown(markdown, transcriptMenu.close).catch(console.error);
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [transcriptMenu, markdown]);
+
   return {
     onContextMenu: handleTranscriptContextMenu,
     menu: (
@@ -124,6 +167,16 @@ export function useTranscriptContextMenu(
             ) : null}
             <PositionedMenuItem icon={<Clipboard />} label="Copy text" onClick={handleCopyText} />
           </>
+        )}
+        {markdown && (
+          <PositionedMenuItem
+            icon={<Clipboard />}
+            label="Copy Markdown"
+            shortcut={formatKeybind(KEYBINDS.COPY_MARKDOWN)}
+            onClick={() => {
+              handleCopyMarkdown(markdown, transcriptMenu.close).catch(console.error);
+            }}
+          />
         )}
       </PositionedMenu>
     ),

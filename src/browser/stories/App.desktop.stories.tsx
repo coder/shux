@@ -53,6 +53,7 @@ function setupDesktopStory(phone = false): APIClient {
   client.desktop = {
     watchViewer: watchDesktopViewerFixture,
     acknowledgeViewerRelease: () => Promise.resolve(),
+    detachViewer: () => Promise.resolve(),
     openWindow: ({ instanceId }) => Promise.resolve({ instanceId }),
     closeWindow: () => Promise.resolve(),
     getWindow: () => Promise.resolve(null),
@@ -82,7 +83,11 @@ async function expectCallerConnection(
     const preview = canvas.getByLabelText("Desktop session preview");
     if (visible) await expect(preview).toBeVisible();
     else await expect(preview).not.toBeVisible();
-    await expect(getBootstrap).toHaveBeenLastCalledWith({ workspaceId });
+    // The pane names its viewer registration in the bootstrap (see getBootstrap's viewerId).
+    await expect(getBootstrap).toHaveBeenLastCalledWith({
+      workspaceId,
+      viewerId: expect.any(String) as string,
+    });
     const viewer = DesktopRfb.instances.at(-1);
     if (!viewer) throw new Error("Desktop viewer did not connect");
     const url = new URL(viewer.url);
@@ -90,7 +95,9 @@ async function expectCallerConnection(
     await expect(url.searchParams.get("token")).toBe(`token-for-${workspaceId}`);
     await expect(viewer.viewOnly).toBe(true);
   });
-  await expect(getBootstrap).not.toHaveBeenCalledWith({ workspaceId: OWNER_ID });
+  await expect(getBootstrap).not.toHaveBeenCalledWith(
+    expect.objectContaining({ workspaceId: OWNER_ID })
+  );
 }
 
 export default {

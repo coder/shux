@@ -13,7 +13,11 @@ import type {
 import type { Result } from "@/common/types/result";
 import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { RuntimeConfig } from "@/common/types/runtime";
-import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
+import type {
+  FrontendWorkspaceMetadata,
+  WorkspaceMetadata,
+  WorkspaceRemovalDescendant,
+} from "@/common/types/workspace";
 import type { AgentAiSettingsLayerValues } from "@/common/types/agentAiSettings";
 import type {
   OpenAIReasoningMode,
@@ -258,9 +262,10 @@ export interface ArchiveWorkspaceOptions {
   forbidWorktreeCheckoutDeletion?: boolean;
   /**
    * Refuse to archive when live user activity exists at the sink (a stream, a send still in
-   * its pre-admission window, queued/preparing turns, terminal sessions, or a desktop
-   * session). Model-facing callers set this so an agent-driven archive fails closed instead
-   * of silently terminating user work that started after the caller's earlier activity check.
+   * its pre-admission window, queued/preparing turns, terminal sessions, or an attached
+   * desktop viewer/popout). Model-facing callers set this so an agent-driven archive fails
+   * closed instead of silently terminating user work that started after the caller's earlier
+   * activity check.
    * Checked synchronously in the same block that marks the workspace as archiving, pairing
    * with sendMessage's synchronous entry guards: whichever side runs first is observed by the
    * other. Also holds the session's turn admission for the rest of the archive so a queued
@@ -306,7 +311,12 @@ export interface WorkspaceLiveActivity {
    */
   backgroundBashProcesses: boolean;
   terminalSessions: boolean;
-  desktopSession: boolean;
+  /**
+   * A desktop startup, browser viewer, or popout window attached to this workspace's desktop.
+   * A bare idle desktop process is intentionally excluded (see
+   * DesktopSessionManager.hasAttachedViewers).
+   */
+  desktopViewers: boolean;
 }
 
 export interface SendMessageInternalOptions {
@@ -461,6 +471,8 @@ export interface WorkspaceLifecycleHost {
     }
   ): Result<Disposable>;
   listLiveWorkspaceActivity(workspaceId: string): WorkspaceLiveActivity;
+  getStoppablePreparingWorkspaceTurn(workspaceId: string): WorkspaceTurnTaskCorrelation | undefined;
+  waitForIdle(workspaceId: string): Promise<void>;
   hasRunningBackgroundBashProcesses(workspaceId: string): Promise<boolean>;
   hasUntrackableExternalAppOpen(workspaceId: string): Promise<boolean>;
   isSnapshotArchiveEligibilityMutationSensitive(
@@ -533,6 +545,11 @@ export type WorkspaceHost = WorkspaceTurnHost &
 export interface AgentTaskIntegration {
   withTaskTreeLifecycleLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T>;
   hasDescendantAgentTasks(workspaceId: string): boolean;
+  listWorkspaceRemovalDescendants(workspaceId: string): WorkspaceRemovalDescendant[];
+  removeAcknowledgedDescendantsWhileTaskTreeLocked(
+    workspaceId: string,
+    acknowledgedIds: string[]
+  ): Promise<Result<void>>;
   hasActiveDescendantAgentTasksForWorkspace(workspaceId: string): boolean;
   hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId: string): Promise<boolean>;
   getAgentTaskStatus(workspaceId: string): AgentTaskStatus | null | undefined;

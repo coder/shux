@@ -20,6 +20,9 @@ import type {
   AgentPluginPreviewMcpServer,
   AgentPluginPreviewSkill,
   AgentPluginUpdateCheck,
+  AgentPluginCapabilityChange,
+  AgentPluginUpdateConsent,
+  AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
 import { resolvePluginHookGrants } from "@/node/services/agentPlugins/hookSandbox";
 import assert from "@/common/utils/assert";
@@ -35,6 +38,7 @@ import {
 } from "@/common/orpc/schemas/agentSkill";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
+import type { MCPServerInfo } from "@/common/types/mcp";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
@@ -1307,30 +1311,41 @@ export class AgentPluginInstallService {
    */
   private async capabilitySurface(
     plugin: AgentPluginInfo,
-    instanceId: string
+    instanceId: string,
+    finalTargetPath: string,
+    /** Receives component-loader diagnostics (skills that will not load, mcp.json problems). */
+    warnings: string[]
   ): Promise<{
     hook: AgentPluginPreviewHook | undefined;
-    servers: Map<string, string>;
-    skills: Map<string, string>;
+    /** serverName → { fingerprint (compared), display (shown in the update review) }. */
+    servers: Map<string, { fingerprint: string; display: string }>;
+    /** skillName → { fingerprint (compared), display (the advertisement as the model sees it) }. */
+    skills: Map<string, { fingerprint: string; display: string }>;
     agents: Map<string, string>;
     components: Set<string>;
   }> {
     const hook = this.collectHook(plugin);
-    const skills = new Map<string, string>();
-    for (const skill of await this.collectSkills(plugin, [])) {
+    const skills = new Map<string, { fingerprint: string; display: string }>();
+    for (const skill of await this.collectSkills(plugin, warnings)) {
       // EVERY model-visible advertisement field: description, whenToUse
       // (both interpolate into the agent_skill_read tool description on each
       // request), and advertise (a flip from hidden to visible surfaces a
       // previously invisible skill). Changing any of them is re-consent
-      // territory, same as adding a skill.
-      skills.set(
-        skill.name,
-        JSON.stringify({
+      // territory, same as adding a skill. The fingerprint stays JSON (field
+      // boundaries are unambiguous); the display rendering is NOT used for
+      // comparison because a multi-line description could imitate it.
+      skills.set(skill.name, {
+        fingerprint: JSON.stringify({
           description: skill.description ?? null,
           whenToUse: skill.whenToUse ?? null,
           advertise: skill.advertise ?? null,
-        })
-      );
+        }),
+        display: [
+          skill.description ?? "(no description)",
+          ...(skill.whenToUse !== undefined ? [`When to use: ${skill.whenToUse}`] : []),
+          ...(skill.advertise === false ? ["(not advertised to the model)"] : []),
+        ].join("\n"),
+      });
     }
     const agents = new Map<string, string>();
     for (const agent of await this.collectAgentFiles(plugin.agentsDir)) {
@@ -1342,13 +1357,15 @@ export class AgentPluginInstallService {
         (command) => `slash command /${command.name}`
       ),
     ]);
-    const servers = new Map<string, string>();
+    const servers = new Map<string, { fingerprint: string; display: string }>();
     if (plugin.mcpConfigPath !== undefined) {
-      const { servers: infos } = await loadPluginMcpServers(plugin, {
+      const { servers: infos, diagnostics } = await loadPluginMcpServers(plugin, {
         xumHome: this.config.rootDir,
         instanceId,
       });
+      warnings.push(...diagnostics.map((d) => d.message));
       const normalize = (value: string): string => value.split(plugin.rootPath).join("<plugin>");
+      const rewrite = (value: string): string => value.split(plugin.rootPath).join(finalTargetPath);
       for (const info of Object.values(infos)) {
         assert(info.plugin !== undefined, "plugin server info must carry provenance");
         const fingerprint =
@@ -1368,34 +1385,55 @@ export class AgentPluginInstallService {
                 ...(info.cwd !== undefined ? { cwd: normalize(info.cwd) } : {}),
               })
             : JSON.stringify({ transport: info.transport, url: info.url });
-        servers.set(info.plugin.serverName, fingerprint);
+        servers.set(info.plugin.serverName, {
+          fingerprint,
+          display: this.describeMcpServer(info, rewrite, finalTargetPath).summary,
+        });
       }
     }
     return { hook, servers, skills, agents, components };
   }
 
   /**
-   * Update gate: reject capability increases/changes between the installed
-   * tree and the staged new tree. A missing or invalid installed tree yields
-   * an empty surface, so everything staged counts as an addition
+   * Update gate input: every capability increase/change between the installed
+   * tree and the staged new tree, with the consented and staged values so
+   * the user can review them in place. A missing or invalid installed tree
+   * yields an empty surface, so everything staged counts as an addition
    * (conservative: nothing inspectable was consented to at this path).
-   * Capability REMOVALS and grant reductions apply without re-consent.
+   * Capability REMOVALS and grant reductions are not changes here: they
+   * apply without re-consent.
+   *
+   * `stagedWarnings` receives the staged tree's component-loader diagnostics
+   * (a skill or MCP entry that will stop loading): the review must disclose
+   * them alongside the capability changes, exactly like the install preview
+   * does, or a consent could silently accept a broken component.
    */
-  private async assertNoCapabilityIncrease(
+  private async collectCapabilityChanges(
     name: string,
     installedPath: string,
-    stagedPlugin: AgentPluginInfo
-  ): Promise<void> {
+    stagedPlugin: AgentPluginInfo,
+    stagedWarnings: string[]
+  ): Promise<AgentPluginCapabilityChange[]> {
     const instanceId = this.instanceIdFor(name);
     const { plugin: currentPlugin } = await discoverAgentPluginAt({
       pluginDir: installedPath,
       scope: "global",
     });
-    const staged = await this.capabilitySurface(stagedPlugin, instanceId);
+    const staged = await this.capabilitySurface(
+      stagedPlugin,
+      instanceId,
+      installedPath,
+      stagedWarnings
+    );
+    // Diagnostics of the CURRENT tree are not news to the user; discard them.
     const current =
-      currentPlugin === null ? undefined : await this.capabilitySurface(currentPlugin, instanceId);
+      currentPlugin === null
+        ? undefined
+        : await this.capabilitySurface(currentPlugin, instanceId, installedPath, []);
 
-    const changes: string[] = [];
+    const changes: AgentPluginCapabilityChange[] = [];
+    const describeGrants = (grants: string[]): string =>
+      grants.length > 0 ? grants.join(", ") : "(no tool visibility granted)";
     if (staged.hook !== undefined) {
       const currentHook = current?.hook;
       if (currentHook === undefined) {
@@ -1403,61 +1441,81 @@ export class AgentPluginInstallService {
           staged.hook.toolGrants.length > 0
             ? ` with tool grants: ${staged.hook.toolGrants.join(", ")}`
             : "";
-        changes.push(`adds executable hooks (${staged.hook.path}${grantSuffix})`);
+        changes.push({
+          summary: `adds executable hooks (${staged.hook.path}${grantSuffix})`,
+          after: `${staged.hook.path} — tool grants: ${describeGrants(staged.hook.toolGrants)}`,
+        });
       } else {
         if (staged.hook.path !== currentHook.path) {
-          changes.push(`moves its hook entry (${currentHook.path} → ${staged.hook.path})`);
+          changes.push({
+            summary: `moves its hook entry (${currentHook.path} → ${staged.hook.path})`,
+            before: currentHook.path,
+            after: staged.hook.path,
+          });
         }
         const newGrants = staged.hook.toolGrants.filter(
           (grant) => !currentHook.toolGrants.includes(grant)
         );
         if (newGrants.length > 0) {
-          changes.push(`expands hook tool grants: ${newGrants.join(", ")}`);
+          changes.push({
+            summary: `expands hook tool grants: ${newGrants.join(", ")}`,
+            before: describeGrants(currentHook.toolGrants),
+            after: describeGrants(staged.hook.toolGrants),
+          });
         }
       }
     }
-    for (const [serverName, fingerprint] of staged.servers) {
-      const currentFingerprint = current?.servers.get(serverName);
-      if (currentFingerprint === undefined) {
-        changes.push(`adds MCP server '${serverName}'`);
-      } else if (currentFingerprint !== fingerprint) {
-        changes.push(`changes MCP server '${serverName}'`);
+    for (const [serverName, server] of staged.servers) {
+      const currentServer = current?.servers.get(serverName);
+      if (currentServer === undefined) {
+        changes.push({ summary: `adds MCP server '${serverName}'`, after: server.display });
+      } else if (currentServer.fingerprint !== server.fingerprint) {
+        changes.push({
+          summary: `changes MCP server '${serverName}'`,
+          before: currentServer.display,
+          after: server.display,
+        });
       }
     }
     // Skill advertisements interpolate into the model-visible skill index on
     // every request, so a new skill — or a reworded description — can inject
     // instructions without the user ever invoking it. Gate both.
-    for (const [skillName, fingerprint] of staged.skills) {
-      const currentFingerprint = current?.skills.get(skillName);
-      if (currentFingerprint === undefined) {
-        changes.push(`adds skill '${skillName}'`);
-      } else if (currentFingerprint !== fingerprint) {
-        changes.push(`changes the model-visible advertisement of skill '${skillName}'`);
+    for (const [skillName, skill] of staged.skills) {
+      const currentSkill = current?.skills.get(skillName);
+      if (currentSkill === undefined) {
+        changes.push({ summary: `adds skill '${skillName}'`, after: skill.display });
+      } else if (currentSkill.fingerprint !== skill.fingerprint) {
+        changes.push({
+          summary: `changes the model-visible advertisement of skill '${skillName}'`,
+          before: currentSkill.display,
+          after: skill.display,
+        });
       }
     }
     // Agent definitions: the description injects into the task tool's
     // model-visible prompt and runnable/base/policy change execution
     // privileges, so a changed definition behind an unchanged filename is
-    // gated exactly like an addition.
+    // gated exactly like an addition. The fingerprint is the key-sorted
+    // frontmatter JSON, which is also the most faithful thing to show.
     for (const [agentName, fingerprint] of staged.agents) {
       const currentFingerprint = current?.agents.get(agentName);
       if (currentFingerprint === undefined) {
-        changes.push(`adds agent ${agentName}`);
+        changes.push({ summary: `adds agent ${agentName}`, after: fingerprint });
       } else if (currentFingerprint !== fingerprint) {
-        changes.push(`changes the definition of agent ${agentName}`);
+        changes.push({
+          summary: `changes the definition of agent ${agentName}`,
+          before: currentFingerprint,
+          after: fingerprint,
+        });
       }
     }
     // Consent covered a specific component set; additions need a new preview.
     for (const component of staged.components) {
       if (!(current?.components.has(component) ?? false)) {
-        changes.push(`adds ${component}`);
+        changes.push({ summary: `adds ${component}` });
       }
     }
-    if (changes.length > 0) {
-      throw new Error(
-        `The update to '${name}' ${changes.join("; ")}. Updates cannot expand a plugin's capabilities without review — uninstall it and reinstall to see the full consent preview.`
-      );
-    }
+    return changes;
   }
 
   /**
@@ -1686,52 +1744,63 @@ export class AgentPluginInstallService {
 
     const rewrite = (value: string): string => value.split(plugin.rootPath).join(finalTargetPath);
 
-    const result: AgentPluginPreviewMcpServer[] = [];
-    for (const info of Object.values(servers)) {
-      assert(info.plugin !== undefined, "plugin server info must carry provenance");
-      if (info.transport === "stdio") {
-        // Mirror the runtime's rendering (MCPServerManager shell-quotes every
-        // token): the consent preview must show the exact argument boundaries
-        // that will run — an arg containing whitespace/quotes could otherwise
-        // masquerade as several args or hide a boundary.
-        const commandLine =
-          info.args !== undefined
-            ? [info.command, ...info.args].map(rewrite).map(shellQuote).join(" ")
-            : rewrite(info.command);
-        // Env VALUES are execution-relevant (e.g. NODE_OPTIONS=--require=…
-        // auto-loads code the argv never shows), so consent must disclose the
-        // full assignment, quoted like the argv so boundaries are unambiguous.
-        const envAssignments = Object.entries(info.env ?? {})
-          .filter(([key]) => key !== "PLUGIN_ROOT" && key !== "PLUGIN_DATA")
-          .map(([key, value]) => `${key}=${shellQuote(rewrite(value))}`);
-        const details: string[] = [];
-        // cwd is execution-relevant too: prepareStdioLaunch passes it to the
-        // runtime, so `node server.js` resolves scripts/configs relative to
-        // it — including from WRITABLE persistent plugin data — and the argv
-        // alone would imply a different resolution (capabilitySurface treats
-        // cwd as consent-relevant for the same reason). The loader defaults
-        // cwd to the plugin root; only a DEVIATION from the reviewed tree
-        // root needs calling out.
-        if (info.cwd !== undefined && rewrite(info.cwd) !== finalTargetPath) {
-          details.push(`cwd: ${shellQuote(rewrite(info.cwd))}`);
-        }
-        if (envAssignments.length > 0) {
-          details.push(`env: ${envAssignments.join(" ")}`);
-        }
-        result.push({
-          serverName: info.plugin.serverName,
-          transport: "stdio",
-          summary: details.length > 0 ? `${commandLine} (${details.join("; ")})` : commandLine,
-        });
-      } else {
-        result.push({
-          serverName: info.plugin.serverName,
-          transport: info.transport === "http" ? "http" : "sse",
-          summary: info.url,
-        });
-      }
-    }
+    const result: AgentPluginPreviewMcpServer[] = Object.values(servers).map((info) =>
+      this.describeMcpServer(info, rewrite, finalTargetPath)
+    );
     return result.sort((a, b) => a.serverName.localeCompare(b.serverName));
+  }
+
+  /**
+   * Human-readable disclosure of one plugin MCP server, shared by the install
+   * consent preview and the update review (so "before"/"after" render exactly
+   * like the line the user originally consented to).
+   */
+  private describeMcpServer(
+    info: MCPServerInfo,
+    rewrite: (value: string) => string,
+    finalTargetPath: string
+  ): AgentPluginPreviewMcpServer {
+    assert(info.plugin !== undefined, "plugin server info must carry provenance");
+    if (info.transport !== "stdio") {
+      return {
+        serverName: info.plugin.serverName,
+        transport: info.transport === "http" ? "http" : "sse",
+        summary: info.url,
+      };
+    }
+    // Mirror the runtime's rendering (MCPServerManager shell-quotes every
+    // token): the consent preview must show the exact argument boundaries
+    // that will run — an arg containing whitespace/quotes could otherwise
+    // masquerade as several args or hide a boundary.
+    const commandLine =
+      info.args !== undefined
+        ? [info.command, ...info.args].map(rewrite).map(shellQuote).join(" ")
+        : rewrite(info.command);
+    // Env VALUES are execution-relevant (e.g. NODE_OPTIONS=--require=…
+    // auto-loads code the argv never shows), so consent must disclose the
+    // full assignment, quoted like the argv so boundaries are unambiguous.
+    const envAssignments = Object.entries(info.env ?? {})
+      .filter(([key]) => key !== "PLUGIN_ROOT" && key !== "PLUGIN_DATA")
+      .map(([key, value]) => `${key}=${shellQuote(rewrite(value))}`);
+    const details: string[] = [];
+    // cwd is execution-relevant too: prepareStdioLaunch passes it to the
+    // runtime, so `node server.js` resolves scripts/configs relative to
+    // it — including from WRITABLE persistent plugin data — and the argv
+    // alone would imply a different resolution (capabilitySurface treats
+    // cwd as consent-relevant for the same reason). The loader defaults
+    // cwd to the plugin root; only a DEVIATION from the reviewed tree
+    // root needs calling out.
+    if (info.cwd !== undefined && rewrite(info.cwd) !== finalTargetPath) {
+      details.push(`cwd: ${shellQuote(rewrite(info.cwd))}`);
+    }
+    if (envAssignments.length > 0) {
+      details.push(`env: ${envAssignments.join(" ")}`);
+    }
+    return {
+      serverName: info.plugin.serverName,
+      transport: "stdio",
+      summary: details.length > 0 ? `${commandLine} (${details.join("; ")})` : commandLine,
+    };
   }
 
   // ---------------------------------------------------------------------
@@ -1773,6 +1842,10 @@ export class AgentPluginInstallService {
 
   updateResult(args: Parameters<AgentPluginInstallService["update"]>[0]) {
     return this.captureResult(() => this.update(args));
+  }
+
+  previewUpdateResult(args: Parameters<AgentPluginInstallService["previewUpdate"]>[0]) {
+    return this.captureResult(() => this.previewUpdate(args));
   }
 
   async preview(args: {
@@ -3575,98 +3648,195 @@ export class AgentPluginInstallService {
   }
 
   /**
+   * Pre-flight shared by previewUpdate and update: registry lookup, the
+   * refusals that make an update impossible, and the remote ref resolution.
+   * Must run under runExclusive (reads the registry document for a later
+   * write).
+   */
+  private async resolveUpdateTarget(name: string): Promise<{
+    envelope: Record<string, unknown>;
+    rawRegistry: unknown[];
+    entry: AgentPluginInstallEntry;
+    resolved: ResolvedRemoteRef;
+    updateJournalPath: string;
+  }> {
+    const { envelope, rawEntries: rawRegistry } = await this.readRegistryDocument("strict");
+    const registry = this.parseRegistryEntries(rawRegistry, "strict");
+    const entry = registry.find((e) => e.name === name);
+    if (!entry) {
+      throw new Error(`'${name}' is not a managed plugin install.`);
+    }
+    if (entry.source.refType === "commit") {
+      throw new Error(
+        `'${entry.name}' is pinned to commit ${entry.lockedSha.slice(0, 12)}; uninstall and reinstall to change it.`
+      );
+    }
+    if (entry.source.subpath !== undefined) {
+      // The registry schema deliberately preserves subpath entries written
+      // by newer builds (upgrade↔downgrade), but this build clones and
+      // validates only the repository ROOT: updating would swap the
+      // installed subpath snapshot for an unrelated root tree while the
+      // registry keeps claiming the subpath source.
+      throw new Error(
+        `'${entry.name}' was installed from a repository subpath by a newer version of Mux; update it with that version.`
+      );
+    }
+    // A retained journal means a previous swap's recovery is unfinished
+    // (e.g. the target was occupied by an unidentifiable tree). Refuse
+    // BEFORE cloning and comparing capabilities: a new journal would
+    // clobber the trashDir reference protecting the recoverable original,
+    // and the capability comparison would run against the wrong tree.
+    const updateJournalPath = this.journalPath(UPDATE_JOURNAL_PREFIX, entry.name);
+    if (await pathExists(updateJournalPath)) {
+      throw new Error(
+        `A previous update of '${entry.name}' has unfinished recovery. Open Settings → Plugins to let recovery complete, then try again.`
+      );
+    }
+    // Same for an unresolved UNINSTALL journal (the registry still owns the
+    // plugin while its tree sits in staging): a skills-only plugin has an
+    // empty capability surface, so the missing target would NOT stop this
+    // update — it would promote a replacement, after which uninstall
+    // recovery sees the occupied target, keeps its journal forever, and the
+    // whole managed container stays suppressed.
+    if (await pathExists(this.journalPath(UNINSTALL_JOURNAL_PREFIX, entry.name))) {
+      throw new Error(
+        `A previous uninstall of '${entry.name}' has unfinished cleanup. Open Settings → Plugins to let recovery complete, then try again.`
+      );
+    }
+
+    const resolved = await this.resolveRemoteRef(
+      entry.source.url,
+      entry.source.ref,
+      entry.source.refType
+    );
+    if (resolved.refType !== entry.source.refType) {
+      // The ref name now resolves to a different kind on the remote (e.g. a
+      // tracked branch was deleted and a tag of the same name exists). The
+      // update check flags this as an error; a stale Update click must not
+      // silently install content from a different ref kind while the
+      // registry keeps claiming the old one.
+      throw new Error(
+        `Tracked ${entry.source.refType} '${entry.source.ref}' is now a ${resolved.refType} on the remote. Uninstall and reinstall to track it.`
+      );
+    }
+    return { envelope, rawRegistry, entry, resolved, updateJournalPath };
+  }
+
+  /** Stage `sha`, validate it, and refuse an upstream rename (names are identity). */
+  private async stageUpdate(
+    entry: AgentPluginInstallEntry,
+    sha: string
+  ): Promise<{ stagedDir: string; plugin: AgentPluginInfo; warnings: string[] }> {
+    const stagedDir = await this.cloneExactSha(entry.source, sha);
+    try {
+      const { plugin, warnings } = await this.validateStagedClone(stagedDir);
+      if (plugin.name !== entry.name) {
+        // Container-entry names are identity (instanceId, PLUGIN_DATA,
+        // workspace overrides hash the path) — never rename on update.
+        throw new Error(
+          `The plugin renamed itself upstream ('${entry.name}' → '${plugin.name}'). Uninstall and reinstall to adopt the new name.`
+        );
+      }
+      return { stagedDir, plugin, warnings };
+    } catch (error) {
+      await this.removeDir(stagedDir);
+      throw error;
+    }
+  }
+
+  /**
+   * Stateless update review: stage the pending commit and report every
+   * capability change relative to the installed tree (see
+   * collectCapabilityChanges). Writes nothing; the UI shows the result and,
+   * on confirmation, calls update() with a consent naming these exact SHAs.
+   */
+  async previewUpdate(args: { name: string }): Promise<AgentPluginUpdateReview> {
+    this.assertEnabled();
+
+    return this.runExclusive(async () => {
+      const { entry, resolved } = await this.resolveUpdateTarget(args.name);
+      if (resolved.sha === entry.lockedSha) {
+        return {
+          name: entry.name,
+          fromSha: entry.lockedSha,
+          toSha: entry.lockedSha,
+          changes: [],
+          warnings: [],
+        };
+      }
+      const { stagedDir, plugin, warnings } = await this.stageUpdate(entry, resolved.sha);
+      try {
+        const changes = await this.collectCapabilityChanges(
+          entry.name,
+          this.targetPathFor(entry.name),
+          plugin,
+          warnings
+        );
+        return {
+          name: entry.name,
+          fromSha: entry.lockedSha,
+          toSha: resolved.sha,
+          ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
+          changes,
+          warnings,
+        };
+      } finally {
+        await this.removeDir(stagedDir);
+      }
+    });
+  }
+
+  /**
    * Apply an update: temp clone at the new SHA → re-validate → wholesale
    * directory swap (rename-old → promote-new → delete-old) → bump lockedSha →
    * recycle that plugin's MCP servers. Never an in-place `git pull`; local
    * edits to the managed dir are discarded.
    */
-  async update(args: { name: string }): Promise<AgentPluginInstallEntry> {
+  async update(args: {
+    name: string;
+    consent?: AgentPluginUpdateConsent | undefined;
+  }): Promise<AgentPluginInstallEntry> {
     this.assertEnabled();
+    if (args.consent !== undefined) {
+      assert(
+        isFullCommitSha(args.consent.toSha),
+        "update: consent.toSha must be a full commit SHA"
+      );
+    }
 
     return this.runExclusive(async () => {
-      const { envelope, rawEntries: rawRegistry } = await this.readRegistryDocument("strict");
-      const registry = this.parseRegistryEntries(rawRegistry, "strict");
-      const entry = registry.find((e) => e.name === args.name);
-      if (!entry) {
-        throw new Error(`'${args.name}' is not a managed plugin install.`);
-      }
-      if (entry.source.refType === "commit") {
+      const { envelope, rawRegistry, entry, resolved, updateJournalPath } =
+        await this.resolveUpdateTarget(args.name);
+      if (args.consent !== undefined && args.consent.fromSha !== entry.lockedSha) {
+        // The review compared the staged tree against THIS install; if
+        // another update landed in between, the shown diff is stale.
         throw new Error(
-          `'${entry.name}' is pinned to commit ${entry.lockedSha.slice(0, 12)}; uninstall and reinstall to change it.`
+          `'${entry.name}' changed since you reviewed the update (installed ${entry.lockedSha.slice(0, 12)}, reviewed against ${args.consent.fromSha.slice(0, 12)}). Check for updates again.`
         );
       }
-      if (entry.source.subpath !== undefined) {
-        // The registry schema deliberately preserves subpath entries written
-        // by newer builds (upgrade↔downgrade), but this build clones and
-        // validates only the repository ROOT: updating would swap the
-        // installed subpath snapshot for an unrelated root tree while the
-        // registry keeps claiming the subpath source.
-        throw new Error(
-          `'${entry.name}' was installed from a repository subpath by a newer version of Mux; update it with that version.`
-        );
-      }
-      // A retained journal means a previous swap's recovery is unfinished
-      // (e.g. the target was occupied by an unidentifiable tree). Refuse
-      // BEFORE cloning and comparing capabilities: a new journal would
-      // clobber the trashDir reference protecting the recoverable original,
-      // and the capability comparison would run against the wrong tree.
-      const updateJournalPath = this.journalPath(UPDATE_JOURNAL_PREFIX, entry.name);
-      if (await pathExists(updateJournalPath)) {
-        throw new Error(
-          `A previous update of '${entry.name}' has unfinished recovery. Open Settings → Plugins to let recovery complete, then try again.`
-        );
-      }
-      // Same for an unresolved UNINSTALL journal (the registry still owns the
-      // plugin while its tree sits in staging): a skills-only plugin has an
-      // empty capability surface, so the missing target would NOT stop this
-      // update — it would promote a replacement, after which uninstall
-      // recovery sees the occupied target, keeps its journal forever, and the
-      // whole managed container stays suppressed.
-      if (await pathExists(this.journalPath(UNINSTALL_JOURNAL_PREFIX, entry.name))) {
-        throw new Error(
-          `A previous uninstall of '${entry.name}' has unfinished cleanup. Open Settings → Plugins to let recovery complete, then try again.`
-        );
-      }
-
-      const resolved = await this.resolveRemoteRef(
-        entry.source.url,
-        entry.source.ref,
-        entry.source.refType
-      );
-      if (resolved.refType !== entry.source.refType) {
-        // The ref name now resolves to a different kind on the remote (e.g. a
-        // tracked branch was deleted and a tag of the same name exists). The
-        // update check flags this as an error; a stale Update click must not
-        // silently install content from a different ref kind while the
-        // registry keeps claiming the old one.
-        throw new Error(
-          `Tracked ${entry.source.refType} '${entry.source.ref}' is now a ${resolved.refType} on the remote. Uninstall and reinstall to track it.`
-        );
-      }
-      if (resolved.sha === entry.lockedSha) {
+      // Consent installs exactly the reviewed commit (mirroring install's
+      // expectedSha): if the branch moved on since the review, the newer
+      // commit was never shown to the user and surfaces on the next check.
+      const targetSha = args.consent?.toSha ?? resolved.sha;
+      if (targetSha === entry.lockedSha) {
         return entry; // Already current.
       }
 
-      const stagedDir = await this.cloneExactSha(entry.source, resolved.sha);
+      const { stagedDir, plugin } = await this.stageUpdate(entry, targetSha);
       try {
-        const { plugin } = await this.validateStagedClone(stagedDir);
-        if (plugin.name !== entry.name) {
-          // Container-entry names are identity (instanceId, PLUGIN_DATA,
-          // workspace overrides hash the path) — never rename on update.
-          throw new Error(
-            `The plugin renamed itself upstream ('${entry.name}' → '${plugin.name}'). Uninstall and reinstall to adopt the new name.`
-          );
-        }
-
         const targetPath = this.targetPathFor(entry.name);
         // Security: an update must not silently expand what the plugin can
         // do — a compromised upstream could add hooks.js plus a bash grant
         // and auto-load it on the next request. Compare the staged tree's
-        // capability surface against the installed tree and reject
-        // increases/changes; uninstall + reinstall routes through the full
-        // install consent preview. (In-place re-consent UX for updates is
-        // a v2 item.)
-        await this.assertNoCapabilityIncrease(entry.name, targetPath, plugin);
+        // capability surface against the installed tree; changes need a
+        // consent from previewUpdate naming this exact (from, to) pair,
+        // which the user gave after seeing every change.
+        const changes = await this.collectCapabilityChanges(entry.name, targetPath, plugin, []);
+        if (changes.length > 0 && args.consent === undefined) {
+          throw new Error(
+            `The update to '${entry.name}' ${changes.map((change) => change.summary).join("; ")}. Updates cannot expand a plugin's capabilities without review — open Settings → Plugins and review the update to confirm it.`
+          );
+        }
 
         await this.removeDir(path.join(stagedDir, ".git"));
 
@@ -3700,7 +3870,7 @@ export class AgentPluginInstallService {
             trashDir,
             nonce: updateNonce,
             stagedAt: Date.now(),
-            newSha: resolved.sha,
+            newSha: targetSha,
           });
           try {
             await this.renameIntoStaging(targetPath, trashDir);
@@ -3798,7 +3968,7 @@ export class AgentPluginInstallService {
 
         const updated: AgentPluginInstallEntry = {
           ...entry,
-          lockedSha: resolved.sha,
+          lockedSha: targetSha,
           updatedAt: new Date().toISOString(),
           manifest: {
             ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
@@ -3860,7 +4030,7 @@ export class AgentPluginInstallService {
         }
 
         log.info(
-          `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${resolved.sha.slice(0, 12)}`
+          `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${targetSha.slice(0, 12)}`
         );
         return updated;
       } finally {

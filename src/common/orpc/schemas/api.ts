@@ -84,6 +84,7 @@ import { BashToolResultSchema, FileTreeNodeSchema } from "./tools";
 import { WorkspaceStatsSnapshotSchema } from "./workspaceStats";
 import {
   FrontendWorkspaceMetadataSchema,
+  WorkspaceRemoveResultSchema,
   GitStatusSchema,
   ProjectRefSchema,
   WorkspaceActivitySnapshotSchema,
@@ -133,6 +134,8 @@ import {
   AgentPluginInstallPreviewSchema,
   AgentPluginListItemSchema,
   AgentPluginUpdateCheckSchema,
+  AgentPluginUpdateConsentSchema,
+  AgentPluginUpdateReviewSchema,
 } from "./agentPlugins";
 import { PolicyGetResponseSchema } from "./policy";
 import {
@@ -1091,8 +1094,24 @@ export const agentPlugins = {
     input: z.void(),
     output: ResultSchema(z.array(AgentPluginUpdateCheckSchema), z.string()),
   },
-  update: {
+  /**
+   * Temp clone of the pending update + capability comparison against the
+   * installed tree; writes nothing. Drives the in-place re-consent panel.
+   */
+  previewUpdate: {
     input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginUpdateReviewSchema, z.string()),
+  },
+  update: {
+    input: z.object({
+      name: z.string(),
+      /**
+       * Required when the update changes the capability surface: carries the
+       * exact SHAs the user reviewed via previewUpdate. Without it, such an
+       * update is refused.
+       */
+      consent: AgentPluginUpdateConsentSchema.nullish(),
+    }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
   },
 };
@@ -1365,9 +1384,14 @@ export const workspace = {
   remove: {
     input: z.object({
       workspaceId: z.string(),
-      options: z.object({ force: z.boolean().optional() }).optional(),
+      options: z
+        .object({
+          force: z.boolean().optional(),
+          acknowledgedDescendantIds: z.array(z.string()).optional(),
+        })
+        .optional(),
     }),
-    output: z.object({ success: z.boolean(), error: z.string().optional() }),
+    output: WorkspaceRemoveResultSchema,
   },
   rename: {
     input: z.object({ workspaceId: z.string(), newName: z.string() }),
@@ -3214,11 +3238,25 @@ export const DesktopViewerEventSchema = z.object({
 });
 
 export const desktop = {
+  /**
+   * The pane may name its registration (`viewerId`, a fresh UUID) so it knows the identity
+   * before `ready` arrives and can give it up definitively even if it unmounts in between;
+   * an id already registered is refused. Omitted, the backend assigns one.
+   */
   watchViewer: {
-    input: z.object({ workspaceId: z.string().min(1) }),
+    input: z.object({ workspaceId: z.string().min(1), viewerId: z.string().min(1).nullish() }),
     output: eventIterator(DesktopViewerEventSchema),
   },
   acknowledgeViewerRelease: {
+    input: z.object({ viewerId: z.string().min(1) }),
+    output: z.void(),
+  },
+  /**
+   * A pane settling in a terminal state (unavailable desktop, first connection failed) gives up
+   * its viewer registration definitively: unlike a dropped subscription, no attachment grace
+   * should keep the workspace counted as attached afterwards.
+   */
+  detachViewer: {
     input: z.object({ viewerId: z.string().min(1) }),
     output: z.void(),
   },
@@ -3242,8 +3280,12 @@ export const desktop = {
     input: z.object({ workspaceId: z.string() }),
     output: DesktopCapabilitySchema,
   },
+  /**
+   * `viewerId` is the pane's ready viewer registration (see watchViewer): the bridge opened with
+   * this bootstrap is attributed to it, so detachViewer can retract that bridge's grace too.
+   */
   getBootstrap: {
-    input: z.object({ workspaceId: z.string() }),
+    input: z.object({ workspaceId: z.string(), viewerId: z.string().min(1).nullish() }),
     output: z.object({
       capability: DesktopCapabilitySchema,
       bridgePath: z.string().optional(),

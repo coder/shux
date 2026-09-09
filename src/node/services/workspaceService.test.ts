@@ -58,6 +58,7 @@ import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
 import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
@@ -13507,6 +13508,86 @@ describe("WorkspaceService assertPricedModelForBudgetedGoal", () => {
 });
 
 describe("WorkspaceService remove lifecycle coordination", () => {
+  test("acknowledged removal keeps the parent last and returns forced failure scope", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+    let notifications = 0;
+    const unsubscribe = config.onConfigChanged(() => {
+      notifications += 1;
+    });
+    const descendants = [{ workspaceId: "child", title: "Child", active: true }];
+    const order: string[] = [];
+    let locked = false;
+    let blocked = true;
+    const removeDescendants = mock(async () => {
+      expect(locked).toBe(true);
+      const before = notifications;
+      order.push("descendants");
+      await config.editConfig((value) => value);
+      await config.editConfig((value) => value);
+      expect(notifications).toBe(before);
+      return blocked ? Err("active child") : Ok(undefined);
+    });
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        withTaskTreeLifecycleLock: async <T>(
+          _id: string,
+          operation: () => Promise<T>
+        ): Promise<T> => {
+          expect(locked).toBe(false);
+          locked = true;
+          try {
+            return await operation();
+          } finally {
+            locked = false;
+          }
+        },
+        listWorkspaceRemovalDescendants: () => descendants,
+        removeAcknowledgedDescendantsWhileTaskTreeLocked: removeDescendants,
+      })
+    );
+    const removeParent = spyOn(
+      workspaceService as unknown as {
+        removeUnlocked(id: string, force: boolean): Promise<Result<void>>;
+      },
+      "removeUnlocked"
+    ).mockImplementation(async () => {
+      expect(locked).toBe(true);
+      order.push("parent");
+      await config.editConfig((value) => value);
+      return Err("parent failure");
+    });
+    expect(
+      await workspaceService.remove("parent", true, { acknowledgedDescendantIds: ["child"] })
+    ).toEqual({
+      success: false,
+      error: "active child",
+      descendants,
+    });
+    expect(removeParent).not.toHaveBeenCalled();
+    blocked = false;
+    expect(
+      await workspaceService.remove("parent", true, { acknowledgedDescendantIds: ["child"] })
+    ).toEqual({
+      success: false,
+      error: "parent failure",
+      descendants,
+    });
+    expect(order).toEqual(["descendants", "descendants", "parent"]);
+    expect(notifications).toBe(2);
+    removeDescendants.mockClear();
+    expect(await workspaceService.remove("parent", true)).toEqual({
+      success: false,
+      error: "parent failure",
+      descendants,
+    });
+    expect(removeDescendants).not.toHaveBeenCalled();
+    expect(notifications).toBe(3);
+    unsubscribe();
+    removeParent.mockRestore();
+    await cleanup();
+  });
+
   test("checks descendant tasks while holding the task-tree lifecycle lock", async () => {
     const workspaceId = "parent-remove-lifecycle";
     const workspaceService = createWorkspaceServiceForTest({
@@ -15401,6 +15482,47 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(hookBehavior).toBe("keep");
   });
 
+  test("archive() under refuseLiveUserActivity closes an idle desktop process instead of refusing", async () => {
+    // The desktop process an agent started lingers after its turn finished; nobody is attached,
+    // so an agent-driven archive must proceed and close it like the user-driven path does.
+    const close = mock(() => Promise.resolve(undefined));
+    const desktopSessionManager = {
+      close,
+      has: () => true,
+      hasAttachedViewers: () => false,
+      setWorkspaceArchiveGuard: () => undefined,
+    } as unknown as DesktopSessionManager;
+    workspaceService.setDesktopSessionManager(desktopSessionManager);
+
+    const result = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+
+    expect(result).toEqual(Ok({ kind: "archived" }));
+    expect(close).toHaveBeenCalledWith(workspaceId);
+  });
+
+  test("archive() under refuseLiveUserActivity refuses while a desktop viewer is attached", async () => {
+    const close = mock(() => Promise.resolve(undefined));
+    const desktopSessionManager = {
+      close,
+      has: () => true,
+      hasAttachedViewers: () => true,
+      setWorkspaceArchiveGuard: () => undefined,
+    } as unknown as DesktopSessionManager;
+    workspaceService.setDesktopSessionManager(desktopSessionManager);
+
+    const result = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("desktop viewer");
+    }
+    expect(close).not.toHaveBeenCalled();
+  });
+
   test("archive() refuses while in-process workflow work exists under refuseLiveUserActivity", async () => {
     // Simulates a workflow admission/runner that entered before the archive gate armed: the
     // sink's synchronous gate must observe it and refuse instead of orphaning the run.
@@ -15443,6 +15565,20 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       expect(refused.error).toContain("workflow run");
     }
 
+    // MCP prompt discovery admitted before the hold pairs the same way: its counter refuses
+    // the hold before any delegated turn is interrupted.
+    const discovery = workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId);
+    expect(discovery).toBeDefined();
+    const refusedByDiscovery = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [],
+    });
+    expect(refusedByDiscovery.success).toBe(false);
+    if (!refusedByDiscovery.success) {
+      expect(refusedByDiscovery.error).toContain("MCP prompt discovery in progress");
+    }
+    discovery![Symbol.dispose]();
+
     // In-flight editor/terminal opens are visible only through the pending-open counters
     // until their durable markers persist; the hold must refuse on them before the caller
     // interrupts anything (the sink's untrackable-app check would refuse only afterwards).
@@ -15475,6 +15611,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       if (!refusedOpen.success) {
         expect(refusedOpen.error).toContain("being archived");
       }
+      expect(workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId)).toBeUndefined();
     } finally {
       hold.data[Symbol.dispose]();
     }
@@ -15570,6 +15707,160 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     });
     expect(refused.success).toBe(false);
     expect(releases).toBe(2);
+  });
+
+  test("acquirePreInterruptionArchiveHold exempts only a stoppable PREPARING delegated turn", () => {
+    const delegated = { taskHandleId: "wt-1", ownerWorkspaceId: "owner-1", turnId: "turn-1" };
+    const session = workspaceService.getOrCreateSession(workspaceId);
+    session.isPreparingTurn = () => true;
+    let stoppable: typeof delegated | undefined = delegated;
+    session.getStoppablePreparingWorkspaceTurn = () => stoppable;
+    let queued = 0;
+    session.queuedMessageEntryCount = () => queued;
+
+    // The collected turn itself is PREPARING with its startup registered: interruptWorkspaceTurn's
+    // stopStream cancels it, so the hold is granted.
+    const held = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(held.success).toBe(true);
+    if (held.success) held.data[Symbol.dispose]();
+
+    // A user entry queued behind the exempt delegated turn is still user work.
+    queued = 1;
+    const refusedQueued = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(refusedQueued.success).toBe(false);
+    if (!refusedQueued.success) {
+      expect(refusedQueued.error).toContain("queued messages beyond the delegated turns");
+      expect(refusedQueued.error).not.toContain("a message dispatching");
+    }
+    queued = 0;
+
+    // PREPARING for a different turn than the collected one (the collected turn ended and
+    // another delegated turn took the session) is not the work the caller is interrupting.
+    stoppable = { ...delegated, turnId: "turn-2" };
+    const refusedMismatch = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(refusedMismatch.success).toBe(false);
+    if (!refusedMismatch.success) {
+      expect(refusedMismatch.error).toContain("a message dispatching");
+    }
+
+    // PREPARING work that has not handed its startup to the engine (or a user send) reports no
+    // stoppable turn: a stop there would not cancel it, so the hold fails closed.
+    stoppable = undefined;
+    const refusedUnstoppable = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(refusedUnstoppable.success).toBe(false);
+    if (!refusedUnstoppable.success) {
+      expect(refusedUnstoppable.error).toContain("a message dispatching");
+    }
+  });
+
+  test("archive sink admits a PREPARING delegated turn once its interruption has settled", async () => {
+    // End to end through a real session: the delegated send is PREPARING with its startup
+    // registered, the hold exempts it, the engine-side stop cancels it, and the sink accepts
+    // only after the aborted turn has unwound (stopStream resolves before that happens).
+    const delegated = { taskHandleId: "wt-prep", ownerWorkspaceId: "owner-1", turnId: "turn-prep" };
+    const syntheticMessageId = "starting-prep";
+    const aiEmitter = new EventEmitter();
+    const entered = Promise.withResolvers<void>();
+    const abortController = new AbortController();
+    // StreamManager.stopStream for a pending start: abort it and deliver the startup abort.
+    const stopStream = mock(() => {
+      abortController.abort("system");
+      aiEmitter.emit("stream-abort", {
+        type: "stream-abort",
+        workspaceId,
+        messageId: syntheticMessageId,
+        abortReason: "system",
+        metadata: {},
+      });
+      return Promise.resolve(Ok(undefined));
+    });
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      historyService,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage: mock(async (request: Parameters<AIService["streamMessage"]>[0]) => {
+          // StreamManager registers the pending start before its first await.
+          request.onStreamStarting?.(syntheticMessageId);
+          entered.resolve();
+          await new Promise<void>((resolve) => {
+            abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          const completion: TurnCompletion = { status: "aborted", abortReason: "system" };
+          return Ok({ messageId: syntheticMessageId, completion: Promise.resolve(completion) });
+        }),
+        stopStream,
+      },
+    });
+    const internal = workspaceService as unknown as {
+      sessions: Map<string, AgentSession>;
+      aiService: typeof harness.aiService;
+    };
+    internal.sessions.set(workspaceId, harness.session);
+    internal.aiService = harness.aiService;
+    try {
+      const sent = harness.session.sendMessage(
+        "Summarize",
+        {
+          model: "anthropic:claude-sonnet-4-5",
+          agentId: "exec",
+          muxMetadata: { type: "workspace-turn-task", ...delegated },
+        },
+        { startStreamInBackground: true }
+      );
+      await entered.promise;
+      // The PREPARING send reads as a queued message to the coarse activity snapshot; the
+      // correlation is what tells it apart from user input.
+      expect(workspaceService.listLiveWorkspaceActivity(workspaceId).queuedMessages).toBe(true);
+      expect(workspaceService.getStoppablePreparingWorkspaceTurn(workspaceId)).toEqual(delegated);
+
+      const refused = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+        queuedDelegatedTurnCount: 0,
+        expectedDelegatedTurnCorrelations: [],
+      });
+      expect(refused.success).toBe(false);
+      if (!refused.success) {
+        expect(refused.error).toContain("a message dispatching");
+      }
+      expect(harness.session.isPreparingTurn()).toBe(true);
+
+      const hold = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+        queuedDelegatedTurnCount: 0,
+        expectedDelegatedTurnCorrelations: [delegated],
+      });
+      expect(hold.success).toBe(true);
+      if (!hold.success) return;
+      try {
+        // What interruptWorkspaceTurn does for a running handle. The engine has aborted when
+        // this resolves, but the session's aborted turn has not reached policy yet.
+        expect((await stopStream()).success).toBe(true);
+        expect(harness.session.isPreparingTurn()).toBe(true);
+
+        await workspaceService.waitForIdle(workspaceId);
+        expect((await sent).success).toBe(true);
+        expect(harness.session.hasActiveOrPendingTurnWork()).toBe(false);
+        expect(
+          await workspaceService.archive(workspaceId, undefined, { refuseLiveUserActivity: true })
+        ).toEqual(Ok({ kind: "archived" }));
+      } finally {
+        hold.data[Symbol.dispose]();
+      }
+    } finally {
+      internal.sessions.delete(workspaceId);
+      await harness.session.dispose();
+    }
   });
 
   test("fork() refuses while the source workspace is being archived", async () => {
@@ -16353,6 +16644,102 @@ describe("WorkspaceService archive snapshots", () => {
     });
   });
 
+  test("archive() stops cached MCP servers before snapshot capture", async () => {
+    const order: string[] = [];
+    const stopServers = mock(
+      (_workspaceId: string, _options?: { retainRestartOptions?: boolean }) => {
+        order.push("stop-mcp");
+        return Promise.resolve();
+      }
+    );
+    workspaceService.setMCPServerManager({ stopServers } as unknown as MCPServerManager);
+    const snapshot = {
+      version: 1 as const,
+      capturedAt: "2026-03-30T00:00:00.000Z",
+      stateDirPath: "archive-state",
+      projects: [],
+    };
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => {
+        order.push("capture");
+        return Promise.resolve(Ok(snapshot));
+      }),
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result).toEqual(Ok({ kind: "archived" }));
+    // Removal-style stop (no retainRestartOptions) so its stop epoch retires in-flight startups.
+    expect(stopServers).toHaveBeenCalledWith(workspaceId);
+    expect(order).toEqual(["stop-mcp", "capture"]);
+  });
+
+  test("in-flight MCP prompt discovery holds the model-facing archive gate until released", async () => {
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok("skipped" as const))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+
+    const admission = workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId);
+    expect(admission).toBeDefined();
+
+    const refused = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error).toContain("an MCP prompt discovery in progress");
+    }
+    expect(configState.projects.get(projectPath)?.workspaces[0]?.archivedAt).toBeUndefined();
+
+    admission![Symbol.dispose]();
+
+    const afterRelease = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+    if (!afterRelease.success) {
+      expect(afterRelease.error).not.toContain("MCP prompt discovery");
+    }
+  });
+
+  test("acquireMcpPromptDiscoveryAdmission refuses archiving and archived workspaces", () => {
+    addToArchivingWorkspaces(workspaceService, workspaceId);
+    expect(workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId)).toBeUndefined();
+
+    // Discovery on an archived workspace would re-wake its runtime; refuse it durably too.
+    const archivedService = createWorkspaceServiceForTest({
+      config: {
+        srcDir: "/tmp/src",
+        sessionsDir: "/tmp/test/sessions",
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([
+            [
+              projectPath,
+              {
+                workspaces: [
+                  {
+                    path: workspacePath,
+                    id: workspaceId,
+                    name: "ws-archive-snapshot",
+                    archivedAt: "2026-01-01T00:00:00.000Z",
+                  },
+                ],
+              },
+            ],
+          ]),
+        })),
+      } as unknown as Config,
+      historyService,
+    });
+    expect(archivedService.acquireMcpPromptDiscoveryAdmission(workspaceId)).toBeUndefined();
+    expect(archivedService.acquireMcpPromptDiscoveryAdmission("ws-other")).toBeDefined();
+  });
+
   test("archive() does not close live sessions when archive readiness checks fail", async () => {
     const closeWorkspaceSessions = mock(() => undefined);
     workspaceService.setTerminalService({
@@ -16365,6 +16752,9 @@ describe("WorkspaceService archive snapshots", () => {
       close: closeDesktopSession,
       setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager);
+
+    const stopServers = mock(() => Promise.resolve());
+    workspaceService.setMCPServerManager({ stopServers } as unknown as MCPServerManager);
 
     const captureSnapshotForArchive = mock(() => Promise.resolve(Err("should not run")));
     workspaceService.setWorktreeArchiveSnapshotService({
@@ -16380,6 +16770,7 @@ describe("WorkspaceService archive snapshots", () => {
     expect(captureSnapshotForArchive).not.toHaveBeenCalled();
     expect(closeWorkspaceSessions).not.toHaveBeenCalled();
     expect(closeDesktopSession).not.toHaveBeenCalled();
+    expect(stopServers).not.toHaveBeenCalled();
   });
 
   test("archive() skips snapshot capture for multi-project workspaces", async () => {

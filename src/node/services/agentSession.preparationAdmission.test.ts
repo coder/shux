@@ -530,4 +530,42 @@ describe("preparation admission", () => {
       await h.session.waitForIdle();
     }
   );
+
+  test.each([
+    ["delegated", { taskHandleId: "task", ownerWorkspaceId: "parent", turnId: "turn" }],
+    ["manual", undefined],
+  ] as const)(
+    "a stoppable PREPARING %s send is reported only between engine startup registration and idle",
+    async (kind, correlation) => {
+      const h = await harness(`stoppable-preparing-${kind}`);
+      const entered = Promise.withResolvers<Parameters<typeof h.aiService.streamMessage>[0]>();
+      const release = Promise.withResolvers<void>();
+      spyOn(h.aiService, "streamMessage").mockImplementation(async (request) => {
+        entered.resolve(request);
+        await release.promise;
+        return Ok(createStartedTurnHandle(h.session.closingSignal));
+      });
+      const sent = h.session.sendMessage(
+        "head",
+        {
+          ...options,
+          ...(correlation ? { muxMetadata: { type: "workspace-turn-task", ...correlation } } : {}),
+        },
+        { startStreamInBackground: true }
+      );
+      const request = await entered.promise;
+      // PREPARING, but the engine has not registered the startup: a stopStream here would
+      // only notify, so the turn is not reported as stoppable.
+      expect(h.session.isPreparingTurn()).toBe(true);
+      expect(h.session.getStoppablePreparingWorkspaceTurn()).toBeUndefined();
+
+      request.onStreamStarting?.("starting-1");
+      expect(h.session.getStoppablePreparingWorkspaceTurn()).toEqual(correlation);
+
+      release.resolve();
+      expect((await sent).success).toBe(true);
+      await h.session.waitForIdle();
+      expect(h.session.getStoppablePreparingWorkspaceTurn()).toBeUndefined();
+    }
+  );
 });

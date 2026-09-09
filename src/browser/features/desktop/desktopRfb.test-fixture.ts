@@ -2,11 +2,12 @@ import { wrapAsyncIterator } from "@orpc/shared";
 import type { APIClient } from "@/browser/contexts/API";
 
 export const watchDesktopViewerFixture: APIClient["desktop"]["watchViewer"] = (
-  _input,
+  input,
   { signal } = {}
 ) => {
   async function* events() {
-    yield { type: "ready" as const, viewerId: "desktop-fixture" };
+    // The pane names its registration; the backend echoes that name in ready.
+    yield { type: "ready" as const, viewerId: input.viewerId ?? "desktop-fixture" };
     await new Promise<void>((resolve) => {
       if (signal?.aborted) resolve();
       else signal?.addEventListener("abort", () => resolve(), { once: true });

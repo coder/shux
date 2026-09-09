@@ -589,6 +589,64 @@ describe("Config", () => {
     });
   });
 
+  describe("deferred change notifications", () => {
+    it("flushes slow sequential edits and unrelated edits once", async () => {
+      let notifications = 0;
+      const unsubscribe = config.onConfigChanged(() => {
+        notifications += 1;
+      });
+      const paused = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const operation = config.withDeferredChangeNotifications(async () => {
+        await config.setUpdateChannel("npm");
+        paused.resolve();
+        await resume.promise;
+        await config.setUpdateChannel("nightly");
+        return "complete";
+      });
+      await paused.promise;
+      expect(notifications).toBe(0);
+      await config.editConfig((value) => value);
+      expect(notifications).toBe(0);
+      resume.resolve();
+      expect(await operation).toBe("complete");
+      expect(notifications).toBe(1);
+      expect(config.getUpdateChannel()).toBe("nightly");
+      await config.setUpdateChannel("npm");
+      expect(notifications).toBe(2);
+      unsubscribe();
+    });
+
+    it("flushes nested partial failures only after the outer scope ends", async () => {
+      let notifications = 0;
+      const unsubscribe = config.onConfigChanged(() => {
+        notifications += 1;
+      });
+      const failure = await config
+        .withDeferredChangeNotifications(async () => {
+          await config.setUpdateChannel("npm");
+          const nestedFailure = await config
+            .withDeferredChangeNotifications(async () => {
+              await config.setUpdateChannel("nightly");
+              throw new Error("nested failure");
+            })
+            .catch((error: unknown) => error);
+          expect(nestedFailure).toEqual(new Error("nested failure"));
+          expect(notifications).toBe(0);
+          throw new Error("outer failure");
+        })
+        .catch((error: unknown) => error);
+      expect(failure).toEqual(new Error("outer failure"));
+      expect(notifications).toBe(1);
+      expect(config.getUpdateChannel()).toBe("nightly");
+      await config.withDeferredChangeNotifications(() => Promise.resolve());
+      expect(notifications).toBe(1);
+      await config.setUpdateChannel("npm");
+      expect(notifications).toBe(2);
+      unsubscribe();
+    });
+  });
+
   describe("editConfig", () => {
     it("serializes concurrent edits so no update is lost", async () => {
       // Regression: editConfig used to be a non-serialized read-modify-write
@@ -2831,6 +2889,57 @@ describe("Config", () => {
   });
 
   describe("getAllWorkspaceMetadata with migration", () => {
+    it.each([false, true])(
+      "derives task-family roots through archived rows and cycles (reversed=%s)",
+      async (reversed) => {
+        const projectPath = path.join(tempDir, "project");
+        const nodes = [
+          { id: "root" },
+          { id: "archived", parentWorkspaceId: "root", archivedAt: "2025-01-01T00:00:00.000Z" },
+          { id: "grandchild", parentWorkspaceId: "archived" },
+          { id: "sibling", parentWorkspaceId: "root" },
+          { id: "other-root" },
+          { id: "other-child", parentWorkspaceId: "other-root" },
+          { id: "orphan", parentWorkspaceId: "missing" },
+          { id: "cycle-a", parentWorkspaceId: "cycle-b" },
+          { id: "cycle-b", parentWorkspaceId: "cycle-a" },
+          { id: "cycle-tail", parentWorkspaceId: "cycle-b" },
+        ];
+        await config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, {
+            workspaces: (reversed ? nodes.toReversed() : nodes).map((node) => ({
+              ...node,
+              name: node.id,
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+            })),
+          });
+          return cfg;
+        });
+
+        const metadata = await new Config(tempDir).getAllWorkspaceMetadata();
+        expect(Object.fromEntries(metadata.map((row) => [row.id, row.rootWorkspaceId]))).toEqual({
+          root: "root",
+          archived: "root",
+          grandchild: "root",
+          sibling: "root",
+          "other-root": "other-root",
+          "other-child": "other-root",
+          orphan: "missing",
+          "cycle-a": "cycle-a",
+          "cycle-b": "cycle-a",
+          "cycle-tail": "cycle-a",
+        });
+        expect(
+          config
+            .loadConfigOrDefault()
+            .projects.get(projectPath)
+            ?.workspaces.every((row) => !("rootWorkspaceId" in row))
+        ).toBe(true);
+      }
+    );
+
     it("should migrate legacy workspace without metadata file", async () => {
       const projectPath = "/fake/project";
       const workspacePath = path.join(config.srcDir, "project", "feature-branch");

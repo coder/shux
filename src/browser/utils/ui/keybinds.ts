@@ -298,6 +298,9 @@ export function isKeybindDeprecated(keybind: Keybind): boolean {
  * We also like vim keybinds.
  */
 export const KEYBINDS = {
+  /** Copy selected transcript Markdown while its context menu is open. */
+  COPY_MARKDOWN: { key: "m" },
+
   /** Open agent picker (focuses search) */
   TOGGLE_AGENT: { key: "A", ctrl: true, shift: true },
 

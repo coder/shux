@@ -3,7 +3,11 @@ import { asyncIterableFromSubscription } from "@/common/utils/asyncEventIterator
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { DesktopWindowManager } from "@/desktop/desktopWindowManager";
-import { DESKTOP_DEFAULTS, DESKTOP_VIEWER_RELEASE_TIMEOUT_MS } from "@/common/constants/desktop";
+import {
+  DESKTOP_ATTACHMENT_GRACE_MS,
+  DESKTOP_DEFAULTS,
+  DESKTOP_VIEWER_RELEASE_TIMEOUT_MS,
+} from "@/common/constants/desktop";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   DesktopActionResult,
@@ -33,6 +37,33 @@ interface DesktopViewerRegistration {
   acknowledge?: () => void;
 }
 
+interface DetachmentGrace {
+  requesterWorkspaceId: string;
+  expiresAt: number;
+  /** Owner captured at stamp time: the fallback when the requester can no longer be resolved. */
+  capturedOwnerWorkspaceId: string;
+  /**
+   * An owner this grace covered that closed explicitly meanwhile: its desktop is gone for good,
+   * so the grace no longer covers it — but still covers the requester, and the owner it resolves
+   * to should it be rebound before it reconnects.
+   */
+  excludedOwnerWorkspaceId?: string;
+}
+
+/**
+ * Whether a live VNC bridge attaches `workspaceId`, classifying each bridge's requester against
+ * the owner it CURRENTLY resolves to (see viewerTargets) rather than the one captured at admission.
+ */
+export type DesktopBridgeConnectionProbe = (
+  workspaceId: string,
+  resolveOwner: (requesterWorkspaceId: string, capturedOwnerWorkspaceId: string) => string
+) => boolean;
+
+/** Grace source key of the VNC bridge a viewer bootstrapped (or an anonymous bridge). */
+function bridgeSourceKey(viewerIdOrSequence: string): string {
+  return `bridge:${viewerIdOrSequence}`;
+}
+
 export class DesktopSessionManager {
   private readonly viewers = new Map<string, DesktopViewerRegistration>();
   private readonly sessions = new Map<string, PortableDesktopSession>();
@@ -52,18 +83,56 @@ export class DesktopSessionManager {
   }>();
   private readonly windowOwners = new Map<string, string>();
   private readonly closingWorkspaces = new Map<string, Promise<void>>();
+  /**
+   * Detached source → its grace. Viewer detachments are keyed by their viewerId so a pane's
+   * definitive detach can retract exactly the graces its own (possibly superseded) registrations
+   * stamped — never another pane's; bridge detachments get an opaque key. Graces record the
+   * requester rather than the workspaces they keep attached so an explicit close can retract a
+   * released requester's graces without touching graces other requesters left on the same owner,
+   * and so the owner a grace covers is re-resolved at query time: a grace stamped while the
+   * borrower targeted owner A must follow the borrower to owner B when the binding changes before
+   * it reconnects (see noteDetached / hasRecentDetachment).
+   */
+  private readonly recentDetachments = new Map<string, DetachmentGrace>();
+  private bridgeDetachmentSequence = 0;
+  /**
+   * Viewers a pane gave up definitively (see detachViewer) → until when a bridge detachment
+   * attributed to that viewer stamps no grace: the pane's oRPC call and its VNC socket close
+   * travel independently, so the bridge's detachment may reach us after the retraction.
+   */
+  private readonly definitivelyDetachedViewers = new Map<string, number>();
+  /**
+   * Closes in flight, keyed by the closing workspace → grace sources the teardown owns: those
+   * its released requesters had stamped before it started, plus detachments that target the
+   * closing workspace while it runs (borrowers' viewers and bridges when an owner closes). One
+   * entry per close, so overlapping teardowns never share state, and a grace a rebound borrower
+   * stamps on its NEW owner meanwhile is not attributed to the old owner's teardown.
+   */
+  private readonly teardownSources = new Map<string, Set<string>>();
   private disposed = false;
   private closeAllPromise: Promise<void> | undefined;
 
-  watchViewer(workspaceId: string, signal?: AbortSignal): AsyncGenerator<DesktopViewerEvent> {
+  /**
+   * `viewerId` lets the pane name its registration up front (so it can detach it definitively
+   * before ready arrives); it must not collide with a live registration — a colliding id would
+   * let one pane displace another's registration and, on detach, retract its graces.
+   */
+  watchViewer(
+    workspaceId: string,
+    signal?: AbortSignal,
+    viewerId: string = randomUUID()
+  ): AsyncGenerator<DesktopViewerEvent> {
     return asyncIterableFromSubscription<DesktopViewerEvent>({
       signal,
       subscribe: (push) => {
         // Admission and registration share one synchronous block: cleanup either sees this
         // viewer in its snapshot or rejects its registration before sending ready.
         const target = this.resolveActiveTarget(workspaceId);
+        if (this.viewers.has(viewerId)) {
+          throw new Error(`Desktop viewer ${viewerId} is already registered`);
+        }
         const viewer: DesktopViewerRegistration = {
-          viewerId: randomUUID(),
+          viewerId,
           workspaceId,
           ownerWorkspaceId: target.ownerWorkspaceId,
           push,
@@ -74,7 +143,7 @@ export class DesktopSessionManager {
         // Losing the subscription is not proof that held remote input was released:
         // a pending teardown still waits for its deadline rather than resolving here.
         const unsubscribe = () => {
-          this.viewers.delete(viewer.viewerId);
+          if (this.viewers.delete(viewer.viewerId)) this.noteViewerDetached(viewer);
         };
         signal?.addEventListener("abort", unsubscribe, { once: true });
         return () => {
@@ -89,11 +158,41 @@ export class DesktopSessionManager {
     this.viewers.get(viewerId)?.acknowledge?.();
   }
 
+  /**
+   * The pane behind this registration settled in a terminal state (no desktop, or its first
+   * connection failed with no retry pending) and is giving the registration up for good. Drop
+   * it without the attachment grace: that grace is for transports that may come back. This is
+   * the only detachment that skips the grace — the client alone knows whether it will retry
+   * (a previously connected pane keeps retrying through an unavailable bootstrap), so the
+   * backend never infers "will not reconnect" from a bootstrap outcome.
+   */
+  detachViewer(viewerId: string): void {
+    const viewer = this.viewers.get(viewerId);
+    this.viewers.delete(viewerId);
+    // A release this pane never acknowledged is complete now (the pane is gone for good):
+    // resolve it rather than making the close wait out the release timeout. The viewer is
+    // already deleted, so completing stamps no grace.
+    viewer?.acknowledge?.();
+    // The registration may already be gone and have stamped a grace instead: a ready
+    // registration that dropped while its bootstrap was pending is replaced immediately, and the
+    // pane reports the terminal outcome for the superseded viewerId too. Only that registration's
+    // own graces — its own and its bridge's (bootstrapped under this viewerId) — are retracted;
+    // a grace another pane of the same requester left while it re-registers must keep that pane
+    // attached.
+    this.recentDetachments.delete(viewerId);
+    this.recentDetachments.delete(bridgeSourceKey(viewerId));
+    const now = this.now();
+    for (const [id, until] of this.definitivelyDetachedViewers) {
+      if (until <= now) this.definitivelyDetachedViewers.delete(id);
+    }
+    this.definitivelyDetachedViewers.set(viewerId, now + DESKTOP_ATTACHMENT_GRACE_MS);
+  }
+
   private releaseViewer(viewer: DesktopViewerRegistration): Promise<void> {
     viewer.release ??= new Promise<void>((resolve) => {
       const complete = () => {
         clearTimeout(timeout);
-        this.viewers.delete(viewer.viewerId);
+        if (this.viewers.delete(viewer.viewerId)) this.noteViewerDetached(viewer);
         viewer.acknowledge = undefined;
         resolve();
       };
@@ -179,6 +278,8 @@ export class DesktopSessionManager {
       experimentsService: ExperimentsService;
       workspaceService: WorkspaceService;
       inputCoordinator?: DesktopInputCoordinator;
+      /** Clock for the recent-attachment grace; tests inject a controllable one. */
+      now?: () => number;
     }
   ) {
     this.inputCoordinator = deps.inputCoordinator ?? new DesktopInputCoordinator(deps.config);
@@ -374,23 +475,188 @@ export class DesktopSessionManager {
 
   /** Whether a live desktop session exists for this workspace. */
   has(workspaceId: string): boolean {
-    // Pending startups count as live activity: a user-initiated start that has not resolved
-    // yet exists only in startupPromises, and archive refusal gates must observe it instead of
-    // letting close() cancel it mid-startup. A session whose process exited or crashed is NOT
-    // live activity, though — stale map entries linger until the next ensureStarted()/close()
-    // touches them and must not hold the archive refusal gate open indefinitely.
+    // A session whose process exited or crashed is NOT live — stale map entries linger until
+    // the next ensureStarted()/close() touches them.
     return (
-      (this.sessions.get(workspaceId)?.isAlive() ?? false) ||
+      (this.sessions.get(workspaceId)?.isAlive() ?? false) || this.hasLiveAttachment(workspaceId)
+    );
+  }
+
+  private bridgeConnectionProbe: DesktopBridgeConnectionProbe | undefined;
+
+  /**
+   * DesktopBridgeServer reports its live VNC bridge WebSockets through this probe (it depends
+   * on this manager, not the other way round). The inline Electron pane connects to the bridge
+   * without registering a browser viewer, so without this probe hasAttachedViewers() would
+   * report nobody attached while a user watches or controls the desktop in Electron.
+   */
+  setBridgeConnectionProbe(probe: DesktopBridgeConnectionProbe): void {
+    this.bridgeConnectionProbe = probe;
+  }
+
+  /**
+   * The workspaces a viewer attaches: the requester and the desktop owner it currently resolves
+   * to. The owner is re-resolved rather than read from the registration so a shared-desktop
+   * borrower whose owner changed does not keep the OLD owner attached indefinitely; the captured
+   * owner is only the fallback when the requester can no longer be resolved.
+   */
+  private viewerTargets(viewer: DesktopViewerRegistration): string[] {
+    const ownerWorkspaceId = this.currentOwnerOf(viewer.workspaceId, viewer.ownerWorkspaceId);
+    return ownerWorkspaceId === viewer.workspaceId
+      ? [viewer.workspaceId]
+      : [viewer.workspaceId, ownerWorkspaceId];
+  }
+
+  /**
+   * The desktop owner a requester currently resolves to (viewers and Electron popout windows
+   * alike capture the owner at open time, which goes stale when the binding changes); the
+   * captured owner is the fallback when the requester can no longer be resolved.
+   */
+  private currentOwnerOf(requesterId: string, capturedOwnerId: string): string {
+    try {
+      return this.inputCoordinator.resolveTarget(requesterId).ownerWorkspaceId;
+    } catch {
+      return capturedOwnerId;
+    }
+  }
+
+  /**
+   * A known viewer or VNC bridge just detached from these workspaces: keep them counted as
+   * attached for DESKTOP_ATTACHMENT_GRACE_MS. The client's two transports (oRPC viewer
+   * registration, VNC bridge WebSocket) drop and return independently during reconnects,
+   * re-registration, and inline↔popout handoffs, and no deterministic signal spans that gap;
+   * a bounded grace after a KNOWN attachment is the only way an agent-driven archive can tell
+   * "reconnecting" from "closed". An idle desktop that never had an attachment gets no grace.
+   */
+  noteDetached(
+    requesterWorkspaceId: string,
+    capturedOwnerWorkspaceId: string,
+    viewerId?: string
+  ): void {
+    if (viewerId !== undefined) {
+      const detachedUntil = this.definitivelyDetachedViewers.get(viewerId);
+      if (detachedUntil !== undefined) {
+        if (detachedUntil > this.now()) return;
+        this.definitivelyDetachedViewers.delete(viewerId);
+      }
+    }
+    this.bridgeDetachmentSequence += 1;
+    this.stampDetachment(
+      bridgeSourceKey(viewerId ?? `#${this.bridgeDetachmentSequence}`),
+      requesterWorkspaceId,
+      capturedOwnerWorkspaceId
+    );
+  }
+
+  private stampDetachment(
+    sourceKey: string,
+    requesterWorkspaceId: string,
+    capturedOwnerWorkspaceId: string
+  ): void {
+    assert(requesterWorkspaceId.length > 0, "noteDetached requires the detached requester");
+    assert(capturedOwnerWorkspaceId.length > 0, "noteDetached requires the attachment's owner");
+    this.recentDetachments.set(sourceKey, {
+      requesterWorkspaceId,
+      expiresAt: this.now() + DESKTOP_ATTACHMENT_GRACE_MS,
+      capturedOwnerWorkspaceId,
+    });
+    // Attribute to a teardown in flight only what targets the closing workspace NOW: a bridge
+    // revoked because the borrower was rebound will reconnect to the new owner, so the old
+    // owner's teardown does not own that grace.
+    const ownerWorkspaceId = this.currentOwnerOf(requesterWorkspaceId, capturedOwnerWorkspaceId);
+    this.teardownSources.get(requesterWorkspaceId)?.add(sourceKey);
+    this.teardownSources.get(ownerWorkspaceId)?.add(sourceKey);
+  }
+
+  private noteViewerDetached(viewer: DesktopViewerRegistration): void {
+    this.stampDetachment(viewer.viewerId, viewer.workspaceId, viewer.ownerWorkspaceId);
+  }
+
+  /**
+   * A finished explicit close of `closedWorkspaceId` is definitive: the graces its teardown
+   * owns (see teardownSources) are gone, and its desktop is gone, so a grace some other
+   * requester stamped earlier no longer covers it (that requester's own workspace stays
+   * covered, as does an owner it is rebound to). Graces on other owners stay untouched.
+   */
+  private retractDetachments(closedWorkspaceId: string, sources: Set<string>): void {
+    for (const [sourceKey, grace] of this.recentDetachments) {
+      if (sources.has(sourceKey)) {
+        this.recentDetachments.delete(sourceKey);
+      } else if (
+        this.currentOwnerOf(grace.requesterWorkspaceId, grace.capturedOwnerWorkspaceId) ===
+        closedWorkspaceId
+      ) {
+        grace.excludedOwnerWorkspaceId = closedWorkspaceId;
+      }
+    }
+  }
+
+  private now(): number {
+    return this.deps.now?.() ?? Date.now();
+  }
+
+  /**
+   * Whether an unexpired grace covers `workspaceId`: the detached requester itself, or the owner
+   * that requester CURRENTLY resolves to. Resolving at query time (like viewerTargets) keeps a
+   * borrower rebound mid-reconnect from protecting its old owner while leaving the new one open
+   * to an agent-driven archive; the captured owner is only the fallback for a requester that can
+   * no longer be resolved.
+   */
+  private hasRecentDetachment(workspaceId: string): boolean {
+    const now = this.now();
+    let covered = false;
+    for (const [sourceKey, grace] of this.recentDetachments) {
+      if (grace.expiresAt <= now) {
+        this.recentDetachments.delete(sourceKey);
+        continue;
+      }
+      if (grace.requesterWorkspaceId === workspaceId) covered = true;
+      else if (
+        grace.excludedOwnerWorkspaceId !== workspaceId &&
+        this.currentOwnerOf(grace.requesterWorkspaceId, grace.capturedOwnerWorkspaceId) ===
+          workspaceId
+      ) {
+        covered = true;
+      }
+    }
+    return covered;
+  }
+
+  /**
+   * Whether someone is attached to this workspace's desktop: a startup still resolving, a
+   * registered browser viewer, a live VNC bridge connection (inline Electron pane, inline
+   * browser pane, popouts), an open/pending popout window (including borrowers of a shared
+   * desktop this workspace owns), or a viewer/bridge that detached within
+   * DESKTOP_ATTACHMENT_GRACE_MS (see noteDetached). Agent-driven archive gates consult this
+   * instead of has(): the bare desktop process is disposable infrastructure that lingers after
+   * the agent that started it finished (nothing idles it out), and archive closes it exactly
+   * like the user-driven path does — so an idle process alone must not stall an archive. A
+   * pending startup still counts: a user-initiated start that has not resolved yet exists only
+   * in startupPromises, and the gate must observe it instead of letting close() cancel it
+   * mid-startup.
+   */
+  hasAttachedViewers(workspaceId: string): boolean {
+    return this.hasLiveAttachment(workspaceId) || this.hasRecentDetachment(workspaceId);
+  }
+
+  /** Attachments that exist right now (no grace); also what has() counts as live. */
+  private hasLiveAttachment(workspaceId: string): boolean {
+    return (
       this.startupPromises.has(workspaceId) ||
-      Array.from(this.viewers.values()).some(
-        (viewer) => viewer.workspaceId === workspaceId || viewer.ownerWorkspaceId === workspaceId
+      this.bridgeConnectionProbe?.(workspaceId, (requester, capturedOwner) =>
+        this.currentOwnerOf(requester, capturedOwner)
+      ) === true ||
+      Array.from(this.viewers.values()).some((viewer) =>
+        this.viewerTargets(viewer).includes(workspaceId)
       ) ||
       this.getWindow(workspaceId) !== null ||
       Array.from(this.pendingWindowOpens).some(
         (request) => request.workspaceId === workspaceId || request.ownerWorkspaceId === workspaceId
       ) ||
       Array.from(this.windowOwners).some(
-        ([requesterId, ownerId]) => ownerId === workspaceId && this.getWindow(requesterId) !== null
+        ([requesterId, ownerId]) =>
+          this.currentOwnerOf(requesterId, ownerId) === workspaceId &&
+          this.getWindow(requesterId) !== null
       )
     );
   }
@@ -449,16 +715,38 @@ export class DesktopSessionManager {
         this.pendingWindowOpens.delete(request);
       }
     }
-    const browserViewers = Array.from(this.viewers.values()).filter(
-      (viewer) => viewer.workspaceId === workspaceId || viewer.ownerWorkspaceId === workspaceId
+    // Same current-target classification as hasAttachedViewers(): a borrower whose binding
+    // moved away from this workspace must not be released (and its unrelated desktop yanked)
+    // when this workspace closes.
+    const browserViewers = Array.from(this.viewers.values()).filter((viewer) =>
+      this.viewerTargets(viewer).includes(workspaceId)
     );
     const viewers = new Set([workspaceId]);
     for (const [requesterId, ownerId] of this.windowOwners) {
-      if (requesterId === workspaceId || ownerId === workspaceId) {
+      if (
+        requesterId === workspaceId ||
+        this.currentOwnerOf(requesterId, ownerId) === workspaceId
+      ) {
         viewers.add(requesterId);
         this.windowOwners.delete(requesterId);
       }
     }
+    // The attachments this teardown releases (its viewers, and the bridges revoked through the
+    // close listeners) stamp a recent-detachment grace as they go. That grace exists for
+    // transports that may come back; an explicit close is deterministic, so retract exactly the
+    // graces produced by this teardown's own sources afterwards — a borrower closing must not
+    // leave its owner "attached", while a grace an unrelated viewer stamped meanwhile survives.
+    // The teardown owns the graces this workspace's own earlier attachments had stamped, plus
+    // whatever detaches from it while it runs (its viewers and popouts and — when it is a shared
+    // owner — its borrowers' viewers and bridges; see stampDetachment). A released borrower's
+    // EARLIER graces are not its to retract: a sibling pane of that borrower between
+    // registrations never received this release and still relies on its own grace; the owner leg
+    // of such graces is withdrawn by retractDetachments instead.
+    const teardownSources = new Set<string>();
+    for (const [sourceKey, grace] of this.recentDetachments) {
+      if (grace.requesterWorkspaceId === workspaceId) teardownSources.add(sourceKey);
+    }
+    this.teardownSources.set(workspaceId, teardownSources);
     // Latch before entering the async teardown, but leave established bridges alive long enough
     // for borrower viewers to release held keys/buttons on their owner's still-live desktop.
     const closing = Promise.resolve().then(async () => {
@@ -473,6 +761,9 @@ export class DesktopSessionManager {
         for (const listener of this.closeListeners) listener(workspaceId);
       } finally {
         await this.closeSession(workspaceId);
+        this.teardownSources.delete(workspaceId);
+        // The teardown's detachments (and any its requesters left earlier) are definitive.
+        this.retractDetachments(workspaceId, teardownSources);
       }
     });
     this.closingWorkspaces.set(workspaceId, closing);

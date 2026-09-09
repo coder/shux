@@ -18,6 +18,7 @@ import type {
   AgentPluginInstallPreview,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
+  AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
 import { getErrorMessage } from "@/common/utils/errors";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
@@ -408,6 +409,76 @@ const UninstallConfirm: React.FC<{
   );
 };
 
+/**
+ * In-place re-consent for an update that changes the plugin's capability
+ * surface (new/reworded skill advertisements, MCP servers, hooks, agents,
+ * …). Shows each change with the consented ("before") and staged ("after")
+ * value so the user can judge it, instead of being routed through uninstall
+ * + reinstall. Conditional rendering keeps this testable without portals.
+ */
+const UpdateReviewPanel: React.FC<{
+  review: AgentPluginUpdateReview;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}> = (props) => (
+  <div className="border-border-medium bg-background-secondary mt-2 space-y-2 rounded-md border p-3">
+    <p className="text-foreground text-xs">
+      This update{props.review.version ? ` (v${props.review.version})` : ""} changes what the plugin
+      can do. Review the changes before applying it:
+    </p>
+    <ul className="space-y-2">
+      {props.review.changes.map((change) => (
+        <li key={change.summary} className="text-xs">
+          <span className="text-foreground break-words">{change.summary}</span>
+          {(change.before !== undefined || change.after !== undefined) && (
+            <dl className="mt-1 space-y-1">
+              {change.before !== undefined && (
+                <div className="flex gap-2">
+                  <dt className="text-muted w-10 shrink-0 text-[11px]">Before</dt>
+                  <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
+                    {change.before}
+                  </dd>
+                </div>
+              )}
+              {change.after !== undefined && (
+                <div className="flex gap-2">
+                  <dt className="text-muted w-10 shrink-0 text-[11px]">After</dt>
+                  <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
+                    {change.after}
+                  </dd>
+                </div>
+              )}
+            </dl>
+          )}
+        </li>
+      ))}
+    </ul>
+    {props.review.warnings.length > 0 && (
+      <div className="bg-warning/10 space-y-1 rounded-md px-3 py-2">
+        {props.review.warnings.map((warning) => (
+          <div key={warning} className="text-warning flex items-start gap-2 text-xs">
+            <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span className="break-words">{warning}</span>
+          </div>
+        ))}
+      </div>
+    )}
+    <p className="text-muted text-[11px] break-all">
+      {props.review.fromSha.slice(0, 12)} → {props.review.toSha.slice(0, 12)}
+    </p>
+    <div className="flex gap-2">
+      <Button size="sm" onClick={props.onConfirm} disabled={props.busy}>
+        {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+        {props.busy ? "Updating…" : "Apply update"}
+      </Button>
+      <Button variant="ghost" size="sm" onClick={props.onCancel} disabled={props.busy}>
+        Cancel
+      </Button>
+    </div>
+  </div>
+);
+
 export const PluginsSettingsSection: React.FC = () => {
   const { api } = useAPI();
   const [items, setItems] = useState<AgentPluginListItem[] | null>(null);
@@ -436,6 +507,10 @@ export const PluginsSettingsSection: React.FC = () => {
   );
   /** Name of the plugin with an update/uninstall in flight. */
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
+  /** Pending update whose capability changes await the user's confirmation. */
+  const [updateReview, setUpdateReview] = useState<AgentPluginUpdateReview | null>(
+    initialIntent?.type === "review-update" ? initialIntent.review : null
+  );
   /** Monotonic ids of the latest list/update-check requests; stale responses must not commit state. */
   const listGenerationRef = useRef(0);
   const checkGenerationRef = useRef(0);
@@ -513,6 +588,9 @@ export const PluginsSettingsSection: React.FC = () => {
         case "confirm-uninstall":
           setUninstallTarget(intent.name);
           break;
+        case "review-update":
+          setUpdateReview(intent.review);
+          break;
         case "refresh":
           void refresh();
           void checkForUpdates();
@@ -522,30 +600,69 @@ export const PluginsSettingsSection: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resubscribe on API reconnect only; the listener reads the latest handlers via closure per subscription
   }, [api]);
 
+  /**
+   * Update click: review first. A capability-neutral update applies right
+   * away; one that changes the capability surface opens the inline review,
+   * and only its confirmation applies it (with a consent naming the reviewed
+   * SHAs — see installService.update).
+   */
   const handleUpdate = async (name: string) => {
     if (!api || busyPlugin !== null) return;
     setBusyPlugin(name);
     setError(null);
+    setUpdateReview(null);
     try {
-      const result = await api.agentPlugins.update({ name });
-      if (result.success) {
-        // Mounted composers cache contributed slash-command/skill
-        // descriptors; an update can change them without a remount.
-        publishAgentPluginsMutated();
+      const preview = await api.agentPlugins.previewUpdate({ name });
+      if (!preview.success) {
+        setError(preview.error);
+        return;
       }
-      // Refresh regardless of outcome (the swap may be partially visible),
-      // but re-assert the mutation error AFTER the refresh: refresh's
-      // success path clears the error state, which would silently swallow
-      // the failure the user needs to see.
-      await refresh();
-      await checkForUpdates();
-      if (!result.success) {
-        setError(result.error);
+      if (preview.data.changes.length > 0) {
+        setUpdateReview(preview.data);
+        return;
       }
+      await applyUpdate(name, undefined);
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
       setBusyPlugin(null);
+    }
+  };
+
+  const handleConfirmUpdate = async (review: AgentPluginUpdateReview) => {
+    if (!api || busyPlugin !== null) return;
+    setBusyPlugin(review.name);
+    setError(null);
+    try {
+      await applyUpdate(review.name, { fromSha: review.fromSha, toSha: review.toSha });
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setBusyPlugin(null);
+    }
+  };
+
+  /** Shared tail of both update paths; callers own busy state and error capture. */
+  const applyUpdate = async (
+    name: string,
+    consent: { fromSha: string; toSha: string } | undefined
+  ) => {
+    if (!api) return;
+    const result = await api.agentPlugins.update({ name, consent: consent ?? null });
+    if (result.success) {
+      // Mounted composers cache contributed slash-command/skill
+      // descriptors; an update can change them without a remount.
+      publishAgentPluginsMutated();
+      setUpdateReview(null);
+    }
+    // Refresh regardless of outcome (the swap may be partially visible),
+    // but re-assert the mutation error AFTER the refresh: refresh's
+    // success path clears the error state, which would silently swallow
+    // the failure the user needs to see.
+    await refresh();
+    await checkForUpdates();
+    if (!result.success) {
+      setError(result.error);
     }
   };
 
@@ -764,6 +881,14 @@ export const PluginsSettingsSection: React.FC = () => {
                       unmanaged plugin. The backend uninstall is keyed by
                       managed-registry name, so the managed row is the one
                       identity-correct anchor. */}
+                  {item.managed && updateReview?.name === item.name && (
+                    <UpdateReviewPanel
+                      review={updateReview}
+                      busy={isBusy}
+                      onConfirm={() => void handleConfirmUpdate(updateReview)}
+                      onCancel={() => setUpdateReview(null)}
+                    />
+                  )}
                   {item.managed && uninstallTarget === item.name && (
                     <UninstallConfirm
                       item={item}

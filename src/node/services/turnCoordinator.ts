@@ -772,6 +772,10 @@ export class TurnCoordinator {
     const operation = this.state.turn.operation;
     return operation?.messageId ?? operation?.startupMessageId;
   }
+  /** Whether the current operation has handed its startup to the engine (pending stream start). */
+  get startupRegistered(): boolean {
+    return this.state.turn.operation?.startupMessageId != null;
+  }
   get disposed(): boolean {
     return this.state.lifetime === "disposed";
   }

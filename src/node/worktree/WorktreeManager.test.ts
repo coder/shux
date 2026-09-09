@@ -32,6 +32,7 @@ async function createWorktreeManagerFixture(options?: {
   existingBranchName?: string;
   currentBranchName?: string;
   tempDirPrefix?: string;
+  fetchTimeoutMs?: number;
 }) {
   const rootDir = await fsPromises.realpath(
     await fsPromises.mkdtemp(
@@ -56,10 +57,80 @@ async function createWorktreeManagerFixture(options?: {
   return {
     rootDir,
     projectPath,
-    manager: new WorktreeManager(srcBaseDir),
+    manager: new WorktreeManager(
+      srcBaseDir,
+      options?.fetchTimeoutMs === undefined ? undefined : { fetchTimeoutMs: options.fetchTimeoutMs }
+    ),
     initLogger: createNullInitLogger(),
     cleanup: () => fsPromises.rm(rootDir, { recursive: true, force: true }),
   };
+}
+
+/**
+ * Point origin at an upload-pack shim that never answers and leaves a background child holding
+ * the inherited stdio pipes, like a credential helper blocked on external authentication.
+ */
+async function installStalledOriginFetch(fixture: { rootDir: string; projectPath: string }) {
+  const pidFile = path.join(fixture.rootDir, "stall-pids");
+  const shim = path.join(fixture.rootDir, "stalled-upload-pack.sh");
+  await fsPromises.writeFile(
+    shim,
+    `#!/bin/sh\nsleep 600 &\nprintf '%s\\n%s\\n' "$$" "$!" > "${pidFile}"\nwait\n`,
+    "utf-8"
+  );
+  await fsPromises.chmod(shim, 0o755);
+  execFileSync("git", ["remote", "add", "origin", "."], {
+    cwd: fixture.projectPath,
+    stdio: "ignore",
+  });
+  execFileSync("git", ["config", "remote.origin.uploadpack", shim], {
+    cwd: fixture.projectPath,
+    stdio: "ignore",
+  });
+
+  return {
+    async waitForPids(): Promise<number[]> {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const lines = await fsPromises.readFile(pidFile, "utf-8").then(
+          (content) => content.trim().split("\n"),
+          () => []
+        );
+        if (lines.length === 2) return lines.map(Number);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      throw new Error("stalled upload-pack shim did not start");
+    },
+  };
+}
+
+async function isProcessGone(pid: number): Promise<boolean> {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return true;
+  }
+  // A killed orphan that PID 1 has not reaped yet still answers signal 0.
+  return fsPromises.readFile(`/proc/${pid}/stat`, "utf-8").then(
+    (stat) => stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z"),
+    () => false
+  );
+}
+
+async function waitForProcessesToExit(pids: number[]): Promise<boolean> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const gone = await Promise.all(pids.map(isProcessGone));
+    if (gone.every(Boolean)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
+function gitRevParseHead(cwd: string): string {
+  return execFileSync("git", ["rev-parse", "HEAD"], { cwd, stdio: ["ignore", "pipe", "ignore"] })
+    .toString()
+    .trim();
 }
 
 describe("WorktreeManager constructor", () => {
@@ -235,6 +306,116 @@ describe("WorktreeManager.createWorkspace", () => {
       } else {
         process.env.XUM_DISABLE_PROJECT_AUTOMATION = previous;
       }
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("bounds a stalled origin fetch, kills its process tree, and falls back to the local trunk", async () => {
+    const fixture = await createWorktreeManagerFixture({ fetchTimeoutMs: 1_000 });
+
+    try {
+      const stall = await installStalledOriginFetch(fixture);
+      const stderrLines: string[] = [];
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-stalled-fetch",
+        trunkBranch: "main",
+        trusted: true,
+        initLogger: {
+          ...fixture.initLogger,
+          logStderr: (line) => stderrLines.push(line),
+        },
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) {
+        throw new Error("Expected createWorkspace to fall back to the local trunk");
+      }
+      expect(stderrLines.some((line) => line.includes("did not finish within"))).toBe(true);
+      expect(gitRevParseHead(result.workspacePath)).toBe(gitRevParseHead(fixture.projectPath));
+
+      const pids = await stall.waitForPids();
+      expect(await waitForProcessesToExit(pids)).toBe(true);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("keeps caller cancellation a cancellation while the origin fetch stalls", async () => {
+    const fixture = await createWorktreeManagerFixture({ fetchTimeoutMs: 30_000 });
+
+    try {
+      const stall = await installStalledOriginFetch(fixture);
+      const controller = new AbortController();
+      const stderrLines: string[] = [];
+      const workspacePath = fixture.manager.getWorkspacePath(
+        fixture.projectPath,
+        "feature-cancelled-fetch"
+      );
+
+      const pending = fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-cancelled-fetch",
+        trunkBranch: "main",
+        trusted: true,
+        abortSignal: controller.signal,
+        initLogger: {
+          ...fixture.initLogger,
+          logStderr: (line) => stderrLines.push(line),
+        },
+      });
+      const pids = await stall.waitForPids();
+      controller.abort();
+      const result = await pending;
+
+      expect(result.success).toBe(false);
+      expect(stderrLines).toEqual([]);
+      const workspaceExists = await fsPromises.access(workspacePath).then(
+        () => true,
+        () => false
+      );
+      expect(workspaceExists).toBe(false);
+      expect(await waitForProcessesToExit(pids)).toBe(true);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("bases new branches on the freshly fetched origin trunk", async () => {
+    const fixture = await createWorktreeManagerFixture();
+
+    try {
+      const remotePath = path.join(fixture.rootDir, "remote");
+      execFileSync("git", ["clone", "--quiet", fixture.projectPath, remotePath], {
+        stdio: "ignore",
+      });
+      execSync(
+        'git config user.email "test@example.com" && git config user.name "test" && ' +
+          'git config commit.gpgsign false && git commit --allow-empty -m "remote-only"',
+        { cwd: remotePath, stdio: "ignore" }
+      );
+      execFileSync("git", ["remote", "add", "origin", remotePath], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      const remoteHead = gitRevParseHead(remotePath);
+      expect(remoteHead).not.toBe(gitRevParseHead(fixture.projectPath));
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-fresh-origin",
+        trunkBranch: "main",
+        trusted: true,
+        initLogger: fixture.initLogger,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) {
+        throw new Error("Expected createWorkspace to return a workspace path");
+      }
+      expect(gitRevParseHead(result.workspacePath)).toBe(remoteHead);
+    } finally {
       await fixture.cleanup();
     }
   }, 20_000);

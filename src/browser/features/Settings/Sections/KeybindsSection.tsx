@@ -103,6 +103,8 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   REVIEW_FOCUS_NOTES: "Focus notes sidebar (immersive)",
   REVIEW_COPY_FILE: "Copy file contents (immersive)",
   TOGGLE_PLAN_ANNOTATE: "Toggle plan annotate mode",
+  // Transcript-menu-only actions show their shortcuts in that menu.
+  COPY_MARKDOWN: "Copy Markdown (transcript context menu)",
   // Image-viewer-scoped keybinds (lightbox / image context menu); intentionally
   // omitted from KEYBIND_GROUPS because they only apply while an image surface
   // is focused.

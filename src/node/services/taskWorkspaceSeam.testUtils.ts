@@ -35,8 +35,10 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
       queuedMessages: false,
       backgroundBashProcesses: false,
       terminalSessions: false,
-      desktopSession: false,
+      desktopViewers: false,
     }),
+    getStoppablePreparingWorkspaceTurn: () => undefined,
+    waitForIdle: () => Promise.resolve(),
     hasRunningBackgroundBashProcesses: () => Promise.resolve(false),
     hasUntrackableExternalAppOpen: () => Promise.resolve(false),
     // Keep-style behavior makes archive eligibility independent of untracked files.
@@ -67,6 +69,8 @@ export function makeAgentTaskIntegrationFake(
     withTaskTreeLifecycleLock: <T>(_workspaceId: string, operation: () => Promise<T>): Promise<T> =>
       operation(),
     hasDescendantAgentTasks: () => false,
+    listWorkspaceRemovalDescendants: () => [],
+    removeAcknowledgedDescendantsWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     hasActiveDescendantAgentTasksForWorkspace: () => false,
     hasActiveTopLevelWorkflowRunsForWorkspace: () => Promise.resolve(false),
     getAgentTaskStatus: () => undefined,
