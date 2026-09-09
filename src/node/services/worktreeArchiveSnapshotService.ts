@@ -70,6 +70,15 @@ function stagedAttachmentChildInContainer(untrackedPath: string): string | null 
   return STAGED_ATTACHMENT_CONTAINERS.get(segments.at(-2) ?? "") ?? null;
 }
 
+/** Persisted repoRelativeDir values must name a staged attachment directory, nothing else. */
+function isStagedAttachmentRelativeDir(repoRelativeDir: string): boolean {
+  const normalized = repoRelativeDir.replace(/\\/gu, "/").replace(/^\.\//u, "");
+  if (normalized.split("/").some((segment) => segment === "..")) {
+    return false;
+  }
+  return STAGED_ATTACHMENT_DIRS.some((dir) => normalized === dir || normalized.endsWith(`/${dir}`));
+}
+
 interface CreatedRestoreWorkspace {
   projectPath: string;
   projectName: string;
@@ -1056,6 +1065,14 @@ export class WorktreeArchiveSnapshotService {
         );
       }
       const repoRelativeDir = path.relative(args.projectRepo.repoCwd, sourceDir);
+      // Staging writes regular files only; a link planted inside would be archived as a link into
+      // the checkout that is about to be deleted, so the payload could never be restored.
+      const symlink = await this.findSymlink(realSourceDir);
+      if (symlink != null) {
+        throw new Error(
+          `Staged attachments at ${relativeDir} contain a symlink (${path.relative(realSourceDir, symlink)}); remove it before archiving.`
+        );
+      }
 
       const artifactRelativeDir = path.join(args.projectRepo.storageKey, repoRelativeDir);
       const tempArtifactDir = path.join(args.tempAttachmentsDir, artifactRelativeDir);
@@ -1082,9 +1099,14 @@ export class WorktreeArchiveSnapshotService {
     tempAttachmentsDir: string;
     projects: WorktreeArchiveSnapshotProject[];
   }): Promise<void> {
+    await fsPromises.mkdir(path.join(args.sessionDir, ATTACHMENTS_DIR_NAME), { recursive: true });
     for (const project of args.projects) {
       for (const entry of project.stagedAttachmentDirs ?? []) {
-        const artifactDir = this.resolveSessionRelativePath(args.sessionDir, entry.artifactPath);
+        const artifactDir = await this.resolveAttachmentArtifactDir(
+          args.sessionDir,
+          entry.artifactPath
+        );
+        assert(artifactDir != null, "commitStagedAttachmentArtifacts: artifact path escaped");
         const tempArtifactDir = path.join(
           args.tempAttachmentsDir,
           path.relative(ATTACHMENTS_DIR_NAME, entry.artifactPath)
@@ -1110,8 +1132,14 @@ export class WorktreeArchiveSnapshotService {
   }): Promise<void> {
     const sessionDir = path.join(this.config.sessionsDir, args.workspaceId);
     for (const entry of args.projectSnapshot.stagedAttachmentDirs ?? []) {
-      const artifactDir = this.resolveSessionRelativePath(sessionDir, entry.artifactPath);
-      if (!(await this.isExistingDirectory(artifactDir))) {
+      // Both fields come from user-editable config: only a staged attachment directory may be
+      // written into the checkout, and only the attachment artifact subtree may be read.
+      assert(
+        isStagedAttachmentRelativeDir(entry.repoRelativeDir),
+        `restoreStagedAttachments: ${entry.repoRelativeDir} is not a staged attachment directory`
+      );
+      const artifactDir = await this.resolveAttachmentArtifactDir(sessionDir, entry.artifactPath);
+      if (artifactDir == null || !(await this.isExistingDirectory(artifactDir))) {
         if (args.tolerateMissingArtifacts) {
           continue;
         }
@@ -1184,6 +1212,37 @@ export class WorktreeArchiveSnapshotService {
     return realTarget !== realRoot && isPathInsideDir(realRoot, realTarget) ? realTarget : null;
   }
 
+  /**
+   * Resolves a persisted artifactPath, or null unless it lands (through symlinks) strictly inside
+   * the attachment artifact subtree; anything else in the session dir is never read or deleted.
+   */
+  private async resolveAttachmentArtifactDir(
+    sessionDir: string,
+    artifactPath: string
+  ): Promise<string | null> {
+    const attachmentsRoot = path.join(sessionDir, ATTACHMENTS_DIR_NAME);
+    if (!(await this.isExistingDirectory(attachmentsRoot))) {
+      return null;
+    }
+    return this.resolveContainedRealPath(attachmentsRoot, path.resolve(sessionDir, artifactPath));
+  }
+
+  private async findSymlink(root: string): Promise<string | null> {
+    for (const entry of await fsPromises.readdir(root, { withFileTypes: true })) {
+      const entryPath = path.join(root, entry.name);
+      if (entry.isSymbolicLink()) {
+        return entryPath;
+      }
+      if (entry.isDirectory()) {
+        const nested = await this.findSymlink(entryPath);
+        if (nested != null) {
+          return nested;
+        }
+      }
+    }
+    return null;
+  }
+
   /** Removes directories under root that hold nothing but empty directories, root included. */
   private async pruneEmptyDirs(root: string): Promise<boolean> {
     let entries: Dirent[];
@@ -1235,10 +1294,10 @@ export class WorktreeArchiveSnapshotService {
     await fsPromises.rm(stateDir, { recursive: true, force: true });
     for (const project of snapshot.projects) {
       for (const entry of project.stagedAttachmentDirs ?? []) {
-        await fsPromises.rm(this.resolveSessionRelativePath(sessionDir, entry.artifactPath), {
-          recursive: true,
-          force: true,
-        });
+        const artifactDir = await this.resolveAttachmentArtifactDir(sessionDir, entry.artifactPath);
+        if (artifactDir != null) {
+          await fsPromises.rm(artifactDir, { recursive: true, force: true });
+        }
       }
     }
     await this.pruneEmptyDirs(path.join(sessionDir, ATTACHMENTS_DIR_NAME));

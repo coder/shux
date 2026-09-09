@@ -504,6 +504,127 @@ describe("WorktreeArchiveSnapshotService", () => {
     ).toEqual(bytes);
   });
 
+  test("fails capture when the staged attachment tree contains a symlink", async () => {
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
+    if (!staged.success) {
+      return;
+    }
+    // A link into the checkout would be archived as a link to a directory that is about to go.
+    await fs.symlink(
+      path.join(fixture.workspacePath, "tracked.txt"),
+      path.join(fixture.workspacePath, path.dirname(staged.data.stagedPath), "linked.txt")
+    );
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(false);
+    if (captureResult.success) {
+      return;
+    }
+    expect(captureResult.error).toContain("contain a symlink");
+    expect(await pathExists(fixture.workspacePath)).toBe(true);
+  });
+
+  test("never restores into or deletes anything but staged attachment paths from tampered metadata", async () => {
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    if (!captureResult.success) {
+      return;
+    }
+    const sessionDir = path.join(fixture.config.sessionsDir, fixture.workspaceId);
+    await fs.writeFile(path.join(sessionDir, "chat.jsonl"), "history\n", "utf-8");
+    const tamper = (repoRelativeDir: string, artifactPath: string) =>
+      fixture.config.editConfig((cfg) => {
+        const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+        if (!workspace) {
+          throw new Error("Missing workspace entry");
+        }
+        workspace.worktreeArchiveSnapshot = {
+          ...captureResult.data,
+          projects: captureResult.data.projects.map((project) => ({
+            ...project,
+            stagedAttachmentDirs: [{ repoRelativeDir, artifactPath }],
+          })),
+        };
+        return cfg;
+      });
+
+    // Existing checkout matches git state; an artifactPath aimed at chat history must be neither
+    // copied nor removed when the snapshot is cleared.
+    await tamper(path.join(".xum", "user-attachments"), "chat.jsonl");
+    const reconcile = await fixture.service.restoreSnapshotAfterUnarchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(reconcile).toEqual({ success: true, data: "skipped" });
+    expect(await fs.readFile(path.join(sessionDir, "chat.jsonl"), "utf-8")).toBe("history\n");
+
+    // A repoRelativeDir naming a tracked directory must not receive the payload on a fresh restore.
+    await fs.mkdir(path.join(fixture.workspacePath, "src"));
+    await fs.writeFile(path.join(fixture.workspacePath, "src", "notes.txt"), "code\n", "utf-8");
+    runGit(fixture.workspacePath, ["add", "src"]);
+    runGit(fixture.workspacePath, ["commit", "-m", "src"]);
+    const recapture = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(recapture.success).toBe(true);
+    if (!recapture.success) {
+      return;
+    }
+    const artifactPath = recapture.data.projects[0]?.stagedAttachmentDirs?.[0]?.artifactPath;
+    expect(artifactPath).toBeDefined();
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+      if (!workspace) {
+        throw new Error("Missing workspace entry");
+      }
+      workspace.worktreeArchiveSnapshot = {
+        ...recapture.data,
+        projects: recapture.data.projects.map((project) => ({
+          ...project,
+          stagedAttachmentDirs: [{ repoRelativeDir: "src", artifactPath: artifactPath ?? "" }],
+        })),
+      };
+      return cfg;
+    });
+    runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
+    const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(restoreResult.success).toBe(false);
+    if (restoreResult.success) {
+      return;
+    }
+    expect(restoreResult.error).toContain("is not a staged attachment directory");
+    expect(await pathExists(fixture.workspacePath)).toBe(false);
+  });
+
   test("fails capture when the staging directory resolves outside the checkout", async () => {
     const outsideDir = path.join(fixture.muxRoot, "outside-attachments");
     await fs.mkdir(path.join(outsideDir, "upload"), { recursive: true });
@@ -659,7 +780,7 @@ describe("WorktreeArchiveSnapshotService", () => {
           ...project,
           stagedAttachmentDirs: project.stagedAttachmentDirs?.map((entry) => ({
             ...entry,
-            repoRelativeDir: path.join("link", "user-attachments"),
+            repoRelativeDir: path.join("link", ".xum", "user-attachments"),
           })),
         })),
       };
