@@ -8,12 +8,15 @@ import writeFileAtomic from "write-file-atomic";
 
 import {
   AgentPluginInstallEntrySchema,
+  AgentPluginImportedComponentsSchema,
+  type AgentPluginImportedComponents,
   type AgentPluginGitSource,
   type AgentPluginInstallEntry,
 } from "@/common/config/schemas/agentPluginInstalls";
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
 import type {
   AgentPluginInstallPreview,
+  AgentPluginComponents,
   AgentPluginListItem,
   AgentPluginManifestSummary,
   AgentPluginPreviewHook,
@@ -65,6 +68,7 @@ import {
   UNINSTALL_JOURNAL_PREFIX,
   UPDATE_JOURNAL_PREFIX,
 } from "./journals";
+import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
 import type { AgentPluginManifest } from "./manifest";
 import {
   buildPluginServerKey,
@@ -107,9 +111,6 @@ import {
  * - Failure paths must leave no partial state: staging dirs are cleaned up,
  *   and promote + registry-write failures roll back.
  */
-
-/** Registry file name under the mux home dir. */
-const REGISTRY_FILE_NAME = "plugins.json";
 
 /*
  * Journal semantics (prefixes and helpers live in ./journals so discovery can
@@ -467,7 +468,7 @@ export class AgentPluginInstallService {
     assert(path.isAbsolute(config.rootDir), "AgentPluginInstallService: rootDir must be absolute");
     this.containerDir = path.join(config.rootDir, "plugins");
     this.stagingRoot = path.join(config.rootDir, STAGING_DIR_NAME);
-    this.registryFile = path.join(config.rootDir, REGISTRY_FILE_NAME);
+    this.registryFile = path.join(config.rootDir, PLUGIN_REGISTRY_FILE_NAME);
     // Not gated on isEnabled(): journals only exist if the feature staged
     // something, and cleaning up our own crash leftovers is correct even if
     // the experiment was disabled afterwards (a missing staging root makes
@@ -587,77 +588,14 @@ export class AgentPluginInstallService {
    * install rewrite it with a single entry, permanently orphaning every
    * previously managed install.
    */
-  private async readRegistryDocument(mode: "lenient" | "strict"): Promise<{
-    envelope: Record<string, unknown>;
-    rawEntries: unknown[];
-  }> {
-    const corrupted = (detail: string): never => {
-      throw new Error(
-        `The plugin registry (${shortenHome(this.registryFile)}) is corrupted: ${detail}. Repair or remove the file, then retry.`
-      );
-    };
-
-    let raw: string;
-    try {
-      raw = await fsPromises.readFile(this.registryFile, "utf8");
-    } catch (error) {
-      // Only a MISSING file is an empty registry. Any other read failure
-      // (e.g. an unreadable mode-000 file in a writable ~/.mux) must block
-      // mutations: the atomic write replaces the file wholesale, so treating
-      // "unreadable" as "empty" would erase every existing entry.
-      if (hasErrorCode(error, "ENOENT")) {
-        return { envelope: {}, rawEntries: [] };
-      }
-      if (mode === "strict") {
-        corrupted(`it cannot be read (${getErrorMessage(error)})`);
-      }
-      log.warn("Ignoring unreadable plugin registry file", {
-        file: this.registryFile,
-        error: getErrorMessage(error),
-      });
-      return { envelope: {}, rawEntries: [] };
-    }
-
-    let parsedJson: unknown;
-    try {
-      parsedJson = JSON.parse(raw);
-    } catch (error) {
-      if (mode === "strict") {
-        corrupted(`it cannot be parsed (${getErrorMessage(error)})`);
-      }
-      log.warn("Ignoring unparseable plugin registry file", {
-        file: this.registryFile,
-        error: getErrorMessage(error),
-      });
-      return { envelope: {}, rawEntries: [] };
-    }
-
-    if (
-      typeof parsedJson !== "object" ||
-      parsedJson === null ||
-      Array.isArray(parsedJson) ||
-      !Array.isArray((parsedJson as { plugins?: unknown }).plugins)
-    ) {
-      if (mode === "strict") {
-        corrupted("expected an object with a 'plugins' array");
-      }
-      log.warn("Ignoring structurally invalid plugin registry file", {
-        file: this.registryFile,
-      });
-      return { envelope: {}, rawEntries: [] };
-    }
-
-    return {
-      envelope: parsedJson as Record<string, unknown>,
-      rawEntries: (parsedJson as { plugins: unknown[] }).plugins,
-    };
+  private readRegistryDocument(mode: "lenient" | "strict") {
+    return readPluginRegistryDocument(this.registryFile, mode);
   }
 
   /**
    * Lenient-on-read: entries this build does not recognize degrade to
-   * "unmanaged dirs" rather than errors (discovery stays the source of truth
-   * for what loads; the registry only annotates) — but they stay in the raw
-   * file. Name validation in the schema doubles as a filesystem-safety gate:
+   * "unmanaged dirs" rather than errors in list views, but stay in the raw
+   * file. Discovery independently fails closed on unreadable component imports. Name validation in the schema doubles as a filesystem-safety gate:
    * a traversal name like `..` must never reach targetPathFor.
    */
   private parseRegistryEntries(
@@ -1828,6 +1766,14 @@ export class AgentPluginInstallService {
     return this.captureResult(() => this.install(args));
   }
 
+  getComponentsResult(args: { name: string }) {
+    return this.captureResult(() => this.getComponents(args));
+  }
+
+  addComponentsResult(args: Parameters<AgentPluginInstallService["addComponents"]>[0]) {
+    return this.captureResult(() => this.addComponents(args));
+  }
+
   listResult() {
     return this.captureResult(() => this.list());
   }
@@ -1945,6 +1891,7 @@ export class AgentPluginInstallService {
   async install(args: {
     source: AgentPluginGitSource;
     expectedSha: string;
+    importedComponents?: AgentPluginImportedComponents;
   }): Promise<AgentPluginInstallEntry> {
     this.assertEnabled();
     assert(isFullCommitSha(args.expectedSha), "install: expectedSha must be a full commit SHA");
@@ -1962,6 +1909,13 @@ export class AgentPluginInstallService {
       try {
         const { plugin } = await this.validateStagedClone(stagedDir);
         const name = plugin.name;
+        const importedComponents =
+          args.importedComponents === undefined
+            ? undefined
+            : this.validateComponentImports(
+                args.importedComponents,
+                await this.collectComponents(plugin)
+              );
         await this.assertNoCollision(name);
         await this.assertNoPendingOverridePrune(name);
         await this.assertNoResidualInstanceState(name);
@@ -2011,6 +1965,7 @@ export class AgentPluginInstallService {
           source: args.source,
           lockedSha: args.expectedSha,
           installedAt: new Date().toISOString(),
+          ...(importedComponents !== undefined ? { importedComponents } : {}),
           manifest: {
             ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
             ...(plugin.manifest.description !== undefined
@@ -2682,6 +2637,114 @@ export class AgentPluginInstallService {
     return restored;
   }
 
+  /** Full inventory deliberately ignores saved imports: package update consent stays unchanged. */
+  private async collectComponents(plugin: AgentPluginInfo) {
+    const warnings: string[] = [];
+    const skills = await this.collectSkills(plugin, warnings);
+    const mcpServers = await this.collectMcpServers(
+      { ...plugin, importedComponents: undefined },
+      path.join(plugin.containerPath, plugin.dirName),
+      computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName)),
+      warnings
+    );
+    return {
+      skills: skills.map(({ name, description }) => ({
+        name,
+        ...(description !== undefined ? { description } : {}),
+      })),
+      mcpServers,
+    };
+  }
+
+  private validateComponentImports(
+    input: AgentPluginImportedComponents,
+    inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">
+  ): AgentPluginImportedComponents {
+    const selection = AgentPluginImportedComponentsSchema.parse(input);
+    for (const name of selection.skills) {
+      if (!inventory.skills.some((skill) => skill.name === name))
+        throw new Error(`Unknown plugin skill '${name}'. Refresh the component inventory.`);
+    }
+    for (const name of selection.mcpServers) {
+      if (!inventory.mcpServers.some((server) => server.serverName === name))
+        throw new Error(`Unknown plugin MCP server '${name}'. Refresh the component inventory.`);
+    }
+    return {
+      skills: [...new Set(selection.skills)].sort(),
+      mcpServers: [...new Set(selection.mcpServers)].sort(),
+    };
+  }
+
+  private async readInstalledComponents(
+    entry: AgentPluginInstallEntry
+  ): Promise<AgentPluginComponents> {
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: this.targetPathFor(entry.name),
+      scope: "global",
+    });
+    if (plugin === null || plugin.name !== entry.name)
+      throw new Error(`Installed plugin '${entry.name}' is missing or invalid.`);
+    return {
+      lockedSha: entry.lockedSha,
+      ...(await this.collectComponents(plugin)),
+      ...(entry.importedComponents !== undefined
+        ? { importedComponents: entry.importedComponents }
+        : {}),
+    };
+  }
+
+  async getComponents(args: { name: string }): Promise<AgentPluginComponents> {
+    this.assertEnabled();
+    return this.runExclusive(async () => {
+      const entry = (await this.readRegistry("strict")).find((entry) => entry.name === args.name);
+      if (entry === undefined) throw new Error(`No managed plugin named '${args.name}'.`);
+      return this.readInstalledComponents(entry);
+    });
+  }
+
+  async addComponents(
+    args: AgentPluginImportedComponents & { name: string; expectedLockedSha: string }
+  ): Promise<AgentPluginInstallEntry> {
+    this.assertEnabled();
+    return this.runExclusive(async () => {
+      const { envelope, rawEntries } = await this.readRegistryDocument("strict");
+      const entry = this.parseRegistryEntries(rawEntries, "strict").find(
+        (entry) => entry.name === args.name
+      );
+      if (entry === undefined) throw new Error(`No readable managed plugin named '${args.name}'.`);
+      if (entry.lockedSha !== args.expectedLockedSha)
+        throw new Error("Plugin changed since component review. Refresh the component inventory.");
+      const added = this.validateComponentImports(args, await this.readInstalledComponents(entry));
+      // Legacy installs already import everything; do not silently convert their update behavior.
+      if (entry.importedComponents === undefined) return entry;
+      const importedComponents = {
+        skills: [...new Set([...entry.importedComponents.skills, ...added.skills])].sort(),
+        mcpServers: [
+          ...new Set([...entry.importedComponents.mcpServers, ...added.mcpServers]),
+        ].sort(),
+      };
+      if (JSON.stringify(importedComponents) === JSON.stringify(entry.importedComponents))
+        return entry;
+      await this.writeRegistry(
+        envelope,
+        rawEntries.map((raw) => {
+          if (this.rawEntryName(raw) !== entry.name) return raw;
+          const record = raw as Record<string, unknown>;
+          return {
+            ...record,
+            importedComponents: {
+              ...(record.importedComponents as Record<string, unknown>),
+              ...importedComponents,
+            },
+          };
+        })
+      );
+      // Fresh discovery reads publish these additive imports. Do NOT bump the tree mutation
+      // epoch: it recycles every plugin server. An overlapping scan sees only a safe older subset.
+      return { ...entry, importedComponents };
+    });
+  }
+
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
   async list(): Promise<AgentPluginListItem[]> {
     this.assertEnabled();
@@ -2722,20 +2785,10 @@ export class AgentPluginInstallService {
         managedByName.delete(plugin.dirName);
       }
 
-      const warnings: string[] = [];
-      const skillCount = (await this.collectSkills(plugin, warnings)).length;
-      let mcpServerCount = 0;
-      if (plugin.mcpConfigPath !== undefined) {
-        try {
-          const { servers } = await loadPluginMcpServers(plugin, {
-            xumHome: this.config.rootDir,
-            instanceId: computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName)),
-          });
-          mcpServerCount = Object.keys(servers).length;
-        } catch (error) {
-          log.warn(`Agent plugin ${plugin.rootPath}: failed to count MCP servers`, { error });
-        }
-      }
+      const inventory = await this.collectComponents(plugin);
+      const skillCount = inventory.skills.length;
+      const mcpServerCount = inventory.mcpServers.length;
+      const selection = plugin.importedComponents;
 
       // Managed rows keep their REGISTRY identity: update/uninstall look
       // entries up by this name, so a locally edited/corrupted manifest name
@@ -2763,6 +2816,15 @@ export class AgentPluginInstallService {
           : {}),
         skillCount,
         mcpServerCount,
+        ...(entry?.importedComponents !== undefined
+          ? { importedComponents: entry.importedComponents }
+          : {}),
+        importedSkillCount: inventory.skills.filter(
+          (skill) => selection === undefined || selection.skills.includes(skill.name)
+        ).length,
+        importedMcpServerCount: inventory.mcpServers.filter(
+          (server) => selection === undefined || selection.mcpServers.includes(server.serverName)
+        ).length,
       });
     }
 
@@ -2783,6 +2845,11 @@ export class AgentPluginInstallService {
         ...(entry.updatedAt !== undefined ? { updatedAt: entry.updatedAt } : {}),
         skillCount: 0,
         mcpServerCount: 0,
+        importedSkillCount: 0,
+        importedMcpServerCount: 0,
+        ...(entry.importedComponents !== undefined
+          ? { importedComponents: entry.importedComponents }
+          : {}),
       });
     }
 

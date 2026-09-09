@@ -204,6 +204,7 @@ interface AgentSkillScanCandidate {
   pluginRoot?: string;
   /** Agent Plugins only: contributing plugin name for descriptor attribution. */
   pluginName?: string;
+  importedSkills?: string[];
 }
 
 /**
@@ -264,6 +265,7 @@ async function buildPluginScanCandidates(args: {
       runtime: localRuntime,
       pluginRoot: plugin.rootPath,
       pluginName: plugin.name,
+      importedSkills: plugin.importedComponents?.skills,
     });
   }
 
@@ -627,6 +629,7 @@ export async function discoverAgentSkills(
       }
 
       const directoryName = nameParsed.data;
+      if (scan.importedSkills != null && !scan.importedSkills.includes(directoryName)) continue;
 
       if (dedupeByName && byName.has(directoryName)) {
         continue;
@@ -771,6 +774,7 @@ export async function discoverAgentSkillsDiagnostics(
       }
 
       const directoryName = nameParsed.data;
+      if (scan.importedSkills != null && !scan.importedSkills.includes(directoryName)) continue;
 
       if (byName.has(directoryName)) {
         continue;
@@ -983,6 +987,7 @@ export async function readAgentSkill(
   const candidates = await buildScanCandidates(runtime, workspacePath, roots, containment);
 
   for (const candidate of candidates) {
+    if (candidate.importedSkills != null && !candidate.importedSkills.includes(name)) continue;
     let resolvedRoot: string;
     try {
       resolvedRoot = await candidate.runtime.resolvePath(candidate.root);

@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import {
   AgentPluginGitSourceSchema,
+  AgentPluginImportedComponentsSchema,
   AgentPluginInstallEntrySchema,
 } from "@/common/config/schemas/agentPluginInstalls";
 
@@ -24,6 +25,15 @@ export const AgentPluginPreviewMcpServerSchema = z.object({
   /** Human-readable command line (stdio) or URL (remote) shown in the consent preview. */
   summary: z.string(),
 });
+
+/** Offline full inventory of the locked installed tree, separate from its saved imports. */
+export const AgentPluginComponentsSchema = z.object({
+  lockedSha: z.string(),
+  skills: z.array(AgentPluginPreviewSkillSchema),
+  mcpServers: z.array(AgentPluginPreviewMcpServerSchema),
+  importedComponents: AgentPluginImportedComponentsSchema.optional(),
+});
+export type AgentPluginComponents = z.infer<typeof AgentPluginComponentsSchema>;
 
 /**
  * Executable hooks.js disclosure: hooks load automatically after install and
@@ -92,6 +102,10 @@ export const AgentPluginListItemSchema = z.object({
   lockedSha: z.string().optional(),
   installedAt: z.string().optional(),
   updatedAt: z.string().optional(),
+  importedComponents: AgentPluginImportedComponentsSchema.optional(),
+  importedSkillCount: z.number().int().nonnegative().optional(),
+  importedMcpServerCount: z.number().int().nonnegative().optional(),
+  /** Available counts include components not yet imported. */
   skillCount: z.number().int().nonnegative(),
   mcpServerCount: z.number().int().nonnegative(),
 });

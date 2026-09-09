@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -1373,6 +1374,119 @@ describe("agentSkillsService agent plugins", () => {
     }
     return pluginDir;
   }
+
+  test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {
+    using tmp = new DisposableTempDir("plugin-selected-skills");
+    const container = path.join(tmp.path, "plugins");
+    await writePlugin(container, "a-selected", [
+      { name: "allowed", description: "selected" },
+      { name: "blocked", description: "not selected" },
+      { name: "shared", description: "not selected shadow" },
+    ]);
+    await writePlugin(container, "b-fallback", [{ name: "shared", description: "fallback" }]);
+    await fs.writeFile(
+      path.join(tmp.path, "plugins.json"),
+      JSON.stringify({
+        plugins: [
+          { name: "a-selected", importedComponents: { skills: ["allowed"], mcpServers: [] } },
+        ],
+      })
+    );
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: "",
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+    const skills = await discoverAgentSkills(runtime, tmp.path, { roots });
+    expect(skills.find((s) => s.name === "allowed")?.description).toBe("selected");
+    expect(skills.find((s) => s.name === "blocked")).toBeUndefined();
+    expect(skills.find((s) => s.name === "shared")?.description).toBe("fallback");
+    const diagnostics = await discoverAgentSkillsDiagnostics(runtime, tmp.path, { roots });
+    expect(diagnostics.skills.find((s) => s.name === "blocked")).toBeUndefined();
+    expect(diagnostics.skills.find((s) => s.name === "shared")?.description).toBe("fallback");
+    await expect(
+      readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("blocked"), { roots })
+    ).rejects.toThrow("not found");
+    expect(
+      (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("shared"), { roots })).package
+        .frontmatter.description
+    ).toBe("fallback");
+    expect(
+      (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("allowed"), { roots })).package
+        .frontmatter.description
+    ).toBe("selected");
+  });
+
+  test.each([
+    { skills: ["guarded"] },
+    { mcpServers: [] },
+    { skills: "guarded", mcpServers: [] },
+    { skills: ["guarded"], mcpServers: null },
+    null,
+  ])(
+    "malformed saved selection fails closed rather than becoming legacy import-all: %j",
+    async (selection) => {
+      using tmp = new DisposableTempDir("plugin-invalid-selection");
+      const container = path.join(tmp.path, "plugins");
+      await writePlugin(container, "managed", [{ name: "guarded", description: "not imported" }]);
+      await fs.writeFile(
+        path.join(tmp.path, "plugins.json"),
+        JSON.stringify({ plugins: [{ name: "managed", importedComponents: selection }] })
+      );
+      const runtime = new LocalRuntime(tmp.path);
+      const roots = {
+        projectRoot: "",
+        globalRoot: "",
+        universalRoot: "",
+        globalPluginRoots: [container],
+      };
+      expect(
+        (await discoverAgentSkills(runtime, tmp.path, { roots })).some((s) => s.name === "guarded")
+      ).toBe(false);
+      await expect(
+        readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("guarded"), { roots })
+      ).rejects.toThrow("not found");
+    }
+  );
+
+  test("corrupt registry suppresses global component imports, recovers after repair, and never gates project plugins", async () => {
+    using tmp = new DisposableTempDir("plugin-corrupt-imports");
+    const container = path.join(tmp.path, "plugins");
+    await writePlugin(container, "managed", [{ name: "guarded", description: "valid skill" }]);
+    const registryFile = path.join(tmp.path, "plugins.json");
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: "",
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+    for (const corrupt of ["{", "{}", '{"plugins":null}', '{"plugins":[null]}']) {
+      await fs.writeFile(registryFile, corrupt);
+      expect(
+        (await discoverAgentSkills(runtime, tmp.path, { roots })).some((s) => s.name === "guarded")
+      ).toBe(false);
+      await expect(
+        readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("guarded"), { roots })
+      ).rejects.toThrow("not found");
+      const projectRoots = { ...roots, globalPluginRoots: [], projectPluginRoots: [container] };
+      expect(
+        (await discoverAgentSkills(runtime, tmp.path, { roots: projectRoots })).some(
+          (s) => s.name === "guarded"
+        )
+      ).toBe(true);
+    }
+    // A legacy row and then an unmanaged directory both retain import-all behavior.
+    for (const plugins of [[{ name: "managed" }], []]) {
+      await fs.writeFile(registryFile, JSON.stringify({ plugins }));
+      expect(
+        (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("guarded"), { roots }))
+          .package.frontmatter.description
+      ).toBe("valid skill");
+    }
+  });
 
   test("getDefaultAgentSkillsRoots includes plugin containers only when includeAgentPlugins is set", () => {
     using project = new DisposableTempDir("agent-skills-plugin-roots");

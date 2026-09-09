@@ -6,11 +6,13 @@ import {
   PROJECT_METADATA_DIR_NAMES,
   listProjectMetadataRelativePaths,
 } from "@/common/compat/legacyMux";
+import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
 import { getErrorMessage } from "@/common/utils/errors";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { isMutationEpochUnreadable, readContainerMutationState } from "./journals";
+import { PLUGIN_REGISTRY_FILE_NAME, readPluginComponentImports } from "./registry";
 import {
   isValidAgentPluginName,
   validatePluginManifest,
@@ -155,6 +157,8 @@ export interface AgentPluginContainer {
 }
 
 export interface AgentPluginInfo {
+  /** Managed global imports; absent means legacy/unmanaged import-all. */
+  importedComponents?: AgentPluginImportedComponents;
   name: string;
   scope: AgentPluginScope;
   /** Canonical (realpath) plugin root directory. */
@@ -617,6 +621,12 @@ export async function discoverAgentPlugins(
       continue;
     }
 
+    const imports =
+      container.scope === "global"
+        ? await readPluginComponentImports(
+            path.join(path.dirname(container.path), PLUGIN_REGISTRY_FILE_NAME)
+          )
+        : undefined;
     const projectMetadataIndex =
       container.scope === "project"
         ? PROJECT_METADATA_DIR_NAMES.findIndex(
@@ -634,6 +644,8 @@ export async function discoverAgentPlugins(
         diagnostics,
       });
       if (plugin) {
+        plugin.importedComponents =
+          imports === null ? { skills: [], mcpServers: [] } : imports?.get(entryName);
         plugins.push(plugin);
       }
     }

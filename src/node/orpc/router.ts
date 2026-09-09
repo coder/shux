@@ -1053,6 +1053,18 @@ export const router = (authToken?: string) => {
         .input(schemas.agentPlugins.list.input)
         .output(schemas.agentPlugins.list.output)
         .handler(({ context }) => context.agentPluginInstallService.listResult()),
+      getComponents: t
+        .input(schemas.agentPlugins.getComponents.input)
+        .output(schemas.agentPlugins.getComponents.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.getComponentsResult(input)
+        ),
+      addComponents: t
+        .input(schemas.agentPlugins.addComponents.input)
+        .output(schemas.agentPlugins.addComponents.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.addComponentsResult(input)
+        ),
       containerLocation: t
         .input(schemas.agentPlugins.containerLocation.input)
         .output(schemas.agentPlugins.containerLocation.output)
