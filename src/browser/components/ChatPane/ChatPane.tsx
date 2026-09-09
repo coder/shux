@@ -7,7 +7,7 @@ import React, {
   useDeferredValue,
   useMemo,
 } from "react";
-import { Lightbulb, Loader2 } from "lucide-react";
+import { Lightbulb } from "lucide-react";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
 import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
@@ -1454,10 +1454,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // `w-full` is required in the centered mode because auto cross-axis
                 // margins disable flex-item stretch.
                 chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-4xl mx-auto w-full",
-                // `flex-1` pushes the dock to the scrollport bottom for short
-                // transcripts. Keep a permanent gutter for the loading overlay so
-                // even compact tail rows remain unobscured without resizing on catch-up.
-                "flex-1 pb-8",
+                // Push the dock to the bottom for short transcripts without reserving
+                // loading space: initial hydration uses the in-flow shimmer, cached replay aria-busy.
+                "flex-1",
                 // Only the empty/centered placeholder fills height (as a flex column
                 // so the placeholder's flex-1 centering works). The hydration
                 // skeleton renders in normal top-aligned transcript flow so it sits
@@ -1703,24 +1702,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                         ({formatKeybind(KEYBINDS.JUMP_TO_BOTTOM)})
                       </span>
                     </button>
-                  )}
-                  {/* Replay feedback must not resize the in-flow dock: even a brief
-                      catch-up would otherwise shift cached transcript rows on workspace switches.
-                      Keep it above the dock for both editable and read-only transcripts,
-                      yielding to Jump to bottom while scrolled up so they cannot overlap on phones. */}
-                  {isHydratingTranscript && !shouldMountStreamingBarrier && autoScroll && (
-                    <div className="pointer-events-none absolute inset-x-0 bottom-full">
-                      <ChatDockSurface>
-                        <div
-                          role={showTranscriptHydrationPlaceholder ? undefined : "status"}
-                          data-testid="transcript-loading-status"
-                          className="text-muted bg-surface-primary flex w-fit items-center gap-2 rounded px-3 py-1 text-xs"
-                        >
-                          <Loader2 aria-hidden="true" className="size-3 shrink-0 animate-spin" />
-                          <span>Loading messages...</span>
-                        </div>
-                      </ChatDockSurface>
-                    </div>
                   )}
                   {transcriptOnly ? (
                     // Transcript-only workspaces keep their historical transcript, but the whole
