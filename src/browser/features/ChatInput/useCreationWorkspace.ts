@@ -690,6 +690,28 @@ export function useCreationWorkspace({
           markPendingInitialSend: initialSlashCommand == null,
         });
 
+        // SendMessageOptions.muxMetadata is a black box (z.any); the creation
+        // caller only ever passes XumMessageMetadata built in ChatInput.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        const overrideMuxMetadata: MuxMessageMetadata | undefined = optionsOverride?.muxMetadata;
+        const overrideRawCommand =
+          overrideMuxMetadata &&
+          "rawCommand" in overrideMuxMetadata &&
+          typeof overrideMuxMetadata.rawCommand === "string"
+            ? overrideMuxMetadata.rawCommand
+            : null;
+
+        // Runtime startup can take minutes; keep the initial message visible in the new
+        // transcript until the backend echoes it. Staged files join the persisted row later.
+        const pendingSendId = `pending-send-${Date.now()}`;
+        if (initialSlashCommand == null) {
+          workspaceStore.beginPendingSend(metadata.id, {
+            id: pendingSendId,
+            content: overrideRawCommand ?? messageText,
+            fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
+          });
+        }
+
         if (typeof draftId === "string" && draftId.trim().length > 0 && promoteWorkspaceDraft) {
           // UI-only: show the created workspace in-place where the draft was rendered.
           promoteWorkspaceDraft(projectPath, draftId, metadata);
@@ -706,17 +728,6 @@ export function useCreationWorkspace({
             ? await stagePendingFiles(api, metadata.id, pendingFilesToStage)
             : { staged: [], failures: [] };
         const stagingFailed = stagingOutcome.failures.length > 0;
-
-        // SendMessageOptions.muxMetadata is a black box (z.any); the creation
-        // caller only ever passes XumMessageMetadata built in ChatInput.
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-        const overrideMuxMetadata: MuxMessageMetadata | undefined = optionsOverride?.muxMetadata;
-        const overrideRawCommand =
-          overrideMuxMetadata &&
-          "rawCommand" in overrideMuxMetadata &&
-          typeof overrideMuxMetadata.rawCommand === "string"
-            ? overrideMuxMetadata.rawCommand
-            : null;
 
         if (stagingFailed) {
           workspaceStore.clearPendingInitialSendState(metadata.id);
@@ -859,6 +870,7 @@ export function useCreationWorkspace({
           return { success: false, error: sendResult.error };
         }
 
+        workspaceStore.markPendingSendAccepted(metadata.id, pendingSendId);
         return { success: true };
       } catch (err) {
         if (createdWorkspaceId) {

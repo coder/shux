@@ -364,6 +364,19 @@ export interface WorkflowToolLiveRunState {
   run?: WorkflowRunRecord;
 }
 
+interface PendingSendState {
+  message: PendingSendMessage;
+  /** User echoes already in the transcript when the send began; null when begun before catch-up. */
+  knownUserEchoIds: Set<string> | null;
+  /** The send request succeeded, so any later replay is guaranteed to contain its echo. */
+  accepted: boolean;
+}
+
+/** A persisted user turn the backend emits in response to a send; synthetic rows are not echoes. */
+function isUserEcho(message: MuxMessage): boolean {
+  return message.role === "user" && message.metadata?.synthetic !== true;
+}
+
 interface WorkspaceChatTransientState {
   caughtUp: boolean;
   isHydratingTranscript: boolean;
@@ -371,7 +384,7 @@ interface WorkspaceChatTransientState {
   pendingStreamEvents: WorkspaceChatMessage[];
   replayingHistory: boolean;
   queuedMessage: QueuedMessage | null;
-  pendingSend: PendingSendMessage | null;
+  pendingSend: PendingSendState | null;
   liveBashOutput: Map<string, LiveBashOutputInternal>;
   liveAdvisorOutput: Map<string, AdvisorLiveOutputState>;
   liveAdvisorReasoning: Map<string, AdvisorLiveReasoningState>;
@@ -2314,7 +2327,7 @@ export class WorkspaceStore {
         name: metadata?.name ?? workspaceId, // Fall back to ID if metadata missing
         messages: displayedMessages,
         queuedMessage: transient.queuedMessage,
-        pendingSend: transient.pendingSend,
+        pendingSend: transient.pendingSend?.message ?? null,
         canInterrupt,
         isCompacting: aggregator.isCompacting(),
         isStreamStarting,
@@ -3767,6 +3780,8 @@ export class WorkspaceStore {
     if (previousTransient?.isHydratingTranscript) {
       nextTransient.isHydratingTranscript = true;
     }
+    // A send begun before the first replay (new workspace) is retired by the replay itself.
+    nextTransient.pendingSend = previousTransient?.pendingSend ?? null;
 
     this.chatTransientState.set(workspaceId, nextTransient);
 
@@ -4028,6 +4043,12 @@ export class WorkspaceStore {
   }
 
   clearPendingInitialSendState(workspaceId: string): void {
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient?.pendingSend) {
+      transient.pendingSend = null;
+      this.states.bump(workspaceId);
+    }
+
     const aggregator = this.aggregators.get(workspaceId);
     if (aggregator?.getPendingStreamStartTime() == null) {
       return;
@@ -4039,28 +4060,58 @@ export class WorkspaceStore {
 
   /**
    * Show the composer content in the transcript tail while the send request is in flight.
-   * Cleared when the backend echoes a user message or queues it, when replay catches up, or
-   * via clearPendingSend after a failed send.
+   * Retired by the backend acknowledgement (a user echo or a queue update), by a replay that
+   * must contain the echo, or by clearPendingSend after a failed send.
    */
   beginPendingSend(workspaceId: string, message: PendingSendMessage): void {
     const transient = this.chatTransientState.get(workspaceId);
-    if (!transient) {
+    const aggregator = this.aggregators.get(workspaceId);
+    if (!transient || !aggregator) {
       return;
     }
 
-    transient.pendingSend = message;
+    transient.pendingSend = {
+      message,
+      knownUserEchoIds: transient.caughtUp
+        ? new Set(
+            aggregator
+              .getAllMessages()
+              .filter(isUserEcho)
+              .map((echo) => echo.id)
+          )
+        : null,
+      accepted: false,
+    };
     this.states.bump(workspaceId);
+  }
+
+  /** Record that the backend accepted the send, so the next replay is known to contain its echo. */
+  markPendingSendAccepted(workspaceId: string, id: string): void {
+    const pending = this.chatTransientState.get(workspaceId)?.pendingSend;
+    if (pending?.message.id === id) {
+      pending.accepted = true;
+    }
   }
 
   /** Remove the pending send row; a mismatched id means a newer send already replaced it. */
   clearPendingSend(workspaceId: string, id: string): void {
     const transient = this.chatTransientState.get(workspaceId);
-    if (transient?.pendingSend?.id !== id) {
+    if (transient?.pendingSend?.message.id !== id) {
       return;
     }
 
     transient.pendingSend = null;
     this.states.bump(workspaceId);
+  }
+
+  private hasUnseenUserEcho(
+    aggregator: StreamingMessageAggregator,
+    pending: PendingSendState
+  ): boolean {
+    const known = pending.knownUserEchoIds;
+    return aggregator
+      .getAllMessages()
+      .some((message) => isUserEcho(message) && !known?.has(message.id));
   }
 
   /**
@@ -4534,8 +4585,15 @@ export class WorkspaceStore {
       // Mark as caught up
       transient.caughtUp = true;
       transient.isHydratingTranscript = false;
-      // Replayed history is authoritative: a send acknowledged while disconnected is in it now.
-      transient.pendingSend = null;
+      // An accepted send is in the replayed history; an unaccepted one is only retired when
+      // the replay shows its echo, so a reconnect during preflight keeps the row.
+      const pendingSend = transient.pendingSend;
+      if (
+        pendingSend &&
+        (pendingSend.accepted || this.hasUnseenUserEcho(aggregator, pendingSend))
+      ) {
+        transient.pendingSend = null;
+      }
       this.lastUserPromptStore.bump(workspaceId);
       this.states.bump(workspaceId);
       this.checkAndBumpRecencyIfChanged(); // Messages loaded, update recency
@@ -4792,7 +4850,7 @@ export class WorkspaceStore {
         // Process live events immediately (after history loaded)
         applyWorkspaceChatEventToAggregator(aggregator, data);
 
-        if (data.role === "user") {
+        if (isUserEcho(data)) {
           // The backend echoed the send; the persisted row replaces the pending one.
           transient.pendingSend = null;
         }
@@ -4885,6 +4943,10 @@ export const workspaceStore = {
     getStoreInstance().markPendingInitialSend(workspaceId, pendingStreamModel),
   clearPendingInitialSendState: (workspaceId: string) =>
     getStoreInstance().clearPendingInitialSendState(workspaceId),
+  beginPendingSend: (workspaceId: string, message: PendingSendMessage) =>
+    getStoreInstance().beginPendingSend(workspaceId, message),
+  markPendingSendAccepted: (workspaceId: string, id: string) =>
+    getStoreInstance().markPendingSendAccepted(workspaceId, id),
   /**
    * Set the active workspace for onChat subscription management.
    * Exposed for test helpers that bypass React routing effects.

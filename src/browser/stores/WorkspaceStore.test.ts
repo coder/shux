@@ -4779,11 +4779,21 @@ describe("WorkspaceStore", () => {
   describe("pending send", () => {
     const pendingSend = { id: "pending-1", content: "hello" };
 
+    function gate(): { release: () => void; opened: Promise<void> } {
+      let release!: () => void;
+      const opened = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { release, opened };
+    }
+
     async function createCaughtUpWorkspace(
       workspaceId: string,
-      liveEvents: (signal: AbortSignal | undefined) => AsyncIterable<WorkspaceChatMessage>
+      liveEvents: (signal: AbortSignal | undefined) => AsyncIterable<WorkspaceChatMessage>,
+      history: WorkspaceChatMessage[] = []
     ): Promise<void> {
       mockChatStreamFor(workspaceId, async function* (signal) {
+        yield* history;
         yield { type: "caught-up", hasOlderHistory: false };
         yield* liveEvents(signal);
       });
@@ -4812,18 +4822,15 @@ describe("WorkspaceStore", () => {
 
     it("clears the pending row when the backend echoes a user message", async () => {
       const workspaceId = "pending-send-user-echo";
-      let releaseEcho!: () => void;
-      const echoGate = new Promise<void>((resolve) => {
-        releaseEcho = resolve;
-      });
+      const echo = gate();
       await createCaughtUpWorkspace(workspaceId, async function* (signal) {
-        await echoGate;
+        await echo.opened;
         yield createUserMessageEvent("user-1", "hello", 1, 1);
         await waitForAbortSignal(signal);
       });
 
       store.beginPendingSend(workspaceId, pendingSend);
-      releaseEcho();
+      echo.release();
 
       expect(await waitUntil(() => store.getWorkspaceState(workspaceId).pendingSend === null)).toBe(
         true
@@ -4833,14 +4840,37 @@ describe("WorkspaceStore", () => {
       );
     });
 
+    it("keeps the pending row across a synthetic user row such as an auto-compaction request", async () => {
+      const workspaceId = "pending-send-synthetic";
+      const echo = gate();
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        await echo.opened;
+        yield {
+          type: "message",
+          id: "compaction-1",
+          role: "user",
+          parts: [{ type: "text", text: "Summarize" }],
+          metadata: { historySequence: 1, timestamp: 1, synthetic: true, uiVisible: true },
+        };
+        await waitForAbortSignal(signal);
+      });
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      echo.release();
+
+      expect(
+        await waitUntil(() =>
+          store.getWorkspaceState(workspaceId).muxMessages.some((m) => m.id === "compaction-1")
+        )
+      ).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+    });
+
     it("clears the pending row when the send lands in the backend queue", async () => {
       const workspaceId = "pending-send-queued";
-      let releaseQueue!: () => void;
-      const queueGate = new Promise<void>((resolve) => {
-        releaseQueue = resolve;
-      });
+      const queue = gate();
       await createCaughtUpWorkspace(workspaceId, async function* (signal) {
-        await queueGate;
+        await queue.opened;
         yield {
           type: "queued-message-changed",
           workspaceId,
@@ -4852,7 +4882,7 @@ describe("WorkspaceStore", () => {
       });
 
       store.beginPendingSend(workspaceId, pendingSend);
-      releaseQueue();
+      queue.release();
 
       expect(
         await waitUntil(() => store.getWorkspaceState(workspaceId).queuedMessage !== null)
@@ -4860,27 +4890,126 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
     });
 
-    it("clears the pending row when a replay catches up", async () => {
-      const workspaceId = "pending-send-caught-up";
-      let releaseCaughtUp!: () => void;
-      const caughtUpGate = new Promise<void>((resolve) => {
-        releaseCaughtUp = resolve;
-      });
-      mockChatStreamFor(workspaceId, async function* (signal) {
-        await caughtUpGate;
-        yield { type: "caught-up", hasOlderHistory: false };
+    it("acceptance alone keeps the row until the backend acknowledges it", async () => {
+      const workspaceId = "pending-send-accepted-live";
+      const echo = gate();
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        await echo.opened;
+        yield createUserMessageEvent("user-1", "hello", 1, 1);
         await waitForAbortSignal(signal);
       });
-      createAndAddWorkspace(store, workspaceId);
 
       store.beginPendingSend(workspaceId, pendingSend);
+      store.markPendingSendAccepted(workspaceId, pendingSend.id);
       expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
-      releaseCaughtUp();
 
+      echo.release();
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).pendingSend === null)).toBe(
+        true
+      );
+    });
+
+    // Resubscribe by switching away and back; the second attempt replays since the cursor.
+    async function resubscribe(workspaceId: string, otherWorkspaceId: string): Promise<void> {
+      createAndAddWorkspace(store, otherWorkspaceId);
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp === false)
+      ).toBe(true);
+      store.setActiveWorkspaceId(workspaceId);
       expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
         true
       );
+    }
+
+    function mockReplayAttempts(
+      workspaceId: string,
+      secondAttempt: () => WorkspaceChatMessage[]
+    ): void {
+      let attempt = 0;
+      mockChatStreamFor(workspaceId, async function* (signal) {
+        attempt += 1;
+        if (attempt === 1) {
+          yield createUserMessageEvent("user-1", "earlier", 1, 1);
+          yield fullCaughtUpEvent(1, "user-1");
+        } else {
+          yield* secondAttempt();
+        }
+        await waitForAbortSignal(signal);
+      });
+    }
+
+    it("keeps an unaccepted pending row through a replay that lacks its echo", async () => {
+      const workspaceId = "pending-send-replay-preflight";
+      mockReplayAttempts(workspaceId, () => [
+        createUserMessageEvent("user-1", "earlier", 1, 1),
+        sinceCaughtUpEvent(1, "user-1"),
+      ]);
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      await resubscribe(workspaceId, `${workspaceId}-other`);
+
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+    });
+
+    it("clears an accepted pending row when a replay catches up", async () => {
+      const workspaceId = "pending-send-replay-accepted";
+      mockReplayAttempts(workspaceId, () => [
+        createUserMessageEvent("user-1", "earlier", 1, 1),
+        sinceCaughtUpEvent(1, "user-1"),
+      ]);
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      store.markPendingSendAccepted(workspaceId, pendingSend.id);
+      await resubscribe(workspaceId, `${workspaceId}-other`);
+
       expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
+    });
+
+    it("clears the pending row when a replay shows an echo that was not there before", async () => {
+      const workspaceId = "pending-send-replay-new-echo";
+      mockReplayAttempts(workspaceId, () => [
+        createUserMessageEvent("user-1", "earlier", 1, 1),
+        createUserMessageEvent("user-2", "hello", 2, 2),
+        sinceCaughtUpEvent(2, "user-2"),
+      ]);
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      await resubscribe(workspaceId, `${workspaceId}-other`);
+
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toBeNull();
+      expect(store.getWorkspaceState(workspaceId).muxMessages.some((m) => m.id === "user-2")).toBe(
+        true
+      );
+    });
+
+    it("keeps a pending row begun before the first replay of an empty new workspace", async () => {
+      const workspaceId = "pending-send-new-workspace";
+      const replay = gate();
+      mockChatStreamFor(workspaceId, async function* (signal) {
+        await replay.opened;
+        yield { type: "caught-up", replay: "full" };
+        await waitForAbortSignal(signal);
+      });
+      createAndAddWorkspace(store, workspaceId);
+      store.beginPendingSend(workspaceId, pendingSend);
+
+      replay.release();
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)).toBe(
+        true
+      );
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
     });
   });
 

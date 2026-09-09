@@ -766,11 +766,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Creation sends also pass through the async resolution phase guarded by
   // sendingCount, so include it alongside the creation-specific flag.
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
-  // Stream startup lets follow-ups queue behind a slow turn, but never before the current
-  // send has been acknowledged: a second send would replace the pending row.
+  // Stream startup lets follow-ups queue behind a slow turn, but never while a send is still
+  // unacknowledged: a second send would replace the pending row.
   const sendInFlightBlocksInput =
     variant === "workspace"
-      ? isSendInFlight && (!isStreamStarting || hasPendingSend)
+      ? (isSendInFlight && !isStreamStarting) || hasPendingSend
       : isSendInFlight;
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
@@ -2163,7 +2163,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         pendingSendId = `pending-send-${Date.now()}`;
         store.beginPendingSend(props.workspaceId, {
           id: pendingSendId,
-          content: messageText,
+          // Staged files only exist in the persisted text as the attachment notice.
+          content: appendStagedNoticeToUserMessage
+            ? appendStagedAttachmentNotice(messageText, sendAttachments)
+            : messageText,
           fileParts: sendFileParts,
           reviews: reviewsData,
         });
@@ -2187,6 +2190,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           setDraft(preSendDraft);
           setDraftReviews(preSendReviews);
         } else {
+          store.markPendingSendAccepted(props.workspaceId, pendingSendId);
           // Track telemetry for successful message send
           telemetry.messageSent(
             props.workspaceId,
