@@ -158,7 +158,7 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
     description: buildMemoryDescription(config),
     inputSchema: TOOL_DEFINITIONS.memory.schema,
-    execute: async (input, { toolCallId }): Promise<MemoryToolResult> => {
+    execute: async (input, { toolCallId, abortSignal }): Promise<MemoryToolResult> => {
       if (writePath != null && writePin && input.command !== "view") {
         if (input.command === "delete" || input.command === "rename") {
           return {
@@ -205,7 +205,9 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
                     },
               CONTEXT_NOTES_RESERVED_BYTES,
               "agent",
-              toolCallId
+              toolCallId,
+              // Stop during the flush must not let the write land once the lock is acquired.
+              abortSignal
             ));
           if (!result.success) pinnedMutationUsed = false;
           return result;

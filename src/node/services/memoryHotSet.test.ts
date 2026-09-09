@@ -157,6 +157,27 @@ describe("additive context notes", () => {
     }
   );
 
+  it("onlyContextNotes re-fits even a pinned notes file to the notes caps and drops the rest", async () => {
+    const content = "x".repeat(12_000);
+    const candidates = [
+      candidate({ path: notesPath, pinned: true }),
+      candidate({ path: "/memories/global/a.md", pinned: true }),
+    ];
+    const args = { candidates, readFile: () => Promise.resolve(content), countTokens, now: NOW };
+    // Ordinary pass: the pinned notes ride the larger per-item budget untruncated.
+    const ordinary = await selectHotMemories({ ...args, tokenBudgetActive: true });
+    expect(ordinary.find((item) => item.path === notesPath)).toMatchObject({
+      truncated: false,
+      content,
+    });
+    const flush = await selectHotMemories({ ...args, onlyContextNotes: true });
+    expect(flush.map((item) => item.path)).toEqual([notesPath]);
+    expect(flush[0].truncated).toBe(true);
+    const rendered = formatHotMemoriesBlock(flush);
+    expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_BYTES);
+    expect(await countTokens(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_TOKENS);
+  });
+
   it("does not take any of the base byte/token allowance, including wrapper costs", async () => {
     const baseCandidate = candidate({ path: "/memories/global/pin.md", pinned: true });
     const readFile = (path: string) =>

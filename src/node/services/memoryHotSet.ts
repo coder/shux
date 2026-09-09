@@ -111,6 +111,12 @@ export async function selectHotMemories(args: {
   candidates: MemoryHotSetCandidate[];
   /** Effective turn policy, not the raw global experiment override. */
   tokenBudgetActive?: boolean;
+  /**
+   * Context-budget final flush: preload only the context notes, always under their own
+   * 8 KiB / reserved-token caps. A pinned or well-used notes file would otherwise enter the
+   * ordinary pass under the larger per-item budget and eat the flush's reserved headroom.
+   */
+  onlyContextNotes?: boolean;
   /** Read a memory file by virtual path; may reject for missing/unreadable files. */
   readFile: (virtualPath: string) => Promise<string>;
   /** Count tokens for the exact rendered hot-memory block using the active model. */
@@ -153,7 +159,8 @@ export async function selectHotMemories(args: {
   let remainingBytes = maxTotalBytes;
   let selectedTokens = 0;
   let attempts = 0;
-  for (const candidate of rankHotSetCandidates(args.candidates, now)) {
+  const ordinaryCandidates = args.onlyContextNotes ? [] : args.candidates;
+  for (const candidate of rankHotSetCandidates(ordinaryCandidates, now)) {
     if (remainingBytes <= 0 || selectedTokens >= maxTotalTokens || items.length >= maxItems) break;
     if (attempts >= maxSelectionAttempts) break;
     attempts += 1;
@@ -190,7 +197,10 @@ export async function selectHotMemories(args: {
     items.push(item);
   }
   // Token-budget notes are additive: never displace a normal selection or spend its budgets.
-  if (args.tokenBudgetActive && !items.some((item) => item.path === CONTEXT_NOTES_MEMORY_PATH)) {
+  if (
+    (args.tokenBudgetActive || args.onlyContextNotes) &&
+    !items.some((item) => item.path === CONTEXT_NOTES_MEMORY_PATH)
+  ) {
     const notes = args.candidates.find((candidate) => candidate.path === CONTEXT_NOTES_MEMORY_PATH);
     if (notes) {
       try {

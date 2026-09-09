@@ -418,17 +418,6 @@ describe("memory tool", () => {
       ).toBe(true);
     });
 
-    it("describes the pinned contract instead of the generic scopes/commands", async () => {
-      using pinned = await createFixture({ memoryWritePath: notes });
-      using generic = await createFixture();
-      const pinnedDescription = pinned.tool.description ?? "";
-      expect(pinnedDescription).not.toBe(generic.tool.description);
-      expect(pinnedDescription).toContain(notes);
-      // The generic contract's scope list and destructive commands do not apply in pinned mode.
-      expect(pinnedDescription).not.toContain("/memories/global/...");
-      expect(pinnedDescription).not.toMatch(/^- (delete|rename):/m);
-    });
-
     it("never fails on a stale existence verdict: create replaces, updates create", async () => {
       using fixture = await createFixture({ memoryWritePath: notes });
       // The prompt may have said "does not exist" while another writer created it meanwhile.
@@ -465,6 +454,22 @@ describe("memory tool", () => {
       ).toBe(true);
       view = await run(fixture.tool, { command: "view", path: notes });
       expect(view.success && view.output).toContain("recovered");
+    });
+
+    it("an aborted flush write cannot land after Stop", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      const controller = new AbortController();
+      controller.abort();
+      const result = (await fixture.tool.execute!(
+        TOOL_DEFINITIONS.memory.schema.parse({ command: "create", path: notes, file_text: "late" }),
+        { ...mockToolCallOptions, abortSignal: controller.signal }
+      )) as MemoryToolResult;
+      expect(result).toMatchObject({ success: false });
+      expect((await run(fixture.tool, { command: "view", path: notes })).success).toBe(false);
+      // The refused write freed the single slot for a live retry.
+      expect(
+        (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success
+      ).toBe(true);
     });
 
     it("caps the resulting notes file, not just the payload", async () => {

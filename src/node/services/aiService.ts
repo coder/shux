@@ -305,14 +305,17 @@ export class AIService extends EventEmitter {
             this.providerService.getConfig()
           );
           const tokenizer = await getTokenizerForModel(modelString, metadataModel);
-          const allItems = await this.turnRequestBuilderBindings.memoryService.listHotMemories(
-            ctx,
-            {
-              countTokens: (text) => tokenizer.countTokens(text),
-              tokenBudgetActive: options?.tokenBudgetActive === true,
-            }
+          // Flush turns select the notes alone under their own caps inside the selector (a
+          // post-filter would keep an item fitted under the larger ordinary per-item budget).
+          const items = await this.turnRequestBuilderBindings.memoryService.listHotMemories(ctx, {
+            countTokens: (text) => tokenizer.countTokens(text),
+            tokenBudgetActive: options?.tokenBudgetActive === true,
+            onlyContextNotes: options?.onlyContextNotes === true,
+          });
+          assert(
+            options?.onlyContextNotes !== true || items.every(onlyNotes),
+            "flush turns must preload only the context notes"
           );
-          const items = options?.onlyContextNotes === true ? allItems.filter(onlyNotes) : allItems;
           hotMemoriesBlock = items.length === 0 ? null : formatHotMemoriesBlock(items);
         } catch (error) {
           // Hot preloading is best-effort context. Preserve the pull-based
