@@ -219,6 +219,108 @@ describe("inactive atomic pending/history publication", () => {
     }
   );
 
+  it.each(
+    (["cancel", "refuse", "write failure"] as const).flatMap((failure) =>
+      [false, true].map((update) => ({ failure, update }))
+    )
+  )("keeps the same prepared rows retryable after final %j", async ({ failure, update }) => {
+    let current = true;
+    let admitted = true;
+    let failing = true;
+    let committedSequences: Array<number | undefined> | undefined;
+    const request = input("B", {
+      tailCopies: [createMuxMessage("tail", "user", "Retained")],
+      updateExisting: update,
+      isCurrent: () => current,
+      shouldPersist: () => admitted,
+      onCommitted: () => {
+        committedSequences = [request.summaryMessage, ...request.tailCopies].map(
+          (row) => row.metadata?.historySequence
+        );
+      },
+    });
+    if (update) {
+      const streamed = createMuxMessage("B", "assistant", "Streaming");
+      assert((await h.historyService.appendToHistory(workspaceId, streamed)).success);
+      request.summaryMessage.metadata = {
+        ...request.summaryMessage.metadata,
+        historySequence: streamed.metadata?.historySequence,
+      };
+    }
+    const prepared = [request.summaryMessage, ...request.tailCopies];
+    const before = structuredClone(prepared);
+    const atomic = atomicWrite.default;
+    spyOn(atomicWrite, "default").mockImplementation(
+      new Proxy(atomic, {
+        async apply(target, _thisArg, args: Parameters<typeof atomic>) {
+          const result = await target(...args);
+          if (failing && String(args[0]).startsWith(`${chatPath}.continuous-`)) {
+            if (failure === "cancel") current = false;
+            if (failure === "refuse") admitted = false;
+          }
+          return result;
+        },
+      })
+    );
+    const rename = syncFs.renameSync;
+    spyOn(syncFs, "renameSync").mockImplementation((from, to) => {
+      if (failing && failure === "write failure" && to === chatPath)
+        throw new Error("transient history rename failure");
+      rename(from, to);
+    });
+    expect((await store.publishBoundary(request)).success).toBe(false);
+    expect(committedSequences).toBeUndefined();
+    expect(prepared).toEqual(before);
+    failing = false;
+    current = true;
+    admitted = true;
+    const retry = await store.publishBoundary(request);
+    assert(retry.success, retry.success ? undefined : retry.error);
+    const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(history.success);
+    expect(history.data.map((row) => row.id)).toEqual(["B", "tail"]);
+    const durableSequences = history.data.map((row) => row.metadata?.historySequence);
+    expect(committedSequences).toEqual(durableSequences);
+    expect(prepared.map((row) => row.metadata?.historySequence)).toEqual(durableSequences);
+  });
+
+  it.each(["tail", "summary", "updated tail"] as const)(
+    "refuses aliased %s objects without consuming the corrected request",
+    async (alias) => {
+      assert((await store.publishBoundary(input("A"))).success);
+      const copy = createMuxMessage("tail", "user", "Retained");
+      const request = input("B", { updateExisting: alias === "updated tail" });
+      if (request.updateExisting) {
+        const streamed = createMuxMessage("B", "assistant", "Streaming");
+        assert((await h.historyService.appendToHistory(workspaceId, streamed)).success);
+        request.summaryMessage.metadata = {
+          ...request.summaryMessage.metadata,
+          historySequence: streamed.metadata?.historySequence,
+        };
+      }
+      request.tailCopies = alias === "summary" ? [request.summaryMessage, copy] : [copy, copy];
+      const prepared = [request.summaryMessage, copy];
+      const before = structuredClone(prepared);
+      const files = [
+        chatPath,
+        pendingPath,
+        path.join(path.dirname(chatPath), "chat-archive.jsonl"),
+      ];
+      const bytes = await Promise.all(files.map((file) => fs.readFile(file, "utf8")));
+      expect((await store.publishBoundary(request)).success).toBe(false);
+      expect(prepared).toEqual(before);
+      expect(await Promise.all(files.map((file) => fs.readFile(file, "utf8")))).toEqual(bytes);
+      request.tailCopies = [copy];
+      assert((await store.publishBoundary(request)).success);
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      assert(history.success);
+      expect(history.data.map((row) => row.id)).toEqual(["B", "tail"]);
+      expect(prepared.map((row) => row.metadata?.historySequence)).toEqual(
+        history.data.map((row) => row.metadata?.historySequence)
+      );
+    }
+  );
+
   it("refuses reusing the current boundary ID before replacing its committed pending file", async () => {
     assert((await store.publishBoundary(input("A"))).success);
     const before = await fs.readFile(pendingPath, "utf8");
@@ -509,19 +611,24 @@ describe("inactive atomic pending/history publication", () => {
           return Promise.reject(new Error("cleanup observer failed"));
         return rm(file, options);
       });
-      const result = await store.publishBoundary(
-        input("A", {
-          onCommitted: (receipt) => {
-            committed = receipt;
-            if (failure === "receipt") throw new Error("receipt observer failed");
-          },
-        })
-      );
+      const request = input("A", {
+        tailCopies: [createMuxMessage("tail", "user", "Retained")],
+        onCommitted: (receipt) => {
+          committed = receipt;
+          if (failure === "receipt") throw new Error("receipt observer failed");
+        },
+      });
+      const result = await store.publishBoundary(request);
       assert(result.success);
       assert(committed);
       assert(result.data);
       expect(result.data).toBe(committed);
-      expect(await historyIds()).toEqual(["A"]);
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      assert(history.success);
+      expect(history.data.map((row) => row.id)).toEqual(["A", "tail"]);
+      expect([request.summaryMessage, ...request.tailCopies].map((row) => row.metadata)).toEqual(
+        history.data.map((row) => row.metadata)
+      );
       expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/A.ts"]);
       expect(await store.rollback(result.data, () => true)).toBe(false);
     }

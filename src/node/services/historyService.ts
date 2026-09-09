@@ -3537,6 +3537,10 @@ export class HistoryService {
     },
     assertStillOwned?: () => Promise<void>
   ): Promise<Result<void>> {
+    // One caller object cannot represent two appended sequences; reject aliases before allocation.
+    const appendedInputs = updateExisting ? tailCopies : [summaryMessage, ...tailCopies];
+    if (new Set(appendedInputs).size !== appendedInputs.length)
+      return Err("Compaction publication requires distinct appended message objects");
     if (
       commit &&
       !(await this.getContinuousCompactionJournal(workspaceId).isPublicationCurrentUnderHistoryLock(
@@ -3557,6 +3561,7 @@ export class HistoryService {
       const historyPath = this.getChatHistoryPath(workspaceId);
       const { rows, messages } = await this.readHistoryForRewrite(historyPath);
       const updates = new Map<MuxMessage, MuxMessage>();
+      const appended = new Map<MuxMessage, MuxMessage>();
 
       // Rolling summaries are prepared outside this lock. Edits, resets, and
       // newly appended rows must win over a stale prepared boundary.
@@ -3599,20 +3604,18 @@ export class HistoryService {
           return Err(`No message found with historySequence ${targetSequence}`);
         }
       } else {
-        // Append semantics: assign the next sequence in place so callers
-        // observe it, exactly like appendToHistory does.
         assert(
           summaryMessage.metadata?.historySequence === undefined,
           "persistBoundaryWithTailCopies append expects an unsequenced summary"
         );
         const nextSeqNum = await this.getNextHistorySequence(workspaceId);
-        summaryMessage.metadata = {
-          ...summaryMessage.metadata,
-          historySequence: nextSeqNum,
+        persistedSummary = {
+          ...summaryMessage,
+          metadata: { ...summaryMessage.metadata, historySequence: nextSeqNum },
         };
         this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
-        persistedSummary = summaryMessage;
-        messages.push(summaryMessage);
+        appended.set(summaryMessage, persistedSummary);
+        messages.push(persistedSummary);
       }
 
       for (const copy of tailCopies) {
@@ -3621,11 +3624,18 @@ export class HistoryService {
           "persistBoundaryWithTailCopies expects unsequenced tail copies"
         );
         const seq = await this.getNextHistorySequence(workspaceId);
-        copy.metadata = { ...copy.metadata, historySequence: seq };
+        const persistedCopy = { ...copy, metadata: { ...copy.metadata, historySequence: seq } };
         this.sequenceCounters.set(workspaceId, seq + 1);
-        messages.push(copy);
+        appended.set(copy, persistedCopy);
+        messages.push(persistedCopy);
       }
 
+      // Final admission or rename can fail: keep caller rows retryable until the boundary is
+      // durable, then publish their sequence metadata before delivering its synchronous receipt.
+      const onCommitted = () => {
+        for (const [input, persisted] of appended) input.metadata = persisted.metadata;
+        commit?.onCommitted();
+      };
       const serialized = this.serializeHistoryRewrite(
         rows,
         workspaceId,
@@ -3638,7 +3648,7 @@ export class HistoryService {
             historyPath,
             serialized,
             () => shouldPersist(sourceMessages),
-            commit?.onCommitted,
+            onCommitted,
             assertStillOwned
           ))
         )
@@ -3646,6 +3656,7 @@ export class HistoryService {
       } else {
         assert(!commit, "Compaction commit receipts require a final ownership predicate");
         await writeFileAtomic(historyPath, serialized);
+        onCommitted();
       }
 
       // Seal the previous epoch only after boundary + tail are durable.
