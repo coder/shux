@@ -25,7 +25,11 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { Config } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
-import { decodeHistoryCursor, encodeHistoryCursor } from "@/node/services/historyCursor";
+import {
+  decodeHistoryCursor,
+  encodeHistoryCursor,
+  type HistoryScanState,
+} from "@/node/services/historyCursor";
 
 export type SessionHistoryArgs = z.infer<typeof TOOL_DEFINITIONS.session_history.schema>;
 export type SessionHistoryResult = z.infer<typeof TOOL_DEFINITIONS.session_history.resultSchema>;
@@ -130,6 +134,32 @@ function createsTask(message: MuxMessage, taskId: string): boolean {
   return message.parts.some(
     (part: unknown) => isPlainObject(part) && part.type === "dynamic-tool" && spawns(part, 0)
   );
+}
+
+/**
+ * A proven caller scan only needs its validated snapshots (and any resumed append check) to
+ * detect later resets/rewrites; drop browse positions, probes and window IDs so a descendant
+ * cursor carrying two scan states stays well inside the cursor and result limits.
+ */
+function proofState(state: HistoryScanState): HistoryScanState {
+  return {
+    ...state,
+    phase: "done",
+    artifact: "chat",
+    byteOffset: 0,
+    skippingOversized: false,
+    oversizedRowEnd: null,
+    resetProbe: "",
+    resetStage: 0,
+    possibleReset: false,
+    anchorSequence: null,
+    windowId: "w:0",
+    windowBoundaryKind: null,
+    windowPending: false,
+    floor: null,
+    probe: null,
+    span: null,
+  };
 }
 
 const FILTERABLE_ACTIONS: ReadonlySet<SessionHistoryArgs["action"]> = new Set([
@@ -268,21 +298,14 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           maxRows: SESSION_HISTORY_MAX_SCAN_ROWS,
         };
         let authorization = cursor?.authorization ?? null;
-        let inFlight = false;
         if (branchRoot !== null) {
           assert(
             authorization === null || authorization.branchRoot === branchRoot,
             "descendant cursor binding must pin the branch root"
           );
-          // A child created earlier in the SAME streaming turn is only in the caller's
-          // partial message until stream end; that receipt is inside the current segment by
-          // construction (resets require a settled stream). Re-derived every page and read
-          // only within the page budget: an oversized partial defers proof to the settled scan.
-          const partial = await history.readPartialBounded(workspaceId, budget.maxBytes);
-          budget.maxBytes -= partial.bytesRead;
-          result.bytesRead = partial.bytesRead;
-          inFlight = partial.message !== null && createsTask(partial.message, branchRoot);
-          if (!inFlight) {
+          // A child created in the current turn is only in the caller's partial message
+          // until stream end, so it is provable (and readable) once the turn settles.
+          {
             // Proven cursors carry the caller scan as "done": continuing it only runs the
             // append check (an appended manual reset or rewrite throws stale_cursor) without
             // browsing further caller rows.
@@ -298,12 +321,12 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             });
             budget.maxBytes -= auth.bytesRead;
             budget.maxRows -= auth.rowsScanned;
-            result.bytesRead += auth.bytesRead;
+            result.bytesRead = auth.bytesRead;
             result.rowsScanned = auth.rowsScanned;
             if (authorization?.proven) {
               assert(auth.state, "a resumed caller scan reports its final state");
               // Keep the advanced snapshot; an unfinished append check resumes next page.
-              authorization = { ...authorization, scan: auth.state };
+              authorization = { ...authorization, scan: proofState(auth.state) };
               if (auth.cursor) {
                 result.exhausted = false;
                 result.nextCursor = encodeHistoryCursor({
@@ -315,7 +338,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               }
             } else if (found) {
               assert(auth.cursor, "a receipt row leaves the caller scan resumable");
-              authorization = { branchRoot, scan: { ...auth.cursor, phase: "done" }, proven: true };
+              authorization = { branchRoot, scan: proofState(auth.cursor), proven: true };
             } else if (auth.cursor) {
               authorization = { branchRoot, scan: auth.cursor, proven: false };
               result.exhausted = false;
@@ -449,20 +472,6 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           });
           return result;
         };
-        if (inFlight) {
-          // The in-flight receipt must still be present after the target read; if the turn
-          // settled meanwhile the rows are withheld and the next page proves via the scan.
-          const again = await history.readPartialBounded(
-            workspaceId,
-            Math.max(0, budget.maxBytes - scan.bytesRead)
-          );
-          result.bytesRead = (result.bytesRead ?? 0) + again.bytesRead;
-          if (again.message === null || !createsTask(again.message, branchRoot!)) {
-            result.bytesRead += scan.bytesRead;
-            result.rowsScanned = (result.rowsScanned ?? 0) + scan.rowsScanned;
-            return withheld();
-          }
-        }
         if (authorization?.proven) {
           // Another backend may have appended a caller reset between the authorization
           // scan (caller lock released) and this target scan. Revalidate the caller snapshot
@@ -479,7 +488,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             visit: () => true,
           });
           assert(recheck.state, "a resumed caller scan reports its final state");
-          authorization = { ...authorization, scan: recheck.state };
+          authorization = { ...authorization, scan: proofState(recheck.state) };
           result.bytesRead = (result.bytesRead ?? 0) + recheck.bytesRead;
           if (recheck.cursor) {
             result.bytesRead += scan.bytesRead;

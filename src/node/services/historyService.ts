@@ -2303,27 +2303,6 @@ export class HistoryService {
   }
 
   /**
-   * Budgeted variant for read-only tools: refuses (skipped) instead of loading a partial larger
-   * than `maxBytes`, and reports the bytes it did read so callers can account for them.
-   */
-  async readPartialBounded(
-    workspaceId: string,
-    maxBytes: number
-  ): Promise<{ message: MuxMessage | null; bytesRead: number; skipped: boolean }> {
-    assert(maxBytes >= 0, "readPartialBounded requires a non-negative budget");
-    const size = await fs.stat(this.getPartialPath(workspaceId)).then(
-      (stat) => stat.size,
-      (error: NodeJS.ErrnoException) => {
-        if (error.code !== "ENOENT") throw error;
-        return null;
-      }
-    );
-    if (size === null) return { message: null, bytesRead: 0, skipped: false };
-    if (size > maxBytes) return { message: null, bytesRead: 0, skipped: true };
-    return { message: await this.readPartial(workspaceId), bytesRead: size, skipped: false };
-  }
-
-  /**
    * Write a partial message to disk.
    */
   async writePartial(workspaceId: string, message: MuxMessage): Promise<Result<void>> {

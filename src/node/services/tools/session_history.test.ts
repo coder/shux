@@ -3344,6 +3344,11 @@ describe("session_history descendant task history", () => {
       expect(result.success).toBe(true);
       expect(result.bytesRead ?? 0).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
       expect(result.rowsScanned ?? 0).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
+      if (result.nextCursor)
+        expect(result.nextCursor.length).toBeLessThanOrEqual(SESSION_HISTORY_MAX_CURSOR_CHARS);
+      expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(
+        SESSION_HISTORY_MAX_RESULT_BYTES
+      );
       results.push(result);
       cursor = result.nextCursor;
       expect(results.length).toBeLessThan(40);
@@ -3513,22 +3518,25 @@ describe("session_history descendant task history", () => {
     });
   });
 
-  test("in-flight, legacy PTC and deeply nested receipts are handled without unbounded recursion", async () => {
+  test("partial receipts wait for settlement; legacy PTC and deeply nested receipts are bounded", async () => {
     await appendChild("child-row", "child facts");
     // Same-turn spawn: the receipt lives only in the caller's partial message until stream end.
     const inFlight = createMuxMessage("in-flight", "assistant", "", undefined, [
       taskPart("task", { status: "running", taskId: childId, note: "await it" }),
     ]);
     await fixture.historyService.writePartial(workspaceId, inFlight);
-    const first = await callAs({ action: "list_items", task_id: childId, limit: 1 });
-    expect(first.items?.map((item) => item.text)).toEqual(["child facts"]);
-    await appendChild("child-two", "child two");
-    // Once the turn settles the receipt is persisted and the bounded scan takes over.
-    await fixture.historyService.deletePartial(workspaceId);
+    // The partial is never read (unbounded, not a settled receipt): denied until the turn ends.
     expect(await callAs({ action: "list_items", task_id: childId })).toMatchObject({
       success: false,
       error: "task_not_found",
     });
+    await appendChild("child-two", "child two");
+    await fixture.historyService.deletePartial(workspaceId);
+    await appendSpawnPart(inFlight.parts[0]);
+    expect(
+      (await callAs({ action: "list_items", task_id: childId })).items?.map((item) => item.text)
+    ).toEqual(["child facts", "child two"]);
+    await append("caller-reset", "", { contextBoundaryKind: "reset", synthetic: true });
     // Legacy PTC persistence: nested calls only inside code_execution's output.toolCalls.
     await appendSpawnPart(
       taskPart("code_execution", {
@@ -3558,7 +3566,7 @@ describe("session_history descendant task history", () => {
     expect((await callAs({ action: "list_items", task_id: childId })).success).toBe(true);
   });
 
-  test("foreign toolCalls, oversized partials and cross-backend resets never disclose rows", async () => {
+  test("foreign toolCalls and cross-backend resets never disclose rows", async () => {
     await appendChild("child-row", "child facts");
     // Legacy toolCalls only count inside code_execution results; other tools' output is data.
     await appendSpawnPart(
@@ -3570,18 +3578,6 @@ describe("session_history descendant task history", () => {
       success: false,
       error: "task_not_found",
     });
-    // A partial larger than the page budget is not loaded; proof waits for the settled scan.
-    const huge = createMuxMessage(
-      "huge",
-      "assistant",
-      "x".repeat(SESSION_HISTORY_MAX_SCAN_BYTES),
-      undefined,
-      [taskPart("task", { status: "running", taskId: childId })]
-    );
-    await fixture.historyService.writePartial(workspaceId, huge);
-    const skipped = await callAs({ action: "list_items", task_id: childId });
-    expect(skipped).toMatchObject({ success: false, error: "task_not_found" });
-    await fixture.historyService.deletePartial(workspaceId);
     // A reset appended to the caller (by another backend) between the authorization scan and
     // the target scan is caught by the post-scan revalidation: nothing is disclosed.
     await spawn([childId]);
