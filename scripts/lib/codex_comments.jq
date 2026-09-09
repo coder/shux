@@ -4,7 +4,7 @@
 # Strip only the observed help text: a heading alone must not hide a finding
 # added inside the details section, or a second section appended after it.
 def codex_without_help:
-  ltrimstr("### 🛡️ Codex Security Review · _Automatically triggered_\n\n")
+  sub("^### 🛡️ Codex Security Review( · _Automatically triggered_)?\n\n"; "")
   | rtrimstr("\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n"
     + "[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n"
     + "- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\n"
