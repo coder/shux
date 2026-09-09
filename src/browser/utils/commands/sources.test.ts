@@ -1320,15 +1320,21 @@ test("fast mode command is route-aware and keyboard accessible", async () => {
       selectedWorkspaceState: {
         lifecycle: "active",
         goal: null,
-        currentModel: "openai:gpt-5.6-sol",
+        currentModel: "openai:gpt-6-astra",
       } as unknown as WorkspaceState,
-      getEffectiveComposerModel: () => "openai:gpt-5.6-sol",
+      getEffectiveComposerModel: () => "openai:gpt-6-astra",
       providersConfig: {
-        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+        openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
       },
       getRouteForModel: () => "openrouter",
+      onToggleFastMode,
     });
-    expect(gatewayActions.some((action) => action.id === "thinking:toggle-fast-mode")).toBe(false);
+    const gatewayFastAction = gatewayActions.find(
+      (action) => action.id === "thinking:toggle-fast-mode"
+    );
+    expect(gatewayFastAction?.shortcutHint).toBeDefined();
+    await gatewayFastAction?.run();
+    expect(onToggleFastMode).toHaveBeenCalledTimes(4);
   } finally {
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
