@@ -568,6 +568,12 @@ export function extractMemoryDescription(content: string): string {
 // Service
 // ---------------------------------------------------------------------------
 
+/** One pinned-file mutation for {@link MemoryService.writePinnedFile}. */
+export type PinnedFileMutation =
+  | { command: "create"; fileText: string }
+  | { command: "str_replace"; oldStr: string; newStr: string }
+  | { command: "insert"; insertLine: number; insertText: string };
+
 export class MemoryService extends EventEmitter {
   /**
    * Canonical key into the process-wide target mutation registry: mutating
@@ -999,13 +1005,12 @@ export class MemoryService extends EventEmitter {
     fileText: string,
     actor: MemoryActor,
     toolCallId?: string,
-    abortSignal?: AbortSignal,
-    maxFileBytes?: number
+    abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
-      assertWithinFileSizeCap(fileText, maxFileBytes);
+      assertWithinFileSizeCap(fileText);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
       return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         // create is a write: materialize the scope root on first use — but
@@ -1054,8 +1059,7 @@ export class MemoryService extends EventEmitter {
     newStr: string,
     actor: MemoryActor,
     toolCallId?: string,
-    abortSignal?: AbortSignal,
-    maxFileBytes?: number
+    abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -1067,7 +1071,7 @@ export class MemoryService extends EventEmitter {
       return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const updated = computeStrReplaceUpdate(content, oldStr, newStr, virtualPath);
-        assertWithinFileSizeCap(updated, maxFileBytes);
+        assertWithinFileSizeCap(updated);
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
@@ -1097,8 +1101,7 @@ export class MemoryService extends EventEmitter {
     actor: MemoryActor,
     toolCallId?: string,
     expectedFingerprint?: string,
-    abortSignal?: AbortSignal,
-    maxFileBytes?: number
+    abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -1121,7 +1124,7 @@ export class MemoryService extends EventEmitter {
         }
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
-        assertWithinFileSizeCap(updated, maxFileBytes);
+        assertWithinFileSizeCap(updated);
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
@@ -1156,6 +1159,84 @@ export class MemoryService extends EventEmitter {
    * mutation lock is taken (the state can change between staging and apply,
    * where the real command re-validates authoritatively).
    */
+  /**
+   * Preservation-turn write for one pinned file (the context-budget final flush). The agent
+   * gets a single call, so the mutation must not fail on an existence verdict that went stale
+   * between the prompt and the call (Memory UI or another session creating/deleting the file).
+   * Under the target mutation lock: `create` replaces an existing file, `str_replace`/`insert`
+   * create a missing file from their payload, and the actual result is capped at
+   * `maxFileBytes` (which must tighten the ordinary cap).
+   */
+  async writePinnedFile(
+    ctx: MemoryScopeContext,
+    virtualPath: string,
+    mutation: PinnedFileMutation,
+    maxFileBytes: number,
+    actor: MemoryActor,
+    toolCallId?: string,
+    abortSignal?: AbortSignal
+  ): Promise<MemoryCommandResult> {
+    return this.runCommand(async () => {
+      const parsed = parseMemoryPath(virtualPath);
+      const scope = this.requireFilePath(parsed, virtualPath);
+      if (mutation.command === "str_replace" && mutation.oldStr.length === 0) {
+        throw new MemoryCommandError("old_str must not be empty");
+      }
+      const store = await this.resolveStore(ctx, scope, parsed.relPath);
+      return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
+        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await store.ensureRoot();
+        const kind = await store.kind(parsed.relPath);
+        if (kind === "dir") {
+          throw new MemoryCommandError(`${virtualPath} is a directory, not a file`);
+        }
+        const current =
+          kind === null ? null : await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
+        if (current === null) {
+          const files = await store.listFiles();
+          if (files.length >= MEMORY_MAX_FILES_PER_SCOPE) {
+            throw new MemoryCommandError(
+              `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
+            );
+          }
+        }
+        const updated =
+          mutation.command === "create"
+            ? mutation.fileText
+            : mutation.command === "str_replace"
+              ? current === null
+                ? mutation.newStr
+                : computeStrReplaceUpdate(current, mutation.oldStr, mutation.newStr, virtualPath)
+              : computeInsertUpdate(
+                  current ?? "",
+                  current === null ? 0 : mutation.insertLine,
+                  mutation.insertText
+                ).updated;
+        assertWithinFileSizeCap(updated, maxFileBytes);
+        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await store.writeFile(parsed.relPath, updated);
+        const physicalPath = store.physicalPath(parsed.relPath);
+        // Row is written before the write is acknowledged (mutation → row → ack).
+        await this.journalRefinement(
+          ctx,
+          { op: mutation.command, path: toVirtualPath(scope, parsed.relPath) },
+          current === null
+            ? { op: "delete-files", paths: [physicalPath] }
+            : { op: "restore-files", files: [{ path: physicalPath, content: current }] },
+          actor,
+          toolCallId,
+          [{ path: physicalPath, content: updated }]
+        );
+        await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
+        this.emitChange(ctx, scope, parsed.relPath, actor);
+        return {
+          success: true as const,
+          output: `${current === null ? "Created" : "Edited"} ${toVirtualPath(scope, parsed.relPath)}`,
+        };
+      });
+    });
+  }
+
   async validateMutation(
     ctx: MemoryScopeContext,
     command:
@@ -1810,9 +1891,9 @@ function computeInsertUpdate(
 }
 
 /**
- * `maxFileBytes` lets a caller tighten the cap for one file (the context-budget flush caps
- * its notes at the preload size); it is checked against the actual updated content INSIDE
- * the target mutation lock, so a concurrent edit cannot slip an oversized result past it.
+ * `maxFileBytes` tightens the cap for one file (writePinnedFile caps the context notes at
+ * their preload size); callers check it against the actual updated content INSIDE the target
+ * mutation lock, so a concurrent edit cannot slip an oversized result past it.
  */
 function assertWithinFileSizeCap(content: string, maxFileBytes?: number): void {
   const bytes = Buffer.byteLength(content, "utf-8");

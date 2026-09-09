@@ -172,18 +172,28 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
             };
           }
           pinnedMutationUsed = true;
-          // The notes are preloaded truncated to CONTEXT_NOTES_RESERVED_BYTES; a resulting file
-          // beyond that only bloats it with content the next window never sees. The service
-          // checks the actual result under its mutation lock (a concurrent Memory UI edit cannot
-          // stale a precheck here); a refused write changed nothing, so it frees the slot.
-          const result = await executeMemoryCommand(
-            memoryService,
-            ctx,
-            input,
-            checkWriteAccess,
-            toolCallId,
-            { checkReadAccess: checkPinnedPath, maxFileBytes: CONTEXT_NOTES_RESERVED_BYTES }
-          );
+          // The single call must not fail on a stale existence verdict (create vs update) and
+          // the notes are preloaded truncated to CONTEXT_NOTES_RESERVED_BYTES, so the service
+          // resolves create-or-update and caps the actual result under its mutation lock. A
+          // refused write changed nothing, so it frees the slot.
+          const result =
+            checkWriteAccess(input.path!) ??
+            (await memoryService.writePinnedFile(
+              ctx,
+              input.path!,
+              input.command === "create"
+                ? { command: "create", fileText: input.file_text! }
+                : input.command === "str_replace"
+                  ? { command: "str_replace", oldStr: input.old_str!, newStr: input.new_str ?? "" }
+                  : {
+                      command: "insert",
+                      insertLine: input.insert_line!,
+                      insertText: input.insert_text!,
+                    },
+              CONTEXT_NOTES_RESERVED_BYTES,
+              "agent",
+              toolCallId
+            ));
           if (!result.success) pinnedMutationUsed = false;
           return result;
         }
@@ -235,8 +245,6 @@ export async function executeMemoryCommand(
     abortSignal?: AbortSignal;
     /** Read guard (view); the agent tool uses it to pin flush turns to one file. */
     checkReadAccess?: (virtualPath: string) => MemoryToolResult | null;
-    /** Tighter per-file size cap for create/str_replace/insert, enforced under the mutation lock. */
-    maxFileBytes?: number;
   }
 ): Promise<MemoryToolResult> {
   try {
@@ -264,8 +272,7 @@ export async function executeMemoryCommand(
             input.file_text,
             "agent",
             toolCallId,
-            options?.abortSignal,
-            options?.maxFileBytes
+            options?.abortSignal
           ))
         );
       }
@@ -282,8 +289,7 @@ export async function executeMemoryCommand(
             input.new_str ?? "",
             "agent",
             toolCallId,
-            options?.abortSignal,
-            options?.maxFileBytes
+            options?.abortSignal
           ))
         );
       }
@@ -304,8 +310,7 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.expectedTargetFingerprint,
-            options?.abortSignal,
-            options?.maxFileBytes
+            options?.abortSignal
           ))
         );
       }

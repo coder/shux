@@ -14,7 +14,6 @@ import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentToo
 import { resolveMemoryAccessPolicy } from "./tools/memory";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
-  CONTEXT_NOTES_MEMORY_PATH,
   CONTEXT_WARNING_DEDUPE_KEY,
   WARNING_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
@@ -39,7 +38,7 @@ import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
 import { Effect, Fiber } from "effect";
 import { StartupRecovery, type StartupRecoveryOutcome } from "./startupRecovery";
-import { access, mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
+import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PlatformPaths } from "@/common/utils/paths";
@@ -244,7 +243,7 @@ import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
-import { workspaceMemoryStorePath, type MemorySessionContext } from "@/node/services/memoryService";
+import type { MemorySessionContext } from "@/node/services/memoryService";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -5698,7 +5697,6 @@ export class AgentSession {
         (await this.checkContextBudgetHistoryAccess(options)).success
           ? await this.captureRolloverRequestAssembly()
           : undefined;
-      const notesExist = admitted?.success ? await this.workspaceContextNotesExist() : false;
       // Re-read the gates after the last await: the slider may have moved meanwhile, and a Stop
       // (interruptStream → clearContextBudgetState) drops the intent and its paired
       // continuation, so a flush accepted now would run with nothing to seal the window.
@@ -5714,9 +5712,7 @@ export class AgentSession {
         // this capture cannot add an executable tool to the memory-only turn either.
         this.pendingRolloverSnapshot = admitted.data;
         return Ok({
-          prefix: [
-            createContextBudgetWarning(decision.projected, maxTokens, true, true, { notesExist }),
-          ],
+          prefix: [createContextBudgetWarning(decision.projected, maxTokens, true, true, true)],
           requestAssemblySnapshot: admitted.data,
         });
       }
@@ -5820,23 +5816,6 @@ export class AgentSession {
       });
     }
     return Ok({ prefix: [] });
-  }
-
-  /**
-   * Authoritative on-disk check for the workspace context notes: the flush prompt must not
-   * guess from a possibly missing memory index whether to `create` or update.
-   */
-  private async workspaceContextNotesExist(): Promise<boolean> {
-    const relPath = CONTEXT_NOTES_MEMORY_PATH.replace(/^\/memories\/workspace\//, "");
-    assert(relPath !== CONTEXT_NOTES_MEMORY_PATH, "context notes must live in workspace memory");
-    try {
-      await access(
-        path.join(workspaceMemoryStorePath(this.config.sessionsDir, this.workspaceId), relPath)
-      );
-      return true;
-    } catch {
-      return false;
-    }
   }
 
   /** Sealed tool-end continuation shared by the mid-stream and resume-hydration paths. */
@@ -7937,6 +7916,12 @@ export class AgentSession {
     agentInitiated?: boolean;
   }): Promise<void> {
     if (!this.workspaceGoalService) {
+      return;
+    }
+    // The context-budget final flush is housekeeping, like compaction: it must not consume a
+    // goal turn or charge the goal's cost cap. Its row keeps the goal attribution on purpose,
+    // because a restart re-derives the paired continuation's goalKind/goalId from that row.
+    if (this.activeStreamContext?.contextBudgetFlushTurn === true) {
       return;
     }
 

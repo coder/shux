@@ -57,17 +57,12 @@ export function buildLeadInText(rollover: ContextWindowRollover): string {
   ].join("\n");
 }
 
-/** Final pre-rollover flush prompt; `notesExist` is checked on disk when the turn dispatches. */
-export interface FinalFlushPrompt {
-  notesExist: boolean;
-}
-
 export function buildBudgetWarningText(
   contextTokens: number,
   maxTokens: number,
   memoryWritable: boolean,
   sessionHistoryAvailable: boolean,
-  final?: FinalFlushPrompt
+  final = false
 ): string {
   assert(maxTokens > 0, "context budget warnings require a known positive limit");
   const usage = `Context window ~${Math.round((contextTokens / maxTokens) * 100)}% used (${Math.ceil(contextTokens)} of ${maxTokens} tokens).`;
@@ -80,11 +75,10 @@ export function buildBudgetWarningText(
       "This is the last step in this context window: the next message starts a fresh provider context that does not carry this transcript.",
       `${CONTEXT_NOTES_MEMORY_PATH} stays available through the memory tool and, when memory hot-set loading is enabled, is preloaded there if present (bounded to 8 KiB); session_history can retrieve earlier messages.`,
       "Write or update that file now in a single memory call, essential state first: goal, decisions, invariants, open tasks, blockers, and the exact paths/IDs needed to resume.",
-      // The existence verdict is authoritative (checked on disk at dispatch): a failed
-      // `create` on an existing file would waste the only step this turn gets.
-      final.notesExist
-        ? "The file already exists: update it with str_replace on its preloaded text, or insert with insert_line 0 (needs no contents). Do not use create."
-        : "The file does not exist yet: use create.",
+      // The pinned memory tool resolves create-or-update atomically (see
+      // MemoryService.writePinnedFile), so no on-disk existence verdict is needed here and a
+      // stale one cannot waste the only step this turn gets.
+      "If its text is preloaded above, update it with str_replace or insert (insert_line 0 needs no contents); otherwise use create, which also replaces an existing file.",
       "Do not continue the task or reply to the user in this step.",
     ].join(" ");
   }
@@ -102,7 +96,7 @@ export function createContextBudgetWarning(
   maxTokens: number,
   memoryWritable: boolean,
   sessionHistoryAvailable: boolean,
-  final?: FinalFlushPrompt
+  final = false
 ): MuxMessage {
   return createMuxMessage(
     createUserMessageId(),

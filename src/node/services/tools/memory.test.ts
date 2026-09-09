@@ -10,7 +10,11 @@ import { MemoryService, projectMemoryDirName } from "@/node/services/memoryServi
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { RefinementEvidenceSchema } from "@/common/types/refinement";
 import { readRefinementEvents } from "@/node/services/refinement/refinementTestHelpers";
-import { createMemoryTool, resolveMemoryAccessPolicy } from "./memory";
+import {
+  createMemoryTool,
+  memoryScopeContextFromToolConfig,
+  resolveMemoryAccessPolicy,
+} from "./memory";
 import { TestTempDir, createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 import type { MemoryToolResult } from "@/common/types/tools";
 import type { MemoryScopeAccess, MemoryScope } from "@/common/constants/memory";
@@ -412,6 +416,44 @@ describe("memory tool", () => {
         (await run(fresh, { command: "insert", path: notes, insert_line: 0, insert_text: "x" }))
           .success
       ).toBe(true);
+    });
+
+    it("never fails on a stale existence verdict: create replaces, updates create", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      // The prompt may have said "does not exist" while another writer created it meanwhile.
+      expect(
+        (await run(fixture.tool, { command: "create", path: notes, file_text: "theirs" })).success
+      ).toBe(true);
+      expect(
+        (
+          await run(createMemoryTool(fixture.config), {
+            command: "create",
+            path: notes,
+            file_text: "ours",
+          })
+        ).success
+      ).toBe(true);
+      let view = await run(fixture.tool, { command: "view", path: notes });
+      expect(view.success && view.output).toContain("ours");
+      expect(view.success && view.output).not.toContain("theirs");
+      // ...or "exists" while it was deleted meanwhile.
+      await fixture.config.memoryService!.deletePath(
+        memoryScopeContextFromToolConfig(fixture.config),
+        notes,
+        "user"
+      );
+      expect(
+        (
+          await run(createMemoryTool(fixture.config), {
+            command: "str_replace",
+            path: notes,
+            old_str: "ours",
+            new_str: "recovered",
+          })
+        ).success
+      ).toBe(true);
+      view = await run(fixture.tool, { command: "view", path: notes });
+      expect(view.success && view.output).toContain("recovered");
     });
 
     it("caps the resulting notes file, not just the payload", async () => {

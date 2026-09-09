@@ -14,6 +14,7 @@ import {
   projectMemoryDirName,
   resolveMemoryProjectIdentity,
   type MemoryScopeContext,
+  type PinnedFileMutation,
 } from "./memoryService";
 import { MemoryMetaService } from "./memoryMeta";
 import {
@@ -561,38 +562,40 @@ describe("MemoryService", () => {
       expect(result.success).toBe(false);
     });
 
-    it("applies a caller-tightened cap to the actual updated content", async () => {
+    it("writePinnedFile resolves create-or-update under the lock and caps the actual result", async () => {
       using fixture = await createFixture();
       const notes = "/memories/global/notes.md";
-      await fixture.service.create(fixture.ctx, notes, "a".repeat(60), "agent");
-      // 60 + 41 > 100: rejected even though the payload alone would fit.
-      const grow = await fixture.service.insert(
-        fixture.ctx,
-        notes,
-        0,
-        "b".repeat(40),
-        "agent",
-        undefined,
-        undefined,
-        undefined,
-        100
-      );
+      const write = (mutation: PinnedFileMutation) =>
+        fixture.service.writePinnedFile(fixture.ctx, notes, mutation, 100, "agent");
+      const read = async () => {
+        const result = await fixture.service.readFileWithSha(fixture.ctx, notes);
+        return result.success ? result.data.content : null;
+      };
+      // An update command on a missing file creates it from its payload.
+      expect(
+        (await write({ command: "str_replace", oldStr: "gone", newStr: "seed" })).success
+      ).toBe(true);
+      expect(await read()).toBe("seed");
+      // create replaces an existing file instead of failing on a stale existence verdict.
+      expect((await write({ command: "create", fileText: "a".repeat(60) })).success).toBe(true);
+      expect(await read()).toBe("a".repeat(60));
+      // 60 + 41 > 100: rejected against the actual contents even though the payload alone fits.
+      const grow = await write({ command: "insert", insertLine: 0, insertText: "b".repeat(40) });
       expect(grow.success).toBe(false);
       if (!grow.success) expect(grow.error).toContain("limited to 100 bytes");
+      expect(await read()).toBe("a".repeat(60));
       // Replacing content that frees space fits under the same cap.
-      const shrink = await fixture.service.strReplace(
-        fixture.ctx,
-        notes,
-        "a".repeat(60),
-        "c".repeat(90),
-        "agent",
-        undefined,
-        undefined,
-        100
-      );
-      expect(shrink.success).toBe(true);
-      const view = await fixture.service.view(fixture.ctx, notes);
-      expect(view.success && view.output).toContain("c".repeat(90));
+      expect(
+        (await write({ command: "str_replace", oldStr: "a".repeat(60), newStr: "c".repeat(90) }))
+          .success
+      ).toBe(true);
+      expect(await read()).toBe("c".repeat(90));
+      // insert on a missing file ignores the line position and normalizes like insert.
+      await fixture.service.deletePath(fixture.ctx, notes, "agent");
+      expect(
+        (await write({ command: "insert", insertLine: 7, insertText: "x\ny\n" })).success
+      ).toBe(true);
+      expect(await read()).toBe("x\ny");
     });
   });
 

@@ -1523,7 +1523,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
   });
 
-  test("a flush turn's text-only finish never completes a goal implicitly", async () => {
+  test("a flush turn's finish never completes a goal implicitly nor consumes goal accounting", async () => {
     const h = await setup();
     const completeGoal = spyOn(
       h.session as unknown as {
@@ -1531,6 +1531,22 @@ describe("AgentSession token-budget lifecycle", () => {
       },
       "maybeAutoCompleteGoalFromSilentContinuation"
     );
+    // Minimal goal service: only the stream-end accounting seam is observed.
+    const recordStreamAccounting = mock((_input: { streamOriginKind?: string }) =>
+      Promise.resolve(null)
+    );
+    const noop = () => Promise.resolve();
+    Reflect.set(h.session, "workspaceGoalService", {
+      recordStreamAccounting,
+      previewStreamAccounting: noop,
+      recordStreamStarted: noop,
+      recordUserStoppedStream: noop,
+      applyPendingAfterStreamEnd: noop,
+      requestContinuationAfterStreamEnd: noop,
+      syncGoalModeWithChatTail: noop,
+      getGoal: () => Promise.resolve(null),
+      assertPricedModelForBudgetedGoal: () => Promise.resolve(Ok(undefined)),
+    });
     expect(
       (
         await h.session.sendMessage("Goal work", options, {
@@ -1543,10 +1559,24 @@ describe("AgentSession token-budget lifecycle", () => {
     ).toBe(true);
     expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
     await h.finishAndDispatch();
+    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
+    expect(recordStreamAccounting.mock.calls[0][0]).toMatchObject({
+      streamOriginKind: "goal_continuation",
+    });
+    // The flush row keeps the goal attribution (a restart re-derives the paired continuation's
+    // goalKind/goalId from it), but the housekeeping stream itself is not goal work.
     expect((await allRows(h)).at(-1)?.metadata).toMatchObject({ kind: GOAL_CONTINUATION_KIND });
     h.settleStream(1, { finishReason: "stop" });
     await h.waitForRequest(3);
     expect(completeGoal).not.toHaveBeenCalled();
+    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
+    // The paired continuation is goal work again.
+    h.settleStream(2, { finishReason: "stop" });
+    await h.session.waitForIdle();
+    expect(recordStreamAccounting).toHaveBeenCalledTimes(2);
+    expect(recordStreamAccounting.mock.calls[1][0]).toMatchObject({
+      streamOriginKind: "goal_continuation",
+    });
   });
 
   test("disabling rollover while the flush streams drops the pending reset but keeps the Continue", async () => {
