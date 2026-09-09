@@ -370,8 +370,6 @@ interface PendingSendState {
   knownUserEchoIds: Set<string> | null;
   /** The send request succeeded, so any later replay is guaranteed to contain its echo. */
   accepted: boolean;
-  /** Queue entries dispatched since the send began; each echoes a user row that is not this send. */
-  drainedEchoesExpected: number;
   /** A synthetic user row (pre-send compaction) took the turn; the echo follows that turn. */
   deferredBehindSyntheticTurn: boolean;
 }
@@ -390,6 +388,8 @@ interface WorkspaceChatTransientState {
   queuedMessage: QueuedMessage | null;
   /** Visible queue payload size from the last queue update, to tell drains from new enqueues. */
   queuedMessageCount: number;
+  /** Dispatched queue entries whose user rows have not arrived yet; they are not send echoes. */
+  queueDispatchesAwaitingEcho: number;
   pendingSend: PendingSendState | null;
   liveBashOutput: Map<string, LiveBashOutputInternal>;
   liveAdvisorOutput: Map<string, AdvisorLiveOutputState>;
@@ -503,6 +503,7 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     replayingHistory: false,
     queuedMessage: null,
     queuedMessageCount: 0,
+    queueDispatchesAwaitingEcho: 0,
     pendingSend: null,
     liveBashOutput: new Map(),
     liveAdvisorOutput: new Map(),
@@ -1195,13 +1196,16 @@ export class WorkspaceStore {
       // Attachment-only entries add no text, so size the queue by every visible payload kind.
       const nextCount =
         data.queuedMessages.length + (data.fileParts?.length ?? 0) + (data.reviews?.length ?? 0);
-      if (pending && transient.caughtUp && !transient.replayingHistory) {
-        if (nextCount > transient.queuedMessageCount || (pending.accepted && queuedMessage)) {
+      if (transient.caughtUp && !transient.replayingHistory) {
+        if (nextCount < transient.queuedMessageCount) {
+          // One dispatched entry per shrink, however many batched strings it carried.
+          transient.queueDispatchesAwaitingEcho += 1;
+        } else if (
+          pending &&
+          (nextCount > transient.queuedMessageCount || (pending.accepted && queuedMessage))
+        ) {
           // The send landed in the backend queue; the queued card takes over from the pending row.
           transient.pendingSend = null;
-        } else if (nextCount < transient.queuedMessageCount) {
-          // One dispatched entry per shrink, however many batched strings it carried.
-          pending.drainedEchoesExpected += 1;
         }
       }
       transient.queuedMessageCount = nextCount;
@@ -4060,11 +4064,9 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
   }
 
-  clearPendingInitialSendState(workspaceId: string): void {
-    const transient = this.chatTransientState.get(workspaceId);
-    if (transient?.pendingSend) {
-      transient.pendingSend = null;
-      this.states.bump(workspaceId);
+  clearPendingInitialSendState(workspaceId: string, pendingSendId?: string | null): void {
+    if (pendingSendId != null) {
+      this.clearPendingSend(workspaceId, pendingSendId);
     }
 
     const aggregator = this.aggregators.get(workspaceId);
@@ -4099,7 +4101,6 @@ export class WorkspaceStore {
           )
         : null,
       accepted: false,
-      drainedEchoesExpected: 0,
       deferredBehindSyntheticTurn: false,
     };
     this.states.bump(workspaceId);
@@ -4166,18 +4167,14 @@ export class WorkspaceStore {
     transient: WorkspaceChatTransientState,
     echo: MuxMessage
   ): void {
-    const pending = transient.pendingSend;
-    if (!pending) {
-      return;
-    }
     if (echo.metadata?.synthetic === true) {
-      if (echo.metadata.muxMetadata?.type === "compaction-request") {
-        pending.deferredBehindSyntheticTurn = true;
+      if (transient.pendingSend && echo.metadata.muxMetadata?.type === "compaction-request") {
+        transient.pendingSend.deferredBehindSyntheticTurn = true;
       }
       return;
     }
-    if (pending.drainedEchoesExpected > 0) {
-      pending.drainedEchoesExpected -= 1;
+    if (transient.queueDispatchesAwaitingEcho > 0) {
+      transient.queueDispatchesAwaitingEcho -= 1;
       return;
     }
     transient.pendingSend = null;
@@ -5022,8 +5019,8 @@ export const workspaceStore = {
    */
   markPendingInitialSend: (workspaceId: string, pendingStreamModel: string | null) =>
     getStoreInstance().markPendingInitialSend(workspaceId, pendingStreamModel),
-  clearPendingInitialSendState: (workspaceId: string) =>
-    getStoreInstance().clearPendingInitialSendState(workspaceId),
+  clearPendingInitialSendState: (workspaceId: string, pendingSendId?: string | null) =>
+    getStoreInstance().clearPendingInitialSendState(workspaceId, pendingSendId),
   beginPendingSend: (workspaceId: string, message: PendingSendMessage) =>
     getStoreInstance().beginPendingSend(workspaceId, message),
   updatePendingSend: (workspaceId: string, message: PendingSendMessage) =>

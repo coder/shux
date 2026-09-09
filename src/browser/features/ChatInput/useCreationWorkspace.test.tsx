@@ -1129,7 +1129,9 @@ describe("useCreationWorkspace", () => {
     // barrier is cleared once staging fails.
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
     expect(onWorkspaceCreated.mock.calls[0][1]).toMatchObject({ markPendingInitialSend: true });
-    expect(clearPendingInitialSendSpy.mock.calls).toContainEqual([TEST_WORKSPACE_ID]);
+    expect(clearPendingInitialSendSpy.mock.calls.map(([workspaceId]) => workspaceId)).toContain(
+      TEST_WORKSPACE_ID
+    );
     clearPendingInitialSendSpy.mockRestore();
 
     const pendingScopeId = getPendingScopeId(TEST_PROJECT_PATH);

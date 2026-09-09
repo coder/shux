@@ -1110,7 +1110,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       hasRenderableMessages: deferredMessages.length > 0,
       // Any mounted barrier (including waiting-on-monitor) counts: a cleared
       // transcript with an armed monitor must not flash placeholders under it.
-      shouldShowStreamingBarrier: shouldMountStreamingBarrier,
+      // A pending send is a live tail row for the same reason.
+      shouldShowStreamingBarrier: shouldMountStreamingBarrier || pendingSend !== null,
     });
   const showEmptyTranscriptPlaceholder =
     deferredMessages.length === 0 &&

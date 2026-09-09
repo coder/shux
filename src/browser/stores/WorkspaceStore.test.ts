@@ -4955,6 +4955,49 @@ describe("WorkspaceStore", () => {
       );
     });
 
+    it("does not treat the echo of an entry dispatched before the send began as its acknowledgement", async () => {
+      const workspaceId = "pending-send-queue-drain-before-begin";
+      const echo = gate();
+      const own = gate();
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: true,
+          queuedMessages: ["earlier follow-up"],
+          displayText: "earlier follow-up",
+        };
+        // Dispatch happens before the user sends; the dispatched row arrives only afterwards.
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: false,
+          queuedMessages: [],
+          displayText: "",
+        };
+        await echo.opened;
+        yield createUserMessageEvent("follow-up-1", "earlier follow-up", 2, 2);
+        await own.opened;
+        yield createUserMessageEvent("user-2", "hello", 3, 3);
+        await waitForAbortSignal(signal);
+      });
+      await tick(20);
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      echo.release();
+      expect(
+        await waitUntil(() =>
+          store.getWorkspaceState(workspaceId).muxMessages.some((m) => m.id === "follow-up-1")
+        )
+      ).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+
+      own.release();
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).pendingSend === null)).toBe(
+        true
+      );
+    });
+
     it("keeps the pending row when a queue update only shrinks", async () => {
       const workspaceId = "pending-send-queue-partial-drain";
       const drain = gate();

@@ -503,6 +503,7 @@ export function useCreationWorkspace({
       );
 
       let createdWorkspaceId: string | null = null;
+      let pendingSendId: string | null = null;
 
       try {
         // Wait for identity generation to complete (blocks if still in progress)
@@ -704,7 +705,7 @@ export function useCreationWorkspace({
         // Runtime startup can take minutes; keep the initial message visible in the new
         // transcript until the backend echoes it. Files awaiting staging show as display-only
         // parts until the staged notice replaces them below.
-        const pendingSendId = `pending-send-${Date.now()}`;
+        pendingSendId = `pending-send-${Date.now()}`;
         const pendingDisplayText = overrideRawCommand ?? messageText;
         if (initialSlashCommand == null) {
           const displayFileParts: FilePart[] = [
@@ -748,7 +749,7 @@ export function useCreationWorkspace({
         }
 
         if (stagingFailed) {
-          workspaceStore.clearPendingInitialSendState(metadata.id);
+          workspaceStore.clearPendingInitialSendState(metadata.id, pendingSendId);
           // Fail closed: a partial notice would misrepresent the workspace
           // contents. Transfer the draft (staged results kept, failed files
           // still pending) so the user can retry from the workspace composer.
@@ -801,7 +802,7 @@ export function useCreationWorkspace({
           setIsSending(false);
 
           if (commandResult.inputDisposition !== "consume") {
-            workspaceStore.clearPendingInitialSendState(metadata.id);
+            workspaceStore.clearPendingInitialSendState(metadata.id, pendingSendId);
             return { success: false };
           }
 
@@ -865,7 +866,7 @@ export function useCreationWorkspace({
 
         if (!sendResult.success) {
           if (createdWorkspaceId) {
-            workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
+            workspaceStore.clearPendingInitialSendState(createdWorkspaceId, pendingSendId);
           }
           if (stagingOutcome.staged.length > 0) {
             // The creation draft was already cleared; without a transferred
@@ -892,7 +893,7 @@ export function useCreationWorkspace({
         return { success: true };
       } catch (err) {
         if (createdWorkspaceId) {
-          workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
+          workspaceStore.clearPendingInitialSendState(createdWorkspaceId, pendingSendId);
         }
         const errorMessage = getErrorMessage(err);
         setToast({
