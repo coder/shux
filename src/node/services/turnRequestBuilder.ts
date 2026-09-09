@@ -2787,9 +2787,10 @@ export class TurnRequestBuilder {
         };
       // Final toolset of the request being started: request.assemble
       // middleware ran inside prepareModelRequest, and `memory` is a built-in
-      // that tool search never defers, so its absence means denied. The deny
-      // lands now; the grant waits for onStreamStarted (see
-      // persistWorkspaceMemoryWritable).
+      // that tool search never defers and PTC never bridges (ptcExcluded in
+      // toolDefinitions: its top-level presence keys the memory index / hot
+      // set), so its absence means denied. The deny lands now; the grant
+      // waits for onStreamStarted (see persistWorkspaceMemoryWritable).
       const finalWorkspaceMemoryWritable = workspaceMemoryWritable && tools.memory !== undefined;
       if (!finalWorkspaceMemoryWritable && !(await persistWorkspaceMemoryWritable(false))) {
         const errorEvent = createErrorEvent(workspaceId, {

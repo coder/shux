@@ -1008,13 +1008,14 @@ export class MemoryService extends EventEmitter {
             await store.writeFile(target.relPath, content);
             imported++;
           }
-          adopted[relPath] = contentHash;
-          manifestDirty = true;
-          // Pins/stats were keyed by the child: a written copy gets them under
-          // the owner key too. The child-keyed entry stays — like the legacy
-          // file, it is what a downgraded build reads. For an identical file
-          // the owner already has, the owner's own stats stand.
-          if (!target.write) continue;
+          // Pins/stats were keyed by the child: fill them in under the owner
+          // key too. The child-keyed entry stays — like the legacy file, it is
+          // what a downgraded build reads. Done even when the bytes were
+          // already there, and recorded in the manifest only once it
+          // succeeded: an adoption interrupted after its writeFile (or a
+          // failing sidecar write) retries this step on the next access.
+          // copyKeys never overwrites an entry the owner already has, so a
+          // note the owner tracked independently keeps the owner's history.
           try {
             await this.metaService.copyKeys(
               memoryLogicalKey("workspace", relPath, {
@@ -1027,8 +1028,14 @@ export class MemoryService extends EventEmitter {
               })
             );
           } catch (error) {
-            log.debug("[MemoryService] failed to copy legacy memory stats", { relPath, error });
+            log.warn("[MemoryService] failed to copy legacy memory stats; retrying on next access", {
+              relPath,
+              error,
+            });
+            continue;
           }
+          adopted[relPath] = contentHash;
+          manifestDirty = true;
         }
         if (manifestDirty) {
           await writeFileAtomic(manifestPath, JSON.stringify(adopted), { encoding: "utf-8" });

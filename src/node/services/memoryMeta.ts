@@ -241,9 +241,13 @@ export class MemoryMetaService {
       }),
 
     /**
-     * Duplicate a subtree's entries under a second key, keeping the source:
-     * a legacy sub-agent note copied into the shared store stays readable by
-     * a downgraded build under its child key, so its pin/stats must too.
+     * Duplicate a subtree's entries under a second key, keeping the source
+     * and never overwriting an entry the target already has: a legacy
+     * sub-agent note copied into the shared store stays readable by a
+     * downgraded build under its child key (so its pin/stats must too), while
+     * a note the owner already tracked keeps the owner's own history.
+     * Idempotent, so a retried adoption fills in what an interrupted one
+     * missed without disturbing anything recorded since.
      */
     copyKeys: (
       sourceLogicalKey: string,
@@ -252,7 +256,9 @@ export class MemoryMetaService {
       this.mutate((entries) => {
         for (const [key, entry] of Object.entries(entries)) {
           if (!keyInSubtree(key, sourceLogicalKey)) continue;
-          entries[`${targetLogicalKey}${key.slice(sourceLogicalKey.length)}`] = { ...entry };
+          const targetKey = `${targetLogicalKey}${key.slice(sourceLogicalKey.length)}`;
+          if (targetKey in entries) continue;
+          entries[targetKey] = { ...entry };
         }
       }),
 
@@ -402,7 +408,7 @@ export class MemoryMetaService {
     await Effect.runPromise(this.effects.renameKeys(oldLogicalKey, newLogicalKey));
   }
 
-  /** Duplicate a subtree's entries under `targetLogicalKey`, keeping the source (see effects). */
+  /** Fill in a subtree's entries under `targetLogicalKey`, keeping the source and existing targets (see effects). */
   async copyKeys(sourceLogicalKey: string, targetLogicalKey: string): Promise<void> {
     await Effect.runPromise(this.effects.copyKeys(sourceLogicalKey, targetLogicalKey));
   }

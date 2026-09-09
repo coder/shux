@@ -1285,11 +1285,18 @@ describe("MemoryService", () => {
       );
       // A downgraded build wrote a new note into the legacy dir meanwhile.
       await fsPromises.writeFile(path.join(legacyRoot, "downgrade.md"), "written on old build");
+      // An earlier adoption was interrupted right after writing this file's
+      // bytes: identical bytes in the owner store, pin only under the child
+      // key, nothing in the manifest. The retry must still copy the pin.
+      await fsPromises.writeFile(path.join(legacyRoot, "half.md"), "half adopted");
+      await fsPromises.writeFile(path.join(ownerRoot, "half.md"), "half adopted");
+      await fixture.metaService.setPinned("workspace:ws-child:half.md", true);
       const restarted = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
       const relisted = await restarted.listIndexEntries(fixture.ctx);
       expect(relisted.filter((e) => e.scope === "workspace").map((e) => e.relPath)).toEqual([
         "clash.md",
         "downgrade.md",
+        "half.md",
         "imported/ws-child/clash.md",
         "only-child.md",
         "sub/same.md",
@@ -1297,6 +1304,12 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(path.join(ownerRoot, "only-child.md"), "utf-8")).toBe(
         "shared edit"
       );
+      expect([...(await fixture.metaService.getPinnedKeys())].sort()).toEqual([
+        "workspace:ws-child:half.md",
+        "workspace:ws-child:only-child.md",
+        "workspace:ws-owner:half.md",
+        "workspace:ws-owner:only-child.md",
+      ]);
 
       // A workspace that is its own owner keeps its private store untouched.
       const solo = { ...fixture.ctx, workspaceId: "ws-solo" };
