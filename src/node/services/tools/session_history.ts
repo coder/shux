@@ -6,9 +6,11 @@ import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { MuxMessage } from "@/common/types/message";
 import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import { HISTORY_PROVENANCE_MAX_RECEIPT_BYTES } from "@/node/services/historyAppendProvenance";
 import {
   SESSION_HISTORY_MAX_SCAN_BYTES,
   SESSION_HISTORY_MAX_SCAN_ROWS,
+  SESSION_HISTORY_SCAN_CHUNK_BYTES,
   SESSION_HISTORY_DEFAULT_LIMIT,
   SESSION_HISTORY_RESULT_ENVELOPE_BYTES,
   SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES,
@@ -97,9 +99,12 @@ function projectHistory(message: MuxMessage): { text: string; toolNames: Set<str
 }
 
 /**
- * Whether a caller row holds a canonical `task` creation receipt for `taskId`: a top-level or
- * PTC-nested `task` tool result naming it in taskId / taskIds / tasks[] / reports[]. IDs that
- * merely appear in reports, other tools' output (task_list, task_await) or free text do not count.
+ * Whether a caller row holds a canonical `task` creation receipt for `taskId`: a top-level
+ * `task` tool result, a PTC-nested one (persisted `nestedCalls`, or the legacy
+ * `code_execution` output `toolCalls` records that displayedMessageBuilder still reconstructs),
+ * naming it in taskId / taskIds / tasks[] / reports[]. IDs that merely appear in other tools'
+ * output (task_list, task_await) or free text do not count. Persisted JSON is validated here
+ * and traversal depth is bounded so one corrupt row cannot take the feature down.
  */
 function createsTask(message: MuxMessage, taskId: string): boolean {
   const names = (entry: unknown): boolean => isPlainObject(entry) && entry.taskId === taskId;
@@ -109,13 +114,18 @@ function createsTask(message: MuxMessage, taskId: string): boolean {
       (Array.isArray(output.taskIds) && output.taskIds.includes(taskId)) ||
       (Array.isArray(output.tasks) && output.tasks.some(names)) ||
       (Array.isArray(output.reports) && output.reports.some(names)));
-  const spawns = (record: Record<string, unknown>): boolean =>
-    (record.toolName === "task" && receiptNames(record.output)) ||
-    (Array.isArray(record.nestedCalls) &&
-      record.nestedCalls.some((nested) => isPlainObject(nested) && spawns(nested)));
-  // Parts are persisted JSON; validate the shape at this boundary instead of asserting types.
+  const spawns = (record: Record<string, unknown>, depth: number): boolean => {
+    if (depth > 30) return false;
+    if (record.toolName === "task" && receiptNames(record.output ?? record.result)) return true;
+    const children = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+    const nested: unknown[] = [
+      ...children(record.nestedCalls),
+      ...children(isPlainObject(record.output) ? record.output.toolCalls : undefined),
+    ];
+    return nested.some((entry) => isPlainObject(entry) && spawns(entry, depth + 1));
+  };
   return message.parts.some(
-    (part: unknown) => isPlainObject(part) && part.type === "dynamic-tool" && spawns(part)
+    (part: unknown) => isPlainObject(part) && part.type === "dynamic-tool" && spawns(part, 0)
   );
 }
 
@@ -260,42 +270,78 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             authorization === null || authorization.branchRoot === branchRoot,
             "descendant cursor binding must pin the branch root"
           );
-          // Proven cursors carry the caller scan as "done": continuing it only runs the
-          // append check (an appended manual reset or rewrite throws stale_cursor) without
-          // browsing further caller rows.
-          let found = authorization?.proven === true;
-          const auth = await history.scanHistoryBounded(workspaceId, {
-            cursor: authorization?.scan,
-            budget,
-            visit: ({ message }) => {
-              if (found || !createsTask(message, branchRoot)) return true;
-              found = true;
-              return false;
-            },
-          });
-          budget.maxBytes -= auth.bytesRead;
-          budget.maxRows -= auth.rowsScanned;
-          result.bytesRead = auth.bytesRead;
-          result.rowsScanned = auth.rowsScanned;
-          if (authorization?.proven) {
-            // A partially completed append check resumes next page; otherwise keep the proof.
-            authorization = { ...authorization, scan: auth.cursor ?? authorization.scan };
-          } else if (found) {
-            assert(auth.cursor, "a receipt row leaves the caller scan resumable");
-            authorization = { branchRoot, scan: { ...auth.cursor, phase: "done" }, proven: true };
-          } else if (auth.cursor) {
-            authorization = { branchRoot, scan: auth.cursor, proven: false };
+          // A child created earlier in the SAME streaming turn is only in the caller's
+          // partial message until stream end; that receipt is inside the current segment by
+          // construction (resets require a settled stream). Re-derived every page: once the
+          // turn settles the receipt lives in chat.jsonl and the bounded scan proves it.
+          const partial = await history.readPartial(workspaceId);
+          const inFlight = partial !== null && createsTask(partial, branchRoot);
+          if (!inFlight) {
+            // Proven cursors carry the caller scan as "done": continuing it only runs the
+            // append check (an appended manual reset or rewrite throws stale_cursor) without
+            // browsing further caller rows.
+            let found = authorization?.proven === true;
+            const auth = await history.scanHistoryBounded(workspaceId, {
+              cursor: authorization?.scan,
+              budget,
+              visit: ({ message }) => {
+                if (found || !createsTask(message, branchRoot)) return true;
+                found = true;
+                return false;
+              },
+            });
+            budget.maxBytes -= auth.bytesRead;
+            budget.maxRows -= auth.rowsScanned;
+            result.bytesRead = auth.bytesRead;
+            result.rowsScanned = auth.rowsScanned;
+            if (authorization?.proven) {
+              // An unfinished append check (large caller appends) resumes next page.
+              if (auth.cursor) {
+                result.exhausted = false;
+                result.nextCursor = encodeHistoryCursor({
+                  ...binding,
+                  scan: cursor?.scan ?? null,
+                  authorization: { ...authorization, scan: auth.cursor },
+                });
+                return result;
+              }
+            } else if (found) {
+              assert(auth.cursor, "a receipt row leaves the caller scan resumable");
+              authorization = { branchRoot, scan: { ...auth.cursor, phase: "done" }, proven: true };
+            } else if (auth.cursor) {
+              authorization = { branchRoot, scan: auth.cursor, proven: false };
+              result.exhausted = false;
+              // Keep any target progress made while the in-flight receipt still authorized.
+              result.nextCursor = encodeHistoryCursor({
+                ...binding,
+                scan: cursor?.scan ?? null,
+                authorization,
+              });
+              return result;
+            } else {
+              // The caller's whole post-floor history holds no creation receipt for this branch.
+              return {
+                success: false,
+                error: "task_not_found",
+                exhausted: false,
+                skipped_oversized_rows: 0,
+              };
+            }
+          }
+          // The target scan needs room for its provenance receipts and snapshot anchors;
+          // otherwise hand back a progress page instead of tripping the scanner's budget assert.
+          if (
+            budget.maxBytes <=
+              2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES + SESSION_HISTORY_SCAN_CHUNK_BYTES ||
+            budget.maxRows <= 0
+          ) {
             result.exhausted = false;
-            result.nextCursor = encodeHistoryCursor({ ...binding, scan: null, authorization });
+            result.nextCursor = encodeHistoryCursor({
+              ...binding,
+              scan: cursor?.scan ?? null,
+              authorization,
+            });
             return result;
-          } else {
-            // The caller's whole post-floor history holds no creation receipt for this branch.
-            return {
-              success: false,
-              error: "task_not_found",
-              exhausted: false,
-              skipped_oversized_rows: 0,
-            };
           }
         }
         const scan = await history.scanHistoryBounded(target, {

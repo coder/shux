@@ -3513,6 +3513,78 @@ describe("session_history descendant task history", () => {
     });
   });
 
+  test("in-flight, legacy PTC and deeply nested receipts are handled without unbounded recursion", async () => {
+    await appendChild("child-row", "child facts");
+    // Same-turn spawn: the receipt lives only in the caller's partial message until stream end.
+    const inFlight = createMuxMessage("in-flight", "assistant", "", undefined, [
+      taskPart("task", { status: "running", taskId: childId, note: "await it" }),
+    ]);
+    await fixture.historyService.writePartial(workspaceId, inFlight);
+    const first = await callAs({ action: "list_items", task_id: childId, limit: 1 });
+    expect(first.items?.map((item) => item.text)).toEqual(["child facts"]);
+    await appendChild("child-two", "child two");
+    // Once the turn settles the receipt is persisted and the bounded scan takes over.
+    await fixture.historyService.deletePartial(workspaceId);
+    expect(await callAs({ action: "list_items", task_id: childId })).toMatchObject({
+      success: false,
+      error: "task_not_found",
+    });
+    // Legacy PTC persistence: nested calls only inside code_execution's output.toolCalls.
+    await appendSpawnPart(
+      taskPart("code_execution", {
+        toolCalls: [
+          { toolName: "task", duration_ms: 3, result: { status: "completed", taskId: childId } },
+        ],
+      })
+    );
+    expect(
+      (await callAs({ action: "list_items", task_id: childId })).items?.map((item) => item.text)
+    ).toEqual(["child facts", "child two"]);
+    // A pathologically nested row neither authorizes nor crashes the scan.
+    let deep: Record<string, unknown> = { toolName: "task", output: { taskId: grandchildId } };
+    for (let i = 0; i < 200; i++)
+      deep = {
+        toolCallId: `n${i}`,
+        toolName: "code_execution",
+        state: "output-available",
+        nestedCalls: [deep],
+      };
+    await appendSpawnPart(deep as unknown as MuxMessage["parts"][number]);
+    await appendTo(grandchildId, "grandchild-row", "grandchild facts");
+    // grandchild resolves to the child branch root, which IS proven; the deep row is just skipped.
+    expect(
+      (await callAs({ action: "list_items", task_id: grandchildId })).items?.map((i) => i.text)
+    ).toEqual(["grandchild facts"]);
+    expect((await callAs({ action: "list_items", task_id: childId })).success).toBe(true);
+  });
+
+  test("large caller appends between proven pages resume the append check as progress pages", async () => {
+    await spawn([childId]);
+    await appendChild("child-one", "child one");
+    await appendChild("child-two", "child two");
+    const first = await callAs({ action: "list_items", task_id: childId, limit: 1 });
+    expect(first.items?.map((item) => item.text)).toEqual(["child one"]);
+    const rows = Array.from({ length: SESSION_HISTORY_MAX_SCAN_ROWS + 100 }, (_, i) =>
+      createMuxMessage(`later-${i}`, "assistant", `later ${i}`, { historySequence: 5000 + i })
+    );
+    await appendTrackedHistory(chatPath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+    const checking = await callAs({
+      action: "list_items",
+      task_id: childId,
+      limit: 1,
+      cursor: first.nextCursor,
+    });
+    expect(checking).toMatchObject({ success: true, exhausted: false, items: [] });
+    expect(checking.nextCursor).toBeString();
+    const resumed = await callAs({
+      action: "list_items",
+      task_id: childId,
+      limit: 1,
+      cursor: checking.nextCursor,
+    });
+    expect(resumed.items?.map((item) => item.text)).toEqual(["child two"]);
+  });
+
   test("unauthorized, unknown and unavailable targets fail closed without creating sessions", async () => {
     await spawn([childId, removedChildId, "sibling-workspace", "unknown"]);
     await appendChild("child-row", "child facts");
