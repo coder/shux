@@ -145,13 +145,13 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
     description: buildMemoryDescription(config),
     inputSchema: TOOL_DEFINITIONS.memory.schema,
-    execute: (input, { toolCallId }): Promise<MemoryToolResult> => {
+    execute: async (input, { toolCallId }): Promise<MemoryToolResult> => {
       if (writePath != null && writePin && input.command !== "view") {
         if (input.command === "delete" || input.command === "rename") {
-          return Promise.resolve({
+          return {
             success: false,
             error: `This turn may only create or update ${writePath}; '${input.command}' is unavailable.`,
-          });
+          };
         }
         // Only a mutation the executor would accept (required fields present, pinned path)
         // claims the single slot, so a malformed or mis-targeted sibling cannot waste the
@@ -165,20 +165,36 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
               ? input.old_str != null
               : input.insert_line != null && input.insert_text != null);
         if (wellFormed) {
-          // The notes are preloaded truncated to CONTEXT_NOTES_RESERVED_BYTES; larger writes
-          // would only bloat the file with content the next window never sees.
-          const written = input.file_text ?? input.insert_text ?? input.new_str ?? "";
-          if (Buffer.byteLength(written, "utf8") > CONTEXT_NOTES_RESERVED_BYTES) {
-            return Promise.resolve({
+          // The notes are preloaded truncated to CONTEXT_NOTES_RESERVED_BYTES; a resulting
+          // file beyond that only bloats it with content the next window never sees. Size the
+          // payload by command and project the resulting file against the current contents.
+          const payload =
+            input.command === "create"
+              ? (input.file_text ?? "")
+              : input.command === "insert"
+                ? (input.insert_text ?? "")
+                : (input.new_str ?? "");
+          let currentBytes = 0;
+          if (input.command !== "create") {
+            const current = await memoryService.readFileWithSha(ctx, input.path);
+            currentBytes = current.success
+              ? Buffer.byteLength(current.data.content, "utf8") -
+                (input.command === "str_replace"
+                  ? Buffer.byteLength(input.old_str ?? "", "utf8")
+                  : 0)
+              : 0;
+          }
+          if (currentBytes + Buffer.byteLength(payload, "utf8") > CONTEXT_NOTES_RESERVED_BYTES) {
+            return {
               success: false,
-              error: `Context notes are limited to ${CONTEXT_NOTES_RESERVED_BYTES} bytes; shorten the content (essential state first).`,
-            });
+              error: `Context notes are limited to ${CONTEXT_NOTES_RESERVED_BYTES} bytes in total; shorten or replace content (essential state first).`,
+            };
           }
           if (pinnedMutationUsed) {
-            return Promise.resolve({
+            return {
               success: false,
               error: `This turn allows a single memory mutation of ${writePath}; it was already used.`,
-            });
+            };
           }
           pinnedMutationUsed = true;
         }

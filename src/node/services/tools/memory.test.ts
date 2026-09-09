@@ -374,6 +374,17 @@ describe("memory tool", () => {
       });
       expect(oversized.success).toBe(false);
       if (!oversized.success) expect(oversized.error).toContain("limited to");
+      // The payload is sized by command: an irrelevant empty file_text does not hide an
+      // oversized insert.
+      const oversizedInsert = await run(fixture.tool, {
+        command: "insert",
+        path: notes,
+        insert_line: 0,
+        insert_text: "y".repeat(8 * 1024 + 1),
+        file_text: "",
+      });
+      expect(oversizedInsert.success).toBe(false);
+      if (!oversizedInsert.success) expect(oversizedInsert.error).toContain("limited to");
       expect(
         (
           await run(fixture.tool, {
@@ -400,6 +411,38 @@ describe("memory tool", () => {
       expect(
         (await run(fresh, { command: "insert", path: notes, insert_line: 0, insert_text: "x" }))
           .success
+      ).toBe(true);
+    });
+
+    it("caps the resulting notes file, not just the payload", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      expect(
+        (
+          await run(fixture.tool, {
+            command: "create",
+            path: notes,
+            file_text: "a".repeat(6 * 1024),
+          })
+        ).success
+      ).toBe(true);
+      const grow = await run(createMemoryTool(fixture.config), {
+        command: "insert",
+        path: notes,
+        insert_line: 0,
+        insert_text: "b".repeat(3 * 1024),
+      });
+      expect(grow.success).toBe(false);
+      if (!grow.success) expect(grow.error).toContain("limited to");
+      // Replacing content that frees space is fine.
+      expect(
+        (
+          await run(createMemoryTool(fixture.config), {
+            command: "str_replace",
+            path: notes,
+            old_str: "a".repeat(6 * 1024),
+            new_str: "c".repeat(7 * 1024),
+          })
+        ).success
       ).toBe(true);
     });
 

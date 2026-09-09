@@ -35,6 +35,12 @@ const options: SendMessageOptions = {
   agentId: "exec",
   experiments: { tokenBudget: true },
 };
+// Resume paths re-validate memory writability from the caller's options; the harness has no
+// backend experiment service, so resumes state the Memory experiment explicitly.
+const resumeOptions: SendMessageOptions = {
+  ...options,
+  experiments: { tokenBudget: true, memory: true },
+};
 const correlation = {
   type: "workspace-turn-task",
   taskHandleId: "wst_budget",
@@ -1679,7 +1685,7 @@ describe("AgentSession token-budget lifecycle", () => {
     );
     await first.session.dispose();
     const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(options)).success).toBe(true);
+    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
     expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     expect(applyToolPolicyToNames(["memory", "bash"], h.requests[0].toolPolicy)).toEqual([
       "memory",
@@ -1734,7 +1740,7 @@ describe("AgentSession token-budget lifecycle", () => {
     await first.session.dispose();
     // Startup retry resumes the persisted flush turn through history, not a fresh send.
     const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(options)).success).toBe(true);
+    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
     // The sealing intent is restored with the resumed turn: the rollover continuation is
     // queued up front, and the flush stays bounded to one step even though the resumed step
     // no longer crosses the threshold.
@@ -1779,7 +1785,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await first.historyService.writePartial(workspaceId, partial)).success).toBe(true);
     await first.session.dispose();
     const h = await setup({ previous: first });
-    expect((await h.session.resumeStream(options)).success).toBe(true);
+    expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
     expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     // No tools at all: the resumed turn can only end, then the queued rollover seals the window.
