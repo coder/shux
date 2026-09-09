@@ -1,6 +1,6 @@
 import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
 import { describe, expect, it, spyOn } from "bun:test";
-import { generateText, jsonSchema, streamText, tool, type Tool } from "ai";
+import { generateText, jsonSchema, streamText, tool, type LanguageModel, type Tool } from "ai";
 import { xai } from "@ai-sdk/xai";
 import { writeFile } from "node:fs/promises";
 import * as fs from "fs";
@@ -32,7 +32,8 @@ import {
   wrapFetchWithXAIServiceTier,
   type OauthServiceBindings,
 } from "./providerModelFactory";
-import { hasLanguageModelCleanup } from "./languageModelCleanup";
+import { hasLanguageModelCleanup, runLanguageModelCleanup } from "./languageModelCleanup";
+import * as openAIWebSocketTransport from "./openAIWebSocketTransportFetch";
 import type { DevToolsService } from "./devToolsService";
 import { CodexOauthService } from "./codexOauthService";
 import type { CoderOauthService } from "./coderOauthService";
@@ -1320,7 +1321,172 @@ describe("ProviderModelFactory GitHub Copilot", () => {
   });
 });
 
+describe("ProviderModelFactory native OpenAI alias tiers", () => {
+  it.each(["responses", "chatCompletions"] as const)(
+    "retains SDK tier gating for unmapped native models over %s",
+    async (wireFormat) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        store.saveProvidersConfig({
+          openai: { apiKey: "native-key", wireFormat, serviceTier: "priority" },
+        });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel("openai:gpt-5-nano");
+          if (!result.success) throw new Error(result.error.type);
+          await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+            () => undefined
+          );
+          expect(calls).toHaveLength(1);
+          expect(parseSentBody(calls[0])).not.toHaveProperty("service_tier");
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
+
+  it.each(["responses", "chatCompletions"] as const)(
+    "preserves tier and store precedence over %s without changing the raw alias",
+    async (wireFormat) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        const provider = {
+          apiKey: "native-key",
+          baseUrl: "https://native.example.com/v1",
+          wireFormat,
+          serviceTier: "priority" as const,
+          store: false,
+          models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+        };
+        store.saveProvidersConfig({ openai: provider });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel("openai:team-astra");
+          if (!result.success) throw new Error(result.error.type);
+          store.saveProvidersConfig({ openai: { ...provider, serviceTier: "auto", store: true } });
+          for (const [providerOptions, tier, storeValue] of [
+            [undefined, "priority", false],
+            [{ openai: { serviceTier: "flex", store: true } }, "flex", true],
+          ] as const) {
+            for (const stream of [false, true]) {
+              const before = calls.length;
+              const request = {
+                model: result.data,
+                providerOptions,
+                prompt: "hello",
+                maxRetries: 0,
+              };
+              if (stream) {
+                await streamText(request).consumeStream({ onError: () => undefined });
+              } else {
+                await generateText(request).catch(() => undefined);
+              }
+              expect(calls.length).toBe(before + 1);
+              expect(parseSentBody(calls[before])).toMatchObject({
+                model: "team-astra",
+                service_tier: tier,
+                store: storeValue,
+              });
+              const endpoint = wireFormat === "responses" ? "responses" : "chat/completions";
+              expect(calls[before].url).toBe(`https://native.example.com/v1/${endpoint}`);
+              expect(new Headers(calls[before].init.headers).get("authorization")).toBe(
+                "Bearer native-key"
+              );
+            }
+          }
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
+});
+
 describe("ProviderModelFactory OpenAI WebSocket transport", () => {
+  it("reuses one transport for tiered native aliases and runs cleanup once", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      const provider = {
+        apiKey: "native-key",
+        baseUrl: "https://native.example.com/v1",
+        webSocketTransportEnabled: true,
+        serviceTier: "priority" as const,
+        store: false,
+        models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+      };
+      store.saveProvidersConfig({ openai: provider });
+      const http = createCapturingFetch();
+      const ws = createCapturingFetch();
+      const createTransport = openAIWebSocketTransport.createOpenAIWebSocketTransportFetch;
+      let transports = 0;
+      let webSocketFetches = 0;
+      let closes = 0;
+      const transportSpy = spyOn(
+        openAIWebSocketTransport,
+        "createOpenAIWebSocketTransportFetch"
+      ).mockImplementation((options) => {
+        transports++;
+        return createTransport({
+          ...options,
+          createWebSocketFetch: (options) => {
+            webSocketFetches++;
+            expect(options?.url).toBe("wss://native.example.com/v1/responses");
+            return Object.assign(ws.fakeFetch, {
+              close: () => {
+                closes++;
+              },
+            });
+          },
+        });
+      });
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(http.fakeFetch);
+      let model: LanguageModel | undefined;
+      try {
+        const result = await factory.createModel("openai:team-astra");
+        if (!result.success) throw new Error(result.error.type);
+        model = result.data;
+        expect(hasLanguageModelCleanup(model)).toBe(true);
+        store.saveProvidersConfig({
+          openai: { ...provider, serviceTier: "auto", webSocketTransportEnabled: false },
+        });
+        for (const serviceTier of [undefined, "flex"] as const) {
+          await streamText({
+            model,
+            prompt: "hello",
+            maxRetries: 0,
+            ...(serviceTier ? { providerOptions: { openai: { serviceTier } } } : {}),
+          }).consumeStream({ onError: () => undefined });
+        }
+        await generateText({ model, prompt: "hello", maxRetries: 0 }).catch(() => undefined);
+        expect(ws.calls.map((call) => parseSentBody(call).service_tier)).toEqual([
+          "priority",
+          "flex",
+        ]);
+        expect(http.calls).toHaveLength(1);
+        expect(parseSentBody(http.calls[0])).toMatchObject({
+          model: "team-astra",
+          service_tier: "priority",
+          store: false,
+        });
+        for (const call of ws.calls) {
+          expect(parseSentBody(call)).toMatchObject({ model: "team-astra", store: false });
+          expect(new Headers(call.init.headers).get("authorization")).toBe("Bearer native-key");
+        }
+        expect(transports).toBe(1);
+        expect(webSocketFetches).toBe(1);
+        expect(closes).toBe(0);
+        runLanguageModelCleanup(model);
+        runLanguageModelCleanup(model);
+        expect(closes).toBe(1);
+        expect(hasLanguageModelCleanup(model)).toBe(false);
+      } finally {
+        runLanguageModelCleanup(model);
+        fetchSpy.mockRestore();
+        transportSpy.mockRestore();
+      }
+    });
+  });
+
   it("attaches cleanup when enabled for Responses models", async () => {
     await withOpenAIBaseUrlEnvUnset(async () =>
       withTempConfig(async (config, factory) => {
@@ -2431,6 +2597,7 @@ describe("ProviderModelFactory Coder", () => {
     "github-copilot:gpt-6-astra",
     "github-copilot:gpt-5.4",
     "openai:gpt-6-astra",
+    "openai:team-astra",
     "responses-proxy:team-astra",
     "openrouter:openai/team-astra",
     "mux-gateway:openai/team-astra",
@@ -2452,6 +2619,7 @@ describe("ProviderModelFactory Coder", () => {
         openai: {
           ...(modelString.startsWith("openai:") ? { apiKey: "test-key" } : {}),
           serviceTier: "priority",
+          models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
         },
         openrouter: { apiKey: "test-key" },
         "mux-gateway": { couponCode: "test-token" },
@@ -2586,12 +2754,22 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
-  it.each(["openai", "openai-compat", "openai-responses"])(
+  it.each(["openai", "openai-compat", "openai-responses", "native-responses", "native-chat"])(
     "keeps concurrent tier overrides isolated for %s aliases",
     async (type) => {
       await withTempConfig(async (config, factory, oauth, store) => {
         const custom = type === "openai-responses";
-        if (custom) {
+        const native = type === "native-responses" || type === "native-chat";
+        if (native) {
+          store.saveProvidersConfig({
+            openai: {
+              apiKey: "custom-key",
+              baseUrl: "https://native.example.com/v1",
+              wireFormat: type === "native-chat" ? "chatCompletions" : "responses",
+              models: [{ id: "astra-alias", mappedToModel: "openai:gpt-6-astra" }],
+            },
+          });
+        } else if (custom) {
           store.saveProvidersConfig({
             "responses-proxy": {
               providerType: "openai-responses",
@@ -2625,14 +2803,18 @@ describe("ProviderModelFactory Coder", () => {
         oauth.coderOauthService = oauthService;
         const { calls, fakeFetch } = createCapturingFetch();
         const interleavedFetch = Object.assign(async (...args: Parameters<typeof fakeFetch>) => {
-          if (custom) await interleaveFirstRequest();
+          if (custom || native) await interleaveFirstRequest();
           return fakeFetch(...args);
         }, fakeFetch);
         const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(interleavedFetch);
         let first: Promise<unknown> | undefined;
         try {
           const created = await factory.createModel(
-            custom ? "responses-proxy:astra-alias" : "coder:team/astra-alias"
+            native
+              ? "openai:astra-alias"
+              : custom
+                ? "responses-proxy:astra-alias"
+                : "coder:team/astra-alias"
           );
           if (!created.success) throw new Error(created.error.type);
           first = generateText({
@@ -2654,7 +2836,7 @@ describe("ProviderModelFactory Coder", () => {
             "flex",
             "priority",
           ]);
-          if (custom) {
+          if (custom || native) {
             expect(
               calls.map((call) => new Headers(call.init.headers).get("authorization"))
             ).toEqual(["Bearer custom-key", "Bearer custom-key"]);
@@ -2718,6 +2900,7 @@ describe("ProviderModelFactory Coder", () => {
           serviceTier: "priority",
           codexOauth: auth,
           codexOauthDefaultAuth: "oauth",
+          models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
         },
       });
       await saveRoutePriority(config, ["direct"]);
@@ -2728,6 +2911,7 @@ describe("ProviderModelFactory Coder", () => {
       const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
       try {
         for (const model of [
+          "openai:team-astra",
           "openai:gpt-6-astra",
           "coder:openai/gpt-6-astra",
           "coder:google/gemini-3-pro",
@@ -2742,6 +2926,11 @@ describe("ProviderModelFactory Coder", () => {
             () => undefined
           );
           expect(calls.length).toBe(before + 1);
+          if (model.startsWith("openai:")) {
+            expect(calls[before].url).toBe(CODEX_ENDPOINT);
+            expect(parseSentBody(calls[before]).store).toBe(false);
+            expect(hasLanguageModelCleanup(result.data.model)).toBe(false);
+          }
           expect(parseSentBody(calls[before])).not.toHaveProperty("service_tier");
         }
       } finally {

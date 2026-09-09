@@ -1896,18 +1896,25 @@ export class ProviderModelFactory {
 
           // Lazy-load OpenAI provider to reduce startup time
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
-          const provider = createOpenAI({
-            ...configWithCreds,
-            // Cast is safe: our fetch implementation is compatible with the SDK's fetch type.
-            // The preconnect method is optional in our implementation but required by the SDK type.
-            fetch: webSocketTransport.fetch,
-          });
-          // OpenAI reasoning state is preserved via explicit history, so no extra
-          // middleware is needed beyond the provider's standard Responses handling.
-          const model =
-            effectiveWireFormat === "chatCompletions"
+          const createNativeModel = (fetch: typeof webSocketTransport.fetch) => {
+            const provider = createOpenAI({ ...configWithCreds, fetch });
+            return effectiveWireFormat === "chatCompletions"
               ? provider.chat(modelId)
               : provider.responses(modelId);
+          };
+          // Reuse the same transport across per-call adapters. Inject tiers before
+          // its HTTP/WebSocket dispatch, and keep OAuth's normalization unchanged.
+          // Only explicit native aliases bypass name-based SDK tier gating;
+          // ordinary model IDs retain their existing capability restrictions.
+          const isMappedAlias =
+            resolveModelForMetadata(fullModelId, providersConfig) !== fullModelId;
+          const model = shouldRouteThroughCodexOauth
+            ? createNativeModel(webSocketTransport.fetch)
+            : createOpenAIModelWithServiceTier(
+                createNativeModel,
+                webSocketTransport.fetch,
+                serviceTierAvailable && isMappedAlias
+              );
           if (webSocketTransport.active) {
             attachLanguageModelCleanup(model, webSocketTransport.close);
           }
