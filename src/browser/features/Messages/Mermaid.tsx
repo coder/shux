@@ -5,6 +5,7 @@ import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 
 const MIN_HEIGHT = 300;
 const DEFAULT_ZOOM = 1;
@@ -427,6 +428,9 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
         </div>
         <div
           className="mermaid-container"
+          ref={(element) => {
+            if (element) transcriptMermaidSources.set(element, chart);
+          }}
           style={{
             maxWidth: "70%",
             margin: "0 auto",

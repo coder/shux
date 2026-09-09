@@ -7,7 +7,12 @@ import {
   type FormattedClipboardContent,
 } from "@/browser/utils/clipboard";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { isEditableElement } from "@/browser/utils/ui/keybinds";
+import {
+  isEditableElement,
+  KEYBINDS,
+  matchesKeybind,
+  formatKeybind,
+} from "@/browser/utils/ui/keybinds";
 import {
   formatTranscriptTextAsQuote,
   getTranscriptContextMenuLink,
@@ -65,9 +70,12 @@ export function useTranscriptContextMenu(
       }
 
       const selection = typeof window === "undefined" ? null : window.getSelection();
-      setMarkdown(
-        getTranscriptContextMenuMarkdown({ transcriptRoot, target: event.target, selection })
-      );
+      const selectedMarkdown = getTranscriptContextMenuMarkdown({
+        transcriptRoot,
+        target: event.target,
+        selection,
+      });
+      setMarkdown(selectedMarkdown);
 
       // Links get priority: right-clicking an anchor should offer "Copy link"
       // rather than falling through to text quote/copy actions. Electron has
@@ -90,12 +98,12 @@ export function useTranscriptContextMenu(
         selection,
       });
 
-      if (!text) {
+      if (!text && !selectedMarkdown) {
         transcriptMenu.close();
         return;
       }
 
-      transcriptMenuTextRef.current = text;
+      transcriptMenuTextRef.current = text ?? selectedMarkdown!.text;
       transcriptMenuLinkRef.current = "";
       setMode({ kind: "text" });
       transcriptMenu.onContextMenu(event);
@@ -129,14 +137,7 @@ export function useTranscriptContextMenu(
     if (!transcriptMenu.isOpen || !markdown) return;
     // Right-click menus can leave focus on the transcript instead of the menu.
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (
-        event.key.toLowerCase() !== "m" ||
-        event.ctrlKey ||
-        event.metaKey ||
-        event.altKey ||
-        isEditableElement(event.target)
-      )
-        return;
+      if (!matchesKeybind(event, KEYBINDS.COPY_MARKDOWN) || isEditableElement(event.target)) return;
       event.preventDefault();
       stopKeyboardPropagation(event);
       handleCopyMarkdown(markdown, transcriptMenu.close).catch(console.error);
@@ -171,7 +172,7 @@ export function useTranscriptContextMenu(
           <PositionedMenuItem
             icon={<Clipboard />}
             label="Copy Markdown"
-            shortcut="M"
+            shortcut={formatKeybind(KEYBINDS.COPY_MARKDOWN)}
             onClick={() => {
               handleCopyMarkdown(markdown, transcriptMenu.close).catch(console.error);
             }}

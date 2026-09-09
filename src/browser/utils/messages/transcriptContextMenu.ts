@@ -5,6 +5,7 @@ import {
   TRANSCRIPT_MESSAGE_SELECTOR,
   TRANSCRIPT_QUOTE_ROOT_SELECTOR,
   TRANSCRIPT_QUOTE_TEXT_ATTRIBUTE,
+  transcriptMermaidSources,
 } from "./transcriptQuoteAttributes";
 
 // Preserve native link context-menu actions (open/copy link, etc.) by treating
@@ -118,14 +119,15 @@ function selectionIntersectsIgnoredChrome(quoteRoot: Element, selectionRange: Ra
 function getSelectedTranscriptText(
   transcriptRoot: HTMLElement,
   selection: Selection | null,
-  target: EventTarget | null
+  target: EventTarget | null,
+  allowDiagrams = false
 ): string | null {
   if (!selection || selection.rangeCount === 0) {
     return null;
   }
 
   const selectedText = normalizeTranscriptText(selection.toString());
-  if (!hasNonWhitespaceTranscriptText(selectedText)) {
+  if (selection.isCollapsed || (!allowDiagrams && !hasNonWhitespaceTranscriptText(selectedText))) {
     return null;
   }
 
@@ -191,6 +193,14 @@ function getSelectedTranscriptText(
     return null;
   }
 
+  if (allowDiagrams && !hasNonWhitespaceTranscriptText(selectedText)) {
+    return Array.from(startQuoteRoot.querySelectorAll(".mermaid-container")).some(
+      (element) =>
+        transcriptMermaidSources.has(element) && hasSelectedContents(selectedRange, element)
+    )
+      ? "mermaid"
+      : null;
+  }
   return selectedText;
 }
 
@@ -390,6 +400,17 @@ function hasSelectedOwnListText(item: Element, range: Range): boolean {
   return false;
 }
 
+function hasSelectedContents(range: Range, element: Element): boolean {
+  if (!range.intersectsNode(element)) return false;
+  const intersection = element.ownerDocument.createRange();
+  intersection.selectNodeContents(element);
+  if (range.compareBoundaryPoints(range.START_TO_START, intersection) > 0)
+    intersection.setStart(range.startContainer, range.startOffset);
+  if (range.compareBoundaryPoints(range.END_TO_END, intersection) < 0)
+    intersection.setEnd(range.endContainer, range.endOffset);
+  return !intersection.collapsed;
+}
+
 function appendClipboardNodes(
   source: Node,
   destination: Node,
@@ -433,7 +454,21 @@ function appendClipboardNodes(
       destination.appendChild(marker);
       continue;
     }
-    if (element.matches(CLIPBOARD_EXCLUDED_SELECTOR)) continue;
+    const chart = transcriptMermaidSources.get(element);
+    if (chart != null && hasSelectedContents(range, element)) {
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.className = "language-mermaid";
+      code.textContent = chart;
+      pre.appendChild(code);
+      destination.appendChild(pre);
+      continue;
+    }
+    if (
+      element.matches(CLIPBOARD_EXCLUDED_SELECTOR) ||
+      element.hasAttribute("data-footnote-backref")
+    )
+      continue;
     if (element.matches(".katex")) {
       const tex = element.querySelector('annotation[encoding="application/x-tex"]')?.textContent;
       if (tex != null) {
@@ -480,6 +515,20 @@ function appendClipboardNodes(
       continue;
     }
     const copy = document.createElement(tag);
+    // Carry selected footnote candidates until both sides of each relationship are known.
+    if ((tag === "li" && element.id) || element.hasAttribute("data-footnote-ref")) {
+      const contents = document.createRange();
+      contents.selectNodeContents(element);
+      const fullySelected =
+        range.compareBoundaryPoints(range.START_TO_START, contents) <= 0 &&
+        range.compareBoundaryPoints(range.END_TO_END, contents) >= 0;
+      if (tag === "li" && fullySelected) copy.setAttribute("data-clipboard-source-id", element.id);
+      if (tag === "a")
+        copy.setAttribute(
+          "data-clipboard-footnote-candidate",
+          fullySelected ? "complete" : "partial"
+        );
+    }
     if (tag === "a") {
       const href = element.getAttribute("href") ?? "";
       if (isSafeClipboardHref(href)) copy.setAttribute("href", href);
@@ -527,20 +576,65 @@ function appendClipboardNodes(
   }
 }
 
+function restoreSelectedFootnotes(container: HTMLElement): void {
+  const definitions = new Map(
+    Array.from(container.querySelectorAll("[data-clipboard-source-id]"), (element) => [
+      element.getAttribute("data-clipboard-source-id")!,
+      element,
+    ])
+  );
+  let referenceNumber = 0;
+  for (const reference of container.querySelectorAll("[data-clipboard-footnote-candidate]")) {
+    const href = reference.getAttribute("href") ?? "";
+    const definition = href.startsWith("#") ? definitions.get(href.slice(1)) : undefined;
+    // Partial selections retain visible numbers, without unresolved navigation targets.
+    if (!definition || reference.getAttribute("data-clipboard-footnote-candidate") !== "complete") {
+      reference.replaceWith(...reference.childNodes);
+      continue;
+    }
+    referenceNumber++;
+    const label =
+      definition.getAttribute("data-clipboard-footnote-definition") ?? String(referenceNumber);
+    definition.setAttribute("data-clipboard-footnote-definition", label);
+    definition.id = "clipboard-fn-" + label;
+    reference.id = "clipboard-fnref-" + referenceNumber;
+    reference.setAttribute("href", "#" + definition.id);
+    reference.setAttribute("data-clipboard-footnote-ref", label);
+    const backlink = container.ownerDocument.createElement("a");
+    backlink.setAttribute("href", "#" + reference.id);
+    backlink.setAttribute("data-clipboard-footnote-backref", "");
+    backlink.textContent = "Back to reference";
+    definition.appendChild(backlink);
+  }
+  for (const element of container.querySelectorAll(
+    "[data-clipboard-source-id], [data-clipboard-footnote-candidate]"
+  )) {
+    element.removeAttribute("data-clipboard-source-id");
+    element.removeAttribute("data-clipboard-footnote-candidate");
+  }
+}
+
 /** Return only the selected chat text, with Markdown and safe rich-text formatting. */
 export function getTranscriptContextMenuMarkdown(
   options: TranscriptContextMenuTextOptions
 ): FormattedClipboardContent | null {
   const target = getEventTargetElement(options.target);
   const excludedTarget = target?.closest(CLIPBOARD_EXCLUDED_SELECTOR);
+  const diagramTarget = target?.closest(".mermaid-container");
+  // Permit diagram graphics, but never controls or links inside the diagram.
+  const trustedDiagramTarget =
+    diagramTarget &&
+    excludedTarget?.tagName.toLowerCase() === "svg" &&
+    transcriptMermaidSources.has(diagramTarget) &&
+    !target?.closest(INTERACTIVE_SELECTOR);
   if (
     !target ||
     !options.transcriptRoot.contains(target) ||
-    (excludedTarget && !excludedTarget.closest(".katex"))
+    (excludedTarget && !excludedTarget.closest(".katex") && !trustedDiagramTarget)
   ) {
     return null;
   }
-  if (!getSelectedTranscriptText(options.transcriptRoot, options.selection, options.target)) {
+  if (!getSelectedTranscriptText(options.transcriptRoot, options.selection, options.target, true)) {
     return null;
   }
 
@@ -563,10 +657,34 @@ export function getTranscriptContextMenuMarkdown(
   while (container.childNodes.length === 1 && container.firstElementChild?.tagName === "DIV") {
     container.replaceChildren(...container.firstElementChild.childNodes);
   }
+  restoreSelectedFootnotes(container);
   const markdown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
   // Preserve literal HTML and entities as text when the copied Markdown is parsed again.
   markdown.escape = (text) =>
     TurndownService.prototype.escape(text).replace(/&/g, "&amp;").replace(/</g, "\\<");
+  markdown.addRule("footnoteReference", {
+    filter: (node) =>
+      node.nodeName === "SUP" && node.querySelector("[data-clipboard-footnote-ref]") !== null,
+    replacement: (_content, node) =>
+      "[^" +
+      node
+        .querySelector("[data-clipboard-footnote-ref]")!
+        .getAttribute("data-clipboard-footnote-ref") +
+      "]",
+  });
+  markdown.addRule("footnoteDefinition", {
+    filter: (node) => node.hasAttribute("data-clipboard-footnote-definition"),
+    replacement: (content, node) =>
+      "\n\n[^" +
+      node.getAttribute("data-clipboard-footnote-definition") +
+      "]: " +
+      content.trim().replace(/\n/g, "\n    ") +
+      "\n\n",
+  });
+  markdown.addRule("footnoteBacklink", {
+    filter: (node) => node.hasAttribute("data-clipboard-footnote-backref"),
+    replacement: () => "",
+  });
   markdown.addRule("selectedMathAndTasks", {
     filter: (node) =>
       node.hasAttribute("data-clipboard-math") || node.hasAttribute("data-clipboard-task"),
@@ -582,12 +700,17 @@ export function getTranscriptContextMenuMarkdown(
     },
   });
   markdown.addRule("scripts", {
-    filter: ["sub", "sup"],
+    filter: (node) =>
+      ["SUB", "SUP"].includes(node.nodeName) &&
+      !node.querySelector("[data-clipboard-footnote-ref]"),
     // SECURITY AUDIT: This node contains only the sanitized clipboard elements and attributes.
     replacement: (_content, node) => node.outerHTML,
   });
   markdown.addRule("safeLink", {
-    filter: (node) => node.nodeName === "A" && node.hasAttribute("href"),
+    filter: (node) =>
+      node.nodeName === "A" &&
+      node.hasAttribute("href") &&
+      !node.hasAttribute("data-clipboard-footnote-backref"),
     replacement: (content, node) => {
       const href = (node.getAttribute("href") ?? "").replace(/[<>\s]/g, encodeURIComponent);
       return "[" + content + "](<" + href + ">)";
@@ -604,12 +727,16 @@ export function getTranscriptContextMenuMarkdown(
       element.attributes,
       (attribute) => " " + attribute.name + '="' + attribute.value + '"'
     ).join("");
-    const content = element.matches("td, th, li")
+    const content = element.matches("td, th, li, dt, dd")
       ? markdown.turndown(element as HTMLElement)
       : Array.from(element.children, serializeStructuredHtml).join("\n\n");
     return "<" + tag + attributes + ">\n\n" + content + "\n\n</" + tag + ">";
   };
 
+  markdown.addRule("definitionList", {
+    filter: "dl",
+    replacement: (_content, node) => "\n\n" + serializeStructuredHtml(node) + "\n\n",
+  });
   markdown.addRule("numberedList", {
     filter: (node) =>
       node.nodeName === "OL" &&
@@ -670,6 +797,11 @@ export function getTranscriptContextMenuMarkdown(
   });
   const text = markdown.turndown(container);
   if (!text.trim()) return null;
+  for (const element of container.querySelectorAll("*")) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (attribute.name.startsWith("data-clipboard-")) element.removeAttribute(attribute.name);
+    }
+  }
   // SECURITY AUDIT: Serialize only allowlisted elements and attributes, never the original selection HTML.
   return { text, html: container.innerHTML };
 }

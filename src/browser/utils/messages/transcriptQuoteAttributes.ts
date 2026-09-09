@@ -1,3 +1,6 @@
+// Only renderer refs register chart sources. Raw HTML cannot forge this metadata.
+export const transcriptMermaidSources = new WeakMap<Element, string>();
+
 export const TRANSCRIPT_MESSAGE_SELECTOR = "[data-transcript-message]";
 export const TRANSCRIPT_QUOTE_ROOT_SELECTOR = "[data-transcript-quote-root]";
 export const TRANSCRIPT_IGNORE_CONTEXT_MENU_SELECTOR = "[data-transcript-ignore-context-menu]";

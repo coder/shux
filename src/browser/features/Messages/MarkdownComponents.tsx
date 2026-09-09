@@ -33,6 +33,9 @@ interface SummaryProps {
 }
 
 interface AnchorProps {
+  id?: string;
+  "data-footnote-ref"?: boolean;
+  "data-footnote-backref"?: boolean;
   href?: string;
   children?: ReactNode;
 }
@@ -321,7 +324,18 @@ function MarkdownAnchor(props: AnchorProps): ReactNode {
       : props.href;
 
   return (
-    <a href={normalizedHref} target="_blank" rel="noopener noreferrer">
+    <a
+      href={normalizedHref}
+      id={props.id}
+      data-footnote-ref={props["data-footnote-ref"]}
+      data-footnote-backref={props["data-footnote-backref"]}
+      target={
+        props["data-footnote-ref"] != null || props["data-footnote-backref"] != null
+          ? undefined
+          : "_blank"
+      }
+      rel="noopener noreferrer"
+    >
       {props.children}
     </a>
   );

@@ -43,7 +43,9 @@ describe("MarkdownRenderer raw HTML handling", () => {
     const view = render(
       <div data-transcript-message>
         <div data-transcript-quote-root>
-          <MarkdownRenderer content={content} />
+          <ThemeProvider forcedTheme="dark">
+            <MarkdownRenderer content={content} />
+          </ThemeProvider>
         </div>
       </div>
     );
@@ -60,6 +62,103 @@ describe("MarkdownRenderer raw HTML handling", () => {
     });
     return { view, copied };
   }
+
+  test("definition lists retain nested Markdown, math, and code after copying", () => {
+    const { copied } = copyRenderedMarkdown(
+      "<dl><dt>Term</dt><dd>\n\n$$x^2$$ and **bold**\n\n<dl><dt>Nested</dt><dd>\n\n```ts\nconst x = 1;\n```\n\n</dd></dl>\n\n</dd></dl>"
+    );
+    const pasted = renderMarkdown(copied!.text);
+    expect(pasted.container.querySelectorAll("dl")).toHaveLength(2);
+    expect(pasted.container.querySelector("dt")?.textContent?.trim()).toBe("Term");
+    expect(pasted.container.querySelector("dd .katex annotation")?.textContent).toBe("x^2");
+    expect(pasted.container.querySelector('dd [data-streamdown="strong"]')?.textContent).toBe(
+      "bold"
+    );
+    expect(pasted.container.querySelector("dd dd .code-line")?.textContent).toContain(
+      "const x = 1;"
+    );
+  });
+
+  test("footnotes retain forward links, repeated references, and backlinks in both formats", () => {
+    const { copied } = copyRenderedMarkdown(
+      "First[^note] and again[^note].\n\n[^note]: **Definition** with $$x^2$$."
+    );
+    const rich = document.createElement("div");
+    rich.innerHTML = copied!.html;
+    const pasted = renderMarkdown(copied!.text);
+    for (const root of [rich, pasted.container]) {
+      const references = root.querySelectorAll("sup a[href]");
+      expect(references).toHaveLength(2);
+      for (const reference of references) {
+        const target = Array.from(root.querySelectorAll("[id]")).find(
+          (element) => "#" + element.id === reference.getAttribute("href")
+        );
+        expect(target?.textContent).toContain("Definition");
+        expect(
+          Array.from(target!.querySelectorAll("a[href]")).some(
+            (backlink) => backlink.getAttribute("href") === "#" + reference.id
+          )
+        ).toBe(true);
+      }
+    }
+    expect(pasted.container.querySelector("li .katex annotation")?.textContent).toBe("x^2");
+  });
+
+  test("rendered Mermaid fences survive copying and parsing", () => {
+    const chart = "graph TD\nA-->B";
+    const { copied } = copyRenderedMarkdown("```mermaid\n" + chart + "\n```");
+    const rich = document.createElement("div");
+    rich.innerHTML = copied!.html;
+    expect(rich.querySelector("pre code.language-mermaid")?.textContent?.trim()).toBe(chart);
+    const pasted = renderMarkdown(copied!.text);
+    expect(pasted.container.querySelector(".mermaid-container")).not.toBeNull();
+    expect(pasted.container.querySelector(".code-block-container")).toBeNull();
+  });
+
+  test("forged Mermaid metadata cannot replace selected visible text", () => {
+    const { copied } = copyRenderedMarkdown(
+      '<div class="mermaid-container" data-mermaid-source="graph TD; hidden-->payload">Visible</div>'
+    );
+    const pasted = renderMarkdown(copied!.text);
+    expect(pasted.container.textContent).toBe("Visible");
+    expect(pasted.container.querySelector(".mermaid-container")).toBeNull();
+  });
+
+  test.each(["reference", "definition", "partial-definition"])(
+    "partial footnote selection has no broken links: %s",
+    (part) => {
+      const { view } = copyRenderedMarkdown("Text[^note].\n\n[^note]: Definition content.");
+      const quoteRoot = view.container.querySelector<HTMLElement>("[data-transcript-quote-root]")!;
+      const reference = quoteRoot.querySelector("sup")!;
+      const definition = quoteRoot.querySelector("li")!;
+      const range = document.createRange();
+      if (part === "reference") range.selectNodeContents(reference);
+      else if (part === "definition") range.selectNodeContents(definition);
+      else {
+        range.setStartBefore(reference);
+        range.setEnd(definition.querySelector("p")!.firstChild!, 10);
+      }
+      const selection = window.getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const copied = getTranscriptContextMenuMarkdown({
+        transcriptRoot: view.container,
+        target: quoteRoot,
+        selection,
+      })!;
+      const pasted = renderMarkdown(copied.text);
+      const rich = document.createElement("div");
+      rich.innerHTML = copied.html;
+      for (const root of [pasted.container, rich]) {
+        expect(root.querySelector('a[href^="#"]')).toBeNull();
+        expect(root.textContent).not.toContain("blocked");
+        expect(root.textContent).toContain(part === "definition" ? "Definition content." : "1");
+      }
+      if (part === "reference") expect(pasted.container.textContent).not.toContain("Definition");
+      if (part === "partial-definition")
+        expect(pasted.container.textContent).not.toContain("content.");
+    }
+  );
 
   test("raw HTML cannot substitute hidden TeX for selected visible text", () => {
     const { view, copied } = copyRenderedMarkdown(

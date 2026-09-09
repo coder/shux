@@ -68,6 +68,21 @@ describe("transcriptContextMenu", () => {
       expect(result).toEqual({ text: "**beta**", html: "<p><strong>beta</strong></p>" });
     });
 
+    test("definition-list selections retain only selected terms and definitions", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<dl><dt id="before">Other</dt><dd id="first">First definition</dd><dt id="last">Last</dt><dd>Unselected</dd></dl>'
+        )
+      );
+      const copied = getTranscriptContextMenuMarkdown(select(root, "#before", "#last", 5, 0))!;
+      const pasted = document.createElement("div");
+      pasted.innerHTML = new MarkdownIt({ html: true }).render(copied.text);
+      expect(pasted.querySelectorAll("dl > dd")).toHaveLength(1);
+      expect(pasted.querySelector("dt")).toBeNull();
+      expect(pasted.textContent?.trim()).toBe("First definition");
+      expect(copied.html).toBe("<dl><dd>First definition</dd></dl>");
+    });
+
     test("body-only disclosure selections omit the disclosure control", () => {
       const root = createTranscriptRoot(
         createQuoteableTranscriptMessage(

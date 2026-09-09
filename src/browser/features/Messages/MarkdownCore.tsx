@@ -148,10 +148,28 @@ const rehypePreserveUnknownRawHtml: Plugin<[], Root> = () => {
   };
 };
 
+// Sanitization prefixes IDs. Keep generated footnote links paired with those safe IDs.
+const rehypeFootnoteLinks: Plugin<[], Root> = () => (tree) => {
+  const visit = (node: Root | RootContent) => {
+    if (
+      node.type === "element" &&
+      node.tagName === "a" &&
+      (node.properties.dataFootnoteRef != null || node.properties.dataFootnoteBackref != null) &&
+      typeof node.properties.href === "string" &&
+      node.properties.href.startsWith("#")
+    ) {
+      node.properties.href = "#" + defaultSchema.clobberPrefix + node.properties.href.slice(1);
+    }
+    if ("children" in node) node.children.forEach(visit);
+  };
+  visit(tree);
+};
+
 const REHYPE_PLUGINS: Pluggable[] = [
   rehypePreserveUnknownRawHtml,
   rehypeRaw, // Parse HTML elements first
   [rehypeSanitize, sanitizeSchema], // Sanitize HTML to prevent XSS (strips dangerous elements/attributes)
+  rehypeFootnoteLinks,
   [
     harden, // Additional URL filtering for links and images
     {

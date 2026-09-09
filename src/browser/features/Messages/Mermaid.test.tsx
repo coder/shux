@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { StreamingContext } from "./StreamingContext";
 import { Mermaid, sanitizeMermaidSvg } from "./Mermaid";
+import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
+import MarkdownIt from "markdown-it";
 
 const DEFAULT_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" /></svg>';
@@ -57,6 +59,61 @@ describe("Mermaid layout stability", () => {
     globalThis.HTMLElement = originalHTMLElement;
     mermaidParse.mockClear();
     mermaidRender.mockClear();
+  });
+
+  test("copies a selected textless diagram and excludes diagram controls", async () => {
+    const chart = "graph TD\nA-->B";
+    const view = render(
+      <div data-transcript-message>
+        <div data-transcript-quote-root>
+          <p>Before</p>
+          <Mermaid chart={chart} />
+          <p>After</p>
+        </div>
+      </div>
+    );
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg")).not.toBeNull()
+    );
+    const diagram = view.container.querySelector(".mermaid-container")!;
+    const range = document.createRange();
+    range.selectNodeContents(diagram);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    expect(selection.toString()).toBe("");
+    const options = {
+      transcriptRoot: view.container,
+      selection,
+      target: diagram.querySelector("rect"),
+    };
+    const copied = getTranscriptContextMenuMarkdown(options)!;
+    const parsed = document.createElement("div");
+    parsed.innerHTML = new MarkdownIt().render(copied.text);
+    expect(parsed.querySelector("code.language-mermaid")?.textContent?.trim()).toBe(chart);
+    expect(copied.html).not.toContain("svg");
+    expect(
+      getTranscriptContextMenuMarkdown({
+        ...options,
+        target: view.container.querySelector("button"),
+      })
+    ).toBeNull();
+
+    const first = view.container.querySelector("p")!;
+    range.setStart(first.firstChild!, 0);
+    range.setEndBefore(diagram.parentElement!);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    expect(getTranscriptContextMenuMarkdown({ ...options, target: first })?.text).toBe("Before");
+
+    range.setEndAfter(diagram.parentElement!);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const mixed = getTranscriptContextMenuMarkdown({ ...options, target: first })!;
+    parsed.innerHTML = new MarkdownIt().render(mixed.text);
+    expect(parsed.querySelector("p")?.textContent).toBe("Before");
+    expect(parsed.querySelector("code.language-mermaid")?.textContent?.trim()).toBe(chart);
+    expect(parsed.textContent).not.toContain("After");
   });
 
   test("guest Escape cannot close an expanded host diagram", async () => {
