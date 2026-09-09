@@ -241,6 +241,22 @@ export class MemoryMetaService {
       }),
 
     /**
+     * Duplicate a subtree's entries under a second key, keeping the source:
+     * a legacy sub-agent note copied into the shared store stays readable by
+     * a downgraded build under its child key, so its pin/stats must too.
+     */
+    copyKeys: (
+      sourceLogicalKey: string,
+      targetLogicalKey: string
+    ): Effect.Effect<void, MemoryMetaWriteError> =>
+      this.mutate((entries) => {
+        for (const [key, entry] of Object.entries(entries)) {
+          if (!keyInSubtree(key, sourceLogicalKey)) continue;
+          entries[`${targetLogicalKey}${key.slice(sourceLogicalKey.length)}`] = { ...entry };
+        }
+      }),
+
+    /**
      * Drop all entries for a deleted file or directory subtree so a future file
      * at the same path never resurrects stale pins or stats.
      */
@@ -384,6 +400,11 @@ export class MemoryMetaService {
    */
   async renameKeys(oldLogicalKey: string, newLogicalKey: string): Promise<void> {
     await Effect.runPromise(this.effects.renameKeys(oldLogicalKey, newLogicalKey));
+  }
+
+  /** Duplicate a subtree's entries under `targetLogicalKey`, keeping the source (see effects). */
+  async copyKeys(sourceLogicalKey: string, targetLogicalKey: string): Promise<void> {
+    await Effect.runPromise(this.effects.copyKeys(sourceLogicalKey, targetLogicalKey));
   }
 
   /**

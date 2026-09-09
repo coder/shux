@@ -925,11 +925,12 @@ export class MemoryService extends EventEmitter {
    * later deletes the child's session dir, discarding them for good. On the
    * child's first shared-store access per process, copy every legacy file
    * into the owner store (same relPath when free or identical; otherwise
-   * under imported/<child>/) and move pins/stats with them.
+   * under imported/<child>/) and copy pins/stats to the owner key.
    *
    * The legacy directory is left in place, untouched: it is exactly where a
    * DOWNGRADED build reads (and writes) this child's notebook, so the notes
-   * stay visible across upgrade↔downgrade and files the import cannot carry
+   * stay visible across upgrade↔downgrade (the child-keyed sidecar entries
+   * stay for the same reason) and files the import cannot carry
    * (binary/oversize, dotfiles, doubly conflicting) are never moved anywhere.
    * The copy is idempotent — identical files are skipped, differing ones land
    * under imported/<child>/ — so notes edited during a downgrade are folded in
@@ -1009,27 +1010,24 @@ export class MemoryService extends EventEmitter {
           }
           adopted[relPath] = contentHash;
           manifestDirty = true;
-          // Pins/stats were keyed by the child; they follow a written file.
-          // For an identical file the owner already has, the owner's own
-          // stats stand and the child's stale key is dropped.
-          const childKey = memoryLogicalKey("workspace", relPath, {
-            projectPath: ctx.projectPath,
-            workspaceId: childId,
-          });
+          // Pins/stats were keyed by the child: a written copy gets them under
+          // the owner key too. The child-keyed entry stays — like the legacy
+          // file, it is what a downgraded build reads. For an identical file
+          // the owner already has, the owner's own stats stand.
+          if (!target.write) continue;
           try {
-            if (target.write) {
-              await this.metaService.renameKeys(
-                childKey,
-                memoryLogicalKey("workspace", target.relPath, {
-                  projectPath: ctx.projectPath,
-                  workspaceId: owner,
-                })
-              );
-            } else {
-              await this.metaService.removeKeys(childKey);
-            }
+            await this.metaService.copyKeys(
+              memoryLogicalKey("workspace", relPath, {
+                projectPath: ctx.projectPath,
+                workspaceId: childId,
+              }),
+              memoryLogicalKey("workspace", target.relPath, {
+                projectPath: ctx.projectPath,
+                workspaceId: owner,
+              })
+            );
           } catch (error) {
-            log.debug("[MemoryService] failed to move legacy memory stats", { relPath, error });
+            log.debug("[MemoryService] failed to copy legacy memory stats", { relPath, error });
           }
         }
         if (manifestDirty) {

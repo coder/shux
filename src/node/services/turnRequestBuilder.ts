@@ -2403,7 +2403,12 @@ export class TurnRequestBuilder {
                   this.dependencies.config.sessionsDir,
                   workspaceId
                 );
-        const sandboxMemory =
+        // Built anew for EVERY attempt (prepareModelRequest runs per primary /
+        // fallback request) from the never-mutated policy: refinement_rollback
+        // reads it by reference, and the request.assemble demotion below only
+        // touches this attempt's object, so a fallback whose middleware keeps
+        // `memory` starts writable again.
+        const attemptSandboxMemory =
           memoryService === undefined
             ? undefined
             : {
@@ -2427,7 +2432,7 @@ export class TurnRequestBuilder {
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             sharedWorkspaceMemorySessionDir,
             listSharedWorkspaceMemoryPeerSessionDirs,
-            memory: sandboxMemory,
+            memory: attemptSandboxMemory,
             kernelFileLoader,
           },
         });
@@ -2529,8 +2534,8 @@ export class TurnRequestBuilder {
           // notebook once `memory` is gone: the tool reads its memory policy
           // from this per-attempt object by reference, so demote it to
           // view-only the same way tool assembly does for policy-denied memory.
-          if (attemptTools.memory === undefined && sandboxMemory !== undefined) {
-            sandboxMemory.access = READ_ONLY_ACCESS;
+          if (attemptTools.memory === undefined && attemptSandboxMemory !== undefined) {
+            attemptSandboxMemory.access = READ_ONLY_ACCESS;
           }
           if (attemptTools.intuition === undefined) {
             assembleCtx.systemMessage = removeIntuitionGuidance(

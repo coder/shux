@@ -901,9 +901,13 @@ export async function rollbackRefinement(
     // shared-store rows (see listSharedWorkspaceMemoryPeerSessionDirs); the
     // store clock (`sourceTs`) orders rows across journals. Target lookup,
     // rollbackOf checks and the appended row stay on this session's journal.
-    const divergenceRows =
-      kind === "memory" ? [...rows, ...(await readSharedMemoryPeerRows(opts))] : rows;
-    const divergence = await collectDivergence(divergenceRows, target, inverse, readContent);
+    // Re-read under the target locks below before the apply.
+    const divergence = await collectDivergence(
+      kind === "memory" ? [...rows, ...(await readSharedMemoryPeerRows(opts))] : rows,
+      target,
+      inverse,
+      readContent
+    );
     if (divergence.length > 0 && opts.force !== true) {
       throw new RollbackError(
         `Refusing rollback of '${opts.id}': current state diverges from what the inverse expects:\n` +
@@ -957,14 +961,24 @@ export async function rollbackRefinement(
       }
       // Re-verify INSIDE the lock, immediately before mutating: a writer that
       // won the lock first has already landed, and its change must surface as
-      // divergence rather than be overwritten. `rows` is intentionally the
-      // pre-lock read — the fs-level checks (postState hashes, presence) are
-      // what detect concurrent mutations; force skips this exactly like the
-      // plan-time check. Cross-process residual: a writer in ANOTHER process
-      // (live app vs. debug CLI) does not contend on this in-process lock, so
-      // this re-verify narrows but cannot fully close that window.
+      // divergence rather than be overwritten. The journals are re-read here
+      // too: a rename row carries no post-state hash, so a tree member's edit
+      // beneath the renamed destination that journaled between the plan-time
+      // scan and this lock is visible only as its (now committed) row. Force
+      // skips this exactly like the plan-time check. Cross-process residual:
+      // a writer in ANOTHER process (live app vs. debug CLI) does not contend
+      // on this in-process lock, so this re-verify narrows but cannot fully
+      // close that window.
       if (opts.force !== true) {
-        const raced = await collectDivergence(divergenceRows, target, inverse, readContent);
+        const lockedRows = await listRefinements(opts.sessionDir);
+        const raced = await collectDivergence(
+          kind === "memory"
+            ? [...lockedRows, ...(await readSharedMemoryPeerRows(opts))]
+            : lockedRows,
+          target,
+          inverse,
+          readContent
+        );
         if (raced.length > 0) {
           throw new RollbackError(
             `Refusing rollback of '${opts.id}': a concurrent mutation landed before the apply:\n` +

@@ -1250,8 +1250,10 @@ describe("MemoryService", () => {
       expect(
         await fsPromises.readFile(path.join(ownerRoot, "imported", "ws-child", "clash.md"), "utf-8")
       ).toBe("child version");
-      // The pin followed the file to the owner-keyed logical key.
-      expect([...(await fixture.metaService.getPinnedKeys())]).toEqual([
+      // The pin is copied to the owner-keyed logical key; the child-keyed
+      // entry stays for a downgraded build, which keys by the child id.
+      expect([...(await fixture.metaService.getPinnedKeys())].sort()).toEqual([
+        "workspace:ws-child:only-child.md",
         "workspace:ws-owner:only-child.md",
       ]);
       // The legacy copy stays where a downgraded build reads it; the tree's
@@ -1448,7 +1450,9 @@ describe("MemoryService", () => {
       ).toBe("child edit");
 
       // Rolling the child's edit back first (its journal sees the owner's
-      // rename as EARLIER, not a conflict) unblocks the owner's rollback.
+      // rename as EARLIER, not a conflict) unblocks the owner's rollback —
+      // unless another child edit lands between the owner's plan-time scan
+      // and its target lock: the journals are re-read under the lock.
       const [childRow] = await readRefinementEvents(childSessionDir);
       const childUndo = await rollbackRefinement({
         sessionDir: childSessionDir,
@@ -1458,6 +1462,40 @@ describe("MemoryService", () => {
         evidence: { toolName: "test", actor: "user" },
       });
       expect(childUndo.success).toBe(true);
+      const raced = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: renameRow.id,
+        listSharedWorkspaceMemoryPeerSessionDirs: peersOf("ws-owner"),
+        evidence: { toolName: "test", actor: "user" },
+        testOnlyBeforeTargetLock: async () => {
+          const late = await fixture.service.strReplace(
+            fixture.ctx,
+            "/memories/workspace/moved/a.md",
+            "v1",
+            "late child edit",
+            "agent"
+          );
+          expect(late.success).toBe(true);
+        },
+      });
+      expect(raced.success).toBe(false);
+      if (!raced.success) expect(raced.error).toContain("a concurrent mutation landed");
+      expect(
+        await fsPromises.readFile(path.join(ownerSessionDir, "memory", "moved", "a.md"), "utf-8")
+      ).toBe("late child edit");
+      // LIFO: undo the late edit (its own journal, netted out) and the
+      // owner's rollback goes through.
+      const childRows = await readRefinementEvents(childSessionDir);
+      const lateRow = childRows[childRows.length - 1];
+      expect(lateRow.data.rollbackOf).toBeUndefined();
+      const lateUndo = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        id: lateRow.id,
+        listSharedWorkspaceMemoryPeerSessionDirs: peersOf("ws-child"),
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(lateUndo.success).toBe(true);
       const ownerUndo = await rollbackRefinement({
         sessionDir: ownerSessionDir,
         id: renameRow.id,
