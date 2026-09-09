@@ -2378,27 +2378,14 @@ export class TaskService implements AgentTaskIntegration {
 
     let config = this.config.loadConfigOrDefault();
     let taskIndex = this.buildAgentTaskIndex(config);
-    // Recompute the startup recovery candidate lists from a config snapshot. Hoisted into a
-    // closure so the post-interrupt refresh below reuses the exact same status filters.
-    const listStartupRecoveryCandidates = async (sourceConfig: ProjectsConfig) => {
-      // An ordinary user Stop may retain a steerable running status. Its durable marker
-      // still forbids restart nudges and completion prompts, including on older installs.
-      const candidates = this.listAgentTaskWorkspaces(sourceConfig).filter(
+    const startupTasks = () =>
+      this.listAgentTaskWorkspaces(config).filter(
         (task) => task.id && ["running", "awaiting_report"].includes(task.taskStatus ?? "running")
       );
-      const stopped = await Promise.all(
-        candidates.map((task) => this.workspaceService.isStartupRecoveryBlocked(task.id!))
-      );
-      const active = candidates.filter((_, index) => !stopped[index]);
-      return {
-        awaitingReportTasks: active.filter((task) => task.taskStatus === "awaiting_report"),
-        runningTasks: active.filter((task) => (task.taskStatus ?? "running") === "running"),
-      };
-    };
-    let { awaitingReportTasks, runningTasks } = await listStartupRecoveryCandidates(config);
 
     let interruptedInactiveWorkflowOwnerAtStartup = false;
-    for (const task of [...awaitingReportTasks, ...runningTasks]) {
+    // Workflow cancellation is authoritative even when a child has its own Stop or question.
+    for (const task of startupTasks()) {
       if (!task.id) continue;
       if (
         await this.interruptTaskRecoveryForInactiveWorkflowOwner(
@@ -2417,8 +2404,15 @@ export class TaskService implements AgentTaskIntegration {
       // blocked by a child that this startup pass just interrupted.
       config = this.config.loadConfigOrDefault();
       taskIndex = this.buildAgentTaskIndex(config);
-      ({ awaitingReportTasks, runningTasks } = await listStartupRecoveryCandidates(config));
     }
+
+    const candidates = startupTasks();
+    const blocked = await Promise.all(
+      candidates.map((task) => this.workspaceService.isStartupRecoveryBlocked(task.id!))
+    );
+    const eligible = candidates.filter((_, index) => !blocked[index]);
+    const awaitingReportTasks = eligible.filter((task) => task.taskStatus === "awaiting_report");
+    const runningTasks = eligible.filter((task) => (task.taskStatus ?? "running") === "running");
 
     let resumedAwaitingReportCount = 0;
     let skippedAwaitingReportDueToActiveDescendants = 0;

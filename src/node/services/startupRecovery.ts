@@ -14,6 +14,26 @@ interface StartupRecoveryOptions {
   report: (error: unknown) => void;
 }
 
+/** Share bounded read retries without replaying recovery side effects. */
+export async function retryStartupRead<T>(
+  read: () => Promise<T>,
+  retryable: (value: T) => boolean,
+  options: Pick<StartupRecoveryOptions, "signal" | "wait">
+): Promise<T | undefined> {
+  for (let attempt = 0; attempt < STARTUP_RECOVERY_MAX_READ_ATTEMPTS; attempt += 1) {
+    if (options.signal.aborted) return undefined;
+    const value = await read();
+    if (options.signal.aborted) return undefined;
+    if (!retryable(value) || attempt + 1 === STARTUP_RECOVERY_MAX_READ_ATTEMPTS) return value;
+    await options.wait(
+      Math.min(
+        STARTUP_RECOVERY_READ_BASE_DELAY_MS * 2 ** attempt,
+        STARTUP_RECOVERY_READ_MAX_DELAY_MS
+      )
+    );
+  }
+}
+
 /**
  * One startup attempt, with checkpoints for successful side effects. Read retries never
  * replay acknowledgment/compaction/follow-up work; a failed step needs a later explicit run.
@@ -57,22 +77,14 @@ export class StartupRecovery {
       await this.options.steps[this.nextStep]();
       this.nextStep += 1;
     }
-    for (let attempt = 0; attempt < STARTUP_RECOVERY_MAX_READ_ATTEMPTS; attempt += 1) {
-      if (this.options.signal.aborted) return "completed";
-      const outcome = await this.options.check();
-      if (this.options.signal.aborted) return "completed";
-      if (outcome === "completed") this.completed = true;
-      if (outcome !== "retryable") return outcome;
-      if (attempt + 1 === STARTUP_RECOVERY_MAX_READ_ATTEMPTS) break;
-      await this.options.wait(
-        Math.min(
-          STARTUP_RECOVERY_READ_BASE_DELAY_MS * 2 ** attempt,
-          STARTUP_RECOVERY_READ_MAX_DELAY_MS
-        )
-      );
-    }
-    // Leave checkpoints intact. An explicit later run may retry the failed read.
-    return "retryable";
+    const outcome =
+      (await retryStartupRead(
+        this.options.check,
+        (value) => value === "retryable",
+        this.options
+      )) ?? "completed";
+    if (outcome === "completed") this.completed = true;
+    return outcome;
   }
 
   private waitUntilIdle(): void {

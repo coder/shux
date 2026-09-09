@@ -40,7 +40,8 @@ import * as path from "path";
 import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
 import { Effect, Fiber } from "effect";
-import { StartupRecovery, type StartupRecoveryOutcome } from "./startupRecovery";
+import { StartupRecovery, retryStartupRead, type StartupRecoveryOutcome } from "./startupRecovery";
+import { hasErrorCode } from "./tools/skillFileUtils";
 import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
@@ -558,11 +559,7 @@ export async function clearProviderConfigFixableAbandonMarkers(
   try {
     entries = await readdir(sessionsDir, { withFileTypes: true });
   } catch (error) {
-    const errno =
-      typeof error === "object" && error !== null && "code" in error
-        ? (error as { code?: unknown }).code
-        : undefined;
-    if (errno === "ENOENT") {
+    if (hasErrorCode(error, "ENOENT")) {
       return;
     }
     throw error;
@@ -1815,24 +1812,20 @@ export class AgentSession {
       if (this.coordinator.closing) return;
       // Missing preference file is the default path. Use any legacy frontend hint
       // (captured at onChat subscribe time) before falling back to enabled.
-      const errno =
-        typeof error === "object" && error !== null && "code" in error
-          ? (error as { code?: unknown }).code
-          : undefined;
-      const defaultEnabled =
-        errno === "ENOENT" && this.legacyAutoRetryEnabledHint === false ? false : true;
+      const missing = hasErrorCode(error, "ENOENT");
+      const defaultEnabled = !(missing && this.legacyAutoRetryEnabledHint === false);
 
       this.autoRetryEnabledPreference = defaultEnabled;
       this.legacyAutoRetryEnabledHint = null;
       this.startupAutoRetryAbandon = null;
       this.retryManager.setEnabled(defaultEnabled);
 
-      if (errno === "ENOENT" && defaultEnabled === false) {
+      if (missing && defaultEnabled === false) {
         // Persist migrated legacy opt-out so restart behavior no longer depends
         // on renderer localStorage keys. This write runs inside the load, so
         // persistAutoRetryState must not wait for loadAutoRetryState.
         await this.persistAutoRetryState();
-      } else if (errno !== "ENOENT") {
+      } else if (!missing) {
         log.warn("Failed to load auto-retry preference; defaulting to enabled", {
           workspaceId: this.workspaceId,
           error: getErrorMessage(error),
@@ -1996,22 +1989,13 @@ export class AgentSession {
       return undefined;
     }
 
-    const trimmed = model.trim();
-    if (trimmed.length === 0) {
-      return undefined;
-    }
-
     // Preserve explicit gateway identities (coder:, mux-gateway:, ...) just
     // like normal send-option normalization: normalizeToCanonical would
     // rewrite a cross-typed canonical-name instance such as
     // coder:openai/<claude> (type anthropic) to openai:<claude>, sending the
     // recovered turn through direct OpenAI instead of the selected gateway.
-    const normalized = normalizeSelectedModel(trimmed);
-    if (!isValidModelFormat(normalized)) {
-      return undefined;
-    }
-
-    return normalized;
+    const normalized = normalizeSelectedModel(model);
+    return isValidModelFormat(normalized) ? normalized : undefined;
   }
 
   private normalizeAgentIdForRetry(agentId: unknown): string | undefined {
@@ -2761,12 +2745,21 @@ export class AgentSession {
   async isStartupRecoveryBlocked(): Promise<boolean> {
     await this.loadAutoRetryState();
     if (this.autoRetryEnabledPreference === false) return true;
-    const [partial, history] = await Promise.all([
-      this.historyService
-        .readPartial(this.workspaceId, { throwOnError: true })
-        .catch(() => undefined),
-      this.historyService.getLastMessages(this.workspaceId, 20).catch(() => null),
-    ]);
+    const [partial, history] =
+      (await retryStartupRead(
+        () =>
+          Promise.all([
+            this.historyService
+              .readPartial(this.workspaceId, { throwOnError: true })
+              .catch(() => undefined),
+            this.historyService.getLastMessages(this.workspaceId, 20).catch(() => null),
+          ]),
+        ([partial, history]) => partial === undefined || !history?.success,
+        {
+          signal: this.closingSignal,
+          wait: (delay) => this.waitForStartupAutoRetryRerunWindow(delay),
+        }
+      ).catch(() => undefined)) ?? [];
     if (!history?.success || partial === undefined) return true;
     if (
       this.isPendingAskUserQuestion(partial) ||

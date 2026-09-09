@@ -14593,7 +14593,9 @@ describe("TaskService", () => {
     await innerRunStore.appendStatus(innerWorkflowRunId, "running", "2026-05-29T00:00:01.000Z");
 
     const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
-    const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks();
+    const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks({
+      isStartupRecoveryBlocked: mock(() => Promise.resolve(true)),
+    });
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     await taskService.initialize();

@@ -823,11 +823,40 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     const partialPath = path.join(config.sessionsDir, workspaceId, "partial.json");
     await fsPromises.mkdir(partialPath);
+    const wait = spyOn(
+      session as unknown as { waitForStartupAutoRetryRerunWindow(delay: number): Promise<void> },
+      "waitForStartupAutoRetryRerunWindow"
+    ).mockResolvedValue(undefined);
     try {
       expect(await session.isStartupRecoveryBlocked()).toBe(true);
+      expect(wait).toHaveBeenCalled();
       await fsPromises.rm(partialPath, { recursive: true });
       expect(await session.isStartupRecoveryBlocked()).toBe(false);
     } finally {
+      wait.mockRestore();
+      await session.dispose();
+    }
+  });
+
+  test("retries a transient task blocker read without restarting the app", async () => {
+    const workspaceId = "startup-transient-partial";
+    const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user", "user", "Pending work")
+    );
+    const partialPath = path.join(config.sessionsDir, workspaceId, "partial.json");
+    await fsPromises.mkdir(partialPath);
+    const wait = spyOn(
+      session as unknown as { waitForStartupAutoRetryRerunWindow(delay: number): Promise<void> },
+      "waitForStartupAutoRetryRerunWindow"
+    ).mockImplementationOnce(() => fsPromises.rm(partialPath, { recursive: true }));
+    try {
+      expect(await session.isStartupRecoveryBlocked()).toBe(false);
+      expect(wait).toHaveBeenCalledTimes(1);
+    } finally {
+      wait.mockRestore();
       await session.dispose();
     }
   });
