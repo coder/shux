@@ -2380,20 +2380,22 @@ export class TaskService implements AgentTaskIntegration {
     let taskIndex = this.buildAgentTaskIndex(config);
     // Recompute the startup recovery candidate lists from a config snapshot. Hoisted into a
     // closure so the post-interrupt refresh below reuses the exact same status filters.
-    const listStartupRecoveryCandidates = (
-      sourceConfig: ProjectsConfig
-    ): {
-      awaitingReportTasks: AgentTaskWorkspaceEntry[];
-      runningTasks: AgentTaskWorkspaceEntry[];
-    } => ({
-      awaitingReportTasks: this.listAgentTaskWorkspaces(sourceConfig).filter(
-        (t) => t.taskStatus === "awaiting_report"
-      ),
-      runningTasks: this.listAgentTaskWorkspaces(sourceConfig).filter(
-        (t) => t.taskStatus === "running"
-      ),
-    });
-    let { awaitingReportTasks, runningTasks } = listStartupRecoveryCandidates(config);
+    const listStartupRecoveryCandidates = async (sourceConfig: ProjectsConfig) => {
+      // An ordinary user Stop may retain a steerable running status. Its durable marker
+      // still forbids restart nudges and completion prompts, including on older installs.
+      const candidates = this.listAgentTaskWorkspaces(sourceConfig).filter(
+        (task) => task.id && ["running", "awaiting_report"].includes(task.taskStatus ?? "running")
+      );
+      const stopped = await Promise.all(
+        candidates.map((task) => this.workspaceService.isStartupRecoveryStopped(task.id!))
+      );
+      const active = candidates.filter((_, index) => !stopped[index]);
+      return {
+        awaitingReportTasks: active.filter((task) => task.taskStatus === "awaiting_report"),
+        runningTasks: active.filter((task) => (task.taskStatus ?? "running") === "running"),
+      };
+    };
+    let { awaitingReportTasks, runningTasks } = await listStartupRecoveryCandidates(config);
 
     let interruptedInactiveWorkflowOwnerAtStartup = false;
     for (const task of [...awaitingReportTasks, ...runningTasks]) {
@@ -2415,7 +2417,7 @@ export class TaskService implements AgentTaskIntegration {
       // blocked by a child that this startup pass just interrupted.
       config = this.config.loadConfigOrDefault();
       taskIndex = this.buildAgentTaskIndex(config);
-      ({ awaitingReportTasks, runningTasks } = listStartupRecoveryCandidates(config));
+      ({ awaitingReportTasks, runningTasks } = await listStartupRecoveryCandidates(config));
     }
 
     let resumedAwaitingReportCount = 0;
@@ -2445,6 +2447,7 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
 
+      if (await this.workspaceService.dispatchPendingCompactionFollowUp(task.id)) continue;
       const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
         reason: "startup",
       });
@@ -2542,6 +2545,8 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
 
+      // Preserve durable compaction intent before a generic nudge makes its tail stale.
+      if (await this.workspaceService.dispatchPendingCompactionFollowUp(task.id)) continue;
       const isPlanLike = await this.isPlanLikeTaskWorkspace({
         projectPath: task.projectPath,
         workspace: task,

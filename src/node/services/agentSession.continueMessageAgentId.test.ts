@@ -101,6 +101,17 @@ function heartbeatBoundaryMessage(pendingFollowUp = idleFollowUp()): MuxMessage 
 
 function createAiService(): AIService {
   return {
+    getWorkspaceMetadata: (id: string) =>
+      Promise.resolve({
+        success: true as const,
+        data: {
+          id,
+          name: id,
+          projectName: "project",
+          projectPath: "/tmp/project",
+          runtimeConfig: { type: "local" as const },
+        },
+      }),
     on() {
       return this;
     },

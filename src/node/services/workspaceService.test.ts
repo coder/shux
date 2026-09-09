@@ -9167,7 +9167,7 @@ describe("WorkspaceService initialize", () => {
     const taskWorkspace = createFrontendWorkspaceMetadata({
       id: "task-ws",
       name: "Task Workspace",
-      taskStatus: "running",
+      parentWorkspaceId: "live-ws",
     });
     const archivedWorkspace = createFrontendWorkspaceMetadata({
       id: "archived-ws",

@@ -415,6 +415,8 @@ export interface WorkspaceTurnHost {
 }
 
 export interface TurnAdmissionHost {
+  isStartupRecoveryStopped(workspaceId: string): Promise<boolean>;
+  dispatchPendingCompactionFollowUp(workspaceId: string): Promise<boolean>;
   isBusyForMessage(workspaceId: string): boolean;
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;

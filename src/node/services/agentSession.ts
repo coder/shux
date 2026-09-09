@@ -1745,10 +1745,7 @@ export class AgentSession {
   }
 
   private getAutoRetryPreferencePath(): string {
-    return path.join(
-      path.join(this.config.sessionsDir, this.workspaceId),
-      AUTO_RETRY_PREFERENCE_FILE
-    );
+    return path.join(this.config.sessionsDir, this.workspaceId, AUTO_RETRY_PREFERENCE_FILE);
   }
 
   setLegacyAutoRetryEnabledHint(enabled: boolean): void {
@@ -2026,10 +2023,6 @@ export class AgentSession {
     }
 
     const normalized = normalizeAgentId(agentId, "");
-    if (normalized.length === 0) {
-      return undefined;
-    }
-
     const parsed = AgentIdSchema.safeParse(normalized);
     return parsed.success ? parsed.data : undefined;
   }
@@ -2359,9 +2352,8 @@ export class AgentSession {
    * Startup crash recovery replays the ORIGINAL interrupted request from
    * persisted retry options / history metadata / workspace buckets. This is
    * request replay, not preference resolution, so it intentionally does not go
-   * through resolveAgentAiSettings: its layers (and the child-task-workspace
-   * inversion below) reconstruct a specific prior request rather than deriving
-   * a fresh choice, and nothing here is promoted into new defaults.
+   * through resolveAgentAiSettings: these layers reconstruct a specific prior
+   * request rather than deriving a fresh choice or promoting new defaults.
    */
   private async deriveStartupAutoRetryRequest(params: {
     partial: MuxMessage | null;
@@ -2381,6 +2373,7 @@ export class AgentSession {
             );
 
     const workspaceMetadata = await this.getWorkspaceMetadataForRetry();
+    if (!workspaceMetadata || workspaceMetadata.parentWorkspaceId != null) return undefined;
 
     const persistedRetrySendOptions = lastUserMessage?.metadata?.retrySendOptions;
     // The user row's own metadata.goalId is the durable copy (stamped next to
@@ -2405,23 +2398,9 @@ export class AgentSession {
     const workspaceAgentId = workspaceAgentIdCandidates[0] ?? WORKSPACE_DEFAULTS.agentId;
     const persistedAgentId = this.normalizeAgentIdForRetry(persistedRetrySendOptions?.agentId);
     const assistantAgentId = this.normalizeAgentIdForRetry(lastAssistantMessage?.metadata?.agentId);
-    // Child task workspaces carry their creation-time identity/settings in workspace metadata.
-    // Startup retry metadata can be stale after recovery sends restamp agentId to exec, so
-    // child retries must prefer the persisted workspace candidate before history metadata.
-    const isChildTaskWorkspace = workspaceMetadata?.parentWorkspaceId != null;
-    const baseAgentId = isChildTaskWorkspace
-      ? workspaceAgentId
-      : (persistedAgentId ?? assistantAgentId ?? workspaceAgentId);
-    const agentSettingsCandidateFields = isChildTaskWorkspace
-      ? [...workspaceAgentIdCandidates, baseAgentId, persistedAgentId, assistantAgentId]
-      : [baseAgentId, ...workspaceAgentIdCandidates, workspaceAgentId];
-    const agentSettingsCandidates = agentSettingsCandidateFields.filter(
-      (agentId, index, candidates): agentId is string =>
-        typeof agentId === "string" && candidates.indexOf(agentId) === index
-    );
-
+    const baseAgentId = persistedAgentId ?? assistantAgentId ?? workspaceAgentId;
     const agentSettings =
-      agentSettingsCandidates
+      [baseAgentId, ...workspaceAgentIdCandidates]
         .map((agentId) => workspaceMetadata?.aiSettingsByAgent?.[agentId])
         .find((settings) => settings != null) ?? workspaceMetadata?.aiSettings;
     const compactSettings = workspaceMetadata?.aiSettingsByAgent?.compact;
@@ -2429,18 +2408,15 @@ export class AgentSession {
     const persistedModel = this.normalizeStartupModel(persistedRetrySendOptions?.model);
     const assistantModel = this.normalizeStartupModel(lastAssistantMessage?.metadata?.model);
     const agentSettingsModel = this.normalizeStartupModel(agentSettings?.model);
-    const baseModel = isChildTaskWorkspace
-      ? (agentSettingsModel ?? persistedModel ?? assistantModel ?? DEFAULT_MODEL)
-      : (persistedModel ?? assistantModel ?? agentSettingsModel ?? DEFAULT_MODEL);
+    const baseModel = persistedModel ?? assistantModel ?? agentSettingsModel ?? DEFAULT_MODEL;
 
     const persistedThinkingLevel = coerceThinkingLevel(persistedRetrySendOptions?.thinkingLevel);
     const assistantThinkingLevel = coerceThinkingLevel(
       lastAssistantMessage?.metadata?.thinkingLevel
     );
     const agentSettingsThinkingLevel = coerceThinkingLevel(agentSettings?.thinkingLevel);
-    const baseThinkingLevel = isChildTaskWorkspace
-      ? (agentSettingsThinkingLevel ?? persistedThinkingLevel ?? assistantThinkingLevel)
-      : (persistedThinkingLevel ?? assistantThinkingLevel ?? agentSettingsThinkingLevel);
+    const baseThinkingLevel =
+      persistedThinkingLevel ?? assistantThinkingLevel ?? agentSettingsThinkingLevel;
 
     // Pro reasoning mode threads alongside thinkingLevel from the same sources
     // (assistant message metadata does not carry it), so startup retries do not
@@ -2449,9 +2425,7 @@ export class AgentSession {
       persistedRetrySendOptions?.reasoningMode
     );
     const agentSettingsReasoningMode = coerceOpenAIReasoningMode(agentSettings?.reasoningMode);
-    const baseReasoningMode = isChildTaskWorkspace
-      ? (agentSettingsReasoningMode ?? persistedReasoningMode)
-      : (persistedReasoningMode ?? agentSettingsReasoningMode);
+    const baseReasoningMode = persistedReasoningMode ?? agentSettingsReasoningMode;
 
     const persistedToolPolicy =
       lastUserMessage?.metadata?.toolPolicy ?? persistedRetrySendOptions?.toolPolicy;
@@ -2597,6 +2571,17 @@ export class AgentSession {
     return retryRequest;
   }
 
+  private hasInterruptedStartupTail(partial: MuxMessage | null, history: MuxMessage[]): boolean {
+    if (this.isPendingAskUserQuestion(partial)) return false;
+    if (partial?.role === "assistant") return true;
+    const last = this.getLastNonSystemHistoryMessage(history);
+    return last?.role === "user"
+      ? !this.isVisibleCompletedSubagentReportMessage(last)
+      : last?.role === "assistant" &&
+          last.metadata?.partial === true &&
+          !this.isPendingAskUserQuestion(last);
+  }
+
   async getStartupAutoRetryModelHint(): Promise<string | null> {
     this.assertNotDisposed("getStartupAutoRetryModelHint");
 
@@ -2614,21 +2599,7 @@ export class AgentSession {
     if (this.lastAutoRetryResumeRequest?.options.model) {
       return this.lastAutoRetryResumeRequest.options.model;
     }
-    if (partial && this.isPendingAskUserQuestion(partial)) {
-      return null;
-    }
-
-    const lastHistoryMessage = this.getLastNonSystemHistoryMessage(historyResult.data);
-    const interruptedByPartial = partial?.role === "assistant";
-    const interruptedByHistory =
-      lastHistoryMessage?.role === "user" ||
-      (lastHistoryMessage?.role === "assistant" &&
-        lastHistoryMessage.metadata?.partial === true &&
-        !this.isPendingAskUserQuestion(lastHistoryMessage));
-
-    if (!interruptedByPartial && !interruptedByHistory) {
-      return null;
-    }
+    if (!this.hasInterruptedStartupTail(partial, historyResult.data)) return null;
 
     const retryRequest = await this.deriveStartupAutoRetryRequest({
       partial,
@@ -2684,28 +2655,7 @@ export class AgentSession {
 
     const startupRetryUserMessage = this.findLastRetryUserMessage(historyResult.data);
     if (startupRetryUserMessage?.metadata?.contextBudgetRejected) return "completed";
-    if (partial && this.isPendingAskUserQuestion(partial)) {
-      return "completed";
-    }
-
-    const lastHistoryMessage = this.getLastNonSystemHistoryMessage(historyResult.data);
-    const interruptedByPartial = partial?.role === "assistant";
-    if (
-      !interruptedByPartial &&
-      lastHistoryMessage &&
-      this.isVisibleCompletedSubagentReportMessage(lastHistoryMessage)
-    ) {
-      return "completed";
-    }
-    const interruptedByHistory =
-      lastHistoryMessage?.role === "user" ||
-      (lastHistoryMessage?.role === "assistant" &&
-        lastHistoryMessage.metadata?.partial === true &&
-        !this.isPendingAskUserQuestion(lastHistoryMessage));
-
-    if (!interruptedByPartial && !interruptedByHistory) {
-      return "completed";
-    }
+    if (!this.hasInterruptedStartupTail(partial, historyResult.data)) return "completed";
 
     if (this.startupAutoRetryAbandon) {
       const abandonReason = this.startupAutoRetryAbandon.reason;
@@ -2823,11 +2773,29 @@ export class AgentSession {
     }
   }
 
+  async isStartupRecoveryStopped(): Promise<boolean> {
+    await this.loadAutoRetryState();
+    const abandon = this.startupAutoRetryAbandon;
+    if (abandon?.reason !== "aborted") return false;
+    if (abandon.userMessageId === undefined) return true;
+    // Preserve known Stop intent if history cannot establish a newer user turn.
+    const history = await this.historyService
+      .getLastMessages(this.workspaceId, 20)
+      .catch(() => null);
+    const latestUserId = history?.success
+      ? this.findLastRetryUserMessage(history.data)?.id
+      : undefined;
+    return latestUserId === undefined || latestUserId === abandon.userMessageId;
+  }
+
   ensureStartupAutoRetryCheck(): Promise<void> {
     return this.runStartupRecovery();
   }
 
-  runStartupRecovery(): Promise<void> {
+  async runStartupRecovery(): Promise<void> {
+    // TaskService owns child recovery; replaying a stopped child must never restart it.
+    const metadata = await this.getWorkspaceMetadataForRetry();
+    if (!metadata || metadata.parentWorkspaceId != null) return;
     return this.startupRecovery.run();
   }
 

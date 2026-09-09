@@ -3338,7 +3338,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // or removed since `allMetadata` was read does not get a hidden recovery stream.
       const liveConfig = this.config.loadConfigOrDefault();
       for (const metadata of allMetadata) {
-        if (metadata.taskStatus) {
+        if (metadata.parentWorkspaceId != null) {
           skippedTaskCount += 1;
           continue;
         }
@@ -11851,6 +11851,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       log.error("Unexpected error in setAutoRetryEnabled handler:", error);
       return Err(`Failed to set auto-retry enabled state: ${errorMessage}`);
     }
+  }
+
+  dispatchPendingCompactionFollowUp(workspaceId: string): Promise<boolean> {
+    return this.getOrCreateSession(workspaceId).dispatchPendingCompactionFollowUpIfNeeded();
+  }
+
+  isStartupRecoveryStopped(workspaceId: string): Promise<boolean> {
+    return this.getOrCreateSession(workspaceId).isStartupRecoveryStopped();
   }
 
   async getStartupAutoRetryModel(workspaceId: string): Promise<Result<string | null>> {

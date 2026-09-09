@@ -3447,6 +3447,45 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toBeUndefined();
   });
 
+  test.each(["running", "awaiting_report", undefined] as const)(
+    "startup honors user Stop without changing steerable task status (%s)",
+    async (taskStatus) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", "parent"),
+          ...["stopped", "crashed", "compacted"].map((id) =>
+            projectWorkspace(projectPath, id, id, {
+              parentWorkspaceId: "parent",
+              agentId: "exec",
+              agentType: "exec",
+              taskStatus,
+              taskModelString: "openai:gpt-5.2",
+            })
+          ),
+        ],
+        testTaskSettings()
+      );
+      const dispatchPendingCompactionFollowUp = mock((id: string) =>
+        Promise.resolve(id === "compacted")
+      );
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+        isStartupRecoveryStopped: mock((id: string) => Promise.resolve(id === "stopped")),
+        dispatchPendingCompactionFollowUp,
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      await taskService.recoverInterruptedTasks();
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage.mock.calls[0]?.[0]).toBe("crashed");
+      expect(findWorkspaceInConfig(config, "stopped")?.taskStatus).toBe(taskStatus);
+      expect(dispatchPendingCompactionFollowUp).not.toHaveBeenCalledWith("stopped");
+      expect(dispatchPendingCompactionFollowUp).toHaveBeenCalledWith("compacted");
+    }
+  );
+
   test("initialize does not resend the restart nudge to a running task that is already streaming", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

@@ -1331,6 +1331,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
 
   interface GuidanceStreamFixture {
     session: AgentSession;
+    aiService: Pick<AIService, "getWorkspaceMetadata">;
     historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"];
     aiEmitter: EventEmitter;
     streamHistories: MuxMessage[][];
@@ -1423,6 +1424,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
 
     return {
       session: harness.session,
+      aiService: harness.aiService,
       historyService: harness.historyService,
       aiEmitter,
       streamHistories,
@@ -1548,6 +1550,15 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
   test("startup retry of an interrupted compaction keeps compaction identity", async () => {
     const workspaceId = "ws-compaction-startup-retry";
     const fixture = await createGuidanceHarness({ workspaceId });
+    spyOn(fixture.aiService, "getWorkspaceMetadata").mockResolvedValue(
+      Ok({
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath: "/tmp/project",
+        runtimeConfig: { type: "local" },
+      })
+    );
 
     // Simulate a crash mid-compaction: durable compaction request row followed
     // by a synthetic row (e.g. a file-change notice) appended before resume.

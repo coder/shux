@@ -23,7 +23,7 @@ import {
 } from "@/common/types/message";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -698,60 +698,136 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
-  test("startup auto-retry prefers child workspace agent settings over stale retry metadata", async () => {
-    const workspaceId = "startup-retry-child-stale-agent";
-    const workspaceMetadata: WorkspaceMetadata = {
-      id: workspaceId,
-      name: workspaceId,
-      projectName: "project",
-      projectPath: "/tmp/project",
-      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
-      parentWorkspaceId: "parent-workspace",
-      agentId: "exec",
-      agentType: "explore",
-      aiSettingsByAgent: {
-        exec: { model: "openai:gpt-5.5", thinkingLevel: "high" },
-        explore: { model: "openai:gpt-5.5-low", thinkingLevel: "low" },
-      },
-    };
-    const { session, historyService, cleanup } = await createAgentSessionHarness({
-      workspaceId,
-      aiServiceOverrides: {
-        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
-      },
+  test.each([
+    undefined,
+    "queued",
+    "starting",
+    "running",
+    "awaiting_report",
+    "interrupted",
+    "reported",
+  ] as const)("leaves child startup recovery to TaskService (status=%s)", async (taskStatus) => {
+    const workspaceId = "startup-child-owned";
+    const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId, {
+      getWorkspaceMetadata: mock(() =>
+        Promise.resolve(
+          Ok({
+            id: workspaceId,
+            name: workspaceId,
+            projectName: "project",
+            projectPath: "/tmp/project",
+            runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+            parentWorkspaceId: "parent",
+            taskStatus,
+          })
+        )
+      ),
     });
     cleanups.push(cleanup);
-
-    const appendResult = await historyService.appendToHistory(
+    const followUp = spyOn(
+      session as unknown as { dispatchPendingFollowUp(): Promise<boolean> },
+      "dispatchPendingFollowUp"
+    );
+    await historyService.appendToHistory(
       workspaceId,
-      createMuxMessage("user-1", "user", "Interrupted child task turn", {
-        timestamp: Date.now(),
-        retrySendOptions: {
-          model: "openai:gpt-5.5",
-          agentId: "exec",
-          thinkingLevel: "high",
-        },
+      createMuxMessage("user-1", "user", "Unfinished child turn")
+    );
+    try {
+      await session.ensureStartupAutoRetryCheck();
+      expect(followUp).not.toHaveBeenCalled();
+      expect(session.hasPendingAutoRetry()).toBe(false);
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+      expect(await session.getStartupAutoRetryModelHint()).toBeNull();
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  test.each([
+    { reason: "aborted", userMessageId: "user-1", stopped: true },
+    { reason: "aborted", userMessageId: undefined, stopped: true },
+    { reason: "aborted", userMessageId: "older-user", stopped: false },
+    { reason: "context_exceeded", userMessageId: "user-1", stopped: false },
+  ])("reads applicable durable user-stop evidence: %j", async (marker) => {
+    const workspaceId = "startup-task-stop";
+    const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "Current intent")
+    );
+    await fsPromises.writeFile(
+      path.join(config.sessionsDir, workspaceId, "auto-retry-preference.json"),
+      JSON.stringify({
+        startupAutoRetryAbandon: { reason: marker.reason, userMessageId: marker.userMessageId },
       })
     );
-    expect(appendResult.success).toBe(true);
-
-    await session.ensureStartupAutoRetryCheck();
-
-    const retryOptions = (
-      session as unknown as {
-        lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-      }
-    ).lastAutoRetryResumeRequest;
-    expect(retryOptions).toBeDefined();
-    if (!retryOptions) {
-      throw new Error("Expected startup retry options");
+    try {
+      expect(await session.isStartupRecoveryStopped()).toBe(marker.stopped);
+      const history = await historyService.getLastMessages(workspaceId, 20);
+      expect(history.success && history.data.map((message) => message.id)).toEqual(["user-1"]);
+    } finally {
+      await session.dispose();
     }
+  });
 
-    expect(retryOptions.options.agentId).toBe("explore");
-    expect(retryOptions.options.model).toBe("openai:gpt-5.5-low");
-    expect(retryOptions.options.thinkingLevel).toBe("low");
+  test("preserves a scoped Stop until history proves a newer user intent", async () => {
+    const workspaceId = "startup-long-stopped-task";
+    const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    await historyService.appendManyToHistory(workspaceId, [
+      createMuxMessage("stopped-user", "user", "Long-running task"),
+      ...Array.from({ length: 21 }, (_, index) =>
+        createMuxMessage(`assistant-${index}`, "assistant", "Work")
+      ),
+    ]);
+    const preferencePath = path.join(config.sessionsDir, workspaceId, "auto-retry-preference.json");
+    await fsPromises.writeFile(
+      preferencePath,
+      JSON.stringify({
+        startupAutoRetryAbandon: { reason: "aborted", userMessageId: "stopped-user" },
+      })
+    );
+    try {
+      expect(await session.isStartupRecoveryStopped()).toBe(true);
+      spyOn(historyService, "getLastMessages").mockRejectedValueOnce(new Error("unreadable"));
+      expect(await session.isStartupRecoveryStopped()).toBe(true);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("new-user", "user", "Continue")
+      );
+      expect(await session.isStartupRecoveryStopped()).toBe(false);
+      expect(JSON.parse(await fsPromises.readFile(preferencePath, "utf-8"))).toMatchObject({
+        startupAutoRetryAbandon: { reason: "aborted", userMessageId: "stopped-user" },
+      });
+    } finally {
+      await session.dispose();
+    }
+  });
 
-    await session.dispose();
+  test("does not start recovery while workspace identity is unavailable", async () => {
+    const { session, historyService, events, cleanup } = await createSessionBundle(
+      "startup-unknown",
+      {
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("unavailable"))),
+      }
+    );
+    cleanups.push(cleanup);
+    await historyService.appendToHistory(
+      "startup-unknown",
+      createMuxMessage("user-1", "user", "Unfinished")
+    );
+    const followUp = spyOn(
+      session as unknown as { dispatchPendingFollowUp(): Promise<boolean> },
+      "dispatchPendingFollowUp"
+    );
+    try {
+      await session.runStartupRecovery();
+      expect(followUp).not.toHaveBeenCalled();
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    } finally {
+      await session.dispose();
+    }
   });
 
   test("replays pending auto-retry schedule during reconnect catch-up", async () => {

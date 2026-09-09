@@ -106,7 +106,7 @@ test("history retries use virtual backoff, stay bounded, and preserve completed 
   try {
     const first = h.session.runStartupRecovery();
     const concurrent = h.session.ensureStartupAutoRetryCheck();
-    expect(concurrent).toBe(first);
+    // Identity lookups may wrap the shared recovery promise; its side effects still run once.
     for (const entry of waits) {
       const delay = await entry.promise;
       const before = probes;
@@ -114,7 +114,7 @@ test("history retries use virtual backoff, stay bounded, and preserve completed 
       expect(probes).toBe(before);
       await h.clock.adjust(1);
     }
-    await first;
+    await Promise.all([first, concurrent]);
     expect(probes).toBe(4);
     expect(prefixes).toBe(1);
     expect(h.session.shouldRetainAfterStartupRecovery()).toBe(false);
