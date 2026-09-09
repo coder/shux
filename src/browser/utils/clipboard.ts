@@ -20,3 +20,23 @@ export async function copyToClipboard(text: string): Promise<void> {
   document.execCommand("copy");
   document.body.removeChild(textarea);
 }
+
+export interface FormattedClipboardContent {
+  text: string;
+  html: string;
+}
+
+/** Copy Markdown and rich text together so formatted paste works in Slack. */
+export async function copyFormattedToClipboard(content: FormattedClipboardContent): Promise<void> {
+  if (navigator.clipboard?.write && typeof ClipboardItem !== "undefined") {
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        "text/plain": new Blob([content.text], { type: "text/plain" }),
+        "text/html": new Blob([content.html], { type: "text/html" }),
+      }),
+    ]);
+    return;
+  }
+
+  await copyToClipboard(content.text);
+}

@@ -1,3 +1,5 @@
+import TurndownService from "turndown";
+import type { FormattedClipboardContent } from "@/browser/utils/clipboard";
 import {
   TRANSCRIPT_IGNORE_CONTEXT_MENU_SELECTOR,
   TRANSCRIPT_MESSAGE_SELECTOR,
@@ -308,6 +310,156 @@ export function getTranscriptContextMenuText(
   }
 
   return getHoveredTranscriptText(options.transcriptRoot, options.target);
+}
+
+// Copy only semantic formatting. Transcript content can contain untrusted repository text.
+const CLIPBOARD_TAGS = new Set([
+  "p",
+  "br",
+  "strong",
+  "b",
+  "em",
+  "i",
+  "s",
+  "del",
+  "blockquote",
+  "pre",
+  "code",
+  "ul",
+  "ol",
+  "li",
+  "a",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "hr",
+  "table",
+  "thead",
+  "tbody",
+  "tr",
+  "th",
+  "td",
+]);
+const CLIPBOARD_EXCLUDED_SELECTOR = `script, style, svg, img, iframe, object, .line-number, button, input, textarea, select, [hidden], [aria-hidden="true"], ${TRANSCRIPT_IGNORE_CONTEXT_MENU_SELECTOR}`;
+
+function appendClipboardNodes(source: Node, destination: Node, range: Range): void {
+  const document = destination.ownerDocument!;
+  for (const child of source.childNodes) {
+    if (!range.intersectsNode(child)) {
+      // Empty cells retain column positions without copying unselected text.
+      if (child.nodeName === "TH" || child.nodeName === "TD") {
+        destination.appendChild(document.createElement(child.nodeName.toLowerCase()));
+      }
+      continue;
+    }
+    if (child.nodeType === 3) {
+      const start = child === range.startContainer ? range.startOffset : 0;
+      const end = child === range.endContainer ? range.endOffset : child.textContent?.length;
+      destination.appendChild(document.createTextNode((child.textContent ?? "").slice(start, end)));
+      continue;
+    }
+    if (child.nodeType !== 1) continue;
+    const element = child as Element;
+    if (element.matches(CLIPBOARD_EXCLUDED_SELECTOR)) continue;
+    // Highlighted code uses a grid, not semantic pre/code elements. Exclude its line numbers.
+    if (element.matches(".code-block-container")) {
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      const lines: string[] = [];
+      for (const line of element.querySelectorAll(".code-line")) {
+        if (!range.intersectsNode(line)) continue;
+        const selectedLine = document.createElement("div");
+        appendClipboardNodes(line, selectedLine, range);
+        lines.push(selectedLine.textContent ?? "");
+      }
+      code.textContent = lines.join("\n");
+      pre.appendChild(code);
+      destination.appendChild(pre);
+      continue;
+    }
+    const tag = element.tagName.toLowerCase();
+    if (!CLIPBOARD_TAGS.has(tag)) {
+      appendClipboardNodes(element, destination, range);
+      continue;
+    }
+    const copy = document.createElement(tag);
+    if (tag === "a") {
+      const href = element.getAttribute("href") ?? "";
+      if (/^(https?:|mailto:)/i.test(href)) copy.setAttribute("href", href);
+    }
+    if (tag === "ol") {
+      const list = element as HTMLOListElement;
+      const firstSelected = Array.from(list.children).findIndex((item) =>
+        range.intersectsNode(item)
+      );
+      copy.setAttribute("start", String(list.start + Math.max(0, firstSelected)));
+    }
+    appendClipboardNodes(element, copy, range);
+    destination.appendChild(copy);
+  }
+}
+
+/** Return only the selected chat text, with Markdown and safe rich-text formatting. */
+export function getTranscriptContextMenuMarkdown(
+  options: TranscriptContextMenuTextOptions
+): FormattedClipboardContent | null {
+  const target = getEventTargetElement(options.target);
+  if (
+    !target ||
+    !options.transcriptRoot.contains(target) ||
+    target.closest(CLIPBOARD_EXCLUDED_SELECTOR)
+  ) {
+    return null;
+  }
+  if (!getSelectedTranscriptText(options.transcriptRoot, options.selection, options.target)) {
+    return null;
+  }
+
+  const range = options.selection!.getRangeAt(0);
+  const quoteRoot = getEventTargetElement(range.startContainer)!.closest(
+    TRANSCRIPT_QUOTE_ROOT_SELECTOR
+  )!;
+  const container = options.transcriptRoot.ownerDocument.createElement("div");
+  // Walk the original range so partial selections retain their formatting and list positions.
+  appendClipboardNodes(quoteRoot, container, range);
+  const markdown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
+  markdown.addRule("strikethrough", {
+    filter: ["s", "del"],
+    replacement: (content) => `~~${content}~~`,
+  });
+  markdown.addRule("table", {
+    filter: "table",
+    replacement: (_content, node) => {
+      const rows = Array.from(node.querySelectorAll<HTMLTableRowElement>("tr"), (row) =>
+        Array.from(row.cells, (cell) =>
+          markdown.turndown(cell).replace(/\|/g, "\\|").replace(/\n/g, "<br>")
+        )
+      );
+      const width = Math.max(0, ...rows.map((row) => row.length));
+      if (!width) return "";
+      if (!node.querySelector("tr th")) rows.unshift(Array<string>(width).fill(""));
+      rows.splice(1, 0, Array<string>(width).fill("---"));
+      return (
+        "\n\n" +
+        rows
+          .map(
+            (row) =>
+              "| " +
+              Array.from({ length: width }, (_, index) => row[index] ?? "").join(" | ") +
+              " |"
+          )
+          .join("\n") +
+        "\n\n"
+      );
+    },
+  });
+  const text = markdown.turndown(container);
+  if (!text.trim()) return null;
+  // SECURITY AUDIT: Serialize only allowlisted elements and attributes, never the original selection HTML.
+  return { text, html: container.innerHTML };
 }
 
 /**

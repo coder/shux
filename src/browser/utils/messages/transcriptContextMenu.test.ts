@@ -3,6 +3,7 @@ import { GlobalWindow } from "happy-dom";
 import {
   formatTranscriptTextAsQuote,
   getTranscriptContextMenuLink,
+  getTranscriptContextMenuMarkdown,
   getTranscriptContextMenuText,
 } from "./transcriptContextMenu";
 
@@ -35,6 +36,159 @@ describe("transcriptContextMenu", () => {
   afterEach(() => {
     globalThis.window = undefined as unknown as Window & typeof globalThis;
     globalThis.document = undefined as unknown as Document;
+  });
+
+  describe("selected Markdown", () => {
+    function select(
+      root: HTMLElement,
+      start: string,
+      end = start,
+      startOffset = 0,
+      endOffset?: number
+    ) {
+      const first = getFirstTextNode(root.querySelector(start));
+      const last = getFirstTextNode(root.querySelector(end));
+      const range = document.createRange();
+      range.setStart(first, startOffset);
+      range.setEnd(last, endOffset ?? last.length);
+      const selection = window.getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return { transcriptRoot: root, target: first.parentElement, selection };
+    }
+
+    test("preserves formatting around a partial text selection", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<p>Before <strong id="part">Alpha beta gamma</strong> after</p>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#part", "#part", 6, 10));
+      expect(result).toEqual({ text: "**beta**", html: "<p><strong>beta</strong></p>" });
+    });
+
+    test("preserves links when the selection target is an anchor", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<p><a id="part" href="https://example.com">Example</a></p>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
+      expect(result?.text).toBe("[Example](https://example.com)");
+      expect(result?.html).toContain('href="https://example.com"');
+    });
+
+    test("preserves lists, emphasis, and paragraph boundaries", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<p id="start">Introduction</p><ul><li><em>First</em></li><li id="end">Second</li></ul><p>Excluded</p>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#start", "#end"));
+      expect(result?.text).toBe("Introduction\n\n*   _First_\n*   Second");
+      expect(result?.html).toBe(
+        "<p>Introduction</p><ul><li><em>First</em></li><li>Second</li></ul>"
+      );
+    });
+
+    test("preserves selected code whitespace without syntax-highlighting markup", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<pre><code><span id="part" style="color:red">  const x = 1;\n  x++;</span></code></pre>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
+      expect(result?.text).toBe(["```", "  const x = 1;", "  x++;", "```"].join("\n"));
+      expect(result?.html).toBe("<pre><code>  const x = 1;\n  x++;</code></pre>");
+    });
+
+    test("preserves partial highlighted code lines without line numbers or controls", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<div class="code-block-wrapper"><div class="code-block-container"><div class="line-number">1</div><div class="code-line"><span id="first">before selected</span></div><div class="line-number">2</div><div class="code-line"><span id="last">  next after</span></div></div><button>Copy</button></div>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#first", "#last", 7, 6));
+      expect(result?.text).toBe(["```", "selected", "  next", "```"].join("\n"));
+      expect(result?.html).toBe("<pre><code>selected\n  next</code></pre>");
+    });
+
+    test("preserves the starting number of a partial ordered list", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<ol start="4"><li>Before</li><li id="part">Selected</li><li>After</li></ol>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
+      expect(result?.text).toBe("5.  Selected");
+      expect(result?.html).toBe('<ol start="5"><li>Selected</li></ol>');
+    });
+
+    test("preserves table columns and escapes cell separators", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<table><thead><tr><th id="first">Name</th><th>Value</th></tr></thead><tbody><tr><td>A|B</td><td id="last">Two</td></tr></tbody></table>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#first", "#last"));
+      expect(result?.text).toBe("| Name | Value |\n| --- | --- |\n| A\\|B | Two |");
+      expect(result?.html).toContain("<table>");
+    });
+
+    test("keeps column positions when a table selection starts in the second column", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<table><thead><tr><th>Excluded</th><th id="first">Value</th></tr></thead><tbody><tr><td>A</td><td id="last">Two</td></tr></tbody></table>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#first", "#last"));
+      expect(result?.text).toBe("|  | Value |\n| --- | --- |\n| A | Two |");
+      expect(result?.html).toContain("<tr><th></th><th>Value</th></tr>");
+      expect(result?.html).not.toContain("Excluded");
+    });
+
+    test("removes unsafe URLs, attributes, and active content", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<p><span id="start">&lt;script&gt;</span><a href="javascript:alert(1)" onclick="alert(1)">link</a><img src="https://example.com/tracker"><script>bad()</script><span id="end" style="color:red">end</span></p>'
+        )
+      );
+      const result = getTranscriptContextMenuMarkdown(select(root, "#start", "#end"));
+      expect(result?.html).toBe("<p>&lt;script&gt;<a>link</a>end</p>");
+      expect(result?.text).not.toContain("bad()");
+    });
+
+    test("requires a selection and rejects cross-message selections and ignored controls", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage(
+          '<p id="first">First</p><button data-transcript-ignore-context-menu>Copy</button><p id="last">Last</p>'
+        ) + createQuoteableTranscriptMessage('<p id="other">Other</p>')
+      );
+      expect(
+        getTranscriptContextMenuMarkdown({
+          transcriptRoot: root,
+          target: root.querySelector("#first"),
+          selection: null,
+        })
+      ).toBeNull();
+      expect(getTranscriptContextMenuMarkdown(select(root, "#first", "#other"))).toBeNull();
+      expect(getTranscriptContextMenuMarkdown(select(root, "#first", "#last"))).toBeNull();
+      const options = select(root, "#first");
+      options.selection.collapseToStart();
+      expect(getTranscriptContextMenuMarkdown(options)).toBeNull();
+    });
+
+    test("does not copy a selection from another message or outside the transcript", () => {
+      const root = createTranscriptRoot(
+        createQuoteableTranscriptMessage('<p id="first">First</p>') +
+          createQuoteableTranscriptMessage('<p id="other">Other</p>')
+      );
+      const options = select(root, "#first");
+      expect(
+        getTranscriptContextMenuMarkdown({ ...options, target: root.querySelector("#other") })
+      ).toBeNull();
+      expect(getTranscriptContextMenuMarkdown({ ...options, target: document.body })).toBeNull();
+    });
   });
 
   test("prefers selected transcript text over hovered text", () => {
