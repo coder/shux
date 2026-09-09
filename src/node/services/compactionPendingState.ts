@@ -78,6 +78,12 @@ interface PendingPreparation {
 }
 
 export interface CompactionPendingHistory {
+  /** Owns its history locks; invoke outside withLock, then revalidate any pending receipt. */
+  cleanupHeartbeat(
+    summary: MuxMessage,
+    isCurrent: () => boolean,
+    onCommitted: () => undefined
+  ): Promise<Result<"applied" | "skipped">>;
   /**
    * Hold BOTH existing history locks throughout the callback, reject removed workspaces,
    * and provide a stable view without reacquiring history/journal queues inside the lock.
@@ -278,7 +284,9 @@ export class CompactionPendingState {
     {
       identity: string;
       generation: string | undefined;
+      boundaryMessageId?: string;
       prepared: boolean;
+      published: boolean;
       startingBoundary?: CompactionPendingBoundary;
     }
   >();
@@ -323,7 +331,9 @@ export class CompactionPendingState {
     this.receipts.set(receipt, {
       identity: identity(state),
       generation,
+      boundaryMessageId: state.boundaryMessageId,
       prepared,
+      published: !prepared,
       startingBoundary,
     });
     return receipt;
@@ -332,14 +342,18 @@ export class CompactionPendingState {
   load(isCurrent: () => boolean): Promise<CompactionPendingReceipt | undefined> {
     return this.enqueue(async (view) => {
       // Optional enrichment must not brick recovery when its sidecar is unreadable.
-      const raw = await this.readBytes().catch(() => undefined);
+      const raw = await this.readBytes(view.assertStillOwned).catch(() => undefined);
       if (!isCurrent()) return;
       const parsed = parseJson(raw);
       // A downgraded reader must leave newer schemas intact for the version that owns them.
       if (parsed !== undefined && record(parsed)?.version !== 1) return;
       const persisted = parseState(parsed);
       const state = eligibleState(persisted, view);
-      if (state) return this.receipt(state, view.generation);
+      if (state) {
+        await view.assertStillOwned();
+        if (isCurrent()) return this.receipt(state, view.generation);
+        return;
+      }
       // A live writer may still be between pending-file publication and boundary commit.
       // Missing boundary proof suppresses injection; it does not authorize deleting its file.
       // Preserve ambiguous legacy bytes too; fresh compaction must establish usable ownership.
@@ -350,7 +364,8 @@ export class CompactionPendingState {
             persisted.publicationGeneration !== (view.generation ?? null)))
       ) {
         // Attachments are already suppressed; inability to prune them must not block a request.
-        await fs.unlink(this.filePath).catch(() => undefined);
+        await view.assertStillOwned();
+        if (isCurrent()) await fs.unlink(this.filePath).catch(() => undefined);
       }
     });
   }
@@ -463,6 +478,8 @@ export class CompactionPendingState {
             () => {
               // The rename is the commit: observer/lock-disposal failures cannot undo it.
               committed = true;
+              const owner = receipt && this.receipts.get(receipt);
+              if (owner) owner.published = true;
               onCommitted(receipt);
             }
           );
@@ -485,19 +502,99 @@ export class CompactionPendingState {
   consume(receipt: CompactionPendingReceipt): Promise<boolean> {
     const expected = this.receipts.get(receipt);
     if (!expected) return Promise.resolve(false);
-    return this.enqueue(async () => {
-      const state = parseState(parseJson(await this.readBytes()));
+    return this.enqueue(async (view) => {
+      const state = parseState(parseJson(await this.readBytes(view.assertStillOwned)));
       if (!state) return false;
       if (identity(state) === expected.identity) {
+        await view.assertStillOwned();
         await fs.unlink(this.filePath);
         return true;
       }
       if (!state.previousState || identity(state.previousState) !== expected.identity) return false;
       // A may be consumed while B is provisional. Remove only A's fallback, durably, so
       // B's later rollback/restart cannot resurrect it. B retains its immutable write identity.
-      await publishCompactionFile(this.filePath, JSON.stringify(head(state)), () => true);
+      await publishCompactionFile(
+        this.filePath,
+        JSON.stringify(head(state)),
+        () => true,
+        undefined,
+        view.assertStillOwned
+      );
       return true;
     });
+  }
+
+  /** Acknowledgement removes the file, but warm skills/paths still require current provenance. */
+  isCurrent(
+    receipt: CompactionPendingReceipt,
+    scope: "pending" | "carryover",
+    isCurrent: () => boolean
+  ): Promise<boolean> {
+    const expected = this.receipts.get(receipt);
+    if (!expected) return Promise.resolve(false);
+    return this.enqueue(async (view) => {
+      if (expected.generation !== view.generation || view.boundary.kind === "unreadable-reset")
+        return false;
+      // A provisional file is not evidence that its attachments ever belonged to history.
+      if (scope === "carryover" && !expected.published) return false;
+      if (scope === "pending") {
+        const state = eligibleState(
+          parseState(parseJson(await this.readBytes(view.assertStillOwned))),
+          view
+        );
+        if (!state || identity(state) !== expected.identity) return false;
+      }
+      await view.assertStillOwned();
+      if (!isCurrent()) return false;
+      expected.published = true;
+      return true;
+    });
+  }
+
+  /**
+   * Restart receipts cannot authorize ordinary rollback. Only this composition witnesses
+   * exact heartbeat removal, then rechecks the captured file and persisted predecessor proof.
+   * Never hold the pending/history lock while calling the separately queued history cleanup.
+   */
+  async rollbackHeartbeat(input: {
+    summaryMessage: MuxMessage;
+    isCurrent: () => boolean;
+    canRestorePrevious: () => boolean;
+    onCommitted: () => undefined;
+    onRestored: (receipt: CompactionPendingReceipt) => undefined;
+  }): Promise<Result<{ outcome: "applied" | "skipped"; restored?: CompactionPendingReceipt }>> {
+    const summary = structuredClone(input.summaryMessage);
+    const { isCurrent, canRestorePrevious, onCommitted, onRestored } = input;
+    let committed = false;
+    let restored: CompactionPendingReceipt | undefined;
+    // Enrichment read failures must not prevent mandatory exact history cleanup.
+    const receipt = await this.load(isCurrent).catch(() => undefined);
+    try {
+      const result = await this.history.cleanupHeartbeat(summary, isCurrent, () => {
+        committed = true;
+        onCommitted();
+      });
+      if (!committed) return result.success ? Ok({ outcome: "skipped" }) : result;
+    } catch (error) {
+      if (!committed) return Err(`Failed to roll back heartbeat: ${getErrorMessage(error)}`);
+      log.warn("Heartbeat cleanup failed after history commit", error);
+    }
+    try {
+      if (receipt && this.receipts.get(receipt)?.boundaryMessageId === summary.id)
+        await this.enqueue((view) =>
+          this.rollbackUnderLock(view, receipt, canRestorePrevious, {
+            boundaryMessageId: summary.id,
+            onRestored: (previous) => {
+              restored = previous;
+              onRestored(previous);
+            },
+          })
+        );
+    } catch (error) {
+      // Cleanup is already committed. Optional restoration cannot turn it into a retry.
+      log.warn("Pending heartbeat restoration unavailable", error);
+    }
+    return Ok({ outcome: "applied", restored });
   }
 
   rollback(receipt: CompactionPendingReceipt, canRestorePrevious: () => boolean): Promise<boolean> {
@@ -508,12 +605,17 @@ export class CompactionPendingState {
   private async rollbackUnderLock(
     view: CompactionPendingHistoryView,
     receipt: CompactionPendingReceipt,
-    canRestorePrevious: () => boolean
+    canRestorePrevious: () => boolean,
+    cleanup?: {
+      boundaryMessageId: string;
+      onRestored: (receipt: CompactionPendingReceipt) => undefined;
+    }
   ): Promise<boolean> {
     const expected = this.receipts.get(receipt);
-    if (!expected?.prepared) return false;
+    if (!expected || (!expected.prepared && !cleanup)) return false;
     const state = parseState(parseJson(await this.readBytes(view.assertStillOwned)));
     if (!state || identity(state) !== expected.identity) return false;
+    if (cleanup && state.boundaryMessageId !== cleanup.boundaryMessageId) return false;
     if (isCurrentState(state, view)) return false;
     // Restoring a committed heartbeat also needs the caller's exact history rollback proof.
     // A generation change permits exact cleanup, never restoration of the prior context.
@@ -523,7 +625,10 @@ export class CompactionPendingState {
     if (
       previous &&
       expected.generation === view.generation &&
-      sameBoundary(expected.startingBoundary, view.boundary) &&
+      sameBoundary(
+        cleanup ? state.previousStateBoundary : expected.startingBoundary,
+        view.boundary
+      ) &&
       canRestorePrevious()
     ) {
       if (
@@ -531,7 +636,9 @@ export class CompactionPendingState {
           this.filePath,
           JSON.stringify(head(previous)),
           canRestorePrevious,
-          undefined,
+          () => {
+            cleanup?.onRestored(this.receipt(previous, view.generation));
+          },
           view.assertStillOwned
         )
       )
@@ -545,17 +652,14 @@ export class CompactionPendingState {
   /** Call only after the destructive boundary/generation change committed under the history lock. */
   discardAfterBoundary(): Promise<void> {
     return this.enqueue(async (view) => {
-      const raw = await this.readBytes();
+      const raw = await this.readBytes(view.assertStillOwned);
       if (raw === undefined) return;
       const state = parseState(parseJson(raw));
-      if (
-        state &&
-        (isCurrentState(state, view) ||
-          (state.boundaryMessageId !== undefined &&
-            state.publicationGeneration !== undefined &&
-            state.publicationGeneration === (view.generation ?? null)))
-      )
-        return;
+      // A reset may retire proven old V1 state, never bytes owned by a future reader or
+      // ambiguous legacy state. Their absence from enrichment is enough to honor the reset.
+      if (state?.publicationGeneration === undefined) return;
+      if (state.publicationGeneration === (view.generation ?? null)) return;
+      await view.assertStillOwned();
       await fs.unlink(this.filePath);
     });
   }
