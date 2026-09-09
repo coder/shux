@@ -290,7 +290,7 @@ describe("inactive pending consumer contracts", () => {
     }
   );
 
-  it("keeps acknowledged carryover eligible until a foreign reset, while pending authority ends", async () => {
+  it("keeps acknowledged warmth only while its boundary remains current", async () => {
     const a = await publish("A");
     assert(a.result.success && a.result.data);
     const receipt = a.result.data;
@@ -305,10 +305,50 @@ describe("inactive pending consumer contracts", () => {
     const successor = await bytes();
     expect(await store.consume(receipt)).toBe(false);
     expect(await bytes()).toBe(successor);
-    expect(await store.isCurrent(receipt, "carryover", () => true)).toBe(true);
+    expect(await store.isCurrent(receipt, "carryover", () => true)).toBe(false);
     assert((await new HistoryService(h.config).clearHistory(workspaceId)).success);
     expect(await store.isCurrent(receipt, "carryover", () => true)).toBe(false);
   });
+
+  it.each(["history-only boundary", "future sidecar", "same-boundary owner"] as const)(
+    "refuses stale warmth after a foreign %s without deleting its bytes",
+    async (change) => {
+      const a = await publish("A");
+      assert(a.result.success && a.result.data);
+      expect(await store.consume(a.result.data)).toBe(true);
+      const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
+      const generation = await journal.captureGeneration();
+      if (change === "history-only boundary") {
+        assert(
+          (
+            await new HistoryService(h.config).appendToHistory(
+              workspaceId,
+              createMuxMessage("B", "assistant", "B", {
+                compacted: "user",
+                compactionBoundary: true,
+                compactionEpoch: 2,
+              })
+            )
+          ).success
+        );
+      } else if (change === "future sidecar") {
+        await fs.writeFile(pendingPath, '{"version":9,"opaque":"future owner"}\n');
+      } else {
+        assert(
+          await restart().prepare({
+            boundaryMessageId: a.summary.id,
+            publication: { generation },
+            attachments: { diffs: [], loadedSkills: [], readFiles: ["/replacement.ts"] },
+            isCurrent: () => true,
+          })
+        );
+      }
+      expect(await journal.captureGeneration()).toBe(generation);
+      const before = await bytes().catch(() => undefined);
+      expect(await store.isCurrent(a.result.data, "carryover", () => true)).toBe(false);
+      expect(await bytes().catch(() => undefined)).toBe(before);
+    }
+  );
 
   it.each(["future", "legacy", "malformed"] as const)(
     "reset preserves %s bytes without trusting them as enrichment",
@@ -370,7 +410,7 @@ describe("inactive pending consumer contracts", () => {
     }
   });
 
-  it.each(["consume", "load", "discard", "restore"] as const)(
+  it.each(["consume", "load", "discard", "restore", "pending", "carryover"] as const)(
     "lost physical authority during %s cannot affect successor bytes",
     async (operation) => {
       const a = await publish("A");
@@ -397,7 +437,9 @@ describe("inactive pending consumer contracts", () => {
             ? store.consume(a.result.data)
             : operation === "load"
               ? store.load(() => true)
-              : store.discardAfterBoundary()
+              : operation === "pending" || operation === "carryover"
+                ? store.isCurrent(a.result.data, operation, () => true)
+                : store.discardAfterBoundary()
       ).catch((error: unknown) => error);
       try {
         await entered.promise;

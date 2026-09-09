@@ -535,13 +535,21 @@ export class CompactionPendingState {
     return this.enqueue(async (view) => {
       if (expected.generation !== view.generation || view.boundary.kind === "unreadable-reset")
         return false;
-      // A provisional file is not evidence that its attachments ever belonged to history.
-      if (scope === "carryover" && !expected.published) return false;
-      if (scope === "pending") {
-        const state = eligibleState(
-          parseState(parseJson(await this.readBytes(view.assertStillOwned))),
-          view
-        );
+      // An acknowledged file may be absent, but its boundary must still be current.
+      // A foreign compaction can replace that boundary without advancing the reset generation.
+      if (
+        scope === "carryover" &&
+        (!expected.published ||
+          (view.boundary.kind === "identified"
+            ? view.boundary.messageId !== expected.boundaryMessageId
+            : expected.boundaryMessageId !== undefined))
+      )
+        return false;
+      const raw = await this.readBytes(view.assertStillOwned);
+      // Existing bytes must prove this exact owner, including replacement writes at the same
+      // boundary. Future formats stay untouched and cannot authorize cached enrichment.
+      if (scope === "pending" || raw !== undefined) {
+        const state = eligibleState(parseState(parseJson(raw)), view);
         if (!state || identity(state) !== expected.identity) return false;
       }
       await view.assertStillOwned();
