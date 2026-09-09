@@ -663,9 +663,11 @@ export class CompactionPendingState {
       const raw = await this.readBytes(view.assertStillOwned);
       if (raw === undefined) return;
       const state = parseState(parseJson(raw));
-      // A reset may retire proven old V1 state, never bytes owned by a future reader or
-      // ambiguous legacy state. Their absence from enrichment is enough to honor the reset.
-      if (state?.publicationGeneration === undefined) return;
+      // Explicit destruction must remove compatible legacy V1 too: older readers do not
+      // honor the generation fence and would re-inject its attachments after a downgrade.
+      // Ordinary ambiguous loads still preserve it; unknown schemas remain untouched here.
+      if (!state || (state.publicationGeneration === undefined && view.generation === undefined))
+        return;
       if (state.publicationGeneration === (view.generation ?? null)) return;
       await view.assertStillOwned();
       await fs.unlink(this.filePath);

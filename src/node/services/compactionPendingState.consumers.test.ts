@@ -351,7 +351,7 @@ describe("inactive pending consumer contracts", () => {
   );
 
   it.each(["future", "legacy", "malformed"] as const)(
-    "reset preserves %s bytes without trusting them as enrichment",
+    "destructive reset handles %s bytes without trusting them as enrichment",
     async (kind) => {
       const raw =
         kind === "future"
@@ -362,9 +362,11 @@ describe("inactive pending consumer contracts", () => {
       await fs.writeFile(pendingPath, raw);
       assert((await new HistoryService(h.config).clearHistory(workspaceId)).success);
       await store.discardAfterBoundary();
-      expect(await bytes()).toBe(raw);
+      if (kind === "legacy")
+        expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+      else expect(await bytes()).toBe(raw);
       expect(await restart().load(() => true)).toBeUndefined();
-      if (kind !== "malformed") expect(await bytes()).toBe(raw);
+      if (kind === "future") expect(await bytes()).toBe(raw);
     }
   );
 

@@ -688,7 +688,8 @@ describe("unactivated compaction pending-file protocol", () => {
         changed ? undefined : ["/legacy.ts"]
       );
       if (operation === "discard" && changed)
-        expect(JSON.parse(await bytes())).toMatchObject({ version: 1, boundaryMessageId: "a" });
+        expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+      else expect(JSON.parse(await bytes())).toMatchObject({ version: 1, boundaryMessageId: "a" });
     }
   );
 
