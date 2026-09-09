@@ -175,10 +175,27 @@ const rehypePreserveUnknownRawHtml: Plugin<[], Root> = () => {
   };
 };
 
+function stripRawKatexClasses(parent: Root | Element): void {
+  for (const child of parent.children) {
+    if (child.type !== "element") continue;
+    const className = child.properties.className;
+    if (typeof className === "string" || Array.isArray(className)) {
+      const classes = typeof className === "string" ? className.split(/\s+/) : className;
+      child.properties.className = classes.filter((name) => !String(name).startsWith("katex"));
+    }
+    stripRawKatexClasses(child);
+  }
+}
+
+// SECURITY AUDIT: Raw HTML cannot claim KaTeX metadata that the clipboard trusts as rendered math.
+// Run before rehypeKatex so only the math renderer can create the reserved classes.
+const rehypeReserveKatexClasses: Plugin<[], Root> = () => stripRawKatexClasses;
+
 const REHYPE_PLUGINS: Pluggable[] = [
   rehypePreserveUnknownRawHtml,
   rehypeRaw, // Parse HTML elements first
   [rehypeSanitize, sanitizeSchema], // Sanitize HTML to prevent XSS (strips dangerous elements/attributes)
+  rehypeReserveKatexClasses,
   [
     harden, // Additional URL filtering for links and images
     {

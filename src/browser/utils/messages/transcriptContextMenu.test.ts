@@ -210,7 +210,7 @@ describe("transcriptContextMenu", () => {
           )
         );
         const result = getTranscriptContextMenuMarkdown(select(root, "#part"));
-        expect(result?.text).toBe(display ? "$$\nx^2\n$$" : "$x^2$");
+        expect(result?.text).toBe(display ? "$$\nx^2\n$$" : "$$x^2$$");
         expect(result?.html).not.toContain("x2");
         expect(result?.html).not.toContain("<math");
       }

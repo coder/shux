@@ -407,7 +407,7 @@ function appendClipboardNodes(source: Node, destination: Node, range: Range): vo
         const math = document.createElement("span");
         math.textContent = element.closest(".katex-display")
           ? "$$\n" + tex + "\n$$"
-          : "$" + tex + "$";
+          : "$$" + tex + "$$";
         math.setAttribute("data-clipboard-math", math.textContent);
         destination.appendChild(math);
         continue;
