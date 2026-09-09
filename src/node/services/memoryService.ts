@@ -419,9 +419,14 @@ function isLegacyAdoptionRecord(value: unknown): value is LegacyAdoptionRecord {
   );
 }
 
-/** Pin bit of a manifest record's child sidecar fingerprint (null when none was recorded). */
+/**
+ * Pin bit of a manifest record's child sidecar fingerprint. No child entry at
+ * that adoption is the default, unpinned state (a usage entry a downgraded
+ * build creates by merely viewing the note is not a pin transition); null
+ * only for an unparsable fingerprint.
+ */
 function legacySidecarPinned(sidecar: string): boolean | null {
-  if (sidecar === "") return null;
+  if (sidecar === "") return false;
   try {
     const parsed: unknown = JSON.parse(sidecar);
     return typeof parsed === "object" && parsed !== null
@@ -1342,8 +1347,10 @@ export class MemoryService extends EventEmitter {
         // changes its usage counters, which must not drag the owner's pin
         // back to the child's unchanged value.
         if (childEntry !== undefined) {
-          const childPinChanged =
-            previous !== undefined && legacySidecarPinned(previous.sidecar) !== childEntry.pinned;
+          const priorPinned = previous === undefined ? null : legacySidecarPinned(previous.sidecar);
+          // Only an actual boolean transition of the child's pin overrides
+          // the owner's; an unknown prior state never does.
+          const childPinChanged = priorPinned !== null && priorPinned !== childEntry.pinned;
           try {
             await this.metaService.mergeKeys(
               childKey,

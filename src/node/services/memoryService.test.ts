@@ -1587,13 +1587,17 @@ describe("MemoryService", () => {
         projectPath: "",
         workspaceId: "ws-owner",
       });
-      // Child had viewed it once on the old build (unpinned); adopted.
-      await fixture.metaService.recordAccess(childKey, { write: false });
+      // Adopted before the child ever had a sidecar entry (no view, no pin).
       await fixture.service.listIndexEntries({ ...fixture.ctx });
       // The owner pins the shared copy...
       await fixture.metaService.setPinned(ownerKey, true);
-      // ...then the downgraded build merely views the legacy note again: the
-      // child sidecar changes (usage), its pin bit does not.
+      // ...then the downgraded build merely views the legacy note: the child
+      // sidecar gains a usage-only entry — the default unpinned state, not a
+      // pin transition — so the owner's pin stands.
+      await fixture.metaService.recordAccess(childKey, { write: false });
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      // Another view once an entry exists: usage changes, the pin bit does not.
       await fixture.metaService.recordAccess(childKey, { write: false });
       await fixture.service.listIndexEntries({ ...fixture.ctx });
       expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
