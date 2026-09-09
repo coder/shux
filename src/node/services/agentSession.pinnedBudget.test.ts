@@ -623,6 +623,47 @@ describe("pinned full-payload rollover admission", () => {
     }
   });
 
+  test("a final-flush turn never starts MCP servers", async () => {
+    const fixture = await setup("small");
+    const { h, service, start } = fixture;
+    const mcpServerManager = service.turnRequestBuilderBindings.mcpServerManager!;
+    const startServers = spyOn(mcpServerManager, "getToolsForWorkspace");
+    // No on-send auto-compaction: the persisted trigger must be the request's last user row.
+    h.session.setAutoCompactionThreshold(1);
+    try {
+      // Token-budget mode off keeps the persisted trigger's flag intact for the request builder
+      // (a resumed flush after a restart takes the same path).
+      const flushSend = {
+        model,
+        agentId: "exec",
+        experiments: { tokenBudget: false },
+        muxMetadata: { type: "normal", contextBudgetFlush: true },
+      } as const;
+      expect((await h.session.sendMessage("Flush context notes now.", flushSend)).success).toBe(
+        true
+      );
+      expect(start).toHaveBeenCalledTimes(1);
+      // The memory-only ceiling proves the flag reached the builder.
+      expect(Object.keys(start.mock.calls[0][0].tools ?? {})).not.toContain("tool_catalog_search");
+      expect(startServers).not.toHaveBeenCalled();
+      await h.session.interruptStream();
+      await h.session.waitForIdle();
+      // Control: an ordinary turn on the same fixture does start them.
+      expect(
+        (
+          await h.session.sendMessage("Ordinary turn", {
+            model,
+            agentId: "exec",
+            experiments: { tokenBudget: false },
+          })
+        ).success
+      ).toBe(true);
+      expect(startServers).toHaveBeenCalledTimes(1);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   test("prepared primary keeps fallbacks lazy and admits the actual fallback model on demand", async () => {
     const fixture = await setup("small");
     const { h, config, start, factory, assembly, assembleTools, modelCleanup } = fixture;

@@ -329,6 +329,12 @@ interface AutoRetryResumeRequest {
   // intentionally omitted from durable startup-recovery snapshots.
   options: SendMessageOptions;
   requestAssemblySnapshot?: RequestAssemblySnapshot;
+  /**
+   * The request already is an admitted context reset, so a budget failure on retry must not
+   * reset again. Distinct from the snapshot: an admitted final flush pins its chain too, yet
+   * its emergency reset stays available.
+   */
+  contextBudgetRetried?: boolean;
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
@@ -1633,7 +1639,8 @@ export class AgentSession {
     agentInitiated?: boolean,
     goalKind?: GoalSyntheticMessageKind,
     goalId?: string,
-    requestAssemblySnapshot?: RequestAssemblySnapshot
+    requestAssemblySnapshot?: RequestAssemblySnapshot,
+    contextBudgetRetried?: boolean
   ): void {
     if (!options) {
       this.lastAutoRetryResumeRequest = undefined;
@@ -1643,6 +1650,7 @@ export class AgentSession {
     this.lastAutoRetryResumeRequest = {
       options,
       ...(requestAssemblySnapshot ? { requestAssemblySnapshot } : {}),
+      ...(contextBudgetRetried === true ? { contextBudgetRetried: true } : {}),
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
@@ -1685,6 +1693,7 @@ export class AgentSession {
       goalId: request.goalId,
       retrySignal: signal,
       requestAssemblySnapshot: request.requestAssemblySnapshot,
+      contextBudgetRetried: request.contextBudgetRetried,
     });
     // Interrupting the scheduling fiber cannot cancel resumeStream's original Promise.
     // Its late settlement must not mutate a replacement retry or accepted manual turn.
@@ -4610,7 +4619,8 @@ export class AgentSession {
       agentInitiated,
       goalKind,
       internal?.goalId,
-      requestAssemblySnapshot
+      requestAssemblySnapshot,
+      contextRollover
     );
     try {
       await accept();
@@ -4770,6 +4780,7 @@ export class AgentSession {
       goalId?: string;
       retrySignal?: AbortSignal;
       requestAssemblySnapshot?: RequestAssemblySnapshot;
+      contextBudgetRetried?: boolean;
     }
   ): Promise<AgentSessionResult<{ started: boolean }>> {
     this.assertNotDisposed("resumeStream");
@@ -4849,7 +4860,8 @@ export class AgentSession {
         internal?.agentInitiated,
         internal?.goalKind,
         internal?.goalId,
-        internal?.requestAssemblySnapshot
+        internal?.requestAssemblySnapshot,
+        internal?.contextBudgetRetried
       );
       // Open the mid-turn thinking override window for the resumed turn (after
       // preparation publication; the coordinator expires the holder when the turn becomes idle).
@@ -4869,7 +4881,7 @@ export class AgentSession {
         internal?.goalId,
         turnThinkingOverride,
         attempt,
-        internal?.requestAssemblySnapshot != null,
+        internal?.contextBudgetRetried === true,
         internal?.requestAssemblySnapshot
       );
       if (!result.success) {
@@ -5676,6 +5688,7 @@ export class AgentSession {
       // The prompt promises that the next message seals the window, so require the same
       // admission the rollover itself needs (history access, toolset-preserving middleware).
       // Threshold 100% disables automatic rollover: a flush promising a sealed window would lie.
+      const generation = this.contextBudgetGeneration;
       const admitted =
         this.pendingRollover != null &&
         rolloverEnabled &&
@@ -5686,15 +5699,25 @@ export class AgentSession {
           ? await this.captureRolloverRequestAssembly()
           : undefined;
       const notesExist = admitted?.success ? await this.workspaceContextNotesExist() : false;
-      // Re-read the threshold after the last await: the slider may have moved meanwhile.
-      if (admitted?.success && this.compactionMonitor.getThreshold() < 1) {
+      // Re-read the gates after the last await: the slider may have moved meanwhile, and a Stop
+      // (interruptStream → clearContextBudgetState) drops the intent and its paired
+      // continuation, so a flush accepted now would run with nothing to seal the window.
+      if (
+        admitted?.success &&
+        this.contextBudgetGeneration === generation &&
+        this.pendingRollover != null &&
+        this.compactionMonitor.getThreshold() < 1
+      ) {
         // Keep pendingRollover and pin this admitted snapshot: the promised reset must not be
-        // invalidated by registry changes that happen during the flush turn itself.
+        // invalidated by registry changes that happen during the flush turn itself. The flush
+        // request runs the same pinned middleware, so a tool-mutating hook registered after
+        // this capture cannot add an executable tool to the memory-only turn either.
         this.pendingRolloverSnapshot = admitted.data;
         return Ok({
           prefix: [
             createContextBudgetWarning(decision.projected, maxTokens, true, true, { notesExist }),
           ],
+          requestAssemblySnapshot: admitted.data,
         });
       }
       // Neither the trigger text nor the flush flag may leak into the fresh window.
@@ -5851,7 +5874,20 @@ export class AgentSession {
   ): Promise<"continue" | "warn" | "rollover" | "block"> {
     const context = this.activeStreamContext;
     const generation = this.contextBudgetGeneration;
-    if (!context?.options || !this.isTokenBudgetActive(context.options)) return "continue";
+    if (!context?.options || !this.isTokenBudgetActive(context.options)) {
+      // Token-budget mode was disabled after the flush trigger was persisted or queued: nothing
+      // restores or seals the window any more, so end the hidden turn after its single step
+      // and drop whatever intent and paired continuation the disabled mode left behind.
+      if (context?.contextBudgetFlushTurn === true) {
+        this.pendingRollover = undefined;
+        this.pendingRolloverSnapshot = undefined;
+        this.contextBudgetFlushClaimed = false;
+        if (this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY).removedCount > 0)
+          this.emitQueuedMessageChanged();
+        return "rollover";
+      }
+      return "continue";
+    }
     // Fallbacks rebuild this callback's model binding; never use the requested primary's limit.
     context.modelString = step.model;
     this.contextBudgetMemoryWritable = step.memoryWritable;
@@ -6926,7 +6962,8 @@ export class AgentSession {
         agentInitiated,
         goalKind,
         goalId,
-        requestAssemblySnapshot
+        requestAssemblySnapshot,
+        contextBudgetRetried
       );
     }
 
@@ -7009,6 +7046,9 @@ export class AgentSession {
       }
 
       let resumedFlushCannotWrite = false;
+      // A resumed flush runs the middleware chain admitted for its promised reset (see
+      // prepareContextBudgetSend), never the live registry.
+      let resumedFlushSnapshot: RequestAssemblySnapshot | undefined;
       if (this.isTokenBudgetActive(options)) {
         this.contextBudgetWarningClaimed ||= historyResult.data.some(
           (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
@@ -7045,6 +7085,7 @@ export class AgentSession {
           if (isStreamStartAborted()) return Ok(undefined);
           if (!captured.success) return await fail(captured.error);
           this.pendingRolloverSnapshot = captured.data;
+          resumedFlushSnapshot = captured.data;
           // The promised notes write needs a writable memory tool under the *current* options
           // and agent; when it is gone, degrade the resumed flush to a tool-less step so the
           // queued rollover still seals the window instead of running an unwritable flush.
@@ -7281,10 +7322,13 @@ export class AgentSession {
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
-        requestAssemblySnapshot,
-        onStepSettled: this.isTokenBudgetActive(options)
-          ? (step) => this.onContextBudgetStepSettled(step)
-          : undefined,
+        requestAssemblySnapshot: requestAssemblySnapshot ?? resumedFlushSnapshot,
+        // A flush turn stays bounded to one step even when token-budget mode was disabled
+        // after its trigger was persisted (the callback then only stops it).
+        onStepSettled:
+          this.isTokenBudgetActive(options) || contextBudgetFlushTurn
+            ? (step) => this.onContextBudgetStepSettled(step)
+            : undefined,
         openaiTruncationModeOverride,
         // Mid-turn thinking overrides clamp against the same floor as the
         // send-time level above (single source of truth for the floor).

@@ -1565,6 +1565,49 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
   });
 
+  test("a Stop during flush admission degrades the flush instead of running it unsealed", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    const capture = h.aiService.captureRequestAssemblySnapshot!.bind(h.aiService);
+    // interruptStream clears the pending reset and its paired continuation while the flush
+    // dispatch is still awaiting its admission checks.
+    spyOn(h.aiService, "captureRequestAssemblySnapshot").mockImplementationOnce(async (id) => {
+      expect((await h.session.interruptStream()).success).toBe(true);
+      return capture(id);
+    });
+    await h.finishAndDispatch();
+    const rows = await allRows(h);
+    expect(warningRows(rows)).toHaveLength(0);
+    const trigger = rows.at(-1)!;
+    expect(text(trigger)).toBe("Continue");
+    expect(trigger.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+  });
+
+  test("a persisted flush resumed with token-budget mode disabled stays bounded to one step", async () => {
+    const first = await setup();
+    expect((await first.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await first.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await first.finishAndDispatch();
+    await first.session.dispose();
+    const h = await setup({ previous: first });
+    const disabled = { ...options, experiments: { tokenBudget: false } };
+    expect((await h.session.resumeStream(disabled)).success).toBe(true);
+    // The hidden trigger keeps its memory-only ceiling, but nothing restores the promised reset.
+    expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    // The settled-step callback still ends the turn after its single step.
+    expect(await h.requests[0].onStepSettled?.(step(50_000))).toBe("rollover");
+    h.settleStream(0, { finishReason: "stop" });
+    await h.session.waitForIdle();
+    expect(h.requests).toHaveLength(1);
+    expect((await h.session.sendMessage("Follow-up", disabled)).success).toBe(true);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+  });
+
   test("resuming a persisted flush re-validates rollover admission first", async () => {
     const first = await setup();
     expect((await first.session.sendMessage("Work", options)).success).toBe(true);
@@ -1651,6 +1694,9 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
     await h.finishAndDispatch();
     expect(warningRows(await allRows(h)).filter(isFinalFlushRow)).toHaveLength(1);
+    // The flush request itself runs the admitted chain, so a tool-mutating hook registered
+    // between admission and assembly cannot widen the memory-only turn either.
+    expect(h.requests[1].requestAssemblySnapshot?.preservesToolset).toBe(true);
     const unregister = eventSpine.useBefore(
       "request.assemble",
       (ctx) => {

@@ -999,12 +999,13 @@ export class MemoryService extends EventEmitter {
     fileText: string,
     actor: MemoryActor,
     toolCallId?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    maxFileBytes?: number
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
-      assertWithinFileSizeCap(fileText);
+      assertWithinFileSizeCap(fileText, maxFileBytes);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
       return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         // create is a write: materialize the scope root on first use — but
@@ -1053,7 +1054,8 @@ export class MemoryService extends EventEmitter {
     newStr: string,
     actor: MemoryActor,
     toolCallId?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    maxFileBytes?: number
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -1065,7 +1067,7 @@ export class MemoryService extends EventEmitter {
       return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const updated = computeStrReplaceUpdate(content, oldStr, newStr, virtualPath);
-        assertWithinFileSizeCap(updated);
+        assertWithinFileSizeCap(updated, maxFileBytes);
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
@@ -1095,7 +1097,8 @@ export class MemoryService extends EventEmitter {
     actor: MemoryActor,
     toolCallId?: string,
     expectedFingerprint?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    maxFileBytes?: number
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -1118,7 +1121,7 @@ export class MemoryService extends EventEmitter {
         }
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
-        assertWithinFileSizeCap(updated);
+        assertWithinFileSizeCap(updated, maxFileBytes);
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
@@ -1806,8 +1809,24 @@ function computeInsertUpdate(
   return { updated: lines.join("\n"), insertedLineCount: insertedLines.length };
 }
 
-function assertWithinFileSizeCap(content: string): void {
+/**
+ * `maxFileBytes` lets a caller tighten the cap for one file (the context-budget flush caps
+ * its notes at the preload size); it is checked against the actual updated content INSIDE
+ * the target mutation lock, so a concurrent edit cannot slip an oversized result past it.
+ */
+function assertWithinFileSizeCap(content: string, maxFileBytes?: number): void {
   const bytes = Buffer.byteLength(content, "utf-8");
+  if (maxFileBytes !== undefined) {
+    assert(
+      Number.isInteger(maxFileBytes) && maxFileBytes > 0 && maxFileBytes <= MEMORY_MAX_FILE_BYTES,
+      "maxFileBytes must tighten the memory file cap"
+    );
+    if (bytes > maxFileBytes) {
+      throw new MemoryCommandError(
+        `This file is limited to ${maxFileBytes} bytes in total (got ${bytes}); shorten or replace content (essential state first)`
+      );
+    }
+  }
   if (bytes > MEMORY_MAX_FILE_BYTES) {
     throw new MemoryCommandError(
       `Memory files are limited to ${MEMORY_MAX_FILE_BYTES} bytes (got ${bytes}); split the content into smaller files`

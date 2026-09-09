@@ -1693,7 +1693,9 @@ export class TurnRequestBuilder {
     let mcpPromptRuntime: MCPPromptRuntime | undefined;
     let mcpSetupDurationMs = 0;
 
-    if (this.dependencies.bindings.mcpServerManager) {
+    // SECURITY: the memory-only flush turn filters every MCP tool out anyway, so never start
+    // repository-configured servers (with project secrets) for this hidden automatic turn.
+    if (this.dependencies.bindings.mcpServerManager && !contextBudgetFlushTurn) {
       const mcpServerManager = this.dependencies.bindings.mcpServerManager;
       const mcpToolSetupStartedAt = Date.now();
       try {

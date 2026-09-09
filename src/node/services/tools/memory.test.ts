@@ -374,17 +374,6 @@ describe("memory tool", () => {
       });
       expect(oversized.success).toBe(false);
       if (!oversized.success) expect(oversized.error).toContain("limited to");
-      // The payload is sized by command: an irrelevant empty file_text does not hide an
-      // oversized insert.
-      const oversizedInsert = await run(fixture.tool, {
-        command: "insert",
-        path: notes,
-        insert_line: 0,
-        insert_text: "y".repeat(8 * 1024 + 1),
-        file_text: "",
-      });
-      expect(oversizedInsert.success).toBe(false);
-      if (!oversizedInsert.success) expect(oversizedInsert.error).toContain("limited to");
       expect(
         (
           await run(fixture.tool, {
@@ -408,6 +397,17 @@ describe("memory tool", () => {
       // Reads remain available and a fresh instance (next request) may mutate again.
       expect((await run(fixture.tool, { command: "view", path: notes })).success).toBe(true);
       const fresh = createMemoryTool(fixture.config);
+      // The resulting size is checked against the actual file (an irrelevant empty file_text
+      // does not hide an oversized insert); the refused write frees the slot.
+      const oversizedInsert = await run(fresh, {
+        command: "insert",
+        path: notes,
+        insert_line: 0,
+        insert_text: "y".repeat(8 * 1024 + 1),
+        file_text: "",
+      });
+      expect(oversizedInsert.success).toBe(false);
+      if (!oversizedInsert.success) expect(oversizedInsert.error).toContain("limited to");
       expect(
         (await run(fresh, { command: "insert", path: notes, insert_line: 0, insert_text: "x" }))
           .success

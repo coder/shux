@@ -165,31 +165,6 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
               ? input.old_str != null
               : input.insert_line != null && input.insert_text != null);
         if (wellFormed) {
-          // The notes are preloaded truncated to CONTEXT_NOTES_RESERVED_BYTES; a resulting
-          // file beyond that only bloats it with content the next window never sees. Size the
-          // payload by command and project the resulting file against the current contents.
-          const payload =
-            input.command === "create"
-              ? (input.file_text ?? "")
-              : input.command === "insert"
-                ? (input.insert_text ?? "")
-                : (input.new_str ?? "");
-          let currentBytes = 0;
-          if (input.command !== "create") {
-            const current = await memoryService.readFileWithSha(ctx, input.path);
-            currentBytes = current.success
-              ? Buffer.byteLength(current.data.content, "utf8") -
-                (input.command === "str_replace"
-                  ? Buffer.byteLength(input.old_str ?? "", "utf8")
-                  : 0)
-              : 0;
-          }
-          if (currentBytes + Buffer.byteLength(payload, "utf8") > CONTEXT_NOTES_RESERVED_BYTES) {
-            return {
-              success: false,
-              error: `Context notes are limited to ${CONTEXT_NOTES_RESERVED_BYTES} bytes in total; shorten or replace content (essential state first).`,
-            };
-          }
           if (pinnedMutationUsed) {
             return {
               success: false,
@@ -197,6 +172,20 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
             };
           }
           pinnedMutationUsed = true;
+          // The notes are preloaded truncated to CONTEXT_NOTES_RESERVED_BYTES; a resulting file
+          // beyond that only bloats it with content the next window never sees. The service
+          // checks the actual result under its mutation lock (a concurrent Memory UI edit cannot
+          // stale a precheck here); a refused write changed nothing, so it frees the slot.
+          const result = await executeMemoryCommand(
+            memoryService,
+            ctx,
+            input,
+            checkWriteAccess,
+            toolCallId,
+            { checkReadAccess: checkPinnedPath, maxFileBytes: CONTEXT_NOTES_RESERVED_BYTES }
+          );
+          if (!result.success) pinnedMutationUsed = false;
+          return result;
         }
       }
       return executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId, {
@@ -246,6 +235,8 @@ export async function executeMemoryCommand(
     abortSignal?: AbortSignal;
     /** Read guard (view); the agent tool uses it to pin flush turns to one file. */
     checkReadAccess?: (virtualPath: string) => MemoryToolResult | null;
+    /** Tighter per-file size cap for create/str_replace/insert, enforced under the mutation lock. */
+    maxFileBytes?: number;
   }
 ): Promise<MemoryToolResult> {
   try {
@@ -273,7 +264,8 @@ export async function executeMemoryCommand(
             input.file_text,
             "agent",
             toolCallId,
-            options?.abortSignal
+            options?.abortSignal,
+            options?.maxFileBytes
           ))
         );
       }
@@ -290,7 +282,8 @@ export async function executeMemoryCommand(
             input.new_str ?? "",
             "agent",
             toolCallId,
-            options?.abortSignal
+            options?.abortSignal,
+            options?.maxFileBytes
           ))
         );
       }
@@ -311,7 +304,8 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.expectedTargetFingerprint,
-            options?.abortSignal
+            options?.abortSignal,
+            options?.maxFileBytes
           ))
         );
       }

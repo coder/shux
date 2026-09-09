@@ -560,6 +560,40 @@ describe("MemoryService", () => {
       );
       expect(result.success).toBe(false);
     });
+
+    it("applies a caller-tightened cap to the actual updated content", async () => {
+      using fixture = await createFixture();
+      const notes = "/memories/global/notes.md";
+      await fixture.service.create(fixture.ctx, notes, "a".repeat(60), "agent");
+      // 60 + 41 > 100: rejected even though the payload alone would fit.
+      const grow = await fixture.service.insert(
+        fixture.ctx,
+        notes,
+        0,
+        "b".repeat(40),
+        "agent",
+        undefined,
+        undefined,
+        undefined,
+        100
+      );
+      expect(grow.success).toBe(false);
+      if (!grow.success) expect(grow.error).toContain("limited to 100 bytes");
+      // Replacing content that frees space fits under the same cap.
+      const shrink = await fixture.service.strReplace(
+        fixture.ctx,
+        notes,
+        "a".repeat(60),
+        "c".repeat(90),
+        "agent",
+        undefined,
+        undefined,
+        100
+      );
+      expect(shrink.success).toBe(true);
+      const view = await fixture.service.view(fixture.ctx, notes);
+      expect(view.success && view.output).toContain("c".repeat(90));
+    });
   });
 
   describe("UI read/save", () => {
