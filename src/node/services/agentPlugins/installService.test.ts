@@ -313,6 +313,20 @@ describe("AgentPluginInstallService", () => {
       expect((await manager.getToolsForWorkspace(request)).stats.startedServerCount).toBe(2);
       expect(await fsPromises.readFile(startsFile, "utf8")).toBe(starts);
       expect(await fsPromises.readFile(siblingStartsFile, "utf8")).toBe(siblingStarts);
+
+      // A saved enable override is honored only after import, without restarting either sibling.
+      await service.addComponents({
+        name: "demo-plugin",
+        expectedLockedSha: preview.lockedSha,
+        skills: [],
+        mcpServers: ["excluded"],
+      });
+      expect((await manager.getToolsForWorkspace(request)).stats.startedServerCount).toBe(3);
+      const afterEnabledAddition = await fsPromises.readFile(startsFile, "utf8");
+      expect(afterEnabledAddition.startsWith(starts)).toBe(true);
+      expect(afterEnabledAddition.trim().split("\n")).toHaveLength(2);
+      expect(afterEnabledAddition.slice(starts.length)).toMatch(/^excluded /);
+      expect(await fsPromises.readFile(siblingStartsFile, "utf8")).toBe(siblingStarts);
       expect(await fsPromises.readFile(stateFile, "utf8")).toBe("preserve me");
       expect(await fsPromises.readFile(overridesFile, "utf8")).toBe(JSON.stringify(overrides));
       expect(request.overrides).toEqual(overrides);

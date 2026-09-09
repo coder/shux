@@ -411,6 +411,62 @@ describe("agent_skill_list", () => {
     });
   });
 
+  it("lists only imported plugin skills and refreshes additions without hiding fallback sources", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-imports-home");
+    using project = new TestTempDir("test-agent-skill-list-imports-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-imports-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        const container = path.join(xumHomeDir.path, "plugins");
+        await writePlugin(container, "a-managed", [
+          { name: "selected", description: "selected plugin skill" },
+          { name: "skipped", description: "managed skill" },
+          { name: "hidden", description: "not imported" },
+        ]);
+        await writePlugin(container, "z-unmanaged", [
+          { name: "skipped", description: "fallback skill" },
+        ]);
+        const saveSelection = (skills: string[] | null) =>
+          fs.writeFile(
+            path.join(xumHomeDir.path, "plugins.json"),
+            JSON.stringify({
+              plugins: [{ name: "a-managed", importedComponents: { skills, mcpServers: [] } }],
+            })
+          );
+        await saveSelection(["selected"]);
+        const tool = createAgentSkillListTool({
+          ...createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          }),
+          experiments: { agentPlugins: true },
+        });
+        const list = async () => {
+          const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+          if (!result.success) throw new Error(result.error);
+          return result.skills;
+        };
+        const initial = await list();
+        expect(initial.some((skill) => skill.name === "selected")).toBe(true);
+        expect(initial.some((skill) => skill.name === "hidden")).toBe(false);
+        expect(getSkill(initial, "skipped").description).toBe("fallback skill");
+
+        await saveSelection(["selected", "skipped"]);
+        expect(getSkill(await list(), "skipped").description).toBe("managed skill");
+        // Malformed selection is not a legacy import-all entry.
+        await saveSelection(null);
+        const invalid = await list();
+        expect(invalid.some((skill) => skill.name === "selected")).toBe(false);
+        expect(getSkill(invalid, "skipped").description).toBe("fallback skill");
+      });
+    });
+  });
+
   it("lists checkout-level plugin skills when the workspace executes in a subproject", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-plugins-subproject-home");
     using checkout = new TestTempDir("test-agent-skill-list-plugins-subproject-checkout");

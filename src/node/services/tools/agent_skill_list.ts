@@ -229,6 +229,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           skillsRoot: string;
           containmentRoot: string;
           scope: "global" | "project";
+          importedSkills?: readonly string[];
         }> = [
           {
             skillsRoot: path.join(xumScope.xumHome, "skills"),
@@ -310,13 +311,14 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               skillsRoot: plugin.skillsDir,
               containmentRoot: plugin.rootPath,
               scope: plugin.scope,
+              importedSkills: plugin.importedComponents?.skills,
             });
           }
         }
 
         const skills: AgentSkillDescriptor[] = [];
         const seenByScope = new Set<string>();
-        for (const { skillsRoot, containmentRoot, scope } of roots) {
+        for (const { skillsRoot, containmentRoot, scope, importedSkills } of roots) {
           let skillsRootReal: string;
           try {
             skillsRootReal = await fsPromises.realpath(skillsRoot);
@@ -338,6 +340,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
 
           const directoryNames = await listSkillDirectories(skillsRootReal);
           for (const directoryName of directoryNames) {
+            // Skipped plugin skills must not claim a same-named fallback in this manual scan.
+            if (importedSkills != null && !importedSkills.includes(directoryName)) continue;
             // SECURITY: symlinked skill directories are allowed only through
             // readSkillDescriptor's realpath containment check, which rejects
             // entries resolving outside the containment root. This matches the
