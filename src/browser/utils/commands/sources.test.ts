@@ -544,16 +544,20 @@ test.each(["stable", "nightly", "npm"] as const)(
     });
     await actions.find((a) => a.title === "Install Update and Restart")!.run();
     expect(install).toHaveBeenCalledTimes(1);
+    expect(install).not.toHaveBeenCalledWith({ force: true });
     expect(onOpenAbout).toHaveBeenCalledTimes(1);
+    await actions.find((a) => a.id === CommandIds.updateInstallForce())!.run();
+    expect(install).toHaveBeenLastCalledWith({ force: true });
+    expect(onOpenAbout).toHaveBeenCalledTimes(2);
     // About reads the channel when it opens, so the switch must persist before the dialog appears.
     const switchAction = actions.find((a) => a.id === CommandIds.updateChannel(channel));
     expect(switchAction).toBeDefined();
     const switched = switchAction!.run();
     expect(setChannel).toHaveBeenCalledWith({ channel });
-    expect(onOpenAbout).toHaveBeenCalledTimes(1);
+    expect(onOpenAbout).toHaveBeenCalledTimes(2);
     settleChannel();
     await switched;
-    expect(onOpenAbout).toHaveBeenCalledTimes(2);
+    expect(onOpenAbout).toHaveBeenCalledTimes(3);
     expect(getActions().some((a) => a.title === "Check for Updates")).toBe(false);
   }
 );

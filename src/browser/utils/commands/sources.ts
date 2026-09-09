@@ -1501,6 +1501,14 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["update", "upgrade", "restart"],
         run: updateCommand((api) => api.update.install()),
       },
+      {
+        id: CommandIds.updateInstallForce(),
+        title: "Install Update and Restart Anyway",
+        subtitle: "Interrupts active work",
+        section: section.help,
+        keywords: ["update", "upgrade", "restart", "force"],
+        run: updateCommand((api) => api.update.install({ force: true })),
+      },
       ...p.supportedUpdateChannels.map((channel) => ({
         id: CommandIds.updateChannel(channel),
         title: `Update Channel: ${UPDATE_CHANNEL_LABELS[channel]}`,

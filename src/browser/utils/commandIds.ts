@@ -110,6 +110,7 @@ export const CommandIds = {
   updateCheck: () => "update:check" as const,
   updateDownload: () => "update:download" as const,
   updateInstall: () => "update:install" as const,
+  updateInstallForce: () => "update:install-force" as const,
   updateChannel: (channel: string) => `update:channel:${channel}` as const,
 } as const;
 
