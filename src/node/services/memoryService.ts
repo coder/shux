@@ -1028,10 +1028,13 @@ export class MemoryService extends EventEmitter {
               })
             );
           } catch (error) {
-            log.warn("[MemoryService] failed to copy legacy memory stats; retrying on next access", {
-              relPath,
-              error,
-            });
+            log.warn(
+              "[MemoryService] failed to copy legacy memory stats; retrying on next access",
+              {
+                relPath,
+                error,
+              }
+            );
             continue;
           }
           adopted[relPath] = contentHash;
