@@ -389,6 +389,20 @@ interface MemoryStore {
   assertContained(relPath: string): Promise<void>;
 }
 
+/**
+ * Owner-store directory that receives a sub-agent's legacy private notes whose
+ * relPath the owner already uses with different content (adoptLegacyPrivateStore).
+ */
+const LEGACY_IMPORT_DIR = "imported";
+
+async function isDirectory(absPath: string): Promise<boolean> {
+  try {
+    return (await fsPromises.stat(absPath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function isPathWithinRoot(
   realRoot: string,
   candidate: string,
@@ -691,6 +705,12 @@ export class MemoryService extends EventEmitter {
   private readonly ownerByContext = new WeakMap<MemoryScopeContext, string>();
 
   /**
+   * Sub-agents whose pre-sharing private notebook was found absent or already
+   * adopted during this process lifetime (see adoptLegacyPrivateStore).
+   */
+  private readonly legacyStoreChecked = new Set<string>();
+
+  /**
    * Owner of the workspace scope for this context ("" when there is no
    * workspace). Public so callers that key sidecar metadata for the same
    * context (memoryOperations) bind to the exact owner the store resolved to.
@@ -857,10 +877,157 @@ export class MemoryService extends EventEmitter {
     relPath: string
   ): Promise<MemoryStore> {
     const store = this.getStore(ctx, scope);
-    if (scope === "workspace") await this.assertWorkspaceStoreReadable(ctx, store);
+    if (scope === "workspace") await this.openWorkspaceStore(ctx, store);
     await store.assertRootSafe();
     await store.assertContained(relPath);
     return store;
+  }
+
+  /**
+   * Every workspace-scope entry point (commands, root listing, index build)
+   * goes through here: refuse revoked access, then fold a sub-agent's
+   * pre-sharing private notebook into the shared store it now resolves to.
+   */
+  private async openWorkspaceStore(ctx: MemoryScopeContext, store: MemoryStore): Promise<void> {
+    await this.assertWorkspaceStoreReadable(ctx, store);
+    await this.adoptLegacyPrivateStore(ctx, store);
+  }
+
+  /**
+   * Upgrade compatibility for the shared task-tree notebook. Sub-agents
+   * created by builds before sharing kept `/memories/workspace` in their OWN
+   * session dir (<sessionsDir>/<child>/memory). getStore now redirects them to
+   * the owner's root, which would make those notes invisible — and removal
+   * later deletes the child's session dir, discarding them for good. On the
+   * child's first shared-store access, import every legacy file into the
+   * owner store (same relPath when free or identical; otherwise under
+   * imported/<child>/), move pins/stats with them, and rename the legacy
+   * directory aside so the import is one-shot and nothing is lost even for
+   * files the import skips (binary/oversize). Downgrading afterwards shows
+   * the notes in the parent's notebook rather than the child's — no loss.
+   *
+   * Runs under the owner store's mutation lock with the same commit guard as
+   * file mutations, and never throws: an import failure (lock timeout, disk)
+   * leaves the legacy directory intact for the next access, while the caller
+   * proceeds with the shared store. Not journaled: this is a mechanical
+   * relocation, not an agent edit; pre-upgrade child journal rows keep
+   * targeting the legacy physical paths (rollback restores there and the next
+   * access re-imports).
+   */
+  private async adoptLegacyPrivateStore(
+    ctx: MemoryScopeContext,
+    store: MemoryStore
+  ): Promise<void> {
+    const childId = ctx.workspaceId;
+    if (childId === "" || this.legacyStoreChecked.has(childId)) return;
+    const owner = this.storeOwnerWorkspaceId(store);
+    assert(owner !== null, "workspace-scope stores live under sessionsDir");
+    if (owner === childId) return; // not redirected: the private store IS the store
+    const legacyRoot = path.join(this.config.sessionsDir, childId, "memory");
+    if (!(await isDirectory(legacyRoot))) {
+      // One stat per child per process; a legacy dir can only reappear via a
+      // downgrade/upgrade cycle, which restarts the backend.
+      this.legacyStoreChecked.add(childId);
+      return;
+    }
+    try {
+      await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
+        if (!(await isDirectory(legacyRoot))) return; // adopted by a concurrent command
+        await this.assertMutationCommittable(ctx, store, undefined, toVirtualPath("workspace", ""));
+        const legacy = new LocalMemoryStore(legacyRoot);
+        const files = await legacy.listFiles();
+        let imported = 0;
+        let skipped = 0;
+        for (const relPath of files) {
+          // Oversize or binary (lossy utf-8 decode) files cannot be carried
+          // by a text write; they stay in the renamed-aside directory.
+          const content = await this.readBoundedTextFile(legacy, relPath, relPath).catch(
+            () => null
+          );
+          if (content === null || content.includes("\uFFFD")) {
+            skipped++;
+            continue;
+          }
+          const target = await this.legacyImportTarget(store, childId, relPath, content);
+          if (target === null) {
+            skipped++;
+            continue;
+          }
+          if (target.write) await store.writeFile(target.relPath, content);
+          imported++;
+          // Pins/stats were keyed by the child; they follow a written file.
+          // For an identical file the owner already has, the owner's own
+          // stats stand and the child's stale key is dropped.
+          const childKey = memoryLogicalKey("workspace", relPath, {
+            projectPath: ctx.projectPath,
+            workspaceId: childId,
+          });
+          try {
+            if (target.write) {
+              await this.metaService.renameKeys(
+                childKey,
+                memoryLogicalKey("workspace", target.relPath, {
+                  projectPath: ctx.projectPath,
+                  workspaceId: owner,
+                })
+              );
+            } else {
+              await this.metaService.removeKeys(childKey);
+            }
+          } catch (error) {
+            log.debug("[MemoryService] failed to move legacy memory stats", { relPath, error });
+          }
+        }
+        await fsPromises.rename(legacyRoot, `${legacyRoot}.migrated-${Date.now()}`);
+        await this.advanceStoreRevision(store);
+        log.info(
+          "[MemoryService] adopted a sub-agent's legacy workspace notebook into the shared store",
+          {
+            childId,
+            owner,
+            imported,
+            skipped,
+          }
+        );
+      });
+      this.legacyStoreChecked.add(childId);
+    } catch (error) {
+      log.warn(
+        "[MemoryService] failed to adopt a sub-agent's legacy workspace notebook; retrying on next access",
+        {
+          childId,
+          owner,
+          error,
+        }
+      );
+      return;
+    }
+    this.emitChange(ctx, "workspace", "", "agent");
+  }
+
+  /**
+   * Where a legacy file lands in the owner store: its own relPath when free
+   * (write) or already identical (no write); the per-child import directory
+   * when the owner has different content there; null when even that slot is
+   * taken by different content (left in the renamed-aside legacy directory).
+   */
+  private async legacyImportTarget(
+    store: MemoryStore,
+    childId: string,
+    relPath: string,
+    content: string
+  ): Promise<{ relPath: string; write: boolean } | null> {
+    for (const candidate of [relPath, `${LEGACY_IMPORT_DIR}/${childId}/${relPath}`]) {
+      const kind = await store.kind(candidate);
+      if (kind === null) return { relPath: candidate, write: true };
+      if (kind === "file") {
+        const existing = await this.readBoundedTextFile(store, candidate, candidate).catch(
+          () => null
+        );
+        if (existing === content) return { relPath: candidate, write: false };
+      }
+    }
+    return null;
   }
 
   /**
@@ -1257,6 +1424,12 @@ export class MemoryService extends EventEmitter {
     if (scope === "workspace") {
       const store = this.getStore(ctx, scope);
       await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
+        // Same commit guard as file mutations: `key` and `store` were bound to
+        // the owner the context resolved BEFORE the lock. If that owner was
+        // removed meanwhile (removal publishes its tombstone under this lock)
+        // or ownership moved, the pin would land under a dead logical key and
+        // the route would still report success. Refuse instead.
+        await this.assertMutationCommittable(ctx, store, undefined, virtualPath);
         await this.metaService.setPinned(key, pinned);
         // A pin changes the hot set other backends derive from this store.
         await this.advanceStoreRevision(store);
@@ -1306,7 +1479,7 @@ export class MemoryService extends EventEmitter {
           sections.push(`- ${scope}/`);
           try {
             const store = this.getStore(ctx, scope);
-            if (scope === "workspace") await this.assertWorkspaceStoreReadable(ctx, store);
+            if (scope === "workspace") await this.openWorkspaceStore(ctx, store);
             // Read-only: never create roots just to list (missing ⇒ empty).
             await store.assertRootSafe();
             const files = await store.listFiles();
@@ -1919,7 +2092,7 @@ export class MemoryService extends EventEmitter {
         // child's stream in another backend must not keep indexing / hot-set
         // reading its former owner's notes. Refused here (skipped below) like
         // any other scope failure.
-        if (scope === "workspace") await this.assertWorkspaceStoreReadable(ctx, store);
+        if (scope === "workspace") await this.openWorkspaceStore(ctx, store);
         // Read-only enumeration (stream startup, Memory tab) must not create
         // scope roots unnecessarily. Missing roots list as empty.
         await store.assertRootSafe();

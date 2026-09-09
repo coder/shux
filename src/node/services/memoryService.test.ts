@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { Config } from "@/node/config";
+import { getErrorMessage } from "@/common/utils/errors";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   extractMemoryDescription,
@@ -1177,6 +1178,105 @@ describe("MemoryService", () => {
           (entry) => entry.scope === "workspace"
         )
       ).toBe(false);
+    });
+
+    it("refuses a pin toggle once the owner it was bound to is tombstoned", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      const events: unknown[] = [];
+      fixture.service.on("change", (event) => events.push(event));
+      // Owner removed by another backend between the tab's owner resolution
+      // and the pin's lock acquisition: the pin must not be committed under
+      // the dead owner's logical key while the route reports success.
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-owner");
+      await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-owner" }));
+      const refused = await fixture.service
+        .setPinned(fixture.ctx, "/memories/workspace/n.md", true)
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+      expect(refused).toBeInstanceOf(Error);
+      expect(getErrorMessage(refused)).toContain("was removed");
+      expect((await fixture.metaService.getPinnedKeys()).size).toBe(0);
+      expect(events).toEqual([]);
+    });
+
+    it("adopts a sub-agent's pre-sharing private notebook into the shared store on first access", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      // Notes written by a build that kept the child's workspace scope in its
+      // own session dir, plus a pin recorded under the child's logical key.
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(path.join(legacyRoot, "sub"), { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "only-child.md"), "child notes");
+      await fsPromises.writeFile(path.join(legacyRoot, "sub", "same.md"), "identical");
+      await fsPromises.writeFile(path.join(legacyRoot, "clash.md"), "child version");
+      await fixture.metaService.setPinned("workspace:ws-child:only-child.md", true);
+      // The owner already holds one identical and one conflicting file.
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      await fixture.service.create(
+        ownerCtx,
+        "/memories/workspace/sub/same.md",
+        "identical",
+        "agent"
+      );
+      await fixture.service.create(
+        ownerCtx,
+        "/memories/workspace/clash.md",
+        "owner version",
+        "agent"
+      );
+      const events: unknown[] = [];
+      fixture.service.on("change", (event) => events.push(event));
+
+      const listed = await fixture.service.listIndexEntries(fixture.ctx);
+      expect(listed.filter((e) => e.scope === "workspace").map((e) => e.relPath)).toEqual([
+        "clash.md",
+        "imported/ws-child/clash.md",
+        "only-child.md",
+        "sub/same.md",
+      ]);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      expect(await fsPromises.readFile(path.join(ownerRoot, "only-child.md"), "utf-8")).toBe(
+        "child notes"
+      );
+      expect(await fsPromises.readFile(path.join(ownerRoot, "clash.md"), "utf-8")).toBe(
+        "owner version"
+      );
+      expect(
+        await fsPromises.readFile(path.join(ownerRoot, "imported", "ws-child", "clash.md"), "utf-8")
+      ).toBe("child version");
+      // The pin followed the file to the owner-keyed logical key.
+      expect([...(await fixture.metaService.getPinnedKeys())]).toEqual([
+        "workspace:ws-owner:only-child.md",
+      ]);
+      // Legacy directory is moved aside (never deleted), so a second access
+      // is a no-op and the tree's tabs were told once.
+      expect(await pathExists(legacyRoot)).toBe(false);
+      const sessionEntries = await fsPromises.readdir(
+        path.join(fixture.config.sessionsDir, "ws-child")
+      );
+      expect(sessionEntries.some((name) => name.startsWith("memory.migrated-"))).toBe(true);
+      expect(events).toEqual([
+        {
+          scope: "workspace",
+          path: "/memories/workspace",
+          actor: "agent",
+          workspaceId: "ws-owner",
+          projectPath: FIXTURE_PROJECT_PATH,
+        },
+      ]);
+      await fixture.service.listIndexEntries(fixture.ctx);
+      expect(events).toHaveLength(1);
+      // A workspace that is its own owner keeps its private store untouched.
+      const solo = { ...fixture.ctx, workspaceId: "ws-solo" };
+      await fixture.service.create(solo, "/memories/workspace/mine.md", "solo", "agent");
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-solo", "memory", "mine.md"))
+      ).toBe(true);
     });
 
     it("refuses a child's rollback into the shared store once the owner is tombstoned", async () => {
