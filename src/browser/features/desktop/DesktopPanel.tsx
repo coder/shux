@@ -101,6 +101,14 @@ export function DesktopViewer(props: {
    * desktop comes back.
    */
   suspended?: boolean;
+  /**
+   * Mounted while the popout coordinator is still reconciling (Electron `checking`): register
+   * as a viewer right away, without connecting. The manager lookup is a round trip during which
+   * nothing else would mark the pane attached, and an agent-driven archive could close the
+   * desktop the user just opened; a popout found meanwhile keeps this registration (a suspended
+   * inline pane behind a live child is attached too), and no popout resumes into it.
+   */
+  reserve?: boolean;
   hidden?: boolean;
 }) {
   const desktop = useDesktopConnection(props.workspaceId, {
@@ -111,6 +119,8 @@ export function DesktopViewer(props: {
   useEffect(() => {
     const detach = props.attach?.(desktop);
     if (!props.suspended) desktop.connect();
+    // register() never rejects; it reports whether a lease exists, which nothing awaits here.
+    else if (props.reserve) void desktop.register();
     return detach;
     // disconnect handled by hook's own cleanup
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -197,21 +207,21 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
       {/* The viewer stays mounted (hidden) while detached so its viewer registration keeps the
           pane attached across the inline↔popout handoff; otherwise nothing would mark the
           desktop as in use between the source disconnecting and the destination registering,
-          and an agent-driven archive could close it mid-handoff. */}
-      {snapshot.state !== "checking" ? (
-        <DesktopViewer
-          workspaceId={props.workspaceId}
-          attach={(desktop) =>
-            popout.attach(desktop.suspend, desktop.connect, !inline, desktop.register)
-          }
-          // Unmounting while a popout is opening (or showing the desktop) is not this pane
-          // giving the desktop up: the child takes over, so leave the grace for the gap.
-          unmountKeepsGrace={() => popout.getSnapshot().state !== "inline"}
-          onDetach={detach}
-          suspended={!inline}
-          hidden={!inline}
-        />
-      ) : null}
+          and an agent-driven archive could close it mid-handoff. It also mounts while the
+          coordinator is still checking for a popout, reserving the pane (see `reserve`). */}
+      <DesktopViewer
+        workspaceId={props.workspaceId}
+        attach={(desktop) =>
+          popout.attach(desktop.suspend, desktop.connect, !inline, desktop.register)
+        }
+        // Unmounting while a popout is opening (or showing the desktop) is not this pane
+        // giving the desktop up: the child takes over, so leave the grace for the gap.
+        unmountKeepsGrace={() => popout.getSnapshot().state !== "inline"}
+        onDetach={detach}
+        suspended={!inline}
+        reserve={snapshot.state === "checking"}
+        hidden={!inline}
+      />
       {inline ? null : (
         <div
           className="text-muted-foreground flex h-full flex-col items-center justify-center gap-3 p-4 text-center"

@@ -125,6 +125,36 @@ describe("DesktopPanel binding", () => {
     }
   );
 
+  test("the Electron pane registers as a viewer while the popout check is still pending", async () => {
+    Object.defineProperty(window, "api", { configurable: true, value: {} });
+    const watchViewer = mock(watchDesktopViewerFixture);
+    api.desktop.watchViewer = watchViewer;
+    let resolveLookup!: (value: null) => void;
+    getWindow.mockImplementationOnce(
+      () =>
+        new Promise<null>((resolve) => {
+          resolveLookup = resolve;
+        })
+    );
+    try {
+      render(<DesktopPanel workspaceId="electron-reserve" />);
+      // The manager lookup is a round trip during which nothing else would mark the pane
+      // attached; the pane reserves itself first, without connecting.
+      await waitFor(() => expect(watchViewer).toHaveBeenCalledTimes(1));
+      expect(getBootstrap).not.toHaveBeenCalled();
+      expect(FakeRfb.instances).toHaveLength(0);
+      await act(async () => {
+        resolveLookup(null);
+        await Promise.resolve();
+      });
+      // No popout: the pane connects, reusing the reservation rather than registering again.
+      await connectedViewer();
+      expect(watchViewer).toHaveBeenCalledTimes(1);
+    } finally {
+      api.desktop.watchViewer = watchDesktopViewerFixture;
+    }
+  });
+
   test.each(["native", "synchronous"])(
     "browser detach opens before the click returns with %s queueMicrotask",
     async (scheduling) => {
