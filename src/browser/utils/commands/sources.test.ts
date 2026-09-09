@@ -13,6 +13,12 @@ import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { APIClient } from "@/browser/contexts/API";
 import type { UpdateChannel } from "@/common/types/project";
+import {
+  consumePendingPluginsSectionIntent,
+  subscribePluginsSectionIntents,
+  type PluginsSectionIntent,
+} from "@/browser/features/Settings/Sections/pluginsSectionIntents";
+import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { CommandIds } from "@/browser/utils/commandIds";
 
 const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
@@ -1471,3 +1477,67 @@ test.each(["coder", "mux-gateway", "direct"])(
       expect(resolveEffectiveRoute).toHaveBeenCalled();
     })
 );
+
+test("plugin component action is gated and only targets present managed installs without mutation", async () => {
+  const openSettings = mock(() => undefined);
+  expect(
+    mk({ onOpenSettings: openSettings })
+      .flatMap((source) => source())
+      .find((action) => action.id === CommandIds.pluginsAddComponents())
+  ).toBeUndefined();
+  const api = createMockORPCClient({
+    agentPlugins: {
+      items: [
+        {
+          name: "managed",
+          location: "/plugins/managed",
+          managed: true,
+          present: true,
+          skillCount: 1,
+          mcpServerCount: 0,
+        },
+        {
+          name: "missing",
+          location: "/plugins/missing",
+          managed: true,
+          present: false,
+          skillCount: 0,
+          mcpServerCount: 0,
+        },
+        {
+          name: "unmanaged",
+          location: "/plugins/unmanaged",
+          managed: false,
+          present: true,
+          skillCount: 1,
+          mcpServerCount: 0,
+        },
+      ],
+    },
+  });
+  const mutation = mock(() =>
+    Promise.resolve({ success: false as const, error: "Must use the chooser" })
+  );
+  api.agentPlugins.addComponents = mutation;
+  const action = mk({ api, agentPluginsEnabled: true, onOpenSettings: openSettings })
+    .flatMap((source) => source())
+    .find((action) => action.id === CommandIds.pluginsAddComponents());
+  const field = action?.prompt?.fields[0];
+  if (field?.type !== "select" || !action?.prompt)
+    throw new Error("Expected component plugin picker");
+  expect((await field.getOptions({})).map((option) => option.id)).toEqual(["managed"]);
+  consumePendingPluginsSectionIntent();
+  await action.prompt.onSubmit({ pluginName: "managed" });
+  expect(consumePendingPluginsSectionIntent()).toEqual({ type: "add-components", name: "managed" });
+  const received: PluginsSectionIntent[] = [];
+  const unsubscribe = subscribePluginsSectionIntents((intent) => received.push(intent));
+  try {
+    await action.prompt.onSubmit({ pluginName: "managed" });
+    expect(received).toEqual([{ type: "add-components", name: "managed" }]);
+    expect(consumePendingPluginsSectionIntent()).toBeNull();
+    expect(mutation).not.toHaveBeenCalled();
+    expect(openSettings).toHaveBeenCalledWith("plugins");
+  } finally {
+    unsubscribe();
+  }
+});

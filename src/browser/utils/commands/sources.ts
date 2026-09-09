@@ -1742,6 +1742,41 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               },
             },
             {
+              id: CommandIds.pluginsAddComponents(),
+              title: "Add Plugin Components…",
+              subtitle: "Import more skills or MCP servers from the installed version",
+              section: section.settings,
+              keywords: ["plugin", "add", "import", "skill", "mcp", "components"],
+              run: () => undefined,
+              prompt: {
+                title: "Add Plugin Components",
+                fields: [
+                  {
+                    type: "select",
+                    name: "pluginName",
+                    label: "Installed managed plugin",
+                    placeholder: "Search installed plugins…",
+                    getOptions: async () => {
+                      const result = await p.api?.agentPlugins.list();
+                      return result?.success
+                        ? result.data
+                            .filter((item) => item.managed && item.present)
+                            .map((item) => ({
+                              id: item.name,
+                              label: item.name,
+                              keywords: [item.name, item.location],
+                            }))
+                        : [];
+                    },
+                  },
+                ],
+                onSubmit: (values) => {
+                  publishPluginsSectionIntent({ type: "add-components", name: values.pluginName });
+                  openSettings("plugins");
+                },
+              },
+            },
+            {
               id: CommandIds.pluginsUninstall(),
               title: "Uninstall Agent Plugin…",
               section: section.settings,
