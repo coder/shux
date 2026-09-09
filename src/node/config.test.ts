@@ -589,6 +589,64 @@ describe("Config", () => {
     });
   });
 
+  describe("deferred change notifications", () => {
+    it("flushes slow sequential edits and unrelated edits once", async () => {
+      let notifications = 0;
+      const unsubscribe = config.onConfigChanged(() => {
+        notifications += 1;
+      });
+      const paused = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const operation = config.withDeferredChangeNotifications(async () => {
+        await config.setUpdateChannel("npm");
+        paused.resolve();
+        await resume.promise;
+        await config.setUpdateChannel("nightly");
+        return "complete";
+      });
+      await paused.promise;
+      expect(notifications).toBe(0);
+      await config.editConfig((value) => value);
+      expect(notifications).toBe(0);
+      resume.resolve();
+      expect(await operation).toBe("complete");
+      expect(notifications).toBe(1);
+      expect(config.getUpdateChannel()).toBe("nightly");
+      await config.setUpdateChannel("npm");
+      expect(notifications).toBe(2);
+      unsubscribe();
+    });
+
+    it("flushes nested partial failures only after the outer scope ends", async () => {
+      let notifications = 0;
+      const unsubscribe = config.onConfigChanged(() => {
+        notifications += 1;
+      });
+      const failure = await config
+        .withDeferredChangeNotifications(async () => {
+          await config.setUpdateChannel("npm");
+          const nestedFailure = await config
+            .withDeferredChangeNotifications(async () => {
+              await config.setUpdateChannel("nightly");
+              throw new Error("nested failure");
+            })
+            .catch((error: unknown) => error);
+          expect(nestedFailure).toEqual(new Error("nested failure"));
+          expect(notifications).toBe(0);
+          throw new Error("outer failure");
+        })
+        .catch((error: unknown) => error);
+      expect(failure).toEqual(new Error("outer failure"));
+      expect(notifications).toBe(1);
+      expect(config.getUpdateChannel()).toBe("nightly");
+      await config.withDeferredChangeNotifications(() => Promise.resolve());
+      expect(notifications).toBe(1);
+      await config.setUpdateChannel("npm");
+      expect(notifications).toBe(2);
+      unsubscribe();
+    });
+  });
+
   describe("editConfig", () => {
     it("serializes concurrent edits so no update is lost", async () => {
       // Regression: editConfig used to be a non-serialized read-modify-write

@@ -1036,7 +1036,29 @@ export class Config {
     };
   }
 
+  private deferredChangeNotificationDepth = 0;
+  private changeNotificationPending = false;
+
+  /** Flush config changes once after the outermost operation, including partial failures. */
+  async withDeferredChangeNotifications<T>(operation: () => Promise<T>): Promise<T> {
+    this.deferredChangeNotificationDepth += 1;
+    try {
+      return await operation();
+    } finally {
+      this.deferredChangeNotificationDepth -= 1;
+      if (this.deferredChangeNotificationDepth === 0 && this.changeNotificationPending) {
+        this.changeNotificationPending = false;
+        this.notifyConfigChanged();
+      }
+    }
+  }
+
   private notifyConfigChanged(): void {
+    // The signal has no payload. A batch also includes unrelated edits during its lifetime.
+    if (this.deferredChangeNotificationDepth > 0) {
+      this.changeNotificationPending = true;
+      return;
+    }
     this.emitter.emit("configChanged");
   }
 

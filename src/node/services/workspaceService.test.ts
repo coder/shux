@@ -13509,17 +13509,24 @@ describe("WorkspaceService assertPricedModelForBudgetedGoal", () => {
 
 describe("WorkspaceService remove lifecycle coordination", () => {
   test("acknowledged removal keeps the parent last and returns forced failure scope", async () => {
-    const workspaceService = createWorkspaceServiceForTest({
-      config: { findWorkspace: mock(() => null) },
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+    let notifications = 0;
+    const unsubscribe = config.onConfigChanged(() => {
+      notifications += 1;
     });
     const descendants = [{ workspaceId: "child", title: "Child", active: true }];
     const order: string[] = [];
     let locked = false;
     let blocked = true;
-    const removeDescendants = mock(() => {
+    const removeDescendants = mock(async () => {
       expect(locked).toBe(true);
+      const before = notifications;
       order.push("descendants");
-      return Promise.resolve(blocked ? Err("active child") : Ok(undefined));
+      await config.editConfig((value) => value);
+      await config.editConfig((value) => value);
+      expect(notifications).toBe(before);
+      return blocked ? Err("active child") : Ok(undefined);
     });
     workspaceService.setAgentTaskIntegration(
       makeAgentTaskIntegrationFake({
@@ -13544,10 +13551,11 @@ describe("WorkspaceService remove lifecycle coordination", () => {
         removeUnlocked(id: string, force: boolean): Promise<Result<void>>;
       },
       "removeUnlocked"
-    ).mockImplementation(() => {
+    ).mockImplementation(async () => {
       expect(locked).toBe(true);
       order.push("parent");
-      return Promise.resolve(Err("parent failure"));
+      await config.editConfig((value) => value);
+      return Err("parent failure");
     });
     expect(
       await workspaceService.remove("parent", true, { acknowledgedDescendantIds: ["child"] })
@@ -13566,6 +13574,7 @@ describe("WorkspaceService remove lifecycle coordination", () => {
       descendants,
     });
     expect(order).toEqual(["descendants", "descendants", "parent"]);
+    expect(notifications).toBe(2);
     removeDescendants.mockClear();
     expect(await workspaceService.remove("parent", true)).toEqual({
       success: false,
@@ -13573,7 +13582,10 @@ describe("WorkspaceService remove lifecycle coordination", () => {
       descendants,
     });
     expect(removeDescendants).not.toHaveBeenCalled();
+    expect(notifications).toBe(3);
+    unsubscribe();
     removeParent.mockRestore();
+    await cleanup();
   });
 
   test("checks descendant tasks while holding the task-tree lifecycle lock", async () => {

@@ -1354,16 +1354,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
               ? wasInActiveMap // was active, now archived
               : !wasInActiveMap && meta !== null; // was absent (archived), now active (unarchived)
 
-            // Also reload when:
-            // 1. Workspace is deleted in another session
-            // 2. New workspace appears (e.g., from fork)
-            // 3. Workspace transitions from initializing to ready (init completed)
-            if (
-              meta === null ||
-              isNewWorkspace ||
-              (wasInitializing && isNowReady) ||
-              archiveStateChanged
-            ) {
+            // Config notifications refresh deleted workspace lists once after a cascade.
+            // Keep metadata refreshes for new workspaces and completed initialization.
+            if (isNewWorkspace || (wasInitializing && isNowReady) || archiveStateChanged) {
               void refreshProjects();
             }
 

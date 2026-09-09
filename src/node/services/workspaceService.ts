@@ -5741,30 +5741,37 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     options?: { beforeRemove?: () => Promise<boolean>; acknowledgedDescendantIds?: string[] }
   ): Promise<Result<void> & { descendants?: WorkspaceRemovalDescendant[] }> {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
-      if (options?.beforeRemove != null && !(await options.beforeRemove())) {
-        return Ok(undefined);
-      }
-      const failure = (error: string) => {
-        const descendants = this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId);
-        return { ...Err(error), ...(descendants?.length ? { descendants } : {}) };
-      };
-      try {
-        if (options?.acknowledgedDescendantIds != null) {
-          if (this.agentTaskIntegration == null) {
-            return failure("Task lifecycle service is unavailable.");
-          }
-          const descendantsResult =
-            await this.agentTaskIntegration.removeAcknowledgedDescendantsWhileTaskTreeLocked(
-              workspaceId,
-              options.acknowledgedDescendantIds
-            );
-          if (!descendantsResult.success) return failure(descendantsResult.error);
+      const operation = async () => {
+        if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+          return Ok(undefined);
         }
-        const result = await this.removeUnlocked(workspaceId, force);
-        return result.success ? result : failure(result.error);
-      } catch (error) {
-        return failure(getErrorMessage(error));
-      }
+        const failure = (error: string) => {
+          const descendants =
+            this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId);
+          return { ...Err(error), ...(descendants?.length ? { descendants } : {}) };
+        };
+        try {
+          if (options?.acknowledgedDescendantIds != null) {
+            if (this.agentTaskIntegration == null) {
+              return failure("Task lifecycle service is unavailable.");
+            }
+            const descendantsResult =
+              await this.agentTaskIntegration.removeAcknowledgedDescendantsWhileTaskTreeLocked(
+                workspaceId,
+                options.acknowledgedDescendantIds
+              );
+            if (!descendantsResult.success) return failure(descendantsResult.error);
+          }
+          const result = await this.removeUnlocked(workspaceId, force);
+          return result.success ? result : failure(result.error);
+        } catch (error) {
+          return failure(getErrorMessage(error));
+        }
+      };
+      // Defer the project-list refresh until the complete descendant cascade ends.
+      return options?.acknowledgedDescendantIds != null
+        ? await this.config.withDeferredChangeNotifications(operation)
+        : await operation();
     });
   }
 
