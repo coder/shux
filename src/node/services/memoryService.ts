@@ -970,7 +970,9 @@ export class MemoryService extends EventEmitter {
       this.legacyStoreChecked.add(childId);
       return;
     }
-    let imported = 0;
+    // Files adopted this pass (bytes written OR only their sidecar entries
+    // copied): either changes what the shared store's readers derive from it.
+    let adoptedCount = 0;
     try {
       await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
         await this.assertMutationCommittable(ctx, store, undefined, toVirtualPath("workspace", ""));
@@ -984,6 +986,7 @@ export class MemoryService extends EventEmitter {
         const manifestPath = path.join(legacyRoot, LEGACY_ADOPTION_MANIFEST_FILE_NAME);
         const adopted = await readLegacyAdoptionManifest(manifestPath);
         let manifestDirty = false;
+        let imported = 0;
         let skipped = 0;
         for (const relPath of files) {
           // Same read gates as a memory command: containment (no symlink
@@ -1039,11 +1042,14 @@ export class MemoryService extends EventEmitter {
           }
           adopted[relPath] = contentHash;
           manifestDirty = true;
+          adoptedCount++;
         }
         if (manifestDirty) {
           await writeFileAtomic(manifestPath, JSON.stringify(adopted), { encoding: "utf-8" });
         }
-        if (imported > 0) {
+        if (adoptedCount > 0) {
+          // A metadata-only adoption (identical bytes, child pin copied) still
+          // changes the hot set other backends derive, so the clock moves too.
           await this.advanceStoreRevision(store);
           log.info(
             "[MemoryService] adopted a sub-agent's legacy workspace notebook into the shared store",
@@ -1063,7 +1069,7 @@ export class MemoryService extends EventEmitter {
       );
       return;
     }
-    if (imported > 0) this.emitChange(ctx, "workspace", "", "agent");
+    if (adoptedCount > 0) this.emitChange(ctx, "workspace", "", "agent");
   }
 
   /**

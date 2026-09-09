@@ -64,8 +64,15 @@ export async function refinementsCommand(
         memoryOwnerId === workspaceId
           ? undefined
           : path.join(defaultConfig.sessionsDir, memoryOwnerId),
+      // Reloaded per check (plan-time and in-lock), not from the snapshot
+      // above: a live backend may register a new tree member while this
+      // process waits for the shared-store lock, and its rows must count.
       listSharedWorkspaceMemoryPeerSessionDirs: () =>
-        sharedWorkspaceMemoryPeerSessionDirs(cfg, defaultConfig.sessionsDir, workspaceId),
+        sharedWorkspaceMemoryPeerSessionDirs(
+          defaultConfig.loadConfigOrDefault(),
+          defaultConfig.sessionsDir,
+          workspaceId
+        ),
       id: opts.rollback,
       force: opts.force,
       evidence: { toolName: "debug-cli", actor: "user" },

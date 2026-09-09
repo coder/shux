@@ -1292,7 +1292,32 @@ describe("MemoryService", () => {
       await fsPromises.writeFile(path.join(ownerRoot, "half.md"), "half adopted");
       await fixture.metaService.setPinned("workspace:ws-child:half.md", true);
       const restarted = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
+      const restartedEvents: unknown[] = [];
+      restarted.on("change", (event) => restartedEvents.push(event));
+      const revisionBefore = Number(await fixture.service.workspaceMemoryRevision("ws-owner"));
       const relisted = await restarted.listIndexEntries(fixture.ctx);
+      // The pass wrote one file and copied one pin: both change what other
+      // backends derive from the store, so the clock moved and the tabs heard.
+      expect(Number(await fixture.service.workspaceMemoryRevision("ws-owner"))).toBeGreaterThan(
+        revisionBefore
+      );
+      expect(restartedEvents).toHaveLength(1);
+      // Metadata-only pass (nothing to write, one pin to copy): same signals.
+      await fsPromises.writeFile(path.join(legacyRoot, "meta-only.md"), "same bytes");
+      await fsPromises.writeFile(path.join(ownerRoot, "meta-only.md"), "same bytes");
+      await fixture.metaService.setPinned("workspace:ws-child:meta-only.md", true);
+      const metaOnly = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
+      const metaOnlyEvents: unknown[] = [];
+      metaOnly.on("change", (event) => metaOnlyEvents.push(event));
+      const revisionMid = Number(await fixture.service.workspaceMemoryRevision("ws-owner"));
+      await metaOnly.listIndexEntries(fixture.ctx);
+      expect(Number(await fixture.service.workspaceMemoryRevision("ws-owner"))).toBeGreaterThan(
+        revisionMid
+      );
+      expect(metaOnlyEvents).toHaveLength(1);
+      expect(await fixture.metaService.getPinnedKeys()).toContain(
+        "workspace:ws-owner:meta-only.md"
+      );
       expect(relisted.filter((e) => e.scope === "workspace").map((e) => e.relPath)).toEqual([
         "clash.md",
         "downgrade.md",
@@ -1306,8 +1331,10 @@ describe("MemoryService", () => {
       );
       expect([...(await fixture.metaService.getPinnedKeys())].sort()).toEqual([
         "workspace:ws-child:half.md",
+        "workspace:ws-child:meta-only.md",
         "workspace:ws-child:only-child.md",
         "workspace:ws-owner:half.md",
+        "workspace:ws-owner:meta-only.md",
         "workspace:ws-owner:only-child.md",
       ]);
 
