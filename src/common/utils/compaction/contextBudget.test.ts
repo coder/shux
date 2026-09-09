@@ -229,7 +229,9 @@ describe("absolute warning advance floor", () => {
   });
 
   test("small windows warn at least the floor ahead of the ceiling-anchored rollover", () => {
-    // hardCeiling = 32_768 - min(8_192, 8_192) = 24_576 = forceAt at 75%; percent rule ~19_661.
+    // For this window hardCeiling (limit - OUTPUT_RESERVE_TOKENS) coincides with forceAt, so it
+    // is the rollover point; the warning fires WARNING_ADVANCE_MIN_TOKENS ahead of it instead of
+    // at the later percent-based point.
     const warnAt = 24_576 - WARNING_ADVANCE_MIN_TOKENS;
     expect(evaluate({ modelContextLimit: 32_768, contextTokens: warnAt - 1 }).decision).toBe(
       "continue"
@@ -241,7 +243,9 @@ describe("absolute warning advance floor", () => {
   });
 
   test("the hard ceiling anchors the floor when it precedes the force point", () => {
-    // forceAt = 64_000 at 100%, hardCeiling = 55_808; percent rule would warn at 54_400.
+    // At this threshold forceAt reaches the whole limit, so hardCeiling (limit -
+    // OUTPUT_RESERVE_TOKENS) anchors the floor; the percent rule alone would warn later than
+    // WARNING_ADVANCE_MIN_TOKENS ahead of the ceiling.
     const warnAt = 55_808 - WARNING_ADVANCE_MIN_TOKENS;
     expect(
       evaluate({ modelContextLimit: 64_000, threshold: 0.95, contextTokens: warnAt - 1 }).decision
@@ -252,14 +256,16 @@ describe("absolute warning advance floor", () => {
   });
 
   test("a low threshold still keeps the first half of the usable window warning-free", () => {
-    // 10% threshold: the percent rule would warn at 0; rolloverAt = forceAt = 15_000.
+    // Low threshold: the percent rule would warn from the first request; rolloverAt = forceAt
+    // (threshold + FORCE_COMPACTION_BUFFER_PERCENT) and the floor clamps to half of it.
     expect(evaluate({ threshold: 0.1, contextTokens: 7_499 }).decision).toBe("continue");
     expect(evaluate({ threshold: 0.1, contextTokens: 7_500 }).decision).toBe("warn");
   });
 
   test("a tiny window keeps its first half usable and then rolls over without a flush", () => {
-    // hardCeiling = 3_000 < WARNING_ADVANCE_MIN_TOKENS: the floor is clamped to half the
-    // rollover point (1_500), where the reserve no longer fits, so the outcome is rollover.
+    // hardCeiling (limit - OUTPUT_RESERVE_TOKENS) is below WARNING_ADVANCE_MIN_TOKENS: the floor
+    // is clamped to half the rollover point, where FLUSH_RESERVE_TOKENS no longer fits, so the
+    // outcome is rollover.
     expect(evaluate({ modelContextLimit: 4_000, contextTokens: 1_499 }).decision).toBe("continue");
     expect(evaluate({ modelContextLimit: 4_000, contextTokens: 1_500 })).toMatchObject({
       decision: "rollover",

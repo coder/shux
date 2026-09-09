@@ -1702,6 +1702,38 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
   });
 
+  test("disabling rollover between flush admission and publication degrades the flush", async () => {
+    const h = await setup();
+    expect(
+      (await h.session.sendMessage("Work", { ...options, muxMetadata: correlation })).success
+    ).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    // Skill snapshot materialization is one of the awaits between flush admission and the
+    // durable batch append.
+    const session = h.session as unknown as {
+      materializeAgentSkillSnapshots: (...args: unknown[]) => Promise<unknown>;
+    };
+    const materialize = session.materializeAgentSkillSnapshots.bind(h.session);
+    spyOn(session, "materializeAgentSkillSnapshots").mockImplementationOnce(async (...args) => {
+      h.session.setAutoCompactionThreshold(1);
+      return materialize(...args);
+    });
+    await h.finishAndDispatch();
+    const rows = await allRows(h);
+    // No durable promise of a fresh window that nothing will deliver: plain continuation instead.
+    expect(warningRows(rows)).toHaveLength(0);
+    expect(text(rows.at(-1)!)).toBe("Continue");
+    expect(rows.at(-1)?.metadata?.muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    expect(h.requests[1].muxMetadata).not.toHaveProperty("contextBudgetFlush");
+    expect(h.requests[1].requestAssemblySnapshot).toBeUndefined();
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    h.settleStream(1, { finishReason: "stop" });
+    await h.session.waitForIdle();
+    h.session.setAutoCompactionThreshold(0.7);
+    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+  });
+
   test("a Stop during flush admission degrades the flush instead of running it unsealed", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);

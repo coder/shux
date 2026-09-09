@@ -316,7 +316,12 @@ export class AIService extends EventEmitter {
             options?.onlyContextNotes !== true || items.every(onlyNotes),
             "flush turns must preload only the context notes"
           );
-          hotMemoriesBlock = items.length === 0 ? null : formatHotMemoriesBlock(items);
+          hotMemoriesBlock =
+            items.length === 0
+              ? null
+              : formatHotMemoriesBlock(items, {
+                  flushPreload: options?.onlyContextNotes === true,
+                });
         } catch (error) {
           // Hot preloading is best-effort context. Preserve the pull-based
           // memory index when tokenizer setup or ranked selection fails.

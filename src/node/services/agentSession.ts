@@ -3983,17 +3983,7 @@ export class AgentSession {
     // middleware snapshot, nothing to seal): dispatch it as an ordinary continuation instead of a
     // hidden memory-only turn, and drop its paired continuation (mirrors the pre-dispatch degrade).
     if (!tokenBudgetActive && userMessage.metadata?.muxMetadata?.contextBudgetFlush === true) {
-      userMessage.parts = [{ type: "text", text: "Continue" }];
-      const { contextBudgetFlush: _dropped, ...rest } = userMessage.metadata.muxMetadata;
-      userMessage.metadata.muxMetadata = rest;
-      // Delegated turns resolve the stream metadata from the send options: strip it there too.
-      if ((optionsForStream.muxMetadata as MuxMessageMetadata | undefined)?.contextBudgetFlush) {
-        const { contextBudgetFlush: _optionFlag, ...optionRest } =
-          optionsForStream.muxMetadata as MuxMessageMetadata;
-        optionsForStream = { ...optionsForStream, muxMetadata: optionRest };
-      }
-      if (this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY).removedCount > 0)
-        this.emitQueuedMessageChanged();
+      optionsForStream = this.degradeFlushEntryToContinuation(userMessage, optionsForStream);
     }
     // Await rejection at each return so the execution lease owns persistence and goal safety.
     const rejectBudgetSend = async (error: SendMessageError) => {
@@ -4337,7 +4327,25 @@ export class AgentSession {
           requestPreludeMessageIds: requestPrelude.map((row) => row.id),
         };
       }
-      const batch = [...contextBudgetPrefix, ...requestPrelude, userMessage];
+      let batch = [...contextBudgetPrefix, ...requestPrelude, userMessage];
+      // The flush admission above happened several awaits ago (snapshots, goal safety, history).
+      // Re-check at publication: if rollover was disabled or a Stop dropped the intent meanwhile,
+      // the durable final warning would promise a fresh window nothing will deliver. Publish an
+      // ordinary continuation instead (same degrade as the dispatch-time check).
+      const flushPrefix =
+        contextBudgetPrefix[0]?.metadata?.muxMetadata?.type === "context-budget-warning" &&
+        contextBudgetPrefix[0].metadata.muxMetadata.final === true;
+      if (
+        flushPrefix &&
+        (this.pendingRollover == null || this.compactionMonitor.getThreshold() >= 1) &&
+        userMessage.metadata?.muxMetadata?.contextBudgetFlush === true
+      ) {
+        optionsForStream = this.degradeFlushEntryToContinuation(userMessage, optionsForStream);
+        contextBudgetPrefix = [];
+        batch = [...requestPrelude, userMessage];
+        requestAssemblySnapshot = undefined;
+        this.dropContextBudgetIntent();
+      }
       if (contextRollover) {
         assert(requestAssemblySnapshot != null, "Rollover must pin request assembly");
         const generation = this.contextBudgetGeneration;
@@ -5040,6 +5048,34 @@ export class AgentSession {
       return false;
     }
     return !isCompactionRequestMetadata(options?.muxMetadata);
+  }
+
+  /**
+   * A flush entry that can no longer run as the hidden memory-only step (mode inactive, rollover
+   * disabled, intent dropped) becomes an ordinary continuation: neither the trigger text nor the
+   * flag may reach the provider, delegated turns resolve stream metadata from the send options
+   * (strip it there too), and the paired rollover continuation is dropped.
+   */
+  private degradeFlushEntryToContinuation(
+    userMessage: MuxMessage,
+    options: SendMessageOptions
+  ): SendMessageOptions {
+    assert(
+      userMessage.metadata?.muxMetadata?.contextBudgetFlush === true,
+      "only flush entries are degraded"
+    );
+    userMessage.parts = [{ type: "text", text: "Continue" }];
+    const { contextBudgetFlush: _dropped, ...rest } = userMessage.metadata.muxMetadata;
+    userMessage.metadata.muxMetadata = rest;
+    let next = options;
+    if ((options.muxMetadata as MuxMessageMetadata | undefined)?.contextBudgetFlush === true) {
+      const { contextBudgetFlush: _optionFlag, ...optionRest } =
+        options.muxMetadata as MuxMessageMetadata;
+      next = { ...options, muxMetadata: optionRest };
+    }
+    if (this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY).removedCount > 0)
+      this.emitQueuedMessageChanged();
+    return next;
   }
 
   /**

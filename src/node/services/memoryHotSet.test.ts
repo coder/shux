@@ -173,9 +173,14 @@ describe("additive context notes", () => {
     const flush = await selectHotMemories({ ...args, onlyContextNotes: true });
     expect(flush.map((item) => item.path)).toEqual([notesPath]);
     expect(flush[0].truncated).toBe(true);
-    const rendered = formatHotMemoriesBlock(flush);
+    const rendered = formatHotMemoriesBlock(flush, { flushPreload: true });
     expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_BYTES);
     expect(await countTokens(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_TOKENS);
+    // The pinned flush tool has no `view`: its truncation marker must not point at one, while
+    // the ordinary preload keeps directing the model to the tool.
+    expect(rendered).toContain("[truncated");
+    expect(rendered).not.toContain(`view ${notesPath}`);
+    expect(formatHotMemoriesBlock(flush)).toContain(`view ${notesPath}`);
   });
 
   it("does not take any of the base byte/token allowance, including wrapper costs", async () => {
