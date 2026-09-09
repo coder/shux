@@ -4909,6 +4909,127 @@ describe("WorkspaceStore", () => {
       );
     });
 
+    it("does not treat a drained queue entry's echo as the pending send's acknowledgement", async () => {
+      const workspaceId = "pending-send-queue-drain";
+      const drain = gate();
+      const echo = gate();
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: true,
+          queuedMessages: ["earlier follow-up"],
+          displayText: "earlier follow-up",
+        };
+        await drain.opened;
+        // The active turn ends: the queued follow-up dispatches and echoes its own user row.
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: false,
+          queuedMessages: [],
+          displayText: "",
+        };
+        yield createUserMessageEvent("follow-up-1", "earlier follow-up", 2, 2);
+        await echo.opened;
+        yield createUserMessageEvent("user-2", "hello", 3, 3);
+        await waitForAbortSignal(signal);
+      });
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).queuedMessage !== null)
+      ).toBe(true);
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      drain.release();
+      expect(
+        await waitUntil(() =>
+          store.getWorkspaceState(workspaceId).muxMessages.some((m) => m.id === "follow-up-1")
+        )
+      ).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+
+      echo.release();
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).pendingSend === null)).toBe(
+        true
+      );
+    });
+
+    it("keeps the pending row when a queue update only shrinks", async () => {
+      const workspaceId = "pending-send-queue-partial-drain";
+      const drain = gate();
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: true,
+          queuedMessages: ["first", "second"],
+          displayText: "first\nsecond",
+        };
+        await drain.opened;
+        yield {
+          type: "queued-message-changed",
+          workspaceId,
+          hasQueuedMessages: true,
+          queuedMessages: ["second"],
+          displayText: "second",
+        };
+        await waitForAbortSignal(signal);
+      });
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).queuedMessage !== null)
+      ).toBe(true);
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      drain.release();
+      expect(
+        await waitUntil(
+          () => store.getWorkspaceState(workspaceId).queuedMessage?.content === "second"
+        )
+      ).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+    });
+
+    it("retires the pending row when the compaction turn that took it over is abandoned", async () => {
+      const workspaceId = "pending-send-compaction-abandoned";
+      const compaction = gate();
+      const abort = gate();
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        await compaction.opened;
+        const compactionRequest: WorkspaceChatMessage = {
+          type: "message",
+          id: "compaction-1",
+          role: "user",
+          parts: [{ type: "text", text: "Summarize" }],
+          metadata: { historySequence: 1, timestamp: 1, synthetic: true, uiVisible: true },
+        };
+        yield compactionRequest;
+        await abort.opened;
+        const streamAbort: WorkspaceChatMessage = {
+          type: "stream-abort",
+          workspaceId,
+          messageId: "compaction-stream",
+          abortReason: "user",
+          metadata: {},
+        };
+        yield streamAbort;
+        await waitForAbortSignal(signal);
+      });
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      compaction.release();
+      expect(
+        await waitUntil(() =>
+          store.getWorkspaceState(workspaceId).muxMessages.some((m) => m.id === "compaction-1")
+        )
+      ).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+
+      abort.release();
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).pendingSend === null)).toBe(
+        true
+      );
+    });
+
     // Resubscribe by switching away and back; the second attempt replays since the cursor.
     async function resubscribe(workspaceId: string, otherWorkspaceId: string): Promise<void> {
       createAndAddWorkspace(store, otherWorkspaceId);

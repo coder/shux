@@ -702,13 +702,23 @@ export function useCreationWorkspace({
             : null;
 
         // Runtime startup can take minutes; keep the initial message visible in the new
-        // transcript until the backend echoes it. Staged files join the persisted row later.
+        // transcript until the backend echoes it. Files awaiting staging show as display-only
+        // parts until the staged notice replaces them below.
         const pendingSendId = `pending-send-${Date.now()}`;
+        const pendingDisplayText = overrideRawCommand ?? messageText;
         if (initialSlashCommand == null) {
+          const displayFileParts: FilePart[] = [
+            ...(fileParts ?? []),
+            ...pendingFilesToStage.map((file) => ({
+              mediaType: file.mediaType,
+              url: `data:${file.mediaType};base64,${file.dataBase64}`,
+              filename: file.filename,
+            })),
+          ];
           workspaceStore.beginPendingSend(metadata.id, {
             id: pendingSendId,
-            content: overrideRawCommand ?? messageText,
-            fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
+            content: pendingDisplayText,
+            fileParts: displayFileParts.length > 0 ? displayFileParts : undefined,
           });
         }
 
@@ -728,6 +738,14 @@ export function useCreationWorkspace({
             ? await stagePendingFiles(api, metadata.id, pendingFilesToStage)
             : { staged: [], failures: [] };
         const stagingFailed = stagingOutcome.failures.length > 0;
+
+        if (stagingOutcome.staged.length > 0 && !stagingFailed) {
+          workspaceStore.updatePendingSend(metadata.id, {
+            id: pendingSendId,
+            content: appendStagedAttachmentNotice(pendingDisplayText, stagingOutcome.staged),
+            fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
+          });
+        }
 
         if (stagingFailed) {
           workspaceStore.clearPendingInitialSendState(metadata.id);
