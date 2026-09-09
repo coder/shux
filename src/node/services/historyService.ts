@@ -311,8 +311,31 @@ export class HistoryService {
     return new HistoryAppendProvenance(this.getSessionDir(workspaceId));
   }
 
+  /**
+   * Hold a workspace's history locks across a composite read-only operation, e.g. a descendant
+   * read that must keep the caller's privacy floor frozen while a separate target scan runs.
+   * Nested scans inside `operation` must target DESCENDANT workspaces only, so lock order
+   * always follows the task tree and cannot deadlock with another caller's composite read.
+   */
+  withHistoryScanLocks<T>(workspaceId: string, operation: () => Promise<T>): Promise<T> {
+    assert(workspaceId.trim().length > 0, "history scan locks require workspaceId");
+    return this.fileLocks.withLock(workspaceId, () =>
+      this.withHistoryWriteFileLock(workspaceId, () => operation())
+    );
+  }
+
   /** One bounded page under both history locks; never performs mutation recovery. */
   scanHistoryBounded(
+    workspaceId: string,
+    options: Parameters<HistoryService["scanHistoryBoundedUnderLocks"]>[1]
+  ) {
+    return this.withHistoryScanLocks(workspaceId, () =>
+      this.scanHistoryBoundedUnderLocks(workspaceId, options)
+    );
+  }
+
+  /** The page itself; the caller must already hold `withHistoryScanLocks(workspaceId)`. */
+  async scanHistoryBoundedUnderLocks(
     workspaceId: string,
     options: BoundedHistoryScanOptions & {
       /**
@@ -327,8 +350,8 @@ export class HistoryService {
     }
   ) {
     assert(workspaceId.trim().length > 0, "history scan requires workspaceId");
-    return this.fileLocks.withLock(workspaceId, () =>
-      this.withHistoryWriteFileLock(workspaceId, async () => {
+    {
+      {
         if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
           throw new Error(options.requireExistingHistory ? "session_unavailable" : "stale_cursor");
         if (options.requireExistingHistory) {
@@ -384,8 +407,8 @@ export class HistoryService {
         result.bytesRead += bytesRead + (await provenance.validatePage(receipt));
         await assertNoTruncate();
         return result;
-      })
-    );
+      }
+    }
   }
 
   private readonly CHAT_FILE = CHAT_FILE_NAME;

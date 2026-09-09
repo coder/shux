@@ -3566,7 +3566,7 @@ describe("session_history descendant task history", () => {
     expect((await callAs({ action: "list_items", task_id: childId })).success).toBe(true);
   });
 
-  test("foreign toolCalls and cross-backend resets never disclose rows", async () => {
+  test("foreign toolCalls never authorize and a racing caller reset waits for the page", async () => {
     await appendChild("child-row", "child facts");
     // Legacy toolCalls only count inside code_execution results; other tools' output is data.
     await appendSpawnPart(
@@ -3578,24 +3578,34 @@ describe("session_history descendant task history", () => {
       success: false,
       error: "task_not_found",
     });
-    // A reset appended to the caller (by another backend) between the authorization scan and
-    // the target scan is caught by the post-scan revalidation: nothing is disclosed.
+    // A caller reset racing the read (another backend) cannot slip between the authorization
+    // scan and the target scan: the caller's history locks are held across both, so the reset
+    // is serialized after the page and the NEXT call is denied.
     await spawn([childId]);
     const original = fixture.historyService.scanHistoryBounded.bind(fixture.historyService);
+    let resetSettled = false;
+    let pendingReset: Promise<unknown> | undefined;
     const spy = spyOn(fixture.historyService, "scanHistoryBounded").mockImplementation(
-      async (workspace, options) => {
-        if (workspace === childId)
-          await append("foreign-reset", "", { contextBoundaryKind: "reset", synthetic: true });
+      (workspace, options) => {
+        if (workspace === childId && !pendingReset)
+          pendingReset = append("foreign-reset", "", {
+            contextBoundaryKind: "reset",
+            synthetic: true,
+          }).then(() => {
+            resetSettled = true;
+          });
         return original(workspace, options);
       }
     );
     try {
       const raced = await callAs({ action: "list_items", task_id: childId });
-      expect(raced).toMatchObject({ success: false, error: "stale_cursor" });
-      expect(raced.items ?? []).toEqual([]);
+      expect(resetSettled).toBe(false);
+      expect(raced.items?.map((item) => item.text)).toEqual(["child facts"]);
     } finally {
       spy.mockRestore();
     }
+    await pendingReset;
+    expect(resetSettled).toBe(true);
     expect(await callAs({ action: "list_items", task_id: childId })).toMatchObject({
       success: false,
       error: "task_not_found",

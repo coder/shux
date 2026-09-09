@@ -284,7 +284,10 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           ? SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES
           : SESSION_HISTORY_RESULT_ENVELOPE_BYTES);
       const byteLength = () => Buffer.byteLength(JSON.stringify(result));
-      try {
+      // Descendant reads hold the caller's history locks across BOTH scans so no backend can
+      // append a caller reset between proving the floor and disclosing target rows; a
+      // caller-side append (including its own tool-result persistence) simply waits.
+      const run = async (): Promise<SessionHistoryResult> => {
         // Match in the original string: lowercasing can expand Unicode characters
         // and shift snippet offsets. Escape the query so matching stays literal.
         const search =
@@ -310,7 +313,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             // append check (an appended manual reset or rewrite throws stale_cursor) without
             // browsing further caller rows.
             let found = authorization?.proven === true;
-            const auth = await history.scanHistoryBounded(workspaceId, {
+            const auth = await history.scanHistoryBoundedUnderLocks(workspaceId, {
               cursor: authorization?.scan,
               budget,
               visit: ({ message }) => {
@@ -461,41 +464,6 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             return true;
           },
         });
-        const withheld = () => {
-          result.items = [];
-          result.windows = [];
-          result.exhausted = false;
-          result.nextCursor = encodeHistoryCursor({
-            ...binding,
-            scan: cursor?.scan ?? null,
-            authorization,
-          });
-          return result;
-        };
-        if (authorization?.proven) {
-          // Another backend may have appended a caller reset between the authorization
-          // scan (caller lock released) and this target scan. Revalidate the caller snapshot
-          // before disclosing anything; a reset throws stale_cursor here, and an append check
-          // that cannot finish in this page defers the rows (re-read next page).
-          budget.maxBytes -= scan.bytesRead;
-          budget.maxRows -= scan.rowsScanned;
-          const recheck = await history.scanHistoryBounded(workspaceId, {
-            cursor: authorization.scan,
-            budget: {
-              maxBytes: Math.max(budget.maxBytes, 4 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES),
-              maxRows: Math.max(budget.maxRows, 1),
-            },
-            visit: () => true,
-          });
-          assert(recheck.state, "a resumed caller scan reports its final state");
-          authorization = { ...authorization, scan: proofState(recheck.state) };
-          result.bytesRead = (result.bytesRead ?? 0) + recheck.bytesRead;
-          if (recheck.cursor) {
-            result.bytesRead += scan.bytesRead;
-            result.rowsScanned = (result.rowsScanned ?? 0) + scan.rowsScanned;
-            return withheld();
-          }
-        }
         result.bytesRead = (result.bytesRead ?? 0) + scan.bytesRead;
         result.rowsScanned = (result.rowsScanned ?? 0) + scan.rowsScanned;
         result.oversizedLines = scan.oversizedLines;
@@ -513,6 +481,9 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           "session_history aggregate result exceeds budget"
         );
         return result;
+      };
+      try {
+        return foreign ? await history.withHistoryScanLocks(workspaceId, run) : await run();
       } catch (error) {
         const message = error instanceof Error ? error.message : "history_unavailable";
         return {
