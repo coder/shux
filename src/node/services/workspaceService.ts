@@ -358,6 +358,10 @@ import {
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import {
+  setWorkspaceMemoryWritableForEpoch,
+  workspaceMemoryWritableForEpoch,
+} from "@/node/services/workspaceMemoryPolicyEpochs";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 
@@ -4376,9 +4380,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // first. The first turn of a fresh epoch has no prior turns and grants
     // normally.
     const storedFor = (entry: WorkspaceConfigEntry): boolean | undefined =>
-      entry.workspaceMemoryWritableEpoch === policyEpoch
-        ? entry.workspaceMemoryWritable
-        : undefined;
+      workspaceMemoryWritableForEpoch(entry, policyEpoch);
     const stored = storedFor(before.workspace);
     const unknownHistory =
       stored === undefined && mirror === undefined && options.epochHasPriorTurns;
@@ -4396,8 +4398,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         const current = findWorkspaceEntry(cfg, workspaceId);
         if (current !== null) {
           effective = conjunction(storedFor(current.workspace));
-          current.workspace.workspaceMemoryWritable = effective;
-          current.workspace.workspaceMemoryWritableEpoch = policyEpoch;
+          // Per-epoch record: never overwrites the closing epoch's value,
+          // which the compacting backend may not have observed yet
+          // (workspaceMemoryPolicyEpochs.ts).
+          setWorkspaceMemoryWritableForEpoch(current.workspace, policyEpoch, effective);
         }
         return cfg;
       });
@@ -4534,9 +4538,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             workspaceId
           )?.workspace;
           persistedWritable =
-            entry?.workspaceMemoryWritableEpoch === closingEpoch
-              ? entry.workspaceMemoryWritable
-              : undefined;
+            entry === undefined ? undefined : workspaceMemoryWritableForEpoch(entry, closingEpoch);
         } catch (error: unknown) {
           log.warn("Skipping post-compaction memory harvest: config.json unreadable", {
             workspaceId,

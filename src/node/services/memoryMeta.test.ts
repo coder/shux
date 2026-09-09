@@ -3,7 +3,7 @@ import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
+import { MemoryMetaService, MemoryMetaWriteError, memoryLogicalKey } from "./memoryMeta";
 import { TestTempDir } from "./tools/testHelpers";
 
 describe("memoryLogicalKey", () => {
@@ -59,6 +59,34 @@ describe("MemoryMetaService", () => {
     reader.mockRestore();
     expect(await reloaded.getPinnedKeys()).toEqual(new Set(["global:prefs.md"]));
     await reloaded.setPinned("workspace:ws-1:scratch.md", true);
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md", "workspace:ws-1:scratch.md"])
+    );
+  });
+
+  it("refuses a mutation whose read of the sidecar failed instead of overwriting it", async () => {
+    using tempDir = new TestTempDir("test-memory-meta");
+    await new MemoryMetaService(tempDir.path).setPinned("global:prefs.md", true);
+    // The mutating call itself hits the transient failure: its healed empty
+    // view must not become the file, or every existing pin is erased.
+    const reader = spyOn(fsPromises, "readFile").mockImplementationOnce((() =>
+      Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))) as never);
+    const fresh = new MemoryMetaService(tempDir.path);
+    try {
+      const failure = await fresh.setPinned("workspace:ws-1:scratch.md", true).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(failure).toBeInstanceOf(MemoryMetaWriteError);
+      expect((failure as MemoryMetaWriteError).reason).toContain("could not be read");
+    } finally {
+      reader.mockRestore();
+    }
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md"])
+    );
+    // Once readable again the same instance mutates normally.
+    await fresh.setPinned("workspace:ws-1:scratch.md", true);
     expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
       new Set(["global:prefs.md", "workspace:ws-1:scratch.md"])
     );

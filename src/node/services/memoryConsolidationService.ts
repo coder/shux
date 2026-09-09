@@ -96,6 +96,12 @@ interface MemoryConsolidationRunOptions {
    */
   skipWorkspaceDebounce?: boolean;
   skipHarvestRecovery?: boolean;
+  /**
+   * Set by maybeRun when a sub-agent's trigger is redirected to its owner: the
+   * child's own durable removal tombstone then gates the owner run too, since
+   * a child mid-teardown must not mutate the shared notebook.
+   */
+  actingWorkspaceId?: string;
 }
 
 interface ExperimentsCheck {
@@ -324,29 +330,38 @@ class HarvestRefusedError extends Error {
 }
 
 /**
- * Whether some user row of the epoch belongs to no turn that recorded its
- * write policy. A turn records that policy in start(), before its assistant
- * row is appended, and the assistant row carries `requestHistorySequence` —
- * the last history sequence its request was built from. The turn's own batch
- * is the LAST user row at or below that bound (the request's latest user
- * message) plus the snapshot/payload rows that row lists in
- * `requestPreludeMessageIds`. Only that batch is covered — not every user row
- * below the bound: with several backends on one chat.jsonl, another
- * backend's read-only batch can land between this turn's user row and its
- * request snapshot while that backend's deny has not been recorded yet; the
- * snapshot would then include the foreign row (making it this turn's latest
- * user message) and this turn's own row would be left without a turn of its
- * own — which is exactly what surfaces here as uncovered. Rows are matched by
- * exact id, never by adjacency, so no interleaved foreign row can ride along.
- * Assistant rows without the bound, or without `workspaceMemoryPolicyRecorded`
- * (a build that does not maintain the policy — e.g. turns run by a downgraded
- * build mid-epoch, which also left the durable accumulator untouched), cover
- * nothing (fail closed). Token-budget
- * control rows (rollover lead-in, budget warning) need no turn: backend
- * template text appended in the same durable batch as the turn they precede,
- * carrying neither agent nor repository content.
+ * Why the compacted epoch's transcript cannot be harvested under the policy
+ * observed at completion, or null when every turn of it is accounted for.
+ *
+ * A turn records its write policy in start(), before its assistant row is
+ * appended, and the assistant row carries `requestHistorySequence` — the
+ * last history sequence its request was built from — plus
+ * `workspaceMemoryPolicyEpoch`, the epoch that policy was recorded under. A
+ * turn accounts for its own batch only when that epoch is the one being
+ * closed: a turn started in another backend before a destructive reset and
+ * appended after the new boundary recorded its (possibly read-only) policy
+ * for the epoch the reset discarded, and the reset may have removed its user
+ * row too, so nothing else would surface it — such a turn is refused
+ * outright. The turn's own batch is the LAST user row at or below the bound
+ * (the request's latest user message) plus the snapshot/payload rows that
+ * row lists in `requestPreludeMessageIds`. Only that batch is covered — not
+ * every user row below the bound: with several backends on one chat.jsonl,
+ * another backend's read-only batch can land between this turn's user row
+ * and its request snapshot while that backend's deny has not been recorded
+ * yet; the snapshot would then include the foreign row (making it this
+ * turn's latest user message) and this turn's own row would be left without
+ * a turn of its own — which is exactly what surfaces here as uncovered. Rows
+ * are matched by exact id, never by adjacency, so no interleaved foreign row
+ * can ride along. Assistant rows without the bound or without the epoch
+ * stamp (a build that does not maintain the policy — e.g. turns run by a
+ * downgraded build mid-epoch, which also left the durable accumulator
+ * untouched; synthetic payload/summary rows that are no turn) cover nothing
+ * (fail closed). Token-budget control rows (rollover lead-in, budget
+ * warning) need no turn: backend template text appended in the same durable
+ * batch as the turn they precede, carrying neither agent nor repository
+ * content.
  */
-function epochHasUncoveredUserRows(messages: readonly MuxMessage[]): boolean {
+function epochHarvestRefusal(messages: readonly MuxMessage[], closingEpoch: number): string | null {
   const userRows: Array<{ message: MuxMessage; sequence: number }> = [];
   for (const message of messages) {
     const sequence = message.metadata?.historySequence;
@@ -355,11 +370,14 @@ function epochHasUncoveredUserRows(messages: readonly MuxMessage[]): boolean {
   }
   const covered = new Set<string>();
   for (const message of messages) {
-    if (message.role !== "assistant" || message.metadata?.workspaceMemoryPolicyRecorded !== true) {
-      continue;
-    }
+    if (message.role !== "assistant") continue;
     const bound = message.metadata?.requestHistorySequence;
     if (typeof bound !== "number") continue;
+    const policyEpoch = message.metadata?.workspaceMemoryPolicyEpoch;
+    if (typeof policyEpoch === "number" && policyEpoch !== closingEpoch) {
+      return "the compacted epoch holds a turn whose memory policy was recorded for another epoch; harvest refused (fail closed)";
+    }
+    if (policyEpoch === undefined) continue;
     const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;
     if (anchor === undefined) continue;
     covered.add(anchor.id);
@@ -367,10 +385,13 @@ function epochHasUncoveredUserRows(messages: readonly MuxMessage[]): boolean {
       covered.add(id);
     }
   }
-  return messages.some(
+  const uncovered = messages.some(
     (message) =>
       message.role === "user" && !covered.has(message.id) && !isTokenBudgetInternalMessage(message)
   );
+  return uncovered
+    ? "the compacted epoch holds user rows of a turn whose memory policy was never recorded; harvest refused (fail closed)"
+    : null;
 }
 
 export class MemoryConsolidationService extends EventEmitter {
@@ -874,6 +895,14 @@ export class MemoryConsolidationService extends EventEmitter {
     // one-shot promotion pass; a child archive must not trigger it. Compared
     // by resolved owner, not parentWorkspaceId: a dangling/cyclic chain falls
     // back to a private store that must stay consolidatable.
+    //
+    // The acting child's own teardown gate comes BEFORE the redirect:
+    // cancelInFlightConsolidation(child) marks only the child id, and an
+    // owner-keyed run reserved after that would neither be refused by the
+    // owner's check below nor be cancellable by the child's removal drain.
+    if (this.removalCancelled.has(workspaceId)) {
+      return Err("workspace is being removed; consolidation refused");
+    }
     const ownerWorkspaceId = this.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
     if (ownerWorkspaceId !== workspaceId) {
       if (trigger === "archive") {
@@ -881,11 +910,13 @@ export class MemoryConsolidationService extends EventEmitter {
           "sub-agent workspaces share their owner's workspace memory; the owner's archive pass promotes it"
         );
       }
-      // The owner run's recovery covers this child's harvest bucket too.
-      return this.maybeRun(ownerWorkspaceId, trigger, options);
-    }
-    if (this.removalCancelled.has(workspaceId)) {
-      return Err("workspace is being removed; consolidation refused");
+      // The owner run's recovery covers this child's harvest bucket too. The
+      // child's durable tombstone is probed behind the reservation, like the
+      // owner's (actingWorkspaceId).
+      return this.maybeRun(ownerWorkspaceId, trigger, {
+        ...options,
+        actingWorkspaceId: options.actingWorkspaceId ?? workspaceId,
+      });
     }
     const active = this.inFlight.get(workspaceId);
     if (active !== undefined) {
@@ -937,6 +968,12 @@ export class MemoryConsolidationService extends EventEmitter {
       // Durable cross-process teardown gate (r61); see isRemovalTombstonedEffect
       // for why this runs behind the in-flight reservation.
       if (yield* self.isRemovalTombstonedEffect(workspaceId)) {
+        return Err("workspace is being removed; consolidation refused");
+      }
+      if (
+        options.actingWorkspaceId !== undefined &&
+        (yield* self.isRemovalTombstonedEffect(options.actingWorkspaceId))
+      ) {
         return Err("workspace is being removed; consolidation refused");
       }
 
@@ -1244,15 +1281,21 @@ export class MemoryConsolidationService extends EventEmitter {
         catch: (error) => error,
       });
       if (!epoch.success) return yield* Effect.fail(new Error(epoch.error));
+      // RLM keep-recent copies (compactionHandler) duplicate the previous
+      // epoch's last turns after its boundary: that epoch's harvest already
+      // judged the originals, and the copies carry no turn stamps of their
+      // own, so they neither need covering nor get harvested twice.
+      const messages = epoch.data.messages.filter(
+        (message) => message.metadata?.rlmPreservedTailCopy !== true
+      );
       // Every scanned user row must be covered by a turn whose write policy
-      // was recorded (see epochHasUncoveredUserRows). Uncovered rows have an
-      // unknown policy the grant evaluated at completion could not have
-      // accounted for. Terminal refusal: a retry would replay that grant.
-      if (epochHasUncoveredUserRows(epoch.data.messages)) {
-        const reason =
-          "the compacted epoch holds user rows of a turn whose memory policy was never recorded; harvest refused (fail closed)";
-        yield* Effect.promise(() => self.recordRefusedHarvest(metadata, reason));
-        return yield* Effect.fail(new HarvestRefusedError(reason));
+      // was recorded for THIS epoch (see epochHarvestRefusal). Uncovered rows
+      // have an unknown policy the grant evaluated at completion could not
+      // have accounted for. Terminal refusal: a retry would replay that grant.
+      const refusal = epochHarvestRefusal(messages, metadata.previousBoundaryHistorySequence ?? -1);
+      if (refusal !== null) {
+        yield* Effect.promise(() => self.recordRefusedHarvest(metadata, refusal));
+        return yield* Effect.fail(new HarvestRefusedError(refusal));
       }
 
       const modelString = resolveDreamModelString(self.config, metadata.workspaceId);
@@ -1279,7 +1322,7 @@ export class MemoryConsolidationService extends EventEmitter {
             memoryService: self.memoryService,
             ctx,
             completionMetadata: metadata,
-            messages: epoch.data.messages,
+            messages,
             summary: epoch.data.summary,
             // Timeout + removal (r60); see the runLockedEffect signal for rationale.
             abortSignal: AbortSignal.any([

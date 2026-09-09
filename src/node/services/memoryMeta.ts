@@ -301,15 +301,25 @@ export class MemoryMetaService {
    * (logged for diagnosis) and only writes can fail.
    */
   private load(): Effect.Effect<MemoryMetaFile> {
+    return Effect.map(this.loadWithHealth(), (loaded) => loaded.meta);
+  }
+
+  /**
+   * `load()` plus whether this view is a healed substitute for a sidecar that
+   * exists but could not be read. Reads may serve that substitute; a mutation
+   * must not (see mutate()).
+   */
+  private loadWithHealth(): Effect.Effect<{ meta: MemoryMetaFile; readFailed: boolean }> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
       const stamp = yield* Effect.promise(() => self.fileStamp());
-      if (self.cache !== null && stamp === self.cacheStamp) return self.cache;
+      if (self.cache !== null && stamp === self.cacheStamp) {
+        return { meta: self.cache, readFailed: false };
+      }
       let readFailed = false;
-      const parsed = yield* Effect.tryPromise({
-        try: async (): Promise<unknown> =>
-          JSON.parse(await fsPromises.readFile(self.metaPath, "utf-8")),
+      const raw = yield* Effect.tryPromise({
+        try: (): Promise<string | null> => fsPromises.readFile(self.metaPath, "utf-8"),
         catch: (error) => error,
       }).pipe(
         Effect.catch((error) => {
@@ -318,9 +328,19 @@ export class MemoryMetaService {
             log.debug("[MemoryMetaService] healing unreadable sidecar", { error });
             readFailed = true;
           }
-          return Effect.succeed<unknown>(null);
+          return Effect.succeed<string | null>(null);
         })
       );
+      let parsed: unknown = null;
+      if (raw !== null) {
+        try {
+          parsed = JSON.parse(raw);
+        } catch (error) {
+          // Corrupt content (unlike a failed read) IS the file's state: healing
+          // it to empty and letting the next mutation rewrite it is the fix.
+          log.debug("[MemoryMetaService] healing corrupt sidecar", { error });
+        }
+      }
       self.cache = sanitizeMetaFile(parsed);
       // The stamp is remembered only for a real read (or a genuinely absent
       // file): a transiently unreadable sidecar (EACCES interval, a writer
@@ -328,7 +348,7 @@ export class MemoryMetaService {
       // under the file's unchanged stamp would keep serving it once readable
       // again — and the next mutation would write the pins and stats away.
       self.cacheStamp = readFailed ? null : stamp;
-      return self.cache;
+      return { meta: self.cache, readFailed };
     });
   }
 
@@ -367,7 +387,19 @@ export class MemoryMetaService {
         });
         yield* Effect.addFinalizer(() => Effect.promise(() => fileLock[Symbol.asyncDispose]()));
         // Stamp-validated: sees a foreign backend's write that landed since.
-        const meta = yield* self.load();
+        const { meta, readFailed } = yield* self.loadWithHealth();
+        // A read that healed to empty is fine to serve, but rewriting the
+        // sidecar from it would erase every existing pin and usage stat the
+        // moment the file becomes readable again. Fail the mutation instead;
+        // the caller retries on a later call, which re-reads.
+        if (readFailed) {
+          return yield* Effect.fail(
+            new MemoryMetaWriteError({
+              metaPath: self.metaPath,
+              reason: "sidecar exists but could not be read; refusing to overwrite it",
+            })
+          );
+        }
         const entries = { ...meta.entries };
         update(entries);
         for (const [key, entry] of Object.entries(entries)) {

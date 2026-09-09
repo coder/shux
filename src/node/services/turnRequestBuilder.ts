@@ -2844,15 +2844,19 @@ export class TurnRequestBuilder {
           result: Err({ type: "unknown", raw: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR }),
         };
       }
+      // Proof for the harvest gate that this turn's policy was recorded
+      // (above, or the grant at onStreamStarted) and for which epoch: a build
+      // without the sink — or an older build after a downgrade — leaves it
+      // unset and its turns' user rows stay unaccounted for. Carried by the
+      // placeholder AND the stream's initialMetadata below: StreamManager
+      // builds the final assistant row from the latter, not the placeholder.
+      const workspaceMemoryPolicyStamp =
+        !isCompactionRequest && this.dependencies.bindings.workspaceMemoryPolicySink
+          ? { workspaceMemoryPolicyEpoch: policyEpoch }
+          : {};
       const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
-        // Proof for the harvest gate that this turn's policy was recorded
-        // (above, or the grant at onStreamStarted): a build without the sink
-        // — or an older build after a downgrade — leaves it unset and its
-        // turns' user rows stay unaccounted for.
-        ...(!isCompactionRequest && this.dependencies.bindings.workspaceMemoryPolicySink
-          ? { workspaceMemoryPolicyRecorded: true as const }
-          : {}),
+        ...workspaceMemoryPolicyStamp,
         timestamp: Date.now(),
         model: canonicalModelString,
         routedThroughGateway,
@@ -3213,6 +3217,7 @@ export class TurnRequestBuilder {
         contextBudgetLimit: primaryRequest.contextBudgetLimit,
         initialMetadata: {
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
+          ...workspaceMemoryPolicyStamp,
           systemMessageTokens,
           timestamp: Date.now(),
           agentId: effectiveAgentId,

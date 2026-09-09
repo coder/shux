@@ -953,13 +953,17 @@ export interface MuxMetadata {
   /** Highest persisted history sequence included in the provider request that produced this assistant. */
   requestHistorySequence?: number;
   /**
-   * The turn that produced this assistant row recorded its workspace-memory
-   * write policy before the row was appended (TurnRequestBuilder start()).
-   * Builds that do not maintain that policy (older ones, after a downgrade)
-   * leave it unset, so the post-compaction harvest cannot take their turns'
-   * user rows as accounted for (memoryConsolidationService.ts).
+   * The compaction epoch (opening boundary's history sequence, -1 before any
+   * boundary) under which the turn that produced this assistant row recorded
+   * its workspace-memory write policy, before the row was appended
+   * (TurnRequestBuilder start()). The post-compaction harvest accepts a turn
+   * only when this matches the epoch being harvested: a turn started before
+   * a destructive reset but appended after the new boundary carries the old
+   * epoch, whose deny the reset discarded. Builds that do not maintain the
+   * policy (older ones, after a downgrade) leave it unset, so their turns'
+   * user rows are never taken as accounted for (memoryConsolidationService.ts).
    */
-  workspaceMemoryPolicyRecorded?: true;
+  workspaceMemoryPolicyEpoch?: number;
   historySequence?: number; // Assigned by backend for global message ordering (required when writing to history)
   /** Provider step boundaries in parts, persisted so continuous compaction can keep complete steps. */
   stepStartPartIndices?: number[];

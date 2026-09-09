@@ -93,6 +93,11 @@ import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/ut
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
+  deleteWorkspaceMemoryWritableForEpoch,
+  setWorkspaceMemoryWritableForEpoch,
+  workspaceMemoryWritableForEpoch,
+} from "@/node/services/workspaceMemoryPolicyEpochs";
+import {
   carryWorkspaceMemoryDenyMarker,
   clearWorkspaceMemoryDenyMarker,
 } from "@/node/services/workspaceMemoryDenyMarker";
@@ -1112,24 +1117,29 @@ export class AgentSession {
       options
     );
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
-    if (entry?.workspace.workspaceMemoryWritable === undefined) return;
+    if (entry?.workspace.workspaceMemoryWritableByEpoch === undefined) return;
+    if (
+      options !== undefined &&
+      workspaceMemoryWritableForEpoch(entry.workspace, options.closingEpoch) === undefined
+    ) {
+      return;
+    }
     await this.config.editConfig((cfg) => {
       const current = findWorkspaceEntry(cfg, this.workspaceId);
       if (current === null) return cfg;
       // Fenced to the epoch being closed: another backend may already have
       // recorded the first turn of the NEW epoch between the completion and
-      // this locked write; a value bound to a different epoch is that newer
-      // epoch's and must survive. (Readers ignore a stale epoch's value
-      // anyway — WorkspaceService.recordWorkspaceMemoryWritable — so this
-      // delete is hygiene, not the correctness boundary.)
-      if (
-        options !== undefined &&
-        current.workspace.workspaceMemoryWritableEpoch !== options.closingEpoch
-      ) {
-        return cfg;
+      // this locked write; its record (a different epoch's) must survive.
+      // Records are per epoch and readers key by epoch anyway
+      // (WorkspaceService.recordWorkspaceMemoryWritable), so this delete is
+      // hygiene, not the correctness boundary. A destructive boundary
+      // (no closing epoch: /clear, reset, history replace) discards every
+      // epoch's transcript and so every record.
+      if (options !== undefined) {
+        deleteWorkspaceMemoryWritableForEpoch(current.workspace, options.closingEpoch);
+      } else {
+        delete current.workspace.workspaceMemoryWritableByEpoch;
       }
-      delete current.workspace.workspaceMemoryWritable;
-      delete current.workspace.workspaceMemoryWritableEpoch;
       return cfg;
     });
   }
@@ -1153,11 +1163,27 @@ export class AgentSession {
       nextEpoch
     );
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
-    if (entry?.workspace.workspaceMemoryWritableEpoch !== closingEpoch) return;
+    if (
+      entry === null ||
+      workspaceMemoryWritableForEpoch(entry.workspace, closingEpoch) === undefined
+    ) {
+      return;
+    }
     await this.config.editConfig((cfg) => {
       const current = findWorkspaceEntry(cfg, this.workspaceId);
-      if (current?.workspace.workspaceMemoryWritableEpoch !== closingEpoch) return cfg;
-      current.workspace.workspaceMemoryWritableEpoch = nextEpoch;
+      if (current === null) return cfg;
+      const closing = workspaceMemoryWritableForEpoch(current.workspace, closingEpoch);
+      if (closing === undefined) return cfg;
+      // ANDed into a record another backend's first turn of the new epoch
+      // may already have made (its own conjunction could not see the closing
+      // value under the new key), never overwriting it.
+      const next = workspaceMemoryWritableForEpoch(current.workspace, nextEpoch);
+      setWorkspaceMemoryWritableForEpoch(
+        current.workspace,
+        nextEpoch,
+        next === undefined ? closing : next && closing
+      );
+      deleteWorkspaceMemoryWritableForEpoch(current.workspace, closingEpoch);
       return cfg;
     });
   }

@@ -336,7 +336,7 @@ async function seedCompactionEpoch(
     workspaceId,
     createMuxMessage("reply-1", "assistant", "Noted.", {
       requestHistorySequence: prompt.metadata?.historySequence,
-      workspaceMemoryPolicyRecorded: true,
+      workspaceMemoryPolicyEpoch: -1,
     })
   );
   await fixture.historyService.appendToHistory(
@@ -1222,7 +1222,7 @@ describe("MemoryConsolidationService", () => {
       "ws-dream",
       createMuxMessage("reply-1", "assistant", "Noted.", {
         requestHistorySequence: prompt.metadata?.historySequence,
-        workspaceMemoryPolicyRecorded: true,
+        workspaceMemoryPolicyEpoch: -1,
       })
     );
     await fixture.historyService.appendToHistory(
@@ -1292,7 +1292,7 @@ describe("MemoryConsolidationService", () => {
       "ws-dream",
       createMuxMessage("reply-1", "assistant", "Noted.", {
         requestHistorySequence: foreign.metadata?.historySequence,
-        workspaceMemoryPolicyRecorded: true,
+        workspaceMemoryPolicyEpoch: -1,
       })
     );
     await fixture.historyService.appendToHistory(
@@ -1320,6 +1320,92 @@ describe("MemoryConsolidationService", () => {
     const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
     expect(record?.status).toBe("failed");
     expect(record?.error).toContain("never recorded");
+  });
+
+  it("refuses a turn whose policy was recorded for another epoch, and ignores preserved-tail copies", async () => {
+    using fixture = await createFixture();
+    await fixture.addWorkspace("ws-clean");
+    const seed = async (workspaceId: string, foreignTurn: boolean) => {
+      const reset = createMuxMessage("reset-1", "assistant", "", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+      });
+      await fixture.historyService.appendToHistory(workspaceId, reset);
+      const closingEpoch = reset.metadata?.historySequence ?? -1;
+      // RLM keep-recent copies of the previous epoch's turns: no stamps of
+      // their own, no coverage needed (their originals were judged already),
+      // and not harvested again.
+      for (const [id, role] of [
+        ["copy-user", "user"],
+        ["copy-reply", "assistant"],
+      ] as const) {
+        await fixture.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage(id, role, "Copied tail row.", {
+            synthetic: true,
+            rlmPreservedTailCopy: true,
+          })
+        );
+      }
+      const prompt = createMuxMessage("pref-1", "user", "Remember I prefer concise tests.");
+      await fixture.historyService.appendToHistory(workspaceId, prompt);
+      await fixture.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("reply-1", "assistant", "Noted.", {
+          requestHistorySequence: prompt.metadata?.historySequence,
+          workspaceMemoryPolicyEpoch: closingEpoch,
+        })
+      );
+      if (foreignTurn) {
+        // Backend B started a read-only turn under the previous epoch (-1) and
+        // recorded its deny there; backend A then reset the context (the deny
+        // went with the epoch) and B's assistant landed after the new boundary
+        // — without its user row, which the reset removed. Only the epoch
+        // stamp can surface it.
+        await fixture.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("b-reply", "assistant", "Read-only output.", {
+            requestHistorySequence: closingEpoch - 1,
+            workspaceMemoryPolicyEpoch: -1,
+          })
+        );
+      }
+      await fixture.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("compact-request", "user", "Please compact", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        })
+      );
+      const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 2,
+      });
+      await fixture.historyService.appendToHistory(workspaceId, summary);
+      return fixture.service.maybeHarvestThenSweep({
+        workspaceId,
+        workspaceMemoryWritable: true,
+        summaryMessageId: "summary-1",
+        summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+        compactionEpoch: 2,
+        compactionRequestMessageId: "compact-request",
+        previousBoundaryHistorySequence: closingEpoch,
+      });
+    };
+    const refused = await seed("ws-dream", true);
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("another epoch");
+    expect(fixture.modelCalls).toHaveLength(0);
+    expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord?.refused).toBe(true);
+
+    // Without the foreign turn the copies alone refuse nothing, and the
+    // harvest transcript leaves them out.
+    const granted = await seed("ws-clean", false);
+    expect(granted.success).toBe(true);
+    expect(fixture.modelPrompts.length).toBeGreaterThan(0);
+    expect(fixture.modelPrompts[0]).toContain("concise tests");
+    expect(fixture.modelPrompts[0]).not.toContain("Copied tail row");
   });
 
   it("takes no coverage from assistant rows of a build that did not record the policy", async () => {
@@ -1400,7 +1486,7 @@ describe("MemoryConsolidationService", () => {
         "ws-dream",
         createMuxMessage(`${ids.summary}-reply`, "assistant", "Noted.", {
           requestHistorySequence: prompt.metadata?.historySequence,
-          workspaceMemoryPolicyRecorded: true,
+          workspaceMemoryPolicyEpoch: previousBoundaryHistorySequence ?? -1,
         })
       );
       await fixture.historyService.appendToHistory(
@@ -1829,6 +1915,25 @@ describe("MemoryConsolidationService", () => {
     const archive = await fixture.service.maybeRun("ws-sub", "archive");
     expect(archive.success).toBe(false);
     if (!archive.success) expect(archive.error).toContain("owner");
+    expect(fixture.modelCalls).toHaveLength(2);
+
+    // A child mid-teardown must not start an owner run: locally cancelled
+    // (the child's removal drain could never cancel an owner-keyed run) or
+    // tombstoned by another backend.
+    await fixture.addWorkspace("ws-sub-gone", { parentWorkspaceId: "ws-dream" });
+    const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-sub-gone");
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId: "ws-sub-gone", removedAt: Date.now() })
+    );
+    const tombstoned = await fixture.service.maybeRun("ws-sub-gone", "manual");
+    expect(tombstoned.success).toBe(false);
+    if (!tombstoned.success) expect(tombstoned.error).toContain("being removed");
+    await fixture.service.cancelInFlightConsolidation("ws-sub");
+    const cancelled = await fixture.service.maybeRun("ws-sub", "manual");
+    expect(cancelled.success).toBe(false);
+    if (!cancelled.success) expect(cancelled.error).toContain("being removed");
     expect(fixture.modelCalls).toHaveLength(2);
 
     // A dangling parent chain resolves to a PRIVATE store (owner == self), so
