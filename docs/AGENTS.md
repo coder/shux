@@ -72,6 +72,7 @@ Core workflow:
 - If a PR has `coder-agents-review` feedback, address it and reply before resolving: either reply inline on each finding or leave a PR comment that explicitly lists each finding and your response. Do not silently resolve those threads.
 - If a PR has Codex review comments, address + resolve them, then re-request review by commenting `@codex review` on the PR.
 - Prefer `gh` CLI for GitHub interactions over manual web/curl flows.
+- User preference: use `gh stack` to manage GitHub-native stacked PRs; keep every PR linked in the native stack, not just chained by base branches.
 
 - User preference: when work is already on an open PR, push branch updates at the end of each completed change set so the PR stays current.
 - **PR creation gate:** Do **not** open/create a pull request unless the user explicitly asks (e.g., "open a PR", "create PR", "submit this"). By default, complete local validation, commit/push branch updates as requested, and let the user review before deciding whether to open a PR.
