@@ -1,6 +1,9 @@
 import * as path from "path";
 import { defaultConfig } from "@/node/config";
-import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
+import {
+  resolveWorkspaceMemoryOwnerId,
+  sharedWorkspaceMemoryPeerSessionDirs,
+} from "@/node/services/memoryWorkspaceOwner";
 import {
   MemoryRefinementActionSchema,
   RollbackRefinementActionSchema,
@@ -53,16 +56,16 @@ export async function refinementsCommand(
   if (opts.rollback !== undefined) {
     // Sub-agents journal workspace-scope rows that point into the owner's
     // session dir; admit that root the same way the in-app tool does.
-    const memoryOwnerId = resolveWorkspaceMemoryOwnerId(
-      defaultConfig.loadConfigOrDefault(),
-      workspaceId
-    );
+    const cfg = defaultConfig.loadConfigOrDefault();
+    const memoryOwnerId = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
     const result = await rollbackRefinement({
       sessionDir,
       sharedWorkspaceMemorySessionDir:
         memoryOwnerId === workspaceId
           ? undefined
           : path.join(defaultConfig.sessionsDir, memoryOwnerId),
+      listSharedWorkspaceMemoryPeerSessionDirs: () =>
+        sharedWorkspaceMemoryPeerSessionDirs(cfg, defaultConfig.sessionsDir, workspaceId),
       id: opts.rollback,
       force: opts.force,
       evidence: { toolName: "debug-cli", actor: "user" },

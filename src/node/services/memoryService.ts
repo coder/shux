@@ -395,11 +395,35 @@ interface MemoryStore {
  */
 const LEGACY_IMPORT_DIR = "imported";
 
-async function isDirectory(absPath: string): Promise<boolean> {
+/**
+ * Dotfile inside a sub-agent's legacy `memory` dir recording, per relPath, the
+ * sha256 of the content already copied into the shared store
+ * (adoptLegacyPrivateStore). Dotfiles are invisible to every build's listing.
+ */
+const LEGACY_ADOPTION_MANIFEST_FILE_NAME = ".adopted-into-shared-store.json";
+
+/** Self-healing read of the adoption manifest: anything malformed reads as empty. */
+async function readLegacyAdoptionManifest(manifestPath: string): Promise<Record<string, string>> {
   try {
-    return (await fsPromises.stat(absPath)).isDirectory();
+    const parsed: unknown = JSON.parse(await fsPromises.readFile(manifestPath, "utf-8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string"
+      )
+    );
   } catch {
-    return false;
+    return {};
+  }
+}
+
+/** Link-aware kind of a path: symlinks are reported as such, never followed. */
+async function lstatKind(absPath: string): Promise<"dir" | "symlink" | "other" | "missing"> {
+  try {
+    const stat = await fsPromises.lstat(absPath);
+    return stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "dir" : "other";
+  } catch {
+    return "missing";
   }
 }
 
@@ -899,20 +923,28 @@ export class MemoryService extends EventEmitter {
    * session dir (<sessionsDir>/<child>/memory). getStore now redirects them to
    * the owner's root, which would make those notes invisible — and removal
    * later deletes the child's session dir, discarding them for good. On the
-   * child's first shared-store access, import every legacy file into the
-   * owner store (same relPath when free or identical; otherwise under
-   * imported/<child>/), move pins/stats with them, and rename the legacy
-   * directory aside so the import is one-shot and nothing is lost even for
-   * files the import skips (binary/oversize). Downgrading afterwards shows
-   * the notes in the parent's notebook rather than the child's — no loss.
+   * child's first shared-store access per process, copy every legacy file
+   * into the owner store (same relPath when free or identical; otherwise
+   * under imported/<child>/) and move pins/stats with them.
    *
-   * Runs under the owner store's mutation lock with the same commit guard as
-   * file mutations, and never throws: an import failure (lock timeout, disk)
-   * leaves the legacy directory intact for the next access, while the caller
-   * proceeds with the shared store. Not journaled: this is a mechanical
-   * relocation, not an agent edit; pre-upgrade child journal rows keep
-   * targeting the legacy physical paths (rollback restores there and the next
-   * access re-imports).
+   * The legacy directory is left in place, untouched: it is exactly where a
+   * DOWNGRADED build reads (and writes) this child's notebook, so the notes
+   * stay visible across upgrade↔downgrade and files the import cannot carry
+   * (binary/oversize, dotfiles, doubly conflicting) are never moved anywhere.
+   * The copy is idempotent — identical files are skipped, differing ones land
+   * under imported/<child>/ — so notes edited during a downgrade are folded in
+   * again on the next upgrade. Writes made through the shared store meanwhile
+   * live in the owner's notebook, which the downgraded build shows there.
+   *
+   * Security: the legacy root must be a real directory (a symlinked root
+   * would let an index build copy arbitrary host text into the shared
+   * notebook and the model's context), and every file passes the store's
+   * containment check before it is read. Runs under the owner store's
+   * mutation lock with the same commit guard as file mutations, and never
+   * throws: a failure (lock timeout, disk) is retried on the next access,
+   * while the caller proceeds with the shared store. Not journaled: this is
+   * a mechanical copy, not an agent edit; pre-upgrade child journal rows keep
+   * targeting the legacy physical paths.
    */
   private async adoptLegacyPrivateStore(
     ctx: MemoryScopeContext,
@@ -924,37 +956,59 @@ export class MemoryService extends EventEmitter {
     assert(owner !== null, "workspace-scope stores live under sessionsDir");
     if (owner === childId) return; // not redirected: the private store IS the store
     const legacyRoot = path.join(this.config.sessionsDir, childId, "memory");
-    if (!(await isDirectory(legacyRoot))) {
-      // One stat per child per process; a legacy dir can only reappear via a
-      // downgrade/upgrade cycle, which restarts the backend.
+    // One lstat per child per process (the copy below is idempotent, so a
+    // repeat after restart only re-reads unchanged files).
+    const legacyRootKind = await lstatKind(legacyRoot);
+    if (legacyRootKind !== "dir") {
+      if (legacyRootKind === "symlink") {
+        log.warn("[MemoryService] ignoring a symlinked legacy workspace memory root", {
+          childId,
+          legacyRoot,
+        });
+      }
       this.legacyStoreChecked.add(childId);
       return;
     }
+    let imported = 0;
     try {
       await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
-        if (!(await isDirectory(legacyRoot))) return; // adopted by a concurrent command
         await this.assertMutationCommittable(ctx, store, undefined, toVirtualPath("workspace", ""));
+        if ((await lstatKind(legacyRoot)) !== "dir") return; // swapped while waiting for the lock
         const legacy = new LocalMemoryStore(legacyRoot);
         const files = await legacy.listFiles();
-        let imported = 0;
+        // Content hashes already folded in, kept beside the legacy files (a
+        // dotfile, so neither build lists it). Without it, an imported note
+        // later edited through the shared store would be re-imported as a
+        // stale duplicate under imported/<child>/ on every backend start.
+        const manifestPath = path.join(legacyRoot, LEGACY_ADOPTION_MANIFEST_FILE_NAME);
+        const adopted = await readLegacyAdoptionManifest(manifestPath);
+        let manifestDirty = false;
         let skipped = 0;
         for (const relPath of files) {
-          // Oversize or binary (lossy utf-8 decode) files cannot be carried
-          // by a text write; they stay in the renamed-aside directory.
-          const content = await this.readBoundedTextFile(legacy, relPath, relPath).catch(
-            () => null
-          );
+          // Same read gates as a memory command: containment (no symlink
+          // escape), size cap, and text-only (a lossy utf-8 decode cannot be
+          // carried by a text write).
+          const content = await legacy
+            .assertContained(relPath)
+            .then(() => this.readBoundedTextFile(legacy, relPath, relPath))
+            .catch(() => null);
           if (content === null || content.includes("\uFFFD")) {
             skipped++;
             continue;
           }
+          const contentHash = sha256Hex(content);
+          if (adopted[relPath] === contentHash) continue; // folded in earlier, unchanged since
           const target = await this.legacyImportTarget(store, childId, relPath, content);
           if (target === null) {
             skipped++;
             continue;
           }
-          if (target.write) await store.writeFile(target.relPath, content);
-          imported++;
+          if (target.write) {
+            await store.writeFile(target.relPath, content);
+            imported++;
+          }
+          adopted[relPath] = contentHash;
+          manifestDirty = true;
           // Pins/stats were keyed by the child; they follow a written file.
           // For an identical file the owner already has, the owner's own
           // stats stand and the child's stale key is dropped.
@@ -978,17 +1032,16 @@ export class MemoryService extends EventEmitter {
             log.debug("[MemoryService] failed to move legacy memory stats", { relPath, error });
           }
         }
-        await fsPromises.rename(legacyRoot, `${legacyRoot}.migrated-${Date.now()}`);
-        await this.advanceStoreRevision(store);
-        log.info(
-          "[MemoryService] adopted a sub-agent's legacy workspace notebook into the shared store",
-          {
-            childId,
-            owner,
-            imported,
-            skipped,
-          }
-        );
+        if (manifestDirty) {
+          await writeFileAtomic(manifestPath, JSON.stringify(adopted), { encoding: "utf-8" });
+        }
+        if (imported > 0) {
+          await this.advanceStoreRevision(store);
+          log.info(
+            "[MemoryService] adopted a sub-agent's legacy workspace notebook into the shared store",
+            { childId, owner, imported, skipped }
+          );
+        }
       });
       this.legacyStoreChecked.add(childId);
     } catch (error) {
@@ -1002,14 +1055,14 @@ export class MemoryService extends EventEmitter {
       );
       return;
     }
-    this.emitChange(ctx, "workspace", "", "agent");
+    if (imported > 0) this.emitChange(ctx, "workspace", "", "agent");
   }
 
   /**
    * Where a legacy file lands in the owner store: its own relPath when free
    * (write) or already identical (no write); the per-child import directory
    * when the owner has different content there; null when even that slot is
-   * taken by different content (left in the renamed-aside legacy directory).
+   * taken by different content (the file stays only in the legacy directory).
    */
   private async legacyImportTarget(
     store: MemoryStore,

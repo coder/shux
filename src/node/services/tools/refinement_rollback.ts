@@ -62,6 +62,8 @@ export function createRefinementRollbackTool(ctx: {
   sessionDir: string;
   /** Owner session dir when this workspace is a sub-agent sharing its notebook. */
   sharedWorkspaceMemorySessionDir?: string;
+  /** Other live task-tree members' session dirs (see RollbackRefinementOptions). */
+  listSharedWorkspaceMemoryPeerSessionDirs?: () => string[];
   /**
    * Memory integration: announces rolled-back memory files so shared-store
    * readers refresh, and applies the agent's per-scope write policy — a
@@ -85,6 +87,7 @@ export function createRefinementRollbackTool(ctx: {
       const result = await rollbackRefinement({
         sessionDir: ctx.sessionDir,
         sharedWorkspaceMemorySessionDir: ctx.sharedWorkspaceMemorySessionDir,
+        listSharedWorkspaceMemoryPeerSessionDirs: ctx.listSharedWorkspaceMemoryPeerSessionDirs,
         id,
         reason,
         evidence: { toolName: "refinement_rollback", toolCallId, actor: "agent" },

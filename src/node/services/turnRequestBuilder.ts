@@ -114,6 +114,7 @@ import {
 } from "@/common/utils/providers/customProviders";
 import type { MCPServerManager, MCPWorkspaceStats } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
+import { sharedWorkspaceMemoryPeerSessionDirs } from "@/node/services/memoryWorkspaceOwner";
 import { memoryScopeContextFromToolConfig } from "@/node/services/tools/memory";
 import type { TaskService } from "@/node/services/taskService";
 import { READ_ONLY_ACCESS, resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
@@ -2391,6 +2392,17 @@ export class TurnRequestBuilder {
           memoryOwnerId === workspaceId
             ? undefined
             : path.join(this.dependencies.config.sessionsDir, memoryOwnerId);
+        // Resolved per rollback (not per turn): tree membership changes as
+        // sub-agents are spawned and removed while the tool instance lives.
+        const listSharedWorkspaceMemoryPeerSessionDirs =
+          memoryService === undefined
+            ? undefined
+            : () =>
+                sharedWorkspaceMemoryPeerSessionDirs(
+                  this.dependencies.config.loadConfigOrDefault(),
+                  this.dependencies.config.sessionsDir,
+                  workspaceId
+                );
         const sandboxMemory =
           memoryService === undefined
             ? undefined
@@ -2414,6 +2426,7 @@ export class TurnRequestBuilder {
             workspaceId,
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             sharedWorkspaceMemorySessionDir,
+            listSharedWorkspaceMemoryPeerSessionDirs,
             memory: sandboxMemory,
             kernelFileLoader,
           },

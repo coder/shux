@@ -123,6 +123,8 @@ export interface ApplyToolPolicyAndExperimentsOptions {
     sessionDir: string;
     /** Owner session dir when the workspace is a sub-agent sharing its notebook. */
     sharedWorkspaceMemorySessionDir?: string;
+    /** Other live task-tree members' session dirs (see RollbackRefinementOptions). */
+    listSharedWorkspaceMemoryPeerSessionDirs?: () => string[];
     /** Lets refinement_rollback announce its direct-to-disk memory writes. */
     memory?: { service: MemoryService; ctx: MemoryScopeContext; access: MemoryScopeAccess };
     kernelFileLoader?: KernelFileLoader;

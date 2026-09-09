@@ -27,6 +27,7 @@ import {
 import { applyRefinementInverse, readRefinementEvents } from "./refinement/refinementTestHelpers";
 import { rollbackRefinement } from "./refinement/refinementRollback";
 import { migrateSharedMemoryRefinementRows } from "./refinement/sharedMemoryRowMigration";
+import { sharedWorkspaceMemoryPeerSessionDirs } from "./memoryWorkspaceOwner";
 import { createRefinementRollbackTool } from "./tools/refinement_rollback";
 import type { MemoryScopeAccess } from "@/common/constants/memory";
 import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
@@ -1204,7 +1205,7 @@ describe("MemoryService", () => {
       expect(events).toEqual([]);
     });
 
-    it("adopts a sub-agent's pre-sharing private notebook into the shared store on first access", async () => {
+    it("adopts a sub-agent's pre-sharing private notebook into the shared store, keeping the legacy copy downgrade-readable", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
       // Notes written by a build that kept the child's workspace scope in its
@@ -1253,13 +1254,11 @@ describe("MemoryService", () => {
       expect([...(await fixture.metaService.getPinnedKeys())]).toEqual([
         "workspace:ws-owner:only-child.md",
       ]);
-      // Legacy directory is moved aside (never deleted), so a second access
-      // is a no-op and the tree's tabs were told once.
-      expect(await pathExists(legacyRoot)).toBe(false);
-      const sessionEntries = await fsPromises.readdir(
-        path.join(fixture.config.sessionsDir, "ws-child")
+      // The legacy copy stays where a downgraded build reads it; the tree's
+      // tabs were told once and a second access is a no-op.
+      expect(await fsPromises.readFile(path.join(legacyRoot, "only-child.md"), "utf-8")).toBe(
+        "child notes"
       );
-      expect(sessionEntries.some((name) => name.startsWith("memory.migrated-"))).toBe(true);
       expect(events).toEqual([
         {
           scope: "workspace",
@@ -1271,12 +1270,69 @@ describe("MemoryService", () => {
       ]);
       await fixture.service.listIndexEntries(fixture.ctx);
       expect(events).toHaveLength(1);
+
+      // Edited through the shared store, then a backend restart: the legacy
+      // copy is known to be folded in already and must not resurface as a
+      // stale duplicate.
+      await fixture.service.strReplace(
+        ownerCtx,
+        "/memories/workspace/only-child.md",
+        "child notes",
+        "shared edit",
+        "agent"
+      );
+      // A downgraded build wrote a new note into the legacy dir meanwhile.
+      await fsPromises.writeFile(path.join(legacyRoot, "downgrade.md"), "written on old build");
+      const restarted = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
+      const relisted = await restarted.listIndexEntries(fixture.ctx);
+      expect(relisted.filter((e) => e.scope === "workspace").map((e) => e.relPath)).toEqual([
+        "clash.md",
+        "downgrade.md",
+        "imported/ws-child/clash.md",
+        "only-child.md",
+        "sub/same.md",
+      ]);
+      expect(await fsPromises.readFile(path.join(ownerRoot, "only-child.md"), "utf-8")).toBe(
+        "shared edit"
+      );
+
       // A workspace that is its own owner keeps its private store untouched.
       const solo = { ...fixture.ctx, workspaceId: "ws-solo" };
       await fixture.service.create(solo, "/memories/workspace/mine.md", "solo", "agent");
       expect(
         await pathExists(path.join(fixture.config.sessionsDir, "ws-solo", "memory", "mine.md"))
       ).toBe(true);
+    });
+
+    it("never imports through a symlinked legacy notebook root or escaped files", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const outside = path.join(fixture.xumHome, "outside");
+      await fsPromises.mkdir(outside, { recursive: true });
+      await fsPromises.writeFile(path.join(outside, "secret.md"), "host file");
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      await fsPromises.mkdir(childSessionDir, { recursive: true });
+      // Root itself is a symlink: refused outright (lstat, never followed).
+      await fsPromises.symlink(outside, path.join(childSessionDir, "memory"));
+      expect(
+        (await fixture.service.listIndexEntries(fixture.ctx)).filter((e) => e.scope === "workspace")
+      ).toEqual([]);
+
+      // Real root whose entries point outside: symlinked entries are not
+      // regular files to the walk, and a symlinked subdirectory is never
+      // descended into.
+      await fsPromises.unlink(path.join(childSessionDir, "memory"));
+      const legacyRoot = path.join(childSessionDir, "memory");
+      await fsPromises.mkdir(legacyRoot);
+      await fsPromises.symlink(path.join(outside, "secret.md"), path.join(legacyRoot, "link.md"));
+      await fsPromises.symlink(outside, path.join(legacyRoot, "linked-dir"));
+      await fsPromises.writeFile(path.join(legacyRoot, "real.md"), "real note");
+      const fresh = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
+      expect(
+        (await fresh.listIndexEntries(fixture.ctx))
+          .filter((e) => e.scope === "workspace")
+          .map((e) => e.relPath)
+      ).toEqual(["real.md"]);
     });
 
     it("refuses a child's rollback into the shared store once the owner is tombstoned", async () => {
@@ -1326,6 +1382,92 @@ describe("MemoryService", () => {
       if (!refused.success) expect(refused.error).toContain("this workspace was removed");
       expect(await pathExists(path.join(ownerSessionDir, "memory", "n.md"))).toBe(true);
       expect(await readRefinementEvents(childSessionDir)).toHaveLength(1);
+    });
+
+    it("sees a live tree member's later shared-store edit as divergence when rolling back", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      const peersOf = (workspaceId: string) => () =>
+        sharedWorkspaceMemoryPeerSessionDirs(
+          fixture.config.loadConfigOrDefault(),
+          fixture.config.sessionsDir,
+          workspaceId
+        );
+      expect(peersOf("ws-owner")()).toEqual([
+        childSessionDir,
+        path.join(fixture.config.sessionsDir, "ws-grandchild"),
+      ]);
+      expect(peersOf("ws-solo")()).toEqual([]);
+
+      // Owner renames a directory; the child then edits a file beneath the
+      // destination. That edit lives only in the child's journal.
+      await fixture.service.create(ownerCtx, "/memories/workspace/notes/a.md", "v1", "agent");
+      await fixture.service.rename(
+        ownerCtx,
+        "/memories/workspace/notes",
+        "/memories/workspace/moved",
+        "agent"
+      );
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/workspace/moved/a.md",
+        "v1",
+        "child edit",
+        "agent"
+      );
+      const ownerRows = await readRefinementEvents(ownerSessionDir);
+      const renameRow = ownerRows.find(
+        (row) => (row.data.action as { op: string }).op === "rename"
+      )!;
+
+      // Own journal only: the rename looks cleanly undoable and would move
+      // the child's newer content back without a word.
+      const blind = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: renameRow.id,
+        listSharedWorkspaceMemoryPeerSessionDirs: () => [],
+        evidence: { toolName: "test", actor: "user" },
+        testOnlyBeforeTargetLock: () => Promise.reject(new Error("would have applied")),
+      });
+      expect(blind.success).toBe(false);
+      if (!blind.success) expect(blind.error).toContain("would have applied");
+
+      const refused = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: renameRow.id,
+        listSharedWorkspaceMemoryPeerSessionDirs: peersOf("ws-owner"),
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("touched the same paths");
+      expect(
+        await fsPromises.readFile(path.join(ownerSessionDir, "memory", "moved", "a.md"), "utf-8")
+      ).toBe("child edit");
+
+      // Rolling the child's edit back first (its journal sees the owner's
+      // rename as EARLIER, not a conflict) unblocks the owner's rollback.
+      const [childRow] = await readRefinementEvents(childSessionDir);
+      const childUndo = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        id: childRow.id,
+        listSharedWorkspaceMemoryPeerSessionDirs: peersOf("ws-child"),
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(childUndo.success).toBe(true);
+      const ownerUndo = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: renameRow.id,
+        listSharedWorkspaceMemoryPeerSessionDirs: peersOf("ws-owner"),
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(ownerUndo.success).toBe(true);
+      expect(
+        await fsPromises.readFile(path.join(ownerSessionDir, "memory", "notes", "a.md"), "utf-8")
+      ).toBe("v1");
     });
 
     it("migrates a removed sub-agent's live shared-memory rows into the owner's journal, rollbackable there", async () => {

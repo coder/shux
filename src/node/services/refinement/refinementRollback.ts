@@ -77,6 +77,15 @@ export interface RollbackRefinementOptions {
    * owns its store). Admits that one extra memory root for confinement.
    */
   sharedWorkspaceMemorySessionDir?: string;
+  /**
+   * Session dirs of the OTHER live task-tree members sharing this session's
+   * `/memories/workspace` store (owner, siblings, descendants), resolved at
+   * rollback time. Each member journals only its own mutations of the shared
+   * store, so their rows are merged into divergence detection: a child's
+   * later edit under a path the owner renamed must surface as a conflict
+   * when the owner rolls the rename back. Omit when the store is private.
+   */
+  listSharedWorkspaceMemoryPeerSessionDirs?: () => string[];
   /** Attribution for the emitted rollback row. */
   evidence: { toolName: string; toolCallId?: string; actor?: string };
   /** Caller-supplied justification, recorded in the rollback row's action. */
@@ -525,6 +534,38 @@ function isAfter(row: RefinementEvent, other: RefinementEvent): boolean {
   return rowTs > otherTs || (rowTs === otherTs && row.seq > other.seq);
 }
 
+/**
+ * Memory rows from the other task-tree members' journals that touched the
+ * shared workspace store (owner's <sessionDir>/memory). Read without their
+ * session locks: journals are append-only and self-healing on read, and a
+ * row landing after this read is caught by the fs-level checks like any
+ * other concurrent writer.
+ */
+async function readSharedMemoryPeerRows(
+  opts: RollbackRefinementOptions
+): Promise<RefinementEvent[]> {
+  const peerDirs = opts.listSharedWorkspaceMemoryPeerSessionDirs?.() ?? [];
+  if (peerDirs.length === 0) return [];
+  const sharedRoot = path.join(
+    path.resolve(opts.sharedWorkspaceMemorySessionDir ?? opts.sessionDir),
+    "memory"
+  );
+  const peerRows: RefinementEvent[] = [];
+  for (const peerDir of peerDirs) {
+    assert(
+      path.resolve(peerDir) !== path.resolve(opts.sessionDir),
+      "peer session dirs exclude the acting session"
+    );
+    for (const row of await listRefinements(peerDir)) {
+      if (row.data.kind !== "memory") continue;
+      const parsed = RefinementInverseSchema.safeParse(row.data.inverse);
+      if (!parsed.success) continue;
+      if (inversePaths(parsed.data).some((p) => pathsOverlap(p, sharedRoot))) peerRows.push(row);
+    }
+  }
+  return peerRows;
+}
+
 async function collectDivergence(
   rows: RefinementEvent[],
   target: RefinementEvent,
@@ -856,7 +897,13 @@ export async function rollbackRefinement(
       },
     };
 
-    const divergence = await collectDivergence(rows, target, inverse, readContent);
+    // Conflict detection sees this journal plus every live tree member's
+    // shared-store rows (see listSharedWorkspaceMemoryPeerSessionDirs); the
+    // store clock (`sourceTs`) orders rows across journals. Target lookup,
+    // rollbackOf checks and the appended row stay on this session's journal.
+    const divergenceRows =
+      kind === "memory" ? [...rows, ...(await readSharedMemoryPeerRows(opts))] : rows;
+    const divergence = await collectDivergence(divergenceRows, target, inverse, readContent);
     if (divergence.length > 0 && opts.force !== true) {
       throw new RollbackError(
         `Refusing rollback of '${opts.id}': current state diverges from what the inverse expects:\n` +
@@ -917,7 +964,7 @@ export async function rollbackRefinement(
       // (live app vs. debug CLI) does not contend on this in-process lock, so
       // this re-verify narrows but cannot fully close that window.
       if (opts.force !== true) {
-        const raced = await collectDivergence(rows, target, inverse, readContent);
+        const raced = await collectDivergence(divergenceRows, target, inverse, readContent);
         if (raced.length > 0) {
           throw new RollbackError(
             `Refusing rollback of '${opts.id}': a concurrent mutation landed before the apply:\n` +

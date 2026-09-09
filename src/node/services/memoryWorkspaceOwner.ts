@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { log } from "@/node/services/log";
@@ -87,4 +88,30 @@ export function workspaceMemoryOwnerResolver(cfg: ProjectsConfig): (workspaceId:
   };
   resolversBySnapshot.set(cfg, resolver);
   return resolver;
+}
+
+/**
+ * Session dirs of the OTHER registered members of `workspaceId`'s task tree —
+ * every workspace resolving to the same owner (the owner itself, siblings,
+ * descendants). They journal their own mutations of the shared
+ * `/memories/workspace` store, so a rollback in one member must consult all
+ * of them for later conflicting rows (refinementRollback.ts). Empty for a
+ * workspace that owns its store alone.
+ */
+export function sharedWorkspaceMemoryPeerSessionDirs(
+  cfg: ProjectsConfig,
+  sessionsDir: string,
+  workspaceId: string
+): string[] {
+  assert(sessionsDir.length > 0, "sharedWorkspaceMemoryPeerSessionDirs requires sessionsDir");
+  const resolve = workspaceMemoryOwnerResolver(cfg);
+  const owner = resolve(workspaceId);
+  const peers: string[] = [];
+  for (const project of cfg.projects.values()) {
+    for (const workspace of project.workspaces) {
+      if (workspace.id === undefined || workspace.id === workspaceId) continue;
+      if (resolve(workspace.id) === owner) peers.push(path.join(sessionsDir, workspace.id));
+    }
+  }
+  return peers;
 }
