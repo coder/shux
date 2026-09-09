@@ -1,3 +1,4 @@
+import { STARTUP_RECOVERY_MAX_READ_ATTEMPTS } from "@/constants/startupRecovery";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
@@ -1372,6 +1373,107 @@ describe("AgentSession startup auto-retry recovery", () => {
       for (const spy of spies) spy.mockRestore();
     }
   });
+
+  test.each([false, true])(
+    "preference EIO stays fail-closed and retries without poisoning the load cache (persistent=%s)",
+    async (persistent) => {
+      const workspaceId = "preference-read-fault";
+      const { session, config, historyService, aiService, cleanup } =
+        await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("intent", "user", "Unfinished work")
+      );
+      const preferencePath = path.join(
+        config.sessionsDir,
+        workspaceId,
+        "auto-retry-preference.json"
+      );
+      await fsPromises.writeFile(preferencePath, JSON.stringify({ enabled: false }));
+      const readFile = fsPromises.readFile.bind(fsPromises);
+      let failing = true;
+      let attempts = 0;
+      const readSpy = spyOn(fsPromises, "readFile").mockImplementation((async (
+        ...args: Parameters<typeof fsPromises.readFile>
+      ) => {
+        if (args[0] === preferencePath) {
+          attempts += 1;
+          if (failing) {
+            failing = persistent;
+            throw Object.assign(new Error("Preference disk I/O failure"), { code: "EIO" });
+          }
+        }
+        return readFile(...args);
+      }) as typeof fsPromises.readFile);
+      const wait = spyOn(
+        session as unknown as { waitForStartupReadRetry: () => Promise<void> },
+        "waitForStartupReadRetry"
+      ).mockResolvedValue(undefined);
+      const stream = spyOn(aiService, "streamMessage");
+      try {
+        expect(await session.getStartupRecoveryState()).toBe(persistent ? "blocked" : "stopped");
+        expect(attempts).toBe(persistent ? STARTUP_RECOVERY_MAX_READ_ATTEMPTS : 2);
+        expect(wait).toHaveBeenCalledTimes(persistent ? STARTUP_RECOVERY_MAX_READ_ATTEMPTS - 1 : 1);
+        expect(JSON.parse(await Bun.file(preferencePath).text())).toEqual({ enabled: false });
+        if (persistent) {
+          const beforeRootRecovery = attempts;
+          await session.ensureStartupAutoRetryCheck();
+          expect(attempts - beforeRootRecovery).toBe(STARTUP_RECOVERY_MAX_READ_ATTEMPTS);
+          expect(stream).not.toHaveBeenCalled();
+          await (
+            session as unknown as {
+              persistStartupAutoRetryAbandon(reason: string, userMessageId: string): Promise<void>;
+            }
+          ).persistStartupAutoRetryAbandon("aborted", "new-stop");
+          expect(await session.recordPendingAutoRetryState()).toBe(false);
+          expect(JSON.parse(await Bun.file(preferencePath).text())).toEqual({ enabled: false });
+        }
+        failing = false;
+        expect(await session.recordPendingAutoRetryState()).toBe(true);
+        if (persistent) {
+          expect(JSON.parse(await Bun.file(preferencePath).text())).toEqual({
+            enabled: false,
+            startupAutoRetryAbandon: { reason: "aborted", userMessageId: "new-stop" },
+          });
+        }
+        expect(await session.getStartupRecoveryState()).toBe("stopped");
+        const acceptedLoadAttempts = attempts;
+        expect(await session.getStartupRecoveryState()).toBe("stopped");
+        expect(attempts).toBe(acceptedLoadAttempts);
+        await session.ensureStartupAutoRetryCheck();
+        expect(stream).not.toHaveBeenCalled();
+      } finally {
+        stream.mockRestore();
+        readSpy.mockRestore();
+        wait.mockRestore();
+        await session.dispose();
+      }
+    }
+  );
+
+  test.each([undefined, "{broken", "null", "[]"])(
+    "missing or malformed preference compatibility (%s)",
+    async (raw) => {
+      const workspaceId = "preference-format-compatibility";
+      const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("intent", "user", "Unfinished work")
+      );
+      if (raw != null)
+        await fsPromises.writeFile(
+          path.join(config.sessionsDir, workspaceId, "auto-retry-preference.json"),
+          raw
+        );
+      try {
+        expect(await session.getStartupRecoveryState()).toBe("interrupted");
+      } finally {
+        await session.dispose();
+      }
+    }
+  );
 
   test("a marker recorded while the preference file is still loading survives the load and keeps the file's opt-out", async () => {
     const workspaceId = "startup-retry-marker-during-preference-load";

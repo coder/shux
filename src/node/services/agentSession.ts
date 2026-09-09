@@ -1786,12 +1786,17 @@ export class AgentSession {
   }
 
   /**
-   * The preference file is read once per session, and every reader and writer of the in-memory
+   * Successful preference reads are cached per session, and every reader and writer of in-memory
    * auto-retry state waits for that read: a load that lands late cannot overwrite a newer change,
    * and a write never rebuilds the file from unloaded defaults.
    */
   private loadAutoRetryState(): Promise<void> {
-    this.autoRetryStateLoad ??= this.runStartupRecoveryStep(() => this.readAutoRetryState());
+    this.autoRetryStateLoad ??= this.runStartupRecoveryStep(() => this.readAutoRetryState()).catch(
+      (error: unknown) => {
+        this.autoRetryStateLoad = null;
+        throw error;
+      }
+    );
     return this.autoRetryStateLoad;
   }
 
@@ -1802,44 +1807,38 @@ export class AgentSession {
   }
 
   private async readAutoRetryState(): Promise<void> {
-    const preferencePath = this.getAutoRetryPreferencePath();
-    try {
-      const raw = await readFile(preferencePath, "utf-8");
-      if (this.coordinator.closing) return;
-      const parsed = JSON.parse(raw) as {
-        enabled?: unknown;
-        startupAutoRetryAbandon?: unknown;
-      };
-      const enabled = parsed.enabled !== false;
-      this.autoRetryEnabledPreference = enabled;
-      this.legacyAutoRetryEnabledHint = null;
-      this.startupAutoRetryAbandon = this.parseStartupAutoRetryAbandon(
-        parsed.startupAutoRetryAbandon
-      );
-      this.retryManager.setEnabled(enabled);
-    } catch (error) {
-      if (this.coordinator.closing) return;
-      // Missing preference file is the default path. Use any legacy frontend hint
-      // (captured at onChat subscribe time) before falling back to enabled.
-      const missing = hasErrorCode(error, "ENOENT");
-      const defaultEnabled = !(missing && this.legacyAutoRetryEnabledHint === false);
-
-      this.autoRetryEnabledPreference = defaultEnabled;
-      this.legacyAutoRetryEnabledHint = null;
-      this.startupAutoRetryAbandon = null;
-      this.retryManager.setEnabled(defaultEnabled);
-
-      if (missing && defaultEnabled === false) {
-        // Persist migrated legacy opt-out so restart behavior no longer depends
-        // on renderer localStorage keys. This write runs inside the load, so
-        // persistAutoRetryState must not wait for loadAutoRetryState.
-        await this.persistAutoRetryState();
-      } else if (!missing) {
-        log.warn("Failed to load auto-retry preference; defaulting to enabled", {
-          workspaceId: this.workspaceId,
-          error: getErrorMessage(error),
-        });
+    const raw = await readFile(this.getAutoRetryPreferencePath(), "utf-8").catch(
+      (error: unknown) => {
+        // An unreadable preference is not consent to restart; let bounded admission retry the I/O.
+        if (!hasErrorCode(error, "ENOENT")) throw error;
+        return null;
       }
+    );
+    if (this.coordinator.closing) return;
+    let parsed: { enabled?: unknown; startupAutoRetryAbandon?: unknown } = {};
+    try {
+      parsed = (JSON.parse(raw ?? "{}") as typeof parsed | null) ?? {};
+    } catch (error) {
+      log.warn("Failed to load auto-retry preference; defaulting to enabled", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    // Missing preference file is the default path. Use any legacy frontend hint
+    // (captured at onChat subscribe time) before falling back to enabled.
+    const enabled =
+      raw == null ? this.legacyAutoRetryEnabledHint !== false : parsed.enabled !== false;
+    this.autoRetryEnabledPreference = enabled;
+    this.legacyAutoRetryEnabledHint = null;
+    this.startupAutoRetryAbandon ??= this.parseStartupAutoRetryAbandon(
+      parsed.startupAutoRetryAbandon
+    );
+    this.retryManager.setEnabled(enabled);
+    if (raw == null && !enabled) {
+      // Persist migrated legacy opt-out so restart behavior no longer depends
+      // on renderer localStorage keys. This write runs inside the load, so
+      // persistAutoRetryState must not wait for loadAutoRetryState.
+      await this.persistAutoRetryState();
     }
   }
 
@@ -1908,7 +1907,8 @@ export class AgentSession {
    * outlived a failed unlink can only disable retries or suppress a replay.
    */
   async recordPendingAutoRetryState(): Promise<boolean> {
-    await this.loadAutoRetryState();
+    await this.loadAutoRetryState().catch(() => undefined);
+    if (this.autoRetryEnabledPreference === null) return false;
     if (this.autoRetryEnabledPreference !== false && this.startupAutoRetryAbandon === null) {
       return true;
     }
@@ -1928,12 +1928,14 @@ export class AgentSession {
     isCurrent = () => true
   ): Promise<void> {
     if (!isCurrent()) return;
-    await this.loadAutoRetryState();
+    await this.loadAutoRetryState().catch(() => undefined);
     this.startupAutoRetryAbandon = {
       reason,
       ...(userMessageId ? { userMessageId } : {}),
     };
-    await this.persistAutoRetryState();
+    // Keep new Stop intent owed on a failed initial read, without overwriting an unknown opt-out.
+    if (this.autoRetryEnabledPreference === null) this.autoRetryStateUnrecorded = true;
+    else await this.persistAutoRetryState();
   }
 
   private async clearStartupAutoRetryAbandon(isCurrent = () => true): Promise<void> {
@@ -2076,20 +2078,12 @@ export class AgentSession {
   }
 
   private getLastNonSystemHistoryMessage(historyTail: MuxMessage[]): MuxMessage | undefined {
-    for (let index = historyTail.length - 1; index >= 0; index -= 1) {
-      const candidate = historyTail[index];
-      if (candidate.role === "system") {
-        continue;
-      }
-      if (this.isSyntheticGoalPauseBoundaryMessage(candidate)) {
-        continue;
-      }
-      if (isSyntheticSnapshotUserMessage(candidate)) {
-        continue;
-      }
-      return candidate;
-    }
-    return undefined;
+    return historyTail.findLast(
+      (candidate) =>
+        candidate.role !== "system" &&
+        !this.isSyntheticGoalPauseBoundaryMessage(candidate) &&
+        !isSyntheticSnapshotUserMessage(candidate)
+    );
   }
 
   private async requireGoalAcknowledgmentForCrashRecoveredPartial(): Promise<void> {
@@ -2593,7 +2587,10 @@ export class AgentSession {
       return "deferred";
     }
 
-    const autoRetryEnabled = await this.loadAutoRetryEnabledPreference(isCurrent);
+    const autoRetryEnabled = await this.loadAutoRetryEnabledPreference(isCurrent).catch(
+      () => undefined
+    );
+    if (autoRetryEnabled == null) return "retryable";
     if (!isCurrent() || !autoRetryEnabled) return "completed";
 
     const [partial, historyResult] = (await this.readStartupTail()) ?? [];
@@ -2738,11 +2735,13 @@ export class AgentSession {
     const signal = AbortSignal.any([this.closingSignal, deadline.signal]);
     try {
       // Release admission on timeout, not the original read's physical I/O lease.
-      const result = await raceWithAbortAndTimeout(this.readStartupRecoveryState(signal), {
-        signal,
-        timeoutMs,
-      });
-      return result.kind === "ok" ? result.value : "blocked";
+      const probe = retryStartupRead(
+        () => this.readStartupRecoveryState(signal).catch(() => "blocked" as const),
+        (state) => state === "blocked",
+        { signal, wait: (delay) => this.waitForStartupReadRetry(delay, signal) }
+      );
+      const result = await raceWithAbortAndTimeout(probe, { signal, timeoutMs });
+      return result.kind === "ok" ? (result.value ?? "blocked") : "blocked";
     } catch {
       return "blocked";
     } finally {
@@ -2766,12 +2765,7 @@ export class AgentSession {
     await this.loadAutoRetryState();
     if (signal.aborted) return "blocked";
     if (this.autoRetryEnabledPreference === false) return "stopped";
-    const [partial, history] =
-      (await retryStartupRead(
-        () => this.readStartupTail(true),
-        (value) => value?.[0] === undefined || !value[1]?.success,
-        { signal, wait: (delay) => this.waitForStartupReadRetry(delay, signal) }
-      ).catch(() => undefined)) ?? [];
+    const [partial, history] = (await this.readStartupTail(true)) ?? [];
     if (!history?.success || partial === undefined) return "blocked";
     const abandon = this.startupAutoRetryAbandon;
     if (abandon?.reason === "aborted") {

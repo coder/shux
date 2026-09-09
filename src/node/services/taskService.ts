@@ -2397,11 +2397,9 @@ export class TaskService implements AgentTaskIntegration {
           id,
           false
         );
-        if (!stopped.success)
-          log.warn("Failed to settle stopped task on startup", {
-            taskId: task.id,
-            error: stopped.error,
-          });
+        if (!stopped.success) throw new Error(stopped.error);
+      }).catch((error: unknown) => {
+        log.warn("Failed to settle stopped task on startup", { taskId: id, error });
       });
     }
 
@@ -5617,6 +5615,10 @@ export class TaskService implements AgentTaskIntegration {
             continue;
           }
 
+          // Stop cancels the durable queue too, but never guidance authored after this snapshot.
+          const canceledGuidance = new Set(
+            current.workspace.taskPendingGuidance?.map((entry) => entry.id)
+          );
           for (const handle of activeHandles) {
             const interrupted = await this.getWorkspaceTurnManager().interruptWorkspaceTurn(
               handle.ownerWorkspaceId,
@@ -5655,6 +5657,10 @@ export class TaskService implements AgentTaskIntegration {
             (workspace) => {
               const previousStatus = workspace.taskStatus;
               parentWorkspaceId = workspace.parentWorkspaceId;
+              workspace.taskPendingGuidance = workspace.taskPendingGuidance?.filter(
+                (entry) => !canceledGuidance.has(entry.id)
+              );
+              if (workspace.taskPendingGuidance?.length === 0) delete workspace.taskPendingGuidance;
               const mutation = this.applyInterruptedTaskStatus(workspace);
               transitioned = mutation === "interrupted" && previousStatus !== "interrupted";
             },

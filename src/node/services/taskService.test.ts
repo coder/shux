@@ -3488,11 +3488,12 @@ describe("TaskService", () => {
       try {
         await taskService.initialize();
         expect(compaction).not.toHaveBeenCalled();
-        expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toEqual(guidance);
         if (state === "stopped" || state === "opted-out") {
+          expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toBeUndefined();
           expect(sends).toHaveLength(0);
           return;
         }
+        expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toEqual(guidance);
         expect(sends).toHaveLength(2);
         for (const [index, entry] of guidance.entries()) {
           expect(sends[index]?.[2].queueDispatchMode).toBe(entry.queueDispatchMode);
@@ -4004,6 +4005,148 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0]?.[0]).toBe("sibling");
   });
+
+  test.each(["lifecycle-lock", "handle-read"] as const)(
+    "startup contains a throwing %s stop normalization while healthy siblings proceed",
+    async (fault) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      await config.editConfig((cfg) => {
+        cfg.taskSettings = testTaskSettings(2, 3);
+        cfg.projects.get(projectPath)!.workspaces.push(
+          ...["unreadable", "healthy", "queued"].map((id) => ({
+            id,
+            path: projectPath,
+            name: id,
+            parentWorkspaceId: parentId,
+            taskStatus: id === "queued" ? ("queued" as const) : ("running" as const),
+            taskIsolation: "none" as const,
+            runtimeConfig: { type: "local" as const },
+            agentId: "explore",
+            agentType: "explore",
+            taskModelString: defaultModel,
+            taskPrompt: id === "queued" ? "Continue healthy work" : undefined,
+          }))
+        );
+        return cfg;
+      });
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+        getStartupRecoveryState: mock(() => Promise.resolve("stopped")),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      if (fault === "lifecycle-lock") {
+        spyOn(taskService, "withTaskTreeLifecycleLock").mockRejectedValueOnce(
+          new Error("Lock unavailable")
+        );
+      } else {
+        spyOn(workspaceTurnManagerFor(taskService), "listAllWorkspaceTurns").mockRejectedValueOnce(
+          new Error("Handle directory EIO")
+        );
+      }
+      await taskService.recoverInterruptedTasks();
+      expect(findWorkspaceInConfig(config, "unreadable")?.taskStatus).toBe("running");
+      expect(findWorkspaceInConfig(config, "healthy")?.taskStatus).toBe("interrupted");
+      expect(findWorkspaceInConfig(config, "queued")?.taskStatus).toBe("running");
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(sendMessage.mock.calls[0]?.[0]).toBe("queued");
+    }
+  );
+
+  test.each([false, true])(
+    "stopping cancels captured durable guidance before reactivation (later=%s)",
+    async (later) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      const childId = "stopped-guidance";
+      const oldGuidance = {
+        id: "old",
+        message: "Old correction",
+        queueDispatchMode: "tool-end" as const,
+      };
+      const newGuidance = {
+        id: "new",
+        message: "Later correction",
+        queueDispatchMode: "turn-end" as const,
+      };
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push({
+          id: childId,
+          path: projectPath,
+          name: childId,
+          parentWorkspaceId: parentId,
+          taskStatus: "running",
+          taskIsolation: "none",
+          runtimeConfig: { type: "local" },
+          agentId: "explore",
+          agentType: "explore",
+          taskModelString: defaultModel,
+          taskPendingGuidance: [oldGuidance],
+        });
+        return cfg;
+      });
+      const sendMessage = mock(async (...args: Parameters<WorkspaceHost["sendMessage"]>) => {
+        await args[3]?.onAccepted?.();
+        return Ok(undefined);
+      });
+      const { workspaceService } = createWorkspaceServiceMocks({
+        sendMessage,
+        getStartupRecoveryState: mock(() => Promise.resolve("stopped")),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      const manager = workspaceTurnManagerFor(taskService);
+      if (later) {
+        await registerLiveWorkspaceTurnHandle(
+          taskService,
+          childId,
+          "wst_canceled_guidance",
+          parentId,
+          false
+        );
+        const interrupt = manager.interruptWorkspaceTurn.bind(manager);
+        spyOn(manager, "interruptWorkspaceTurn").mockImplementationOnce(async (...args) => {
+          // A concurrent writer after stop's capture horizon must not lose its fresh GUID.
+          await config.editConfig((cfg) => {
+            cfg.projects
+              .get(projectPath)!
+              .workspaces.find((ws) => ws.id === childId)!
+              .taskPendingGuidance!.push(newGuidance);
+            return cfg;
+          });
+          return interrupt(...args);
+        });
+      }
+      await taskService.recoverInterruptedTasks();
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("interrupted");
+      if (later) {
+        expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toEqual([newGuidance]);
+        return;
+      }
+      expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toBeUndefined();
+      // A user resume admits the existing child again; canceled orchestration must not block it.
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      const resumed = await taskService.sendMessageToDescendantAgentTask(
+        parentId,
+        childId,
+        "Finish the new request",
+        "turn-end"
+      );
+      expect(resumed).toMatchObject({ success: true, data: { delivery: "accepted" } });
+      await handleTaskServiceStreamEndForTest(taskService, {
+        type: "stream-end",
+        workspaceId: childId,
+        messageId: "fresh-final",
+        metadata: {
+          model: defaultModel,
+          finishReason: "stop",
+        },
+        parts: [{ type: "text", text: "Finished the new request" }],
+      });
+      expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
+      await taskService.maybeStartQueuedTasks();
+      await flushTerminalAttentionDrains(taskService);
+    }
+  );
 
   test("initialize does not resend the restart nudge to a running task that is already streaming", async () => {
     const config = await createTestConfig(rootDir);
