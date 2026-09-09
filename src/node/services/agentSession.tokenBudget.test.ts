@@ -1623,6 +1623,32 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(warningRows(rows).filter(isFinalFlushRow)).toHaveLength(1);
   });
 
+  test("a flush stopped without its settled-step callback while the mode is disabled leaves no stale reset", async () => {
+    const h = await setup();
+    const globalOptions: SendMessageOptions = { model, agentId: "exec" };
+    const experiment = spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET
+    );
+    expect((await h.session.sendMessage("Work", globalOptions)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("rollover");
+    await h.finishAndDispatch();
+    // Disabled while the flush streams; a `require: memory` success (or a text-only finish)
+    // stops the stream before the settled-step callback runs.
+    experiment.mockImplementation(() => false);
+    h.settleStream(1, { finishReason: "stop" });
+    await h.waitForRequest(3);
+    expect(text((await allRows(h)).at(-1)!)).toBe("Continue");
+    h.settleStream(2, { finishReason: "stop" });
+    await h.session.waitForIdle();
+    experiment.mockImplementation((id) => id === EXPERIMENT_IDS.TOKEN_BUDGET);
+    expect((await h.session.sendMessage("Follow-up", globalOptions)).success).toBe(true);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    // Fresh pressure seals normally; the durable final row already used this window's one offer.
+    expect(await h.requests[3].onStepSettled?.(step(110_000))).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+  });
+
   test("disabling token-budget mode while the flush pair is queued bounds the flush and keeps its Continue", async () => {
     const h = await setup();
     const globalOptions: SendMessageOptions = { model, agentId: "exec", muxMetadata: correlation };

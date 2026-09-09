@@ -3974,6 +3974,11 @@ export class AgentSession {
     // contains the new prompt, then replay it again post-compaction).
     let autoCompactionMessage: MuxMessage | null = null;
     const tokenBudgetActive = this.isTokenBudgetActive(optionsForStream);
+    // Token-budget mode went inactive with a reset pending: a flush turn may have stopped on a
+    // required-tool success or a text-only finish, both of which bypass the settled-step callback
+    // that normally drops the intent. Drop it here, unconditionally, so re-enabling the mode later
+    // (possibly with a larger model) cannot seal a below-threshold context with a stale snapshot.
+    if (!tokenBudgetActive && this.pendingRollover != null) this.dropContextBudgetIntent();
     // Await rejection at each return so the execution lease owns persistence and goal safety.
     const rejectBudgetSend = async (error: SendMessageError) => {
       if (isManualUserMessage) {
@@ -5021,6 +5026,17 @@ export class AgentSession {
     return !isCompactionRequestMetadata(options?.muxMetadata);
   }
 
+  /**
+   * Drop a pending reset (intent, pinned snapshot, flush claim) without touching queued
+   * continuations: used when rollover can no longer seal the window but a paired "Continue"
+   * must still dispatch as an ordinary continuation.
+   */
+  private dropContextBudgetIntent(): void {
+    this.pendingRollover = undefined;
+    this.pendingRolloverSnapshot = undefined;
+    this.contextBudgetFlushClaimed = false;
+  }
+
   private clearContextBudgetState(): void {
     this.contextBudgetGeneration += 1;
     this.pendingRollover = undefined;
@@ -5861,9 +5877,7 @@ export class AgentSession {
       // a delegated turn it keeps the notes-only finish from being recorded as the task's
       // outcome (WorkspaceTurnManager defers while a same-turn continuation is pending).
       if (context?.contextBudgetFlushTurn === true) {
-        this.pendingRollover = undefined;
-        this.pendingRolloverSnapshot = undefined;
-        this.contextBudgetFlushClaimed = false;
+        this.dropContextBudgetIntent();
         return "rollover";
       }
       return "continue";
@@ -5903,9 +5917,7 @@ export class AgentSession {
         // dispatches as an ordinary continuation of the interrupted work in this window, and a
         // delegated turn must not record the notes-only flush finish as the task's outcome
         // (WorkspaceTurnManager defers finalization while a same-turn continuation is pending).
-        this.pendingRollover = undefined;
-        this.pendingRolloverSnapshot = undefined;
-        this.contextBudgetFlushClaimed = false;
+        this.dropContextBudgetIntent();
         return "rollover";
       }
       // A flush turn is bounded to one provider step even when the step no longer crosses the
