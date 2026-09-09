@@ -30,26 +30,41 @@ def check_line:
 JQ
 }
 
-# gh pr checks deduplicates by display name, hiding a failed run behind another
-# suite's success. GitHub's rollup retains those independent runs but omits
-# superseded attempts. Pin both refs and paginate before making any readiness claim.
-# shellcheck disable=SC2016 # GraphQL/jq variables must not expand in the shell.
-fetch_pr_checks() {
-  local pr refs oid pages normalized checks='[]'
+# shellcheck disable=SC2016 # These are GraphQL variables, not shell variables.
+fetch_pr_check_state() {
+  local pr
   pr=$(gh api graphql -F owner='{owner}' -F name='{repo}' -F number="$1" -f query='
     query($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
-        pullRequest(number: $number) { headRefOid potentialMergeCommit { oid } }
+        pullRequest(number: $number) {
+          state mergeable mergeStateStatus reviewDecision headRefOid potentialMergeCommit { oid }
+        }
       }
     }') || return 1
-  refs=$(jq -er '
+  jq -cSe '
     .data.repository.pullRequest
     | if (.headRefOid | type) != "string" or .headRefOid == ""
         or (has("potentialMergeCommit") | not)
         or (.potentialMergeCommit != null and ((.potentialMergeCommit.oid | type) != "string" or .potentialMergeCommit.oid == ""))
       then error("Missing PR refs")
-      else [.headRefOid, .potentialMergeCommit.oid] | map(select(. != null)) | unique[] end
-  ' <<<"$pr") || return 1
+      else .reviewDecision = (.reviewDecision // "") end
+  ' <<<"$pr"
+}
+
+# gh pr checks deduplicates by display name, hiding a failed run behind another
+# suite's success. GitHub's rollup retains those independent runs but omits
+# superseded attempts. Return 10 if a push/base update invalidates the snapshot.
+# shellcheck disable=SC2016 # GraphQL/jq variables must not expand in the shell.
+fetch_pr_checks() {
+  local pr latest expected refs oid pages normalized checks='[]'
+  pr=$(fetch_pr_check_state "$1") || return 1
+  if [ "$#" -gt 1 ]; then
+    # Do not combine an earlier CLEAN verdict with checks for a different head.
+    expected=$(jq -cS . <<<"$2") || return 1
+    latest=$(jq -cS 'del(.potentialMergeCommit)' <<<"$pr") || return 1
+    [ "$latest" = "$expected" ] || return 10
+  fi
+  refs=$(jq -r '[.headRefOid, .potentialMergeCommit.oid] | map(select(. != null)) | unique[]' <<<"$pr") || return 1
 
   for oid in $refs; do
     pages=$(gh api graphql --paginate --slurp -F owner='{owner}' -F name='{repo}' -f oid="$oid" -f query='
@@ -102,5 +117,8 @@ fetch_pr_checks() {
     ' <<<"$pages") || return 1
     checks=$(printf '%s\n%s\n' "$checks" "$normalized" | jq -cs 'add') || return 1
   done
+  # A passing old commit is not evidence that a concurrently pushed PR is ready.
+  latest=$(fetch_pr_check_state "$1") || return 1
+  [ "$latest" = "$pr" ] || return 10
   printf '%s\n' "$checks"
 }

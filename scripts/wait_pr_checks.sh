@@ -88,7 +88,7 @@ CHECK_PR_CHECKS_ONCE() {
   local reviews_output
 
   # Get PR status
-  status=$(gh pr view "$PR_NUMBER" --json mergeable,mergeStateStatus,reviewDecision,state 2>/dev/null || echo "error")
+  status=$(gh pr view "$PR_NUMBER" --json mergeable,mergeStateStatus,reviewDecision,state,headRefOid 2>/dev/null || echo "error")
 
   if [ "$status" = "error" ]; then
     echo "❌ Failed to get PR status. Does PR #$PR_NUMBER exist?"
@@ -184,11 +184,16 @@ CHECK_PR_CHECKS_ONCE() {
   local ignored_unready_count
   local ignored_unready_checks
 
-  if ! checks_json=$(fetch_pr_checks "$PR_NUMBER" 2>&1); then
+  checks_json=$(fetch_pr_checks "$PR_NUMBER" "$status" 2>&1) || {
+    local fetch_status=$?
+    if [ "$fetch_status" -eq 10 ]; then
+      echo "PR state changed while collecting checks; retrying."
+      return 10
+    fi
     echo "❌ Failed to get PR checks for PR #$PR_NUMBER" >&2
     echo "$checks_json" >&2
     return 1
-  fi
+  }
 
   jq_defs=$(visual_check_jq_defs)
   filtered_checks=$(echo "$checks_json" | jq "$jq_defs [ .[] | select(is_visual_review_check | not) ]")

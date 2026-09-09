@@ -47,7 +47,7 @@ def page(oid, nodes=None, more=False):
 
 def fixture(nodes=None, merge_state="CLEAN"):
     return {
-        "pr": {"state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": merge_state, "reviewDecision": ""},
+        "pr": {"state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": merge_state, "reviewDecision": "", "headRefOid": HEAD},
         "refs": {"headRefOid": HEAD, "potentialMergeCommit": {"oid": MERGE}},
         "pages": {HEAD: [page(HEAD, nodes)], MERGE: [page(MERGE)]},
     }
@@ -72,7 +72,13 @@ if args[:2] == ['pr', 'view']:
 elif args[:2] == ['api', 'graphql']:
     query = next(arg[6:] for arg in args if arg.startswith('query='))
     if 'potentialMergeCommit' in query:
-        print(json.dumps({'data': {'repository': {'pullRequest': fixture['refs']}}}))
+        calls = [json.loads(line) for line in pathlib.Path(os.environ['PR_CHECK_CALLS']).read_text().splitlines()]
+        recheck = sum(any(arg.startswith('query=') and 'potentialMergeCommit' in arg for arg in call) for call in calls) > 1
+        if recheck and fixture.get('fail_recheck'):
+            sys.exit(1)
+        refs = fixture.get('refs_after', fixture['refs']) if recheck else fixture['refs']
+        state = dict(fixture['pr'], **refs) if refs is not None else None
+        print(json.dumps({'data': {'repository': {'pullRequest': state}}}))
     elif 'statusCheckRollup' in query:
         assert '--paginate' in args and '--slurp' in args, args
         assert '$endCursor' in query and 'after: $endCursor' in query, query
@@ -161,6 +167,29 @@ else:
         data["refs"]["potentialMergeCommit"] = None
         self.assert_gate(0, data)
         self.assertFalse(any(f"oid={MERGE}" in args for args in self.calls))
+
+    def test_ref_or_state_change_during_discovery_returns_pending(self):
+        for changed in (
+            {"headRefOid": "3" * 40},
+            {"potentialMergeCommit": {"oid": "3" * 40}},
+            {"mergeStateStatus": "BLOCKED"},
+        ):
+            with self.subTest(changed=changed):
+                data = fixture([check()])
+                data["refs_after"] = dict(data["refs"], **changed)
+                result = self.assert_gate(10, data)
+                self.assertNotIn(check()["detailsUrl"], result.stdout)
+
+    def test_head_change_between_status_and_discovery_returns_pending(self):
+        data = fixture([check()])
+        data["refs"]["headRefOid"] = "3" * 40
+        self.assert_gate(10, data)
+        self.assertFalse(any(any(arg.startswith("oid=") for arg in args) for args in self.calls))
+
+    def test_failed_final_snapshot_read_cannot_accept_passing_checks(self):
+        data = fixture([check()])
+        data["fail_recheck"] = True
+        self.assert_gate(1, data)
 
     def test_blocked_is_not_explained_by_pixel_alone(self):
         self.assert_gate(10, fixture([check(), pixel()], "BLOCKED"))
