@@ -376,9 +376,16 @@ interface PendingSendState {
   deferredBehindSyntheticTurn: boolean;
 }
 
-/** A persisted user turn the backend emits in response to a send; synthetic rows are not echoes. */
+/**
+ * A persisted user turn the backend emits in response to a send. Synthetic rows and
+ * agent-initiated turns (hidden queue entries) are not echoes.
+ */
 function isUserEcho(message: MuxMessage): boolean {
-  return message.role === "user" && message.metadata?.synthetic !== true;
+  return (
+    message.role === "user" &&
+    message.metadata?.synthetic !== true &&
+    message.metadata?.retrySendOptions?.agentInitiated !== true
+  );
 }
 
 interface WorkspaceChatTransientState {
@@ -4180,15 +4187,19 @@ export class WorkspaceStore {
 
   /**
    * A live user row arrived. A synthetic pre-send compaction request defers the echo behind its
-   * turn, drained queue entries echo their own rows, and other synthetic rows (monitor wakes,
-   * continuations) are unrelated; anything else is this send's echo.
+   * turn, drained queue entries echo their own rows, and other non-echo rows (monitor wakes,
+   * continuations, agent-initiated turns) are unrelated; anything else is this send's echo.
    */
   private acknowledgePendingSendEcho(
     transient: WorkspaceChatTransientState,
     echo: MuxMessage
   ): void {
-    if (echo.metadata?.synthetic === true) {
-      if (transient.pendingSend && echo.metadata.muxMetadata?.type === "compaction-request") {
+    if (!isUserEcho(echo)) {
+      if (
+        transient.pendingSend &&
+        echo.metadata?.synthetic === true &&
+        echo.metadata.muxMetadata?.type === "compaction-request"
+      ) {
         transient.pendingSend.deferredBehindSyntheticTurn = true;
       }
       return;

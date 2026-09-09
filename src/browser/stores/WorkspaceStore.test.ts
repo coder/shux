@@ -4866,6 +4866,37 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
     });
 
+    it("keeps the pending row across an agent-initiated user turn", async () => {
+      const workspaceId = "pending-send-agent-initiated";
+      const turn = gate();
+      await createCaughtUpWorkspace(workspaceId, async function* (signal) {
+        await turn.opened;
+        const agentTurn: WorkspaceChatMessage = {
+          type: "message",
+          id: "agent-turn-1",
+          role: "user",
+          parts: [{ type: "text", text: "Continue with the next goal step" }],
+          metadata: {
+            historySequence: 1,
+            timestamp: 1,
+            retrySendOptions: { agentInitiated: true },
+          },
+        };
+        yield agentTurn;
+        await waitForAbortSignal(signal);
+      });
+
+      store.beginPendingSend(workspaceId, pendingSend);
+      turn.release();
+
+      expect(
+        await waitUntil(() =>
+          store.getWorkspaceState(workspaceId).muxMessages.some((m) => m.id === "agent-turn-1")
+        )
+      ).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).pendingSend).toEqual(pendingSend);
+    });
+
     it("clears the pending row when the send lands in the backend queue", async () => {
       const workspaceId = "pending-send-queued";
       const queue = gate();
