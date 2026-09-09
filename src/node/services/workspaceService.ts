@@ -36,6 +36,7 @@ import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import {
   ProvidersConfigStore,
   SecretsStore,
+  configFilePath,
   type Config,
   type Workspace as WorkspaceConfigEntry,
 } from "@/node/config";
@@ -6679,44 +6680,66 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // admitted under the real owner lock recreate the deleted session dir.
         // Without an earlier pass, resolve strictly — an unreadable config
         // aborts the removal (retryable) instead of guessing the topology.
-        const memoryOwnerId =
-          verifiedSharedMemoryOwnerId ??
-          resolveWorkspaceMemoryOwnerId(this.loadConfigForRemovalOrAbort(workspaceId), workspaceId);
-        const ownerSessionDir =
-          memoryOwnerId === workspaceId
-            ? undefined
-            : path.join(this.config.sessionsDir, memoryOwnerId);
-        await removeSessionDirUnderMemoryLocks({
-          rootDir: this.config.rootDir,
-          sessionDir,
-          workspaceId,
-          attemptId: removalAttemptId,
-          sharedWorkspaceMemorySessionDir: ownerSessionDir,
-          beforeTombstone:
-            ownerSessionDir === undefined
+        // Idempotent no-op short of that: a root whose config.json was never
+        // written (fresh install, nothing registered) and no session dir
+        // means there is no topology to resolve and nothing a tombstone
+        // could protect — removing an unknown id must still succeed.
+        const exists = (target: string): Promise<boolean> =>
+          fsPromises.stat(target).then(
+            () => true,
+            () => false
+          );
+        const nothingToTearDown =
+          verifiedSharedMemoryOwnerId === null &&
+          !(await exists(configFilePath(this.config.rootDir))) &&
+          !(await exists(sessionDir));
+        if (nothingToTearDown) {
+          log.debug("Skipping session teardown: no config.json and no session dir", {
+            workspaceId,
+          });
+        } else {
+          const memoryOwnerId =
+            verifiedSharedMemoryOwnerId ??
+            resolveWorkspaceMemoryOwnerId(
+              this.loadConfigForRemovalOrAbort(workspaceId),
+              workspaceId
+            );
+          const ownerSessionDir =
+            memoryOwnerId === workspaceId
               ? undefined
-              : async () => {
-                  // Legacy-notebook delta too (locks held: the owner store's
-                  // AND this child's own, so a self-fallback backend's late
-                  // note into <child>/memory either landed before this pass
-                  // or is refused). Throws → removal aborts, session intact.
-                  await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
-                    workspaceId,
-                    memoryOwnerId,
-                    { locksHeld: true }
-                  );
-                  await migrateSharedMemoryRefinementRows({
-                    childSessionDir: sessionDir,
-                    childWorkspaceId: workspaceId,
-                    ownerSessionDir,
-                    ownerWorkspaceId: memoryOwnerId,
-                  });
-                },
-        });
-        // Only once the session (and with it the transcript) is gone are the
-        // retryable harvest records truly unrecoverable; an aborted removal
-        // above must leave them retryable.
-        await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
+              : path.join(this.config.sessionsDir, memoryOwnerId);
+          await removeSessionDirUnderMemoryLocks({
+            rootDir: this.config.rootDir,
+            sessionDir,
+            workspaceId,
+            attemptId: removalAttemptId,
+            sharedWorkspaceMemorySessionDir: ownerSessionDir,
+            beforeTombstone:
+              ownerSessionDir === undefined
+                ? undefined
+                : async () => {
+                    // Legacy-notebook delta too (locks held: the owner store's
+                    // AND this child's own, so a self-fallback backend's late
+                    // note into <child>/memory either landed before this pass
+                    // or is refused). Throws → removal aborts, session intact.
+                    await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
+                      workspaceId,
+                      memoryOwnerId,
+                      { locksHeld: true }
+                    );
+                    await migrateSharedMemoryRefinementRows({
+                      childSessionDir: sessionDir,
+                      childWorkspaceId: workspaceId,
+                      ownerSessionDir,
+                      ownerWorkspaceId: memoryOwnerId,
+                    });
+                  },
+          });
+          // Only once the session (and with it the transcript) is gone are the
+          // retryable harvest records truly unrecoverable; an aborted removal
+          // above must leave them retryable.
+          await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
+        }
       } catch (error) {
         // r63: without a durable tombstone the retained orphan stays
         // writable by foreign backends forever — abort the removal (the

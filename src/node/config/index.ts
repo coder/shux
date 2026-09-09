@@ -884,6 +884,11 @@ interface ConfigLoadFailureState {
 // re-log the same corrupt-config error once per instance.
 const configLoadFailureStates = new Map<string, ConfigLoadFailureState>();
 
+/** Location of config.json under a Xum root (also used by callers that must stat it without a Config). */
+export function configFilePath(rootDir: string): string {
+  return path.join(rootDir, "config.json");
+}
+
 function configLoadFailureState(configFile: string): ConfigLoadFailureState {
   let state = configLoadFailureStates.get(configFile);
   if (!state) {
@@ -984,7 +989,7 @@ export class Config {
     this.rootDir = sessionLocator.rootDir;
     this.sessionsDir = sessionLocator.sessionsDir;
     this.srcDir = sessionLocator.srcDir;
-    this.configFile = path.join(this.rootDir, "config.json");
+    this.configFile = configFilePath(this.rootDir);
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(this.rootDir);
   }
 
