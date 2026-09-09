@@ -53,16 +53,16 @@ export class StartupRecovery {
     return !this.options.signal.aborted && (this.running != null || this.waiting != null);
   }
 
-  run(): Promise<void> {
+  run(check = this.options.check): Promise<void> {
     if (this.running) return this.running;
     if (this.completed || this.options.signal.aborted || this.waiting) return Promise.resolve();
     const done = Promise.withResolvers<void>();
     // Publish ownership before callbacks: recovery can synchronously reenter through observers.
     this.running = done.promise;
-    this.execute().then(
+    this.execute(check).then(
       (outcome) => {
         this.running = undefined;
-        if (outcome === "deferred" && !this.options.signal.aborted) this.waitUntilIdle();
+        if (outcome === "deferred" && !this.options.signal.aborted) this.waitUntilIdle(check);
         done.resolve();
       },
       (error: unknown) => {
@@ -74,26 +74,23 @@ export class StartupRecovery {
     return done.promise;
   }
 
-  private async execute(): Promise<StartupRecoveryOutcome> {
+  private async execute(check: StartupRecoveryOptions["check"]): Promise<StartupRecoveryOutcome> {
     while (this.nextStep < this.options.steps.length && !this.options.signal.aborted) {
       await this.options.steps[this.nextStep]();
       this.nextStep += 1;
     }
     const outcome =
-      (await retryStartupRead(
-        this.options.check,
-        (value) => value === "retryable",
-        this.options
-      )) ?? "completed";
+      (await retryStartupRead(check, (value) => value === "retryable", this.options)) ??
+      "completed";
     if (outcome === "completed") this.completed = true;
     return outcome;
   }
 
-  private waitUntilIdle(): void {
+  private waitUntilIdle(check: StartupRecoveryOptions["check"]): void {
     this.waiting = this.options.wait(0).then(
       () => {
         this.waiting = undefined;
-        return this.run();
+        return this.run(check);
       },
       (error: unknown) => {
         this.waiting = undefined;

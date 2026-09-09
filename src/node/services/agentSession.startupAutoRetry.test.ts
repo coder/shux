@@ -989,6 +989,28 @@ describe("AgentSession startup auto-retry recovery", () => {
     }
   });
 
+  test.each(["assistant", "user"] as const)(
+    "reuses known startup identity for a %s tail without rescanning",
+    async (role) => {
+      const workspaceId = "known-startup-identity";
+      const { session, aiService, historyService, cleanup } =
+        await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      await historyService.appendToHistory(workspaceId, createMuxMessage("tail", role, "Work"));
+      const metadata = await aiService.getWorkspaceMetadata(workspaceId);
+      if (!metadata.success) throw new Error("Missing fixture metadata");
+      const scan = spyOn(aiService, "getWorkspaceMetadata");
+      scan.mockClear();
+      try {
+        await session.runStartupRecovery(metadata.data);
+        expect(scan).not.toHaveBeenCalled();
+      } finally {
+        scan.mockRestore();
+        await session.dispose();
+      }
+    }
+  );
+
   test("does not start recovery while workspace identity is unavailable", async () => {
     const { session, historyService, events, cleanup } = await createSessionBundle(
       "startup-unknown",

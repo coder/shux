@@ -3349,7 +3349,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           continue;
         }
 
-        this.startStartupRecovery(metadata.id);
+        this.startStartupRecovery(metadata.id, metadata);
         scheduledCount += 1;
       }
 
@@ -4212,7 +4212,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * Run startup recovery without permanently caching a session for every workspace.
    * Only promote the temporary session if recovery leaves background activity alive.
    */
-  private startStartupRecovery(workspaceId: string): void {
+  private startStartupRecovery(workspaceId: string, metadata?: WorkspaceMetadata): void {
     const trimmed = workspaceId.trim();
     if (!trimmed) {
       return;
@@ -4221,7 +4221,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const existingSession =
       this.sessions.get(trimmed) ?? this.transientStartupRecoverySessions.get(trimmed);
     if (existingSession) {
-      existingSession.scheduleStartupRecovery();
+      existingSession.scheduleStartupRecovery(metadata);
       return;
     }
 
@@ -4229,7 +4229,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     this.transientStartupRecoverySessions.set(trimmed, session);
 
     void session
-      .runStartupRecovery()
+      .runStartupRecovery(metadata)
       .then(async () => {
         if (this.transientStartupRecoverySessions.get(trimmed) !== session) {
           return;

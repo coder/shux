@@ -2326,6 +2326,7 @@ export class AgentSession {
   private async deriveStartupAutoRetryRequest(params: {
     partial: MuxMessage | null;
     historyTail: MuxMessage[];
+    workspaceMetadata?: WorkspaceMetadata;
   }): Promise<StartupRetrySendOptions | undefined> {
     const lastUserMessage = this.findLastRetryUserMessage(params.historyTail);
     if (lastUserMessage?.metadata?.contextBudgetRejected) return undefined;
@@ -2340,7 +2341,8 @@ export class AgentSession {
                 message.role === "assistant"
             );
 
-    const workspaceMetadata = await this.getWorkspaceMetadataForRetry();
+    const workspaceMetadata =
+      params.workspaceMetadata ?? (await this.getWorkspaceMetadataForRetry());
     if (!workspaceMetadata || workspaceMetadata.parentWorkspaceId != null) return undefined;
 
     const persistedRetrySendOptions = lastUserMessage?.metadata?.retrySendOptions;
@@ -2581,7 +2583,9 @@ export class AgentSession {
     return await step();
   }
 
-  private async scheduleStartupAutoRetryIfNeeded(): Promise<StartupRecoveryOutcome> {
+  private async scheduleStartupAutoRetryIfNeeded(
+    workspaceMetadata?: WorkspaceMetadata
+  ): Promise<StartupRecoveryOutcome> {
     if (this.coordinator.closing) return "completed";
     using _execution = this.coordinator.enterExecution();
     const turn = this.coordinator.turnId;
@@ -2629,6 +2633,7 @@ export class AgentSession {
       const retryRequest = await this.deriveStartupAutoRetryRequest({
         partial,
         historyTail: historyResult.data,
+        workspaceMetadata,
       });
 
       // Derivation reads metadata. A manual successor may have installed its own retry
@@ -2793,11 +2798,12 @@ export class AgentSession {
     return this.runStartupRecovery();
   }
 
-  async runStartupRecovery(): Promise<void> {
+  async runStartupRecovery(metadata?: WorkspaceMetadata): Promise<void> {
     // TaskService owns child recovery; replaying a stopped child must never restart it.
-    const metadata = await this.getWorkspaceMetadataForRetry();
+    metadata ??= await this.getWorkspaceMetadataForRetry();
     if (!metadata || metadata.parentWorkspaceId != null) return;
-    return this.startupRecovery.run();
+    // Reuse the bulk startup snapshot throughout retry derivation instead of rescanning all workspaces.
+    return this.startupRecovery.run(() => this.scheduleStartupAutoRetryIfNeeded(metadata));
   }
 
   shouldRetainAfterStartupRecovery(): boolean {
@@ -2810,8 +2816,8 @@ export class AgentSession {
     );
   }
 
-  scheduleStartupRecovery(): void {
-    this.runStartupRecovery().catch((error: unknown) => {
+  scheduleStartupRecovery(metadata?: WorkspaceMetadata): void {
+    this.runStartupRecovery(metadata).catch((error: unknown) => {
       log.warn("Failed to schedule startup recovery", {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),

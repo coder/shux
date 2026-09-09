@@ -9246,7 +9246,10 @@ describe("WorkspaceService initialize", () => {
     await workspaceService.initialize();
 
     expect(startStartupRecoverySpy).toHaveBeenCalledTimes(1);
-    expect(startStartupRecoverySpy).toHaveBeenCalledWith("live-ws");
+    expect(startStartupRecoverySpy).toHaveBeenCalledWith(
+      "live-ws",
+      expect.objectContaining({ id: "live-ws" })
+    );
   });
 
   test("swallows startup metadata lookup failures", async () => {
