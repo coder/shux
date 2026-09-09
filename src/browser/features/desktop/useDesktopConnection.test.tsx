@@ -686,6 +686,27 @@ describe("useDesktopConnection control ownership", () => {
     expect(registrations).toHaveLength(1);
   });
 
+  test("a security failure on a reconnect stays terminal through noVNC's follow-up disconnect", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    act(() => {
+      rfb.events.dispatchEvent(
+        new window.CustomEvent("securityfailure", { detail: { status: 1, reason: "expired" } })
+      );
+    });
+    await waitFor(() => expect(view.desktop.state).toBe("error"));
+    // noVNC emits disconnect after the security failure; it must not clear the error or
+    // schedule a reconnect after the pane detached definitively.
+    act(() => {
+      rfb.events.dispatchEvent(new window.CustomEvent("disconnect", { detail: { clean: true } }));
+    });
+    expect(view.desktop.state).toBe("error");
+    expect(view.desktop.reason).toMatch(/security checks: expired/);
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_500));
+    expect(DesktopRfbFixture.instances).toHaveLength(1);
+    expect(view.desktop.state).toBe("error");
+  });
+
   test("bootstrap names the ready registration so the bridge is attributed to it", async () => {
     const view = mountConnection();
     await connect(view);

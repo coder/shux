@@ -684,6 +684,9 @@ export function useDesktopConnection(
             if (generationRef.current !== generation || isDisposedRef.current) {
               return;
             }
+            // noVNC follows a security failure with a disconnect: that failure was terminal (and
+            // already tore this connection down), so it must not turn into a reconnect.
+            if (terminalRef.current) return;
             // A transport drop is not the pane going away: keep the viewer registered while
             // the reconnect backoff runs; the reconnect reuses it once ready. A drop before the
             // first connect is terminal (no retry follows), so the registration is given up.
