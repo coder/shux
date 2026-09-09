@@ -5877,13 +5877,14 @@ export class AgentSession {
     if (!context?.options || !this.isTokenBudgetActive(context.options)) {
       // Token-budget mode was disabled after the flush trigger was persisted or queued: nothing
       // restores or seals the window any more, so end the hidden turn after its single step
-      // and drop whatever intent and paired continuation the disabled mode left behind.
+      // and drop whatever intent the disabled mode left behind. A queued paired "Continue"
+      // stays: without a reset it is an ordinary continuation of the interrupted work, and for
+      // a delegated turn it keeps the notes-only finish from being recorded as the task's
+      // outcome (WorkspaceTurnManager defers while a same-turn continuation is pending).
       if (context?.contextBudgetFlushTurn === true) {
         this.pendingRollover = undefined;
         this.pendingRolloverSnapshot = undefined;
         this.contextBudgetFlushClaimed = false;
-        if (this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY).removedCount > 0)
-          this.emitQueuedMessageChanged();
         return "rollover";
       }
       return "continue";
@@ -5919,12 +5920,13 @@ export class AgentSession {
     if (context.contextBudgetFlushTurn === true) {
       if (this.compactionMonitor.getThreshold() >= 1) {
         // Rollover was disabled while the flush ran: nothing may seal this window, so drop the
-        // stale intent and the paired continuation (mirrors the pre-dispatch degrade path).
+        // stale intent. The paired "Continue" is kept on purpose: with the intent gone it
+        // dispatches as an ordinary continuation of the interrupted work in this window, and a
+        // delegated turn must not record the notes-only flush finish as the task's outcome
+        // (WorkspaceTurnManager defers finalization while a same-turn continuation is pending).
         this.pendingRollover = undefined;
         this.pendingRolloverSnapshot = undefined;
         this.contextBudgetFlushClaimed = false;
-        if (this.messageQueue.removeByDedupeKeyPrefix(CONTEXT_CONTINUE_DEDUPE_KEY).removedCount > 0)
-          this.emitQueuedMessageChanged();
         return "rollover";
       }
       // A flush turn is bounded to one provider step even when the step no longer crosses the
