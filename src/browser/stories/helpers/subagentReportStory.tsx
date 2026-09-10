@@ -99,6 +99,13 @@ export function setupSubagentFailureStory() {
             "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
         },
         {
+          taskId: "6f492837ac",
+          agentType: "exec",
+          errorType: "workspace_turn_incomplete",
+          errorMessage:
+            "Workspace turn incomplete: unknown stop cause; no correlated continuation found.",
+        },
+        {
           taskId: "28a75e1b09",
           agentType: "explore",
           errorType: "process_exit",

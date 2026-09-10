@@ -4802,6 +4802,84 @@ describe("WorkspaceTurnManager", () => {
     }
   );
 
+  test.each(["error", "interrupted"] as const)(
+    "old replacement queue stop preserves newer %s during handle lookup",
+    async (status) => {
+      const { config, parentId, taskService } = await startWorkspaceTurnForTest();
+      const event = intermediateStopEvent(parentId);
+      event.metadata.stopCause = { kind: "queued-input", entryId: "replacement" };
+      const store = (taskService as unknown as { taskHandleStore: TaskHandleStore })
+        .taskHandleStore;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const readHandle = store.getWorkspaceTurn.bind(store);
+      spyOn(store, "getWorkspaceTurn").mockImplementationOnce(async (...args) => {
+        const snapshot = await readHandle(...args);
+        entered.resolve();
+        await release.promise;
+        return snapshot;
+      });
+      const finalizing = finalizeWorkspaceTurnStreamEndForTest(taskService, event);
+      await entered.promise;
+      const error = status === "error" ? "Continuation dispatch failed" : "Continuation canceled";
+      await taskService.settleWorkspaceTurnContinuationFailure(
+        event.workspaceId,
+        workspaceTurnMuxMetadata(parentId),
+        status,
+        error
+      );
+      release.resolve();
+      await finalizing;
+      expect(
+        await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+      ).toMatchObject({ status, error });
+    }
+  );
+
+  test("old queue stop cannot replace a newer terminal message", async () => {
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest();
+    const old = intermediateStopEvent(parentId);
+    old.metadata.stopCause = { kind: "queued-input", entryId: "old-replacement" };
+    old.metadata.historySequence = 10;
+    const newer: StreamEndEvent = {
+      ...old,
+      messageId: "newer-failure",
+      metadata: {
+        ...old.metadata,
+        stopCause: undefined,
+        finishReason: "length",
+        historySequence: 20,
+      },
+    };
+    await finalizeWorkspaceTurnStreamEndForTest(taskService, newer);
+    await finalizeWorkspaceTurnStreamEndForTest(taskService, old);
+    expect(
+      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+    ).toMatchObject({
+      status: "error",
+      messageId: newer.messageId,
+    });
+  });
+
+  test("unreadable history does not keep a deferred continuation active forever", async () => {
+    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+    const event = intermediateStopEvent(parentId);
+    await taskService.markWorkspaceTurnStreamEndDeferred(event);
+    const record = await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle");
+    assert(record);
+    spyOn(historyService, "getHistoryFromLatestBoundary").mockResolvedValueOnce(
+      Err("History unavailable")
+    );
+    await (
+      taskService as unknown as {
+        settleStaleWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void>;
+      }
+    ).settleStaleWorkspaceTurn(record);
+    expect(
+      (await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle"))?.status
+    ).toBe("interrupted");
+  });
+
   test("finalizing continuation remains active until its history commit", async () => {
     const { config, parentId, taskService } = await startWorkspaceTurnForTest();
     const event = intermediateStopEvent(parentId);
@@ -4863,7 +4941,7 @@ describe("WorkspaceTurnManager", () => {
   });
 
   test("workspace-turn deferred stream-end does not finalize the handle", async () => {
-    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest();
     const event: StreamEndEvent = {
       type: "stream-end",
       workspaceId: "childworkspace",
@@ -4884,14 +4962,16 @@ describe("WorkspaceTurnManager", () => {
     await internal.markWorkspaceTurnStreamEndDeferred(event);
     expect(await internal.finalizeWorkspaceTurnFromStreamEnd(event)).toBe(true);
 
-    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+    expect(
+      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+    ).toMatchObject({
       status: "running",
       deferredMessageIds: ["msg_deferred"],
     });
   });
 
   test("a final-flush stream-end is deferred even without a queued continuation", async () => {
-    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest();
     const event: StreamEndEvent = {
       type: "stream-end",
       workspaceId: "childworkspace",
@@ -4911,7 +4991,9 @@ describe("WorkspaceTurnManager", () => {
     // Nothing is queued (e.g. the user cleared the queue mid-flush): the housekeeping finish still
     // must not settle the delegated task.
     expect(await finalizeWorkspaceTurnStreamEndForTest(taskService, event)).toBe(true);
-    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+    expect(
+      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+    ).toMatchObject({
       status: "running",
       deferredMessageIds: ["msg_flush"],
     });

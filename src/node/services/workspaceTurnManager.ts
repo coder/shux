@@ -2280,6 +2280,10 @@ export class WorkspaceTurnManager {
         // actually changes the outcome (duplicate stream-end replays must stay idempotent).
         const resettleStaleTerminal =
           params.allowTerminalResettle === true &&
+          (params.next.finalMessage?.metadata?.finishReason !== "tool-calls" ||
+            (current.status === params.record.status &&
+              current.messageId === params.record.messageId &&
+              current.updatedAt === params.record.updatedAt)) &&
           this.isTerminalWorkspaceTurnStatus(current.status) &&
           current.status !== "completed" &&
           isSelfHealEligibleSettledWorkspaceTurn(current) &&
@@ -4029,7 +4033,19 @@ export class WorkspaceTurnManager {
     const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
     const hasRuntimeActivity =
       this.aiService.isStreaming(record.workspaceId) ||
-      this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId);
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId) ||
+      this.workspaceService.hasPendingBashMonitorWakeContinuation(record.workspaceId) ||
+      this.hasSameTurnContinuation(
+        {
+          workspaceId: record.workspaceId,
+          messageId: record.deferredMessageIds?.at(-1) ?? record.messageId ?? "",
+        },
+        {
+          taskHandleId: record.handleId,
+          ownerWorkspaceId: record.ownerWorkspaceId,
+          turnId: record.turnId,
+        }
+      );
     if (hasRuntimeActivity) {
       return true;
     }
@@ -4068,18 +4084,9 @@ export class WorkspaceTurnManager {
       return;
     }
 
-    // Same-process deferred stream-ends can be observed before the final assistant message is
-    // readable from history. Keep the handle alive in that narrow window; after restart the active
-    // map is empty, so unrecoverable deferred handles still settle terminally instead of leaking.
-    const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
-    if (
-      (record.deferredMessageIds?.length ?? 0) > 0 &&
-      active?.handleId === record.handleId &&
-      active.ownerWorkspaceId === record.ownerWorkspaceId
-    ) {
-      return;
-    }
-
+    // Recovery reads can overlap a continuation start. Check live work again before the fallback.
+    if (await this.isLiveWorkspaceTurn(record)) return;
+    // No runtime work remains. A missing history row must not keep a deferred handle active forever.
     const next: WorkspaceTurnTaskHandleRecord = {
       ...record,
       status: "interrupted",
@@ -4624,7 +4631,7 @@ export class WorkspaceTurnManager {
    * Pending entries must carry the same correlation metadata as the ended stream.
    */
   private hasSameTurnContinuation(
-    event: StreamEndEvent,
+    event: Pick<StreamEndEvent, "workspaceId" | "messageId">,
     correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string }
   ): boolean {
     if (
@@ -4899,8 +4906,11 @@ export class WorkspaceTurnManager {
       // An intermediate stop cannot replace a concrete continuation failure.
       allowTerminalResettle:
         event.metadata.finishReason !== "tool-calls" ||
-        next.status === "completed" ||
-        supersedeEvidence != null,
+        (record.messageId === event.messageId &&
+          record.finalMessage?.metadata?.finishReason === "tool-calls") ||
+        (typeof event.metadata.historySequence === "number" &&
+          typeof record.finalMessage?.metadata?.historySequence === "number" &&
+          event.metadata.historySequence > record.finalMessage.metadata.historySequence),
       disposableOwnershipTransferred,
     });
     return true;
