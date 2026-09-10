@@ -1,4 +1,5 @@
 import {
+  findMissingProperties,
   validateJsonSchemaSubset,
   validateJsonSchemaSubsetSchema,
 } from "@/common/utils/jsonSchemaSubset";
@@ -196,87 +197,109 @@ function getAllOfBranches(schema: Record<string, unknown>): unknown[] {
   return Array.isArray(schema.allOf) ? (schema.allOf as unknown[]) : [];
 }
 
-function withRequired(required: ReadonlySet<string>, schema: unknown): ReadonlySet<string> {
-  return isRecord(schema) ? new Set([...required, ...getRequiredProperties(schema)]) : required;
-}
-
 /**
  * Restore the properties and items this schema node declares directly
- * (including through allOf), removing placeholders on properties that are not
- * in `required`. Union branches are the caller's concern (see restoreNode).
+ * (including through allOf), then remove the placeholders that `context` does
+ * not require for this instance. `context` is the schema in force at this
+ * instance level: the node itself, conjoined with the union branches chosen on
+ * the way in (see restoreNode). Union branches are the caller's concern.
  */
 function restoreStructure(
   schema: Record<string, unknown>,
   value: unknown,
-  required: ReadonlySet<string>,
+  context: unknown,
   options: OmissionPlaceholderOptions
 ): unknown {
   if (Array.isArray(value)) {
     const itemSchema = schema.items;
     let restored: unknown = Array.isArray(itemSchema)
-      ? value.map((item, index) => restoreNode(itemSchema[index], item, new Set(), options))
-      : value.map((item) => restoreNode(itemSchema, item, new Set(), options));
+      ? value.map((item, index) => restoreNode(itemSchema[index], item, itemSchema[index], options))
+      : value.map((item) => restoreNode(itemSchema, item, itemSchema, options));
     for (const subSchema of getAllOfBranches(schema)) {
-      restored = restoreNode(subSchema, restored, required, options);
+      restored = restoreNode(subSchema, restored, context, options);
     }
     return restored;
   }
   if (!isRecord(value)) {
     return value;
   }
-  let restored: unknown = { ...value };
+  const restored: Record<string, unknown> = { ...value };
+  // Which properties are required depends on the instance (if/then,
+  // dependencies), so the validator decides: remove every placeholder the
+  // schema does not list as required, then put back each one the validator
+  // reports missing. Putting one back can activate another requirement, so
+  // repeat until stable; every pass restores at least one, so this ends. When
+  // the schema is outside the validator's subset, the `required` list is the
+  // only evidence.
+  const alwaysRequired = isRecord(context) ? getRequiredProperties(context) : new Set<string>();
+  const removed: string[] = [];
   if (isRecord(schema.properties)) {
     for (const [propertyName, propertySchema] of Object.entries(schema.properties)) {
-      const record = restored as Record<string, unknown>;
-      if (!(propertyName in record)) {
+      if (!(propertyName in restored)) {
         continue;
       }
+      // Children first, so conditions at this level see restored values.
+      restored[propertyName] = restoreNode(
+        propertySchema,
+        restored[propertyName],
+        propertySchema,
+        options
+      );
       if (
-        !required.has(propertyName) &&
-        isOmissionPlaceholder(propertySchema, record[propertyName], options)
+        !alwaysRequired.has(propertyName) &&
+        isOmissionPlaceholder(propertySchema, restored[propertyName], options)
       ) {
-        delete record[propertyName];
-        continue;
+        delete restored[propertyName];
+        removed.push(propertyName);
       }
-      record[propertyName] = restoreNode(propertySchema, record[propertyName], new Set(), options);
     }
   }
-  for (const subSchema of getAllOfBranches(schema)) {
-    restored = restoreNode(subSchema, restored, required, options);
+  while (removed.length > 0) {
+    const missing = findMissingProperties(context, restored);
+    const putBack = removed.filter((propertyName) => missing.has(propertyName));
+    if (putBack.length === 0) {
+      break;
+    }
+    for (const propertyName of putBack) {
+      restored[propertyName] = value[propertyName];
+      removed.splice(removed.indexOf(propertyName), 1);
+    }
   }
-  return restored;
+  let result: unknown = restored;
+  for (const subSchema of getAllOfBranches(schema)) {
+    result = restoreNode(subSchema, result, context, options);
+  }
+  return result;
 }
 
 function restoreNode(
   schema: unknown,
   value: unknown,
-  inheritedRequired: ReadonlySet<string>,
+  context: unknown,
   options: OmissionPlaceholderOptions
 ): unknown {
   if (!isRecord(schema)) {
     return value;
   }
-  const required = withRequired(inheritedRequired, schema);
   const branches = getUnionBranches(schema);
   if (branches.length === 0) {
-    return restoreStructure(schema, value, required, options);
+    return restoreStructure(schema, value, context, options);
   }
 
-  // Which properties are required depends on the anyOf/oneOf branch that
-  // applies, and a branch that accepts the raw value gives that value meaning
-  // (an explicit null a nullable branch allows, a "" a branch requires). So try
-  // the raw-accepting branches first, and for each candidate branch treat its
-  // required properties as required while removing placeholders at this level,
-  // then restore the branch's own structure. The first branch that accepts its
-  // candidate wins.
+  // A union requires nothing until a branch is chosen, and a branch that
+  // accepts the raw value gives that value meaning (an explicit null a nullable
+  // branch allows, a "" a branch requires). So try the raw-accepting branches
+  // first; for each candidate branch, conjoin it with the context so its
+  // requirements apply while restoring this level and the branch's own
+  // structure. The first branch that accepts its candidate wins.
   const rawAccepting = branches.filter((branch) => schemaAcceptsValue(branch, value));
   const ordered = [...rawAccepting, ...branches.filter((branch) => !rawAccepting.includes(branch))];
   for (const branch of ordered) {
-    const branchRequired = withRequired(required, branch);
+    const branchContext = { allOf: [context, branch] };
     const candidate = restoreNode(
       branch,
-      restoreStructure(schema, value, branchRequired, options),
-      branchRequired,
+      restoreStructure(schema, value, branchContext, options),
+      branchContext,
       options
     );
     if (schemaAcceptsValue(branch, candidate)) {
@@ -285,7 +308,7 @@ function restoreNode(
   }
   // No candidate satisfies its branch. Never turn a valid payload into an
   // invalid one: keep a raw value some branch accepted, else strip best-effort.
-  return rawAccepting.length > 0 ? value : restoreStructure(schema, value, required, options);
+  return rawAccepting.length > 0 ? value : restoreStructure(schema, value, context, options);
 }
 
 /**
@@ -298,5 +321,5 @@ export function stripOmissionPlaceholders(
   value: unknown,
   options: OmissionPlaceholderOptions
 ): unknown {
-  return restoreNode(schema, value, new Set(), options);
+  return restoreNode(schema, value, schema, options);
 }

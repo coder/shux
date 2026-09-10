@@ -64,44 +64,43 @@ function isBinaryPart(item: MCPContent): item is MCPBinaryContent {
   );
 }
 
+/** The server's own words in a content part; empty for binary parts. */
+function readableText(item: MCPContent): string {
+  if (item.type === "text") {
+    return item.text;
+  }
+  if (item.type === "resource" && typeof item.resource?.blob !== "string") {
+    return item.resource.text ?? item.resource.uri;
+  }
+  return "";
+}
+
 /**
  * Turn an `isError` result into the message of the thrown tool error. An error
- * result has the wire shape of a successful one, so its text takes the same
- * route as a success (shared text budget, structuredContent guard, total
- * backstop) before it is projected to a string. Binary parts cannot ride in an
- * error message, so they are set aside and described instead. Priority: the
- * server's own words; else binary descriptions plus the structured or legacy
- * details; else the whole bounded result.
+ * result has the wire shape of a successful one, so it takes the same route as
+ * a success (shared text budget, structuredContent guard, total backstop)
+ * before it is projected to a string. Binary parts cannot ride in an error
+ * message, so each becomes a one-line description first and is budgeted like
+ * any other text. structuredContent usually duplicates the server's words, so
+ * it is added only when the server said nothing readable; with nothing else to
+ * show, the whole bounded result is the message.
  */
 export function describeMCPErrorResult(result: MCPCallToolResult): string {
   const content = result.content ?? [];
   // Text-only input keeps the MCP wire shape through transformMCPResult.
   const bounded = transformMCPResult({
     ...result,
-    content: content.filter((item) => !isBinaryPart(item)),
+    content: content.map((item) =>
+      isBinaryPart(item) ? { type: "text" as const, text: describeBinaryErrorPart(item) } : item
+    ),
   }) as MCPCallToolResult;
 
-  const words = (bounded.content ?? [])
-    .flatMap((item) => {
-      if (item.type === "text") {
-        return item.text;
-      }
-      if (item.type === "resource") {
-        return item.resource.text ?? item.resource.uri;
-      }
-      return [];
-    })
-    .filter((text) => text.trim().length > 0);
-  if (words.length > 0) {
-    return words.join("\n");
-  }
-
-  const details = content.filter(isBinaryPart).map(describeBinaryErrorPart);
+  const lines = (bounded.content ?? []).map(readableText).filter((text) => text.trim().length > 0);
   const structured = bounded.structuredContent ?? bounded.toolResult;
-  if (structured !== undefined) {
-    details.push(stringifyMCPErrorValue(structured));
+  if (structured !== undefined && !content.some((item) => readableText(item).trim().length > 0)) {
+    lines.push(stringifyMCPErrorValue(structured));
   }
-  return details.length > 0 ? details.join("\n") : stringifyMCPErrorValue(bounded);
+  return lines.length > 0 ? lines.join("\n") : stringifyMCPErrorValue(bounded);
 }
 
 function stringifyMCPErrorValue(value: unknown): string {

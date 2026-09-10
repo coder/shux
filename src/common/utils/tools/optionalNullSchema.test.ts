@@ -393,4 +393,50 @@ describe("optional null JSON Schema contract", () => {
       expect(restoreMcp(source, { value: null })).toEqual({ value: null });
     }
   );
+
+  test("keeps a placeholder that a satisfied condition requires for this instance", () => {
+    const source = {
+      type: "object",
+      properties: {
+        filter: {
+          type: "object",
+          properties: { mode: { type: "string" }, query: { type: "string" } },
+          if: { properties: { mode: { const: "search" } }, required: ["mode"] },
+          then: { required: ["query"] },
+        },
+      },
+    };
+
+    // `query` is only required when mode is "search"; the model's "" is then a
+    // real (empty) query, not an omission.
+    expect(restoreMcp(source, { filter: { mode: "search", query: "" } })).toEqual({
+      filter: { mode: "search", query: "" },
+    });
+    expect(restoreMcp(source, { filter: { mode: "recent", query: "" } })).toEqual({
+      filter: { mode: "recent" },
+    });
+  });
+
+  test("keeps placeholders that property dependencies require, chained", () => {
+    const source = {
+      type: "object",
+      properties: { a: { type: "string" }, b: { type: "string" }, c: { type: "string" } },
+      dependencies: { a: ["b"], b: ["c"] },
+    };
+
+    // Putting `b` back activates the requirement on `c`.
+    expect(restoreMcp(source, { a: "x", b: "", c: "" })).toEqual({ a: "x", b: "", c: "" });
+    expect(restoreMcp(source, { b: "", c: "" })).toEqual({});
+  });
+
+  test("falls back to the required list when the schema is outside the validator subset", () => {
+    const source = {
+      type: "object",
+      $defs: { text: { type: "string" } },
+      properties: { title: { $ref: "#/$defs/text" }, note: { $ref: "#/$defs/text" } },
+      required: ["title"],
+    };
+
+    expect(restoreMcp(source, { title: "", note: "" })).toEqual({ title: "" });
+  });
 });

@@ -50,6 +50,25 @@ describe("describeMCPErrorResult", () => {
     expect(description).toContain("[MCP tool result text truncated:");
   });
 
+  it("bounds binary part descriptions with the same shared budget", () => {
+    const description = describeMCPErrorResult({
+      isError: true,
+      content: Array.from({ length: 4 }, () => ({
+        type: "image" as const,
+        data: "abc",
+        mimeType: "image/" + "m".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES),
+      })),
+      structuredContent: { code: "TOO_MANY" },
+    });
+
+    expect(Buffer.byteLength(description, "utf8")).toBeLessThanOrEqual(
+      MCP_TOOL_RESULT_MAX_TOTAL_BYTES
+    );
+    expect(description).toStartWith("[Image omitted from MCP error text:");
+    expect(description).toContain("content part(s) omitted:");
+    expect(description).toEndWith(JSON.stringify({ code: "TOO_MANY" }));
+  });
+
   it("bounds many error text parts with one shared budget", () => {
     const partCount = 64;
     const description = describeMCPErrorResult({

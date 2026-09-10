@@ -87,6 +87,35 @@ export function validateJsonSchemaSubset(
   return { success: false, errors: normalizeAjvErrors(validate.errors ?? [], value, schema) };
 }
 
+/**
+ * Property names the validator reports missing from `value` at the top level:
+ * `required`, `dependencies`, and whatever a satisfied `if`/`then`/`else` or
+ * `allOf` activates for this instance. Requirements inside `anyOf`/`oneOf`
+ * are excluded because a union requires nothing until a branch is chosen; a
+ * caller that has chosen one conjoins it with the schema. Empty when the
+ * schema is outside the supported subset, so absence proves nothing.
+ */
+export function findMissingProperties(schema: unknown, value: unknown): Set<string> {
+  const missing = new Set<string>();
+  if (!validateJsonSchemaSubsetSchema(schema).success) {
+    return missing;
+  }
+  const validate = compileSchema(schema);
+  if (validate(value)) {
+    return missing;
+  }
+  for (const error of validate.errors ?? []) {
+    if (
+      error.instancePath === "" &&
+      typeof error.params.missingProperty === "string" &&
+      !/\/(?:anyOf|oneOf)\//u.test(error.schemaPath)
+    ) {
+      missing.add(error.params.missingProperty);
+    }
+  }
+  return missing;
+}
+
 function compileSchema(schema: unknown): ValidateFunction {
   const key = JSON.stringify(schema);
   const cached = validatorCache.get(key);
