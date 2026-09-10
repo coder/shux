@@ -49,14 +49,28 @@ describe("describeMCPErrorResult", () => {
       JSON.stringify({ code: "NOT_FOUND", message: "Issue CODAGT-1 does not exist" })
     );
 
-    // Readable content parts still win over structured details.
+    // Non-blank readable content parts still win over structured details; blank
+    // ones do not shadow them.
     expect(
       describeMCPErrorResult({
         isError: true,
-        content: [{ type: "text", text: "plain failure" }],
+        content: [
+          { type: "text", text: "" },
+          { type: "text", text: "plain failure" },
+        ],
         structuredContent: { code: "IGNORED" },
       })
     ).toBe("plain failure");
+    expect(
+      describeMCPErrorResult({
+        isError: true,
+        content: [
+          { type: "text", text: "   " },
+          { type: "resource", resource: { uri: "linear://issue/1", text: "" } },
+        ],
+        structuredContent: { code: "NOT_FOUND" },
+      })
+    ).toBe(JSON.stringify({ code: "NOT_FOUND" }));
 
     // With nothing else to show, the whole result beats a bare "[]".
     expect(describeMCPErrorResult({ isError: true, content: [] })).toBe(

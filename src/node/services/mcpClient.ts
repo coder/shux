@@ -235,7 +235,11 @@ function createMCPSourceSchema(inputSchema: Record<string, unknown> | undefined)
 }
 
 export function createMCPToolContract(inputSchema: Record<string, unknown> | undefined) {
-  const contract = createOptionalNullSchemaContract(createMCPSourceSchema(inputSchema));
+  // Strict REST-backed servers reject present-but-empty arguments (#2887), so
+  // an optional `""` is an omission here.
+  const contract = createOptionalNullSchemaContract(createMCPSourceSchema(inputSchema), {
+    emptyStringIsOmission: true,
+  });
   return {
     strict: contract.strict,
     inputSchema: jsonSchema(contract.modelSchema as JSONSchema7, {

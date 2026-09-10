@@ -60,15 +60,18 @@ export function isMCPErrorResult(value: unknown): value is MCPCallToolResult & {
  */
 export function describeMCPErrorResult(result: MCPCallToolResult): string {
   const content = result.content ?? [];
-  const readableParts = content.flatMap((item) => {
-    if (item.type === "text") {
-      return item.text;
-    }
-    if (item.type === "resource") {
-      return item.resource.text ?? item.resource.uri;
-    }
-    return [];
-  });
+  // A blank text part explains nothing, so it must not shadow structured details.
+  const readableParts = content
+    .flatMap((item) => {
+      if (item.type === "text") {
+        return item.text;
+      }
+      if (item.type === "resource") {
+        return item.resource.text ?? item.resource.uri;
+      }
+      return [];
+    })
+    .filter((part) => part.trim().length > 0);
   const binaryParts = content.flatMap((item) => {
     if (item.type === "image") {
       return describeBinaryErrorPart("Image", item.data, item.mimeType);

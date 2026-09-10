@@ -46,7 +46,10 @@ import {
 export type { TaskKind } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
+import {
+  STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN,
+  WORKFLOW_REPORT_OMISSION_PLACEHOLDERS,
+} from "@/common/constants/workflowReports";
 import {
   SUBAGENT_FAILURE_ENVELOPE_TAG,
   parseSubagentReportEnvelope,
@@ -328,7 +331,8 @@ function normalizeWorkflowAgentReportArgsForWorkflowTask(
     ...reportArgs,
     structuredOutput: stripOmissionPlaceholders(
       workflowTask.outputSchema,
-      reportArgs.structuredOutput
+      reportArgs.structuredOutput,
+      WORKFLOW_REPORT_OMISSION_PLACEHOLDERS
     ),
   };
 }
@@ -359,7 +363,8 @@ function validateWorkflowAgentReportStructuredOutput(params: {
 
   const structuredOutput = stripOmissionPlaceholders(
     workflowTask.outputSchema,
-    params.reportArgs.structuredOutput
+    params.reportArgs.structuredOutput,
+    WORKFLOW_REPORT_OMISSION_PLACEHOLDERS
   );
   const validation = validateJsonSchemaSubset(workflowTask.outputSchema, structuredOutput);
   if (validation.success) {

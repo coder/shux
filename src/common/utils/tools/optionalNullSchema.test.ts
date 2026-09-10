@@ -4,7 +4,14 @@ import {
   createOptionalNullSchemaContract,
   stripOmissionPlaceholders,
   widenOptionalPropertiesToNullable,
+  type OmissionPlaceholderOptions,
 } from "./optionalNullSchema";
+
+// MCP arguments treat an optional "" as an omission; workflow reports do not.
+const MCP: OmissionPlaceholderOptions = { emptyStringIsOmission: true };
+const WORKFLOW: OmissionPlaceholderOptions = { emptyStringIsOmission: false };
+const restoreMcp = (schema: unknown, value: unknown) =>
+  stripOmissionPlaceholders(schema, value, MCP);
 
 describe("optional null JSON Schema contract", () => {
   test("round trips a Linear-shaped optional argument schema", () => {
@@ -35,7 +42,7 @@ describe("optional null JSON Schema contract", () => {
     });
     expect(source.properties.cursor).toEqual({ type: "string" });
     expect(
-      stripOmissionPlaceholders(source, {
+      restoreMcp(source, {
         issueId: "CODAGT-709",
         cursor: "",
         statusUpdateType: null,
@@ -65,7 +72,7 @@ describe("optional null JSON Schema contract", () => {
     // A required "" is never dropped; the server stays the arbiter of its
     // validity. null and [] pass through where the source accepts them.
     expect(
-      stripOmissionPlaceholders(source, {
+      restoreMcp(source, {
         project_id: "",
         assignee_id: "",
         search: "",
@@ -76,8 +83,34 @@ describe("optional null JSON Schema contract", () => {
     ).toEqual({ project_id: "", labels: [], milestone: null, nested: { id: "" } });
 
     const untouched = { project_id: "42332", search: "bug" };
-    expect(stripOmissionPlaceholders(source, untouched)).toEqual(untouched);
-    expect(stripOmissionPlaceholders(source, undefined)).toBeUndefined();
+    expect(restoreMcp(source, untouched)).toEqual(untouched);
+    expect(restoreMcp(source, undefined)).toBeUndefined();
+  });
+
+  test("keeps optional empty strings for workflow reports while still dropping rejected nulls", () => {
+    const source = {
+      type: "object",
+      required: ["summary"],
+      properties: {
+        summary: { type: "string" },
+        detail: { type: "string" },
+        score: { type: "number" },
+        nested: { type: "object", properties: { note: { type: "string" } } },
+      },
+    };
+    const payload = { summary: "done", detail: "", score: null, nested: { note: "" } };
+
+    // A workflow script may read `detail === ""` back, so it stays; the null the
+    // schema rejects is still a placeholder.
+    expect(stripOmissionPlaceholders(source, payload, WORKFLOW)).toEqual({
+      summary: "done",
+      detail: "",
+      nested: { note: "" },
+    });
+    expect(stripOmissionPlaceholders(source, payload, MCP)).toEqual({
+      summary: "done",
+      nested: {},
+    });
   });
 
   test("preserves optional-property annotations on the widened schema", () => {
@@ -135,7 +168,7 @@ describe("optional null JSON Schema contract", () => {
         },
       },
     });
-    expect(stripOmissionPlaceholders(source, { values: [{ label: null }] })).toEqual({
+    expect(restoreMcp(source, { values: [{ label: null }] })).toEqual({
       values: [{}],
     });
   });
@@ -157,7 +190,40 @@ describe("optional null JSON Schema contract", () => {
       ],
     };
 
-    expect(stripOmissionPlaceholders(source, { value: null })).toEqual({ value: null });
+    expect(restoreMcp(source, { value: null })).toEqual({ value: null });
+  });
+
+  test("restores optional placeholders inside the union branch that accepts the raw value", () => {
+    const source = {
+      anyOf: [
+        {
+          type: "object",
+          required: ["kind"],
+          properties: {
+            kind: { const: "ok" },
+            query: { type: "string" },
+            note: { type: "string" },
+          },
+        },
+        {
+          type: "object",
+          required: ["kind", "message"],
+          properties: { kind: { const: "error" }, message: { type: "string" } },
+        },
+      ],
+    };
+
+    // The "ok" branch accepts the raw object, but its optional `query` still
+    // holds a placeholder that would reach the server.
+    expect(restoreMcp(source, { kind: "ok", query: "", note: "kept" })).toEqual({
+      kind: "ok",
+      note: "kept",
+    });
+    // A required property inside the accepting branch is never a placeholder.
+    expect(restoreMcp(source, { kind: "error", message: "" })).toEqual({
+      kind: "error",
+      message: "",
+    });
   });
 
   test.each(["$ref", "$dynamicRef", "$recursiveRef"])(
@@ -168,7 +234,7 @@ describe("optional null JSON Schema contract", () => {
         properties: { value: { [keyword]: "#/$defs/value" } },
         $defs: { value: { type: "string" } },
       };
-      const contract = createOptionalNullSchemaContract(source);
+      const contract = createOptionalNullSchemaContract(source, MCP);
 
       expect(contract.strict).toBe(false);
       expect(contract.modelSchema).toEqual(source);
@@ -192,7 +258,7 @@ describe("optional null JSON Schema contract", () => {
         impossible: { anyOf: [false, { type: "null" }] },
       },
     });
-    expect(stripOmissionPlaceholders(source, { anything: null, impossible: null })).toEqual({
+    expect(restoreMcp(source, { anything: null, impossible: null })).toEqual({
       anything: null,
     });
   });
@@ -204,7 +270,7 @@ describe("optional null JSON Schema contract", () => {
       anyOf: [{ type: "object" }],
     };
 
-    expect(stripOmissionPlaceholders(source, { value: null })).toEqual({});
+    expect(restoreMcp(source, { value: null })).toEqual({});
   });
 
   test("preserves an empty string the selected union branch requires", () => {
@@ -224,16 +290,17 @@ describe("optional null JSON Schema contract", () => {
 
     // Root marks `message` optional, but the "error" branch requires it, so
     // `""` is a value there and not an omission placeholder.
-    expect(stripOmissionPlaceholders(source, { kind: "error", message: "", detail: "" })).toEqual({
+    expect(restoreMcp(source, { kind: "error", message: "", detail: "" })).toEqual({
       kind: "error",
       message: "",
     });
     // The "ok" branch does not require it, so the placeholder still goes.
-    expect(stripOmissionPlaceholders(source, { kind: "ok", message: "" })).toEqual({ kind: "ok" });
+    expect(restoreMcp(source, { kind: "ok", message: "" })).toEqual({ kind: "ok" });
     // Null placeholders on other properties do not block branch selection.
-    expect(stripOmissionPlaceholders(source, { kind: "error", message: "", detail: null })).toEqual(
-      { kind: "error", message: "" }
-    );
+    expect(restoreMcp(source, { kind: "error", message: "", detail: null })).toEqual({
+      kind: "error",
+      message: "",
+    });
   });
 
   test.each(["allOf", "anyOf"] as const)(
@@ -246,7 +313,7 @@ describe("optional null JSON Schema contract", () => {
       };
 
       expect(widenOptionalPropertiesToNullable(source)).toEqual(source);
-      expect(stripOmissionPlaceholders(source, { value: null })).toEqual({ value: null });
+      expect(restoreMcp(source, { value: null })).toEqual({ value: null });
     }
   );
 });

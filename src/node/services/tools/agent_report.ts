@@ -10,6 +10,7 @@ import {
   createOptionalNullSchemaContract,
   type OptionalNullSchemaContract,
 } from "@/common/utils/tools/optionalNullSchema";
+import { WORKFLOW_REPORT_OMISSION_PLACEHOLDERS } from "@/common/constants/workflowReports";
 import { sanitizeWorkflowAgentReportSchemaForOpenAI } from "@/common/utils/tools/schemaSanitizer";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import {
@@ -78,7 +79,10 @@ function getWorkflowOutputContract(config: ToolConfiguration): WorkflowOutputCon
   });
   if (schemaValidation.success) {
     const hostSchema = outputSchema as Record<string, unknown>;
-    return { outputSchema: hostSchema, contract: createOptionalNullSchemaContract(hostSchema) };
+    return {
+      outputSchema: hostSchema,
+      contract: createOptionalNullSchemaContract(hostSchema, WORKFLOW_REPORT_OMISSION_PLACEHOLDERS),
+    };
   }
   if (config.allowLegacyInvalidWorkflowAgentOutputSchema === true) {
     return undefined;

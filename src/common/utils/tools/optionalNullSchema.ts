@@ -155,8 +155,20 @@ export interface OptionalNullSchemaContract {
   restore: (value: unknown) => unknown;
 }
 
-export function createOptionalNullSchemaContract(schema: unknown): OptionalNullSchemaContract {
-  const restore = (value: unknown) => stripOmissionPlaceholders(schema, value);
+/**
+ * Which values on an optional property count as "the model meant to omit this".
+ * `null` where the source schema rejects it always does. `""` depends on who
+ * consumes the payload, so each caller decides (see isOmissionPlaceholder).
+ */
+export interface OmissionPlaceholderOptions {
+  emptyStringIsOmission: boolean;
+}
+
+export function createOptionalNullSchemaContract(
+  schema: unknown,
+  options: OmissionPlaceholderOptions
+): OptionalNullSchemaContract {
+  const restore = (value: unknown) => stripOmissionPlaceholders(schema, value, options);
   if (containsReferenceKeyword(schema)) {
     // Reference resolution is incomplete here, so leave the model schema alone
     // and let the provider decode without strict mode. `restore` stays: it only
@@ -181,15 +193,21 @@ export function widenOptionalPropertiesToNullable(schema: unknown): unknown {
  * - `null`, because the model contract widens optional properties to nullable
  *   and strict-mode providers make the model emit every property; and
  * - `""`, because models habitually fill optional fields with an empty string
- *   instead of omitting them, and strict REST-backed MCP servers reject
- *   present-but-empty arguments (#2887).
+ *   instead of omitting them. Strict REST-backed MCP servers reject
+ *   present-but-empty arguments (#2887), so MCP callers opt in. A workflow
+ *   script reading its own report may give `""` meaning, so workflow callers
+ *   do not.
  * A `null` the source schema accepts is not a placeholder: the server may give it
  * meaning ("clear this field"). Callers never treat required properties as
  * placeholders for the same reason.
  */
-function isOmissionPlaceholder(propertySchema: unknown, value: unknown): boolean {
+function isOmissionPlaceholder(
+  propertySchema: unknown,
+  value: unknown,
+  options: OmissionPlaceholderOptions
+): boolean {
   if (value === "") {
-    return true;
+    return options.emptyStringIsOmission;
   }
   return value === null && getNullability(propertySchema) === "rejects";
 }
@@ -197,7 +215,8 @@ function isOmissionPlaceholder(propertySchema: unknown, value: unknown): boolean
 function stripProperties(
   value: Record<string, unknown>,
   properties: Record<string, unknown>,
-  required: ReadonlySet<string>
+  required: ReadonlySet<string>,
+  options: OmissionPlaceholderOptions
 ): Record<string, unknown> {
   const stripped = { ...value };
   for (const [propertyName, propertySchema] of Object.entries(properties)) {
@@ -206,12 +225,12 @@ function stripProperties(
     }
     if (
       !required.has(propertyName) &&
-      isOmissionPlaceholder(propertySchema, stripped[propertyName])
+      isOmissionPlaceholder(propertySchema, stripped[propertyName], options)
     ) {
       delete stripped[propertyName];
       continue;
     }
-    stripped[propertyName] = stripOmissionPlaceholders(propertySchema, stripped[propertyName]);
+    stripped[propertyName] = stripNode(propertySchema, stripped[propertyName], new Set(), options);
   }
   return stripped;
 }
@@ -229,7 +248,8 @@ function schemaAcceptsValue(schema: unknown, value: unknown): boolean {
 function stripMatchingUnionBranch(
   schema: Record<string, unknown>,
   value: unknown,
-  inheritedRequired: ReadonlySet<string>
+  inheritedRequired: ReadonlySet<string>,
+  options: OmissionPlaceholderOptions
 ): unknown {
   for (const keyword of ["anyOf", "oneOf"] as const) {
     const branches = schema[keyword];
@@ -238,14 +258,17 @@ function stripMatchingUnionBranch(
     }
     // A branch that accepts the raw value gives that value meaning (for example
     // a nullable property another branch declares non-nullable), so prefer it
-    // over a branch that only accepts the stripped value.
+    // over a branch that only accepts the stripped value. The branch's own
+    // optional descendants still hold placeholders, so restore those too and
+    // keep the raw value only if restoring breaks the match.
     for (const branch of branches) {
       if (schemaAcceptsValue(branch, value)) {
-        return value;
+        const restored = stripNode(branch, value, inheritedRequired, options);
+        return schemaAcceptsValue(branch, restored) ? restored : value;
       }
     }
     for (const branch of branches) {
-      const stripped = stripNode(branch, value, inheritedRequired);
+      const stripped = stripNode(branch, value, inheritedRequired, options);
       if (schemaAcceptsValue(branch, stripped)) {
         return stripped;
       }
@@ -257,7 +280,8 @@ function stripMatchingUnionBranch(
 function stripNode(
   schema: unknown,
   value: unknown,
-  inheritedRequired: ReadonlySet<string>
+  inheritedRequired: ReadonlySet<string>,
+  options: OmissionPlaceholderOptions
 ): unknown {
   if (!isRecord(schema)) {
     return value;
@@ -267,16 +291,16 @@ function stripNode(
   if (Array.isArray(value)) {
     const itemSchema = schema.items;
     const stripped = Array.isArray(itemSchema)
-      ? value.map((item, index) => stripNode(itemSchema[index], item, new Set()))
-      : value.map((item) => stripNode(itemSchema, item, new Set()));
-    return stripMatchingUnionBranch(schema, stripped, required) ?? stripped;
+      ? value.map((item, index) => stripNode(itemSchema[index], item, new Set(), options))
+      : value.map((item) => stripNode(itemSchema, item, new Set(), options));
+    return stripMatchingUnionBranch(schema, stripped, required, options) ?? stripped;
   }
   if (!isRecord(value)) {
     return value;
   }
 
-  const stripped = stripObjectNode(schema, value, required);
-  const matched = stripMatchingUnionBranch(schema, stripped, required);
+  const stripped = stripObjectNode(schema, value, required, options);
+  const matched = stripMatchingUnionBranch(schema, stripped, required, options);
   if (matched !== null) {
     return matched;
   }
@@ -292,8 +316,9 @@ function stripNode(
     const branchRequired = new Set([...required, ...getRequiredProperties(branch)]);
     const candidate = stripNode(
       branch,
-      stripObjectNode(schema, value, branchRequired),
-      branchRequired
+      stripObjectNode(schema, value, branchRequired, options),
+      branchRequired,
+      options
     );
     if (schemaAcceptsValue(branch, candidate)) {
       return candidate;
@@ -315,15 +340,16 @@ function getUnionBranches(schema: Record<string, unknown>): unknown[] {
 function stripObjectNode(
   schema: Record<string, unknown>,
   value: Record<string, unknown>,
-  required: ReadonlySet<string>
+  required: ReadonlySet<string>,
+  options: OmissionPlaceholderOptions
 ): Record<string, unknown> {
   let stripped = { ...value };
   if (isRecord(schema.properties)) {
-    stripped = stripProperties(stripped, schema.properties, required);
+    stripped = stripProperties(stripped, schema.properties, required, options);
   }
   if (Array.isArray(schema.allOf)) {
     for (const subSchema of schema.allOf) {
-      stripped = stripNode(subSchema, stripped, required) as Record<string, unknown>;
+      stripped = stripNode(subSchema, stripped, required, options) as Record<string, unknown>;
     }
   }
   return stripped;
@@ -334,6 +360,10 @@ function stripObjectNode(
  * placeholder values the model used for omitted optional properties (see
  * isOmissionPlaceholder). Required properties and source-nullable values stay.
  */
-export function stripOmissionPlaceholders(schema: unknown, value: unknown): unknown {
-  return stripNode(schema, value, new Set());
+export function stripOmissionPlaceholders(
+  schema: unknown,
+  value: unknown,
+  options: OmissionPlaceholderOptions
+): unknown {
+  return stripNode(schema, value, new Set(), options);
 }
