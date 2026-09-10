@@ -49,7 +49,7 @@ import {
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import {
-  LEGACY_ADOPTION_MANIFEST_FILE_NAME,
+  legacyAdoptionManifestPath,
   readLegacyAdoptionManifest,
   type LegacyAdoptionRecord,
 } from "@/node/services/memoryLegacyAdoption";
@@ -1285,10 +1285,11 @@ export class MemoryService extends EventEmitter {
       // copy. A traversal failure fails the pass instead (access-time:
       // retried on the next access; removal: aborted, session intact).
       const files = await legacy.listFiles({ strict: true });
-      // What was already folded in, kept beside the legacy files (a dotfile,
-      // so neither build lists it): per relPath the content hash, the
-      // fingerprint of the child-keyed sidecar entry, and where the copy
-      // landed. Content: without it, a note later edited through the shared
+      // What was already folded in, kept in the child's session dir OUTSIDE
+      // the legacy root (which is a downgraded build's model-writable
+      // namespace; see legacyAdoptionManifestPath): per relPath the content
+      // hash, the fingerprint of the child-keyed sidecar entry, and where the
+      // copy landed. Content: without it, a note later edited through the shared
       // store would be re-imported as a stale duplicate on every backend
       // start. Sidecar: a downgraded build can change only a pin or usage
       // stats, which must reach the owner key without the bytes changing.
@@ -1296,7 +1297,7 @@ export class MemoryService extends EventEmitter {
       // consider done (and removal then deletes the child session on that
       // basis), so a transiently unreadable manifest, sidecar or owner
       // listing must fail the pass rather than stand in as "empty".
-      const manifestPath = path.join(legacyRoot, LEGACY_ADOPTION_MANIFEST_FILE_NAME);
+      const manifestPath = legacyAdoptionManifestPath(childSessionDir);
       const adopted = await readLegacyAdoptionManifest(manifestPath, { strict: true });
       const sidecarEntries = await this.metaService.getEntriesOrThrow();
       // The per-scope file cap is a store invariant (create/rename enforce

@@ -121,7 +121,10 @@ import {
 } from "@/common/utils/providers/customProviders";
 import type { MCPServerManager, MCPWorkspaceStats } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
-import { sharedWorkspaceMemoryPeerSessionDirs } from "@/node/services/memoryWorkspaceOwner";
+import {
+  resolveWorkspaceMemoryOwnerId,
+  sharedWorkspaceMemoryPeerSessionDirs,
+} from "@/node/services/memoryWorkspaceOwner";
 import { memoryScopeContextFromToolConfig } from "@/node/services/tools/memory";
 import type { TaskService } from "@/node/services/taskService";
 import { READ_ONLY_ACCESS, resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
@@ -2520,27 +2523,34 @@ export class TurnRequestBuilder {
         // A sub-agent's workspace-scope memory rows point into its task-tree
         // owner's session dir; rollback must admit that root (and only that),
         // and announce its direct-to-disk writes through MemoryService so the
-        // shared store's readers refresh.
+        // shared store's readers refresh. Resolved per rollback (not per
+        // turn): tree membership changes as sub-agents are spawned and removed
+        // while the tool instance lives. Strict AND existence-requiring load,
+        // from one snapshot for owner and peers: a config.json that is
+        // unreadable or absent (mid-rewrite) must refuse the rollback (see
+        // RollbackRefinementOptions), not read as a fresh install in which
+        // the child owns its notebook — that "self" fallback would omit the
+        // owner root (a pre-sharing row's inverse then lands on the hidden
+        // legacy notebook instead of the owner's adopted copy) and the peer
+        // list (conflicting sibling rows go unseen).
         const memoryService = this.dependencies.bindings.memoryService;
-        const memoryOwnerId =
-          memoryService?.resolveWorkspaceMemoryOwnerId(workspaceId) ?? workspaceId;
-        const sharedWorkspaceMemorySessionDir =
-          memoryOwnerId === workspaceId
-            ? undefined
-            : path.join(this.dependencies.config.sessionsDir, memoryOwnerId);
-        // Resolved per rollback (not per turn): tree membership changes as
-        // sub-agents are spawned and removed while the tool instance lives.
-        // Strict load: an unreadable config must refuse the rollback (see
-        // RollbackRefinementOptions), not read as an empty tree.
-        const listSharedWorkspaceMemoryPeerSessionDirs =
+        const sessionsDir = this.dependencies.config.sessionsDir;
+        const sharedWorkspaceMemory =
           memoryService === undefined
             ? undefined
-            : () =>
-                sharedWorkspaceMemoryPeerSessionDirs(
-                  this.dependencies.config.loadConfigOrDefault({ throwOnError: true }),
-                  this.dependencies.config.sessionsDir,
-                  workspaceId
-                );
+            : () => {
+                const cfg = this.dependencies.config.loadExistingConfigOrThrow();
+                const ownerId = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
+                return {
+                  ownerSessionDir:
+                    ownerId === workspaceId ? undefined : path.join(sessionsDir, ownerId),
+                  peerSessionDirs: sharedWorkspaceMemoryPeerSessionDirs(
+                    cfg,
+                    sessionsDir,
+                    workspaceId
+                  ),
+                };
+              };
         // Built anew for EVERY attempt (prepareModelRequest runs per primary /
         // fallback request) from the never-mutated policy: refinement_rollback
         // reads it by reference, and the request.assemble demotion below only
@@ -2567,9 +2577,8 @@ export class TurnRequestBuilder {
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
             workspaceId,
-            sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
-            sharedWorkspaceMemorySessionDir,
-            listSharedWorkspaceMemoryPeerSessionDirs,
+            sessionDir: path.join(sessionsDir, workspaceId),
+            sharedWorkspaceMemory,
             memory: attemptSandboxMemory,
             kernelFileLoader,
           },

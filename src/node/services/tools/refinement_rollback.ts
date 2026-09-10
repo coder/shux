@@ -11,6 +11,7 @@ import {
   createLegacyPathRemapper,
   LegacyPathNotAdoptedError,
 } from "@/node/services/memoryLegacyAdoption";
+import { getErrorMessage } from "@/common/utils/errors";
 
 interface RefinementRollbackToolArgs {
   id: string;
@@ -84,13 +85,29 @@ async function refuseReadOnlyMemoryRollback(
   return null;
 }
 
+export interface SharedWorkspaceMemoryTopology {
+  /** Owner session dir when the workspace is a sub-agent sharing its notebook. */
+  ownerSessionDir: string | undefined;
+  /** Other live task-tree members' session dirs (see RollbackRefinementOptions). */
+  peerSessionDirs: string[];
+}
+
+export type SharedWorkspaceMemoryTopologyResolver = () => SharedWorkspaceMemoryTopology;
+
 export function createRefinementRollbackTool(ctx: {
   workspaceId: string;
   sessionDir: string;
-  /** Owner session dir when this workspace is a sub-agent sharing its notebook. */
-  sharedWorkspaceMemorySessionDir?: string;
-  /** Other live task-tree members' session dirs (see RollbackRefinementOptions). */
-  listSharedWorkspaceMemoryPeerSessionDirs?: () => string[];
+  /**
+   * Task-tree topology of a workspace sharing its notebook, resolved PER
+   * EXECUTION (membership changes while the tool instance lives) from a
+   * config snapshot that must prove itself: a throw refuses the rollback. No
+   * fallback view is acceptable here — ownership read from a missing
+   * config.json resolves to "self", which would omit the owner root (a
+   * pre-sharing row's inverse then lands on the hidden legacy notebook
+   * instead of the owner's adopted copy) and the peer list (conflicting
+   * sibling rows go unseen). Omitted = the workspace owns its notebook.
+   */
+  sharedWorkspaceMemory?: SharedWorkspaceMemoryTopologyResolver;
   /**
    * Memory integration: announces rolled-back memory files so shared-store
    * readers refresh, and applies the agent's per-scope write policy — a
@@ -107,10 +124,22 @@ export function createRefinementRollbackTool(ctx: {
       { id, reason }: RefinementRollbackToolArgs,
       { toolCallId }
     ): Promise<RefinementRollbackToolResult> => {
+      let topology: SharedWorkspaceMemoryTopology;
+      try {
+        topology = ctx.sharedWorkspaceMemory?.() ?? {
+          ownerSessionDir: undefined,
+          peerSessionDirs: [],
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: `Cannot resolve this workspace's shared-memory ownership right now (${getErrorMessage(error)}); refusing to roll back '${id}'.`,
+        };
+      }
       if (ctx.memory !== undefined) {
         const refusal = await refuseReadOnlyMemoryRollback(
           ctx.sessionDir,
-          ctx.sharedWorkspaceMemorySessionDir,
+          topology.ownerSessionDir,
           id,
           ctx.memory
         );
@@ -118,8 +147,8 @@ export function createRefinementRollbackTool(ctx: {
       }
       const result = await rollbackRefinement({
         sessionDir: ctx.sessionDir,
-        sharedWorkspaceMemorySessionDir: ctx.sharedWorkspaceMemorySessionDir,
-        listSharedWorkspaceMemoryPeerSessionDirs: ctx.listSharedWorkspaceMemoryPeerSessionDirs,
+        sharedWorkspaceMemorySessionDir: topology.ownerSessionDir,
+        listSharedWorkspaceMemoryPeerSessionDirs: () => topology.peerSessionDirs,
         id,
         reason,
         evidence: { toolName: "refinement_rollback", toolCallId, actor: "agent" },

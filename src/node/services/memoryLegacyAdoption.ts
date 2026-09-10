@@ -13,11 +13,21 @@ import * as path from "node:path";
 import type { RefinementInverse } from "@/common/types/refinement";
 
 /**
- * Dotfile inside a sub-agent's legacy `memory` dir recording, per relPath, the
- * sha256 of the content already copied into the shared store
- * (adoptLegacyPrivateStore). Dotfiles are invisible to every build's listing.
+ * File in the sub-agent's SESSION dir (beside its legacy `memory` dir, never
+ * inside it) recording, per relPath, the sha256 of the content already copied
+ * into the shared store (adoptLegacyPrivateStore). Outside the legacy root on
+ * purpose: everything under `<childSession>/memory` is the model-writable
+ * `/memories/workspace` namespace of a downgraded build (the path grammar
+ * admits dotfiles), and this manifest's `created`/`target`/hash fields are
+ * trusted as provenance — a fabricated settled record with an absent source
+ * would make deletion reconciliation remove a matching owner note. The
+ * session dir itself is not addressable through any memory path.
  */
-export const LEGACY_ADOPTION_MANIFEST_FILE_NAME = ".adopted-into-shared-store.json";
+export const LEGACY_ADOPTION_MANIFEST_FILE_NAME = "memory-adoption-manifest.json";
+
+export function legacyAdoptionManifestPath(childSessionDir: string): string {
+  return path.join(childSessionDir, LEGACY_ADOPTION_MANIFEST_FILE_NAME);
+}
 
 /**
  * One adopted legacy file: content hash, child sidecar fingerprint, owner-store
@@ -206,7 +216,7 @@ export async function createLegacyPathRemapper(args: {
   const legacyRoot = path.join(path.resolve(args.childSessionDir), "memory");
   const ownerRoot = path.join(path.resolve(args.ownerSessionDir), "memory");
   const adopted = await readLegacyAdoptionManifest(
-    path.join(legacyRoot, LEGACY_ADOPTION_MANIFEST_FILE_NAME),
+    legacyAdoptionManifestPath(path.resolve(args.childSessionDir)),
     { strict: args.strict === true }
   );
   // Directory endpoints (pre-sharing directory renames) map only when the

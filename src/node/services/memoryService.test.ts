@@ -19,6 +19,7 @@ import {
   type PinnedFileMutation,
 } from "./memoryService";
 import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
+import { legacyAdoptionManifestPath } from "./memoryLegacyAdoption";
 import {
   MemoryRefinementActionSchema,
   REFINEMENT_CAPTURE_MAX_FILES,
@@ -1694,7 +1695,7 @@ describe("MemoryService", () => {
       }
       expect(await pathExists(path.join(ownerRoot, "late.md"))).toBe(false);
       // Same for the adoption manifest: unreadable (not missing) aborts.
-      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
       const savedManifest = await fsPromises.readFile(manifestPath);
       await fsPromises.rm(manifestPath);
       await fsPromises.mkdir(manifestPath);
@@ -1739,7 +1740,7 @@ describe("MemoryService", () => {
       await fixture.service.listIndexEntries({ ...fixture.ctx });
       expect(await fsPromises.readFile(importedCopy, "utf-8")).toBe("child's a");
       const manifest = JSON.parse(
-        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+        await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(legacyRoot)), "utf-8")
       ) as Record<string, { target: string; created?: boolean }>;
       // The old record stays as a tombstone (rollbacks of the child's
       // pre-sharing rows for a.md still need its mapping).
@@ -1787,7 +1788,7 @@ describe("MemoryService", () => {
       );
       await fixture.service.listIndexEntries({ ...fixture.ctx });
       const manifest = JSON.parse(
-        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+        await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(legacyRoot)), "utf-8")
       ) as Record<string, { created?: boolean }>;
       expect(manifest["imported/ws-child/a.md"].created).not.toBe(true);
       // ...and the obsolete record's tombstone drops its destructive
@@ -2045,7 +2046,7 @@ describe("MemoryService", () => {
       // still know this adoption created the copy...
       await fixture.service.listIndexEntries({ ...fixture.ctx });
       const manifest = JSON.parse(
-        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+        await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(legacyRoot)), "utf-8")
       ) as Record<string, { created?: boolean; pending?: boolean }>;
       expect(manifest["note.md"]).toMatchObject({ created: true });
       expect(manifest["note.md"].pending).toBeUndefined();
@@ -2083,7 +2084,7 @@ describe("MemoryService", () => {
       }
       expect(await pathExists(target)).toBe(true);
       const manifest = JSON.parse(
-        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+        await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(legacyRoot)), "utf-8")
       ) as Record<string, unknown>;
       expect(Object.keys(manifest)).toEqual(["note.md"]);
       // Recovered: the retained provenance lets the copy follow its source out.
@@ -2142,10 +2143,7 @@ describe("MemoryService", () => {
       expect(
         Object.keys(
           JSON.parse(
-            await fsPromises.readFile(
-              path.join(legacyRoot, ".adopted-into-shared-store.json"),
-              "utf-8"
-            )
+            await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(legacyRoot)), "utf-8")
           ) as Record<string, unknown>
         )
       ).toEqual(["note.md"]);
@@ -2189,7 +2187,7 @@ describe("MemoryService", () => {
       expect(await pathExists(path.join(ownerRoot, "imported", "ws-child", "note.md"))).toBe(false);
       expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(false);
       const manifest = JSON.parse(
-        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+        await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(legacyRoot)), "utf-8")
       ) as Record<string, { target: string; created?: boolean }>;
       expect(manifest["note.md"]).toMatchObject({ target: "note.md", created: true });
       // Readable again: the pin folds into the same copy.
@@ -2230,7 +2228,7 @@ describe("MemoryService", () => {
       await fsPromises.rm(path.join(legacyRoot, "note.md"));
       await fixture.service.listIndexEntries({ ...fixture.ctx });
       expect(await pathExists(path.join(ownerRoot, "note.md"))).toBe(false);
-      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
       const tombstoned = JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
         string,
         { deleted?: boolean; target: string }
@@ -2256,6 +2254,42 @@ describe("MemoryService", () => {
       expect(readopted["note.md"].deleted).toBeUndefined();
     });
 
+    it("ignores a manifest a downgraded child wrote into its model-writable legacy root", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/note.md",
+        "owner note",
+        "agent"
+      );
+      // The downgraded build's memory tool serves `<childSession>/memory` as
+      // /memories/workspace and its path grammar admits dotfiles: a model
+      // there can plant a settled record claiming the owner's note as this
+      // adoption's creation whose source is already gone. Read as provenance,
+      // deletion reconciliation would remove the owner's note.
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(legacyRoot, ".adopted-into-shared-store.json"),
+        JSON.stringify({
+          "note.md": {
+            content: sha256Hex("owner note"),
+            sidecar: "",
+            target: "note.md",
+            created: true,
+          },
+        })
+      );
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe(
+        "owner note"
+      );
+      // Nothing listed in the legacy root: the real manifest was never written.
+      expect(await pathExists(legacyAdoptionManifestPath(path.dirname(legacyRoot)))).toBe(false);
+    });
+
     it("recovers an interrupted in-place replacement without duplicating the note", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -2268,7 +2302,7 @@ describe("MemoryService", () => {
       // after recording its pending state but before writing the bytes —
       // the on-disk state that leaves: the PRIOR record marked pending, the
       // owner copy still holding the old bytes.
-      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
       const prior = (
         JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
           string,
@@ -2290,7 +2324,7 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v2");
       expect(await pathExists(path.join(ownerRoot, "imported", "ws-child", "note.md"))).toBe(false);
       const manifest = JSON.parse(
-        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+        await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(legacyRoot)), "utf-8")
       ) as Record<string, { target: string; created?: boolean; pending?: boolean }>;
       expect(Object.keys(manifest)).toEqual(["note.md"]);
       expect(manifest["note.md"]).toMatchObject({ target: "note.md", created: true });
@@ -2364,7 +2398,7 @@ describe("MemoryService", () => {
       await fsPromises.mkdir(legacyRoot, { recursive: true });
       await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
       await fixture.service.listIndexEntries({ ...fixture.ctx });
-      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
       const prior = (
         JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
           string,
@@ -2406,7 +2440,7 @@ describe("MemoryService", () => {
       await fsPromises.mkdir(legacyRoot, { recursive: true });
       await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
       await fixture.service.listIndexEntries({ ...fixture.ctx });
-      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
       const prior = (
         JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
           string,
@@ -2489,7 +2523,7 @@ describe("MemoryService", () => {
       await fsPromises.mkdir(legacyRoot, { recursive: true });
       await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
       await fixture.service.listIndexEntries({ ...fixture.ctx });
-      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
       const prior = (
         JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<string, unknown>
       )["note.md"] as Record<string, unknown>;
@@ -2524,7 +2558,7 @@ describe("MemoryService", () => {
       await fsPromises.mkdir(legacyRoot, { recursive: true });
       await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
       await fixture.service.listIndexEntries({ ...fixture.ctx });
-      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
       const prior = (
         JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<string, unknown>
       )["note.md"] as Record<string, unknown>;
@@ -2566,7 +2600,7 @@ describe("MemoryService", () => {
         "proto notes"
       );
       const manifest = JSON.parse(
-        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+        await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(legacyRoot)), "utf-8")
       ) as Record<string, unknown>;
       expect(Object.keys(manifest)).toEqual(["__proto__"]);
       // A fresh process (empty memo) finds the record and leaves the clock alone.
@@ -2778,9 +2812,7 @@ describe("MemoryService", () => {
           .map((e) => e.relPath)
       ).toEqual(["clash.md"]);
       expect(await pathExists(path.join(outside, "clash.md"))).toBe(false);
-      expect(await pathExists(path.join(legacyRoot, ".adopted-into-shared-store.json"))).toBe(
-        false
-      );
+      expect(await pathExists(legacyAdoptionManifestPath(path.dirname(legacyRoot)))).toBe(false);
       await fsPromises.unlink(path.join(ownerRoot, "imported", "ws-child"));
       await fsPromises.rm(legacyRoot, { recursive: true });
       await fsPromises.rm(path.join(ownerRoot, "clash.md"));
@@ -3540,7 +3572,7 @@ describe("MemoryService", () => {
       const [ownerCreate] = await readRefinementEvents(ownerSessionDir);
       // The child's (pre-sharing) manifest is unreadable: its adopted rows
       // cannot be consulted, so the owner's rollback must not proceed blind.
-      const manifestPath = path.join(childSessionDir, "memory", ".adopted-into-shared-store.json");
+      const manifestPath = legacyAdoptionManifestPath(childSessionDir);
       await fsPromises.mkdir(manifestPath, { recursive: true });
       const refused = await rollbackRefinement({
         sessionDir: ownerSessionDir,
@@ -3606,7 +3638,7 @@ describe("MemoryService", () => {
       const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
       const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
       await fixture.service.create(fixture.ctx, "/memories/workspace/m.md", "v1", "agent");
-      const manifestPath = path.join(childSessionDir, "memory", ".adopted-into-shared-store.json");
+      const manifestPath = legacyAdoptionManifestPath(childSessionDir);
       await fsPromises.mkdir(manifestPath, { recursive: true });
       expect(
         await migrateSharedMemoryRefinementRows({
@@ -3631,7 +3663,7 @@ describe("MemoryService", () => {
         createRefinementRollbackTool({
           workspaceId: "ws-child",
           sessionDir: childSessionDir,
-          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+          sharedWorkspaceMemory: () => ({ ownerSessionDir, peerSessionDirs: [] }),
           memory: { service: fixture.service, ctx: fixture.ctx, access },
         });
       const run = async (access: MemoryScopeAccess) =>
@@ -3653,7 +3685,7 @@ describe("MemoryService", () => {
       const foreignTool = createRefinementRollbackTool({
         workspaceId: "ws-child",
         sessionDir: childSessionDir,
-        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        sharedWorkspaceMemory: () => ({ ownerSessionDir, peerSessionDirs: [] }),
         memory: {
           service: fixture.service,
           ctx: { ...fixture.ctx, workspaceId: "ws-solo" },
@@ -3684,7 +3716,7 @@ describe("MemoryService", () => {
       await fsPromises.mkdir(legacyRoot, { recursive: true });
       await fsPromises.writeFile(path.join(legacyRoot, "legacy.md"), "v2");
       await fsPromises.writeFile(
-        path.join(legacyRoot, ".adopted-into-shared-store.json"),
+        legacyAdoptionManifestPath(path.dirname(legacyRoot)),
         JSON.stringify({
           "legacy.md": { content: "x", sidecar: "", target: "legacy.md", created: true },
         })
@@ -3726,6 +3758,41 @@ describe("MemoryService", () => {
         await fsPromises.readFile(path.join(ownerSessionDir, "memory", "legacy.md"), "utf-8")
       ).toBe("v1");
       expect(await fsPromises.readFile(path.join(legacyRoot, "legacy.md"), "utf-8")).toBe("v2");
+    });
+
+    it("the refinement_rollback tool refuses while shared-memory ownership cannot be proven", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      const [row] = await readRefinementEvents(childSessionDir);
+      // config.json mid-rewrite at execution time: the topology resolver
+      // throws instead of degrading to "the child owns its notebook" (which
+      // would drop the owner root and the peer list from the rollback).
+      const tool = createRefinementRollbackTool({
+        workspaceId: "ws-child",
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemory: () => {
+          throw new Error("config.json is absent");
+        },
+        memory: {
+          service: fixture.service,
+          ctx: fixture.ctx,
+          access: { global: "readwrite", project: "readwrite", workspace: "readwrite" },
+        },
+      });
+      const refused = (await tool.execute!(
+        { id: row.id, reason: "test" },
+        mockToolCallOptions
+      )) as {
+        success: boolean;
+        error?: string;
+      };
+      expect(refused.success).toBe(false);
+      expect(refused.error).toContain("config.json is absent");
+      expect(await pathExists(path.join(ownerSessionDir, "memory", "n.md"))).toBe(true);
+      expect((await readRefinementEvents(childSessionDir)).length).toBe(1);
     });
 
     it("notifyExternalMutation emits one owner-addressed event per touched scope", async () => {

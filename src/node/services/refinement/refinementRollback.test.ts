@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { REFINEMENT_INVERSE_BLOB_QUOTA_BYTES } from "@/common/types/refinement";
 import { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { legacyAdoptionManifestPath } from "@/node/services/memoryLegacyAdoption";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "@/node/services/memoryService";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
@@ -894,7 +895,7 @@ describe("refinementRollback", () => {
     await fsPromises.mkdir(path.join(ownerSessionDir, "memory", "sub"), { recursive: true });
     await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "sub", "note.md"), "v2\n");
     await fsPromises.writeFile(
-      path.join(fixture.sessionDir, "memory", ".adopted-into-shared-store.json"),
+      legacyAdoptionManifestPath(fixture.sessionDir),
       JSON.stringify({
         "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
       })
@@ -959,7 +960,7 @@ describe("refinementRollback", () => {
     const sameRow = await lastRow(fixture.sessionDir);
     await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "same.md"), "same\n");
     await fsPromises.writeFile(
-      path.join(fixture.sessionDir, "memory", ".adopted-into-shared-store.json"),
+      legacyAdoptionManifestPath(fixture.sessionDir),
       JSON.stringify({
         "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
         "same.md": { content: "x", sidecar: "", target: "same.md" },
@@ -981,7 +982,7 @@ describe("refinementRollback", () => {
     await fixture.service.deletePath(fixture.ctx, "/memories/workspace/gone.md", "agent");
     const deleteRow = await lastRow(fixture.sessionDir);
     await fsPromises.writeFile(
-      path.join(fixture.sessionDir, "memory", ".adopted-into-shared-store.json"),
+      legacyAdoptionManifestPath(fixture.sessionDir),
       JSON.stringify({
         "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
         "same.md": { content: "x", sidecar: "", target: "same.md" },
@@ -1012,7 +1013,7 @@ describe("refinementRollback", () => {
     await fsPromises.mkdir(path.join(ownerSessionDir, "memory", "newdir"), { recursive: true });
     await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "newdir", "a.md"), "a\n");
     await fsPromises.writeFile(
-      path.join(fixture.sessionDir, "memory", ".adopted-into-shared-store.json"),
+      legacyAdoptionManifestPath(fixture.sessionDir),
       JSON.stringify({
         "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
         "same.md": { content: "x", sidecar: "", target: "same.md" },

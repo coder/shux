@@ -593,7 +593,7 @@ async function readSharedMemoryPeerRows(
     );
     // A peer sub-agent's pre-sharing rows address ITS legacy private
     // notebook; the notes live in the shared store now (adoption manifest
-    // beside the legacy files). Retarget them through that peer's manifest
+    // in the peer's session dir). Retarget them through that peer's manifest
     // before the overlap test — the peer's later edit of an adopted note must
     // surface against the owner's rollback like any shared-store row. The
     // remapped inverse replaces the recorded one on the returned row, so the

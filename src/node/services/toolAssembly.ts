@@ -35,7 +35,10 @@ import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { PTCExecutionResult } from "@/node/services/ptc/types";
 import { sandboxHostService, type SandboxMount } from "@/node/services/sandbox/sandboxHostService";
-import { createRefinementRollbackTool } from "@/node/services/tools/refinement_rollback";
+import {
+  createRefinementRollbackTool,
+  type SharedWorkspaceMemoryTopologyResolver,
+} from "@/node/services/tools/refinement_rollback";
 import { READ_ONLY_ACCESS } from "@/node/services/tools/memory";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import type { MemoryScopeAccess } from "@/common/constants/memory";
@@ -121,10 +124,8 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   sandbox?: {
     workspaceId: string;
     sessionDir: string;
-    /** Owner session dir when the workspace is a sub-agent sharing its notebook. */
-    sharedWorkspaceMemorySessionDir?: string;
-    /** Other live task-tree members' session dirs (see RollbackRefinementOptions). */
-    listSharedWorkspaceMemoryPeerSessionDirs?: () => string[];
+    /** Shared-notebook topology resolver for refinement_rollback (see its ctx). */
+    sharedWorkspaceMemory?: SharedWorkspaceMemoryTopologyResolver;
     /** Lets refinement_rollback announce its direct-to-disk memory writes. */
     memory?: { service: MemoryService; ctx: MemoryScopeContext; access: MemoryScopeAccess };
     kernelFileLoader?: KernelFileLoader;
