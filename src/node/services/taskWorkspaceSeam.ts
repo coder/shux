@@ -1,7 +1,4 @@
-import {
-  SUBAGENT_FAILURE_FOOTER,
-  WORKSPACE_TURN_FAILURE_FOOTER,
-} from "@/common/utils/subagentFailureEnvelope";
+import { SUBAGENT_FAILURE_FOOTER } from "@/common/utils/subagentFailureEnvelope";
 import type { StartupRecoveryState } from "./startupRecovery";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
@@ -196,9 +193,8 @@ export function formatSubagentFailureUserMessage(params: {
     "<error_message>",
     params.errorMessage,
     "</error_message>",
-    params.errorType.startsWith("workspace_turn_")
-      ? WORKSPACE_TURN_FAILURE_FOOTER
-      : SUBAGENT_FAILURE_FOOTER,
+    // Older clients require this exact terminator to render persisted failures.
+    SUBAGENT_FAILURE_FOOTER,
     "</mux_subagent_failure>",
   ].join("\n");
 }

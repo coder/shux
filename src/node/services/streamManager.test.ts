@@ -1943,6 +1943,38 @@ describe("StreamManager - stopWhen configuration", () => {
     }
   });
 
+  test.each([
+    { cause: { kind: "required-tool" } as const, expected: "stop" },
+    {
+      cause: { kind: "queued-input", entryId: "pending-input" } as const,
+      expected: "tool-calls",
+    },
+  ])("persists a downgrade-compatible finish for $cause.kind", async ({ cause, expected }) => {
+    const manager = new StreamManager(historyService);
+    const workspaceId = "finish-compatibility";
+    const messageId = "finished-message";
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    const events: unknown[] = [];
+    onTurnEngineEvent(manager, "stream-end", (event) => events.push(event));
+    const info = createStreamInfoForTests({
+      messageId,
+      request: { model: createTestLanguageModel(), messages: [], stopCause: cause },
+      parts: [{ type: "text", text: "Tool result" }],
+      streamResult: createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "finish", finishReason: "tool-calls" };
+        })()
+      ),
+    });
+    await getProcessStreamWithCleanupForTests(manager).call(manager, workspaceId, info, 1);
+    expect(StreamEndEventSchema.parse(events[0]).metadata.finishReason).toBe(expected);
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    expect(history.data.at(-1)?.metadata?.finishReason).toBe(expected);
+    expect(history.data.at(-1)?.metadata?.stopCause).toEqual(cause);
+  });
+
   test("records required-tool completion instead of a queued replacement", async () => {
     const request: Parameters<BuildStopWhenCondition>[0] = {
       toolPolicy: [{ regex_match: "agent_report", action: "require" }],

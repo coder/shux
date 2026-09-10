@@ -4454,7 +4454,12 @@ export class StreamManager {
             const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
             const contextProviderMetadata =
               streamMeta.contextProviderMetadata ?? streamInfo.lastStepProviderMetadata;
-            const finishReason = streamInfo.terminalFinishReason ?? streamMeta.finishReason;
+            // Required-tool completion must remain successful after downgrade or crash recovery.
+            // Keep the internal stop cause, but persist the legacy-compatible terminal signal.
+            const finishReason =
+              streamInfo.request.stopCause?.kind === "required-tool"
+                ? "stop"
+                : (streamInfo.terminalFinishReason ?? streamMeta.finishReason);
             if (finishReason === "tool-calls" && streamInfo.request.stopCause == null) {
               workspaceLog.warn("Tool-calls stream ended without a recorded stop cause", {
                 messageId: streamInfo.messageId,
@@ -5335,17 +5340,11 @@ export class StreamManager {
       });
     }
 
-    // Get or create mutex for this workspace
-    if (!this.streamLocks.has(typedWorkspaceId)) {
-      this.streamLocks.set(typedWorkspaceId, new AsyncMutex());
-    }
-    const mutex = this.streamLocks.get(typedWorkspaceId)!;
-
     let registeredStream: WorkspaceStreamInfo | undefined;
     try {
       // Acquire lock - guarantees only one startStream per workspace
       // Lock is automatically released when scope exits via Symbol.asyncDispose
-      await using _lock = await mutex.acquire();
+      await using _lock = await this.acquireStreamStartLock(workspaceId);
 
       // DEBUG: Log stream start
       log.debug(
@@ -5816,10 +5815,20 @@ export class StreamManager {
     return Array.from(this.workspaceStreams.keys()).map((id) => id as string);
   }
 
+  /** Serialize idle recovery with stream startup, including terminal persistence. */
+  async acquireStreamStartLock(workspaceId: string) {
+    const id = workspaceId as WorkspaceId;
+    let mutex = this.streamLocks.get(id);
+    if (mutex == null) {
+      mutex = new AsyncMutex();
+      this.streamLocks.set(id, mutex);
+    }
+    return mutex.acquire();
+  }
+
   /**
-   * Gets the current stream info for a workspace if actively streaming
-   * Returns undefined if no active stream exists
-   * Used to re-establish streaming context on frontend reconnection
+   * Gets the current stream info for a workspace if actively streaming.
+   * Include finalizing streams when checking whether recovery can proceed.
    */
   getStreamInfo(
     workspaceId: string,

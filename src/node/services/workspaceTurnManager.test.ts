@@ -1,3 +1,4 @@
+import { StreamManager } from "./streamManager";
 import * as path from "path";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
@@ -4955,23 +4956,21 @@ describe("WorkspaceTurnManager", () => {
     }
   );
 
-  test("stale recovery rereads history after a continuation commits and becomes idle", async () => {
+  test("stale recovery waits for an in-flight stream start before reading history", async () => {
     const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+    const streams = new StreamManager(historyService);
+    Reflect.set(taskService, "streamManager", streams);
     const event = intermediateStopEvent(parentId);
     await taskService.markWorkspaceTurnStreamEndDeferred(event);
     const record = await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle");
     assert(record);
+    const starting = await streams.acquireStreamStartLock(event.workspaceId);
     const entered = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
-    const readHistory = historyService.getHistoryFromLatestBoundary.bind(historyService);
-    spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(
-      async (...args) => {
-        const snapshot = await readHistory(...args);
-        entered.resolve();
-        await release.promise;
-        return snapshot;
-      }
-    );
+    const acquire = streams.acquireStreamStartLock.bind(streams);
+    spyOn(streams, "acquireStreamStartLock").mockImplementationOnce((id) => {
+      entered.resolve();
+      return acquire(id);
+    });
     const recovering = (
       taskService as unknown as {
         settleStaleWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void>;
@@ -4984,13 +4983,66 @@ describe("WorkspaceTurnManager", () => {
       metadata: { ...event.metadata, finishReason: "stop", stopCause: undefined },
     };
     await persistStopEvent(historyService, completed);
-    release.resolve();
+    await starting[Symbol.asyncDispose]();
     await recovering;
     expect(
       await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
     ).toMatchObject({
       status: "completed",
       messageId: completed.messageId,
+    });
+  });
+
+  test("stale recovery blocks new starts through terminal persistence without blocking other workspaces", async () => {
+    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+    const streams = new StreamManager(historyService);
+    Reflect.set(taskService, "streamManager", streams);
+    const event = intermediateStopEvent(parentId);
+    event.metadata.finishReason = "stop";
+    delete event.metadata.stopCause;
+    await taskService.markWorkspaceTurnStreamEndDeferred(event);
+    await persistStopEvent(historyService, event);
+    const store = (taskService as unknown as { taskHandleStore: TaskHandleStore }).taskHandleStore;
+    const record = await store.getWorkspaceTurn(parentId, "wst_handle");
+    assert(record);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const cleanup = spyOn(
+      taskService as unknown as {
+        cleanupDisposableWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void>;
+      },
+      "cleanupDisposableWorkspaceTurn"
+    ).mockImplementation(async () => {
+      await using _cleanupStart = await streams.acquireStreamStartLock(event.workspaceId);
+    });
+    const persist = store.upsertWorkspaceTurn.bind(store);
+    spyOn(store, "upsertWorkspaceTurn").mockImplementationOnce(async (next) => {
+      entered.resolve();
+      await release.promise;
+      return persist(next);
+    });
+    const recovering = (
+      taskService as unknown as {
+        settleStaleWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void>;
+      }
+    ).settleStaleWorkspaceTurn(record);
+    await entered.promise;
+    let started = false;
+    const starting = streams.acquireStreamStartLock(event.workspaceId).then(async (lock) => {
+      started = true;
+      await lock[Symbol.asyncDispose]();
+    });
+    await using _otherWorkspace = await streams.acquireStreamStartLock("other-workspace");
+    expect(started).toBe(false);
+    release.resolve();
+    await recovering;
+    await starting;
+    expect(cleanup).toHaveBeenCalled();
+    expect(
+      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+    ).toMatchObject({
+      status: "completed",
+      messageId: event.messageId,
     });
   });
 

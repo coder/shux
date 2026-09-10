@@ -275,6 +275,7 @@ export function createAIServiceMocks(
       getStreamInfo,
       getProvidersConfig,
       replayStream,
+      acquireStreamStartLock: mock(() => Promise.resolve(undefined)),
       on,
       off,
     } as unknown as AIService,

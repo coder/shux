@@ -2225,6 +2225,8 @@ export class WorkspaceTurnManager {
      * same turn, and the correlated stream-end proves the turn's real outcome.
      */
     allowTerminalResettle?: boolean;
+    /** Release startup exclusion after persistence, before cleanup can join pending sends. */
+    releaseRecoveryLock?: () => Promise<void>;
     /**
      * Only the settlement that itself moved disposable ownership to a
      * successor (transferDisposableWorkspaceToSuccessor) may clear
@@ -2428,6 +2430,7 @@ export class WorkspaceTurnManager {
             error: queuedProgressRemoval.error,
           });
         }
+        await params.releaseRecoveryLock?.();
         const foregroundWaiterWorkspaceIds = this.settleWorkspaceTurnWaiters(
           params.record.handleId,
           params.waiterSettlement
@@ -4068,16 +4071,27 @@ export class WorkspaceTurnManager {
     if (!isActiveWorkspaceTurnTaskStatus(record.status)) {
       return;
     }
-    let recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
-    if (recovered == null) {
-      if (await this.isLiveWorkspaceTurn(record)) return;
-      // A continuation commits history before it becomes idle. Read again after the idle check
-      // so an earlier snapshot cannot turn its completed result into a restart interruption.
-      recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
-    }
+    // Lock order: stream start, then handle settlement. Registration cannot race recovery writes.
+    let recoveryLock = await this.streamManager?.acquireStreamStartLock(record.workspaceId);
+    await using recoveryScope = {
+      [Symbol.asyncDispose]: () => {
+        const lock = recoveryLock;
+        recoveryLock = undefined;
+        return lock?.[Symbol.asyncDispose]() ?? Promise.resolve();
+      },
+    };
+    const releaseRecoveryLock = () => recoveryScope[Symbol.asyncDispose]();
+    // Preparing input stays visible until registration. Existing streams include finalization.
+    if (
+      this.streamManager?.getStreamInfo(record.workspaceId, true) != null ||
+      (await this.isLiveWorkspaceTurn(record))
+    )
+      return;
+    const recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
     if (recovered != null) {
       await this.settleWorkspaceTurn({
         cause: { kind: "stale-history-recovery" },
+        releaseRecoveryLock,
         record,
         next: recovered,
         waiterSettlement:
@@ -4099,6 +4113,7 @@ export class WorkspaceTurnManager {
     };
     await this.settleWorkspaceTurn({
       cause: { kind: "stale-restart" },
+      releaseRecoveryLock,
       record,
       next,
       waiterSettlement: {

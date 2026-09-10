@@ -36,8 +36,8 @@ describe("parseSubagentFailureEnvelope", () => {
   test.each(["workspace_turn_incomplete", "workspace_turn_superseded", "process_exit"])(
     "accepts current and legacy footers for %s without changing the diagnostic",
     (errorType) => {
-      const current = formatSubagentFailureUserMessage({ ...failure, errorType });
-      const legacy = current.replace(WORKSPACE_TURN_FAILURE_FOOTER, SUBAGENT_FAILURE_FOOTER);
+      const legacy = formatSubagentFailureUserMessage({ ...failure, errorType });
+      const current = legacy.replace(SUBAGENT_FAILURE_FOOTER, WORKSPACE_TURN_FAILURE_FOOTER);
       const expected = {
         taskId: failure.childWorkspaceId,
         agentType: failure.agentType,
