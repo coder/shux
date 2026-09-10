@@ -5847,9 +5847,7 @@ export class AgentSession {
             type: "context-window-rollover",
             rolloverId: randomUUID(),
             reason: "on-send",
-            ...(modelRequested && decision.decision !== "rollover"
-              ? { requestedBy: "model" as const }
-              : {}),
+            ...(modelRequested ? { requestedBy: "model" as const } : {}),
             previousWindowId: currentContextWindowId(history.data),
             flushOpportunity: decision.flushOpportunity,
             contextTokens: decision.projected,

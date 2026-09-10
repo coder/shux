@@ -238,9 +238,4 @@ describe("model-requested rollover receipts", () => {
     ).toBe(false);
     expect(hasUnconsumedNewContextRequest([user])).toBe(false);
   });
-    expect(text).toContain("new_context");
-    expect(text).not.toContain("interrupted");
-    expect(text).not.toContain("filled");
-    expect(buildLeadInText({ ...rollover, reason: "mid-stream" })).toContain("interrupted");
-  });
 });
