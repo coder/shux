@@ -231,14 +231,37 @@ describe("validateJsonSchemaSubset", () => {
     });
   });
 
-  test("does not retain compiled schemas in the Ajv registry", () => {
+  test("treats $id as the document's identity, not part of the instance contract", () => {
     // Two different schemas that share an `$id` would collide in Ajv's registry
-    // if each compiled schema stayed registered after compilation.
+    // if the identity reached it.
     const id = "urn:xum:test:shared-id";
     expect(validateJsonSchemaSubset({ $id: id, type: "string" }, "text")).toEqual({
       success: true,
     });
     expect(validateJsonSchemaSubset({ $id: id, type: "number" }, 1)).toEqual({ success: true });
+  });
+
+  test("keeps validating schemas after compiling one whose $id names a meta-schema", () => {
+    // Registering this schema under the draft-07 URI, or deleting that URI when
+    // the compiled schema is released, would disable schema validation for the
+    // whole process.
+    expect(
+      validateJsonSchemaSubset(
+        { $id: "http://json-schema.org/draft-07/schema#", type: "string" },
+        "x"
+      )
+    ).toEqual({ success: true });
+    expect(validateJsonSchemaSubsetSchema({ type: "object", properties: "oops" }).success).toBe(
+      false
+    );
+  });
+
+  test("validates a schema that declares a dialect this validator does not load", () => {
+    // zod v4 emits a 2020-12 `$schema`; the dialect declaration describes the
+    // document, so it must neither throw nor change the verdict.
+    const schema = { $schema: "https://json-schema.org/draft/2020-12/schema", type: "string" };
+    expect(validateJsonSchemaSubset(schema, "text")).toEqual({ success: true });
+    expect(validateJsonSchemaSubset(schema, 1).success).toBe(false);
   });
 
   test("keeps validating correctly once the compiled-validator cache has evicted entries", () => {

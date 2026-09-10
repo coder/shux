@@ -1,4 +1,5 @@
 import {
+  MCP_MEDIA_TYPE_MAX_BYTES,
   MCP_TOOL_RESULT_MAX_TEXT_BYTES,
   MCP_TOOL_RESULT_MAX_TOTAL_BYTES,
 } from "@/common/constants/toolLimits";
@@ -122,7 +123,9 @@ function describeBinaryErrorPart(item: MCPBinaryContent): string {
             item.resource.blob ?? "",
             item.resource.mimeType ?? "application/octet-stream",
           ];
-  return `[${kind} omitted from MCP error text: ${formatBytesSI(data.length)}, ${mediaType}.]`;
+  // A summary must not grow with the part it summarises.
+  const boundedMediaType = truncateUtf8Bytes(mediaType, MCP_MEDIA_TYPE_MAX_BYTES, "…");
+  return `[${kind} omitted from MCP error text: ${formatBytesSI(data.length)}, ${boundedMediaType}.]`;
 }
 
 /**

@@ -1,5 +1,4 @@
 import {
-  findMissingProperties,
   validateJsonSchemaSubset,
   validateJsonSchemaSubsetSchema,
 } from "@/common/utils/jsonSchemaSubset";
@@ -198,9 +197,51 @@ function getAllOfBranches(schema: Record<string, unknown>): unknown[] {
 }
 
 /**
+ * Delete the placeholders among this level's declared properties that
+ * `context` does not need for this instance. Whether a property is needed
+ * depends on the instance (if/then, dependencies, minProperties, a union
+ * inside then), so the validator decides, one deletion at a time: a deletion
+ * that would turn an instance the context accepts into one it rejects is
+ * undone. `null` placeholders go first: the property schema rejects them, so
+ * deleting one never loses acceptance, and by the time `""` placeholders are
+ * judged, acceptance reflects the best this instance can reach. Statically
+ * required properties are never placeholders; when the context is outside the
+ * validator's subset nothing is accepted, so that list is the only evidence.
+ */
+function deleteOmissionPlaceholders(
+  properties: Record<string, unknown>,
+  restored: Record<string, unknown>,
+  context: unknown,
+  options: OmissionPlaceholderOptions
+): void {
+  const alwaysRequired = isRecord(context) ? getRequiredProperties(context) : new Set<string>();
+  const placeholders = Object.entries(properties)
+    .filter(
+      ([propertyName, propertySchema]) =>
+        propertyName in restored &&
+        !alwaysRequired.has(propertyName) &&
+        isOmissionPlaceholder(propertySchema, restored[propertyName], options)
+    )
+    .map(([propertyName]) => propertyName);
+  const nulls = placeholders.filter((propertyName) => restored[propertyName] === null);
+  const emptyStrings = placeholders.filter((propertyName) => restored[propertyName] !== null);
+  let accepted = schemaAcceptsValue(context, restored);
+  for (const propertyName of [...nulls, ...emptyStrings]) {
+    const placeholder = restored[propertyName];
+    delete restored[propertyName];
+    const stillAccepted = schemaAcceptsValue(context, restored);
+    if (accepted && !stillAccepted) {
+      restored[propertyName] = placeholder;
+    } else {
+      accepted = stillAccepted;
+    }
+  }
+}
+
+/**
  * Restore the properties and items this schema node declares directly
- * (including through allOf), then remove the placeholders that `context` does
- * not require for this instance. `context` is the schema in force at this
+ * (including through allOf), then delete the placeholders that `context` does
+ * not need for this instance. `context` is the schema in force at this
  * instance level: the node itself, conjoined with the union branches chosen on
  * the way in (see restoreNode). Union branches are the caller's concern.
  */
@@ -224,47 +265,19 @@ function restoreStructure(
     return value;
   }
   const restored: Record<string, unknown> = { ...value };
-  // Which properties are required depends on the instance (if/then,
-  // dependencies), so the validator decides: remove every placeholder the
-  // schema does not list as required, then put back each one the validator
-  // reports missing. Putting one back can activate another requirement, so
-  // repeat until stable; every pass restores at least one, so this ends. When
-  // the schema is outside the validator's subset, the `required` list is the
-  // only evidence.
-  const alwaysRequired = isRecord(context) ? getRequiredProperties(context) : new Set<string>();
-  const removed: string[] = [];
-  if (isRecord(schema.properties)) {
-    for (const [propertyName, propertySchema] of Object.entries(schema.properties)) {
-      if (!(propertyName in restored)) {
-        continue;
-      }
-      // Children first, so conditions at this level see restored values.
+  const properties = isRecord(schema.properties) ? schema.properties : {};
+  for (const [propertyName, propertySchema] of Object.entries(properties)) {
+    // Children first, so this level is judged on restored values.
+    if (propertyName in restored) {
       restored[propertyName] = restoreNode(
         propertySchema,
         restored[propertyName],
         propertySchema,
         options
       );
-      if (
-        !alwaysRequired.has(propertyName) &&
-        isOmissionPlaceholder(propertySchema, restored[propertyName], options)
-      ) {
-        delete restored[propertyName];
-        removed.push(propertyName);
-      }
     }
   }
-  while (removed.length > 0) {
-    const missing = findMissingProperties(context, restored);
-    const putBack = removed.filter((propertyName) => missing.has(propertyName));
-    if (putBack.length === 0) {
-      break;
-    }
-    for (const propertyName of putBack) {
-      restored[propertyName] = value[propertyName];
-      removed.splice(removed.indexOf(propertyName), 1);
-    }
-  }
+  deleteOmissionPlaceholders(properties, restored, context, options);
   let result: unknown = restored;
   for (const subSchema of getAllOfBranches(schema)) {
     result = restoreNode(subSchema, result, context, options);
@@ -290,7 +303,7 @@ function restoreNode(
   // accepts the raw value gives that value meaning (an explicit null a nullable
   // branch allows, a "" a branch requires). So try the raw-accepting branches
   // first; for each candidate branch, conjoin it with the context so its
-  // requirements apply while restoring this level and the branch's own
+  // constraints apply while restoring this level and the branch's own
   // structure. The first branch that accepts its candidate wins.
   const rawAccepting = branches.filter((branch) => schemaAcceptsValue(branch, value));
   const ordered = [...rawAccepting, ...branches.filter((branch) => !rawAccepting.includes(branch))];

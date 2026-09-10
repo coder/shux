@@ -1,5 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import {
+  MCP_MEDIA_TYPE_MAX_BYTES,
   MCP_TOOL_RESULT_MAX_TEXT_BYTES,
   MCP_TOOL_RESULT_MAX_TOTAL_BYTES,
 } from "@/common/constants/toolLimits";
@@ -50,10 +51,11 @@ describe("describeMCPErrorResult", () => {
     expect(description).toContain("[MCP tool result text truncated:");
   });
 
-  it("bounds binary part descriptions with the same shared budget", () => {
+  it("keeps binary part descriptions a fixed size regardless of the media type", () => {
+    const partCount = 4;
     const description = describeMCPErrorResult({
       isError: true,
-      content: Array.from({ length: 4 }, () => ({
+      content: Array.from({ length: partCount }, () => ({
         type: "image" as const,
         data: "abc",
         mimeType: "image/" + "m".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES),
@@ -61,11 +63,15 @@ describe("describeMCPErrorResult", () => {
       structuredContent: { code: "TOO_MANY" },
     });
 
-    expect(Buffer.byteLength(description, "utf8")).toBeLessThanOrEqual(
-      MCP_TOOL_RESULT_MAX_TOTAL_BYTES
+    // Every description survives the shared text budget because a summary does
+    // not grow with the part it summarises.
+    expect(description.split("[Image omitted from MCP error text:")).toHaveLength(partCount + 1);
+    expect(description).toContain("image/mmm");
+    expect(description).toContain("…");
+    expect(description).not.toContain("content part(s) omitted:");
+    expect(Buffer.byteLength(description, "utf8")).toBeLessThan(
+      partCount * (MCP_MEDIA_TYPE_MAX_BYTES + 100)
     );
-    expect(description).toStartWith("[Image omitted from MCP error text:");
-    expect(description).toContain("content part(s) omitted:");
     expect(description).toEndWith(JSON.stringify({ code: "TOO_MANY" }));
   });
 

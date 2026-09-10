@@ -41,6 +41,11 @@ export const MCP_TOOL_RESULT_MAX_TEXT_BYTES = 64 * 1024;
 // structuredContent + notices) never trip it.
 export const MCP_TOOL_RESULT_MAX_TOTAL_BYTES = 256 * 1024;
 
+// A media type is at most 255 characters (RFC 6838 caps type and subtype at 127
+// each). A binary part's one-line description in MCP error text is a summary,
+// so it must not grow with a server-controlled `mimeType`.
+export const MCP_MEDIA_TYPE_MAX_BYTES = 255;
+
 // MCP prompt expansions are server-controlled; bound them like web_fetch output.
 export const MCP_PROMPT_MAX_TEXT_BYTES = 64 * 1024;
 export const MCP_PROMPT_TRUNCATION_MARKER = "\n\n[Prompt text truncated]";

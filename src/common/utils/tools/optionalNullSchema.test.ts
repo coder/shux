@@ -429,6 +429,64 @@ describe("optional null JSON Schema contract", () => {
     expect(restoreMcp(source, { b: "", c: "" })).toEqual({});
   });
 
+  test("keeps a placeholder that a union inside a satisfied condition requires", () => {
+    const source = {
+      type: "object",
+      properties: {
+        mode: { type: "string" },
+        query: { type: "string" },
+        ids: { type: "array", items: { type: "string" } },
+      },
+      if: { properties: { mode: { const: "search" } }, required: ["mode"] },
+      then: { anyOf: [{ required: ["query"] }, { required: ["ids"] }] },
+    };
+
+    expect(restoreMcp(source, { mode: "search", query: "" })).toEqual({
+      mode: "search",
+      query: "",
+    });
+    // `ids` satisfies the union, so `query` is a plain omission here.
+    expect(restoreMcp(source, { mode: "search", query: "", ids: ["a"] })).toEqual({
+      mode: "search",
+      ids: ["a"],
+    });
+    expect(restoreMcp(source, { mode: "recent", query: "" })).toEqual({ mode: "recent" });
+  });
+
+  test("keeps a placeholder that a constraint other than required needs", () => {
+    const source = {
+      type: "object",
+      properties: { a: { type: "string" }, b: { type: "string" }, c: { type: "string" } },
+      minProperties: 2,
+    };
+
+    expect(restoreMcp(source, { a: "x", b: "" })).toEqual({ a: "x", b: "" });
+    expect(restoreMcp(source, { a: "x", b: "y", c: "" })).toEqual({ a: "x", b: "y" });
+  });
+
+  test("deletes rejected nulls before judging empty strings", () => {
+    const source = {
+      type: "object",
+      properties: { a: { type: "string" }, b: { type: "string" } },
+      minProperties: 1,
+    };
+
+    // The null can never stay, so it must not count toward minProperties when
+    // deciding whether "" may go.
+    expect(restoreMcp(source, { a: "", b: null })).toEqual({ a: "" });
+  });
+
+  test("restores payloads for a schema that declares a dialect the validator does not load", () => {
+    const source = {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: { a: { type: "string" }, b: { type: "string" } },
+      required: ["a"],
+    };
+
+    expect(restoreMcp(source, { a: "", b: "" })).toEqual({ a: "" });
+  });
+
   test("falls back to the required list when the schema is outside the validator subset", () => {
     const source = {
       type: "object",

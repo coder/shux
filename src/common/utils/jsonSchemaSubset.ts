@@ -18,15 +18,31 @@ export function formatJsonSchemaValidationErrors(
   return visibleErrors.map((error) => `${error.path}: ${error.message}`).join("; ");
 }
 
-const ajv = new Ajv({ allErrors: true, strict: false, validateSchema: true });
+// Ajv compiles schemas for this module; it is not their registry
+// (`addUsedSchema: false`). Compiled validators are looked up by schema text
+// below, never by `$id`.
+const ajv = new Ajv({ allErrors: true, strict: false, validateSchema: true, addUsedSchema: false });
 
 // Compiled validators are reused by schema text so repeated validation of one
 // schema skips Ajv code generation. Schemas can come from third parties (an MCP
 // server may return fresh tool schemas on every catalog refresh), so the cache
 // is bounded: least-recently-used entries are evicted, and Ajv's own per-object
-// registry is released right after compilation so only this map retains code.
+// cache is released right after compilation so only this map retains code.
 const VALIDATOR_CACHE_MAX_ENTRIES = 512;
 const validatorCache = new Map<string, ValidateFunction>();
+
+/**
+ * The schema as Ajv sees it. `$schema` and `$id` describe the schema document,
+ * not the instance: `$schema` names a dialect this Ajv instance may not know
+ * (zod v4 emits 2020-12, which would throw), and `$id` is an identity in Ajv's
+ * shared registry, where a third-party value can collide with a meta-schema or
+ * delete it when the compiled schema is released. `$ref` is rejected, so
+ * neither keyword affects validation.
+ */
+function toValidatorSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  const { $schema, $id, ...validatorSchema } = schema;
+  return validatorSchema;
+}
 
 export function validateJsonSchemaSubsetSchema(
   schema: unknown,
@@ -52,14 +68,13 @@ export function validateJsonSchemaSubsetSchema(
     return { success: false, errors: [refError] };
   }
 
-  if (!ajv.validateSchema(schema)) {
-    return {
-      success: false,
-      errors: normalizeAjvErrors(ajv.errors ?? [], undefined, schema, { schemaErrors: true }),
-    };
-  }
-
   try {
+    if (!ajv.validateSchema(toValidatorSchema(schema))) {
+      return {
+        success: false,
+        errors: normalizeAjvErrors(ajv.errors ?? [], undefined, schema, { schemaErrors: true }),
+      };
+    }
     compileSchema(schema);
     return { success: true };
   } catch (error) {
@@ -87,37 +102,9 @@ export function validateJsonSchemaSubset(
   return { success: false, errors: normalizeAjvErrors(validate.errors ?? [], value, schema) };
 }
 
-/**
- * Property names the validator reports missing from `value` at the top level:
- * `required`, `dependencies`, and whatever a satisfied `if`/`then`/`else` or
- * `allOf` activates for this instance. Requirements inside `anyOf`/`oneOf`
- * are excluded because a union requires nothing until a branch is chosen; a
- * caller that has chosen one conjoins it with the schema. Empty when the
- * schema is outside the supported subset, so absence proves nothing.
- */
-export function findMissingProperties(schema: unknown, value: unknown): Set<string> {
-  const missing = new Set<string>();
-  if (!validateJsonSchemaSubsetSchema(schema).success) {
-    return missing;
-  }
-  const validate = compileSchema(schema);
-  if (validate(value)) {
-    return missing;
-  }
-  for (const error of validate.errors ?? []) {
-    if (
-      error.instancePath === "" &&
-      typeof error.params.missingProperty === "string" &&
-      !/\/(?:anyOf|oneOf)\//u.test(error.schemaPath)
-    ) {
-      missing.add(error.params.missingProperty);
-    }
-  }
-  return missing;
-}
-
 function compileSchema(schema: unknown): ValidateFunction {
-  const key = JSON.stringify(schema);
+  const validatorSchema = isPlainRecord(schema) ? toValidatorSchema(schema) : schema;
+  const key = JSON.stringify(validatorSchema);
   const cached = validatorCache.get(key);
   if (cached != null) {
     // Re-insert so Map iteration order doubles as recency order.
@@ -127,11 +114,11 @@ function compileSchema(schema: unknown): ValidateFunction {
   }
   let validate: ValidateFunction;
   try {
-    validate = ajv.compile(schema as AnySchema);
+    validate = ajv.compile(validatorSchema as AnySchema);
   } finally {
-    // Ajv registers every compiled schema object (and its `$id`) for `$ref`
-    // resolution; `$ref` is rejected above, so the compiled closure stands alone.
-    ajv.removeSchema(schema as AnySchema);
+    // Ajv caches every schema object it compiles; `$ref` is rejected above, so
+    // the compiled closure stands alone and only this module's map retains it.
+    ajv.removeSchema(validatorSchema as AnySchema);
   }
   validatorCache.set(key, validate);
   if (validatorCache.size > VALIDATOR_CACHE_MAX_ENTRIES) {
