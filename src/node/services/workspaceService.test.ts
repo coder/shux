@@ -9519,6 +9519,16 @@ describe("WorkspaceService initialize", () => {
       // 12 → 16 between two separate reads could hide the entry from both).
       expect(await readWorkspaceMemoryDenyMarkerForEpochs(sessionDir, [16, -1, 12])).toBe(true);
       expect(await readWorkspaceMemoryDenyMarkerForEpochs(sessionDir, [16, -1])).toBe(false);
+      // Epochs outside the domain (-1 or a history sequence) are corruption:
+      // the marker reads as malformed, a deny for every epoch.
+      const markerPath = workspaceMemoryDenyMarkerPath(sessionDir);
+      const savedMarker = await fsPromises.readFile(markerPath, "utf-8");
+      await fsPromises.writeFile(
+        markerPath,
+        JSON.stringify({ deniedAt: Date.now(), epochs: [-2], wildcard: false })
+      );
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 16)).toBe(true);
+      await fsPromises.writeFile(markerPath, savedMarker);
       expect(
         await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
           epochHasPriorTurns: false,

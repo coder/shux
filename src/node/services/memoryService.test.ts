@@ -1741,7 +1741,10 @@ describe("MemoryService", () => {
       const manifest = JSON.parse(
         await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
       ) as Record<string, { target: string; created?: boolean }>;
-      expect(Object.keys(manifest)).toEqual(["imported/ws-child/a.md"]);
+      // The old record stays as a tombstone (rollbacks of the child's
+      // pre-sharing rows for a.md still need its mapping).
+      expect(Object.keys(manifest).sort()).toEqual(["a.md", "imported/ws-child/a.md"]);
+      expect(manifest["a.md"]).toMatchObject({ deleted: true });
       expect(manifest["imported/ws-child/a.md"]).toMatchObject({
         target: "imported/ws-child/a.md",
         created: true,
@@ -1793,12 +1796,15 @@ describe("MemoryService", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
       await fsPromises.writeFile(path.join(legacyRoot, "sub", "note.md"), "v2 (downgrade)");
       await fixture.service.listIndexEntries({ ...fixture.ctx });
-      expect(
-        await fsPromises.readFile(
-          path.join(ownerRoot, "imported", "ws-child", "sub", "note.md"),
-          "utf-8"
-        )
-      ).toBe("v2 (downgrade)");
+      // The copy this adoption created was untouched by the owner: the new
+      // bytes replace it in place (an imported/ duplicate would strand the
+      // old copy, provenance lost, in the shared notebook).
+      expect(await fsPromises.readFile(path.join(ownerRoot, "sub", "note.md"), "utf-8")).toBe(
+        "v2 (downgrade)"
+      );
+      expect(await pathExists(path.join(ownerRoot, "imported", "ws-child", "sub", "note.md"))).toBe(
+        false
+      );
       // Sidecar-only change (a pin toggled on the old build under the child
       // key): no file stat changes at all, yet the owner key must follow.
       const childKey = memoryLogicalKey("workspace", "sub/note.md", {
@@ -1807,16 +1813,35 @@ describe("MemoryService", () => {
       });
       await fixture.metaService.setPinned(childKey, true);
       await fixture.service.listIndexEntries({ ...fixture.ctx });
-      // The pin lands on the owner key of the note's current copy (the
-      // imported one, since the owner path holds the older bytes).
       expect(
         (await fixture.metaService.getPinnedKeys()).has(
-          memoryLogicalKey("workspace", "imported/ws-child/sub/note.md", {
+          memoryLogicalKey("workspace", "sub/note.md", {
             projectPath: "",
             workspaceId: "ws-owner",
           })
         )
       ).toBe(true);
+      // Once the OWNER edited the copy it is the owner's: a further legacy
+      // edit is placed anew under imported/.
+      await fixture.service.strReplace(
+        { ...fixture.ctx, workspaceId: "ws-owner" },
+        "/memories/workspace/sub/note.md",
+        "v2",
+        "owner's v3",
+        "agent"
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.writeFile(path.join(legacyRoot, "sub", "note.md"), "v4 (downgrade)");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(
+        await fsPromises.readFile(
+          path.join(ownerRoot, "imported", "ws-child", "sub", "note.md"),
+          "utf-8"
+        )
+      ).toBe("v4 (downgrade)");
+      expect(await fsPromises.readFile(path.join(ownerRoot, "sub", "note.md"), "utf-8")).toBe(
+        "owner's v3 (downgrade)"
+      );
     });
 
     it("follows legacy deletions and renames for copies the adoption created, never owner notes", async () => {
@@ -1898,12 +1923,16 @@ describe("MemoryService", () => {
       } finally {
         lossy.mockRestore();
       }
+      // ...and the edited source replaces its untouched adopted copy in place.
       expect(
         (await fixture.service.listIndexEntries({ ...fixture.ctx }))
           .filter((entry) => entry.scope === "workspace")
           .map((entry) => entry.relPath)
           .sort()
-      ).toEqual(["edited.md", "imported/ws-child/renamed.md", "renamed.md", "same.md"]);
+      ).toEqual(["edited.md", "renamed.md", "same.md"]);
+      expect(await fsPromises.readFile(path.join(ownerRoot, "renamed.md"), "utf-8")).toBe(
+        "to be renamed (v2)"
+      );
     });
 
     it("keeps the owner's pin when a downgraded build only viewed the adopted note", async () => {
@@ -2120,6 +2149,64 @@ describe("MemoryService", () => {
       await fixture.service.listIndexEntries({ ...fixture.ctx });
       expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
       expect(await pathExists(path.join(ownerRoot, "imported", "ws-child", "note.md"))).toBe(false);
+    });
+
+    it("never represents a legacy note through a symlinked owner path", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      // Owner path is a link to an unlisted dotfile with identical bytes:
+      // following it would call the note "already represented" while the
+      // shared notebook never lists it.
+      await fsPromises.writeFile(path.join(ownerRoot, ".hidden"), "child notes");
+      await fsPromises.symlink(".hidden", path.join(ownerRoot, "note.md"));
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "child notes");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(
+        await fsPromises.readFile(path.join(ownerRoot, "imported", "ws-child", "note.md"), "utf-8")
+      ).toBe("child notes");
+      expect((await fsPromises.lstat(path.join(ownerRoot, "note.md"))).isSymbolicLink()).toBe(true);
+    });
+
+    it("keeps a tombstoned record for a deleted legacy source and re-adopts a reappearing one", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(legacyRoot, "note.md"));
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await pathExists(path.join(ownerRoot, "note.md"))).toBe(false);
+      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const tombstoned = JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+        string,
+        { deleted?: boolean; target: string }
+      >;
+      expect(tombstoned["note.md"]).toMatchObject({ target: "note.md", deleted: true });
+      // A copy restored into the shared store (a rollback of the deletion)
+      // is not reconciled away again: the tombstone is final.
+      await fsPromises.writeFile(path.join(ownerRoot, "note.md"), "v1");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/other.md", "o", "agent");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await pathExists(path.join(ownerRoot, "note.md"))).toBe(true);
+      // The source reappears on the old build: adopted as a fresh note.
+      await fsPromises.rm(path.join(ownerRoot, "note.md"));
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v2");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v2");
+      const readopted = JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+        string,
+        { deleted?: boolean; created?: boolean }
+      >;
+      expect(readopted["note.md"]).toMatchObject({ created: true });
+      expect(readopted["note.md"].deleted).toBeUndefined();
     });
 
     it("keeps adopting a legacy note named __proto__ exactly once", async () => {
@@ -3083,6 +3170,12 @@ describe("MemoryService", () => {
       expect(afterRow.data.sourceTs).toBeUndefined();
       expect(afterRow.data.orderUnknown).toBe(true);
       expect(await fsPromises.readFile(revisionPath, "utf-8")).toBe("garbage");
+      // A numeric PREFIX is malformed too (parseInt would accept it).
+      await fsPromises.writeFile(revisionPath, "2000000000000000e1");
+      await fixture.service.create(ownerCtx, "/memories/workspace/after2.md", "x", "agent");
+      const after2 = (await readRefinementEvents(ownerSessionDir)).at(-1)!;
+      expect(after2.data.orderUnknown).toBe(true);
+      expect(await fsPromises.readFile(revisionPath, "utf-8")).toBe("2000000000000000e1");
     });
 
     it("refuses a rollback while a peer's adoption manifest cannot be read", async () => {

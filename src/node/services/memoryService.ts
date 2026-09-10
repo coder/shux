@@ -1338,7 +1338,10 @@ export class MemoryService extends EventEmitter {
           target: "",
           created: false,
         };
-        const previous = adopted.get(relPath);
+        // A record whose source was reconciled as deleted is kept only for
+        // the path mapping (rollbacks); a reappearing source is a fresh note.
+        const priorRecord = adopted.get(relPath);
+        const previous = priorRecord?.deleted === true ? undefined : priorRecord;
         if (
           previous?.content === record.content &&
           previous.sidecar === record.sidecar &&
@@ -1346,48 +1349,40 @@ export class MemoryService extends EventEmitter {
         ) {
           continue; // folded in earlier, nothing changed since
         }
-        let target: { relPath: string; write: boolean } | null = null;
-        if (previous?.content === record.content) {
-          // Bytes already adopted and only the sidecar changed: the recorded
-          // target is reused only while it still holds the adopted bytes —
-          // the owner may have edited, replaced or deleted it since, and the
-          // child's pin must not land on unrelated content or a missing
-          // file. Otherwise the note is placed anew like a fresh adoption.
+        let target: { relPath: string; write: boolean; replaces?: boolean } | null = null;
+        if (previous !== undefined) {
+          // The recorded target is reused only while it still holds bytes
+          // this adoption put there — the owner may have edited, replaced or
+          // deleted it since, and the child's note must not land on unrelated
+          // content or a missing file. Unchanged legacy bytes (only the
+          // sidecar moved): reuse without a write. Legacy bytes edited on the
+          // downgraded build while the copy THIS adoption created is still
+          // untouched: the copy is replaced in place — placing the new bytes
+          // elsewhere would strand the old copy, provenance lost, in the
+          // model-visible notebook. Otherwise the note is placed anew.
           // Inspected strictly: a prior target that merely cannot be stat'ed
-          // or read right now is not "replaced" — placing the note anew would
-          // leave the original copy visible without provenance for good.
-          // Retry on the next access instead (the pass stays incomplete).
+          // or read right now is not "replaced" — retry on the next access
+          // instead (the pass stays incomplete).
           let priorContent: string | null;
           try {
-            const contained = await store.assertContained(previous.target).then(
-              () => true,
-              () => false
-            );
-            priorContent =
-              contained && (await store.kind(previous.target, { strict: true })) === "file"
-                ? await this.readBoundedTextFile(store, previous.target, previous.target)
-                : null;
+            priorContent = await this.inspectAdoptedCopy(store, previous.target);
           } catch (error) {
-            if (error instanceof MemoryCommandError) {
-              priorContent = null; // over the cap: the owner changed it
-            } else {
-              log.warn(
-                "[MemoryService] cannot inspect an adopted note's prior copy; retrying later",
-                {
-                  childId,
-                  owner,
-                  relPath,
-                  target: previous.target,
-                  error,
-                }
-              );
-              skipped++;
-              continue;
-            }
+            log.warn(
+              "[MemoryService] cannot inspect an adopted note's prior copy; retrying later",
+              { childId, owner, relPath, target: previous.target, error }
+            );
+            skipped++;
+            continue;
           }
           if (priorContent === content) {
             target = { relPath: previous.target, write: false };
             record.created = previous.created === true;
+          } else if (
+            previous.created === true &&
+            priorContent !== null &&
+            sha256Hex(priorContent) === previous.content
+          ) {
+            target = { relPath: previous.target, write: true, replaces: true };
           }
         }
         if (target === null) {
@@ -1396,45 +1391,45 @@ export class MemoryService extends EventEmitter {
             skipped++;
             continue;
           }
-          if (target.write) {
-            if (remainingCapacity <= 0) {
-              capacityExhausted = true;
-              skipped++;
-              continue;
-            }
-            // Destination containment immediately before the write (the
-            // same check a memory create runs): a symlinked component under
-            // the owner root — e.g. imported/<child> pointing elsewhere —
-            // must never let the copy land outside the store.
-            try {
-              await store.assertContained(target.relPath);
-            } catch (error) {
-              log.warn("[MemoryService] refusing to adopt a legacy note into an escaping path", {
-                childId,
-                relPath,
-                target: target.relPath,
-                error,
-              });
-              skipped++;
-              continue;
-            }
-            // Provenance BEFORE the copy: interrupted here (crash, or the
-            // sidecar fold below failing), the retry finds the owner file
-            // already identical and takes the no-write path — without this
-            // record it would read as the owner's own note, and a legacy
-            // deletion could then never follow it out of the shared store.
-            adopted.set(relPath, {
-              ...record,
-              target: target.relPath,
-              created: true,
-              pending: true,
-            });
-            await writeManifest();
-            await store.writeFile(target.relPath, content);
-            remainingCapacity--;
-            imported++;
-            record.created = true;
+        }
+        if (target.write) {
+          if (target.replaces !== true && remainingCapacity <= 0) {
+            capacityExhausted = true;
+            skipped++;
+            continue;
           }
+          // Destination containment immediately before the write (the
+          // same check a memory create runs): a symlinked component under
+          // the owner root — e.g. imported/<child> pointing elsewhere —
+          // must never let the copy land outside the store.
+          try {
+            await store.assertContained(target.relPath);
+          } catch (error) {
+            log.warn("[MemoryService] refusing to adopt a legacy note into an escaping path", {
+              childId,
+              relPath,
+              target: target.relPath,
+              error,
+            });
+            skipped++;
+            continue;
+          }
+          // Provenance BEFORE the copy: interrupted here (crash, or the
+          // sidecar fold below failing), the retry finds the owner file
+          // already identical and takes the no-write path — without this
+          // record it would read as the owner's own note, and a legacy
+          // deletion could then never follow it out of the shared store.
+          adopted.set(relPath, {
+            ...record,
+            target: target.relPath,
+            created: true,
+            pending: true,
+          });
+          await writeManifest();
+          await store.writeFile(target.relPath, content);
+          if (target.replaces !== true) remainingCapacity--;
+          imported++;
+          record.created = true;
         }
         record.target = target.relPath;
         // Pins/stats were keyed by the child: fold them into the owner key.
@@ -1492,7 +1487,7 @@ export class MemoryService extends EventEmitter {
       // above; a failed listing never reaches this point.
       const listed = new Set(files);
       for (const [relPath, previous] of adopted) {
-        if (listed.has(relPath)) continue;
+        if (listed.has(relPath) || previous.deleted === true) continue;
         // Absence from the listing is not proof: LocalMemoryStore.listFiles
         // tolerates readdir failures (a partial list). Only a provable ENOENT
         // on the source itself counts; any other outcome keeps the entry
@@ -1592,7 +1587,11 @@ export class MemoryService extends EventEmitter {
             });
           }
         }
-        adopted.delete(relPath);
+        // Kept as a tombstone, not dropped: the child's pre-sharing rows for
+        // this note still need relPath → target to be rolled back into the
+        // shared store (a delete's restore lands at the reconciled target;
+        // the reconciliation above never runs again for it).
+        adopted.set(relPath, { ...previous, deleted: true });
         manifestDirty = true;
       }
       if (manifestDirty) await writeManifest();
@@ -1652,6 +1651,14 @@ export class MemoryService extends EventEmitter {
         () => false
       );
       if (!contained) continue;
+      // A symlink is never a destination: the store's listing excludes links
+      // (and dotfiles), so a note "represented" through one would be
+      // invisible to the shared notebook, and a write would land through it.
+      const linkKind = await lstatKind(store.physicalPath(candidate));
+      if (linkKind === "unreadable") {
+        throw new Error(`cannot inspect adoption destination ${candidate}`);
+      }
+      if (linkKind === "symlink") continue;
       // Strict: a destination that merely could not be stat'ed (EACCES, EIO)
       // is not free — declaring it so would overwrite whatever the owner
       // keeps there once the copy runs. The failure aborts the pass instead
@@ -1666,6 +1673,29 @@ export class MemoryService extends EventEmitter {
       }
     }
     return null;
+  }
+
+  /**
+   * Content of an adopted note's copy in the owner store, or null when no
+   * regular listed file is there (absent, a directory, a symlink, or grown
+   * past the cap — each a change the owner made). Throws when the copy
+   * cannot be inspected at all (EACCES, EIO): callers retry later.
+   */
+  private async inspectAdoptedCopy(store: MemoryStore, relPath: string): Promise<string | null> {
+    const contained = await store.assertContained(relPath).then(
+      () => true,
+      () => false
+    );
+    if (!contained) return null;
+    const linkKind = await lstatKind(store.physicalPath(relPath));
+    if (linkKind === "unreadable") throw new Error(`cannot inspect adopted copy ${relPath}`);
+    if (linkKind !== "other") return null; // missing, dir, or a symlink
+    try {
+      return await this.readBoundedTextFile(store, relPath, relPath);
+    } catch (error) {
+      if (error instanceof MemoryCommandError) return null; // over the cap
+      throw error;
+    }
   }
 
   /**

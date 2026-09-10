@@ -947,6 +947,30 @@ describe("refinementRollback", () => {
     expect(ownerOwned.success).toBe(false);
     expect(ownerOwned.success ? "" : ownerOwned.error).toContain("owner's own note");
     expect(await pathExists(path.join(ownerSessionDir, "memory", "same.md"))).toBe(true);
+    // A note deleted on the downgraded build and reconciled out of the shared
+    // store keeps a tombstoned record: the child's pre-sharing delete row
+    // still maps, and rolling it back restores the note in the shared store.
+    await fixture.service.create(fixture.ctx, "/memories/workspace/gone.md", "g1\n", "agent");
+    await fixture.service.deletePath(fixture.ctx, "/memories/workspace/gone.md", "agent");
+    const deleteRow = await lastRow(fixture.sessionDir);
+    await fsPromises.writeFile(
+      path.join(fixture.sessionDir, "memory", ".adopted-into-shared-store.json"),
+      JSON.stringify({
+        "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
+        "same.md": { content: "x", sidecar: "", target: "same.md" },
+        "gone.md": { content: "x", sidecar: "", target: "gone.md", created: true, deleted: true },
+      })
+    );
+    const restoredDelete = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: deleteRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(restoredDelete.success).toBe(true);
+    expect(
+      await fsPromises.readFile(path.join(ownerSessionDir, "memory", "gone.md"), "utf-8")
+    ).toBe("g1\n");
   });
 
   it("journals the rollback row before releasing the target locks (no durable-order inversion)", async () => {

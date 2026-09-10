@@ -33,6 +33,15 @@ export interface LegacyAdoptionRecord {
   target: string;
   created?: boolean;
   pending?: boolean;
+  /**
+   * The legacy source was deleted (or renamed away) on a downgraded build and
+   * the copy reconciled. Kept rather than dropped: the child's pre-sharing
+   * refinement rows for this note (a delete's restore inverse, a rename's
+   * mirrored rename) still address the legacy path and need the mapping to
+   * be rolled back into the shared store; a reappearing source is adopted
+   * afresh (the record's other fields are stale then).
+   */
+  deleted?: boolean;
 }
 
 function isLegacyAdoptionRecord(value: unknown): value is LegacyAdoptionRecord {

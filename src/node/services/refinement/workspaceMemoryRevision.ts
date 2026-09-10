@@ -50,7 +50,10 @@ async function readWorkspaceMemoryRevisionStrict(ownerSessionDir: string): Promi
     if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return null;
     throw error;
   }
-  const value = Number.parseInt(raw, 10);
+  // The persisted format is exactly the decimal digits of a positive safe
+  // integer (parseInt would accept a numeric prefix of anything).
+  const trimmed = raw.trim();
+  const value = /^[1-9][0-9]{0,15}$/.test(trimmed) ? Number(trimmed) : Number.NaN;
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(
       `workspace memory revision at ${revisionPath} is malformed: ${raw.slice(0, 32)}`
