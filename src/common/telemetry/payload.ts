@@ -20,6 +20,8 @@
  * code only needs to provide event-specific properties.
  */
 
+import type { z } from "zod";
+import type { AdvisorCallCompletedPropertiesSchema } from "@/common/orpc/schemas/telemetry";
 import type { RuntimeMode } from "@/common/types/runtime";
 
 /**
@@ -243,9 +245,9 @@ export interface StreamTimingInvalidPayload {
   reason: string;
 }
 
-/**
- * Stream completion event - tracks when AI responses finish
- */
+/** Advisor cache measurements use rounded values, not prompt content. */
+export type AdvisorCallCompletedPayload = z.infer<typeof AdvisorCallCompletedPropertiesSchema>;
+
 export interface StreamCompletedPayload {
   /** Model used for generation */
   model: string;
@@ -359,6 +361,7 @@ export interface ExperimentOverriddenPayload {
  * Frontend sends these; backend adds BaseTelemetryProperties before forwarding to PostHog
  */
 export type TelemetryEventPayload =
+  | { event: "advisor_call_completed"; properties: AdvisorCallCompletedPayload }
   | { event: "app_started"; properties: AppStartedPayload }
   | { event: "workspace_created"; properties: WorkspaceCreatedPayload }
   | { event: "workspace_switched"; properties: WorkspaceSwitchedPayload }

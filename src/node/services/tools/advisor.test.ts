@@ -7,6 +7,8 @@ import {
   ADVISOR_HANDOFF_MAX_REASONING_CHARS,
   ADVISOR_HANDOFF_MAX_TEXT_CHARS,
 } from "@/common/constants/advisor";
+import { TelemetryEventSchema } from "@/common/orpc/schemas/telemetry";
+import type { AdvisorCallCompletedPayload } from "@/common/telemetry/payload";
 import type { ModelMessage } from "@/common/types/message";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AdvisorToolCallSnapshot, ToolModelUsageEvent } from "@/common/utils/tools/tools";
@@ -40,6 +42,9 @@ function createToolConfig(
   tempDir: string,
   options?: {
     reportModelUsage?: Parameters<typeof createAdvisorTool>[0]["reportModelUsage"];
+    reportTelemetry?: NonNullable<
+      Parameters<typeof createAdvisorTool>[0]["advisorRuntime"]
+    >["reportTelemetry"];
     metadataModel?: string;
     transcript?: ModelMessage[];
     snapshot?: AdvisorToolCallSnapshot | undefined;
@@ -65,6 +70,7 @@ function createToolConfig(
     emitChatEvent: options?.emitChatEvent,
     reportModelUsage: options?.reportModelUsage,
     advisorRuntime: {
+      reportTelemetry: options?.reportTelemetry,
       advisorModelString: ADVISOR_MODEL,
       reasoningLevel: "medium",
       maxUsesPerTurn: 3,
@@ -85,7 +91,13 @@ type StreamTextFinishReason = Awaited<StreamTextResult["finishReason"]>;
 
 function mockStreamTextSuccess(result: {
   text: string;
-  usage: LanguageModelV2Usage;
+  usage: LanguageModelV2Usage & {
+    inputTokenDetails?: {
+      noCacheTokens?: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+    };
+  };
   providerMetadata?: Record<string, unknown>;
   chunks?: Array<{ type: string; text?: string; delta?: string; textDelta?: string }>;
   finishReason?: StreamTextFinishReason;
@@ -111,13 +123,13 @@ function mockStreamTextSuccess(result: {
   }) as unknown as typeof ai.streamText);
 }
 
-function mockStreamTextFailure(error: Error) {
+function mockStreamTextFailure(error: Error, usage?: LanguageModelV2Usage) {
   return spyOn(ai, "streamText").mockImplementation(
     (() =>
       ({
         text: Promise.reject(error),
         finishReason: Promise.resolve("error"),
-        usage: Promise.resolve(undefined),
+        usage: Promise.resolve(usage),
         providerMetadata: Promise.resolve(undefined),
       }) as unknown as StreamTextResult) as unknown as typeof ai.streamText
   );
@@ -638,6 +650,160 @@ describe("advisor tool", () => {
     expect(Object.prototype.hasOwnProperty.call(streamTextArgs ?? {}, "maxOutputTokens")).toBe(
       false
     );
+  });
+
+  describe("completion telemetry", () => {
+    it("reports SDK7 cache usage and first-token timing once", async () => {
+      using tempDir = new TestTempDir("advisor-telemetry-sdk7");
+      const reportTelemetry = mock((_event: AdvisorCallCompletedPayload) => undefined);
+      const { config } = createToolConfig(tempDir.path, { reportTelemetry });
+      mockStreamTextSuccess({
+        text: "Use a queue.",
+        chunks: [
+          { type: "reasoning-delta", text: "Check ordering." },
+          { type: "text-delta", text: "Use a queue." },
+        ],
+        usage: {
+          inputTokens: 128,
+          outputTokens: 16,
+          totalTokens: 144,
+          inputTokenDetails: { noCacheTokens: 32, cacheReadTokens: 64, cacheWriteTokens: 32 },
+        },
+      });
+
+      const tool = createAdvisorTool(config);
+      await tool.execute!({}, mockToolCallOptions);
+
+      expect(reportTelemetry).toHaveBeenCalledTimes(1);
+      expect(reportTelemetry.mock.calls[0]?.[0]).toMatchObject({
+        outcome: "success",
+        call_index: 1,
+        usage_available: true,
+        input_tokens_b2: 128,
+        cache_read_tokens_b2: 64,
+        cache_write_tokens_b2: 32,
+        uncached_input_tokens_b2: 32,
+        output_tokens_b2: 16,
+      });
+      expect(typeof reportTelemetry.mock.calls[0]?.[0].duration_ms_b2).toBe("number");
+      expect(typeof reportTelemetry.mock.calls[0]?.[0].time_to_first_token_ms_b2).toBe("number");
+      const event = {
+        event: "advisor_call_completed" as const,
+        properties: reportTelemetry.mock.calls[0]?.[0],
+      };
+      expect(TelemetryEventSchema.parse(event)).toEqual(event);
+    });
+
+    it("excludes rejected calls from telemetry and increments admitted call indexes", async () => {
+      using tempDir = new TestTempDir("advisor-telemetry-limit");
+      const reportTelemetry = mock((_event: AdvisorCallCompletedPayload) => undefined);
+      const { config } = createToolConfig(tempDir.path, { reportTelemetry });
+      mockStreamTextSuccess({
+        text: "Proceed.",
+        usage: { inputTokens: 8, outputTokens: 4, totalTokens: 12 },
+      });
+      const tool = createAdvisorTool(config);
+      for (let index = 0; index < 3; index++) {
+        await tool.execute!({}, mockToolCallOptions);
+      }
+      const rejected: unknown = await tool.execute!({}, mockToolCallOptions);
+
+      expect(rejected).toEqual(expect.objectContaining({ type: "limit_reached" }));
+      expect(reportTelemetry).toHaveBeenCalledTimes(3);
+      expect(reportTelemetry.mock.calls.map(([event]) => event.call_index)).toEqual([1, 2, 3]);
+      for (const [event] of reportTelemetry.mock.calls) {
+        expect(event.outcome).toBe("success");
+        expect(event.time_to_first_token_ms_b2).toBeNull();
+      }
+    });
+
+    it.each([
+      ["error", new Error("request failed")],
+      ["cancelled", new DOMException("request cancelled", "AbortError")],
+    ] as const)("reports %s without usage when the stream rejects", async (outcome, error) => {
+      using tempDir = new TestTempDir("advisor-telemetry-no-usage");
+      const reportTelemetry = mock((_event: AdvisorCallCompletedPayload) => undefined);
+      const { config } = createToolConfig(tempDir.path, { reportTelemetry });
+      mockStreamTextFailure(error);
+      const tool = createAdvisorTool(config);
+      await tool.execute!({}, mockToolCallOptions);
+
+      expect(reportTelemetry).toHaveBeenCalledTimes(1);
+      expect(reportTelemetry.mock.calls[0]?.[0]).toMatchObject({
+        outcome,
+        call_index: 1,
+        usage_available: false,
+        input_tokens_b2: null,
+        cache_read_tokens_b2: null,
+        cache_write_tokens_b2: null,
+        uncached_input_tokens_b2: null,
+        output_tokens_b2: null,
+        time_to_first_token_ms_b2: null,
+      });
+      expect(typeof reportTelemetry.mock.calls[0]?.[0].duration_ms_b2).toBe("number");
+    });
+
+    it("retains resolved usage when the text promise rejects", async () => {
+      using tempDir = new TestTempDir("advisor-telemetry-failed-usage");
+      const reportTelemetry = mock((_event: AdvisorCallCompletedPayload) => undefined);
+      const { config } = createToolConfig(tempDir.path, { reportTelemetry });
+      mockStreamTextFailure(new Error("stream failed"), {
+        inputTokens: 64,
+        outputTokens: 8,
+        totalTokens: 72,
+      });
+      const tool = createAdvisorTool(config);
+      await tool.execute!({}, mockToolCallOptions);
+
+      expect(reportTelemetry).toHaveBeenCalledTimes(1);
+      expect(reportTelemetry.mock.calls[0]?.[0]).toMatchObject({
+        outcome: "error",
+        usage_available: true,
+        input_tokens_b2: 64,
+        output_tokens_b2: 8,
+      });
+    });
+
+    it("retains usage when an error chunk ends the stream", async () => {
+      using tempDir = new TestTempDir("advisor-telemetry-error-chunk");
+      const reportTelemetry = mock((_event: AdvisorCallCompletedPayload) => undefined);
+      const { config } = createToolConfig(tempDir.path, { reportTelemetry });
+      mockStreamTextSuccess({
+        text: "Partial advice.",
+        finishReason: "error",
+        streamError: new Error("stream failed"),
+        chunks: [{ type: "text-delta", text: "Partial advice." }],
+        usage: { inputTokens: 64, outputTokens: 8, totalTokens: 72 },
+      });
+      const tool = createAdvisorTool(config);
+      await tool.execute!({}, mockToolCallOptions);
+
+      expect(reportTelemetry).toHaveBeenCalledTimes(1);
+      expect(reportTelemetry.mock.calls[0]?.[0]).toMatchObject({
+        outcome: "error",
+        usage_available: true,
+        input_tokens_b2: 64,
+        output_tokens_b2: 8,
+      });
+      expect(typeof reportTelemetry.mock.calls[0]?.[0].time_to_first_token_ms_b2).toBe("number");
+    });
+
+    it("returns advice when telemetry reporting throws", async () => {
+      using tempDir = new TestTempDir("advisor-telemetry-callback-error");
+      const reportTelemetry = mock((_event: AdvisorCallCompletedPayload) => {
+        throw new Error("telemetry failed");
+      });
+      const { config } = createToolConfig(tempDir.path, { reportTelemetry });
+      mockStreamTextSuccess({
+        text: "Use a queue.",
+        usage: { inputTokens: 8, outputTokens: 4, totalTokens: 12 },
+      });
+      const tool = createAdvisorTool(config);
+      const result: unknown = await tool.execute!({}, mockToolCallOptions);
+
+      expect(result).toEqual(expect.objectContaining({ type: "advice", advice: "Use a queue." }));
+      expect(reportTelemetry).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("does not report usage when the advisor model call fails", async () => {

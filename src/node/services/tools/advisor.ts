@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import type { AdvisorCallCompletedPayload } from "@/common/telemetry/payload";
+import { roundToBase2 } from "@/common/telemetry/utils";
+import { advisorCachePolicy, advisorUsageTelemetry } from "./advisorTelemetry";
 
 import { streamText, tool, type Tool } from "ai";
 
@@ -154,6 +158,7 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
   assert(typeof runtime.createModel === "function", "advisor createModel must be a function");
 
   let usesThisTurn = 0;
+  let previousCallStartedAt: number | undefined;
 
   return tool({
     description: TOOL_DEFINITIONS.advisor.description,
@@ -233,6 +238,17 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
       }
       // Reserve the slot before any await so concurrent advisor calls cannot bypass the per-turn cap.
       usesThisTurn++;
+      const callIndex = usesThisTurn;
+      const startedAt = performance.now();
+      const previousCallGap =
+        previousCallStartedAt == null ? null : startedAt - previousCallStartedAt;
+      previousCallStartedAt = startedAt;
+      let outcome: AdvisorCallCompletedPayload["outcome"] = "error";
+      let firstTokenAt: number | undefined;
+      let telemetryModel = advisorModelString;
+      let providerRoute: string | null = null;
+      let telemetryResult: ReturnType<typeof streamText> | undefined;
+      let cachePolicy = advisorCachePolicy([]);
       const remainingUses =
         runtime.maxUsesPerTurn !== null ? runtime.maxUsesPerTurn - usesThisTurn : null;
 
@@ -241,17 +257,17 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
       // which cannot be replayed against a different provider (e.g. OpenAI
       // rejects foreign `srvtoolu_...` ids as unknown item_references). See
       // flattenProviderExecutedToolParts for details.
-      const transcript = flattenProviderExecutedToolParts(runtime.getTranscriptSnapshot());
-      assert(Array.isArray(transcript), "advisor transcript snapshot must be an array");
-      assert(transcript.length > 0, "advisor transcript snapshot must not be empty");
-      assert(toolCallId, "advisor requires toolCallId");
-
-      const snapshot = runtime.takeToolCallSnapshot(toolCallId);
-      const handoffMessage = buildAdvisorHandoffMessage(question, snapshot);
-      const messages: ModelMessage[] =
-        handoffMessage != null ? [...transcript, handoffMessage] : transcript;
-
       try {
+        const transcript = flattenProviderExecutedToolParts(runtime.getTranscriptSnapshot());
+        assert(Array.isArray(transcript), "advisor transcript snapshot must be an array");
+        assert(transcript.length > 0, "advisor transcript snapshot must not be empty");
+        assert(toolCallId, "advisor requires toolCallId");
+
+        const snapshot = runtime.takeToolCallSnapshot(toolCallId);
+        const handoffMessage = buildAdvisorHandoffMessage(question, snapshot);
+        const messages: ModelMessage[] =
+          handoffMessage != null ? [...transcript, handoffMessage] : transcript;
+
         const {
           model,
           metadataModel,
@@ -280,6 +296,9 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
           runtime.reasoningMode
         ) as unknown as StreamTextProviderOptions;
 
+        telemetryModel = metadataModel ?? optionsModelString;
+        providerRoute = optionsRouteProvider ?? null;
+        cachePolicy = advisorCachePolicy(messages, providerOptions);
         emitAdvisorPhase("waiting_for_response");
 
         let advisorStreamError: unknown;
@@ -302,6 +321,12 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
             advisorStreamError = error;
           },
           onChunk: ({ chunk }) => {
+            if (
+              firstTokenAt == null &&
+              (getAdvisorReasoningDelta(chunk) != null || getAdvisorTextDelta(chunk) != null)
+            ) {
+              firstTokenAt = performance.now();
+            }
             const reasoningText = getAdvisorReasoningDelta(chunk);
             if (reasoningText != null) {
               emitAdvisorReasoningOutput(reasoningText);
@@ -317,6 +342,7 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
             emitAdvisorOutput(text);
           },
         });
+        telemetryResult = result;
         const finalAdvice = await result.text;
         const finishReason = await result.finishReason;
         if (advisorStreamError != null || finishReason === "error") {
@@ -366,6 +392,7 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
           }
         }
 
+        outcome = "success";
         return {
           type: "advice" as const,
           advice,
@@ -375,6 +402,7 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
         };
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
+          outcome = "cancelled";
           return {
             type: "error" as const,
             isError: true,
@@ -387,6 +415,39 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
           isError: true,
           message: `Advisor request failed: ${sanitizeErrorMessageForDisplay(getErrorMessage(error))}`,
         };
+      } finally {
+        if (runtime.reportTelemetry) {
+          try {
+            const finishedAt = performance.now();
+            const [usageResult, metadataResult] = await Promise.allSettled([
+              telemetryResult?.usage,
+              telemetryResult?.providerMetadata,
+            ]);
+            const usage = usageResult.status === "fulfilled" ? usageResult.value : undefined;
+            const metadata =
+              metadataResult.status === "fulfilled" ? metadataResult.value : undefined;
+            runtime.reportTelemetry({
+              call_id: randomUUID(),
+              provider_route: providerRoute,
+              workspaceId: config.workspaceId,
+              outcome:
+                (abortSignal ?? runtime.abortSignal).aborted && outcome !== "success"
+                  ? "cancelled"
+                  : outcome,
+              call_index: callIndex,
+              previous_call_gap_ms_b2:
+                previousCallGap == null ? null : roundToBase2(previousCallGap),
+              duration_ms_b2: roundToBase2(finishedAt - startedAt),
+              time_to_first_token_ms_b2:
+                firstTokenAt == null ? null : roundToBase2(firstTokenAt - startedAt),
+              ...cachePolicy,
+              ...advisorUsageTelemetry(telemetryModel, usage, metadata, cachePolicy.cache_ttl),
+            });
+          } catch (error) {
+            // Telemetry must not change the advisor result.
+            log.debug("advisor: failed to report telemetry", { error: getErrorMessage(error) });
+          }
+        }
       }
     },
   });

@@ -1,3 +1,4 @@
+import type { AdvisorCallCompletedPayload } from "@/common/telemetry/payload";
 import type { HistoryService } from "@/node/services/historyService";
 import { createSessionHistoryTool } from "@/node/services/tools/session_history";
 import { createNewContextTool } from "@/node/services/tools/new_context";
@@ -355,6 +356,8 @@ export interface ToolConfiguration {
   };
   /** Runtime bundle for the advisor tool (present only when advisor is eligible for this stream). */
   advisorRuntime?: {
+    /** Report cache economics without sending transcript content. */
+    reportTelemetry?: (event: AdvisorCallCompletedPayload) => void;
     /** The advisor model string (e.g. "anthropic:claude-sonnet-4-20250514") */
     advisorModelString: string;
     /** Optional reasoning/thinking level metadata for the advisor request. */

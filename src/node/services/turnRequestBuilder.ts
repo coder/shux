@@ -2193,6 +2193,12 @@ export class TurnRequestBuilder {
       ...(advisorToolEligible
         ? {
             advisorRuntime: {
+              reportTelemetry: (properties) => {
+                this.dependencies.telemetryService?.capture({
+                  event: "advisor_call_completed",
+                  properties: { ...properties, parent_turn_id: assistantMessageId },
+                });
+              },
               advisorModelString,
               reasoningLevel: advisorReasoningLevel,
               reasoningMode: cfg.advisorReasoningMode,

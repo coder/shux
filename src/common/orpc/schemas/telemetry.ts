@@ -187,6 +187,34 @@ const MCPOAuthFlowFailedPropertiesSchema = z.object({
   error_category: TelemetryMCPOAuthFlowErrorCategorySchema,
 });
 
+export const AdvisorCallCompletedPropertiesSchema = z.object({
+  call_id: z.string(),
+  parent_turn_id: z.string().optional(),
+  provider_route: z.string().nullable(),
+  workspaceId: z.string().optional(),
+  model: z.string(),
+  outcome: z.enum(["success", "error", "cancelled"]),
+  call_index: z.number(),
+  // This gap covers the current tool instance, not the whole workspace history.
+  previous_call_gap_ms_b2: z.number().nullable(),
+  duration_ms_b2: z.number(),
+  time_to_first_token_ms_b2: z.number().nullable(),
+  usage_available: z.boolean(),
+  input_tokens_b2: z.number().nullable(),
+  uncached_input_tokens_b2: z.number().nullable(),
+  cache_read_tokens_b2: z.number().nullable(),
+  cache_write_tokens_b2: z.number().nullable(),
+  output_tokens_b2: z.number().nullable(),
+  // Request markers do not prove that the provider accepts or reuses the cache.
+  cache_marker_count: z.number(),
+  cache_ttl: z.enum(["5m", "1h", "mixed", "unknown"]),
+  // Estimates use catalog rates, not invoice charges. Null means unknown.
+  input_cost_usd_b2: z.number().nullable(),
+  cache_write_premium_usd_b2: z.number().nullable(),
+  cache_read_savings_usd_b2: z.number().nullable(),
+  cache_net_savings_usd_b2: z.number().nullable(),
+});
+
 const StreamCompletedPropertiesSchema = z.object({
   model: z.string(),
   wasInterrupted: z.boolean(),
@@ -228,6 +256,10 @@ const ExperimentOverriddenPropertiesSchema = z.object({
 
 // Union of all telemetry events
 export const TelemetryEventSchema = z.discriminatedUnion("event", [
+  z.object({
+    event: z.literal("advisor_call_completed"),
+    properties: AdvisorCallCompletedPropertiesSchema,
+  }),
   z.object({
     event: z.literal("app_started"),
     properties: AppStartedPropertiesSchema,
