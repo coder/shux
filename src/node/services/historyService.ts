@@ -471,6 +471,32 @@ export class HistoryService {
               boundary,
               isPublicationCurrent: (publication) =>
                 journal.isPublicationCurrentUnderHistoryLock(publication),
+              publishBoundary: async (input, onCommitted) => {
+                // The public partial reader treats errors as absence. Admission must refuse
+                // unreadable state, and cannot re-enter the history reader's lazy rotation.
+                const raw = await fs
+                  .readFile(this.getPartialPath(workspaceId), "utf8")
+                  .catch((error: unknown) => {
+                    if (isErrnoWithCode(error, "ENOENT")) return undefined;
+                    throw error;
+                  });
+                let partial: MuxMessage | null = null;
+                if (raw !== undefined) {
+                  const parsed: unknown = JSON.parse(raw);
+                  if (!isReadableHistoryMessage(parsed))
+                    throw new Error("Compaction partial is unreadable");
+                  partial = normalizeLegacyMuxMetadata(parsed);
+                }
+                return this.persistBoundaryWithTailCopiesUnderWriteLock(
+                  workspaceId,
+                  input.summaryMessage,
+                  input.tailCopies,
+                  input.updateExisting,
+                  (messages) => input.shouldPersist(messages, partial),
+                  { publication: input.publication, onCommitted },
+                  assertStillOwned
+                );
+              },
             });
           })
         ),
@@ -2194,7 +2220,10 @@ export class HistoryService {
    * rotation deduplicates sequence-covered prefix rows only after verifying
    * that the archive contains the same complete row identity.
    */
-  private async rotateSealedHistoryUnlocked(workspaceId: string): Promise<void> {
+  private async rotateSealedHistoryUnlocked(
+    workspaceId: string,
+    assertStillOwned?: () => Promise<void>
+  ): Promise<void> {
     const chatPath = this.getChatHistoryPath(workspaceId);
     const archivePath = this.getChatArchivePath(workspaceId);
 
@@ -2246,6 +2275,7 @@ export class HistoryService {
     if (linesToArchive.length > 0) {
       // Append + fsync BEFORE rewriting chat.jsonl: a crash must never lose
       // sealed rows, only (at worst) duplicate them, which the dedupe above heals.
+      if (assertStillOwned) await assertStillOwned();
       const fh = await fs.open(archivePath, "a+");
       try {
         // A failed archive write can leave a torn tail while chat still contains
@@ -2255,8 +2285,12 @@ export class HistoryService {
           const tail = Buffer.alloc(1);
           const read = await fh.read(tail, 0, 1, size - 1);
           assert(read.bytesRead === 1, "archive tail must remain readable under the history lock");
-          if (tail[0] !== 10) await fh.writeFile("\n");
+          if (tail[0] !== 10) {
+            if (assertStillOwned) await assertStillOwned();
+            await fh.writeFile("\n");
+          }
         }
+        if (assertStillOwned) await assertStillOwned();
         await fh.writeFile(Buffer.concat(linesToArchive));
         await fh.sync();
       } finally {
@@ -2264,7 +2298,9 @@ export class HistoryService {
       }
     }
 
-    await writeFileAtomic(chatPath, activeTail);
+    if (assertStillOwned)
+      await publishCompactionFile(chatPath, activeTail, () => true, undefined, assertStillOwned);
+    else await writeFileAtomic(chatPath, activeTail);
 
     log.debug("Rotated sealed chat history into archive", {
       workspaceId,
@@ -2893,13 +2929,14 @@ export class HistoryService {
    */
   private async rotateAfterBoundaryWriteUnlocked(
     workspaceId: string,
-    message: MuxMessage
+    message: MuxMessage,
+    assertStillOwned?: () => Promise<void>
   ): Promise<void> {
     if (!isDurableContextBoundaryMarker(message)) {
       return;
     }
     try {
-      await this.rotateSealedHistoryUnlocked(workspaceId);
+      await this.rotateSealedHistoryUnlocked(workspaceId, assertStillOwned);
     } catch (error) {
       log.warn("Failed to rotate sealed chat history after boundary write", {
         workspaceId,
@@ -3475,124 +3512,159 @@ export class HistoryService {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to persist compaction boundary with tail copies",
-      async () => {
-        if (
-          commit &&
-          !(await this.getContinuousCompactionJournal(
-            workspaceId
-          ).isPublicationCurrentUnderHistoryLock(commit.publication))
+      () =>
+        this.persistBoundaryWithTailCopiesUnderWriteLock(
+          workspaceId,
+          summaryMessage,
+          tailCopies,
+          updateExisting,
+          shouldPersist,
+          commit
         )
-          return Err("Compaction publication changed");
-        invalidateHistoryAppendProvenance();
-        try {
-          // r52: this path assigns fresh sequences (appended summary + every
-          // preserved tail copy) from the cached counter, so it needs the
-          // same in-lock refresh as the append family — a stale cache would
-          // duplicate a foreign backend's sequences and let a later
-          // updateHistory() replace an unrelated row.
-          await this.refreshSequenceCounterUnderWriteLock(workspaceId);
-          await ensurePrivateDir(this.getSessionDir(workspaceId));
-          const historyPath = this.getChatHistoryPath(workspaceId);
-          const { rows, messages } = await this.readHistoryForRewrite(historyPath);
-          const updates = new Map<MuxMessage, MuxMessage>();
-
-          // Rolling summaries are prepared outside this lock. Edits, resets, and
-          // newly appended rows must win over a stale prepared boundary.
-          if (shouldPersist && !shouldPersist(messages)) return Err("Compaction snapshot changed");
-          const sourceMessages = messages.slice();
-          let persistedSummary: MuxMessage | undefined;
-          if (updateExisting) {
-            // Same replace semantics as updateHistory: match by sequence and
-            // preserve boundary metadata already persisted on the row.
-            const targetSequence = summaryMessage.metadata?.historySequence;
-            if (targetSequence === undefined) {
-              return Err("Cannot update message without historySequence");
-            }
-            assert(
-              isNonNegativeInteger(targetSequence),
-              "persistBoundaryWithTailCopies requires a non-negative historySequence"
-            );
-            for (let i = 0; i < messages.length; i++) {
-              if (messages[i].metadata?.historySequence !== targetSequence) {
-                continue;
-              }
-              const preservedCompactionMetadata = getCompactionMetadataToPreserve(
-                workspaceId,
-                messages[i],
-                summaryMessage
-              );
-              messages[i] = {
-                ...summaryMessage,
-                metadata: {
-                  ...summaryMessage.metadata,
-                  ...(preservedCompactionMetadata ?? {}),
-                  historySequence: targetSequence,
-                },
-              };
-              persistedSummary = messages[i];
-              updates.set(sourceMessages[i], persistedSummary);
-              break;
-            }
-            if (persistedSummary === undefined) {
-              return Err(`No message found with historySequence ${targetSequence}`);
-            }
-          } else {
-            // Append semantics: assign the next sequence in place so callers
-            // observe it, exactly like appendToHistory does.
-            assert(
-              summaryMessage.metadata?.historySequence === undefined,
-              "persistBoundaryWithTailCopies append expects an unsequenced summary"
-            );
-            const nextSeqNum = await this.getNextHistorySequence(workspaceId);
-            summaryMessage.metadata = {
-              ...summaryMessage.metadata,
-              historySequence: nextSeqNum,
-            };
-            this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
-            persistedSummary = summaryMessage;
-            messages.push(summaryMessage);
-          }
-
-          for (const copy of tailCopies) {
-            assert(
-              copy.metadata?.historySequence === undefined,
-              "persistBoundaryWithTailCopies expects unsequenced tail copies"
-            );
-            const seq = await this.getNextHistorySequence(workspaceId);
-            copy.metadata = { ...copy.metadata, historySequence: seq };
-            this.sequenceCounters.set(workspaceId, seq + 1);
-            messages.push(copy);
-          }
-
-          const serialized = this.serializeHistoryRewrite(
-            rows,
-            workspaceId,
-            (row) => updates.get(row) ?? row,
-            messages.slice(sourceMessages.length)
-          );
-          if (shouldPersist) {
-            if (
-              !(await publishCompactionFile(
-                historyPath,
-                serialized,
-                () => shouldPersist(sourceMessages),
-                commit?.onCommitted
-              ))
-            )
-              return Err("Compaction snapshot changed");
-          } else {
-            assert(!commit, "Compaction commit receipts require a final ownership predicate");
-            await writeFileAtomic(historyPath, serialized);
-          }
-
-          // Seal the previous epoch only after boundary + tail are durable.
-          await this.rotateAfterBoundaryWriteUnlocked(workspaceId, persistedSummary);
-          return Ok(undefined);
-        } catch (error) {
-          return Err(`Failed to persist boundary with tail copies: ${getErrorMessage(error)}`);
-        }
-      }
     );
+  }
+
+  // Shared by the public writer and pending publication, which already owns both locks.
+  private async persistBoundaryWithTailCopiesUnderWriteLock(
+    workspaceId: string,
+    summaryMessage: MuxMessage,
+    tailCopies: readonly MuxMessage[],
+    updateExisting: boolean,
+    shouldPersist?: (messages: MuxMessage[]) => boolean,
+    commit?: {
+      publication: ContinuousCompactionPublication;
+      onCommitted: () => void;
+    },
+    assertStillOwned?: () => Promise<void>
+  ): Promise<Result<void>> {
+    // One caller object cannot represent two appended sequences; reject aliases before allocation.
+    const appendedInputs = updateExisting ? tailCopies : [summaryMessage, ...tailCopies];
+    if (new Set(appendedInputs).size !== appendedInputs.length)
+      return Err("Compaction publication requires distinct appended message objects");
+    if (
+      commit &&
+      !(await this.getContinuousCompactionJournal(workspaceId).isPublicationCurrentUnderHistoryLock(
+        commit.publication
+      ))
+    )
+      return Err("Compaction publication changed");
+    invalidateHistoryAppendProvenance();
+    try {
+      // r52: this path assigns fresh sequences (appended summary + every
+      // preserved tail copy) from the cached counter, so it needs the
+      // same in-lock refresh as the append family — a stale cache would
+      // duplicate a foreign backend's sequences and let a later
+      // updateHistory() replace an unrelated row.
+      await this.refreshSequenceCounterUnderWriteLock(workspaceId);
+      if (assertStillOwned) await assertStillOwned();
+      await ensurePrivateDir(this.getSessionDir(workspaceId));
+      const historyPath = this.getChatHistoryPath(workspaceId);
+      const { rows, messages } = await this.readHistoryForRewrite(historyPath);
+      const updates = new Map<MuxMessage, MuxMessage>();
+      const appended = new Map<MuxMessage, MuxMessage>();
+
+      // Rolling summaries are prepared outside this lock. Edits, resets, and
+      // newly appended rows must win over a stale prepared boundary.
+      if (shouldPersist && !shouldPersist(messages)) return Err("Compaction snapshot changed");
+      const sourceMessages = messages.slice();
+      let persistedSummary: MuxMessage | undefined;
+      if (updateExisting) {
+        // Same replace semantics as updateHistory: match by sequence and
+        // preserve boundary metadata already persisted on the row.
+        const targetSequence = summaryMessage.metadata?.historySequence;
+        if (targetSequence === undefined) {
+          return Err("Cannot update message without historySequence");
+        }
+        assert(
+          isNonNegativeInteger(targetSequence),
+          "persistBoundaryWithTailCopies requires a non-negative historySequence"
+        );
+        for (let i = 0; i < messages.length; i++) {
+          if (messages[i].metadata?.historySequence !== targetSequence) {
+            continue;
+          }
+          const preservedCompactionMetadata = getCompactionMetadataToPreserve(
+            workspaceId,
+            messages[i],
+            summaryMessage
+          );
+          messages[i] = {
+            ...summaryMessage,
+            metadata: {
+              ...summaryMessage.metadata,
+              ...(preservedCompactionMetadata ?? {}),
+              historySequence: targetSequence,
+            },
+          };
+          persistedSummary = messages[i];
+          updates.set(sourceMessages[i], persistedSummary);
+          break;
+        }
+        if (persistedSummary === undefined) {
+          return Err(`No message found with historySequence ${targetSequence}`);
+        }
+      } else {
+        assert(
+          summaryMessage.metadata?.historySequence === undefined,
+          "persistBoundaryWithTailCopies append expects an unsequenced summary"
+        );
+        const nextSeqNum = await this.getNextHistorySequence(workspaceId);
+        persistedSummary = {
+          ...summaryMessage,
+          metadata: { ...summaryMessage.metadata, historySequence: nextSeqNum },
+        };
+        this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
+        appended.set(summaryMessage, persistedSummary);
+        messages.push(persistedSummary);
+      }
+
+      for (const copy of tailCopies) {
+        assert(
+          copy.metadata?.historySequence === undefined,
+          "persistBoundaryWithTailCopies expects unsequenced tail copies"
+        );
+        const seq = await this.getNextHistorySequence(workspaceId);
+        const persistedCopy = { ...copy, metadata: { ...copy.metadata, historySequence: seq } };
+        this.sequenceCounters.set(workspaceId, seq + 1);
+        appended.set(copy, persistedCopy);
+        messages.push(persistedCopy);
+      }
+
+      // Final admission or rename can fail: keep caller rows retryable until the boundary is
+      // durable, then publish their sequence metadata before delivering its synchronous receipt.
+      const onCommitted = () => {
+        for (const [input, persisted] of appended) input.metadata = persisted.metadata;
+        commit?.onCommitted();
+      };
+      const serialized = this.serializeHistoryRewrite(
+        rows,
+        workspaceId,
+        (row) => updates.get(row) ?? row,
+        messages.slice(sourceMessages.length)
+      );
+      if (shouldPersist) {
+        if (
+          !(await publishCompactionFile(
+            historyPath,
+            serialized,
+            () => shouldPersist(sourceMessages),
+            onCommitted,
+            assertStillOwned
+          ))
+        )
+          return Err("Compaction snapshot changed");
+      } else {
+        assert(!commit, "Compaction commit receipts require a final ownership predicate");
+        await writeFileAtomic(historyPath, serialized);
+        onCommitted();
+      }
+
+      // Seal the previous epoch only after boundary + tail are durable.
+      await this.rotateAfterBoundaryWriteUnlocked(workspaceId, persistedSummary, assertStillOwned);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to persist boundary with tail copies: ${getErrorMessage(error)}`);
+    }
   }
 
   /**
