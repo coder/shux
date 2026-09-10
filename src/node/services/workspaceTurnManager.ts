@@ -2280,7 +2280,7 @@ export class WorkspaceTurnManager {
         // actually changes the outcome (duplicate stream-end replays must stay idempotent).
         const resettleStaleTerminal =
           params.allowTerminalResettle === true &&
-          (params.next.finalMessage?.metadata?.finishReason !== "tool-calls" ||
+          (!this.isIntermediateToolStop(params.next.finalMessage?.metadata) ||
             (current.status === params.record.status &&
               current.messageId === params.record.messageId &&
               current.updatedAt === params.record.updatedAt)) &&
@@ -4068,7 +4068,13 @@ export class WorkspaceTurnManager {
     if (!isActiveWorkspaceTurnTaskStatus(record.status)) {
       return;
     }
-    const recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
+    let recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
+    if (recovered == null) {
+      if (await this.isLiveWorkspaceTurn(record)) return;
+      // A continuation commits history before it becomes idle. Read again after the idle check
+      // so an earlier snapshot cannot turn its completed result into a restart interruption.
+      recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
+    }
     if (recovered != null) {
       await this.settleWorkspaceTurn({
         cause: { kind: "stale-history-recovery" },
@@ -4361,6 +4367,12 @@ export class WorkspaceTurnManager {
         metadata: event.metadata,
       },
     };
+  }
+
+  private isIntermediateToolStop(
+    metadata: Pick<StreamEndEvent["metadata"], "finishReason" | "stopCause"> | undefined
+  ): boolean {
+    return metadata?.finishReason === "tool-calls" && metadata.stopCause?.kind !== "required-tool";
   }
 
   private describeIncompleteToolStop(event: StreamEndEvent): string {
@@ -4911,7 +4923,7 @@ export class WorkspaceTurnManager {
       // of the same turn; let this settlement correct that stale record.
       // An intermediate stop cannot replace a concrete continuation failure.
       allowTerminalResettle:
-        event.metadata.finishReason !== "tool-calls" ||
+        !this.isIntermediateToolStop(event.metadata) ||
         (record.messageId === event.messageId &&
           record.finalMessage?.metadata?.finishReason === "tool-calls") ||
         (typeof event.metadata.historySequence === "number" &&

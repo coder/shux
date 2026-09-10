@@ -4919,6 +4919,81 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
+  test.each([false, true])(
+    "required-tool completion repairs a transient failure (duringLookup=%s)",
+    async (duringLookup) => {
+      const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+      const event = intermediateStopEvent(parentId);
+      event.metadata.stopCause = { kind: "required-tool" };
+      await persistStopEvent(historyService, event);
+      const store = (taskService as unknown as { taskHandleStore: TaskHandleStore })
+        .taskHandleStore;
+      const fail = () =>
+        taskService.settleWorkspaceTurnContinuationFailure(
+          event.workspaceId,
+          workspaceTurnMuxMetadata(parentId),
+          "error",
+          "Transient provider failure"
+        );
+      if (duringLookup) {
+        const readHandle = store.getWorkspaceTurn.bind(store);
+        spyOn(store, "getWorkspaceTurn").mockImplementationOnce(async (...args) => {
+          const snapshot = await readHandle(...args);
+          await fail();
+          return snapshot;
+        });
+      } else {
+        await fail();
+      }
+      await finalizeWorkspaceTurnStreamEndForTest(taskService, event);
+      expect(
+        await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+      ).toMatchObject({
+        status: "completed",
+        messageId: event.messageId,
+      });
+    }
+  );
+
+  test("stale recovery rereads history after a continuation commits and becomes idle", async () => {
+    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+    const event = intermediateStopEvent(parentId);
+    await taskService.markWorkspaceTurnStreamEndDeferred(event);
+    const record = await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle");
+    assert(record);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const readHistory = historyService.getHistoryFromLatestBoundary.bind(historyService);
+    spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(
+      async (...args) => {
+        const snapshot = await readHistory(...args);
+        entered.resolve();
+        await release.promise;
+        return snapshot;
+      }
+    );
+    const recovering = (
+      taskService as unknown as {
+        settleStaleWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void>;
+      }
+    ).settleStaleWorkspaceTurn(record);
+    await entered.promise;
+    const completed: StreamEndEvent = {
+      ...event,
+      messageId: "continuation-committed",
+      metadata: { ...event.metadata, finishReason: "stop", stopCause: undefined },
+    };
+    await persistStopEvent(historyService, completed);
+    release.resolve();
+    await recovering;
+    expect(
+      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+    ).toMatchObject({
+      status: "completed",
+      messageId: completed.messageId,
+    });
+  });
+
   test("unreadable history does not keep a deferred continuation active forever", async () => {
     const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
     const event = intermediateStopEvent(parentId);
