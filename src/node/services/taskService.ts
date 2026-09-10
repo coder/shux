@@ -205,7 +205,7 @@ import {
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
 import type { AgentWorkflowRunStrictPin } from "@/node/services/agentWorkflowRunReferences";
 import { isWorkflowRunTaskId } from "@/node/services/tools/taskId";
-import { stripSyntheticNulls } from "@/common/utils/tools/optionalNullSchema";
+import { stripOmissionPlaceholders } from "@/common/utils/tools/optionalNullSchema";
 import {
   formatJsonSchemaValidationErrors,
   validateJsonSchemaSubset,
@@ -326,7 +326,10 @@ function normalizeWorkflowAgentReportArgsForWorkflowTask(
   }
   return {
     ...reportArgs,
-    structuredOutput: stripSyntheticNulls(workflowTask.outputSchema, reportArgs.structuredOutput),
+    structuredOutput: stripOmissionPlaceholders(
+      workflowTask.outputSchema,
+      reportArgs.structuredOutput
+    ),
   };
 }
 
@@ -354,7 +357,7 @@ function validateWorkflowAgentReportStructuredOutput(params: {
     });
   }
 
-  const structuredOutput = stripSyntheticNulls(
+  const structuredOutput = stripOmissionPlaceholders(
     workflowTask.outputSchema,
     params.reportArgs.structuredOutput
   );

@@ -127,6 +127,7 @@ describe("agent_report tool", () => {
         code: { type: "string", pattern: "^[A-Z]+$", default: "ABC" },
         score: { type: "number", minimum: 1 },
         notes: { type: "string" },
+        tags: { type: "array", items: { type: "string" }, default: [] },
       },
       additionalProperties: { type: "string" },
       allOf: [{ required: ["notes"] }],
@@ -148,6 +149,11 @@ describe("agent_report tool", () => {
     expect(inputSchema.jsonSchema).toHaveProperty("required", ["code", "score", "notes"]);
     expect(inputSchema.jsonSchema?.properties.notes).toHaveProperty("type", "string");
     expect(inputSchema.jsonSchema).not.toHaveProperty("allOf");
+    // Optional properties stay optional and become nullable for strict providers;
+    // the sanitizer still strips unsupported keywords inside the widened branch.
+    expect(inputSchema.jsonSchema?.properties).toHaveProperty("tags", {
+      anyOf: [{ type: "array", items: { type: "string" } }, { type: "null" }],
+    });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ code: "lowercase", score: 0, notes: "present" }, mockToolCallOptions)

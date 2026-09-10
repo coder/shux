@@ -27,6 +27,8 @@ describe("createMCPToolInputSchema", () => {
       },
     });
 
+    // Both placeholders a model uses for an omitted optional argument are
+    // removed before tools/call: strict-mode `null` and habitual `""` (#2887).
     expect(
       await inputSchema.validate?.({
         issueId: "CODAGT-709",
@@ -35,7 +37,7 @@ describe("createMCPToolInputSchema", () => {
       })
     ).toEqual({
       success: true,
-      value: { issueId: "CODAGT-709", cursor: "" },
+      value: { issueId: "CODAGT-709" },
     });
   });
 

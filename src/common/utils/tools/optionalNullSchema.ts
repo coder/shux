@@ -144,6 +144,11 @@ function widenSchemaNode(schema: unknown, inheritedRequired = new Set<string>())
   }
 }
 
+/**
+ * The two halves of a third-party JSON Schema tool contract:
+ * - `modelSchema` (with `strict`) is what the provider and model see;
+ * - `restore` maps a model payload back to the source schema the executor expects.
+ */
 export interface OptionalNullSchemaContract {
   modelSchema: unknown;
   strict: false | undefined;
@@ -151,18 +156,14 @@ export interface OptionalNullSchemaContract {
 }
 
 export function createOptionalNullSchemaContract(schema: unknown): OptionalNullSchemaContract {
+  const restore = (value: unknown) => stripOmissionPlaceholders(schema, value);
   if (containsReferenceKeyword(schema)) {
-    return {
-      modelSchema: structuredClone(schema),
-      strict: false,
-      restore: (value) => value,
-    };
+    // Reference resolution is incomplete here, so leave the model schema alone
+    // and let the provider decode without strict mode. `restore` stays: it only
+    // removes placeholders the source schema provably rejects.
+    return { modelSchema: structuredClone(schema), strict: false, restore };
   }
-  return {
-    modelSchema: widenOptionalPropertiesToNullable(schema),
-    strict: undefined,
-    restore: (value) => stripSyntheticNulls(schema, value),
-  };
+  return { modelSchema: widenOptionalPropertiesToNullable(schema), strict: undefined, restore };
 }
 
 /**
@@ -173,6 +174,24 @@ export function widenOptionalPropertiesToNullable(schema: unknown): unknown {
   const modelSchema = structuredClone(schema);
   widenSchemaNode(modelSchema);
   return modelSchema;
+}
+
+/**
+ * A model uses two placeholder values for an optional property it means to omit:
+ * - `null`, because the model contract widens optional properties to nullable
+ *   and strict-mode providers make the model emit every property; and
+ * - `""`, because models habitually fill optional fields with an empty string
+ *   instead of omitting them, and strict REST-backed MCP servers reject
+ *   present-but-empty arguments (#2887).
+ * A `null` the source schema accepts is not a placeholder: the server may give it
+ * meaning ("clear this field"). Callers never treat required properties as
+ * placeholders for the same reason.
+ */
+function isOmissionPlaceholder(propertySchema: unknown, value: unknown): boolean {
+  if (value === "") {
+    return true;
+  }
+  return value === null && getNullability(propertySchema) === "rejects";
 }
 
 function stripProperties(
@@ -186,14 +205,13 @@ function stripProperties(
       continue;
     }
     if (
-      stripped[propertyName] === null &&
       !required.has(propertyName) &&
-      getNullability(propertySchema) === "rejects"
+      isOmissionPlaceholder(propertySchema, stripped[propertyName])
     ) {
       delete stripped[propertyName];
       continue;
     }
-    stripped[propertyName] = stripSyntheticNulls(propertySchema, stripped[propertyName]);
+    stripped[propertyName] = stripOmissionPlaceholders(propertySchema, stripped[propertyName]);
   }
   return stripped;
 }
@@ -218,13 +236,16 @@ function stripMatchingUnionBranch(
     if (!Array.isArray(branches)) {
       continue;
     }
+    // A branch that accepts the raw value gives that value meaning (for example
+    // a nullable property another branch declares non-nullable), so prefer it
+    // over a branch that only accepts the stripped value.
     for (const branch of branches) {
       if (schemaAcceptsValue(branch, value)) {
         return value;
       }
     }
     for (const branch of branches) {
-      const stripped = stripSyntheticNullsNode(branch, value, inheritedRequired);
+      const stripped = stripNode(branch, value, inheritedRequired);
       if (schemaAcceptsValue(branch, stripped)) {
         return stripped;
       }
@@ -233,12 +254,12 @@ function stripMatchingUnionBranch(
   return null;
 }
 
-function stripSyntheticNullsNode(
+function stripNode(
   schema: unknown,
   value: unknown,
   inheritedRequired: ReadonlySet<string>
 ): unknown {
-  if (!isRecord(schema) || schemaAcceptsValue(schema, value)) {
+  if (!isRecord(schema)) {
     return value;
   }
 
@@ -246,8 +267,8 @@ function stripSyntheticNullsNode(
   if (Array.isArray(value)) {
     const itemSchema = schema.items;
     const stripped = Array.isArray(itemSchema)
-      ? value.map((item, index) => stripSyntheticNullsNode(itemSchema[index], item, new Set()))
-      : value.map((item) => stripSyntheticNullsNode(itemSchema, item, new Set()));
+      ? value.map((item, index) => stripNode(itemSchema[index], item, new Set()))
+      : value.map((item) => stripNode(itemSchema, item, new Set()));
     return stripMatchingUnionBranch(schema, stripped, required) ?? stripped;
   }
   if (!isRecord(value)) {
@@ -260,16 +281,17 @@ function stripSyntheticNullsNode(
   }
   if (Array.isArray(schema.allOf)) {
     for (const subSchema of schema.allOf) {
-      stripped = stripSyntheticNullsNode(subSchema, stripped, required) as Record<string, unknown>;
+      stripped = stripNode(subSchema, stripped, required) as Record<string, unknown>;
     }
   }
   return stripMatchingUnionBranch(schema, stripped, required) ?? stripped;
 }
 
 /**
- * Restore a third-party executor contract after a model uses `null` to represent
- * an omitted optional property. Explicit source-nullable values remain unchanged.
+ * Restore a third-party executor contract from a model payload by removing the
+ * placeholder values the model used for omitted optional properties (see
+ * isOmissionPlaceholder). Required properties and source-nullable values stay.
  */
-export function stripSyntheticNulls(schema: unknown, value: unknown): unknown {
-  return stripSyntheticNullsNode(schema, value, new Set());
+export function stripOmissionPlaceholders(schema: unknown, value: unknown): unknown {
+  return stripNode(schema, value, new Set());
 }

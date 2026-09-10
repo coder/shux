@@ -26,6 +26,18 @@ describe("describeMCPErrorResult", () => {
     expect(description).toContain("per-image guard");
     expect(description.length).toBeLessThan(200);
   });
+
+  it("caps oversized error text with the same byte budget as successful results", () => {
+    const description = describeMCPErrorResult({
+      isError: true,
+      content: [{ type: "text", text: "e".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES * 2) }],
+    });
+
+    expect(Buffer.byteLength(description, "utf8")).toBeLessThanOrEqual(
+      MCP_TOOL_RESULT_MAX_TEXT_BYTES + "\n[MCP error details truncated]".length
+    );
+    expect(description).toEndWith("[MCP error details truncated]");
+  });
 });
 
 describe("transformMCPResult", () => {

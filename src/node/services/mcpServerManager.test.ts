@@ -27,7 +27,7 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { jsonSchema, type Tool } from "ai";
+import type { Tool } from "ai";
 
 interface MCPServerManagerTestAccess {
   workspaceServers: Map<string, unknown>;
@@ -4691,84 +4691,5 @@ describe("wrapMCPTools", () => {
 
     const wrapped = wrapMCPTools({ noExec: tool });
     expect(wrapped.noExec).toBe(tool);
-  });
-
-  describe("argument sanitization", () => {
-    const makeExecuteMock = () => mock((_args: unknown) => Promise.resolve({ content: [] }));
-
-    // Mirrors how mcpClient builds MCP tools: jsonSchema() wrapping the
-    // server-declared input schema.
-    const makeTool = (executeMock: ReturnType<typeof makeExecuteMock>, required: string[] = []) =>
-      ({
-        inputSchema: jsonSchema({
-          type: "object",
-          properties: {
-            project_id: { type: "string" },
-            assignee_id: { type: "string" },
-            search: { type: "string" },
-            labels: { type: "array" },
-            milestone: { type: "string" },
-          },
-          required,
-          additionalProperties: false,
-        }),
-        execute: executeMock,
-      }) as unknown as Tool;
-
-    test("strips top-level empty strings for optional params before invoking the server", async () => {
-      const executeMock = makeExecuteMock();
-      const wrapped = wrapMCPTools({ myTool: makeTool(executeMock, ["project_id"]) });
-
-      await wrapped.myTool.execute!(
-        { project_id: "42332", assignee_id: "", search: "", labels: [], milestone: null },
-        {} as never
-      );
-
-      expect(executeMock).toHaveBeenCalledTimes(1);
-      // null and [] pass through untouched; only optional "" is dropped.
-      expect(executeMock.mock.calls[0][0]).toEqual({
-        project_id: "42332",
-        labels: [],
-        milestone: null,
-      });
-    });
-
-    test("preserves empty string for schema-required params", async () => {
-      const executeMock = makeExecuteMock();
-      const wrapped = wrapMCPTools({ myTool: makeTool(executeMock, ["project_id"]) });
-
-      await wrapped.myTool.execute!({ project_id: "", assignee_id: "" }, {} as never);
-
-      expect(executeMock.mock.calls[0][0]).toEqual({ project_id: "" });
-    });
-
-    test("passes args through unchanged when no empty strings are present", async () => {
-      const executeMock = makeExecuteMock();
-      const wrapped = wrapMCPTools({ myTool: makeTool(executeMock) });
-
-      const args = { project_id: "42332", search: "bug" };
-      await wrapped.myTool.execute!(args, {} as never);
-
-      expect(executeMock.mock.calls[0][0]).toBe(args);
-    });
-
-    test("strips empty strings when the tool has no readable schema", async () => {
-      const executeMock = makeExecuteMock();
-      const tool = { execute: executeMock } as unknown as Tool;
-      const wrapped = wrapMCPTools({ myTool: tool });
-
-      await wrapped.myTool.execute!({ project_id: "42332", search: "" }, {} as never);
-
-      expect(executeMock.mock.calls[0][0]).toEqual({ project_id: "42332" });
-    });
-
-    test("leaves non-record args untouched", async () => {
-      const executeMock = makeExecuteMock();
-      const wrapped = wrapMCPTools({ myTool: makeTool(executeMock) });
-
-      await wrapped.myTool.execute!(undefined, {} as never);
-
-      expect(executeMock.mock.calls[0][0]).toBeUndefined();
-    });
   });
 });

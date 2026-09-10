@@ -246,7 +246,7 @@ describe("schemaSanitizer", () => {
   });
 
   describe("sanitizeWorkflowAgentReportSchemaForOpenAI", () => {
-    it("preserves useful validation constraints while making objects OpenAI-strict", () => {
+    it("preserves useful validation constraints and source optionality while closing objects", () => {
       const schema = {
         type: "object",
         required: ["code"],
@@ -276,16 +276,18 @@ describe("schemaSanitizer", () => {
 
       const sanitized = sanitizeWorkflowAgentReportSchemaForOpenAI(schema);
 
+      // Optional `tags` stays optional and non-nullable here: nullability is the
+      // optional-null schema contract's job, not the dialect sanitizer's.
       expect(sanitized).toEqual({
         type: "object",
-        required: ["code", "score", "tags", "summary"],
+        required: ["code", "score", "summary"],
         additionalProperties: false,
         properties: {
           code: { type: "string", pattern: "^[A-Z]+$" },
           score: { type: "number", minimum: 1, maximum: 5 },
           summary: { type: "string", minLength: 1 },
           tags: {
-            type: ["array", "null"],
+            type: "array",
             minItems: 1,
             maxItems: 3,
             items: {

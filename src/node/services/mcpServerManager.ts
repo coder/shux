@@ -214,49 +214,6 @@ function shouldRecycleClientAfterToolError(error: unknown): boolean {
 }
 
 /**
- * Top-level parameter names the tool's input schema marks as required.
- *
- * MCP tools built by mcpClient carry their server-declared JSON schema via
- * the AI SDK's jsonSchema() wrapper ({ jsonSchema: <raw schema> }); anything
- * else (or a malformed schema) yields an empty set.
- */
-function requiredParamsFromSchema(inputSchema: unknown): ReadonlySet<string> {
-  if (inputSchema !== null && typeof inputSchema === "object" && "jsonSchema" in inputSchema) {
-    const raw = (inputSchema as { jsonSchema: unknown }).jsonSchema;
-    if (raw !== null && typeof raw === "object" && "required" in raw) {
-      const required = (raw as { required: unknown }).required;
-      if (Array.isArray(required)) {
-        return new Set(required.filter((entry): entry is string => typeof entry === "string"));
-      }
-    }
-  }
-  return new Set();
-}
-
-/**
- * Drop top-level empty-string arguments the model emitted for optional
- * parameters.
- *
- * LLMs often fill optional parameters with "" instead of omitting them, and
- * strict REST-backed MCP servers (e.g. GitLab) treat present-but-empty as
- * invalid and reject the call with 400 (#2887). A required parameter keeps
- * its "" so a genuinely intended empty value is never silently dropped.
- * Explicit null and empty arrays pass through untouched: servers may assign
- * them meaning ("clear this field" / "no filter").
- */
-function sanitizeMCPToolArgs(args: unknown, inputSchema: unknown): unknown {
-  if (args === null || typeof args !== "object" || Array.isArray(args)) {
-    return args;
-  }
-  const entries = Object.entries(args as Record<string, unknown>);
-  if (!entries.some(([, value]) => value === "")) {
-    return args;
-  }
-  const required = requiredParamsFromSchema(inputSchema);
-  return Object.fromEntries(entries.filter(([key, value]) => value !== "" || required.has(key)));
-}
-
-/**
  * Wrap MCP tools to transform their results to AI SDK format.
  * This ensures image content is properly converted to media type.
  */
@@ -287,9 +244,8 @@ export function wrapMCPTools(
               ? (context as { abortSignal?: AbortSignal }).abortSignal
               : undefined;
 
-          const sanitizedArgs = sanitizeMCPToolArgs(args, tool.inputSchema);
           const result: unknown = await runMCPToolWithDeadline(
-            () => Promise.resolve(originalExecute(sanitizedArgs, context)) as Promise<unknown>,
+            () => Promise.resolve(originalExecute(args, context)) as Promise<unknown>,
             { toolName, timeoutMs: MCP_TOOL_CALL_TIMEOUT_MS, signal: abortSignal }
           );
           if (isMCPErrorResult(result)) {

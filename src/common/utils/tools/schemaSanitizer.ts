@@ -129,56 +129,17 @@ const OPENAI_WORKFLOW_REPORT_UNSUPPORTED_SCHEMA_PROPERTIES = new Set([
  *
  * Workflow authors can use Ajv validation keywords for host-side validation; this
  * sanitizer keeps supported constraints (pattern, numeric bounds, array bounds,
- * enum, anyOf) but removes unsupported composition/annotation keys and makes
- * object schemas strict for OpenAI tool parameters.
+ * enum, anyOf) but removes unsupported composition/annotation keys and closes
+ * object schemas for OpenAI tool parameters.
+ *
+ * This is a lossless-as-possible dialect fix only. Optional-property nullability
+ * is the optional-null schema contract's job (see optionalNullSchema.ts), so the
+ * caller passes that contract's model schema here.
  */
 export function sanitizeWorkflowAgentReportSchemaForOpenAI<T>(schema: T): T {
   const clonedSchema = JSON.parse(JSON.stringify(schema)) as T;
   sanitizeWorkflowAgentReportSchemaNode(clonedSchema);
   return clonedSchema;
-}
-
-function makeWorkflowReportPropertyNullable(schema: unknown): unknown {
-  if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
-    return { anyOf: [schema, { type: "null" }] };
-  }
-
-  const obj = schema as Record<string, unknown>;
-  if (Array.isArray(obj.enum)) {
-    const values: unknown[] = obj.enum;
-    if (!values.includes(null)) {
-      obj.enum = [...values, null];
-    }
-    return obj;
-  }
-  if (typeof obj.type === "string") {
-    if (obj.type !== "null") {
-      obj.type = [obj.type, "null"];
-    }
-    return obj;
-  }
-  if (Array.isArray(obj.type)) {
-    const types: unknown[] = obj.type;
-    if (!types.includes("null")) {
-      obj.type = [...types, "null"];
-    }
-    return obj;
-  }
-  if (Array.isArray(obj.anyOf)) {
-    const options: unknown[] = obj.anyOf;
-    const hasNullOption = options.some(
-      (option) =>
-        option != null &&
-        typeof option === "object" &&
-        !Array.isArray(option) &&
-        (option as { type?: unknown }).type === "null"
-    );
-    if (!hasNullOption) {
-      obj.anyOf = [...options, { type: "null" }];
-    }
-    return obj;
-  }
-  return { anyOf: [obj, { type: "null" }] };
 }
 
 function getWorkflowReportRequiredProperties(schema: Record<string, unknown>): Set<string> {
@@ -259,7 +220,6 @@ function sanitizeWorkflowAgentReportSchemaNode(schema: unknown): void {
 
   const obj = schema as Record<string, unknown>;
   mergeAllOfObjectProperties(obj);
-  const requiredBeforeSanitizing = getWorkflowReportRequiredProperties(obj);
   for (const prop of OPENAI_WORKFLOW_REPORT_UNSUPPORTED_SCHEMA_PROPERTIES) {
     if (prop in obj) {
       delete obj[prop];
@@ -278,16 +238,9 @@ function sanitizeWorkflowAgentReportSchemaNode(schema: unknown): void {
       ? (obj.properties as Record<string, unknown>)
       : null;
   if (properties != null) {
-    const originallyRequired = new Set(
-      [...requiredBeforeSanitizing].filter((key) => key in properties)
-    );
     obj.additionalProperties = false;
-    obj.required = Object.keys(properties);
-    for (const [propertyName, propSchema] of Object.entries(properties)) {
+    for (const propSchema of Object.values(properties)) {
       sanitizeWorkflowAgentReportSchemaNode(propSchema);
-      if (!originallyRequired.has(propertyName)) {
-        properties[propertyName] = makeWorkflowReportPropertyNullable(propSchema);
-      }
     }
   } else if (obj.type === "object") {
     obj.additionalProperties = false;

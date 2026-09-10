@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   createOptionalNullSchemaContract,
-  stripSyntheticNulls,
+  stripOmissionPlaceholders,
   widenOptionalPropertiesToNullable,
 } from "./optionalNullSchema";
 
@@ -35,13 +35,49 @@ describe("optional null JSON Schema contract", () => {
     });
     expect(source.properties.cursor).toEqual({ type: "string" });
     expect(
-      stripSyntheticNulls(source, {
+      stripOmissionPlaceholders(source, {
         issueId: "CODAGT-709",
         cursor: "",
         statusUpdateType: null,
         nullableNote: null,
       })
-    ).toEqual({ issueId: "CODAGT-709", cursor: "", nullableNote: null });
+    ).toEqual({ issueId: "CODAGT-709", nullableNote: null });
+  });
+
+  test("strips empty strings only for optional properties", () => {
+    const source = {
+      type: "object",
+      required: ["project_id"],
+      properties: {
+        project_id: { type: "string" },
+        assignee_id: { type: "string" },
+        search: { type: "string" },
+        labels: { type: "array" },
+        milestone: { type: ["string", "null"] },
+        nested: {
+          type: "object",
+          required: ["id"],
+          properties: { id: { type: "string" }, detail: { type: "string" } },
+        },
+      },
+    };
+
+    // A required "" is never dropped; the server stays the arbiter of its
+    // validity. null and [] pass through where the source accepts them.
+    expect(
+      stripOmissionPlaceholders(source, {
+        project_id: "",
+        assignee_id: "",
+        search: "",
+        labels: [],
+        milestone: null,
+        nested: { id: "", detail: "" },
+      })
+    ).toEqual({ project_id: "", labels: [], milestone: null, nested: { id: "" } });
+
+    const untouched = { project_id: "42332", search: "bug" };
+    expect(stripOmissionPlaceholders(source, untouched)).toEqual(untouched);
+    expect(stripOmissionPlaceholders(source, undefined)).toBeUndefined();
   });
 
   test("preserves optional-property annotations on the widened schema", () => {
@@ -99,7 +135,9 @@ describe("optional null JSON Schema contract", () => {
         },
       },
     });
-    expect(stripSyntheticNulls(source, { values: [{ label: null }] })).toEqual({ values: [{}] });
+    expect(stripOmissionPlaceholders(source, { values: [{ label: null }] })).toEqual({
+      values: [{}],
+    });
   });
 
   test("preserves a raw value accepted by another union branch", () => {
@@ -119,7 +157,7 @@ describe("optional null JSON Schema contract", () => {
       ],
     };
 
-    expect(stripSyntheticNulls(source, { value: null })).toEqual({ value: null });
+    expect(stripOmissionPlaceholders(source, { value: null })).toEqual({ value: null });
   });
 
   test.each(["$ref", "$dynamicRef", "$recursiveRef"])(
@@ -134,7 +172,10 @@ describe("optional null JSON Schema contract", () => {
 
       expect(contract.strict).toBe(false);
       expect(contract.modelSchema).toEqual(source);
+      // Nullability behind a reference is unknown, so null stays; "" is a
+      // placeholder regardless of type, so it still goes.
       expect(contract.restore({ value: null })).toEqual({ value: null });
+      expect(contract.restore({ value: "" })).toEqual({});
     }
   );
 
@@ -151,7 +192,7 @@ describe("optional null JSON Schema contract", () => {
         impossible: { anyOf: [false, { type: "null" }] },
       },
     });
-    expect(stripSyntheticNulls(source, { anything: null, impossible: null })).toEqual({
+    expect(stripOmissionPlaceholders(source, { anything: null, impossible: null })).toEqual({
       anything: null,
     });
   });
@@ -163,7 +204,7 @@ describe("optional null JSON Schema contract", () => {
       anyOf: [{ type: "object" }],
     };
 
-    expect(stripSyntheticNulls(source, { value: null })).toEqual({});
+    expect(stripOmissionPlaceholders(source, { value: null })).toEqual({});
   });
 
   test.each(["allOf", "anyOf"] as const)(
@@ -176,7 +217,7 @@ describe("optional null JSON Schema contract", () => {
       };
 
       expect(widenOptionalPropertiesToNullable(source)).toEqual(source);
-      expect(stripSyntheticNulls(source, { value: null })).toEqual({ value: null });
+      expect(stripOmissionPlaceholders(source, { value: null })).toEqual({ value: null });
     }
   );
 });

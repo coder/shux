@@ -13,7 +13,6 @@ import { log } from "@/node/services/log";
  * pass normal screenshots while preventing pathological payloads.
  */
 export const MAX_IMAGE_DATA_BYTES = 8 * 1024 * 1024; // 8MB guard per image
-const MAX_ERROR_DESCRIPTION_CHARACTERS = 64 * 1024;
 
 /**
  * MCP CallToolResult content types (MCP spec wire shapes)
@@ -55,8 +54,13 @@ export function isMCPErrorResult(value: unknown): value is MCPCallToolResult & {
   );
 }
 
+/**
+ * Turn an `isError` result into the message of the thrown tool error. Text and
+ * text-resource parts are the message; binary parts are described, not inlined.
+ */
 export function describeMCPErrorResult(result: MCPCallToolResult): string {
-  const readableParts = (result.content ?? []).flatMap((item) => {
+  const content = result.content ?? [];
+  const readableParts = content.flatMap((item) => {
     if (item.type === "text") {
       return item.text;
     }
@@ -65,11 +69,7 @@ export function describeMCPErrorResult(result: MCPCallToolResult): string {
     }
     return [];
   });
-  if (readableParts.length > 0) {
-    return readableParts.join("\n");
-  }
-
-  const binaryParts = (result.content ?? []).flatMap((item) => {
+  const binaryParts = content.flatMap((item) => {
     if (item.type === "image") {
       return describeBinaryErrorPart("Image", item.data, item.mimeType);
     }
@@ -78,23 +78,24 @@ export function describeMCPErrorResult(result: MCPCallToolResult): string {
     }
     return [];
   });
-  if (binaryParts.length > 0) {
-    return binaryParts.join("\n");
-  }
-
-  return stringifyMCPErrorValue(result.toolResult ?? result.content ?? result);
+  const description =
+    readableParts.length > 0
+      ? readableParts.join("\n")
+      : binaryParts.length > 0
+        ? binaryParts.join("\n")
+        : stringifyMCPErrorValue(result.toolResult ?? result.content ?? result);
+  // The error message enters history like any tool result text, so it gets the
+  // same byte cap as a successful result.
+  return truncateUtf8Bytes(
+    description,
+    MCP_TOOL_RESULT_MAX_TEXT_BYTES,
+    "\n[MCP error details truncated]"
+  );
 }
 
 function stringifyMCPErrorValue(value: unknown): string {
   try {
-    const serialized = JSON.stringify(value);
-    if (serialized == null) {
-      return "MCP tool call failed";
-    }
-    if (serialized.length <= MAX_ERROR_DESCRIPTION_CHARACTERS) {
-      return serialized;
-    }
-    return `${serialized.slice(0, MAX_ERROR_DESCRIPTION_CHARACTERS)}\n[MCP error details truncated]`;
+    return JSON.stringify(value) ?? "MCP tool call failed";
   } catch {
     return "MCP tool call failed";
   }
