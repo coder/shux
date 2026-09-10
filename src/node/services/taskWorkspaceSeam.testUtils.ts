@@ -15,6 +15,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     waitForPendingStreamErrorRecoveryDecision: () => Promise.resolve(undefined),
     getStartupRecoveryState: () => Promise.resolve("interrupted"),
     dispatchPendingCompactionFollowUp: () => Promise.resolve(Ok(false)),
+    acquireIdleTurnExclusion: () => Ok({ [Symbol.dispose]: () => undefined }),
     isBusyForMessage: () => false,
     hasQueuedMessages: () => false,
     hasPendingQueuedOrPreparingTurn: () => false,

@@ -1,3 +1,4 @@
+import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
 import type { OnStepSettled } from "./streamManager";
@@ -314,6 +315,7 @@ export interface StreamMessageOptions {
   prospectiveGoalStatusForToolAvailability?: GoalRecordV1["status"] | null;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
   onStepSettled?: OnStepSettled;
   /**
    * Whether a token-budget rollover could actually be sealed for this request (mode active and
@@ -865,6 +867,7 @@ export class TurnRequestBuilder {
       workspaceGoalService,
       disableWorkspaceAgents,
       hasQueuedMessages,
+      getQueuedInputStopCause,
       onStepSettled,
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
@@ -3207,6 +3210,7 @@ export class TurnRequestBuilder {
         toolPolicy: effectiveToolPolicy,
         providedStreamToken: streamToken,
         hasQueuedMessages,
+        getQueuedInputStopCause,
         onStepSettled,
         workspaceName: metadata.name,
         thinkingLevel: streamThinkingLevel,

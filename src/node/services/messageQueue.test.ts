@@ -863,7 +863,7 @@ describe("MessageQueue", () => {
               ? { type: "bash-monitor-wake" as const, records: [] }
               : undefined;
         queue.add("live", { ...options, muxMetadata: liveMetadata, queueDispatchMode: "turn-end" });
-        expect(queue.getNextQueueCutCandidate()).toEqual({
+        expect(queue.getNextQueueCutCandidate()).toMatchObject({
           muxMetadata: liveMetadata,
           dispatchMode: "turn-end",
         });
