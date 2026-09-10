@@ -2,6 +2,11 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { secretsToRecord } from "@/common/types/secrets";
+import {
+  ALL_WORKSPACES_TARGET,
+  MCP_OVERRIDES_READ_TIMEOUT_MS,
+  MCP_OVERRIDES_REVISION_UNAVAILABLE,
+} from "@/node/services/workspaceMcpOverridesService";
 import type { ORPCContext } from "@/node/orpc/context";
 import { createRuntimeForWorkspace, resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
 import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
@@ -59,9 +64,18 @@ export async function getWorkspaceMcpOverrides(context: ORPCContext, workspaceId
     return { overrides: {}, revision: "mcp-disabled-by-policy" };
   }
   try {
-    return await context.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId);
+    // Bounded and strict like every other request-path read: an inheriting
+    // workspace resolves through its ancestors' documents (remote reads allow
+    // minutes per level), and the settings view must either show the
+    // established state or report it unavailable — never hang, never guess.
+    return await context.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
+      mode: "strict",
+      timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
+    });
   } catch {
-    return { overrides: {}, revision: "unavailable" };
+    // The sentinel revision makes the dialog's save a repair of the unreadable
+    // document (see writeOverridesLocked) rather than a permanent conflict.
+    return { overrides: {}, revision: MCP_OVERRIDES_REVISION_UNAVAILABLE };
   }
 }
 
@@ -85,8 +99,18 @@ export async function listWorkspaceMcpPrompts(
   const { runtime, workspacePath, hostCheckoutRoot } = runtimeResult.data;
   const ready = await runtime.ensureReady(signal ? { signal } : undefined);
   if (!ready.ready) throw new Error(ready.error);
-  const { overrides } =
-    await context.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId);
+  // Forward the authority too: a snapshot the service could not establish
+  // must make the manager re-read disk (and fail closed), not start servers.
+  // Bounded and cancellable like the send path: an inheriting child's
+  // resolution reads through an SSH/Docker parent (minutes per remote op),
+  // and discovery holds its archive admission for the duration.
+  const overridesReadStartedAt = Date.now();
+  const { overrides, authoritative } =
+    await context.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
+      timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
+      ...(signal !== undefined ? { signal } : {}),
+    });
+  if (signal?.aborted) return [];
   const projectSecrets = await secretsToRecord(
     isMultiProject(metadata)
       ? mergeMultiProjectSecrets(metadata, context.secretsStore)
@@ -102,6 +126,13 @@ export async function listWorkspaceMcpPrompts(
       workspacePath,
       trusted: isWorkspaceProjectTrusted(context.config, metadata),
       overrides,
+      overridesAuthoritative: authoritative,
+      // Like the send path: a non-authoritative read that exhausted its
+      // budget must not be followed by a second full-length attempt inside
+      // the manager while discovery holds its archive admission.
+      ...(authoritative
+        ? {}
+        : { overridesReadDeadlineAt: overridesReadStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS }),
       projectSecrets,
       agentPlugins: hostCheckoutRoot
         ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
@@ -144,8 +175,16 @@ export async function setWorkspaceMcpOverrides(
           );
           return new Set(Object.keys(servers).filter((key) => key.startsWith("plugin:")));
         }),
-        publish: (persisted) =>
-          context.mcpServerManager.applyWorkspaceOverrides(input.workspaceId, persisted),
+        // `target` differs from input.workspaceId for affected sharers/descendants;
+        // null = state not establishable, drop the cache instead of guessing.
+        publish: (persisted, target) =>
+          persisted === null
+            ? Promise.resolve(
+                target === ALL_WORKSPACES_TARGET
+                  ? context.mcpServerManager.forgetAllWorkspaceOverrides()
+                  : context.mcpServerManager.forgetWorkspaceOverrides(target)
+              )
+            : context.mcpServerManager.applyWorkspaceOverrides(target, persisted),
       }
     );
     return { success: true as const, data: undefined };

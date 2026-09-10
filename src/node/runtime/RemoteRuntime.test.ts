@@ -33,7 +33,9 @@ class CanonicalPathRemoteRuntime extends RecordingRemoteRuntime {
   override exec(command: string, _options: ExecOptions): Promise<ExecStream> {
     this.commands.push(command);
     return Promise.resolve({
-      stdout: createStream(command.startsWith("stat ") ? "1 2 regular file\n" : "contents"),
+      stdout: createStream(
+        command.startsWith("LC_ALL=C stat ") ? "1 2 regular file\n" : "contents"
+      ),
       stderr: createStream(""),
       stdin: new WritableStream<Uint8Array>(),
       exitCode: Promise.resolve(0),
@@ -85,7 +87,7 @@ describe("RemoteRuntime file path canonicalization", () => {
     expect(runtime.commands.some((command) => command.includes("'/home/test/write.txt'"))).toBe(
       true
     );
-    expect(runtime.commands).toContain("stat -L -c '%s %Y %F' '/workspace/stat.txt'");
+    expect(runtime.commands).toContain("LC_ALL=C stat -L -c '%s %Y %F' '/workspace/stat.txt'");
     expect(runtime.commands).toContain("mkdir -p '/home/test/dir'");
   });
 });

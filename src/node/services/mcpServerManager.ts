@@ -69,6 +69,7 @@ import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import { isWorkspaceOverridesEpochUnreadable } from "@/node/services/workspaceMcpOverridesService";
 
 const TEST_TIMEOUT_MS = 10_000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -300,6 +301,60 @@ export function wrapMCPTools(
 type ResolvedHeaders = Record<string, string> | undefined;
 
 type ResolvedTransport = "stdio" | "http" | "sse";
+
+/** How long a served tool call waits for a publication's enablement repair before failing closed. */
+const PENDING_REPAIR_WAIT_MS = 10_000;
+/**
+ * ONE deadline for a served tool call's complete authorization gate: every
+ * wait in it (repair waits, disk re-reads, re-serves, lock acquisition, epoch
+ * reads, across all retry iterations) draws from this single budget, so the
+ * gate as a whole — not each helper — is bounded.
+ */
+const CALL_GATE_TIMEOUT_MS = 30_000;
+/** How long a remote MCP connect keeps the override writer's lock after its initiation (see launchUnderOverrideFence). */
+const LAUNCH_INITIATION_FENCE_MS = 2_000;
+/**
+ * How long a stdio launch may take to hand back its exec stream under the
+ * override writer's lock before it is ABORTED (see launchUnderOverrideFence).
+ * Matches the SSH2 transport's connection-acquisition cap: a cold connection
+ * that takes longer fails as a startup timeout and is retried by the next
+ * request (with a fresh fence) instead of being released to send its command
+ * after a sibling's revocation committed.
+ */
+const STDIO_LAUNCH_FENCE_MS = 15_000;
+/** Iterations a served tool call spends waiting for override state to settle before failing closed. */
+const CALL_GATE_MAX_ATTEMPTS = 5;
+
+/**
+ * Whether two request options derive the same server enablement: same
+ * workspace and project, same trust, same (normalized) overrides, same Agent
+ * Plugin context. Secrets and identity are irrelevant to authorization.
+ */
+function authorizationStateEqual(
+  a: MCPWorkspaceRequestOptions,
+  b: MCPWorkspaceRequestOptions
+): boolean {
+  return (
+    a.workspaceId === b.workspaceId &&
+    a.projectPath === b.projectPath &&
+    (a.trusted ?? false) === (b.trusted ?? false) &&
+    // A non-authoritative record is a different authorization state even
+    // with an identical override value: the latest serve established that
+    // the state could NOT be verified, and an overlapping authoritative
+    // serve must not hand out tools on the strength of the same value.
+    (a.overridesAuthoritative !== false) === (b.overridesAuthoritative !== false) &&
+    workspaceOverridesEqual(a.overrides, b.overrides) &&
+    JSON.stringify(a.agentPlugins ?? null) === JSON.stringify(b.agentPlugins ?? null)
+  );
+}
+
+/** Structural equality of override snapshots (both sides are normalized by the service). */
+export function workspaceOverridesEqual(
+  a: WorkspaceMCPOverrides | undefined,
+  b: WorkspaceMCPOverrides | undefined
+): boolean {
+  return JSON.stringify(a ?? {}) === JSON.stringify(b ?? {});
+}
 
 function secretRecordsEqual(
   a: Record<string, string> | undefined,
@@ -1000,6 +1055,24 @@ export interface MCPWorkspaceRequestOptions {
   workspacePath: string;
   trusted?: boolean;
   overrides?: WorkspaceMCPOverrides;
+  /**
+   * `false` when the caller could not establish `overrides` authoritatively
+   * (indeterminate probe, unreadable document, failed inheritance): the
+   * manager then re-reads disk itself and fails the serve CLOSED if that read
+   * is not authoritative either. "No overrides" is not "no servers" — a
+   * globally enabled server disabled only by an unreadable document would
+   * otherwise start. Omitted means authoritative (internal callers).
+   */
+  overridesAuthoritative?: boolean;
+  /**
+   * Absolute deadline (epoch ms) of the caller's own override read, set when
+   * that read was NOT authoritative. Had it exhausted the budget (an
+   * unreachable SSH/Docker ancestor), the manager's disk re-read gets only
+   * what remains of it — never a fresh full deadline of its own, which would
+   * double the request's wait and leave a second uncancellable remote probe
+   * behind. Nothing remaining → the serve fails closed without a re-read.
+   */
+  overridesReadDeadlineAt?: number;
   projectSecrets?: Record<string, string>;
   agentPlugins?: AgentPluginsMcpContext | null;
 }
@@ -1016,12 +1089,50 @@ interface MCPToolsForWorkspaceResult {
   stats: MCPWorkspaceStats;
   /** Prompt descriptors for model-facing discovery, from the same enabled/stale gates as getPromptsForWorkspace. */
   promptDescriptors: MCPPromptDescriptor[];
+  /**
+   * The validated workspace overrides this serve's enablement was derived
+   * from (disk-authoritative when the caller's snapshot was not); absent when
+   * the serve failed closed. Callers rebuild prompt-facing listings from these
+   * whenever their own snapshot was not authoritative or differs from them (a
+   * publication replaced the caller's snapshot mid-serve).
+   */
+  overridesUsed?: WorkspaceMCPOverrides;
+  /**
+   * The validated server inventory the serve's enablement was derived from —
+   * config, project trust, overrides, and policy as of the last repair. Trust
+   * and global/project config can change independently of the override
+   * snapshot, so callers list the prompt-facing inventory from this rather
+   * than from their own pre-serve `listServers` call.
+   */
+  serversUsed?: MCPServerMap;
+  /**
+   * Internal: the recorded options the served entry's enablement was derived
+   * from; absent when the serve failed closed. getPrompt compares it with the
+   * recorded options at dispatch time (see serveResult).
+   */
+  enablementDerivedFrom?: MCPWorkspaceRequestOptions;
 }
 interface WorkspaceServers {
   configSignature: string;
   instances: Map<string, MCPServerInstance>;
   /** Filters prompts while leased restarts can leave disabled clients cached. */
   enabledServerNames: Set<string>;
+  /**
+   * The validated server inventory `enabledServerNames` was derived from
+   * (config + trust + overrides + policy at derivation time). Returned to
+   * callers as `serversUsed` so the prompt's MCP listing is built from the
+   * same authorization state as the served tools.
+   */
+  enabledServers: MCPServerMap;
+  /**
+   * `configService.configGeneration` read BEFORE the config read
+   * `enabledServers` was derived from. Global mutations (mcp.setEnabled, a
+   * global/project toolAllowlist edit) bump the generation without replacing
+   * recorded options; the call-time gate compares this with the current
+   * generation and re-derives the inventory when it moved, so a tool object
+   * handed out earlier never dispatches on a stale allowlist.
+   */
+  enabledServersGeneration: number;
   stats: MCPWorkspaceStats;
   timedOutServerNames: string[];
   /** Prevent concurrent cached retries from stacking startup attempts for the same server. */
@@ -1065,7 +1176,43 @@ export interface MCPServerManagerOptions {
      * memory. When absent or failing, the affected cached state is dropped
      * instead.
      */
-    readWorkspaceOverrides?: (workspaceId: string) => Promise<WorkspaceMCPOverrides | undefined>;
+    /**
+     * Disk-authoritative override reader. Resolves `undefined` when the state
+     * could NOT be established authoritatively (unreachable/indeterminate
+     * checkout); callers must then treat the read as failed, never as "no
+     * overrides".
+     */
+    readWorkspaceOverrides?: (
+      workspaceId: string,
+      /**
+       * Bound/cancel the read (the service applies its own default deadline
+       * when `timeoutMs` is omitted). A timed-out or aborted read resolves
+       * `undefined`, i.e. fails closed, never "no overrides".
+       */
+      options?: { timeoutMs?: number; signal?: AbortSignal }
+    ) => Promise<WorkspaceMCPOverrides | undefined>;
+    /**
+     * Cross-process override-write epoch (WorkspaceMcpOverridesService bumps
+     * it under its write lock after every save/prune). Two backends sharing
+     * one home publish only into their own caches; when a sibling's token
+     * changes, every cached override snapshot here is refreshed from disk (or
+     * evicted) so a stale in-memory overlay can never supersede a fresh
+     * authoritative request read.
+     */
+    readOverridesEpoch?: () => Promise<string | undefined>;
+    /**
+     * Acquire the override WRITER's lock (the service's in-process queue plus
+     * the cross-process `mcp-overrides.lock`); resolves with the release. A
+     * served tool call holds it from its final epoch read through the
+     * synchronous invocation start, so a sibling process's revocation either
+     * lands before that read (observed) or after the dispatch — never in the
+     * promise continuations between them (see gateServedToolOnEnablement).
+     */
+    acquireOverridesLock?: (options?: {
+      /** Give up (without ever holding the lock) once aborted or past `timeoutMs`. */
+      signal?: AbortSignal;
+      timeoutMs?: number;
+    }) => Promise<() => Promise<void>>;
   };
 }
 
@@ -1099,6 +1246,12 @@ export class MCPServerManager {
    * cached or recorded state to repair, so stale caller snapshots can be overlaid.
    */
   private readonly latestWorkspaceOverrides = new Map<string, WorkspaceMCPOverrides | undefined>();
+  /**
+   * Publication enablement repairs in flight (applyWorkspaceOverrides awaits
+   * listServers before it can rewrite `entry.enabledServerNames`). Served tool
+   * invocations wait for the pending repair before their call-time gate.
+   */
+  private readonly pendingEnablementRepairs = new Map<string, Promise<void>>();
   private readonly latestProjectTrust = new Map<string, boolean>();
   private readonly workspaceRestartLocks = new MutexMap<string>();
   /** Orders racing prompt refresh completions per instance; see refreshInstancePrompts. */
@@ -1135,6 +1288,7 @@ export class MCPServerManager {
   private readonly pluginInvalidation?: MCPServerManagerOptions["pluginInvalidation"];
   private pluginInvalidationTokenSeen = false;
   private lastPluginInvalidationToken: string | undefined;
+  private lastOverridesEpochToken: string | undefined;
   /** Serializes cross-process invalidation checks (see retireCrossProcessPluginInstances). */
   private pluginInvalidationQueue: Promise<unknown> = Promise.resolve();
   private readonly idleCheckInterval: ReturnType<typeof setInterval>;
@@ -1193,11 +1347,42 @@ export class MCPServerManager {
     // published token and proceed; a failed sweep leaves the token
     // unpublished so the next serve retries it.
     const run = async (): Promise<void> => {
-      const token = await invalidation.readToken();
+      const [token, overridesEpoch] = await Promise.all([
+        invalidation.readToken(),
+        invalidation.readOverridesEpoch?.(),
+      ]);
       if (!this.pluginInvalidationTokenSeen) {
         this.pluginInvalidationTokenSeen = true;
         this.lastPluginInvalidationToken = token;
+        this.lastOverridesEpochToken = overridesEpoch;
+        // Cache state can predate the first token observation (in-process
+        // publications for never-served workspaces), and a sibling's write may
+        // already have superseded it: nothing vouches for that state relative
+        // to the accepted baseline, so evict it and let serves re-read disk.
+        if (
+          invalidation.readOverridesEpoch !== undefined &&
+          (this.latestWorkspaceOverrides.size > 0 || this.lastWorkspaceRequestOptions.size > 0)
+        ) {
+          this.forgetAllWorkspaceOverrides();
+        }
         return;
+      }
+      if (
+        overridesEpoch !== this.lastOverridesEpochToken ||
+        isWorkspaceOverridesEpochUnreadable(overridesEpoch)
+      ) {
+        // A sibling process wrote workspace overrides: our caches were never
+        // notified. Evict every snapshot (invalidation markers) and let each
+        // workspace re-read disk lazily on its next serve — an eager re-read
+        // here would cost one full config enumeration per cached workspace
+        // while every other serve waits on this queue. An UNREADABLE epoch
+        // counts as changed on every observation: nothing can prove it did
+        // not change, so nothing cached may be trusted while it persists.
+        log.info(
+          "[MCP] Cross-process workspace override write detected; evicting cached overrides"
+        );
+        this.forgetAllWorkspaceOverrides();
+        this.lastOverridesEpochToken = overridesEpoch;
       }
       if (token === this.lastPluginInvalidationToken) {
         return;
@@ -1219,6 +1404,21 @@ export class MCPServerManager {
     this.pluginInvalidationQueue = next.catch(() => undefined);
     return next;
   }
+
+  /**
+   * Workspaces whose cached AND recorded override snapshots were invalidated by
+   * forgetWorkspaceOverrides, keyed to an invalidation generation. A disk read
+   * retires only the generation it observed before starting, so a newer
+   * invalidation landing mid-read is never acknowledged by the older result.
+   */
+  private readonly overridesInvalidationGenerations = new Map<string, number>();
+  private overridesInvalidationClock = 0;
+  /**
+   * Bumped by forgetAllWorkspaceOverrides: a cold serve (present in neither
+   * map yet) cannot be named by a global eviction, so its first read compares
+   * this clock instead and fails closed when an eviction landed mid-read.
+   */
+  private globalOverridesEvictionGeneration = 0;
 
   /** Remove only Agent Plugin keys when disk-authoritative overrides cannot be read. */
   private scrubPluginOverrideKeys(
@@ -1270,9 +1470,14 @@ export class MCPServerManager {
       }
       let fresh: WorkspaceMCPOverrides | undefined;
       let readFailed = readOverrides === undefined;
+      // A forget landing while the read below is in flight makes its result
+      // pre-change state (same hazard as loadFirstServeWorkspaceOverrides).
+      const generationBefore = this.overridesInvalidationGenerations.get(workspaceId);
       if (readOverrides !== undefined) {
         try {
           fresh = await readOverrides(workspaceId);
+          // Non-authoritative read: keep the scrub fallback, not a guess.
+          if (fresh === undefined) readFailed = true;
         } catch (error) {
           readFailed = true;
           log.warn("[MCP] Failed to reload workspace overrides after sibling plugin mutation", {
@@ -1281,8 +1486,49 @@ export class MCPServerManager {
           });
         }
       }
+      const latest = this.lastWorkspaceRequestOptions.get(workspaceId);
+      if (latest !== recorded) {
+        // An authoritative publication (or a serve) replaced the recorded
+        // options while the read was in flight: it is newer than both the
+        // snapshot and whatever disk state this read observed, so committing
+        // the read would restore pre-publication enablement over it. Keep the
+        // newer state; only scrub plugin keys from it (a publication carries
+        // disk truth, which the sibling's prune already cleaned, so this is a
+        // no-op for it — a serve's stale caller snapshot loses them).
+        if (latest !== undefined) {
+          this.lastWorkspaceRequestOptions.set(workspaceId, {
+            ...latest,
+            overrides: this.scrubPluginOverrideKeys(latest.overrides),
+          });
+          if (this.latestWorkspaceOverrides.has(workspaceId)) {
+            this.latestWorkspaceOverrides.set(
+              workspaceId,
+              this.scrubPluginOverrideKeys(this.latestWorkspaceOverrides.get(workspaceId))
+            );
+          }
+          this.bumpWorkspaceOptionsMutationCount(workspaceId);
+        }
+        continue;
+      }
       const authoritative = readFailed ? this.scrubPluginOverrideKeys(recorded.overrides) : fresh;
-      this.latestWorkspaceOverrides.set(workspaceId, authoritative);
+      const supersededMidRead =
+        this.overridesInvalidationGenerations.get(workspaceId) !== generationBefore;
+      if (
+        this.overridesInvalidationGenerations.has(workspaceId) &&
+        (readFailed || supersededMidRead)
+      ) {
+        // The recorded snapshot of an invalidated workspace is exactly what is
+        // being distrusted (and a value read before a mid-read forget is no
+        // better): scrub it, but do not repopulate the overlay cache from it —
+        // that would bypass the pending disk re-read. The marker stays live.
+        this.latestWorkspaceOverrides.delete(workspaceId);
+      } else {
+        // Either disk was read authoritatively with no forget in between (the
+        // cache now holds disk truth, so retire any marker), or there was no
+        // invalidation to retire in the first place.
+        this.latestWorkspaceOverrides.set(workspaceId, authoritative);
+        this.overridesInvalidationGenerations.delete(workspaceId);
+      }
       this.lastWorkspaceRequestOptions.set(workspaceId, {
         ...recorded,
         overrides: authoritative,
@@ -1310,29 +1556,134 @@ export class MCPServerManager {
    * workspace has none. Disk is authoritative (every override write
    * persists before publishing), so read it now; when it cannot be read,
    * scrub plugin keys from the caller snapshot so a stale enable can never
-   * override a replacement server's default-disabled state. Off-host
-   * workspaces are skipped (plugin servers are never offered there, and the
-   * read would exec remotely).
+   * override a replacement server's default-disabled state — and under
+   * cross-process override-epoch tracking, fail the serve closed, since the
+   * same staleness applies to ordinary servers (offered on every runtime,
+   * so off-host workspaces read too, at the cost of one remote exec per
+   * cold serve).
    */
   private async loadFirstServeWorkspaceOverrides(
-    requestOptions: MCPWorkspaceRequestOptions
-  ): Promise<WorkspaceMCPOverrides | undefined> {
+    requestOptions: MCPWorkspaceRequestOptions,
+    /** Re-read disk even though recorded options exist (see ensureWorkspaceServers). */
+    revalidate = false,
+    readSignal?: AbortSignal
+  ): Promise<{
+    overrides: WorkspaceMCPOverrides | undefined;
+    /**
+     * True when this serve belongs to an invalidated workspace whose overrides
+     * could not be re-read authoritatively: MCP dispatch for THIS serve fails
+     * CLOSED (no servers). The recorded snapshot predates the change that
+     * triggered the invalidation, so serving from it could keep a just-revoked
+     * server running. Per-serve by construction — concurrent serves of one
+     * workspace must not observe each other's availability.
+     */
+    unavailable: boolean;
+    /** Generations observed before the read; callers recheck them after resuming. */
+    observed: { workspace: number | undefined; global: number };
+    /**
+     * Invalidation generation this (authoritative, un-superseded) read
+     * satisfies. NOT retired here: the caller retires it in the same
+     * synchronous block that records the fresh options, so an overlapping
+     * serve can never find the marker gone while stale options are still the
+     * recorded ones.
+     */
+    satisfiesInvalidation?: number;
+    /**
+     * True when `overrides` is a fresh, un-superseded disk read. The caller
+     * records it as authoritative regardless of what the request claimed:
+     * leaving a repaired snapshot marked non-authoritative would make every
+     * later serve re-enter this read (remote probes on SSH/devcontainer).
+     * getPrompt alone distrusts the recorded options on purpose, once per
+     * dispatch (see promptDispatchOptions).
+     */
+    fromDisk: boolean;
+  }> {
+    const { workspaceId } = requestOptions;
+    const invalidationGeneration = this.overridesInvalidationGenerations.get(workspaceId);
+    const observed = {
+      workspace: invalidationGeneration,
+      global: this.globalOverridesEvictionGeneration,
+    };
+    const invalidated = invalidationGeneration !== undefined;
+    // A caller snapshot that is not authoritative (see overridesAuthoritative)
+    // is distrusted exactly like an invalidated recorded one: disk must vouch
+    // for the enablement or the serve fails closed.
+    const distrusted = invalidated || requestOptions.overridesAuthoritative === false || revalidate;
     if (
       this.pluginInvalidation === undefined ||
-      this.lastWorkspaceRequestOptions.has(requestOptions.workspaceId)
+      (this.lastWorkspaceRequestOptions.has(workspaceId) && !distrusted)
     ) {
-      return requestOptions.overrides;
+      return {
+        overrides: requestOptions.overrides,
+        unavailable: this.pluginInvalidation === undefined && distrusted,
+        observed,
+        fromDisk: false,
+      };
     }
-    const execsOffHost =
-      requestOptions.runtime instanceof RemoteRuntime ||
-      requestOptions.runtime instanceof DevcontainerRuntime;
-    if (execsOffHost) {
-      return requestOptions.overrides;
-    }
+    // Every runtime re-reads disk here, off-host (SSH/devcontainer) included:
+    // besides guarding plugin keys (never offered off-host), this read is what
+    // vouches for a COLD serve relative to the override epoch baseline
+    // retireCrossProcessPluginInstances just accepted. The caller's snapshot
+    // may predate a sibling process's write that landed before our first
+    // epoch observation — there was no cache to evict, the snapshot claims
+    // authority, and the postflight sees an unchanged token — so ordinary
+    // remote servers revoked by that sibling would otherwise serve this turn.
+    // Reading after the baseline observation bounds the state to it.
     const readOverrides = this.pluginInvalidation.readWorkspaceOverrides;
     if (readOverrides !== undefined) {
       try {
-        return await readOverrides(requestOptions.workspaceId);
+        // Bounded by what remains of the caller's read budget (its own
+        // read was already bounded; see overridesReadDeadlineAt), else by the
+        // reader's default deadline, and cancelled with the caller's turn: a
+        // mandatory second read must not wait for a remote parent's command
+        // timeout (a timed-out/aborted read is `undefined` → fail closed).
+        const remainingMs =
+          requestOptions.overridesReadDeadlineAt === undefined
+            ? undefined
+            : Math.max(0, requestOptions.overridesReadDeadlineAt - Date.now());
+        const fresh =
+          remainingMs === 0
+            ? undefined
+            : await readOverrides(workspaceId, {
+                ...(remainingMs !== undefined ? { timeoutMs: remainingMs } : {}),
+                ...(readSignal !== undefined ? { signal: readSignal } : {}),
+              });
+        if (fresh !== undefined) {
+          // Compare even when no invalidation existed before the read: a
+          // forget that STARTED during a cold serve's read is just as
+          // superseding as one that advanced an existing generation.
+          const superseded =
+            this.overridesInvalidationGenerations.get(workspaceId) !== invalidationGeneration ||
+            this.globalOverridesEvictionGeneration !== observed.global;
+          if (superseded) {
+            // A forget landed while this read was in flight: the value read is
+            // pre-change state. It must neither retire the newer invalidation
+            // nor be served — fail closed for this serve, and make sure a
+            // marker exists so the NEXT serve re-reads (a global eviction
+            // alone leaves none for a cold workspace, yet this serve is about
+            // to record the stale snapshot as its options).
+            log.warn(
+              "[MCP] Workspace overrides read superseded by a newer invalidation; disabling MCP for this serve",
+              { workspaceId }
+            );
+            if (!this.overridesInvalidationGenerations.has(workspaceId)) {
+              this.markOverridesInvalidated(workspaceId);
+            }
+            return {
+              overrides: this.scrubPluginOverrideKeys(fresh),
+              unavailable: true,
+              observed,
+              fromDisk: false,
+            };
+          }
+          return {
+            overrides: fresh,
+            unavailable: false,
+            observed,
+            fromDisk: true,
+            ...(invalidated ? { satisfiesInvalidation: invalidationGeneration } : {}),
+          };
+        }
       } catch (error) {
         log.warn("[MCP] Failed to load workspace overrides for a first serve", {
           workspaceId: requestOptions.workspaceId,
@@ -1340,7 +1691,24 @@ export class MCPServerManager {
         });
       }
     }
-    return this.scrubPluginOverrideKeys(requestOptions.overrides);
+    // Fail closed when the snapshot is exactly what is being distrusted, and
+    // likewise for a cold serve under cross-process epoch tracking: the
+    // snapshot's authority is only relative to the caller's read, which the
+    // accepted epoch baseline cannot vouch for (see above). Without a reader
+    // (or epoch tracking) there is nothing more to establish; serve it.
+    const unavailable = distrusted || this.pluginInvalidation.readOverridesEpoch !== undefined;
+    if (unavailable) {
+      log.warn(
+        "[MCP] Workspace overrides could not be established authoritatively; disabling MCP for this serve",
+        { workspaceId, invalidated }
+      );
+    }
+    return {
+      overrides: this.scrubPluginOverrideKeys(requestOptions.overrides),
+      unavailable,
+      observed,
+      fromDisk: false,
+    };
   }
 
   /**
@@ -1728,17 +2096,40 @@ export class MCPServerManager {
   private async runWithStablePluginEpoch<T>(operation: () => Promise<T>): Promise<T> {
     for (let attempt = 0; ; attempt++) {
       await this.retireCrossProcessPluginInstances();
+      // Snapshot the baselines THIS operation runs under. The postflight must
+      // compare against them, not against the live fields: a concurrent
+      // serve's preflight can observe a sibling's newer epoch, evict, and
+      // advance the live baseline while this operation is still in flight —
+      // the live field would then match the fresh read and accept a result
+      // derived from pre-eviction state.
+      const pluginTokenUsed = this.lastPluginInvalidationToken;
+      const overridesEpochUsed = this.lastOverridesEpochToken;
       const result = await operation();
       if (this.pluginInvalidation === undefined || !this.pluginInvalidationTokenSeen) {
         return result;
       }
+      // Bracket the operation with BOTH cross-process tokens: a sibling's
+      // override write landing mid-serve changes no process-local
+      // authorization state, so only this recheck can catch it. The retry's
+      // preflight evicts the caches and the operation re-reads disk. An
+      // unreadable epoch never matches: it cannot vouch for anything.
+      // Sequential, override epoch LAST: it is the fence for the served
+      // tool gate, so it must be the final read before the result is
+      // accepted — a parallel read could capture the old epoch while the
+      // slower token read settles, accepting a pair a sibling revocation
+      // completed in between.
       const token = await this.pluginInvalidation.readToken();
-      if (token === this.lastPluginInvalidationToken) {
+      const overridesEpoch = await this.pluginInvalidation.readOverridesEpoch?.();
+      if (
+        token === pluginTokenUsed &&
+        overridesEpoch === overridesEpochUsed &&
+        !isWorkspaceOverridesEpochUnreadable(overridesEpoch)
+      ) {
         return result;
       }
       if (attempt >= 5) {
         throw new Error(
-          "MCP startup kept racing concurrent plugin mutations; retry once plugin installs/updates settle"
+          "MCP startup kept racing concurrent plugin or workspace override mutations; retry once they settle"
         );
       }
       await this.retireCrossProcessPluginInstances();
@@ -1746,9 +2137,86 @@ export class MCPServerManager {
   }
 
   async getToolsForWorkspace(
-    options: MCPWorkspaceRequestOptions
+    options: MCPWorkspaceRequestOptions,
+    /** Cancels the serve's own disk re-read (see loadFirstServeWorkspaceOverrides). */
+    callOptions?: { signal?: AbortSignal }
   ): Promise<MCPToolsForWorkspaceResult> {
-    return this.runWithStablePluginEpoch(() => this.ensureWorkspaceServers(options, true));
+    const result = await this.getToolsForWorkspaceInternal(options, callOptions?.signal);
+    // The epoch postflight awaits readToken() AFTER serveResult's gate: a
+    // publication or eviction landing in that await is not covered by it.
+    // Re-apply the same check at the very last point before the tools leave
+    // the manager. Beyond this point the served instances stay connected for
+    // the stream's duration (see the leased-restart path), but every tool
+    // invocation re-checks enablement (gateServedToolsOnEnablement). A
+    // non-empty result without provenance cannot be vouched for either.
+    const { workspaceId } = options;
+    if (!this.isServeAuthorizationCurrent(workspaceId, result.enablementDerivedFrom)) {
+      // Regardless of result size: even a zero-surface serve (only enabled
+      // server failed to start) carries `overridesUsed`, from which the
+      // caller rebuilds its prompt inventory — stale provenance must not
+      // leave the manager either.
+      if (Object.keys(result.tools).length > 0 || result.promptDescriptors.length > 0) {
+        log.warn(
+          "[MCP] Workspace overrides changed after the serve completed; disabling MCP for this serve",
+          { workspaceId }
+        );
+      }
+      return this.failClosedResult();
+    }
+    // Internal provenance; not part of the caller-facing result.
+    const { enablementDerivedFrom: _derivedFrom, ...served } = result;
+    return served;
+  }
+
+  /**
+   * getToolsForWorkspace that RETAINS the serve's provenance. Recursive
+   * serves inside ensureWorkspaceServers (timed-out retries, lost restart
+   * ownership) must use this one: the public wrapper strips the provenance,
+   * and a result without it can no longer be checked by the outer wrapper.
+   */
+  private getToolsForWorkspaceInternal(
+    options: MCPWorkspaceRequestOptions,
+    readSignal?: AbortSignal
+  ): Promise<MCPToolsForWorkspaceResult> {
+    return this.runWithStablePluginEpoch(() =>
+      this.ensureWorkspaceServers(options, true, readSignal)
+    );
+  }
+
+  /**
+   * Whether enablement derived from `derivedFrom` is still what this
+   * workspace's recorded options and invalidation state describe:
+   * - a publication (or serve/refresh/stop) replaces the recorded options, so
+   *   identity must match;
+   * - a forgetWorkspaceOverrides leaves them in place and only sets the
+   *   invalidation marker, so no marker may be live;
+   * - no provenance means enablement could not be derived at all.
+   * Every point that hands out tools or dispatches a prompt checks this.
+   */
+  private isServeAuthorizationCurrent(
+    workspaceId: string,
+    derivedFrom: MCPWorkspaceRequestOptions | undefined
+  ): boolean {
+    if (derivedFrom === undefined || this.overridesInvalidationGenerations.has(workspaceId)) {
+      return false;
+    }
+    const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+    // Equivalence, not identity: two ordinary serves of one workspace that
+    // overlap (prompt discovery while a send assembles) each record their own
+    // options object with the SAME authorization state, and the first to
+    // finish must not be failed closed as if a publication had revoked it. A
+    // publication or trust change records different overrides/trust and is
+    // still detected.
+    return recorded !== undefined && authorizationStateEqual(recorded, derivedFrom);
+  }
+
+  private failClosedResult(): MCPToolsForWorkspaceResult {
+    return {
+      tools: {},
+      toolServerNames: {},
+      stats: this.createWorkspaceStats(0, new Map(), []),
+      promptDescriptors: [],
+    };
   }
 
   /**
@@ -1757,7 +2225,9 @@ export class MCPServerManager {
    */
   private async ensureWorkspaceServers(
     requestOptions: MCPWorkspaceRequestOptions,
-    refreshToolCatalogs: boolean
+    refreshToolCatalogs: boolean,
+    /** Cancels this serve's disk re-read of the overrides (the caller's request/turn signal). */
+    readSignal?: AbortSignal
   ): Promise<MCPToolsForWorkspaceResult> {
     // runWithStablePluginEpoch performs the sibling-mutation preflight BEFORE
     // entering this method, so refreshed disk overrides are visible to the
@@ -1766,24 +2236,89 @@ export class MCPServerManager {
     // Cold workspaces have no recorded state for applyWorkspaceOverrides to repair.
     // Overlay the newest overrides over a caller snapshot that may predate the mutation.
     let options: MCPWorkspaceRequestOptions;
-    if (this.latestWorkspaceOverrides.has(requestOptions.workspaceId)) {
-      options = {
-        ...requestOptions,
-        overrides: this.latestWorkspaceOverrides.get(requestOptions.workspaceId),
-      };
+    // Per-serve fail-closed marker (see loadFirstServeWorkspaceOverrides).
+    let overridesUnavailable = false;
+    let satisfiesInvalidation: number | undefined;
+    // A caller whose own read could not establish the current document
+    // (overridesAuthoritative false: unreadable/invalid file) must not be
+    // served from the cache either: the cached publication predates whatever
+    // made the document unreadable, so nothing vouches for it now. Re-read
+    // disk (fail closed if it cannot vouch) and revalidate the entry.
+    const distrustedCaller = requestOptions.overridesAuthoritative === false;
+    const hadCached = this.latestWorkspaceOverrides.has(requestOptions.workspaceId);
+    const cachedBefore = this.latestWorkspaceOverrides.get(requestOptions.workspaceId);
+    // The cache is a repair hint for caller snapshots that predate a save, not
+    // an authority over a LATER authoritative read: a direct edit of the
+    // JSONC file bumps no epoch and publishes nothing, so a cache entry that
+    // disagrees with an authoritative caller snapshot cannot be told apart
+    // from a stale snapshot without disk. Re-read disk whenever they differ
+    // (steady state agrees, so this costs nothing then); disk decides, a
+    // publication landing mid-read still wins, and an unreadable disk fails
+    // closed. Without a reader the cache stays authoritative as before.
+    const cacheDiffersFromCaller =
+      hadCached &&
+      !distrustedCaller &&
+      this.pluginInvalidation?.readWorkspaceOverrides !== undefined &&
+      requestOptions.overrides !== undefined &&
+      !workspaceOverridesEqual(cachedBefore, requestOptions.overrides);
+    const revalidating = distrustedCaller || cacheDiffersFromCaller;
+    if (hadCached && !revalidating) {
+      options = { ...requestOptions, overrides: cachedBefore };
     } else {
-      const firstServeOverrides = await this.loadFirstServeWorkspaceOverrides(requestOptions);
+      const firstServe = await this.loadFirstServeWorkspaceOverrides(
+        requestOptions,
+        cacheDiffersFromCaller,
+        readSignal
+      );
       // Recheck AFTER the await: an MCP settings save completing while the
       // disk read was in flight published newer state into the cache, and
       // recording the read's older result would expose a just-disabled
       // server for this send (the save's repair path only patches recorded
-      // options, which do not exist yet on a first serve).
-      options = this.latestWorkspaceOverrides.has(requestOptions.workspaceId)
-        ? {
-            ...requestOptions,
-            overrides: this.latestWorkspaceOverrides.get(requestOptions.workspaceId),
-          }
-        : { ...requestOptions, overrides: firstServeOverrides };
+      // options, which do not exist yet on a first serve). An authoritative
+      // publication also supersedes this serve's fail-closed verdict. For a
+      // distrusted caller only a NEW publication counts — the entry that was
+      // already there is exactly what is being revalidated.
+      const cachedAfter = this.latestWorkspaceOverrides.get(requestOptions.workspaceId);
+      if (
+        this.latestWorkspaceOverrides.has(requestOptions.workspaceId) &&
+        (!hadCached || cachedAfter !== cachedBefore)
+      ) {
+        // A publication is disk truth: record it as authoritative even for a
+        // caller whose own read was not (see fromDisk).
+        options = { ...requestOptions, overrides: cachedAfter, overridesAuthoritative: true };
+      } else {
+        options = { ...requestOptions, overrides: firstServe.overrides };
+        satisfiesInvalidation = firstServe.satisfiesInvalidation;
+        // The read's own comparison ran before this continuation resumed; a
+        // forget/eviction squeezed into that gap finds no cache entry to
+        // remove yet, so it is only observable here. Fail closed when seen.
+        // (A publication that retired the generation meanwhile also replaced
+        // the cache, which the branch above already took.)
+        const currentGeneration = this.overridesInvalidationGenerations.get(
+          requestOptions.workspaceId
+        );
+        const supersededAfterRead =
+          currentGeneration !== undefined && currentGeneration !== firstServe.observed.workspace;
+        const globallyEvictedAfterRead =
+          this.globalOverridesEvictionGeneration !== firstServe.observed.global;
+        overridesUnavailable =
+          firstServe.unavailable || supersededAfterRead || globallyEvictedAfterRead;
+        if (globallyEvictedAfterRead && currentGeneration === undefined) {
+          // Same retry guarantee as inside the read: the options recorded
+          // below are pre-eviction state and must be re-read next time.
+          this.markOverridesInvalidated(requestOptions.workspaceId);
+        }
+        if (firstServe.fromDisk && !overridesUnavailable) {
+          options = { ...options, overridesAuthoritative: true };
+        }
+        if (revalidating && hadCached && !overridesUnavailable) {
+          // Disk vouched for the revalidation and nothing superseded the
+          // read (no publication — same object — no forget, no eviction):
+          // the cached entry is revalidated with disk truth. Otherwise it is
+          // left alone (still the newest publication this process knows).
+          this.latestWorkspaceOverrides.set(requestOptions.workspaceId, firstServe.overrides);
+        }
+      }
     }
     // Same cold-workspace gap for project trust: a revocation landing while a
     // stream's pre-await trusted snapshot is still in flight has no recorded
@@ -1793,6 +2328,13 @@ export class MCPServerManager {
     );
     if (latestTrust !== undefined && (options.trusted ?? false) !== latestTrust) {
       options = { ...options, trusted: latestTrust };
+    }
+    // The caller's read deadline is request-scoped (see
+    // overridesReadDeadlineAt): the recorded options are re-used by later
+    // distrusted re-reads (prompt dispatch, invalidation repair), which must
+    // get the reader's default budget, not one that expired with this send.
+    if (options.overridesReadDeadlineAt !== undefined) {
+      options = { ...options, overridesReadDeadlineAt: undefined };
     }
     const {
       workspaceId,
@@ -1806,11 +2348,32 @@ export class MCPServerManager {
     } = options;
 
     this.lastWorkspaceRequestOptions.set(workspaceId, options);
+    // Retire the invalidation the disk read satisfied ONLY now that its fresh
+    // options are the recorded ones (same synchronous block), and only if no
+    // newer forget advanced it meanwhile. Retiring inside the read would open
+    // a window in which an overlapping serve sees no marker while the stale
+    // pre-read options are still recorded — and installs them as current.
+    if (
+      satisfiesInvalidation !== undefined &&
+      !overridesUnavailable &&
+      this.overridesInvalidationGenerations.get(workspaceId) === satisfiesInvalidation
+    ) {
+      // Cache the recovered (authoritative) overrides BEFORE retiring the
+      // marker: a later serve carrying a stale pre-save caller snapshot would
+      // otherwise take the fast path and record that snapshot as current.
+      this.latestWorkspaceOverrides.set(workspaceId, overrides);
+      this.overridesInvalidationGenerations.delete(workspaceId);
+    }
 
     // Global mutations (mcp.setEnabled / mcp.remove) bump the config
     // generation without replacing recorded options; capture it before config
     // reads so enablement repair can detect them.
     const configGenerationUsed = this.configService.configGeneration;
+    // Likewise a forgetWorkspaceOverrides landing during getAllServers() or
+    // server startup only advances this marker (the recorded options above
+    // stay the same object, so the repair below sees nothing to redo). The
+    // serve is checked against it before returning (see serveResult).
+    const overridesGenerationUsed = this.overridesInvalidationGenerations.get(workspaceId);
 
     // Snapshot BEFORE reading config: a plugin swap that lands after this
     // point may invalidate instances this call starts (see
@@ -1842,10 +2405,11 @@ export class MCPServerManager {
       fullServerInfo[name] = info;
     }
 
-    // Apply server-level overrides (enabled/disabled) before caching
-    const enabledServers = this.filterServersByPolicy(
-      this.applyServerOverrides(fullServerInfo, overrides)
-    );
+    // Apply server-level overrides (enabled/disabled) before caching. An
+    // invalidated workspace whose overrides could not be re-read fails closed.
+    const enabledServers = overridesUnavailable
+      ? {}
+      : this.filterServersByPolicy(this.applyServerOverrides(fullServerInfo, overrides));
     const enabledEntries = Object.entries(enabledServers).sort(([a], [b]) => a.localeCompare(b));
 
     const enabledServerNames = new Set(enabledEntries.map(([name]) => name));
@@ -1864,7 +2428,7 @@ export class MCPServerManager {
     ) {
       // Another request published while this config read was pending. Re-read
       // before treating its additions as removals and restarting healthy clients.
-      return this.ensureWorkspaceServers(options, refreshToolCatalogs);
+      return this.ensureWorkspaceServers(options, refreshToolCatalogs, readSignal);
     }
     if (existing && existing.timedOutServerNames === undefined) {
       existing.timedOutServerNames = [];
@@ -1880,6 +2444,14 @@ export class MCPServerManager {
     if (existing?.configSignature === signature && !hasClosedInstance) {
       existing.lastActivity = Date.now();
       delete existing.stalePromptServerNames;
+      // The signature only covers START config, so a leased serve that
+      // deferred a restart may have narrowed `enabledServerNames` under this
+      // same signature (a server disabled mid-stream). This serve's options
+      // re-derive the set; without this the re-enabled server's tools would
+      // stay filtered out until an unrelated publication repaired the entry.
+      existing.enabledServerNames = enabledServerNames;
+      existing.enabledServers = enabledServers;
+      existing.enabledServersGeneration = configGenerationUsed;
 
       const timedOutServerNamesToRetry = this.getTimedOutServerNamesToRetry(
         existing,
@@ -1907,6 +2479,7 @@ export class MCPServerManager {
         }
 
         try {
+          await this.assertOverridesEpochUnmovedBeforeStart();
           const {
             instances: retriedInstances,
             failedServerNames: retryFailedNames,
@@ -1945,7 +2518,7 @@ export class MCPServerManager {
               }
             }
 
-            return this.getToolsForWorkspace(options);
+            return this.getToolsForWorkspaceInternal(options, readSignal);
           }
 
           // Drop retried instances whose plugin tree was swapped mid-startup;
@@ -2008,7 +2581,7 @@ export class MCPServerManager {
                 promptDescriptors: [],
               };
             }
-            return this.getToolsForWorkspace(options);
+            return this.getToolsForWorkspaceInternal(options, readSignal);
           }
 
           const failedServerNames = [
@@ -2042,7 +2615,7 @@ export class MCPServerManager {
       // A trust or settings mutation can land while getAllServers() runs above;
       // re-derive enablement so this cached return cannot leave a revoked
       // repo-local server invocable.
-      await this.repairEnablementAfterConcurrentMutation(
+      const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
         options,
         existing,
@@ -2055,17 +2628,18 @@ export class MCPServerManager {
         this.refreshInstancePromptsInBackground(existing);
       }
 
-      return {
-        // Additions may publish while a cached refresh/retry is awaiting. This
-        // snapshot lacks their allowlists, so leave them for a fresh config read.
-        ...this.collectTools(
-          new Map([...existing.instances].filter(([name]) => enabledServerNames.has(name))),
-          fullServerInfo,
-          overrides
-        ),
-        stats: existing.stats,
-        promptDescriptors: this.promptDescriptorsFor(existing),
-      };
+      // Additions may publish while a cached refresh/retry is awaiting. This
+      // snapshot lacks their allowlists, so leave them for a fresh config read.
+      return this.serveResult(
+        workspaceId,
+        existing,
+        new Map([...existing.instances].filter(([name]) => enabledServerNames.has(name))),
+        overrides,
+        existing.stats,
+        overridesGenerationUsed,
+        enablementDerivedFrom,
+        overridesUnavailable
+      );
     }
 
     const additiveServerNames = existing
@@ -2118,6 +2692,7 @@ export class MCPServerManager {
           }
         }
 
+        await this.assertOverridesEpochUnmovedBeforeStart();
         const {
           instances: restartedInstances,
           failedServerNames: failedNames,
@@ -2188,14 +2763,14 @@ export class MCPServerManager {
               promptDescriptors: [],
             };
           }
-          return this.getToolsForWorkspace(options);
+          return this.getToolsForWorkspaceInternal(options, readSignal);
         }
       }
 
       // An addition may have published while closed-client recovery was pending.
       // Re-read its config rather than overwriting the new entry's catalogs/stats.
       if (existing.configSignature !== retainedSignature) {
-        return this.ensureWorkspaceServers(options, refreshToolCatalogs);
+        return this.ensureWorkspaceServers(options, refreshToolCatalogs, readSignal);
       }
 
       log.info("[MCP] Deferring MCP server restart while stream is active", {
@@ -2210,8 +2785,9 @@ export class MCPServerManager {
       );
 
       // Even while deferring restarts, ensure new tool lists and stats reflect the latest
-      // enabled/disabled server set. We cannot revoke tools already captured by an in-flight
-      // stream, but we can avoid exposing tools from newly-disabled servers to the next stream.
+      // enabled/disabled server set. Tool objects already captured by an in-flight stream
+      // stay connected but fail at call time once their server is disabled (see
+      // gateServedToolsOnEnablement); this keeps them out of the next stream entirely.
       const instancesForTools = new Map(
         [...existing.instances].filter(([serverName]) => enabledServers[serverName] !== undefined)
       );
@@ -2225,6 +2801,8 @@ export class MCPServerManager {
       );
       existing.stats = leasedStats;
       existing.enabledServerNames = enabledServerNames;
+      existing.enabledServers = enabledServers;
+      existing.enabledServersGeneration = configGenerationUsed;
 
       // The deferred restart retains same-named instances with the old config,
       // so record which servers changed to block prompt invocation on them.
@@ -2241,26 +2819,40 @@ export class MCPServerManager {
         );
       }
 
+      if (refreshToolCatalogs) {
+        // Honor SEP-2549 freshness hints instead of caching tool lists for the instance lifetime.
+        await this.refreshModernInstanceTools(instancesForTools);
+      }
+
       // Runs after the staleness recompute so the delete above cannot clobber
-      // staleness detected from a mutation newer than this call's config read.
-      await this.repairEnablementAfterConcurrentMutation(
+      // staleness detected from a mutation newer than this call's config read,
+      // and after the awaited tool refresh: a publication landing during that
+      // await replaces the recorded options while its own listServers is still
+      // pending, so `existing.enabledServerNames` is only trustworthy once the
+      // repair has re-derived it here — the serve's last await before return.
+      const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
         options,
         existing,
         configGenerationUsed
       );
 
+      // Spawned after the repair so the uncancellable detached refresh cannot
+      // target servers a concurrent mutation just revoked.
       if (refreshToolCatalogs) {
-        // Honor SEP-2549 freshness hints instead of caching tool lists for the instance lifetime.
         this.refreshInstancePromptsInBackground(existing);
-        await this.refreshModernInstanceTools(instancesForTools);
       }
 
-      return {
-        ...this.collectTools(instancesForTools, fullServerInfo, overrides),
-        stats: leasedStats,
-        promptDescriptors: this.promptDescriptorsFor(existing),
-      };
+      return this.serveResult(
+        workspaceId,
+        existing,
+        instancesForTools,
+        overrides,
+        leasedStats,
+        overridesGenerationUsed,
+        enablementDerivedFrom,
+        overridesUnavailable
+      );
     }
 
     // Serialize restarts so concurrent callers cannot overwrite cached servers
@@ -2280,7 +2872,7 @@ export class MCPServerManager {
             await this.refreshModernInstanceTools(current.instances);
           }
           // Repair again in case a mutation landed after the concurrent starter's check.
-          await this.repairEnablementAfterConcurrentMutation(
+          const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
             workspaceId,
             options,
             current,
@@ -2291,11 +2883,16 @@ export class MCPServerManager {
           if (refreshToolCatalogs) {
             this.refreshInstancePromptsInBackground(current);
           }
-          return {
-            ...this.collectTools(current.instances, fullServerInfo, overrides),
-            stats: current.stats,
-            promptDescriptors: this.promptDescriptorsFor(current),
-          };
+          return this.serveResult(
+            workspaceId,
+            current,
+            current.instances,
+            overrides,
+            current.stats,
+            overridesGenerationUsed,
+            enablementDerivedFrom,
+            overridesUnavailable
+          );
         }
       }
 
@@ -2329,6 +2926,7 @@ export class MCPServerManager {
       if (retained) retained.lastActivity = Date.now();
       else await this.stopServers(workspaceId, { retainRestartOptions: true });
 
+      await this.assertOverridesEpochUnmovedBeforeStart();
       const {
         instances,
         failedServerNames: startFailedNames,
@@ -2390,6 +2988,8 @@ export class MCPServerManager {
             for (const [name, instance] of instances) retained.instances.set(name, instance);
             retained.configSignature = signature;
             retained.enabledServerNames = enabledServerNames;
+            retained.enabledServers = enabledServers;
+            retained.enabledServersGeneration = configGenerationUsed;
             retained.timedOutServerNames.push(...startTimedOutNames, ...invalidatedKeys);
             retained.stats = this.createWorkspaceStats(enabledEntries.length, retained.instances, [
               ...retained.stats.failedServerNames,
@@ -2404,6 +3004,8 @@ export class MCPServerManager {
             configSignature: signature,
             instances,
             enabledServerNames,
+            enabledServers,
+            enabledServersGeneration: configGenerationUsed,
             stats: this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames),
             timedOutServerNames: [...startTimedOutNames, ...invalidatedKeys],
             retryingTimedOutServerNames: new Set(),
@@ -2429,7 +3031,7 @@ export class MCPServerManager {
       // Repair first so the awaited refresh never queries a server revoked
       // during startup, then again after it so mutations landing during the
       // slow refresh cannot leak stale descriptors.
-      await this.repairEnablementAfterConcurrentMutation(
+      let enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
         options,
         entry,
@@ -2445,7 +3047,7 @@ export class MCPServerManager {
             ? new Map([...promptInstances].filter(([name]) => instances.has(name)))
             : promptInstances
         );
-        await this.repairEnablementAfterConcurrentMutation(
+        enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
           workspaceId,
           options,
           entry,
@@ -2454,13 +3056,20 @@ export class MCPServerManager {
         if (retained) this.refreshInstancePromptsInBackground(entry);
       }
 
-      return {
-        ...this.collectTools(entry.instances, fullServerInfo, overrides),
-        // entry.stats, not the pre-publication `stats`: invalidated instances
-        // were closed before publication and must not count as started.
-        stats: entry.stats,
-        promptDescriptors: this.promptDescriptorsFor(entry),
-      };
+      // entry.stats, not the pre-publication `stats`: invalidated instances
+      // were closed before publication and must not count as started.
+      // entry.instances, not `instances`: an additive publication only started
+      // the new servers; the retained entry still serves the older ones.
+      return this.serveResult(
+        workspaceId,
+        entry,
+        entry.instances,
+        overrides,
+        entry.stats,
+        overridesGenerationUsed,
+        enablementDerivedFrom,
+        overridesUnavailable
+      );
     });
     if (result !== undefined) return result;
     if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpochAtQueue) {
@@ -2471,7 +3080,7 @@ export class MCPServerManager {
         stats: this.createWorkspaceStats(0, new Map(), []),
       };
     }
-    return this.ensureWorkspaceServers(options, refreshToolCatalogs);
+    return this.ensureWorkspaceServers(options, refreshToolCatalogs, readSignal);
   }
 
   async getPromptsForWorkspace(
@@ -2489,19 +3098,46 @@ export class MCPServerManager {
     for (;;) {
       const optionsMutationsBefore = this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0;
       const generationBefore = this.configService.configGeneration;
-      const currentOptions = this.lastWorkspaceRequestOptions.get(workspaceId) ?? options;
+      // Recorded options carry save-time repairs, but the caller's snapshot is
+      // a LATER read: its authority verdict (a document that could not be
+      // read) and any disagreement with the recorded overrides must reach
+      // ensureWorkspaceServers, which revalidates against disk — otherwise a
+      // warmed workspace would keep advertising a server its current document
+      // revokes.
+      const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+      const currentOptions =
+        recorded === undefined
+          ? options
+          : options.overridesAuthoritative === false ||
+              (options.overrides !== undefined &&
+                !workspaceOverridesEqual(recorded.overrides, options.overrides))
+            ? {
+                ...recorded,
+                overrides: options.overrides,
+                overridesAuthoritative: options.overridesAuthoritative,
+              }
+            : recorded;
       const secretsUsed = await this.resolveSecretsForRefresh(
         workspaceId,
         currentOptions.projectPath
       );
       const refreshed = await raceWithAbortAndTimeout(
         this.runWithStablePluginEpoch(async () => {
-          await this.ensureWorkspaceServers(
+          const served = await this.ensureWorkspaceServers(
             secretsUsed !== undefined
               ? { ...currentOptions, projectSecrets: secretsUsed }
               : currentOptions,
-            false
+            false,
+            callOptions?.signal
           );
+          // A serve that failed closed (overrides not verifiable — an
+          // inherited parent unreachable, a document unreadable) leaves the
+          // warmed entry cached but vouches for none of its servers: querying
+          // their prompt catalogs would advertise prompts from servers whose
+          // current authorization is unknown. Discover nothing instead.
+          if (served.enablementDerivedFrom === undefined) {
+            return undefined;
+          }
           const entry = this.workspaceServers.get(workspaceId);
           if (entry === undefined) {
             return undefined;
@@ -2513,7 +3149,14 @@ export class MCPServerManager {
             this.promptEligibleInstances(entry),
             callOptions?.signal
           );
-          return entry;
+          // The secret re-resolution belongs inside the bracket too: it is
+          // the last await before the stability check, and a sibling's
+          // override write landing during it changes neither counter below.
+          const secretsNow = await this.resolveSecretsForRefresh(
+            workspaceId,
+            currentOptions.projectPath
+          );
+          return { entry, secretsNow, served };
         }),
         {
           ...(callOptions?.signal !== undefined ? { signal: callOptions.signal } : {}),
@@ -2528,15 +3171,18 @@ export class MCPServerManager {
       if (refreshed.value === undefined) {
         return [];
       }
-      latestEntry = refreshed.value;
-      const secretsNow = await this.resolveSecretsForRefresh(
-        workspaceId,
-        currentOptions.projectPath
-      );
+      latestEntry = refreshed.value.entry;
+      // An ordinary serve landing during prompts/list (a direct edit of the
+      // override document, a disk re-read) can replace the entry or the
+      // recorded options without moving either counter: the captured entry
+      // must still be the published one and the serve's provenance current,
+      // or the descriptors below would come from detached pre-edit state.
       if (
         (this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0) === optionsMutationsBefore &&
         this.configService.configGeneration === generationBefore &&
-        secretRecordsEqual(secretsUsed, secretsNow)
+        secretRecordsEqual(secretsUsed, refreshed.value.secretsNow) &&
+        this.workspaceServers.get(workspaceId) === latestEntry &&
+        this.isServeAuthorizationCurrent(workspaceId, refreshed.value.served.enablementDerivedFrom)
       ) {
         break;
       }
@@ -2714,15 +3360,23 @@ export class MCPServerManager {
   /**
    * Settings changes during startup can miss cache synchronization. Re-derive
    * enablement and mark reconfigured clients stale before prompt dispatch.
+   *
+   * Returns the recorded options `entry.enabledServerNames` was derived from
+   * (captured synchronously with that derivation). serveResult compares it
+   * with the recorded options at return time: a publication landing in the
+   * microtask gap between this method resolving and the caller resuming has
+   * replaced them, and the derived enablement is stale for that serve.
+   * `undefined` means enablement could NOT be (re-)derived — the repair
+   * failed, or there are no recorded options — and the serve fails closed.
    */
   private async repairEnablementAfterConcurrentMutation(
     workspaceId: string,
     optionsUsed: MCPWorkspaceRequestOptions,
     entry: WorkspaceServers,
     configGenerationUsed: number
-  ): Promise<void> {
+  ): Promise<MCPWorkspaceRequestOptions | undefined> {
+    let recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
     try {
-      let recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
       // Workspace mutations replace recorded options; global mutations only bump a
       // generation. Either can invalidate derived enablement.
       let needsRepair =
@@ -2742,6 +3396,8 @@ export class MCPServerManager {
         const latest = this.lastWorkspaceRequestOptions.get(workspaceId);
         if (latest === recorded && this.configService.configGeneration === generationRead) {
           entry.enabledServerNames = new Set(Object.keys(enabled));
+          entry.enabledServers = enabled;
+          entry.enabledServersGeneration = generationRead;
           // configSignature is always in-process JSON.stringify output, so parsing cannot fail.
           const previousEntries = JSON.parse(entry.configSignature) as Record<string, unknown>;
           const reconfigured = Object.keys(signatureEntries).filter(
@@ -2753,16 +3409,63 @@ export class MCPServerManager {
             for (const name of reconfigured) stale.add(name);
             entry.stalePromptServerNames = stale;
           }
-          return;
+          return recorded;
         }
         recorded = latest;
         needsRepair = true;
       }
+      return recorded;
     } catch (error) {
       log.debug("[MCP] Failed to repair enablement after concurrent settings change", {
         workspaceId,
         error: getErrorMessage(error),
       });
+      // Enablement was not re-derived: `entry.enabledServerNames` may still
+      // permit a server the newer options revoked. No verdict → fail closed.
+      return undefined;
+    }
+  }
+
+  /**
+   * Drop a workspace's cached override snapshot so its next request re-reads
+   * disk. Used when a publisher could not establish the workspace's effective
+   * overrides authoritatively (unreachable checkout): caching a guess would
+   * overlay every later request until restart, while a deleted entry simply
+   * defers to the fresh per-request read.
+   */
+  forgetWorkspaceOverrides(workspaceId: string): void {
+    this.latestWorkspaceOverrides.delete(workspaceId);
+    // The marker supersedes any publication repair still in flight (a bounded
+    // publisher evicts exactly because that repair stalled): served tools
+    // must not wait on it before observing the invalidation. Its late result
+    // is discarded by the repair's own fence.
+    this.pendingEnablementRepairs.delete(workspaceId);
+    // Recorded options carry the last served snapshot too, and the prompt
+    // paths (prompt listing, getPrompt) serve from them without a chat send.
+    // Flag them so the next serve of ANY kind re-reads overrides from disk
+    // instead of trusting that snapshot (see loadFirstServeWorkspaceOverrides).
+    this.markOverridesInvalidated(workspaceId);
+    this.bumpWorkspaceOptionsMutationCount(workspaceId);
+  }
+
+  /** Start (or advance) a workspace's invalidation generation. */
+  private markOverridesInvalidated(workspaceId: string): void {
+    this.overridesInvalidationClock += 1;
+    this.overridesInvalidationGenerations.set(workspaceId, this.overridesInvalidationClock);
+  }
+
+  /**
+   * forgetWorkspaceOverrides for every workspace this manager holds any
+   * snapshot for. Used when a publisher could not enumerate the workspace
+   * graph after a write and therefore cannot name the affected descendants.
+   */
+  forgetAllWorkspaceOverrides(): void {
+    this.globalOverridesEvictionGeneration += 1;
+    for (const workspaceId of new Set([
+      ...this.latestWorkspaceOverrides.keys(),
+      ...this.lastWorkspaceRequestOptions.keys(),
+    ])) {
+      this.forgetWorkspaceOverrides(workspaceId);
     }
   }
 
@@ -2772,27 +3475,81 @@ export class MCPServerManager {
     overrides: WorkspaceMCPOverrides | undefined
   ): Promise<void> {
     this.latestWorkspaceOverrides.set(workspaceId, overrides);
+    // An authoritative publication supersedes any pending invalidation: the
+    // cache now holds disk truth, so later serves neither re-read nor fail
+    // closed on its account.
+    this.overridesInvalidationGenerations.delete(workspaceId);
     this.bumpWorkspaceOptionsMutationCount(workspaceId);
     const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
-    if (recorded) {
-      this.lastWorkspaceRequestOptions.set(workspaceId, { ...recorded, overrides });
-    }
+    if (!recorded) return;
+    const published: MCPWorkspaceRequestOptions = { ...recorded, overrides };
+    this.lastWorkspaceRequestOptions.set(workspaceId, published);
     const entry = this.workspaceServers.get(workspaceId);
-    if (!entry || !recorded) return;
-    try {
-      const enabled = await this.listServers(
-        recorded.projectPath,
-        overrides,
-        recorded.trusted ?? false,
-        recorded.agentPlugins
-      );
-      entry.enabledServerNames = new Set(Object.keys(enabled));
-    } catch (error) {
-      log.debug("[MCP] Failed to sync workspace overrides into cached state", {
-        workspaceId,
-        error: getErrorMessage(error),
-      });
-    }
+    if (!entry) return;
+    await this.repairEnablement(workspaceId, published, entry);
+  }
+
+  /**
+   * Re-derive a live entry's enabled set from freshly recorded options (an
+   * override publication, a project trust change). Registered synchronously
+   * in pendingEnablementRepairs so a tool invocation racing the mutation
+   * waits for the repaired enablement instead of passing the gate on the
+   * pre-mutation set (see gateServedToolOnEnablement); never rejects.
+   */
+  private repairEnablement(
+    workspaceId: string,
+    published: MCPWorkspaceRequestOptions,
+    entry: WorkspaceServers
+  ): Promise<void> {
+    const repair = (async () => {
+      try {
+        const generationRead = this.configService.configGeneration;
+        const enabled = await this.listServers(
+          published.projectPath,
+          published.overrides,
+          published.trusted ?? false,
+          published.agentPlugins
+        );
+        // Fence: the publisher may have given up on this repair (bounded
+        // publication) and a later save, serve, or invalidation may have
+        // replaced the recorded options meanwhile — each derives enablement
+        // from state at least as new as this one, so a late completion must
+        // not restore the older enabled set on the live entry (a served tool
+        // would pass the call-time gate for a server the later save disabled).
+        if (
+          this.lastWorkspaceRequestOptions.get(workspaceId) !== published ||
+          this.workspaceServers.get(workspaceId) !== entry ||
+          this.overridesInvalidationGenerations.has(workspaceId)
+        ) {
+          log.debug("[MCP] Discarding a superseded publication repair", { workspaceId });
+          return;
+        }
+        entry.enabledServerNames = new Set(Object.keys(enabled));
+        entry.enabledServers = enabled;
+        entry.enabledServersGeneration = generationRead;
+      } catch (error) {
+        // The recorded overrides now say one thing and `entry.enabledServerNames`
+        // another (the old set), and the per-call disk comparison would find
+        // disk equal to the recorded value: nothing would ever repair the
+        // entry. Invalidate the workspace so every served tool call and the
+        // next serve re-derive enablement from disk (fail closed until then).
+        log.warn("[MCP] Failed to sync workspace overrides into cached state; invalidating", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+        if (this.lastWorkspaceRequestOptions.get(workspaceId) === published) {
+          this.forgetWorkspaceOverrides(workspaceId);
+        }
+      }
+    })();
+    this.pendingEnablementRepairs.set(workspaceId, repair);
+    // Attached before any waiter can observe `repair`, so the registration is
+    // cleared before a gated tool call awaiting it resumes (reaction order).
+    return repair.finally(() => {
+      if (this.pendingEnablementRepairs.get(workspaceId) === repair) {
+        this.pendingEnablementRepairs.delete(workspaceId);
+      }
+    });
   }
 
   /**
@@ -2813,11 +3570,24 @@ export class MCPServerManager {
     for (const [path, trusted] of trustByPath) {
       this.latestProjectTrust.set(path, trusted);
     }
-    for (const [workspaceId, options] of this.lastWorkspaceRequestOptions) {
+    for (const [workspaceId, options] of [...this.lastWorkspaceRequestOptions]) {
       const trusted = trustByPath.get(stripTrailingSlashes(options.projectPath));
       if (trusted === undefined || (options.trusted ?? false) === trusted) continue;
-      this.lastWorkspaceRequestOptions.set(workspaceId, { ...options, trusted });
+      const published: MCPWorkspaceRequestOptions = { ...options, trusted };
+      this.lastWorkspaceRequestOptions.set(workspaceId, published);
       this.bumpWorkspaceOptionsMutationCount(workspaceId);
+      // The live entry's enabled set was derived under the OLD trust, and the
+      // call-time gate evaluates the server info captured at serve time: a
+      // project-local server the user just distrusted would keep dispatching
+      // from an already-prepared stream. Repair the enabled set like an
+      // override publication does (registered synchronously, so a racing
+      // tool call waits for it); the repair's own catch invalidates the
+      // workspace when re-derivation fails.
+      const entry = this.workspaceServers.get(workspaceId);
+      if (entry !== undefined) {
+        // Tracked in pendingEnablementRepairs and self-clearing; it never rejects.
+        this.repairEnablement(workspaceId, published, entry).catch(() => undefined);
+      }
     }
   }
 
@@ -2843,6 +3613,21 @@ export class MCPServerManager {
       });
       return undefined;
     }
+  }
+
+  /**
+   * getPrompt has no caller snapshot: it dispatches from the RECORDED options,
+   * which a direct edit of an override document (the child's, or the parent
+   * document an inheriting child reads through) never touches — no epoch
+   * bump, no publication. Distrust them for the dispatch so
+   * ensureWorkspaceServers re-reads disk (and fails closed when it cannot
+   * vouch); a fresh read is recorded authoritative again. Without a reader the
+   * recorded options stay authoritative, as everywhere else.
+   */
+  private promptDispatchOptions(recorded: MCPWorkspaceRequestOptions): MCPWorkspaceRequestOptions {
+    return this.pluginInvalidation?.readWorkspaceOverrides !== undefined
+      ? { ...recorded, overridesAuthoritative: false }
+      : recorded;
   }
 
   async getPrompt(
@@ -2871,13 +3656,19 @@ export class MCPServerManager {
             // Re-read after the resolver await: a settings mutation recorded
             // while secrets resolved must not be clobbered by a pre-await
             // options snapshot.
-            const currentOptions = this.lastWorkspaceRequestOptions.get(workspaceId) ?? lastOptions;
+            const currentOptions = this.promptDispatchOptions(
+              this.lastWorkspaceRequestOptions.get(workspaceId) ?? lastOptions
+            );
             await this.ensureWorkspaceServers(
               secretsUsed !== undefined
                 ? { ...currentOptions, projectSecrets: secretsUsed }
                 : currentOptions,
-              false
+              false,
+              options?.signal
             );
+            // Inside the bracket like getPromptsForWorkspace: the last await
+            // before the stability check must be covered by the postflight.
+            return this.resolveSecretsForRefresh(workspaceId, lastOptions.projectPath);
           }),
           { ...(options?.signal !== undefined ? { signal: options.signal } : {}) }
         );
@@ -2887,10 +3678,7 @@ export class MCPServerManager {
         if (refreshed.kind === "timeout") {
           throw new Error(`MCP prompt request for '${serverName}/${promptName}' timed out`);
         }
-        const secretsNow = await this.resolveSecretsForRefresh(
-          workspaceId,
-          lastOptions.projectPath
-        );
+        const secretsNow = refreshed.value;
         if (
           (this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0) === optionsMutationsBefore &&
           this.configService.configGeneration === generationBefore &&
@@ -2902,59 +3690,185 @@ export class MCPServerManager {
       }
     }
 
-    const invoked = await raceWithAbortAndTimeout(
-      this.runWithStablePluginEpoch(async () => {
-        // Re-run startup inside the SAME bracket as prompts/get: a sibling
-        // mutation detected by the preflight may have retired the instance
-        // stabilized above, and the operation must rebuild before querying.
-        if (lastOptions !== undefined) {
-          const currentOptions = this.lastWorkspaceRequestOptions.get(workspaceId) ?? lastOptions;
-          await this.ensureWorkspaceServers(
-            stableSecrets !== undefined
-              ? { ...currentOptions, projectSecrets: stableSecrets }
-              : currentOptions,
-            false
-          );
-        }
-        const entry = this.workspaceServers.get(workspaceId);
-        if (entry && !entry.enabledServerNames.has(serverName)) {
-          throw new Error(`MCP server '${serverName}' is disabled`);
-        }
-        if (entry?.stalePromptServerNames?.has(serverName)) {
-          throw new Error(
-            `MCP server '${serverName}' was reconfigured while this request was being prepared; retry`
-          );
-        }
-        const instance = entry?.instances.get(serverName);
-        if (!instance || instance.isClosed) {
-          throw new Error(`MCP server '${serverName}' is not connected`);
-        }
-        this.markActivity(workspaceId);
-        // Include prompts/get itself inside the mutation-epoch bracket. A
-        // sibling update that lands after startup but before materialization
-        // retires the stale instance and retries this read-only operation.
-        const result = await instance.getPrompt(promptName, args, options);
-        const text = flattenMcpPrompt(result);
-        if (text.trim().length === 0) {
-          // Providers can reject empty user content, so fail expansion up
-          // front rather than persisting an empty synthetic user message.
-          throw new Error(`MCP prompt '${serverName}/${promptName}' returned no text content`);
-        }
-        return {
-          // Cap here because both composer expansion and mcp_prompt_get use this path.
-          text: truncateUtf8Bytes(text, MCP_PROMPT_MAX_TEXT_BYTES, MCP_PROMPT_TRUNCATION_MARKER),
-          ...(result.description !== undefined ? { description: result.description } : {}),
-        };
-      }),
-      { ...(options?.signal !== undefined ? { signal: options.signal } : {}) }
+    // Bounded like the served-tool gate: a global settings change landing
+    // during an attempt re-runs the bracket (whose serve re-derives the
+    // inventory), and sustained churn fails closed instead of spinning.
+    for (let attempt = 0; attempt < CALL_GATE_MAX_ATTEMPTS; attempt++) {
+      const invoked = await raceWithAbortAndTimeout(
+        this.runWithStablePluginEpoch(async () => {
+          // Re-run startup inside the SAME bracket as prompts/get: a sibling
+          // mutation detected by the preflight may have retired the instance
+          // stabilized above, and the operation must rebuild before querying.
+          let served: MCPToolsForWorkspaceResult | undefined;
+          if (lastOptions !== undefined) {
+            const currentOptions = this.promptDispatchOptions(
+              this.lastWorkspaceRequestOptions.get(workspaceId) ?? lastOptions
+            );
+            served = await this.ensureWorkspaceServers(
+              stableSecrets !== undefined
+                ? { ...currentOptions, projectSecrets: stableSecrets }
+                : currentOptions,
+              false,
+              options?.signal
+            );
+          }
+          // The serve fails closed (serveResult) when the workspace was
+          // invalidated or re-published mid-serve, but it does not rewrite the
+          // cached entry — consume that verdict here instead of dispatching
+          // through the stale entry. Re-running the SAME check (identity AND
+          // marker) right before dispatch also covers a publication or forget
+          // squeezed between the serve's gate and this continuation.
+          // Synchronous from the last check to the invocation start. A global
+          // settings change (mcp.setEnabled, a config edit) that landed while
+          // this request waited — for the lock below, or an epoch read — only
+          // advances the config generation: it moves neither the provenance
+          // nor the override epoch, so like the served-tool gate the entry's
+          // inventory must be as new as the current generation, or the whole
+          // bracket re-runs (its serve re-derives the inventory).
+          const dispatch = (): ReturnType<MCPServerInstance["getPrompt"]> | "retry" => {
+            if (
+              served !== undefined &&
+              !this.isServeAuthorizationCurrent(workspaceId, served.enablementDerivedFrom)
+            ) {
+              throw new Error(
+                `MCP server '${serverName}' is unavailable while workspace MCP settings are being updated; retry`
+              );
+            }
+            const entry = this.workspaceServers.get(workspaceId);
+            // Only a serve (recorded options) can re-derive the inventory, so
+            // the check is meaningful only when this request ran one.
+            if (
+              served !== undefined &&
+              entry !== undefined &&
+              entry.enabledServersGeneration !== this.configService.configGeneration
+            ) {
+              return "retry";
+            }
+            if (entry && !entry.enabledServerNames.has(serverName)) {
+              throw new Error(`MCP server '${serverName}' is disabled`);
+            }
+            if (entry?.stalePromptServerNames?.has(serverName)) {
+              throw new Error(
+                `MCP server '${serverName}' was reconfigured while this request was being prepared; retry`
+              );
+            }
+            const instance = entry?.instances.get(serverName);
+            if (!instance || instance.isClosed) {
+              throw new Error(`MCP server '${serverName}' is not connected`);
+            }
+            this.markActivity(workspaceId);
+            // Include prompts/get itself inside the mutation-epoch bracket. A
+            // sibling update that lands after startup but before materialization
+            // retires the stale instance and retries this read-only operation.
+            return instance.getPrompt(promptName, args, options);
+          };
+          // Same dispatch fence as served tool calls (see
+          // gateServedToolOnEnablement): a sibling process's disabling save
+          // persists first and bumps the epoch only after its publication
+          // budget, so a postflight alone can still observe the old token and
+          // hand out content from the now-disabled server. Hold the WRITER's
+          // lock from a final epoch read through the synchronous invocation
+          // start; a moved (or unreadable) epoch makes the bracket's postflight
+          // retry this read-only operation instead of dispatching.
+          const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
+          const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
+          let pending: ReturnType<MCPServerInstance["getPrompt"]> | "retry";
+          if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
+            pending = dispatch();
+          } else {
+            // ONE deadline for acquisition and the fenced epoch read: the outer
+            // abort race cannot stop this callback, so a stalled home filesystem
+            // must not keep the writer's lock held (blocking every settings
+            // save and prune) past the budget — release it and fail closed.
+            const fenceDeadlineAt = Date.now() + CALL_GATE_TIMEOUT_MS;
+            const release = await acquireOverridesLock({
+              timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+              ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+            });
+            try {
+              const epochRead = await raceWithAbortAndTimeout(readOverridesEpoch(), {
+                timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+                ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+              });
+              if (epochRead.kind !== "ok") {
+                throw new Error(
+                  epochRead.kind === "aborted"
+                    ? `MCP prompt request for '${serverName}/${promptName}' was aborted`
+                    : `MCP server '${serverName}' is unavailable: the workspace MCP settings marker could not be read in time; retry`
+                );
+              }
+              const epochNow = epochRead.value;
+              if (
+                epochNow !== this.lastOverridesEpochToken ||
+                isWorkspaceOverridesEpochUnreadable(epochNow)
+              ) {
+                return { epochMoved: true } as const;
+              }
+              pending = dispatch();
+            } finally {
+              await release();
+            }
+          }
+          if (pending === "retry") {
+            return { generationMoved: true } as const;
+          }
+          const result = await pending;
+          const text = flattenMcpPrompt(result);
+          if (text.trim().length === 0) {
+            // Providers can reject empty user content, so fail expansion up
+            // front rather than persisting an empty synthetic user message.
+            throw new Error(`MCP prompt '${serverName}/${promptName}' returned no text content`);
+          }
+          return {
+            prompt: {
+              // Cap here because both composer expansion and mcp_prompt_get use this path.
+              text: truncateUtf8Bytes(
+                text,
+                MCP_PROMPT_MAX_TEXT_BYTES,
+                MCP_PROMPT_TRUNCATION_MARKER
+              ),
+              ...(result.description !== undefined ? { description: result.description } : {}),
+            },
+            derivedFrom: served?.enablementDerivedFrom,
+          };
+        }),
+        { ...(options?.signal !== undefined ? { signal: options.signal } : {}) }
+      );
+      if (invoked.kind === "aborted") {
+        throw new Error(`MCP prompt request for '${serverName}/${promptName}' was aborted`);
+      }
+      if (invoked.kind === "timeout") {
+        throw new Error(`MCP prompt request for '${serverName}/${promptName}' timed out`);
+      }
+      if ("generationMoved" in invoked.value) {
+        continue;
+      }
+      if ("epochMoved" in invoked.value) {
+        // The bracket retries a moved epoch itself; reaching here means the
+        // token settled back on the value the fence compared against (or the
+        // bracket ran without epoch tracking). Nothing vouches for the dispatch.
+        throw new Error(
+          `MCP server '${serverName}' is unavailable while workspace MCP settings are being updated; retry`
+        );
+      }
+      // Same final gate as getToolsForWorkspace: a same-process save that
+      // disables the server after the pre-dispatch check — while the bracket's
+      // postflight token reads were in flight — publishes new recorded options
+      // without moving the token those reads captured. Re-check the serve's
+      // provenance right before handing the content out.
+      if (
+        invoked.value.derivedFrom !== undefined &&
+        !this.isServeAuthorizationCurrent(workspaceId, invoked.value.derivedFrom)
+      ) {
+        throw new Error(
+          `MCP server '${serverName}' is unavailable while workspace MCP settings are being updated; retry`
+        );
+      }
+      return invoked.value.prompt;
+    }
+    throw new Error(
+      `MCP server '${serverName}' is unavailable while MCP settings keep changing; retry`
     );
-    if (invoked.kind === "aborted") {
-      throw new Error(`MCP prompt request for '${serverName}/${promptName}' was aborted`);
-    }
-    if (invoked.kind === "timeout") {
-      throw new Error(`MCP prompt request for '${serverName}/${promptName}' timed out`);
-    }
-    return invoked.value;
   }
 
   /**
@@ -3342,15 +4256,482 @@ export class MCPServerManager {
    * Collect tools from all server instances, applying tool allowlists.
    *
    * @param instances - Map of server instances
-   * @param serverInfo - Project-level server info (for project-level tool allowlists)
    * @param workspaceOverrides - Optional workspace MCP overrides for tool allowlists
    * @returns Aggregated tools record with provider-safe namespaced names, plus
    *   a tool name → server name map so callers can advertise the catalog by server
    */
+  /**
+   * Final gate of a serve, after repairEnablementAfterConcurrentMutation. A
+   * forgetWorkspaceOverrides (parent save that could not resolve this
+   * workspace authoritatively, plugin prune, global eviction) that landed
+   * after this serve selected its options leaves those recorded options in
+   * place and only advances the invalidation marker — so the repair, which
+   * keys on option identity and config generation, re-derives nothing. The
+   * recorded snapshot is exactly what is being distrusted: fail THIS serve
+   * closed (no tools, no prompts); the next one re-reads disk. A publication
+   * that superseded the forget retired the marker and replaced the recorded
+   * options, so it reaches the repaired result below instead.
+   */
+  private serveResult(
+    workspaceId: string,
+    entry: WorkspaceServers,
+    instances: Map<string, MCPServerInstance>,
+    fallbackOverrides: WorkspaceMCPOverrides | undefined,
+    stats: MCPWorkspaceStats,
+    overridesGenerationUsed: number | undefined,
+    /** Recorded options the last repair derived `entry.enabledServerNames` from. */
+    enablementDerivedFrom: MCPWorkspaceRequestOptions | undefined,
+    /** Per-serve fail-closed marker (see ensureWorkspaceServers). */
+    overridesUnavailable: boolean
+  ): MCPToolsForWorkspaceResult {
+    const failClosed = (reason: string): MCPToolsForWorkspaceResult => {
+      log.warn(`[MCP] ${reason}; disabling MCP for this serve`, { workspaceId });
+      return this.failClosedResult();
+    };
+    if (overridesUnavailable) {
+      // The serve enabled nothing because neither the caller nor disk could
+      // vouch for the overrides. The recorded options still hold the caller's
+      // unverified fallback; reporting it as `overridesUsed` would let the
+      // prompt inventory advertise a server the unreadable document hides.
+      return failClosed("Workspace overrides could not be verified");
+    }
+    if (this.overridesInvalidationGenerations.get(workspaceId) !== overridesGenerationUsed) {
+      return failClosed("Workspace overrides invalidated while a serve was in flight");
+    }
+    if (enablementDerivedFrom === undefined) {
+      return failClosed("Workspace enablement could not be re-derived after a concurrent mutation");
+    }
+    // An authoritative publication that landed after the last repair (its own
+    // listServers still pending) replaced the recorded options and retired
+    // any marker, but `entry.enabledServerNames` still reflects the older
+    // options: the publication's own completion repairs the entry for later
+    // serves; this one must not filter through the stale set.
+    if (!this.isServeAuthorizationCurrent(workspaceId, enablementDerivedFrom)) {
+      return failClosed("Workspace overrides changed while a serve was completing");
+    }
+    return {
+      ...this.collectServedTools(workspaceId, entry, instances, fallbackOverrides),
+      stats,
+      promptDescriptors: this.promptDescriptorsFor(entry),
+      ...(enablementDerivedFrom !== undefined
+        ? {
+            enablementDerivedFrom,
+            overridesUsed: enablementDerivedFrom.overrides ?? {},
+            serversUsed: entry.enabledServers,
+          }
+        : {}),
+    };
+  }
+
+  /**
+   * collectTools for a serve's return value AFTER repairEnablementAfterConcurrentMutation:
+   * a settings mutation (or an inherited publication) that landed mid-startup
+   * has already repaired `entry.enabledServerNames` and the recorded options,
+   * but the caller still holds the pre-mutation instance map and overrides.
+   * Serving those would expose a just-revoked server's tools to this stream.
+   */
+  private collectServedTools(
+    workspaceId: string,
+    entry: WorkspaceServers,
+    instances: Map<string, MCPServerInstance>,
+    fallbackOverrides: WorkspaceMCPOverrides | undefined
+  ): { tools: Record<string, Tool>; toolServerNames: Record<string, string> } {
+    const served = new Map(
+      [...instances].filter(([serverName]) => entry.enabledServerNames.has(serverName))
+    );
+    const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+    // The REPAIRED inventory (same derivation as `enabledServerNames`), not
+    // the pre-mutation server info the caller started from: a project tool
+    // allowlist narrowed mid-startup must filter the tools handed to the
+    // model, or it receives tools the gate rejects only after selection.
+    const serverInfo = entry.enabledServers;
+    return this.collectTools(
+      served,
+      serverInfo,
+      recorded ? recorded.overrides : fallbackOverrides,
+      (serverName, toolName, tool) =>
+        this.gateServedToolOnEnablement(
+          workspaceId,
+          serverName,
+          toolName,
+          tool,
+          serverInfo[serverName]
+        )
+    );
+  }
+
+  /**
+   * Wait for a publication's enablement repair still in flight, bounded: the
+   * publisher gives up on a stalled repair and evicts (which also drops it
+   * from the map), and a call that grabbed the promise before that must not
+   * hang the stream — fail closed instead, like getPrompt.
+   */
+  private async awaitPendingRepair(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    abortSignal: AbortSignal | undefined,
+    /** Remaining gate budget; the wait never outlives the gate's own deadline. */
+    remainingMs: number
+  ): Promise<void> {
+    const pendingRepair = this.pendingEnablementRepairs.get(workspaceId);
+    if (pendingRepair === undefined) {
+      return;
+    }
+    // Abort-aware like the revalidation itself: Escape must not be ignored
+    // for the whole bound and then misreported as a settings-update error.
+    const raced = await raceWithAbortAndTimeout(pendingRepair, {
+      timeoutMs: Math.max(0, Math.min(PENDING_REPAIR_WAIT_MS, remainingMs)),
+      ...(abortSignal !== undefined ? { signal: abortSignal } : {}),
+    });
+    if (raced.kind === "aborted") {
+      throw new Error(`MCP tool '${serverName}/${toolName}' call was aborted`);
+    }
+    if (raced.kind === "timeout") {
+      throw new Error(
+        `MCP server '${serverName}' is unavailable while workspace MCP settings are being updated; retry`
+      );
+    }
+  }
+
+  /**
+   * Tool objects leave the manager before the stream that uses them starts
+   * (TurnRequestBuilder assembles the request first; StreamManager acquires
+   * its lease later), and a publication landing in between — or mid-stream —
+   * repairs the cached entry but cannot retract objects already handed out.
+   * Rather than shrinking that window, every invocation re-derives the
+   * server's CURRENT authorization for the workspace, so a server (or tool)
+   * revoked after the serve fails at call time regardless of when the change
+   * landed:
+   * - a pending publication repair is awaited first (applyWorkspaceOverrides);
+   * - inside the cross-process epoch bracket, the effective overrides on disk
+   *   are compared with the recorded ones (direct edits) and an invalidation
+   *   marker (forgetWorkspaceOverrides: descendant/off-host publications and
+   *   cross-process epoch changes publish no overrides, only the marker) means
+   *   the recorded enablement can no longer be trusted: re-serve from the
+   *   recorded options so disk re-derives it (a leased entry is repaired in
+   *   place), and reject if the marker survives or the re-read fails;
+   * - a global mutation (mcp.setEnabled, a global/project toolAllowlist edit)
+   *   bumps the config generation without touching recorded options or the
+   *   overrides on disk: the entry's inventory is re-derived when its
+   *   generation is behind (repairEnablementAfterConcurrentMutation);
+   * - the server must be enabled by the LATEST recorded overrides (evaluated
+   *   directly, so a publication that started meanwhile counts even before
+   *   its repair lands), a repair started meanwhile is awaited, the entry's
+   *   CURRENT validated inventory must still hold the server, and the tool
+   *   must pass that inventory's project allowlist intersected with the
+   *   current workspace tool allowlist. The server info captured at serve
+   *   time (`servedInfo`) never authorizes a dispatch — its allowlist is as
+   *   old as the tool object; it only stands in for the early revocation
+   *   check while a publication's repair is pending and the entry's
+   *   inventory is empty (failed closed), so that check still waits for the
+   *   repair instead of rejecting a server the publication re-enables.
+   * Recorded-options identity is deliberately not compared: it changes on
+   * every serve and would fail healthy in-flight tool calls.
+   */
+  private gateServedToolOnEnablement(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    tool: Tool,
+    servedInfo: MCPServerInfo | undefined
+  ): Tool {
+    if (!tool.execute) {
+      return tool;
+    }
+    const originalExecute = tool.execute;
+    const revoked = (what: string) =>
+      new Error(
+        `MCP ${what} was disabled for this workspace after the request was prepared; it is unavailable`
+      );
+    return {
+      ...tool,
+      execute: async (args: Parameters<typeof originalExecute>[0], context) => {
+        const abortSignal =
+          context && typeof context === "object" && "abortSignal" in context
+            ? (context as { abortSignal?: AbortSignal }).abortSignal
+            : undefined;
+        // Bound and abort the authorization work itself: on SSH/Docker the
+        // disk re-read goes through the remote runtime (minutes per op), and
+        // the wrapped tool's own deadline/Escape only start once this returns.
+        // One absolute deadline for the whole gate: every wait below (and
+        // every retry iteration) is given only what remains of it, so
+        // sustained settings contention cannot keep an invocation in this
+        // gate for several helper timeouts in a row.
+        const gateDeadlineAt = Date.now() + CALL_GATE_TIMEOUT_MS;
+        const remainingMs = () => Math.max(0, gateDeadlineAt - Date.now());
+        const bounded = async <T>(work: Promise<T>): Promise<T> => {
+          const raced = await raceWithAbortAndTimeout(work, {
+            timeoutMs: remainingMs(),
+            ...(abortSignal !== undefined ? { signal: abortSignal } : {}),
+          });
+          if (raced.kind === "aborted") {
+            throw new Error(`MCP tool '${serverName}/${toolName}' call was aborted`);
+          }
+          if (raced.kind === "timeout") {
+            throw new Error(
+              `MCP server '${serverName}' is unavailable: its workspace MCP settings could not be re-read in time; retry`
+            );
+          }
+          return raced.value;
+        };
+        // Every await below opens a gap in which a publication can install
+        // new recorded options and start a repair. The decision is therefore
+        // taken in a loop: an iteration whose state moved during an await
+        // starts over; only checks that ran in the same synchronous block as
+        // the dispatch authorize it, so no publication can interleave between
+        // the checks and the call.
+        // The server's CURRENT validated info comes from the live entry's
+        // inventory (refreshed by every serve and repair), never from the
+        // serve that produced this tool object.
+        const currentInfo = (): MCPServerInfo | undefined =>
+          this.workspaceServers.get(workspaceId)?.enabledServers[serverName];
+        const enabledBy = (
+          info: MCPServerInfo | undefined,
+          overrides: WorkspaceMCPOverrides | undefined
+        ): boolean =>
+          info !== undefined &&
+          serverName in
+            this.filterServersByPolicy(
+              this.applyServerOverrides({ [serverName]: info }, overrides)
+            );
+        for (let attempt = 0; attempt < CALL_GATE_MAX_ATTEMPTS; attempt++) {
+          const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+          if (recorded === undefined) {
+            throw revoked(`server '${serverName}'`);
+          }
+          if (this.pendingEnablementRepairs.has(workspaceId)) {
+            // A publication is in flight: its recorded overrides are an
+            // in-process save (disk truth) and authoritative for a revocation
+            // even before its enablement repair lands — decide that without
+            // waiting; otherwise wait for the repair and start over.
+            if (!enabledBy(currentInfo() ?? servedInfo, recorded.overrides)) {
+              throw revoked(`server '${serverName}'`);
+            }
+            await this.awaitPendingRepair(
+              workspaceId,
+              serverName,
+              toolName,
+              abortSignal,
+              remainingMs()
+            );
+            continue;
+          }
+          // A global settings mutation since the inventory was derived: no
+          // recorded options changed and disk holds the same overrides, so
+          // neither check below would notice a narrowed global/project
+          // allowlist or a globally disabled server. Re-derive first.
+          const staleEntry = this.workspaceServers.get(workspaceId);
+          if (
+            staleEntry !== undefined &&
+            staleEntry.enabledServersGeneration !== this.configService.configGeneration
+          ) {
+            const repaired = await bounded(
+              this.repairEnablementAfterConcurrentMutation(
+                workspaceId,
+                recorded,
+                staleEntry,
+                staleEntry.enabledServersGeneration
+              )
+            );
+            if (repaired === undefined) {
+              throw new Error(
+                `MCP server '${serverName}' is unavailable because its enablement could not be re-derived after a settings change; retry`
+              );
+            }
+            continue;
+          }
+          // Same cross-process bracket as every serve: a sibling process's
+          // override write bumps only the on-disk epoch, and without a new
+          // serve in THIS process nothing would ever observe it — the preflight
+          // turns it into invalidation markers, the marker path re-derives
+          // from disk, and the postflight retries if the epoch moved meanwhile.
+          // Direct edits of an override document (the workspace's own, or the
+          // parent document an inheriting child reads through) move neither
+          // the epoch nor any process-local state: compare the effective
+          // overrides on disk with the recorded ones and treat a difference
+          // (or an unreadable document) as an invalidation of this workspace.
+          try {
+            await bounded(
+              this.runWithStablePluginEpoch(async () => {
+                const readOverrides = this.pluginInvalidation?.readWorkspaceOverrides;
+                if (
+                  readOverrides !== undefined &&
+                  !this.overridesInvalidationGenerations.has(workspaceId)
+                ) {
+                  const fresh = await readOverrides(
+                    workspaceId,
+                    abortSignal !== undefined ? { signal: abortSignal } : undefined
+                  );
+                  // Equivalence, like decide() below: an overlapping serve
+                  // whose snapshot predates the disk edit records an
+                  // EQUIVALENT object meanwhile; identity would skip the
+                  // invalidation here while dispatch accepts the replacement,
+                  // letting a revoked tool run. A genuinely different record
+                  // (a publication) is left alone: it already re-derived.
+                  const latestRecorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+                  if (
+                    (fresh === undefined || !workspaceOverridesEqual(fresh, recorded.overrides)) &&
+                    latestRecorded !== undefined &&
+                    authorizationStateEqual(latestRecorded, recorded)
+                  ) {
+                    this.forgetWorkspaceOverrides(workspaceId);
+                  }
+                }
+                if (this.overridesInvalidationGenerations.has(workspaceId)) {
+                  const latest = this.lastWorkspaceRequestOptions.get(workspaceId);
+                  if (latest !== undefined) {
+                    await this.ensureWorkspaceServers(latest, false, abortSignal);
+                  }
+                }
+              })
+            );
+          } catch (error) {
+            // The read or re-serve failed (unreachable parent checkout, config
+            // read error, epoch churn, deadline): nothing vouches for the
+            // cached enablement, so the call fails closed and the next serve
+            // re-reads.
+            log.debug("[MCP] Re-derivation before a tool call failed; rejecting the call", {
+              workspaceId,
+              serverName,
+              error: getErrorMessage(error),
+            });
+            this.forgetWorkspaceOverrides(workspaceId);
+            throw error instanceof Error && error.message.includes("aborted")
+              ? error
+              : new Error(
+                  `MCP server '${serverName}' is unavailable because its workspace MCP settings could not be re-read; retry`
+                );
+          }
+          // Decide only on state read NOW (synchronously), and only if nothing
+          // moved since this iteration's snapshot — every await above and
+          // below opens a gap in which a publication can install new recorded
+          // options or start a repair; "retry" restarts the loop on them.
+          const decide = (): "dispatch" | "retry" => {
+            // Equivalence, not identity (see isServeAuthorizationCurrent): an
+            // overlapping ordinary serve (prompt discovery, a concurrent send)
+            // records a fresh options object with the SAME authorization
+            // state; a burst of those must not exhaust the attempts and
+            // reject an authorized call. A publication or trust change
+            // records different overrides/trust and still retries.
+            const latestRecorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+            if (
+              latestRecorded === undefined ||
+              !authorizationStateEqual(latestRecorded, recorded) ||
+              this.pendingEnablementRepairs.has(workspaceId)
+            ) {
+              return "retry";
+            }
+            if (this.overridesInvalidationGenerations.has(workspaceId)) {
+              throw revoked(`server '${serverName}'`);
+            }
+            const entry = this.workspaceServers.get(workspaceId);
+            if (entry === undefined) {
+              throw revoked(`server '${serverName}'`);
+            }
+            if (entry.enabledServersGeneration !== this.configService.configGeneration) {
+              // A global mutation landed during an await above: re-derive.
+              return "retry";
+            }
+            const overrides = recorded.overrides;
+            const info = entry.enabledServers[serverName];
+            if (
+              info === undefined ||
+              !enabledBy(info, overrides) ||
+              !entry.enabledServerNames.has(serverName)
+            ) {
+              throw revoked(`server '${serverName}'`);
+            }
+            if (
+              !(
+                toolName in
+                this.applyToolAllowlist(
+                  serverName,
+                  { [toolName]: tool },
+                  info.toolAllowlist,
+                  overrides
+                )
+              )
+            ) {
+              throw revoked(`tool '${serverName}/${toolName}'`);
+            }
+            return "dispatch";
+          };
+          if (decide() === "retry") {
+            continue;
+          }
+          const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
+          const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
+          if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
+            // No cross-process writers to fence: the checks above ran in the
+            // same synchronous block as this invocation start.
+            const result: unknown = await Promise.resolve(originalExecute(args, context));
+            return result;
+          }
+          // Cross-process fence. The bracket's postflight epoch read and this
+          // invocation are separated by promise continuations, and a sibling
+          // process's revocation completing in that gap leaves no
+          // process-local marker to observe. Hold the WRITER's lock from a
+          // final epoch read through the synchronous invocation start: a
+          // sibling write either committed (and bumped the epoch) before the
+          // read — observed here, retried by the next preflight — or waits
+          // for the release, by which time the call is already dispatched
+          // under authorization that was current at dispatch. The lock is
+          // released as soon as the invocation has STARTED; the tool's own
+          // execution never runs under it.
+          // The acquisition itself is given the gate's remaining budget and
+          // abort signal: an abandoned call must not stay queued in the
+          // writer's lock queue and briefly hold the lock later, delaying
+          // every settings save queued behind it.
+          const acquisition = acquireOverridesLock({
+            timeoutMs: remainingMs(),
+            ...(abortSignal !== undefined ? { signal: abortSignal } : {}),
+          });
+          let release: () => Promise<void>;
+          try {
+            release = await bounded(acquisition);
+          } catch (error) {
+            // Belt and braces: should the acquisition still succeed after the
+            // race was lost, it must not leave the lock held.
+            acquisition.then((lateRelease) => lateRelease()).catch(() => undefined);
+            throw error;
+          }
+          let pending: Promise<unknown> | undefined;
+          try {
+            const epochNow = await bounded(readOverridesEpoch());
+            if (
+              epochNow !== this.lastOverridesEpochToken ||
+              isWorkspaceOverridesEpochUnreadable(epochNow)
+            ) {
+              // A sibling wrote since the epoch this iteration derived from
+              // (an unreadable epoch vouches for nothing): the next
+              // iteration's preflight evicts and re-derives from disk.
+              continue;
+            }
+            // Process-local state may have moved during the two awaits above.
+            if (decide() === "retry") {
+              continue;
+            }
+            // Synchronous from the last check to the invocation start, under the lock.
+            pending = Promise.resolve(originalExecute(args, context));
+          } finally {
+            await release();
+          }
+          return await pending;
+        }
+        throw new Error(
+          `MCP server '${serverName}' is unavailable while workspace MCP settings keep changing; retry`
+        );
+      },
+    };
+  }
+
   private collectTools(
     instances: Map<string, MCPServerInstance>,
     serverInfo: Record<string, MCPServerInfo>,
-    workspaceOverrides?: WorkspaceMCPOverrides
+    workspaceOverrides?: WorkspaceMCPOverrides,
+    /** Per-tool call-time gate (see gateServedToolOnEnablement); identity when absent. */
+    gate: (serverName: string, toolName: string, tool: Tool) => Tool = (_s, _t, tool) => tool
   ): { tools: Record<string, Tool>; toolServerNames: Record<string, string> } {
     const aggregated: Record<string, Tool> = {};
     const toolServerNames: Record<string, string> = {};
@@ -3415,12 +4796,38 @@ export class MCPServerManager {
           });
         }
 
-        aggregated[result.toolName] = tool;
+        aggregated[result.toolName] = gate(instance.name, toolName, tool);
         toolServerNames[result.toolName] = instance.name;
       }
     }
 
     return { tools: aggregated, toolServerNames };
+  }
+
+  /**
+   * Fence process startup against a sibling process's override write. The
+   * writer persists the document and bumps the epoch BEFORE spending its
+   * publication budget (see writeOverridesLocked), so a serve that derived
+   * its enabled set before that write observes the moved epoch here and
+   * fails closed instead of launching a server whose revocation is already
+   * durable — its repository-configured command must not execute after the
+   * revocation. The bracket's postflight alone would only close the server
+   * after it had started. The next serve's preflight re-derives from disk.
+   */
+  private async assertOverridesEpochUnmovedBeforeStart(): Promise<void> {
+    const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
+    if (readOverridesEpoch === undefined || !this.pluginInvalidationTokenSeen) {
+      return;
+    }
+    const epochNow = await readOverridesEpoch();
+    if (
+      epochNow !== this.lastOverridesEpochToken ||
+      isWorkspaceOverridesEpochUnreadable(epochNow)
+    ) {
+      throw new Error(
+        "Workspace MCP settings changed in another process (or their change marker is unreadable) while MCP servers were about to start; retry"
+      );
+    }
   }
 
   private async startServers(
@@ -3688,6 +5095,133 @@ export class MCPServerManager {
   }
 
   /**
+   * Fence a stdio process launch against the override WRITER (the read-only
+   * check in assertOverridesEpochUnmovedBeforeStart still leaves the gap
+   * between its read and the spawn): hold the writer's lock from a final
+   * epoch read through the exec that spawns the repository-configured
+   * command. A sibling's revocation therefore either committed (and bumped
+   * the epoch) before the read — observed here, the launch refused — or
+   * waits until the process exists, after which the bracket's postflight
+   * closes it. The lock is released as soon as exec returned; the MCP
+   * handshake never runs under it. Without cross-process tracking there is
+   * nothing to fence: plain launch.
+   */
+  private async launchUnderOverrideFence<T>(
+    /** `launchSignal` aborts with the startup signal AND at an `abortAfterMs` deadline. */
+    launch: (launchSignal: AbortSignal) => Promise<T>,
+    signal: AbortSignal,
+    options?: {
+      /**
+       * Release the lock once `launch` has settled OR this many ms have
+       * passed, whichever comes first. Remote (HTTP/SSE) connections: the
+       * launch IS the handshake (bounded only by the startup deadline) and
+       * cannot hold every settings writer for that long, while its first
+       * request — the traffic the fence exists for — leaves within the first
+       * moments.
+       */
+      releaseAfterMs?: number;
+      /**
+       * stdio: ABORT the launch (via `launchSignal`) when it has not handed
+       * back its exec stream within this many ms, and fail the start as a
+       * timeout (`serverName` names it). Releasing instead would let an SSH
+       * exec still awaiting its connection send the command AFTER a sibling's
+       * revocation committed — the postflight can close a process, not undo
+       * its execution. The SSH2 transport re-checks the signal right before
+       * `client.exec`, so an aborted launch never reaches the remote shell.
+       */
+      abortAfterMs?: { ms: number; serverName: string };
+    }
+  ): Promise<T> {
+    const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
+    const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
+    if (
+      acquireOverridesLock === undefined ||
+      readOverridesEpoch === undefined ||
+      !this.pluginInvalidationTokenSeen
+    ) {
+      return launch(signal);
+    }
+    // ONE deadline for acquisition and the fenced read (see getPrompt).
+    const fenceDeadlineAt = Date.now() + CALL_GATE_TIMEOUT_MS;
+    const release = await acquireOverridesLock({
+      timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+      signal,
+    });
+    let released = false;
+    const releaseOnce = async () => {
+      if (!released) {
+        released = true;
+        await release();
+      }
+    };
+    let pending: Promise<T> | undefined;
+    try {
+      const epochRead = await raceWithAbortAndTimeout(readOverridesEpoch(), {
+        timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+        signal,
+      });
+      if (epochRead.kind !== "ok") {
+        throw new Error(
+          epochRead.kind === "aborted"
+            ? "MCP server startup was aborted"
+            : "MCP server startup could not read the workspace MCP settings marker in time; retry"
+        );
+      }
+      if (
+        epochRead.value !== this.lastOverridesEpochToken ||
+        isWorkspaceOverridesEpochUnreadable(epochRead.value)
+      ) {
+        throw new Error(
+          "Workspace MCP settings changed in another process (or their change marker is unreadable) while MCP servers were about to start; retry"
+        );
+      }
+      if (options?.abortAfterMs !== undefined) {
+        const { ms, serverName } = options.abortAfterMs;
+        const launchAbort = new AbortController();
+        const forwardAbort = () => launchAbort.abort();
+        signal.addEventListener("abort", forwardAbort, { once: true });
+        if (signal.aborted) forwardAbort();
+        pending = launch(launchAbort.signal);
+        try {
+          const settled = await raceWithAbortAndTimeout(
+            pending.then(
+              () => undefined,
+              () => undefined
+            ),
+            { timeoutMs: ms }
+          );
+          if (settled.kind === "timeout") {
+            launchAbort.abort();
+            // The aborted launch's own rejection is superseded by the timeout.
+            pending.catch(() => undefined);
+            throw new MCPStartupTimeoutError(serverName, ms);
+          }
+        } finally {
+          signal.removeEventListener("abort", forwardAbort);
+        }
+        return await pending;
+      }
+      pending = launch(signal);
+      if (options?.releaseAfterMs === undefined) {
+        return await pending;
+      }
+      await raceWithAbortAndTimeout(
+        pending.then(
+          () => undefined,
+          () => undefined
+        ),
+        { timeoutMs: options.releaseAfterMs }
+      );
+    } finally {
+      // Released here — BEFORE the remaining wait on a still-pending remote
+      // handshake below: every settings save and prune would otherwise queue
+      // behind an endpoint-controlled request for the whole startup deadline.
+      await releaseOnce();
+    }
+    return await pending;
+  }
+
+  /**
    * Spawn and connect a stdio MCP server (one attempt; negotiation retries
    * live in startSingleServerImpl). Returns null when aborted.
    */
@@ -3704,12 +5238,22 @@ export class MCPServerManager {
     {
       log.debug("[MCP] Spawning stdio server", { name });
       const launch = await prepareStdioLaunch(info);
-      const execStream = await runtime.exec(launch.command, {
-        cwd: launch.cwd ?? workspacePath,
-        ...(launch.env !== undefined ? { env: launch.env } : {}),
-        timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
-        abortSignal: signal,
-      });
+      const execStream = await this.launchUnderOverrideFence(
+        (launchSignal) =>
+          runtime.exec(launch.command, {
+            cwd: launch.cwd ?? workspacePath,
+            ...(launch.env !== undefined ? { env: launch.env } : {}),
+            timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
+            abortSignal: launchSignal,
+          }),
+        signal,
+        // A host-local exec resolves once the process exists; an SSH exec
+        // can stall on connection acquisition. The writer's lock must not be
+        // held for the whole startup deadline, and the launch must not be
+        // released to send its command after a revocation: abort it instead
+        // (see launchUnderOverrideFence).
+        { abortAfterMs: { ms: STDIO_LAUNCH_FENCE_MS, serverName: name } }
+      );
 
       const cleanupSpawnedExecStream = async () => {
         try {
@@ -3974,25 +5518,39 @@ export class MCPServerManager {
     const verdictKey = JSON.stringify(["remote", name, info.transport, info.url, headers ?? null]);
     let prior = design ? { kind: "legacy" as const } : this.getCachedEraVerdict(verdictKey);
 
-    const tryHttp = async () =>
-      createMCPClient({
-        transport: {
-          type: "http",
-          ...transportBase,
-        },
-        onUncaughtError,
-        ...(prior !== undefined ? { prior } : {}),
-      });
+    // Connection initiation is fenced like a stdio spawn (see
+    // launchUnderOverrideFence): the authenticated handshake must not start
+    // after a sibling's revocation is durable — the postflight can close the
+    // client but cannot undo traffic or credentials already sent.
+    const tryHttp = () =>
+      this.launchUnderOverrideFence(
+        () =>
+          createMCPClient({
+            transport: {
+              type: "http",
+              ...transportBase,
+            },
+            onUncaughtError,
+            ...(prior !== undefined ? { prior } : {}),
+          }),
+        signal,
+        { releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+      );
 
-    const trySse = async () =>
-      createMCPClient({
-        transport: {
-          type: "sse",
-          ...transportBase,
-        },
-        onUncaughtError,
-        ...(prior !== undefined ? { prior } : {}),
-      });
+    const trySse = () =>
+      this.launchUnderOverrideFence(
+        () =>
+          createMCPClient({
+            transport: {
+              type: "sse",
+              ...transportBase,
+            },
+            onUncaughtError,
+            ...(prior !== undefined ? { prior } : {}),
+          }),
+        signal,
+        { releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+      );
 
     let client: Awaited<ReturnType<typeof createMCPClient>> | null = null;
     let resolvedTransport: ResolvedTransport = "http";

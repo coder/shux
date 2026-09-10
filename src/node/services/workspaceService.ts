@@ -339,6 +339,7 @@ import {
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 import type { DevToolsService } from "@/node/services/devToolsService";
+import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createBashTool } from "@/node/services/tools/bash";
@@ -654,6 +655,14 @@ type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
 
 /** Narrow DevTools cleanup surface used on archive/remove and by the startup sweep. */
 type WorkspaceDevToolsCleanup = Pick<DevToolsService, "hasWorkspaceData" | "removeWorkspaceData">;
+/**
+ * Narrow overrides surface: stale plugin-key sanitization on registration,
+ * fork-time copy, and the per-workspace lock rename holds across its checkout move.
+ */
+type WorkspaceServiceMcpOverridesPort = Pick<
+  WorkspaceMcpOverridesService,
+  "prunePluginOverrideKeys" | "copyOverridesToForkedCheckout" | "acquireWorkspaceLock"
+>;
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
@@ -2740,10 +2749,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
   private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
   /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
-  private workspaceMcpOverridesService?: {
-    prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
-    acquireExclusiveLock(): Promise<() => Promise<void>>;
-  };
+  private workspaceMcpOverridesService?: WorkspaceServiceMcpOverridesPort;
 
   setTimelineRecorder(recorder: TimelineRecorder): void {
     this.timelineRecorder = recorder;
@@ -2757,10 +2763,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     this.mcpServerManager = manager;
   }
 
-  setWorkspaceMcpOverridesService(service: {
-    prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
-    acquireExclusiveLock(): Promise<() => Promise<void>>;
-  }): void {
+  setWorkspaceMcpOverridesService(service: WorkspaceServiceMcpOverridesPort): void {
     this.workspaceMcpOverridesService = service;
   }
 
@@ -2989,7 +2992,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
     }
     try {
-      await this.workspaceMcpOverridesService.prunePluginOverrideKeys(workspaceId, "plugin:");
+      // A new identity owes no earlier pass an epoch bump: require the
+      // cross-process signal only when this pass actually rewrote a file, so
+      // a fork copy's valid key-free document is not rolled back by a
+      // transiently unwritable epoch file.
+      await this.workspaceMcpOverridesService.prunePluginOverrideKeys(workspaceId, "plugin:", {
+        epochOnlyWhenRewritten: true,
+      });
       return undefined;
     } catch (error) {
       // Abort creation instead of proceeding with the stale file: continuing
@@ -5797,7 +5806,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       this.initAbortControllers.delete(workspaceId);
     }
 
-    const persistedWorkspace = this.config.findWorkspace(workspaceId);
+    // The registered entry is read AFTER the MCP-overrides lock below is held
+    // (a sibling backend's rename retargets the lock onto the renamed checkout,
+    // and the deletion must address that checkout, not a stale path); this
+    // pre-lock view only serves the project-list refresh at the end.
+    let persistedWorkspace = this.config.findWorkspace(workspaceId);
     // Startup recovery or a queued dispatch can be one await from starting a stream that the single
     // stopStream() below cannot see, and the entry stays present and unarchived until removal has
     // finished with the runtime. Hold admission for the whole removal: success disposes the session,
@@ -5809,11 +5822,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       .filter((session): session is AgentSession => session != null)
       .map((session) => session.holdTurnAdmission());
 
+    // Removal deletes the checkout: hold THIS workspace's MCP-overrides lock
+    // like rename does (see rename), so a settings save that verified the
+    // checkout's existence cannot have its `mkdir -p` recreate the deleted
+    // path and write an orphaned override file while both operations report
+    // success. Scoped to this workspace; taken before any disk mutation and
+    // released once removal has settled (finally below).
+    let releaseOverridesLock: (() => Promise<void>) | undefined;
     // Try to remove from runtime (filesystem)
     try {
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
+      // Forced removals too (routine task cleanup uses force): proceeding
+      // while a stalled writer still owns the lock would let it resume after
+      // the deletion and recreate the removed path. The acquisition is
+      // bounded (and a crashed holder's lease is reclaimed), so a failure here
+      // is retryable rather than a permanent block.
+      releaseOverridesLock =
+        await this.workspaceMcpOverridesService?.acquireWorkspaceLock(workspaceId);
+      // Fresh under the lock (see above).
+      persistedWorkspace = this.config.findWorkspace(workspaceId) ?? persistedWorkspace;
 
       // The captured engine stop joins partial finalization and raw terminal delivery.
       try {
@@ -6429,6 +6458,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
+      if (releaseOverridesLock !== undefined) {
+        try {
+          await releaseOverridesLock();
+        } catch (error) {
+          log.debug("Failed to release the MCP overrides lock after workspace removal", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
       for (const hold of admissionHolds) {
         hold[Symbol.dispose]();
       }
@@ -7137,13 +7176,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const { projectPath: configProjectPath } = workspace;
       const configSnapshot = this.config.loadConfigOrDefault();
 
-      // Hold the workspace MCP-overrides lock across the checkout move AND the
-      // config rewrite below. The Agent Plugin override prune resolves
-      // checkouts from config under that lock; a rename interleaving between
-      // its filesystem move and its config write would let the prune stat the
-      // vacated old path, find nothing, and retire a cleanup tombstone while
-      // the moved .xum/mcp.local.jsonc still holds the plugin key.
-      releaseOverridesLock = await this.workspaceMcpOverridesService?.acquireExclusiveLock();
+      // Hold THIS workspace's MCP-overrides lock across the checkout move AND
+      // the config rewrite below, for every runtime. Every writer of the
+      // workspace's override document takes the same lock before the global
+      // write lock: the Agent Plugin override prune (host-local checkouts)
+      // would otherwise stat the vacated old path, find nothing, and retire a
+      // cleanup tombstone while the moved .xum/mcp.local.jsonc still holds the
+      // plugin key; and an MCP settings save (any runtime) that passed its
+      // revision check on the old path would write its disable into a
+      // recreated old path after the move while the renamed checkout keeps
+      // the prior enable. The lock is scoped to this workspace, so a slow
+      // remote move never blocks unrelated workspaces' settings saves; the
+      // lease is re-stamped while held, so a long hold is never reclaimed as
+      // stale.
+      releaseOverridesLock =
+        await this.workspaceMcpOverridesService?.acquireWorkspaceLock(workspaceId);
 
       let oldPath: string;
       let newPath: string;
@@ -10182,6 +10229,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         sourceRuntimeConfigUpdate,
         sourceRuntimeConfigUpdated,
       } = forkResult.data;
+
+      // Per-workspace MCP enables live in the gitignored .xum/mcp.local.jsonc,
+      // which a fresh checkout never materializes; without this copy a server
+      // enabled only for the source workspace is silently gone in the fork.
+      // Runs before the init hook starts (so the hook sees the fork's initial
+      // configuration deterministically) and before the plugin-override
+      // sanitization below (so stale plugin enables are pruned from the copy).
+      // Target path = what WorkspaceMcpOverridesService will later derive for
+      // the registered fork (runtime.getWorkspacePath), NOT forkResult's
+      // primary-project checkout: they differ for multi-project forks, whose
+      // persisted root is the multi-project container.
+      await this.workspaceMcpOverridesService?.copyOverridesToForkedCheckout(sourceWorkspaceId, {
+        runtime: targetRuntime,
+        workspacePath: targetRuntime.getWorkspacePath(foundProjectPath, resolvedName),
+        runtimeConfig: forkedRuntimeConfig,
+      });
 
       // Run init for forked workspace (fire-and-forget like create()).
       // Multi-project forks need per-project secrets for each runtime's init hook.

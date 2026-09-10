@@ -2924,7 +2924,8 @@ export class Config {
   private async addPathsToMetadata(
     metadata: WorkspaceMetadata,
     workspacePath: string,
-    _projectPath: string
+    _projectPath: string,
+    probeCheckout = true
   ): Promise<FrontendWorkspaceMetadata> {
     const result: FrontendWorkspaceMetadata = {
       ...metadata,
@@ -2941,10 +2942,16 @@ export class Config {
     // Mark worktree workspaces with missing checkout directories as transcript-only.
     // Queued/starting agent tasks can briefly exist without a provisioned checkout, so keep
     // those workspaces interactive until the checkout is created.
-    const workspacePathExists = await fs.promises
-      .access(workspacePath)
-      .then(() => true)
-      .catch(() => false);
+    // The probe is filesystem I/O per registered workspace (a stalled mount
+    // blocks it indefinitely); callers that only need registry data skip it
+    // (see getAllWorkspaceMetadata's probeCheckouts) and get no
+    // transcriptOnly classification.
+    const workspacePathExists = probeCheckout
+      ? await fs.promises
+          .access(workspacePath)
+          .then(() => true)
+          .catch(() => false)
+      : true;
     if (
       isWorktreeRuntime(metadata.runtimeConfig) &&
       metadata.taskStatus !== "queued" &&
@@ -3175,7 +3182,17 @@ export class Config {
      * delete activity data findWorkspace still vouches for.
      */
     legacyAliasIds?: Set<string>;
+    /**
+     * Probe each worktree checkout's existence (fs.access) to classify
+     * transcript-only workspaces. Default true. Callers that only need the
+     * registry (ids, paths, runtime, parent links) pass false: one stalled
+     * mount would otherwise block the whole enumeration, and per-request
+     * callers (workspace MCP override resolution) would pay one probe per
+     * registered workspace on every request.
+     */
+    probeCheckouts?: boolean;
   }): Promise<FrontendWorkspaceMetadata[]> {
+    const probeCheckouts = options?.probeCheckouts ?? true;
     const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
     const workspaceMetadata: FrontendWorkspaceMetadata[] = [];
     // Read-time migrations recorded here are re-applied to a FRESH config snapshot inside
@@ -3326,7 +3343,7 @@ export class Config {
             }
 
             workspaceMetadata.push(
-              await this.addPathsToMetadata(metadata, workspace.path, projectPath)
+              await this.addPathsToMetadata(metadata, workspace.path, projectPath, probeCheckouts)
             );
             continue; // Skip metadata file lookup
           }
@@ -3533,7 +3550,7 @@ export class Config {
             }
 
             workspaceMetadata.push(
-              await this.addPathsToMetadata(metadata, workspace.path, projectPath)
+              await this.addPathsToMetadata(metadata, workspace.path, projectPath, probeCheckouts)
             );
             metadataFound = true;
           }
@@ -3605,7 +3622,7 @@ export class Config {
             });
 
             workspaceMetadata.push(
-              await this.addPathsToMetadata(metadata, workspace.path, projectPath)
+              await this.addPathsToMetadata(metadata, workspace.path, projectPath, probeCheckouts)
             );
           }
         } catch (error) {
@@ -3667,7 +3684,7 @@ export class Config {
           };
 
           workspaceMetadata.push(
-            await this.addPathsToMetadata(metadata, workspace.path, projectPath)
+            await this.addPathsToMetadata(metadata, workspace.path, projectPath, probeCheckouts)
           );
         }
       }

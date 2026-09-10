@@ -51,7 +51,7 @@ function overridesServiceStub(
   prune: (
     workspaceId: string,
     keyPrefix: string,
-    options?: { publish?: (persisted: unknown) => Promise<void> }
+    options?: { publish?: (persisted: unknown, workspaceId: string) => Promise<void> }
   ) => Promise<void>
 ): WorkspaceMcpOverridesService {
   const stub: Pick<WorkspaceMcpOverridesService, "prunePluginOverrideKeysForWorkspaces"> = {
@@ -60,9 +60,8 @@ function overridesServiceStub(
       for (const workspaceId of workspaceIds) {
         try {
           await prune(workspaceId, keyPrefix, {
-            publish: (persisted) =>
-              options?.publish?.(workspaceId, persisted as WorkspaceMCPOverrides) ??
-              Promise.resolve(),
+            publish: (persisted, target) =>
+              options?.publish?.(persisted as WorkspaceMCPOverrides, target) ?? Promise.resolve(),
           });
         } catch (error) {
           failures.push({ workspaceId, error });
@@ -2070,16 +2069,16 @@ describe("AgentPluginInstallService", () => {
     // persisted overrides inside the same (stubbed) write step.
     const overridesStub = overridesServiceStub(
       async (
-        _id: string,
+        id: string,
         keyPrefix: string,
-        options?: { publish?: (persisted: unknown) => Promise<void> }
+        options?: { publish?: (persisted: unknown, workspaceId: string) => Promise<void> }
       ) => {
         storedOverrides = {
           enabledServers: storedOverrides.enabledServers.filter(
             (key) => !key.startsWith(keyPrefix)
           ),
         };
-        await options?.publish?.(storedOverrides);
+        await options?.publish?.(storedOverrides, id);
       }
     );
     const applied: Array<{ workspaceId: string; overrides: unknown }> = [];

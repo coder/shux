@@ -43,7 +43,10 @@ import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdo
 import { log } from "@/node/services/log";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import {
+  ALL_WORKSPACES_TARGET,
+  type WorkspaceMcpOverridesService,
+} from "@/node/services/workspaceMcpOverridesService";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -3345,8 +3348,14 @@ export class AgentPluginInstallService {
         serverKeyPrefix,
         mcpServerManager
           ? {
-              publish: (workspaceId, persisted) =>
-                mcpServerManager.applyWorkspaceOverrides(workspaceId, persisted),
+              publish: (persisted, target) =>
+                persisted === null
+                  ? Promise.resolve(
+                      target === ALL_WORKSPACES_TARGET
+                        ? mcpServerManager.forgetAllWorkspaceOverrides()
+                        : mcpServerManager.forgetWorkspaceOverrides(target)
+                    )
+                  : mcpServerManager.applyWorkspaceOverrides(target, persisted),
             }
           : undefined
       );
