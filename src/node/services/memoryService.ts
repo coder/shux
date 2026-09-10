@@ -49,6 +49,7 @@ import {
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import {
+  adoptionTargetStamp,
   legacyAdoptionManifestPath,
   readLegacyAdoptionManifest,
   type LegacyAdoptionRecord,
@@ -1424,6 +1425,17 @@ export class MemoryService extends EventEmitter {
           if (priorContent === content) {
             target = { relPath: previous.target, write: false };
             record.created = previous.created === true;
+            // A pending record is a copy this adoption wrote but could not
+            // finish recording (crash or sidecar failure after the write):
+            // the file holding exactly those bytes now is that write, so its
+            // current identity is the generation to bind. A settled record
+            // keeps the stamp it recorded — identical bytes in a different
+            // generation are the owner's (deletion then preserves).
+            record.targetStamp =
+              previous.targetStamp ??
+              (previous.pending === true
+                ? ((await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined)
+                : undefined);
           } else if (
             previous.created === true &&
             priorContent !== null &&
@@ -1481,6 +1493,9 @@ export class MemoryService extends EventEmitter {
           if (target.replaces !== true) remainingCapacity--;
           imported++;
           record.created = true;
+          // The generation of the file just written (see targetStamp).
+          record.targetStamp =
+            (await adoptionTargetStamp(store.physicalPath(target.relPath))) ?? undefined;
         }
         record.target = target.relPath;
         // Pins/stats were keyed by the child: fold them into the owner key.
@@ -1606,10 +1621,24 @@ export class MemoryService extends EventEmitter {
               }
             }
           }
-          // Either side of an interrupted in-place replacement counts as ours.
+          // Ours only while it is THIS generation of the file (targetStamp,
+          // taken right after this adoption's write): identical bytes in a
+          // file the owner deleted and recreated, or edited and restored, are
+          // the owner's, and a record without a stamp preserves. The one
+          // exception is the far side of an interrupted in-place replacement:
+          // the pending record names the bytes about to be written, and a
+          // file holding exactly those (never before in the store) is that
+          // write, whose stamp the crash kept from being recorded.
+          const currentHash = current === null ? null : sha256Hex(current);
           const unchanged =
-            current !== null &&
-            [previous.content, previous.replacementContent].includes(sha256Hex(current));
+            currentHash !== null &&
+            ((previous.pending === true &&
+              previous.replacementContent !== undefined &&
+              currentHash === previous.replacementContent) ||
+              (currentHash === previous.content &&
+                previous.targetStamp !== undefined &&
+                (await adoptionTargetStamp(store.physicalPath(previous.target))) ===
+                  previous.targetStamp));
           // A listed note may now point at this very target (the downgraded
           // build renamed `a.md` to the path its conflict copy was adopted
           // under, and the new record reused the identical file): the target
@@ -1632,6 +1661,7 @@ export class MemoryService extends EventEmitter {
             // successor keeps its own (non-created) provenance.
             if (unchanged && successor[1].created !== true) {
               successor[1].created = true;
+              successor[1].targetStamp = previous.targetStamp;
               manifestDirty = true;
             }
           } else if (unchanged) {
@@ -2132,9 +2162,25 @@ export class MemoryService extends EventEmitter {
     // Access revoked (acting workspace or owner tombstoned by any backend):
     // a distinct token so a cached context built from the owner's notes is
     // invalidated and the rebuild (listIndexEntries) then excludes the store.
-    for (const guarded of new Set([workspaceId, owner])) {
-      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, guarded)) return "revoked";
-    }
+    const revoked = async (): Promise<boolean> => {
+      for (const guarded of new Set([workspaceId, owner])) {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, guarded)) return true;
+      }
+      return false;
+    };
+    if (await revoked()) return "revoked";
+    const token = await this.buildWorkspaceMemoryRevisionToken(workspaceId, owner);
+    // Re-checked AFTER the token's reads: a tombstone published while they
+    // were in flight is not part of the token, so the unchanged pre-removal
+    // token would let a cached context keep serving the owner's notes to the
+    // removed workspace's next request.
+    return (await revoked()) ? "revoked" : token;
+  }
+
+  private async buildWorkspaceMemoryRevisionToken(
+    workspaceId: string,
+    owner: string
+  ): Promise<string> {
     const ownerSessionDir = path.join(this.config.sessionsDir, owner);
     const revision = await readWorkspaceMemoryRevision(ownerSessionDir);
     // The clock is what this build's writers advance. A downgraded build

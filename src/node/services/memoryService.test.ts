@@ -1386,6 +1386,36 @@ describe("MemoryService", () => {
       ).toBe(false);
     });
 
+    it("reports revocation for a tombstone published while the revision token was being built", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      const before = await fixture.service.workspaceMemoryRevision("ws-child");
+      expect(before).not.toBe("revoked");
+      // Removal lands between the entry check and the token's reads: the
+      // unchanged pre-removal token would let a cached context keep serving
+      // the owner's notes to the removed child's next request.
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-child");
+      const service = fixture.service as unknown as {
+        buildWorkspaceMemoryRevisionToken: (...args: unknown[]) => Promise<string>;
+      };
+      const original = service.buildWorkspaceMemoryRevisionToken.bind(fixture.service);
+      const build = spyOn(service, "buildWorkspaceMemoryRevisionToken").mockImplementationOnce(
+        async (...args) => {
+          const token = await original(...args);
+          await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+          await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+          return token;
+        }
+      );
+      try {
+        expect(await fixture.service.workspaceMemoryRevision("ws-child")).toBe("revoked");
+        expect(build).toHaveBeenCalledTimes(1);
+      } finally {
+        build.mockRestore();
+      }
+    });
+
     it("refuses a read whose workspace was tombstoned while the legacy adoption pass ran", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -2460,6 +2490,34 @@ describe("MemoryService", () => {
       ) as Record<string, { created?: boolean }>;
       expect(Object.keys(manifest)).toEqual([".adopted-into-shared-store.json"]);
       expect(manifest[".adopted-into-shared-store.json"]).toMatchObject({ created: true });
+    });
+
+    it("preserves an owner note recreated with the adopted bytes when the legacy source is deleted", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
+      // ABA on the owner side: the owner deletes the adopted copy and later
+      // writes a note of its own at the same path with the same bytes (or
+      // edits and restores it). The bytes match the record; the file is not
+      // this adoption's copy any more.
+      await fixture.service.deletePath(ownerCtx, "/memories/workspace/note.md", "agent");
+      await fixture.service.create(ownerCtx, "/memories/workspace/note.md", "v1", "agent");
+      // The downgraded child then deletes its source.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(legacyRoot, "note.md"));
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
+      const manifest = JSON.parse(
+        await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(legacyRoot)), "utf-8")
+      ) as Record<string, { deleted?: boolean; created?: boolean }>;
+      // Tombstoned as owner-owned: no destructive provenance survives.
+      expect(manifest["note.md"]).toMatchObject({ deleted: true, created: false });
     });
 
     it("recovers an interrupted in-place replacement without duplicating the note", async () => {

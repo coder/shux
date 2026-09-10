@@ -45,6 +45,16 @@ export interface LegacyAdoptionRecord {
   created?: boolean;
   pending?: boolean;
   /**
+   * Identity of the owner file this adoption wrote (`ino:size:mtimeNs` right
+   * after the write). Deletion reconciliation requires the copy to be THIS
+   * generation of the file, not merely to hold the adopted bytes: an owner
+   * who deleted and recreated (or edited and restored) the note to identical
+   * bytes owns the new file, and a byte match alone would let a downgraded
+   * child's source deletion remove it. Absent (write before stamping, or the
+   * stamp could not be taken): never unchanged — the copy is preserved.
+   */
+  targetStamp?: string;
+  /**
    * Hash of the bytes an in-place replacement is about to write (set on the
    * pending prior record, cleared once the pass completes). With `content`
    * (the pre-write bytes) this lets a retry recognize the copy as this
@@ -95,6 +105,7 @@ function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null 
   if (record.replacementContent !== undefined && typeof record.replacementContent !== "string") {
     return null;
   }
+  if (record.targetStamp !== undefined && typeof record.targetStamp !== "string") return null;
   const flag = (raw: unknown, malformed: boolean): boolean | undefined =>
     raw === undefined ? undefined : typeof raw === "boolean" ? raw : malformed;
   return {
@@ -106,6 +117,7 @@ function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null 
     pendingDeletion: flag(record.pendingDeletion, true),
     deleted: flag(record.deleted, false),
     replacementContent: record.replacementContent,
+    targetStamp: record.targetStamp,
   };
 }
 
@@ -161,6 +173,19 @@ export async function readLegacyAdoptionManifest(
     entries.push([relPath, record]);
   }
   return new Map(entries);
+}
+
+/**
+ * The file identity a LegacyAdoptionRecord.targetStamp records; null when the
+ * file cannot be stat'ed (the record then carries no stamp: preserved).
+ */
+export async function adoptionTargetStamp(absPath: string): Promise<string | null> {
+  try {
+    const stat = await fsPromises.lstat(absPath, { bigint: true });
+    return `${stat.ino}:${stat.size}:${stat.mtimeNs}`;
+  } catch {
+    return null;
+  }
 }
 
 /**
