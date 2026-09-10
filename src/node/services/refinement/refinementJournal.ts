@@ -112,6 +112,12 @@ export interface RefinementEmitArgs {
   /** See the durable event schema: the store clock write failed for this row. */
   orderUnknown?: true;
   /**
+   * Original journal position of a migrated row (see the durable event
+   * schema); only shared-memory row migration sets these, together.
+   */
+  originJournal?: string;
+  originSeq?: number;
+  /**
    * "remote" when the mutation ran through a non-local runtime (SSH/Docker).
    * Such rows carry runtime-namespace paths and are refused by rollback,
    * which only applies inverses to the host filesystem.
@@ -387,6 +393,9 @@ export async function appendRefinementEventUnderBlobLock(
       ...(args.rollbackOf !== undefined ? { rollbackOf: args.rollbackOf } : {}),
       ...(args.sourceTs !== undefined ? { sourceTs: args.sourceTs } : {}),
       ...(args.orderUnknown === true ? { orderUnknown: true } : {}),
+      ...(args.originJournal !== undefined && args.originSeq !== undefined
+        ? { originJournal: args.originJournal, originSeq: args.originSeq }
+        : {}),
       ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
     },
   });

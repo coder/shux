@@ -94,6 +94,20 @@ export const RefinementDataSchema = z.object({
    */
   migratedFrom: z.string().optional(),
   /**
+   * Where a migrated row was ORIGINALLY appended: the journal (workspace id)
+   * whose append sequence positions it, and its `seq` there. Two rows of one
+   * origin were serialized by that store's mutation lock (clock + append run
+   * inside it), so their origin sequence IS their mutation order — even when
+   * neither carries a usable clock value (pre-sharing history, a failed clock
+   * write). Copies are appended to the owner journal later than they happened
+   * and in migration order, so their own `seq` is no order evidence; a
+   * copy-of-copy keeps the first origin. Absent on a copy (older builds,
+   * corruption) = order unknown, never the copying journal's position.
+   * Native rows need no fields: their origin is (`workspaceId`, `seq`).
+   */
+  originJournal: z.string().optional(),
+  originSeq: z.number().optional(),
+  /**
    * Cross-session order key for rollback conflict detection (`sourceTs ?? ts`):
    * a shared workspace store's monotonic clock, advanced under the store's
    * mutation lock by every mutation (workspaceMemoryRevision.ts), so rows in
@@ -209,4 +223,35 @@ export type DurableEventDraft = DistributiveOmit<DurableEvent, "v" | "seq" | "id
  */
 export function isValidSourceClock(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+/** Where a refinement row was originally appended (see `originJournal`). */
+export interface RefinementRowOrigin {
+  journal: string;
+  seq: number;
+}
+
+/**
+ * The journal position that orders a refinement row against rows of the same
+ * origin (RefinementDataSchema.originJournal). A native row is positioned by
+ * its own journal; a migrated copy only by a carried, well-formed origin —
+ * anything else about a copy is no order evidence (null).
+ */
+export function refinementRowOrigin(row: {
+  workspaceId: string;
+  seq: number;
+  data: { migratedFrom?: string; originJournal?: unknown; originSeq?: unknown };
+}): RefinementRowOrigin | null {
+  if (row.data.migratedFrom === undefined) return { journal: row.workspaceId, seq: row.seq };
+  const { originJournal, originSeq } = row.data;
+  if (
+    typeof originJournal !== "string" ||
+    originJournal === "" ||
+    typeof originSeq !== "number" ||
+    !Number.isSafeInteger(originSeq) ||
+    originSeq < 0
+  ) {
+    return null;
+  }
+  return { journal: originJournal, seq: originSeq };
 }

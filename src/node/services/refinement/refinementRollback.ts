@@ -29,7 +29,11 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
-import { isValidSourceClock, type DurableEvent } from "@/common/types/durableEvent";
+import {
+  isValidSourceClock,
+  refinementRowOrigin,
+  type DurableEvent,
+} from "@/common/types/durableEvent";
 import {
   MemoryRefinementActionSchema,
   RefinementInverseSchema,
@@ -529,12 +533,36 @@ interface InverseContentReader {
  * filesystem + journal state. Empty array = safe to apply.
  */
 /**
+ * Two rows first appended to the same journal (a copy at its source position,
+ * see refinementRowOrigin): that store's mutation lock serialized clock and
+ * append, so the origin sequence is their mutation order whatever their clock
+ * values — pre-sharing history and clock-failed rows included. A copy without
+ * a carried origin has none (r73). Equal positions under distinct ids can
+ * only be corruption — no order evidence either.
+ */
+function sameOriginOrder(
+  row: RefinementEvent,
+  other: RefinementEvent
+): { rowAfter: boolean } | null {
+  const rowOrigin = refinementRowOrigin(row);
+  const otherOrigin = refinementRowOrigin(other);
+  if (rowOrigin === null || otherOrigin === null || rowOrigin.journal !== otherOrigin.journal) {
+    return null;
+  }
+  if (rowOrigin.seq === otherOrigin.seq) return null;
+  return { rowAfter: rowOrigin.seq > otherOrigin.seq };
+}
+
+/**
  * Journal order for conflict detection. Rows copied from a removed sub-agent's
  * journal (sharedMemoryRowMigration.ts) were appended later than they
  * happened; their `sourceTs` restores the mutation's real position relative
  * to the owner's own rows. Same-instant ties fall back to append sequence.
+ * Rows of one origin order by that origin's sequence (sameOriginOrder).
  */
 function isAfter(row: RefinementEvent, other: RefinementEvent): boolean {
+  const sameOrigin = sameOriginOrder(row, other);
+  if (sameOrigin !== null) return sameOrigin.rowAfter;
   const rowTs = isValidSourceClock(row.data.sourceTs) ? row.data.sourceTs : row.ts;
   const otherTs = isValidSourceClock(other.data.sourceTs) ? other.data.sourceTs : other.ts;
   return rowTs > otherTs || (rowTs === otherTs && row.seq > other.seq);
@@ -555,13 +583,15 @@ function hasMalformedSourceClock(row: RefinementEvent): boolean {
  * the shared store's clock write failed (`orderUnknown`) has only
  * journal-local `ts`/`seq`, incomparable with other journals' rows — as does
  * a row whose clock value is malformed. Callers fail closed — such a pair
- * conflicts in either direction (force overrides).
+ * conflicts in either direction (force overrides). Rows of one origin are
+ * always ordered (sameOriginOrder), whatever their clock values.
  */
 function orderUnknown(
   row: RefinementEvent,
   target: RefinementEvent,
   targetRetargeted: boolean
 ): boolean {
+  if (sameOriginOrder(row, target) !== null) return false;
   if (row.data.orderUnknown === true || target.data.orderUnknown === true) return true;
   if (hasMalformedSourceClock(row) || hasMalformedSourceClock(target)) return true;
   // A retargeted target (see wasRetargeted) vs. a row of another journal.

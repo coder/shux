@@ -1120,7 +1120,7 @@ export class MemoryService extends EventEmitter {
    * DOWNGRADED build reads (and writes) this child's notebook, so the notes
    * stay visible across upgrade↔downgrade (the child-keyed sidecar entries
    * stay for the same reason) and files the import cannot carry
-   * (binary/oversize, dotfiles, doubly conflicting) are never moved anywhere.
+   * (binary/oversize, doubly conflicting) are never moved anywhere.
    * The copy is idempotent — identical files are skipped, differing ones land
    * under imported/<child>/ — so notes edited during a downgrade are folded in
    * again on the next upgrade. Writes made through the shared store meanwhile
@@ -1365,10 +1365,11 @@ export class MemoryService extends EventEmitter {
           .then(() => this.readBoundedTextFile(legacy, relPath, relPath))
           .catch(() => null);
         if (content === null || content.includes("\uFFFD")) {
-          // An unrepresentable dot-entry (a stray `.DS_Store`, a binary) was
-          // never a note on any build — no listing showed it — so it neither
-          // moves nor holds up removal; an unrepresentable LISTED note does.
-          if (relPath.split("/").some((segment) => segment.startsWith("."))) continue;
+          // Dot-entries too (r73): `.note` is addressable, so a real note
+          // there may hold text `create` permitted (U+FFFD included) or be
+          // transiently unreadable — exempting dot-entries would report a
+          // complete handover and let removal take the only copy. A stray
+          // `.DS_Store` costs a forced removal, never a note.
           skipped++;
           continue;
         }

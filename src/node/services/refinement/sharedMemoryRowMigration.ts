@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
-import { isValidSourceClock } from "@/common/types/durableEvent";
+import { isValidSourceClock, refinementRowOrigin } from "@/common/types/durableEvent";
 import {
   MemoryRefinementActionSchema,
   RefinementEvidenceSchema,
@@ -251,6 +251,7 @@ export async function migrateSharedMemoryRefinementRows(args: {
       }
       const evidence = RefinementEvidenceSchema.safeParse(row.data.evidence);
       const postState = RefinementPostStateSchema.safeParse(row.data.postState);
+      const origin = refinementRowOrigin(row);
       // Throws: this is the only durable copy once the child's journal goes.
       const appended = await appendRefinementEventUnderBlobLock(ownerJournal, {
         sessionDir: args.ownerSessionDir,
@@ -294,6 +295,12 @@ export async function migrateSharedMemoryRefinementRows(args: {
         ...(row.data.orderUnknown === true || !isValidSourceClock(row.data.sourceTs) || retargeted
           ? { orderUnknown: true as const }
           : {}),
+        // Order-unknown against the owner's rows, but not against each other:
+        // the source position (this child's journal, or the first origin of a
+        // copy-of-copy) lets the owner unwind the child's own overlapping
+        // history LIFO — the copies' owner-side `seq` is migration order,
+        // which a retried pass can permute (a re-copied row lands last).
+        ...(origin !== null ? { originJournal: origin.journal, originSeq: origin.seq } : {}),
         ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),
       });
       publishedBlobs.push(...appended.publishedBlobs);

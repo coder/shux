@@ -1798,14 +1798,16 @@ describe("MemoryService", () => {
       ]);
     });
 
-    it("adopts addressable dot-entry notes and ignores unrepresentable stray dot-entries", async () => {
+    it("adopts addressable dot-entry notes and refuses the handover over unrepresentable ones", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
       const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
       const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
       // The path grammar admits dotfiles, so a downgraded child may hold a
-      // real note at `.note` that no listing ever showed; a stray binary
-      // dot-entry (Finder's `.DS_Store`) was never a note on any build.
+      // real note at `.note` that no listing ever showed — including one
+      // whose text `create` accepted but the lossy-decode gate cannot vouch
+      // for. Such an entry must hold up removal like a listed note would
+      // (r73), not be written off as a stray `.DS_Store`.
       await fsPromises.mkdir(path.join(legacyRoot, ".hidden"), { recursive: true });
       await fsPromises.writeFile(path.join(legacyRoot, ".note"), "dot note");
       await fsPromises.writeFile(path.join(legacyRoot, ".hidden", "n.md"), "nested dot note");
@@ -1813,12 +1815,20 @@ describe("MemoryService", () => {
         path.join(legacyRoot, ".DS_Store"),
         Buffer.from([0, 0, 1, 255, 254])
       );
-      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      expect(
+        await fixture.service
+          .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
+          .then(() => null, getErrorMessage)
+      ).toMatch(/1 legacy workspace memory note\(s\)/);
+      // The representable dot-entries were folded in by that same pass.
       expect(await fsPromises.readFile(path.join(ownerRoot, ".note"), "utf-8")).toBe("dot note");
       expect(await fsPromises.readFile(path.join(ownerRoot, ".hidden", "n.md"), "utf-8")).toBe(
         "nested dot note"
       );
       expect(await pathExists(path.join(ownerRoot, ".DS_Store"))).toBe(false);
+      // Removing the stray entry lets a retried (non-forced) handover complete.
+      await fsPromises.rm(path.join(legacyRoot, ".DS_Store"));
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
       // Still addressable through the shared store, like on the old build.
       const viewed = await fixture.service.view(fixture.ctx, "/memories/workspace/.note");
       expect(viewed.success).toBe(true);
@@ -3835,6 +3845,203 @@ describe("MemoryService", () => {
       });
       expect(second.success).toBe(true);
       expect(await pathExists(shared)).toBe(false);
+    });
+
+    it("unwinds a removed child's own overlapping history LIFO through the owner journal", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const legacyRoot = path.join(childSessionDir, "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      // Two pre-sharing rows over one note: a create, then an edit. Both are
+      // retargeted on migration (order-unknown against the OWNER's rows), but
+      // their order against EACH OTHER is the child journal's sequence.
+      await fsPromises.writeFile(path.join(legacyRoot, "old.md"), "v2");
+      const childJournal = sharedDurableEventJournal(childSessionDir);
+      await childJournal.append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "create", path: "/memories/workspace/old.md" },
+          inverse: { op: "delete-files", paths: [path.join(legacyRoot, "old.md")] },
+        },
+      });
+      await childJournal.append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "str_replace", path: "/memories/workspace/old.md" },
+          inverse: {
+            op: "restore-files",
+            files: [{ path: path.join(legacyRoot, "old.md"), text: "v1" }],
+          },
+          postState: {
+            files: [{ path: path.join(legacyRoot, "old.md"), sha256: sha256Hex("v2") }],
+          },
+        },
+      });
+      const [childCreate, childEdit] = await readRefinementEvents(childSessionDir);
+      await fixture.service.listIndexEntries({ ...fixture.ctx }); // adoption
+      const ownerCopy = path.join(ownerSessionDir, "memory", "old.md");
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v2");
+      expect(
+        await migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        })
+      ).toBe(2);
+      const ownerRows = await readRefinementEvents(ownerSessionDir);
+      const copyOf = (source: { id: string }) =>
+        ownerRows.find((row) => row.data.migratedFrom === `ws-child:${source.id}`)!;
+      const createCopy = copyOf(childCreate);
+      const editCopy = copyOf(childEdit);
+      for (const [copy, source] of [
+        [createCopy, childCreate],
+        [editCopy, childEdit],
+      ] as const) {
+        expect(copy.data.orderUnknown).toBe(true);
+        expect(copy.data.originJournal).toBe("ws-child");
+        expect(copy.data.originSeq).toBe(source.seq);
+      }
+      // The older copy is not the newest mutation of the note: refused.
+      const stale = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: createCopy.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(stale.success).toBe(false);
+      expect(stale.success ? "" : stale.error).toContain("later refinement row");
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v2");
+      // Newest first, no force needed...
+      const first = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: editCopy.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(first.success).toBe(true);
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
+      // ...then the create.
+      const second = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: createCopy.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(second.success).toBe(true);
+      expect(await pathExists(ownerCopy)).toBe(false);
+    });
+
+    it("orders re-copied and provenance-less migrated rows by source position, not migration order", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const legacyRoot = path.join(childSessionDir, "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "old.md"), "v2");
+      const childJournal = sharedDurableEventJournal(childSessionDir);
+      await childJournal.append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "create", path: "/memories/workspace/old.md" },
+          inverse: { op: "delete-files", paths: [path.join(legacyRoot, "old.md")] },
+        },
+      });
+      await childJournal.append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "str_replace", path: "/memories/workspace/old.md" },
+          inverse: {
+            op: "restore-files",
+            files: [{ path: path.join(legacyRoot, "old.md"), text: "v1" }],
+          },
+        },
+      });
+      const [childCreate, childEdit] = await readRefinementEvents(childSessionDir);
+      await fixture.service.listIndexEntries({ ...fixture.ctx }); // adoption
+      const ownerCopy = path.join(ownerSessionDir, "memory", "old.md");
+      const migrate = () =>
+        migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        });
+      expect(await migrate()).toBe(2);
+      const journalPath = path.join(ownerSessionDir, "durable-events.jsonl");
+      const rewriteCopyOf = async (
+        source: { id: string },
+        edit: (data: Record<string, unknown>) => void
+      ) => {
+        const rewritten = (await fsPromises.readFile(journalPath, "utf-8"))
+          .split("\n")
+          .map((line) => {
+            if (!line.includes(`"migratedFrom":"ws-child:${source.id}"`)) return line;
+            const row = JSON.parse(line) as { data: Record<string, unknown> };
+            edit(row.data);
+            return JSON.stringify(row);
+          });
+        await fsPromises.writeFile(journalPath, rewritten.join("\n"));
+      };
+      // The CREATE's copy is corrupted before the removal is retried: the
+      // retry re-copies it, so the OLDER mutation now has the higher
+      // owner-journal seq (and a later append time).
+      await rewriteCopyOf(childCreate, (data) => {
+        data.inverse = { op: "bogus" };
+      });
+      expect(await migrate()).toBe(1);
+      const ownerRows = await readRefinementEvents(ownerSessionDir);
+      const editCopy = ownerRows.find(
+        (row) => row.data.migratedFrom === `ws-child:${childEdit.id}`
+      )!;
+      const createCopy = ownerRows.find(
+        (row) =>
+          row.data.migratedFrom === `ws-child:${childCreate.id}` &&
+          (row.data.inverse as { op: string }).op !== "bogus"
+      )!;
+      expect(createCopy.seq).toBeGreaterThan(editCopy.seq);
+      expect(createCopy.data.originSeq!).toBeLessThan(editCopy.data.originSeq!);
+      // Migration order is not mutation order: the edit is still the newest
+      // mutation of the note and rolls back without force.
+      const first = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: editCopy.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(first.success).toBe(true);
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
+      // A copy WITHOUT a carried origin (an older build's migration, or the
+      // fields lost to corruption) has no position: its order against every
+      // other row stays unknown, so the create's rollback needs force.
+      await rewriteCopyOf(childEdit, (data) => {
+        delete data.originJournal;
+        delete data.originSeq;
+      });
+      const refused = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: createCopy.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(refused.success).toBe(false);
+      expect(refused.success ? "" : refused.error).toContain(
+        "order relative to this row is unknown"
+      );
+      const forced = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: createCopy.id,
+        force: true,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(forced.success).toBe(true);
+      expect(await pathExists(ownerCopy)).toBe(false);
     });
 
     it("orders owner and child rows of the shared store by one store clock, advanced by rollbacks too", async () => {
