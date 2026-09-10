@@ -99,6 +99,7 @@ describe("inactive atomic pending/history publication", () => {
     });
     const foreign = new HistoryService(h.config).getCompactionPendingHistory(workspaceId);
     const second = new CompactionPendingState(pendingPath, {
+      ...foreign,
       withLock: (operation) => {
         attempted.resolve();
         return foreign.withLock(operation);

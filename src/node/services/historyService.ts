@@ -455,6 +455,14 @@ export class HistoryService {
   /** Inactive G1 adapter: pending-file I/O must finish before either history lock is released. */
   getCompactionPendingHistory(workspaceId: string): CompactionPendingHistory {
     return {
+      cleanupHeartbeat: (summary, isCurrent, onCommitted) =>
+        this.cleanupCompactionFollowUp(
+          workspaceId,
+          summary,
+          "rollback-heartbeat",
+          isCurrent,
+          onCommitted
+        ),
       withLock: (operation) =>
         this.fileLocks.withLock(workspaceId, () =>
           this.withCrossProcessWriteLock(workspaceId, async (assertStillOwned) => {

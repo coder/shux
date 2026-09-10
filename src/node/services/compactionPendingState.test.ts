@@ -26,6 +26,7 @@ describe("unactivated compaction pending-file protocol", () => {
   function historyAdapter(history = h.historyService): CompactionPendingHistory {
     const adapter = history.getCompactionPendingHistory(workspaceId);
     return {
+      ...adapter,
       withLock: (operation) =>
         adapter.withLock((view) =>
           operation({ ...view, boundary: boundaryOverride ?? view.boundary })
@@ -688,6 +689,7 @@ describe("unactivated compaction pending-file protocol", () => {
       );
       if (operation === "discard" && changed)
         expect(await bytes().catch((error: unknown) => error)).toMatchObject({ code: "ENOENT" });
+      else expect(JSON.parse(await bytes())).toMatchObject({ version: 1, boundaryMessageId: "a" });
     }
   );
 
