@@ -4421,9 +4421,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const storedFor = (entry: WorkspaceConfigEntry): boolean | undefined =>
       workspaceMemoryWritableForEpoch(entry, policyEpoch);
     const stored = storedFor(before.workspace);
+    // Carried epochs whose policy was never recorded anywhere — no record
+    // under any carried key, none under this epoch's (where a completed
+    // carry would have moved it), no marker — are unknown history too: the
+    // tail copies ARE turns of those epochs (excluded from epochHasPriorTurns
+    // by design), e.g. the first tail compaction after upgrading a chat.
+    const carriedUnrecorded =
+      carriedPolicyEpochs.length > 0 &&
+      stored === undefined &&
+      !denyMarker &&
+      carriedFor(before.workspace) === undefined;
     const unknownHistory =
       (stored === undefined && mirror === undefined && options.epochHasPriorTurns) ||
-      options.carriedPolicyUnknown === true;
+      options.carriedPolicyUnknown === true ||
+      carriedUnrecorded;
     const conjunction = (durable: boolean | undefined, carried: boolean | undefined): boolean =>
       !denyMarker &&
       !unknownHistory &&

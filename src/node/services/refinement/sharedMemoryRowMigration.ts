@@ -267,8 +267,14 @@ export async function migrateSharedMemoryRefinementRows(args: {
           : {}),
         migratedFrom,
         ...(rollbackOf !== undefined ? { rollbackOf } : {}),
-        sourceTs: row.data.sourceTs ?? row.ts,
-        ...(row.data.orderUnknown === true ? { orderUnknown: true as const } : {}),
+        // A row without a store-clock value (pre-sharing, or its clock write
+        // failed) has only a journal-local `ts`, incomparable with the
+        // owner's clock-stamped rows: carried as order-unknown rather than
+        // dressed up as a clock value.
+        ...(row.data.sourceTs !== undefined ? { sourceTs: row.data.sourceTs } : {}),
+        ...(row.data.orderUnknown === true || row.data.sourceTs === undefined
+          ? { orderUnknown: true as const }
+          : {}),
         ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),
       });
       publishedBlobs.push(...appended.publishedBlobs);

@@ -1380,7 +1380,7 @@ export class MemoryService extends EventEmitter {
           } else if (
             previous.created === true &&
             priorContent !== null &&
-            sha256Hex(priorContent) === previous.content
+            [previous.content, previous.replacementContent].includes(sha256Hex(priorContent))
           ) {
             target = { relPath: previous.target, write: true, replaces: true };
           }
@@ -1426,7 +1426,7 @@ export class MemoryService extends EventEmitter {
           adopted.set(
             relPath,
             target.replaces === true && previous !== undefined
-              ? { ...previous, pending: true }
+              ? { ...previous, pending: true, replacementContent: record.content }
               : { ...record, target: target.relPath, created: true, pending: true }
           );
           await writeManifest();
@@ -1504,6 +1504,7 @@ export class MemoryService extends EventEmitter {
           (error: unknown) => isMissingPathError(error)
         );
         if (!sourceGone) continue;
+        let unchangedForTombstone = false;
         if (previous.created === true) {
           // Strict probe: a target that merely could not be stat'ed is not
           // "changed" — dropping the entry on that basis would lose the
@@ -1556,7 +1557,10 @@ export class MemoryService extends EventEmitter {
               }
             }
           }
-          const unchanged = current !== null && sha256Hex(current) === previous.content;
+          // Either side of an interrupted in-place replacement counts as ours.
+          const unchanged =
+            current !== null &&
+            [previous.content, previous.replacementContent].includes(sha256Hex(current));
           // A listed note may now point at this very target (the downgraded
           // build renamed `a.md` to the path its conflict copy was adopted
           // under, and the new record reused the identical file): the target
@@ -1566,6 +1570,7 @@ export class MemoryService extends EventEmitter {
             ([rel, record]) =>
               rel !== relPath && listed.has(rel) && record.target === previous.target
           );
+          unchangedForTombstone = unchanged && successor === undefined;
           if (successor !== undefined) {
             // Only a copy still holding the adopted bytes is ours to hand
             // over; one the owner edited since is the owner's, and the
@@ -1599,7 +1604,15 @@ export class MemoryService extends EventEmitter {
         // this note still need relPath → target to be rolled back into the
         // shared store (a delete's restore lands at the reconciled target;
         // the reconciliation above never runs again for it).
-        adopted.set(relPath, { ...previous, deleted: true });
+        // Destructive provenance survives only while the target was still
+        // this adoption's copy and nobody took it over: a copy the owner
+        // edited (or one handed to a successor record) is not the old path's
+        // to delete or restore any more.
+        adopted.set(relPath, {
+          ...previous,
+          deleted: true,
+          created: previous.created === true && unchangedForTombstone,
+        });
         manifestDirty = true;
       }
       if (manifestDirty) await writeManifest();

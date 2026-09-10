@@ -9552,6 +9552,22 @@ describe("WorkspaceService initialize", () => {
         })
       ).toBe(true);
       expect(persistedFor(18)).toBe(true);
+      // A carried epoch with no record anywhere (no carried key, nothing under
+      // this epoch, no marker — e.g. the first tail compaction after an
+      // upgrade) is unknown history: denied.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        delete entry.workspaceMemoryWritableByEpoch;
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 24,
+          carriedPolicyEpochs: [-1],
+        })
+      ).toBe(true);
+      expect(persistedFor(24)).toBe(false);
       // A tail copy whose source epoch is unknown (persisted before the field
       // existed) carries a policy nobody can look up: denied, like unknown
       // history, even for an otherwise writable first turn.

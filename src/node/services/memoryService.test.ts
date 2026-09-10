@@ -1790,6 +1790,10 @@ describe("MemoryService", () => {
         await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
       ) as Record<string, { created?: boolean }>;
       expect(manifest["imported/ws-child/a.md"].created).not.toBe(true);
+      // ...and the obsolete record's tombstone drops its destructive
+      // provenance: the child's old rows may not map onto the owner's note.
+      expect(manifest["a.md"]).toMatchObject({ deleted: true });
+      expect(manifest["a.md"].created).not.toBe(true);
       // Deleting the renamed source leaves the owner's note in place.
       await new Promise((resolve) => setTimeout(resolve, 5));
       await fsPromises.rm(path.join(legacyRoot, "imported", "ws-child", "a.md"));
@@ -2324,6 +2328,32 @@ describe("MemoryService", () => {
       });
       expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v3");
       expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      // The opposite crash window: the replacement bytes landed but the final
+      // manifest write did not, and the downgraded build deletes the source
+      // before the retry. The pending record names both hashes, so the copy
+      // is still recognized as this adoption's and follows the source out.
+      const settled3 = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { content: string; sidecar: string; target: string; created?: boolean }
+        >
+      )["note.md"];
+      await fsPromises.writeFile(path.join(ownerRoot, "note.md"), "v4");
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({
+          "note.md": { ...settled3, pending: true, replacementContent: sha256Hex("v4") },
+        })
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(legacyRoot, "note.md"));
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).listIndexEntries({
+        ...fixture.ctx,
+      });
+      expect(await pathExists(path.join(ownerRoot, "note.md"))).toBe(false);
     });
 
     it("keeps adopting a legacy note named __proto__ exactly once", async () => {
@@ -2913,6 +2943,10 @@ describe("MemoryService", () => {
       expect((copy.data.postState as { files: Array<{ path: string }> }).files[0].path).toBe(
         ownerCopy
       );
+      // No store-clock value existed for the pre-sharing row: its order is
+      // unknown, not its journal-local timestamp dressed up as a clock value.
+      expect(copy.data.sourceTs).toBeUndefined();
+      expect(copy.data.orderUnknown).toBe(true);
       const rolledBack = await rollbackRefinement({
         sessionDir: ownerSessionDir,
         id: copy.id,

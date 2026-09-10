@@ -34,6 +34,13 @@ export interface LegacyAdoptionRecord {
   created?: boolean;
   pending?: boolean;
   /**
+   * Hash of the bytes an in-place replacement is about to write (set on the
+   * pending prior record, cleared once the pass completes). With `content`
+   * (the pre-write bytes) this lets a retry recognize the copy as this
+   * adoption's on either side of an interrupted write.
+   */
+  replacementContent?: string;
+  /**
    * The legacy source was deleted (or renamed away) on a downgraded build and
    * the copy reconciled. Kept rather than dropped: the child's pre-sharing
    * refinement rows for this note (a delete's restore inverse, a rename's

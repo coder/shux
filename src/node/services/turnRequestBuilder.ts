@@ -38,6 +38,7 @@ import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
 import { latestContextBoundaryHistorySequence } from "@/common/utils/messages/compactionBoundary";
+import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -1515,7 +1516,10 @@ export class TurnRequestBuilder {
       const currentBatch = new Set<string>(
         latestUserMessage === undefined
           ? []
-          : [latestUserMessage.id, ...(latestUserMessage.metadata?.requestPreludeMessageIds ?? [])]
+          : [
+              latestUserMessage.id,
+              ...getRequestPreludeMessageIds(latestUserMessage.metadata?.requestPreludeMessageIds),
+            ]
       );
       // RLM keep-recent copies are the previous epoch's turns re-appended
       // after the boundary (compactionHandler), not turns of this epoch: the
