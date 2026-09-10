@@ -75,7 +75,8 @@ export function buildLeadInText(rollover: ContextWindowRollover): string {
             "Your previous turn was interrupted by a context rollover; continue the task. Completed tool results remain in the previous window: retrieve them rather than re-executing their side effects.",
           ]
         : []),
-    ...(!rollover.flushOpportunity
+    // A model-requested reset never "filled" the window; the model chose the timing.
+    ...(!rollover.flushOpportunity && rollover.reason !== "model-requested"
       ? ["The window filled before a safe notes-flush opportunity."]
       : []),
   ].join("\n");
