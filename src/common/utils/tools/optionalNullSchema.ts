@@ -1,4 +1,6 @@
+import { OPTIONAL_PLACEHOLDER_MAX_JUDGED } from "@/common/constants/toolLimits";
 import {
+  compileJsonSchemaSubset,
   validateJsonSchemaSubset,
   validateJsonSchemaSubsetSchema,
 } from "@/common/utils/jsonSchemaSubset";
@@ -172,14 +174,22 @@ function isOmissionPlaceholder(
   return value === null && rejectsNull(propertySchema);
 }
 
-function schemaAcceptsValue(schema: unknown, value: unknown): boolean {
+/**
+ * Compile `schema` into a verdict on instances, so a loop of verdicts pays for
+ * the schema once. A schema the validator cannot judge accepts nothing.
+ */
+function compileAcceptance(schema: unknown): (value: unknown) => boolean {
   if (schema === true) {
-    return true;
+    return () => true;
   }
   if (schema === false) {
-    return false;
+    return () => false;
   }
-  return validateJsonSchemaSubset(schema, value).success;
+  return compileJsonSchemaSubset(schema) ?? (() => false);
+}
+
+function schemaAcceptsValue(schema: unknown, value: unknown): boolean {
+  return compileAcceptance(schema)(value);
 }
 
 function getUnionBranches(schema: Record<string, unknown>): unknown[] {
@@ -198,15 +208,19 @@ function getAllOfBranches(schema: Record<string, unknown>): unknown[] {
 
 /**
  * Delete the placeholders among this level's declared properties that
- * `context` does not need for this instance. Whether a property is needed
- * depends on the instance (if/then, dependencies, minProperties, a union
- * inside then), so the validator decides, one deletion at a time: a deletion
- * that would turn an instance the context accepts into one it rejects is
- * undone. `null` placeholders go first: the property schema rejects them, so
- * deleting one never loses acceptance, and by the time `""` placeholders are
- * judged, acceptance reflects the best this instance can reach. Statically
- * required properties are never placeholders; when the context is outside the
- * validator's subset nothing is accepted, so that list is the only evidence.
+ * `context` does not need for this instance. A rejected `null` is deleted
+ * outright: the property schema rejects it, so the instance is rejected while
+ * it stays. For `""`, the plain reading comes first: every placeholder is an
+ * omission, and when the context accepts that, it is the answer. Otherwise the
+ * context needs some of them, and which ones depends on the instance (if/then,
+ * dependencies, minProperties, a union inside then), so the validator judges
+ * one deletion at a time: a deletion that would turn an instance the context
+ * accepts into one it rejects is undone. Statically required properties are
+ * never placeholders; when the context is outside the validator's subset
+ * nothing is accepted, so that list is the only evidence. Cost: the context is
+ * compiled once, then at most one verdict per `""` plus two, each linear in
+ * the instance; past OPTIONAL_PLACEHOLDER_MAX_JUDGED the `""`s are kept, which
+ * never invalidates a valid instance.
  */
 function deleteOmissionPlaceholders(
   properties: Record<string, unknown>,
@@ -223,15 +237,36 @@ function deleteOmissionPlaceholders(
         isOmissionPlaceholder(propertySchema, restored[propertyName], options)
     )
     .map(([propertyName]) => propertyName);
-  const nulls = placeholders.filter((propertyName) => restored[propertyName] === null);
-  const emptyStrings = placeholders.filter((propertyName) => restored[propertyName] !== null);
-  let accepted = schemaAcceptsValue(context, restored);
-  for (const propertyName of [...nulls, ...emptyStrings]) {
-    const placeholder = restored[propertyName];
+  const emptyStrings: string[] = [];
+  for (const propertyName of placeholders) {
+    if (restored[propertyName] === null) {
+      delete restored[propertyName];
+    } else {
+      emptyStrings.push(propertyName);
+    }
+  }
+  if (emptyStrings.length === 0) {
+    return;
+  }
+  const accepts = compileAcceptance(context);
+  for (const propertyName of emptyStrings) {
     delete restored[propertyName];
-    const stillAccepted = schemaAcceptsValue(context, restored);
+  }
+  if (accepts(restored)) {
+    return;
+  }
+  for (const propertyName of emptyStrings) {
+    restored[propertyName] = "";
+  }
+  if (emptyStrings.length > OPTIONAL_PLACEHOLDER_MAX_JUDGED) {
+    return;
+  }
+  let accepted = accepts(restored);
+  for (const propertyName of emptyStrings) {
+    delete restored[propertyName];
+    const stillAccepted = accepts(restored);
     if (accepted && !stillAccepted) {
-      restored[propertyName] = placeholder;
+      restored[propertyName] = "";
     } else {
       accepted = stillAccepted;
     }

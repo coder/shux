@@ -85,6 +85,20 @@ export function validateJsonSchemaSubsetSchema(
   }
 }
 
+/**
+ * Compile a schema once so repeated verdicts cost only the instance, not the
+ * schema (its serialization for the cache key and its meta-validation). Null
+ * when the schema is outside the supported subset (see
+ * validateJsonSchemaSubsetSchema).
+ */
+export function compileJsonSchemaSubset(schema: unknown): ((value: unknown) => boolean) | null {
+  if (!validateJsonSchemaSubsetSchema(schema).success) {
+    return null;
+  }
+  const validate = compileSchema(schema);
+  return (value) => validate(value);
+}
+
 export function validateJsonSchemaSubset(
   schema: unknown,
   value: unknown

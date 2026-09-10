@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { OPTIONAL_PLACEHOLDER_MAX_JUDGED } from "@/common/constants/toolLimits";
 import {
   createOptionalNullSchemaContract,
   stripOmissionPlaceholders,
@@ -474,6 +475,23 @@ describe("optional null JSON Schema contract", () => {
     // The null can never stay, so it must not count toward minProperties when
     // deciding whether "" may go.
     expect(restoreMcp(source, { a: "", b: null })).toEqual({ a: "" });
+  });
+
+  test("keeps every optional empty string instead of judging an unbounded number one by one", () => {
+    const names = Array.from({ length: OPTIONAL_PLACEHOLDER_MAX_JUDGED + 1 }, (_, i) => `p${i}`);
+    const source = {
+      type: "object",
+      properties: Object.fromEntries(names.map((name) => [name, { type: "string" }])),
+      minProperties: 2,
+    };
+    const value = Object.fromEntries(names.map((name) => [name, ""]));
+
+    // The plain reading ({}) is rejected, and there are too many "" to judge
+    // each deletion, so the valid payload stays whole.
+    expect(restoreMcp(source, value)).toEqual(value);
+    // One fewer, and the judgement runs.
+    const { p0: _p0, ...judged } = value;
+    expect(Object.keys(restoreMcp(source, judged) as object)).toHaveLength(2);
   });
 
   test("restores payloads for a schema that declares a dialect the validator does not load", () => {
