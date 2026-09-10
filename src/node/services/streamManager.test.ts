@@ -1,4 +1,6 @@
 import { describe, test, expect, afterEach, beforeEach, mock, spyOn } from "bun:test";
+import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
+import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import * as fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
@@ -1850,6 +1852,8 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
 describe("StreamManager - stopWhen configuration", () => {
   type StopWhenCondition = (options: { steps: unknown[] }) => boolean | Promise<boolean>;
   type BuildStopWhenCondition = (request: {
+    stopCause?: StreamStopCause;
+    getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
     hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
     toolPolicy?: ToolPolicy;
     onStepSettled?: TurnExecutionOptions["onStepSettled"];
@@ -1876,6 +1880,80 @@ describe("StreamManager - stopWhen configuration", () => {
   function stepsWithToolResult(toolName: string, output: unknown): { steps: unknown[] } {
     return { steps: [{ toolResults: [{ toolName, output }] }] };
   }
+
+  test("persists the queue stop decision after the session clears the cutter", async () => {
+    const { session, cleanup } = await createAgentSessionHarness({ workspaceId: "stop-decision" });
+    const manager = new StreamManager(historyService);
+    const request: Parameters<BuildStopWhenCondition>[0] & {
+      model: LanguageModel;
+      messages: never[];
+    } = {
+      model: createTestLanguageModel(),
+      messages: [],
+      getQueuedInputStopCause: session.getQueuedInputStopCause.bind(session),
+    };
+    try {
+      const correlation = {
+        type: "workspace-turn-task" as const,
+        taskHandleId: "wst_test",
+        ownerWorkspaceId: "owner",
+        turnId: "execution",
+      };
+      session.queueMessage("continue", {
+        model: TEST_STREAM_MODEL_ID,
+        agentId: "exec",
+        muxMetadata: correlation,
+      });
+      const [, stop] = buildStopWhenForTests(manager)(request);
+      expect(await stop({ steps: [] })).toBe(true);
+      const cause = request.stopCause;
+      expect(cause?.kind).toBe("queued-input");
+      session.clearQueue();
+      session.queueMessage("replacement");
+      expect(session.getQueuedInputStopCause()?.entryId).not.toBe(
+        cause?.kind === "queued-input" ? cause.entryId : undefined
+      );
+      expect(request.stopCause).toMatchObject({ muxMetadata: correlation });
+      const messageId = "stop-decision-message";
+      await appendPartialAssistantForTests("stop-decision", messageId, 1);
+      const events: unknown[] = [];
+      onTurnEngineEvent(manager, "stream-end", (event) => events.push(event));
+      const info = createStreamInfoForTests({
+        messageId,
+        request,
+        parts: [{ type: "text", text: "Intermediate result" }],
+        streamResult: createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield { type: "finish", finishReason: "tool-calls" };
+          })()
+        ),
+      });
+      await getProcessStreamWithCleanupForTests(manager).call(manager, "stop-decision", info, 1);
+      expect(events).toHaveLength(1);
+      expect(StreamEndEventSchema.parse(events[0]).metadata.stopCause).toEqual(cause);
+      const history = await historyService.getHistoryFromLatestBoundary("stop-decision");
+      expect(history.success).toBe(true);
+      if (!history.success) throw new Error(history.error);
+      expect(MuxMessageSchema.parse(history.data.at(-1)).metadata?.stopCause).toEqual(cause);
+    } finally {
+      session.clearQueue();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("records required-tool completion instead of a queued replacement", async () => {
+    const request: Parameters<BuildStopWhenCondition>[0] = {
+      toolPolicy: [{ regex_match: "agent_report", action: "require" }],
+      getQueuedInputStopCause: () => ({ kind: "queued-input", entryId: "replacement" }),
+    };
+    const [, queueStop, requiredStop] = buildStopWhenForTests()(request);
+    const step = stepsWithToolResult("agent_report", { success: true });
+    expect(await queueStop(step)).toBe(false);
+    expect(await requiredStop(step)).toBe(true);
+    expect(request.stopCause?.kind).toBe("required-tool");
+  });
 
   test("returns step-cap and queued-message conditions with no policy", async () => {
     let queued = false;

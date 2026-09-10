@@ -27456,8 +27456,8 @@ describe("TaskService", () => {
       status: "error",
       workspaceId: "childworkspace",
       messageId: "msg_tool_calls_terminal",
-      error: "Workspace turn ended before completion (finishReason: tool-calls)",
     });
+    expect(snapshot?.error).toContain("unknown stop cause");
   });
 
   test("parent stream-end auto-resumes for active background workspace turns", async () => {

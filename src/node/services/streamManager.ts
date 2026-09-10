@@ -1,3 +1,4 @@
+import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
 import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
 import {
@@ -17,7 +18,7 @@ import { PlatformPaths } from "@/common/utils/paths";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import {
   streamText,
-  stepCountIs,
+  type stepCountIs,
   type ModelMessage,
   type SystemModelMessage,
   type LanguageModel,
@@ -282,6 +283,7 @@ interface StreamRequestOptions {
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   toolPolicy?: ToolPolicy;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
@@ -324,6 +326,7 @@ interface StepMessageTracker {
   latestMessages?: ModelMessage[];
 }
 interface StreamRequestConfig {
+  stopCause?: StreamStopCause;
   cacheEnabled?: boolean;
   budgetMetadataModel?: string;
   model: LanguageModel;
@@ -338,6 +341,7 @@ interface StreamRequestConfig {
   maxOutputTokens?: number;
   streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
   /** Optional hook for callers that need chunk-level visibility during streaming. */
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
@@ -2295,6 +2299,7 @@ export class StreamManager {
       callSettingsOverrides,
       toolPolicy,
       hasQueuedMessages,
+      getQueuedInputStopCause,
       headers,
       onChunk,
       onStepMessages,
@@ -2351,6 +2356,7 @@ export class StreamManager {
       streamCallSettings:
         Object.keys(streamCallSettings).length > 0 ? streamCallSettings : undefined,
       hasQueuedMessages,
+      getQueuedInputStopCause,
       onChunk,
       onStepMessages,
       onStepSettled,
@@ -2369,6 +2375,8 @@ export class StreamManager {
     request: Pick<
       StreamRequestConfig,
       | "hasQueuedMessages"
+      | "getQueuedInputStopCause"
+      | "stopCause"
       | "toolPolicy"
       | "onStepSettled"
       | "modelString"
@@ -2402,7 +2410,9 @@ export class StreamManager {
 
     const requiredPatterns = buildRequiredToolPatterns(request.toolPolicy);
 
-    const hasSuccessfulRequiredToolResult: ReturnType<typeof stepCountIs> = ({ steps }) => {
+    const hasSuccessfulRequiredToolResult = ({
+      steps,
+    }: Parameters<ReturnType<typeof stepCountIs>>[0]): boolean => {
       if (requiredPatterns.length === 0) {
         return false;
       }
@@ -2421,13 +2431,17 @@ export class StreamManager {
     };
 
     return [
-      stepCountIs(100000),
+      ({ steps }) => {
+        if (steps.length < 100000) return false;
+        request.stopCause ??= { kind: "step-limit" };
+        return true;
+      },
       // The SDK evaluates stop conditions only after every sibling tool result in the
       // model's current step settles. Do not move this to individual tool-call-end events:
       // that would abort the remaining calls the model emitted in the same batch.
       async ({ steps }) => {
         const step = steps.at(-1);
-        if (request.onStepSettled && step && !(await hasSuccessfulRequiredToolResult({ steps }))) {
+        if (request.onStepSettled && step && !hasSuccessfulRequiredToolResult({ steps })) {
           const outputs = step.toolResults.map((result) => result.output);
           const size = estimateToolResultSize(outputs);
           const toolResultTokens = await estimateToolResultTokensForModel(outputs, {
@@ -2447,6 +2461,9 @@ export class StreamManager {
             ),
           });
           // All siblings have settled: stop before another provider step without discarding results.
+          if (decision !== "continue") {
+            request.stopCause ??= { kind: "context-budget", decision };
+          }
           if (decision === "block")
             throw new ContextBudgetBlockedError(
               "The settled tool results exceed the context budget. Use /compact or start a new context before continuing."
@@ -2454,9 +2471,19 @@ export class StreamManager {
           // Budget stops are authoritative even when only a turn-end message is queued.
           if (decision !== "continue") return true;
         }
+        if (hasSuccessfulRequiredToolResult({ steps })) return false;
+        const queuedInput = request.getQueuedInputStopCause?.();
+        if (queuedInput != null) {
+          request.stopCause ??= queuedInput;
+          return true;
+        }
         return request.hasQueuedMessages?.("tool-end") ?? false;
       },
-      hasSuccessfulRequiredToolResult,
+      (options) => {
+        if (!hasSuccessfulRequiredToolResult(options)) return false;
+        request.stopCause ??= { kind: "required-tool" };
+        return true;
+      },
     ];
   }
 
@@ -2590,6 +2617,8 @@ export class StreamManager {
     abortController: AbortController,
     stepTracker?: StepMessageTracker
   ): Awaited<ReturnType<typeof streamText>> {
+    // Retries can reuse the request, but each stream makes its own stop decision.
+    delete request.stopCause;
     // Explicit <ToolSet> pins RUNTIME_CONTEXT to its default: mux tools use
     // Tool's `any` context, which would otherwise infect the inferred result
     // type (no-unsafe-return).
@@ -3592,6 +3621,7 @@ export class StreamManager {
       callSettingsOverrides: prepared.data.callSettingsOverrides,
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
+      getQueuedInputStopCause: streamInfo.request.getQueuedInputStopCause,
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
@@ -4425,6 +4455,12 @@ export class StreamManager {
             const contextProviderMetadata =
               streamMeta.contextProviderMetadata ?? streamInfo.lastStepProviderMetadata;
             const finishReason = streamInfo.terminalFinishReason ?? streamMeta.finishReason;
+            if (finishReason === "tool-calls" && streamInfo.request.stopCause == null) {
+              workspaceLog.warn("Tool-calls stream ended without a recorded stop cause", {
+                messageId: streamInfo.messageId,
+                muxMetadata: streamInfo.initialMetadata?.muxMetadata,
+              });
+            }
             const duration = streamMeta.duration;
             const ttftMs = this.resolveTtftMsForStreamEnd(streamInfo);
             // Aggregated provider metadata across all steps (for cost calculation with cache tokens)
@@ -4463,6 +4499,9 @@ export class StreamManager {
                 contextProviderMetadata, // Last step (for context window display)
                 ...(toolModelUsages != null ? { toolModelUsages } : {}),
                 ...(finishReason !== undefined && { finishReason }),
+                ...(streamInfo.request.stopCause != null && {
+                  stopCause: streamInfo.request.stopCause,
+                }),
                 historySequence: streamInfo.historySequence,
                 duration,
                 ...(ttftMs !== undefined && { ttftMs }),

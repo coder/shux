@@ -192,7 +192,9 @@ export function formatSubagentFailureUserMessage(params: {
     "<error_message>",
     params.errorMessage,
     "</error_message>",
-    "This sub-agent task failed terminally and will not produce a report. Do not re-await it.",
+    params.errorType.startsWith("workspace_turn_")
+      ? "This delegated workspace turn ended without a final report. Do not re-await this execution. Other workspace activity can continue."
+      : "This sub-agent task failed terminally and will not produce a report. Do not re-await it.",
     "</mux_subagent_failure>",
   ].join("\n");
 }

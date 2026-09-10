@@ -2151,7 +2151,9 @@ export class WorkspaceTurnManager {
             executionId: record.handleId,
             errorType: isSupersededWorkspaceTurnInterrupt(record)
               ? "workspace_turn_superseded"
-              : "workspace_turn_error",
+              : record.finalMessage?.metadata?.finishReason === "tool-calls"
+                ? "workspace_turn_incomplete"
+                : "workspace_turn_error",
             errorMessage: record.error ?? "Workspace turn failed",
           });
     if (!alreadyDelivered) {
@@ -4298,17 +4300,7 @@ export class WorkspaceTurnManager {
     const baseRecord = { ...record };
     delete baseRecord.error;
     delete baseRecord.deferredMessageIds;
-    // A "tool-calls" finish on a delegated turn backed by queue-dispatch
-    // evidence is a queue cut: some other queued input (a manual user message,
-    // /compact, the owner's own follow-up turn) dispatched at the tool boundary
-    // and superseded the turn (same-turn continuations were already deferred by
-    // the caller). The child keeps working under that new input, so this is a
-    // supersede — not a failure of the delegated work. Settle as interrupted
-    // with a human-readable reason instead of alarming the owner with an
-    // "error" and internal finishReason jargon. Without such evidence a
-    // "tool-calls" finish can come from other stop conditions (e.g. a
-    // successful required-tool result), so it falls through to the truncation
-    // branch.
+    // Persisted queue decisions remain authoritative after the cutter leaves the queue.
     if (event.metadata.finishReason === "tool-calls" && options.supersedeEvidence != null) {
       const evidence = options.supersedeEvidence;
       const error =
@@ -4331,13 +4323,20 @@ export class WorkspaceTurnManager {
       };
     }
     // Truncated/non-stop provider finishes are partial output, not a completed delegated turn.
-    if (event.metadata.finishReason != null && event.metadata.finishReason !== "stop") {
+    if (
+      event.metadata.finishReason != null &&
+      event.metadata.finishReason !== "stop" &&
+      event.metadata.stopCause?.kind !== "required-tool"
+    ) {
       return {
         ...baseRecord,
         status: "error",
         updatedAt: getIsoNow(),
         messageId: event.messageId,
-        error: `Workspace turn ended before completion (finishReason: ${event.metadata.finishReason})`,
+        error:
+          event.metadata.finishReason === "tool-calls"
+            ? this.describeIncompleteToolStop(event)
+            : `Workspace turn ended before completion (finishReason: ${event.metadata.finishReason})`,
         finalMessageRef: this.buildWorkspaceTurnFinalMessageRef(event),
         finalMessage: {
           messageId: event.messageId,
@@ -4357,6 +4356,25 @@ export class WorkspaceTurnManager {
         metadata: event.metadata,
       },
     };
+  }
+
+  private describeIncompleteToolStop(event: StreamEndEvent): string {
+    const cause = event.metadata.stopCause;
+    if (cause == null) {
+      log.warn("Workspace turn tool-calls stop has unknown cause", {
+        workspaceId: event.workspaceId,
+        messageId: event.messageId,
+        muxMetadata: event.metadata.muxMetadata,
+      });
+      return "Workspace turn incomplete: unknown stop cause; no correlated continuation found.";
+    }
+    if (cause.kind === "queued-input") {
+      return `Workspace turn continuation unavailable after queue stop (entryId: ${cause.entryId}).`;
+    }
+    if (cause.kind === "context-budget") {
+      return `Workspace turn incomplete: context budget ${cause.decision}; no continuation remains.`;
+    }
+    return "Workspace turn incomplete: step limit reached.";
   }
 
   private isDeferredWorkspaceTurnMessage(
@@ -4389,14 +4407,19 @@ export class WorkspaceTurnManager {
       }
       const event = this.buildWorkspaceTurnStreamEndEventFromHistory(record, message);
       if (event != null) {
-        // History order alone cannot prove a queue cut (a later unrelated user
-        // message is not causal evidence), so stale recovery conservatively
-        // settles tool-calls finals as errors. Genuine supersedes are
-        // classified live at stream-end; a crash-window misclassification here
-        // stays self-heal eligible for later correlated evidence.
-        return this.buildTerminalWorkspaceTurnRecordFromEvent(record, event, {
-          supersedeEvidence: null,
+        const supersedeEvidence = this.getQueueCutSupersedeEvidence(event, record, {
+          activeStream: undefined,
+          cutter: undefined,
+          hasPendingQueuedOrPreparingTurn: false,
         });
+        const correlation = this.getWorkspaceTurnMetadata(event);
+        if (
+          supersedeEvidence == null &&
+          correlation != null &&
+          this.hasSameTurnContinuation(event, correlation)
+        )
+          return null;
+        return this.buildTerminalWorkspaceTurnRecordFromEvent(record, event, { supersedeEvidence });
       }
     }
     return null;
@@ -4584,6 +4607,18 @@ export class WorkspaceTurnManager {
     });
   }
 
+  private matchesWorkspaceTurnRecord(
+    record: WorkspaceTurnTaskHandleRecord,
+    value: unknown
+  ): boolean {
+    const correlation = this.getWorkspaceTurnMetadataFromValue(value);
+    return (
+      correlation?.taskHandleId === record.handleId &&
+      correlation.ownerWorkspaceId === record.ownerWorkspaceId &&
+      correlation.turnId === record.turnId
+    );
+  }
+
   /**
    * Whether a continuation of this exact delegated turn is pending or streaming.
    * Pending entries must carry the same correlation metadata as the ended stream.
@@ -4600,7 +4635,7 @@ export class WorkspaceTurnManager {
     ) {
       return true;
     }
-    const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
+    const activeStream = this.streamManager?.getStreamInfo(event.workspaceId, true);
     if (activeStream == null || activeStream.messageId === event.messageId) {
       return false;
     }
@@ -4655,6 +4690,12 @@ export class WorkspaceTurnManager {
         ? { kind: "same_owner_follow_up", successorHandleId }
         : { kind: "other_input" };
     };
+    const cause = event.metadata.stopCause;
+    if (cause != null) {
+      if (cause.kind !== "queued-input") return null;
+      if (this.matchesWorkspaceTurnRecord(record, cause.muxMetadata)) return null;
+      return classifyMetadata(cause.muxMetadata);
+    }
     // Already streaming at the cut: the uncorrelated active stream is the
     // engaged cutter.
     const { activeStream, cutter } = snapshot;
@@ -4762,6 +4803,7 @@ export class WorkspaceTurnManager {
       return true;
     }
 
+    // Check runtime state before history. A finishing successor commits history before it disappears.
     // Parent guidance and report wake-ups continue the exact delegated turn. This includes
     // turn-end guidance: don't publish an early report before the queued guidance runs.
     // Uncorrelated bash-monitor wakes inherit only an open tool-boundary continuation;
@@ -4770,12 +4812,45 @@ export class WorkspaceTurnManager {
       (event.metadata.finishReason === "tool-calls" ||
         event.metadata.finishReason === "stop" ||
         event.metadata.finishReason == null) &&
+      (event.metadata.stopCause == null ||
+        this.getQueueCutSupersedeEvidence(event, record, queueCutSnapshot) == null) &&
       (this.hasSameTurnContinuation(event, metadata) ||
         (event.metadata.finishReason === "tool-calls" &&
           this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)))
     ) {
       await this.markWorkspaceTurnStreamEndDeferred(event);
       return true;
+    }
+
+    if (
+      event.metadata.finishReason === "tool-calls" &&
+      (event.metadata.stopCause == null ||
+        this.getQueueCutSupersedeEvidence(event, record, queueCutSnapshot) == null)
+    ) {
+      const history = await this.historyService.getHistoryFromLatestBoundary(event.workspaceId);
+      if (history.success) {
+        const index = history.data.findIndex((message) => message.id === event.messageId);
+        if (index >= 0) {
+          const successor = history.data
+            .slice(index + 1)
+            .findLast(
+              (message) =>
+                message.role === "assistant" &&
+                this.matchesWorkspaceTurnRecord(record, message.metadata?.muxMetadata)
+            );
+          if (successor != null) {
+            const successorEvent = this.buildWorkspaceTurnStreamEndEventFromHistory(
+              record,
+              successor
+            );
+            if (successorEvent != null) {
+              return this.finalizeWorkspaceTurnFromStreamEnd(successorEvent, queueCutSnapshot);
+            }
+            await this.markWorkspaceTurnStreamEndDeferred(event);
+            return true;
+          }
+        }
+      }
     }
 
     const supersedeEvidence = this.getQueueCutSupersedeEvidence(event, record, queueCutSnapshot);
@@ -4821,7 +4896,11 @@ export class WorkspaceTurnManager {
       // delegated turn's real outcome. A handle that settled interrupted/error from a
       // transient failure (provider error, restart) may have self-healed via auto-retry
       // of the same turn; let this settlement correct that stale record.
-      allowTerminalResettle: true,
+      // An intermediate stop cannot replace a concrete continuation failure.
+      allowTerminalResettle:
+        event.metadata.finishReason !== "tool-calls" ||
+        next.status === "completed" ||
+        supersedeEvidence != null,
       disposableOwnershipTransferred,
     });
     return true;

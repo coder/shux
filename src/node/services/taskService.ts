@@ -1829,12 +1829,8 @@ export class TaskService implements AgentTaskIntegration {
     this.aiService.on("stream-end", (payload: unknown) => {
       if (!isStreamEndEvent(payload)) return;
 
-      // Captured synchronously at event time, BEFORE the workspace event lock:
-      // another operation holding the lock would otherwise let the session
-      // drain the real (manual/cross-owner) cutter and engage a later
-      // same-owner follow-up during the wait, misattributing the cut and
-      // wrongly suppressing the real cutter's wake (see
-      // QueueCutAttributionSnapshot).
+      // New streams persist attribution at the stop decision. Keep this snapshot for legacy events
+      // and disposable ownership transfer, before the event lock lets another input enter the queue.
       const queueCutSnapshot = this.getWorkspaceTurnManager().captureQueueCutAttributionSnapshot(
         payload.workspaceId
       );

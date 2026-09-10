@@ -4650,6 +4650,218 @@ describe("WorkspaceTurnManager", () => {
     expect(followUp.data.maySupersedeTaskId).toBeUndefined();
   });
 
+  function intermediateStopEvent(parentId: string): StreamEndEvent {
+    const muxMetadata = workspaceTurnMuxMetadata(parentId);
+    return {
+      type: "stream-end",
+      workspaceId: "childworkspace",
+      messageId: "intermediate-stop",
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        finishReason: "tool-calls",
+        muxMetadata,
+        stopCause: { kind: "queued-input", entryId: "continuation-entry", muxMetadata },
+      },
+      parts: [{ type: "text", text: "Work in progress" }],
+    };
+  }
+
+  async function persistStopEvent(history: HistoryService, event: StreamEndEvent): Promise<void> {
+    const result = await history.appendToHistory(event.workspaceId, {
+      id: event.messageId,
+      role: "assistant",
+      metadata: event.metadata,
+      parts: event.parts,
+    });
+    expect(result.success).toBe(true);
+  }
+
+  test("queue stop attribution survives queue removal before finalization and recovery", async () => {
+    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+    const event = intermediateStopEvent(parentId);
+    event.metadata.stopCause = { kind: "queued-input", entryId: "manual-entry" };
+    await persistStopEvent(historyService, event);
+    const store = new TaskHandleStore(config);
+    const record = await store.getWorkspaceTurn(parentId, "wst_handle");
+    assert(record);
+    const internal = taskService as unknown as {
+      recoverTerminalWorkspaceTurnFromHistory(
+        record: WorkspaceTurnTaskHandleRecord
+      ): Promise<WorkspaceTurnTaskHandleRecord | null>;
+    };
+    const recovered = await internal.recoverTerminalWorkspaceTurnFromHistory(record);
+    expect(recovered?.status).toBe("interrupted");
+    await finalizeWorkspaceTurnStreamEndForTest(taskService, event);
+    expect(await store.getWorkspaceTurn(parentId, "wst_handle")).toMatchObject({
+      status: "interrupted",
+      error: recovered?.error,
+    });
+  });
+
+  test.each([false, true])(
+    "continuation starts and finishes during finalization await (legacy=%s)",
+    async (legacy) => {
+      const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+      const event = intermediateStopEvent(parentId);
+      if (legacy) delete event.metadata.stopCause;
+      await persistStopEvent(historyService, event);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const readHistory = historyService.getHistoryFromLatestBoundary.bind(historyService);
+      spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(
+        async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return readHistory(...args);
+        }
+      );
+      const finalizing = finalizeWorkspaceTurnStreamEndForTest(taskService, event);
+      await entered.promise;
+      const successor: StreamEndEvent = {
+        ...event,
+        messageId: "finished-continuation",
+        metadata: { ...event.metadata, finishReason: "stop", stopCause: undefined },
+        parts: [{ type: "text", text: "Completed result" }],
+      };
+      await persistStopEvent(historyService, successor);
+      release.resolve();
+      await finalizing;
+      expect(
+        await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+      ).toMatchObject({
+        status: "completed",
+        messageId: successor.messageId,
+        reportMarkdown: "Completed result",
+      });
+      const store = new TaskHandleStore(config);
+      const completed = await store.getWorkspaceTurn(parentId, "wst_handle");
+      await finalizeWorkspaceTurnStreamEndForTest(taskService, successor);
+      expect(await store.getWorkspaceTurn(parentId, "wst_handle")).toEqual(completed);
+    }
+  );
+
+  test.each([false, true])(
+    "recovery preserves pending same-execution continuation (legacy=%s)",
+    async (legacy) => {
+      const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest({
+        hasPendingWorkspaceTurnContinuation: mock(() => true),
+      });
+      const event = intermediateStopEvent(parentId);
+      if (legacy) delete event.metadata.stopCause;
+      await persistStopEvent(historyService, event);
+      const store = new TaskHandleStore(config);
+      const record = await store.getWorkspaceTurn(parentId, "wst_handle");
+      assert(record);
+      const internal = taskService as unknown as {
+        recoverTerminalWorkspaceTurnFromHistory(
+          record: WorkspaceTurnTaskHandleRecord
+        ): Promise<WorkspaceTurnTaskHandleRecord | null>;
+      };
+      expect(await internal.recoverTerminalWorkspaceTurnFromHistory(record)).toBeNull();
+      await finalizeWorkspaceTurnStreamEndForTest(taskService, event);
+      expect(await store.getWorkspaceTurn(parentId, "wst_handle")).toMatchObject({
+        status: "running",
+        deferredMessageIds: [event.messageId],
+      });
+    }
+  );
+
+  test.each(["interrupted", "error"] as const)(
+    "continuation %s survives a late intermediate finalization",
+    async (status) => {
+      const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+      const event = intermediateStopEvent(parentId);
+      await persistStopEvent(historyService, event);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const readHistory = historyService.getHistoryFromLatestBoundary.bind(historyService);
+      spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(
+        async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return readHistory(...args);
+        }
+      );
+      const finalizing = finalizeWorkspaceTurnStreamEndForTest(taskService, event);
+      await entered.promise;
+      const error =
+        status === "interrupted"
+          ? "Continuation canceled by user"
+          : "Continuation dispatch failed: runtime unavailable";
+      await taskService.settleWorkspaceTurnContinuationFailure(
+        event.workspaceId,
+        workspaceTurnMuxMetadata(parentId),
+        status,
+        error
+      );
+      release.resolve();
+      await finalizing;
+      expect(
+        await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+      ).toMatchObject({ status, error });
+    }
+  );
+
+  test("finalizing continuation remains active until its history commit", async () => {
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest();
+    const event = intermediateStopEvent(parentId);
+    const getStreamInfo = mock((_workspaceId: string, includeFinalizing?: boolean) =>
+      includeFinalizing
+        ? { messageId: "continuation-finalizing", muxMetadata: event.metadata.muxMetadata }
+        : undefined
+    );
+    expect(Reflect.set(taskService, "streamManager", { getStreamInfo })).toBe(true);
+    await finalizeWorkspaceTurnStreamEndForTest(taskService, event);
+    expect(getStreamInfo).toHaveBeenCalledWith(event.workspaceId, true);
+    expect(
+      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+    ).toMatchObject({
+      status: "running",
+      deferredMessageIds: [event.messageId],
+    });
+  });
+
+  test.each([
+    { cause: { kind: "required-tool" } as const, status: "completed" },
+    { cause: { kind: "context-budget", decision: "rollover" } as const, status: "error" },
+    { cause: { kind: "step-limit" } as const, status: "error" },
+  ])(
+    "explicit $cause.kind stop does not borrow unrelated queue attribution",
+    async ({ cause, status }) => {
+      const { config, parentId, taskService } = await startWorkspaceTurnForTest({
+        getQueueCutCutter: mock(() => ({ stage: "queued", dispatchMode: "tool-end" })),
+      });
+      const event = intermediateStopEvent(parentId);
+      event.metadata.stopCause = cause;
+      await finalizeWorkspaceTurnStreamEndForTest(taskService, event);
+      expect(
+        (await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle"))?.status
+      ).toBe(status);
+    }
+  );
+
+  test("legacy tool stop without continuation records an unknown cause", async () => {
+    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+    const event = intermediateStopEvent(parentId);
+    delete event.metadata.stopCause;
+    await persistStopEvent(historyService, event);
+    await finalizeWorkspaceTurnStreamEndForTest(taskService, event);
+    const record = await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle");
+    expect(record?.status).toBe("error");
+    expect(record?.error).toContain("unknown stop cause");
+  });
+
+  test("lost continuation settles instead of remaining active after recovery", async () => {
+    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+    const event = intermediateStopEvent(parentId);
+    await persistStopEvent(historyService, event);
+    await finalizeWorkspaceTurnStreamEndForTest(taskService, event);
+    const record = await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle");
+    expect(record?.status).toBe("error");
+    expect(record?.error).toContain("continuation unavailable");
+    expect(record?.error).toContain("continuation-entry");
+  });
+
   test("workspace-turn deferred stream-end does not finalize the handle", async () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest();
     const event: StreamEndEvent = {

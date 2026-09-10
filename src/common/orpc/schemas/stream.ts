@@ -1,3 +1,4 @@
+import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { z } from "zod";
 import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
@@ -273,6 +274,7 @@ export const StreamEndEventSchema = z.object({
       // Last step's provider metadata (for context window cache display)
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
       finishReason: z.string().optional(),
+      stopCause: StreamStopCauseSchema.optional(),
       duration: z.number().optional(),
       ttftMs: z.number().optional(),
       systemMessageTokens: z.number().optional(),
