@@ -1671,13 +1671,17 @@ export class CompactionHandler {
 
     // The epoch whose workspace-memory write policy governs this row: a copy
     // of a copy keeps its ORIGINAL epoch (the chain must stay visible to the
-    // policy conjunction); a first-time copy was produced under the epoch
-    // this compaction closes. Copies from before the field existed carry
-    // nothing forward — no policy record ever existed for their epochs.
+    // policy conjunction); an assistant row keeps the epoch its policy was
+    // recorded under (a turn that started before a destructive reset and
+    // landed after the new boundary belongs to the OLD epoch, whose policy
+    // the new one cannot vouch for); any other first-time copy was produced
+    // under the epoch this compaction closes. Copies from before the field
+    // existed carry nothing forward — no policy record ever existed for
+    // their epochs.
     const sourcePolicyEpoch =
       source?.rlmPreservedTailCopy === true
         ? source.rlmPreservedTailSourcePolicyEpoch
-        : closingPolicyEpoch;
+        : (source?.workspaceMemoryPolicyEpoch ?? closingPolicyEpoch);
     return {
       ...row,
       id: copyId,

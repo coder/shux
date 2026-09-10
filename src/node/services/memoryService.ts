@@ -1448,11 +1448,12 @@ export class MemoryService extends EventEmitter {
         // changes its usage counters, which must not drag the owner's pin
         // back to the child's unchanged value.
         if (childEntry !== undefined) {
-          // A pending record's fold never ran: still a first adoption.
-          const priorPinned =
-            previous === undefined || previous.pending === true
-              ? null
-              : legacySidecarPinned(previous.sidecar);
+          // A pending record still carries the sidecar state it was recorded
+          // with: a fresh adoption's is the child's current state (no
+          // transition → first-adoption semantics), a pending replacement's
+          // is the prior record's — the child's toggle since must not be
+          // lost to the interrupted pass.
+          const priorPinned = previous === undefined ? null : legacySidecarPinned(previous.sidecar);
           // Only an actual boolean transition of the child's pin overrides
           // the owner's; an unknown prior state never does.
           const childPinChanged = priorPinned !== null && priorPinned !== childEntry.pinned;
@@ -1566,7 +1567,10 @@ export class MemoryService extends EventEmitter {
               rel !== relPath && listed.has(rel) && record.target === previous.target
           );
           if (successor !== undefined) {
-            if (successor[1].created !== true) {
+            // Only a copy still holding the adopted bytes is ours to hand
+            // over; one the owner edited since is the owner's, and the
+            // successor keeps its own (non-created) provenance.
+            if (unchanged && successor[1].created !== true) {
               successor[1].created = true;
               manifestDirty = true;
             }

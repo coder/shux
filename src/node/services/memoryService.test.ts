@@ -1756,6 +1756,49 @@ describe("MemoryService", () => {
       expect(await pathExists(importedCopy)).toBe(false);
     });
 
+    it("keeps an owner-edited conflict copy the owner's when a renamed legacy note lands on it", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(ownerRoot, "a.md"), "owner's a");
+      await fsPromises.writeFile(path.join(legacyRoot, "a.md"), "child's a");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      // The owner edits the conflict copy: it is the owner's now.
+      await fixture.service.strReplace(
+        ownerCtx,
+        "/memories/workspace/imported/ws-child/a.md",
+        "child's a",
+        "owner's edit",
+        "agent"
+      );
+      // The downgraded build renames the source onto that path with the
+      // owner's bytes: the new record reuses the file, but no provenance
+      // transfers — the old copy no longer holds the adopted bytes.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.mkdir(path.join(legacyRoot, "imported", "ws-child"), { recursive: true });
+      await fsPromises.rm(path.join(legacyRoot, "a.md"));
+      await fsPromises.writeFile(
+        path.join(legacyRoot, "imported", "ws-child", "a.md"),
+        "owner's edit"
+      );
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const manifest = JSON.parse(
+        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+      ) as Record<string, { created?: boolean }>;
+      expect(manifest["imported/ws-child/a.md"].created).not.toBe(true);
+      // Deleting the renamed source leaves the owner's note in place.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(legacyRoot, "imported", "ws-child", "a.md"));
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(
+        await fsPromises.readFile(path.join(ownerRoot, "imported", "ws-child", "a.md"), "utf-8")
+      ).toBe("owner's edit");
+    });
+
     it("removal lists an oversized legacy notebook completely, counting every unplaceable note", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -2248,6 +2291,39 @@ describe("MemoryService", () => {
       expect(Object.keys(manifest)).toEqual(["note.md"]);
       expect(manifest["note.md"]).toMatchObject({ target: "note.md", created: true });
       expect(manifest["note.md"].pending).toBeUndefined();
+      // A pin the child toggled together with an edit survives an interrupted
+      // replacement: the pending record keeps the PRIOR sidecar state, so the
+      // retry still sees the transition and applies it over the owner's pin.
+      const childKey = memoryLogicalKey("workspace", "note.md", {
+        projectPath: "",
+        workspaceId: "ws-child",
+      });
+      const ownerKey = memoryLogicalKey("workspace", "note.md", {
+        projectPath: "",
+        workspaceId: "ws-owner",
+      });
+      await fixture.metaService.setPinned(ownerKey, false);
+      const settled = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { content: string; sidecar: string; target: string; created?: boolean }
+        >
+      )["note.md"];
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v3");
+      await fixture.metaService.setPinned(childKey, true);
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({ "note.md": { ...settled, pending: true } })
+      );
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).listIndexEntries({
+        ...fixture.ctx,
+      });
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v3");
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
     });
 
     it("keeps adopting a legacy note named __proto__ exactly once", async () => {

@@ -1,4 +1,5 @@
 import * as fsPromises from "node:fs/promises";
+import writeFileAtomic from "write-file-atomic";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import { WORKSPACE_MEMORY_REVISION_FILE_NAME } from "@/common/constants/memory";
@@ -75,6 +76,8 @@ async function readWorkspaceMemoryRevisionStrict(ownerSessionDir: string): Promi
 export async function advanceWorkspaceMemoryRevision(ownerSessionDir: string): Promise<number> {
   const previous = (await readWorkspaceMemoryRevisionStrict(ownerSessionDir)) ?? 0;
   const next = Math.max(Date.now(), previous + 1);
-  await fsPromises.writeFile(workspaceMemoryRevisionPath(ownerSessionDir), String(next));
+  // Atomic: a crash mid-write must not leave a truncated value the strict
+  // reader would reject forever (every later row order-unknown).
+  await writeFileAtomic(workspaceMemoryRevisionPath(ownerSessionDir), String(next));
   return next;
 }

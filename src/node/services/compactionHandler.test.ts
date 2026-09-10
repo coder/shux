@@ -1895,9 +1895,17 @@ describe("CompactionHandler", () => {
       // boundary's epoch — the chain stays visible to the policy conjunction.
       const boundarySequence = epoch[0].metadata?.historySequence;
       if (typeof boundarySequence !== "number") throw new Error("boundary lacks a sequence");
+      // An assistant row that recorded its policy under an OLDER epoch (a
+      // turn that straddled a boundary) keeps that epoch on its copy.
       await seedHistory(
         createMuxMessage("u2", "user", "second question"),
-        createMuxMessage("a2", "assistant", "second answer"),
+        createMuxMessage("a2", "assistant", "second answer", {
+          workspaceMemoryPolicyEpoch: -1,
+        }),
+        createMuxMessage("u3", "user", "third question"),
+        createMuxMessage("a3", "assistant", "third answer", {
+          workspaceMemoryPolicyEpoch: boundarySequence,
+        }),
         createStampedCompactionRequest("compact-req-2", boundarySequence + 1)
       );
       expect(await handler.handleCompletion(createStreamEndEvent("Summary 2"))).toBe(true);
@@ -1905,7 +1913,7 @@ describe("CompactionHandler", () => {
       if (!secondEpoch.success) throw new Error(secondEpoch.error);
       expect(
         secondEpoch.data.slice(1).map((copy) => copy.metadata?.rlmPreservedTailSourcePolicyEpoch)
-      ).toEqual([-1, -1, boundarySequence, boundarySequence]);
+      ).toEqual([-1, -1, boundarySequence, -1, boundarySequence, boundarySequence]);
     });
 
     it("rewrites MCP snapshot invoking IDs to the copy IDs of LATER tail rows", async () => {
