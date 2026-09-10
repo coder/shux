@@ -364,6 +364,22 @@ describe("optional null JSON Schema contract", () => {
     });
   });
 
+  test("keeps the raw shape when stripping would only switch to a sibling branch", () => {
+    const source = {
+      type: "object",
+      required: ["kind"],
+      properties: { kind: { const: "a" }, message: { type: "string" } },
+      oneOf: [
+        { required: ["message"] },
+        { properties: { kind: { const: "a" } }, additionalProperties: false },
+      ],
+    };
+
+    // The raw value satisfies the first branch, which requires `message`; the
+    // stripped value would satisfy the second. The raw match wins.
+    expect(restoreMcp(source, { kind: "a", message: "" })).toEqual({ kind: "a", message: "" });
+  });
+
   test.each(["allOf", "anyOf"] as const)(
     "preserves a parent-required property declared inside %s",
     (keyword) => {

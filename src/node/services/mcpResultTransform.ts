@@ -54,14 +54,34 @@ export function isMCPErrorResult(value: unknown): value is MCPCallToolResult & {
   );
 }
 
+type MCPBinaryContent = MCPImageContent | MCPAudioContent | MCPResourceContent;
+
+function isBinaryPart(item: MCPContent): item is MCPBinaryContent {
+  return (
+    item.type === "image" ||
+    item.type === "audio" ||
+    (item.type === "resource" && typeof item.resource?.blob === "string")
+  );
+}
+
 /**
- * Turn an `isError` result into the message of the thrown tool error. Text and
- * text-resource parts are the message; binary parts are described, not inlined.
+ * Turn an `isError` result into the message of the thrown tool error. An error
+ * result has the wire shape of a successful one, so its text takes the same
+ * route as a success (shared text budget, structuredContent guard, total
+ * backstop) before it is projected to a string. Binary parts cannot ride in an
+ * error message, so they are set aside and described instead. Priority: the
+ * server's own words; else binary descriptions plus the structured or legacy
+ * details; else the whole bounded result.
  */
 export function describeMCPErrorResult(result: MCPCallToolResult): string {
   const content = result.content ?? [];
-  // A blank text part explains nothing, so it must not shadow structured details.
-  const readableParts = content
+  // Text-only input keeps the MCP wire shape through transformMCPResult.
+  const bounded = transformMCPResult({
+    ...result,
+    content: content.filter((item) => !isBinaryPart(item)),
+  }) as MCPCallToolResult;
+
+  const words = (bounded.content ?? [])
     .flatMap((item) => {
       if (item.type === "text") {
         return item.text;
@@ -71,34 +91,17 @@ export function describeMCPErrorResult(result: MCPCallToolResult): string {
       }
       return [];
     })
-    .filter((part) => part.trim().length > 0);
-  const binaryParts = content.flatMap((item) => {
-    if (item.type === "image") {
-      return describeBinaryErrorPart("Image", item.data, item.mimeType);
-    }
-    if (item.type === "audio") {
-      return describeBinaryErrorPart("Audio", item.data, item.mimeType);
-    }
-    return [];
-  });
-  // Servers may explain the failure only in structuredContent (spec) or the
-  // legacy toolResult and leave `content` empty; an empty array tells the
-  // model nothing, so fall through to the whole result instead.
-  const description =
-    readableParts.length > 0
-      ? readableParts.join("\n")
-      : binaryParts.length > 0
-        ? binaryParts.join("\n")
-        : stringifyMCPErrorValue(
-            result.structuredContent ?? result.toolResult ?? (content.length > 0 ? content : result)
-          );
-  // The error message enters history like any tool result text, so it gets the
-  // same byte cap as a successful result.
-  return truncateUtf8Bytes(
-    description,
-    MCP_TOOL_RESULT_MAX_TEXT_BYTES,
-    "\n[MCP error details truncated]"
-  );
+    .filter((text) => text.trim().length > 0);
+  if (words.length > 0) {
+    return words.join("\n");
+  }
+
+  const details = content.filter(isBinaryPart).map(describeBinaryErrorPart);
+  const structured = bounded.structuredContent ?? bounded.toolResult;
+  if (structured !== undefined) {
+    details.push(stringifyMCPErrorValue(structured));
+  }
+  return details.length > 0 ? details.join("\n") : stringifyMCPErrorValue(bounded);
 }
 
 function stringifyMCPErrorValue(value: unknown): string {
@@ -109,12 +112,18 @@ function stringifyMCPErrorValue(value: unknown): string {
   }
 }
 
-function describeBinaryErrorPart(kind: string, data: string, mediaType: string): string {
-  const dataLength = data.length;
-  if (dataLength > MAX_IMAGE_DATA_BYTES) {
-    return `[${kind} omitted: ${formatBytesSI(dataLength)} exceeds per-${kind.toLowerCase()} guard of ${formatBytesSI(MAX_IMAGE_DATA_BYTES)}.]`;
-  }
-  return `[${kind} omitted from MCP error text: ${formatBytesSI(dataLength)}, ${mediaType}.]`;
+function describeBinaryErrorPart(item: MCPBinaryContent): string {
+  const [kind, data, mediaType] =
+    item.type === "image"
+      ? ["Image", item.data, item.mimeType]
+      : item.type === "audio"
+        ? ["Audio", item.data, item.mimeType]
+        : [
+            "Resource",
+            item.resource.blob ?? "",
+            item.resource.mimeType ?? "application/octet-stream",
+          ];
+  return `[${kind} omitted from MCP error text: ${formatBytesSI(data.length)}, ${mediaType}.]`;
 }
 
 /**
@@ -331,13 +340,7 @@ export function transformMCPResult(result: unknown): unknown {
   // Only rewrite results carrying binary payloads. Text-only results pass
   // through in MCP shape for the tool's toModelOutput conversion, with
   // oversized text capped in place.
-  const hasBinaryContent = typed.content.some(
-    (c) =>
-      c.type === "image" ||
-      c.type === "audio" ||
-      (c.type === "resource" && typeof c.resource?.blob === "string")
-  );
-  if (!hasBinaryContent) {
+  if (!typed.content.some(isBinaryPart)) {
     return capTextOnlyResult(typed);
   }
 

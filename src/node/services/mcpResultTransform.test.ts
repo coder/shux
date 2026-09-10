@@ -22,9 +22,20 @@ describe("describeMCPErrorResult", () => {
       ],
     });
 
-    expect(description).toContain("Image omitted");
-    expect(description).toContain("per-image guard");
+    expect(description).toContain("Image omitted from MCP error text");
+    expect(description).toContain("image/png");
     expect(description.length).toBeLessThan(200);
+  });
+
+  it("does not let binary-only content hide structured error details", () => {
+    const description = describeMCPErrorResult({
+      isError: true,
+      content: [{ type: "image", data: "abc", mimeType: "image/png" }],
+      structuredContent: { code: "RATE_LIMITED" },
+    });
+
+    expect(description).toContain("Image omitted from MCP error text");
+    expect(description).toContain(JSON.stringify({ code: "RATE_LIMITED" }));
   });
 
   it("caps oversized error text with the same byte budget as successful results", () => {
@@ -34,9 +45,26 @@ describe("describeMCPErrorResult", () => {
     });
 
     expect(Buffer.byteLength(description, "utf8")).toBeLessThanOrEqual(
-      MCP_TOOL_RESULT_MAX_TEXT_BYTES + "\n[MCP error details truncated]".length
+      MCP_TOOL_RESULT_MAX_TOTAL_BYTES
     );
-    expect(description).toEndWith("[MCP error details truncated]");
+    expect(description).toContain("[MCP tool result text truncated:");
+  });
+
+  it("bounds many error text parts with one shared budget", () => {
+    const partCount = 64;
+    const description = describeMCPErrorResult({
+      isError: true,
+      content: Array.from({ length: partCount }, (_, i) => ({
+        type: "text" as const,
+        text: `${i}:${"e".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES)}`,
+      })),
+    });
+
+    expect(Buffer.byteLength(description, "utf8")).toBeLessThanOrEqual(
+      MCP_TOOL_RESULT_MAX_TOTAL_BYTES
+    );
+    expect(description).toStartWith("0:");
+    expect(description).toContain(`[${partCount - 1} content part(s) omitted:`);
   });
 
   it("surfaces structured-only error details instead of an empty content array", () => {

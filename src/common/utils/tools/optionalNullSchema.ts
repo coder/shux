@@ -172,29 +172,6 @@ function isOmissionPlaceholder(
   return value === null && rejectsNull(propertySchema);
 }
 
-function stripProperties(
-  value: Record<string, unknown>,
-  properties: Record<string, unknown>,
-  required: ReadonlySet<string>,
-  options: OmissionPlaceholderOptions
-): Record<string, unknown> {
-  const stripped = { ...value };
-  for (const [propertyName, propertySchema] of Object.entries(properties)) {
-    if (!(propertyName in stripped)) {
-      continue;
-    }
-    if (
-      !required.has(propertyName) &&
-      isOmissionPlaceholder(propertySchema, stripped[propertyName], options)
-    ) {
-      delete stripped[propertyName];
-      continue;
-    }
-    stripped[propertyName] = stripNode(propertySchema, stripped[propertyName], new Set(), options);
-  }
-  return stripped;
-}
-
 function schemaAcceptsValue(schema: unknown, value: unknown): boolean {
   if (schema === true) {
     return true;
@@ -203,92 +180,6 @@ function schemaAcceptsValue(schema: unknown, value: unknown): boolean {
     return false;
   }
   return validateJsonSchemaSubset(schema, value).success;
-}
-
-function stripMatchingUnionBranch(
-  schema: Record<string, unknown>,
-  value: unknown,
-  inheritedRequired: ReadonlySet<string>,
-  options: OmissionPlaceholderOptions
-): unknown {
-  for (const keyword of ["anyOf", "oneOf"] as const) {
-    const branches = schema[keyword];
-    if (!Array.isArray(branches)) {
-      continue;
-    }
-    // A branch that accepts the raw value gives that value meaning (for example
-    // a nullable property another branch declares non-nullable), so prefer it
-    // over a branch that only accepts the stripped value. The branch's own
-    // optional descendants still hold placeholders, so restore those too and
-    // keep the raw value only if restoring breaks the match.
-    for (const branch of branches) {
-      if (schemaAcceptsValue(branch, value)) {
-        const restored = stripNode(branch, value, inheritedRequired, options);
-        return schemaAcceptsValue(branch, restored) ? restored : value;
-      }
-    }
-    for (const branch of branches) {
-      const stripped = stripNode(branch, value, inheritedRequired, options);
-      if (schemaAcceptsValue(branch, stripped)) {
-        return stripped;
-      }
-    }
-  }
-  return null;
-}
-
-function stripNode(
-  schema: unknown,
-  value: unknown,
-  inheritedRequired: ReadonlySet<string>,
-  options: OmissionPlaceholderOptions
-): unknown {
-  if (!isRecord(schema)) {
-    return value;
-  }
-
-  const required = new Set([...inheritedRequired, ...getRequiredProperties(schema)]);
-  if (Array.isArray(value)) {
-    const itemSchema = schema.items;
-    let stripped = Array.isArray(itemSchema)
-      ? value.map((item, index) => stripNode(itemSchema[index], item, new Set(), options))
-      : value.map((item) => stripNode(itemSchema, item, new Set(), options));
-    // Widening visits `items` declared inside allOf branches, so restore must too.
-    for (const subSchema of getAllOfBranches(schema)) {
-      stripped = stripNode(subSchema, stripped, required, options) as unknown[];
-    }
-    return stripMatchingUnionBranch(schema, stripped, required, options) ?? stripped;
-  }
-  if (!isRecord(value)) {
-    return value;
-  }
-
-  const stripped = stripObjectNode(schema, value, required, options);
-  const matched = stripMatchingUnionBranch(schema, stripped, required, options);
-  if (matched !== null) {
-    return matched;
-  }
-  // No branch accepts the stripped value. A sibling anyOf/oneOf branch can
-  // require a property the root declares optional (a discriminated "error"
-  // branch requiring `message`), so its `""` was never an omission placeholder.
-  // Retry with each branch's required properties treated as required and keep
-  // the first result that branch accepts.
-  for (const branch of getUnionBranches(schema)) {
-    if (!isRecord(branch)) {
-      continue;
-    }
-    const branchRequired = new Set([...required, ...getRequiredProperties(branch)]);
-    const candidate = stripNode(
-      branch,
-      stripObjectNode(schema, value, branchRequired, options),
-      branchRequired,
-      options
-    );
-    if (schemaAcceptsValue(branch, candidate)) {
-      return candidate;
-    }
-  }
-  return stripped;
 }
 
 function getUnionBranches(schema: Record<string, unknown>): unknown[] {
@@ -301,24 +192,100 @@ function getUnionBranches(schema: Record<string, unknown>): unknown[] {
   return branches;
 }
 
-function stripObjectNode(
-  schema: Record<string, unknown>,
-  value: Record<string, unknown>,
-  required: ReadonlySet<string>,
-  options: OmissionPlaceholderOptions
-): Record<string, unknown> {
-  let stripped = { ...value };
-  if (isRecord(schema.properties)) {
-    stripped = stripProperties(stripped, schema.properties, required, options);
-  }
-  for (const subSchema of getAllOfBranches(schema)) {
-    stripped = stripNode(subSchema, stripped, required, options) as Record<string, unknown>;
-  }
-  return stripped;
-}
-
 function getAllOfBranches(schema: Record<string, unknown>): unknown[] {
   return Array.isArray(schema.allOf) ? (schema.allOf as unknown[]) : [];
+}
+
+function withRequired(required: ReadonlySet<string>, schema: unknown): ReadonlySet<string> {
+  return isRecord(schema) ? new Set([...required, ...getRequiredProperties(schema)]) : required;
+}
+
+/**
+ * Restore the properties and items this schema node declares directly
+ * (including through allOf), removing placeholders on properties that are not
+ * in `required`. Union branches are the caller's concern (see restoreNode).
+ */
+function restoreStructure(
+  schema: Record<string, unknown>,
+  value: unknown,
+  required: ReadonlySet<string>,
+  options: OmissionPlaceholderOptions
+): unknown {
+  if (Array.isArray(value)) {
+    const itemSchema = schema.items;
+    let restored: unknown = Array.isArray(itemSchema)
+      ? value.map((item, index) => restoreNode(itemSchema[index], item, new Set(), options))
+      : value.map((item) => restoreNode(itemSchema, item, new Set(), options));
+    for (const subSchema of getAllOfBranches(schema)) {
+      restored = restoreNode(subSchema, restored, required, options);
+    }
+    return restored;
+  }
+  if (!isRecord(value)) {
+    return value;
+  }
+  let restored: unknown = { ...value };
+  if (isRecord(schema.properties)) {
+    for (const [propertyName, propertySchema] of Object.entries(schema.properties)) {
+      const record = restored as Record<string, unknown>;
+      if (!(propertyName in record)) {
+        continue;
+      }
+      if (
+        !required.has(propertyName) &&
+        isOmissionPlaceholder(propertySchema, record[propertyName], options)
+      ) {
+        delete record[propertyName];
+        continue;
+      }
+      record[propertyName] = restoreNode(propertySchema, record[propertyName], new Set(), options);
+    }
+  }
+  for (const subSchema of getAllOfBranches(schema)) {
+    restored = restoreNode(subSchema, restored, required, options);
+  }
+  return restored;
+}
+
+function restoreNode(
+  schema: unknown,
+  value: unknown,
+  inheritedRequired: ReadonlySet<string>,
+  options: OmissionPlaceholderOptions
+): unknown {
+  if (!isRecord(schema)) {
+    return value;
+  }
+  const required = withRequired(inheritedRequired, schema);
+  const branches = getUnionBranches(schema);
+  if (branches.length === 0) {
+    return restoreStructure(schema, value, required, options);
+  }
+
+  // Which properties are required depends on the anyOf/oneOf branch that
+  // applies, and a branch that accepts the raw value gives that value meaning
+  // (an explicit null a nullable branch allows, a "" a branch requires). So try
+  // the raw-accepting branches first, and for each candidate branch treat its
+  // required properties as required while removing placeholders at this level,
+  // then restore the branch's own structure. The first branch that accepts its
+  // candidate wins.
+  const rawAccepting = branches.filter((branch) => schemaAcceptsValue(branch, value));
+  const ordered = [...rawAccepting, ...branches.filter((branch) => !rawAccepting.includes(branch))];
+  for (const branch of ordered) {
+    const branchRequired = withRequired(required, branch);
+    const candidate = restoreNode(
+      branch,
+      restoreStructure(schema, value, branchRequired, options),
+      branchRequired,
+      options
+    );
+    if (schemaAcceptsValue(branch, candidate)) {
+      return candidate;
+    }
+  }
+  // No candidate satisfies its branch. Never turn a valid payload into an
+  // invalid one: keep a raw value some branch accepted, else strip best-effort.
+  return rawAccepting.length > 0 ? value : restoreStructure(schema, value, required, options);
 }
 
 /**
@@ -331,5 +298,5 @@ export function stripOmissionPlaceholders(
   value: unknown,
   options: OmissionPlaceholderOptions
 ): unknown {
-  return stripNode(schema, value, new Set(), options);
+  return restoreNode(schema, value, new Set(), options);
 }
