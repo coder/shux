@@ -1109,7 +1109,12 @@ describe("AgentSession token-budget lifecycle", () => {
     const rows = await allRows(h);
     const resets = rolloverRows(rows);
     expect(resets).toHaveLength(1);
-    expect(resets[0].metadata?.muxMetadata).toMatchObject({ reason: "model-requested" });
+    // Attribution rides in an optional field so a downgraded release still parses the row as an
+    // ordinary rollover instead of a manual privacy reset.
+    expect(resets[0].metadata?.muxMetadata).toMatchObject({
+      reason: "mid-stream",
+      requestedBy: "model",
+    });
     expect(text(rows.at(-1)!)).toBe("Continue");
     expect(
       sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages).some((row) =>
@@ -1120,7 +1125,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(await h.requests[1].onStepSettled?.(step(5_000))).toBe("continue");
   });
 
-  test("a new_context request is ignored while automatic rollover is disabled", async () => {
+  test("a new_context request is ignored while automatic rollover is disabled or history is unavailable", async () => {
     const h = await setup();
     h.session.setAutoCompactionThreshold(1);
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
@@ -1128,6 +1133,44 @@ describe("AgentSession token-budget lifecycle", () => {
       "continue"
     );
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+    h.session.setAutoCompactionThreshold(0.7);
+    expect(
+      await h.requests[0].onStepSettled?.(
+        step(20_000, { newContextRequested: true, sessionHistoryAvailable: false })
+      )
+    ).toBe("continue");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+  });
+
+  test("a persisted receipt is not honored while the policy disables session_history", async () => {
+    const h = await setup();
+    const request = createMuxMessage("requester", "assistant", "", {
+      model,
+      contextUsage: { inputTokens: 20_000, outputTokens: 10, totalTokens: 20_010 },
+    });
+    request.parts.push({
+      type: "dynamic-tool",
+      toolName: "new_context",
+      toolCallId: "nc",
+      state: "output-available",
+      input: {},
+      output: { success: true, status: "scheduled", message: "scheduled" },
+    });
+    expect(
+      (
+        await h.historyService.appendManyToHistory(workspaceId, [
+          createMuxMessage("old-user", "user", "Previous request"),
+          request,
+        ])
+      ).success
+    ).toBe(true);
+    const denied = {
+      ...options,
+      toolPolicy: [{ regex_match: "session_history", action: "disable" as const }],
+    };
+    // The send is admitted as an ordinary turn (not rejected on every retry), without a reset.
+    expect((await h.session.sendMessage("Keep going without history", denied)).success).toBe(true);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
   });
 
   test("restart recovers an unconsumed new_context receipt but not an interrupted one", async () => {
@@ -1165,7 +1208,10 @@ describe("AgentSession token-budget lifecycle", () => {
         expect(resets).toHaveLength(0);
       } else {
         expect(resets).toHaveLength(1);
-        expect(resets[0].metadata?.muxMetadata).toMatchObject({ reason: "model-requested" });
+        expect(resets[0].metadata?.muxMetadata).toMatchObject({
+          reason: "on-send",
+          requestedBy: "model",
+        });
         // Consumed once: the next send in the fresh window does not reset again.
         h.settleStream(0);
         expect((await h.session.sendMessage("Keep going", options)).success).toBe(true);

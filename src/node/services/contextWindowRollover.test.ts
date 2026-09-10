@@ -243,7 +243,8 @@ describe("model-requested rollover receipts", () => {
   test("model-requested lead-in explains the request instead of an interruption", () => {
     const text = buildLeadInText({
       ...rollover,
-      reason: "model-requested",
+      reason: "mid-stream",
+      requestedBy: "model",
       flushOpportunity: false,
     });
     expect(text).toContain("new_context");

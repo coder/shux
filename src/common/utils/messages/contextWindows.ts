@@ -16,7 +16,8 @@ const rolloverMetadataSchema: z.ZodType<
 > = z.object({
   type: z.literal("context-window-rollover"),
   rolloverId: z.string().trim().min(1),
-  reason: z.enum(["on-send", "mid-stream", "context-exceeded", "model-requested"]),
+  reason: z.enum(["on-send", "mid-stream", "context-exceeded"]),
+  requestedBy: z.literal("model").optional(),
   previousWindowId: z.string().trim().min(1),
   flushOpportunity: z.boolean(),
   contextTokens: z.number().finite().nonnegative(),

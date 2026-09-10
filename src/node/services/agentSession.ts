@@ -5819,8 +5819,12 @@ export class AgentSession {
     // assistant row whose rollover has not happened yet (it would sit behind a boundary
     // otherwise). Survives a restart that lost the in-memory intent and its queued
     // continuation; an interrupted (partial) row or a manual reset cancels it.
+    // The receipt stays the window's last assistant row while history access is denied, so a
+    // rejected send here would repeat on every later send: require access before honoring it.
     const modelRequested =
-      this.pendingRollover == null && hasUnconsumedNewContextRequest(history.data);
+      this.pendingRollover == null &&
+      hasUnconsumedNewContextRequest(history.data) &&
+      (await this.checkContextBudgetHistoryAccess(options)).success;
     const shouldRollover =
       this.compactionMonitor.getThreshold() < 1 &&
       (this.pendingRollover != null || decision.decision === "rollover" || modelRequested);
@@ -5829,8 +5833,10 @@ export class AgentSession {
         ? (this.pendingRollover ?? {
             type: "context-window-rollover",
             rolloverId: randomUUID(),
-            reason:
-              modelRequested && decision.decision !== "rollover" ? "model-requested" : "on-send",
+            reason: "on-send",
+            ...(modelRequested && decision.decision !== "rollover"
+              ? { requestedBy: "model" as const }
+              : {}),
             previousWindowId: currentContextWindowId(history.data),
             flushOpportunity: decision.flushOpportunity,
             contextTokens: decision.projected,
@@ -6011,8 +6017,13 @@ export class AgentSession {
     // model never re-executes side effects; the persisted tool result doubles as the durable
     // receipt that prepareRolloverRequest recovers after a restart. Ignored when automatic
     // rollover is disabled (threshold 100%): nothing could seal the window.
+    // Without session_history nothing could be retrieved from the sealed window (and the reset
+    // could not be admitted), so such a request is ignored rather than left to fail every send.
     const modelRequested =
-      step.newContextRequested === true && threshold < 1 && context.contextBudgetFlushTurn !== true;
+      step.newContextRequested === true &&
+      step.sessionHistoryAvailable &&
+      threshold < 1 &&
+      context.contextBudgetFlushTurn !== true;
     if (decision.decision === "continue" && !modelRequested) return "continue";
     let offerFlush = false;
     if (decision.decision === "rollover" || modelRequested) {
@@ -6034,7 +6045,8 @@ export class AgentSession {
       this.pendingRollover ??= {
         type: "context-window-rollover",
         rolloverId: randomUUID(),
-        reason: decision.decision === "rollover" ? "mid-stream" : "model-requested",
+        reason: "mid-stream",
+        ...(decision.decision === "rollover" ? {} : { requestedBy: "model" as const }),
         previousWindowId: currentContextWindowId(history.data),
         flushOpportunity: decision.flushOpportunity,
         contextTokens: decision.projected,

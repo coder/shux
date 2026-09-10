@@ -308,6 +308,8 @@ export interface ToolConfiguration {
     advisorTool?: boolean;
     dynamicWorkflows?: boolean;
     tokenBudget?: boolean;
+    /** Continuous compaction takes precedence over token-budget rollover (new_context). */
+    continuousCompaction?: boolean;
     memory?: boolean;
     timeline?: boolean;
     workspaceHeartbeats?: boolean;
@@ -831,7 +833,12 @@ export async function getToolsForModel(
     ...(config.experiments?.tokenBudget
       ? {
           session_history: wrap(createSessionHistoryTool(config)),
-          new_context: wrap(createNewContextTool(config)),
+          // Continuous compaction and PTC+RLM take precedence over token-budget rollover
+          // (AgentSession.isTokenBudgetActive); a request nothing could honor is not offered.
+          ...(config.experiments.continuousCompaction !== true &&
+          !(config.experiments.programmaticToolCalling === true && config.experiments.rlm === true)
+            ? { new_context: wrap(createNewContextTool(config)) }
+            : {}),
         }
       : {}),
 

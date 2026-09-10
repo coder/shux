@@ -150,6 +150,9 @@ export function resolveBackendGatedPtcExperiments(
       isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
     rlm: experiments?.rlm ?? isExperimentEnabled(EXPERIMENT_IDS.RLM),
     tokenBudget: experiments?.tokenBudget ?? isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET),
+    continuousCompaction:
+      experiments?.continuousCompaction ??
+      isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION),
   };
 }
 
