@@ -4956,6 +4956,28 @@ describe("WorkspaceTurnManager", () => {
     }
   );
 
+  test("stale recovery defers while a send is in pre-admission", async () => {
+    const { config, parentId, taskService, historyService, workspaceMocks } =
+      await startWorkspaceTurnForTest();
+    const event = intermediateStopEvent(parentId);
+    await taskService.markWorkspaceTurnStreamEndDeferred(event);
+    const record = await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle");
+    assert(record);
+    workspaceMocks.acquireIdleTurnExclusion.mockReturnValueOnce(Err("a send is being admitted"));
+    const readHistory = spyOn(historyService, "getHistoryFromLatestBoundary");
+    await (
+      taskService as unknown as {
+        settleStaleWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void>;
+      }
+    ).settleStaleWorkspaceTurn(record);
+    expect(readHistory).not.toHaveBeenCalled();
+    expect(
+      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+    ).toMatchObject({
+      status: "running",
+    });
+  });
+
   test("stale recovery waits for an in-flight stream start before reading history", async () => {
     const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
     const streams = new StreamManager(historyService);
@@ -4994,7 +5016,17 @@ describe("WorkspaceTurnManager", () => {
   });
 
   test("stale recovery blocks new starts through terminal persistence without blocking other workspaces", async () => {
-    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService, historyService, workspaceMocks } =
+      await startWorkspaceTurnForTest();
+    let admissionHeld = false;
+    workspaceMocks.acquireIdleTurnExclusion.mockImplementation(() => {
+      admissionHeld = true;
+      return Ok({
+        [Symbol.dispose]: () => {
+          admissionHeld = false;
+        },
+      });
+    });
     const streams = new StreamManager(historyService);
     Reflect.set(taskService, "streamManager", streams);
     const event = intermediateStopEvent(parentId);
@@ -5013,6 +5045,7 @@ describe("WorkspaceTurnManager", () => {
       },
       "cleanupDisposableWorkspaceTurn"
     ).mockImplementation(async () => {
+      expect(admissionHeld).toBe(false);
       await using _cleanupStart = await streams.acquireStreamStartLock(event.workspaceId);
     });
     const persist = store.upsertWorkspaceTurn.bind(store);
@@ -5034,6 +5067,7 @@ describe("WorkspaceTurnManager", () => {
     });
     await using _otherWorkspace = await streams.acquireStreamStartLock("other-workspace");
     expect(started).toBe(false);
+    expect(admissionHeld).toBe(true);
     release.resolve();
     await recovering;
     await starting;

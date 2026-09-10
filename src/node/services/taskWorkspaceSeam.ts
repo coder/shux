@@ -420,6 +420,7 @@ export interface WorkspaceTurnHost {
 }
 
 export interface TurnAdmissionHost {
+  acquireIdleTurnExclusion(workspaceId: string): Result<Disposable>;
   getStartupRecoveryState(workspaceId: string): Promise<StartupRecoveryState>;
   dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>>;
   isBusyForMessage(workspaceId: string): boolean;

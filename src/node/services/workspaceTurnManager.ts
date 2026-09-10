@@ -4071,16 +4071,23 @@ export class WorkspaceTurnManager {
     if (!isActiveWorkspaceTurnTaskStatus(record.status)) {
       return;
     }
-    // Lock order: stream start, then handle settlement. Registration cannot race recovery writes.
-    let recoveryLock = await this.streamManager?.acquireStreamStartLock(record.workspaceId);
+    // Admission exclusion also covers sends whose user row is not durable yet.
+    const admission = this.workspaceService.acquireIdleTurnExclusion(record.workspaceId);
+    if (!admission.success) return;
+    let admissionHold: Disposable | undefined = admission.data;
+    let recoveryLock: AsyncDisposable | undefined;
     await using recoveryScope = {
       [Symbol.asyncDispose]: () => {
+        admissionHold?.[Symbol.dispose]();
+        admissionHold = undefined;
         const lock = recoveryLock;
         recoveryLock = undefined;
-        return lock?.[Symbol.asyncDispose]() ?? Promise.resolve();
+        return Promise.resolve(lock?.[Symbol.asyncDispose]());
       },
     };
     const releaseRecoveryLock = () => recoveryScope[Symbol.asyncDispose]();
+    // Lock order: admission, stream start, then handle settlement.
+    recoveryLock = await this.streamManager?.acquireStreamStartLock(record.workspaceId);
     // Preparing input stays visible until registration. Existing streams include finalization.
     if (
       this.streamManager?.getStreamInfo(record.workspaceId, true) != null ||
