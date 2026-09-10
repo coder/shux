@@ -2398,6 +2398,89 @@ describe("MemoryService", () => {
       expect(tombstone.pendingDeletion).toBeUndefined();
     });
 
+    it("does not read owner state at a pending-deletion target as removed by us", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const prior = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { content: string; sidecar: string; target: string; created?: boolean }
+        >
+      )["note.md"];
+      // The deletion was recorded pending but failed before the removal; the
+      // owner replaced the copy with a directory of its own in the meantime.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(legacyRoot, "note.md"));
+      await fsPromises.rm(path.join(ownerRoot, "note.md"));
+      await fsPromises.mkdir(path.join(ownerRoot, "note.md"));
+      await fsPromises.writeFile(path.join(ownerRoot, "note.md", "inner.md"), "owner's");
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({ "note.md": { ...prior, pendingDeletion: true } })
+      );
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).listIndexEntries({
+        ...fixture.ctx,
+      });
+      const tombstone = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { deleted?: boolean; created?: boolean }
+        >
+      )["note.md"];
+      expect(tombstone.deleted).toBe(true);
+      expect(tombstone.created).not.toBe(true);
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md", "inner.md"), "utf-8")).toBe(
+        "owner's"
+      );
+    });
+
+    it("re-adopts a source that reappeared identically while its deletion was pending", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const prior = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<string, unknown>
+      )["note.md"] as Record<string, unknown>;
+      // Crash after the copy's removal, before the tombstone; the downgraded
+      // build then recreates the source with the same bytes.
+      await fsPromises.rm(path.join(ownerRoot, "note.md"));
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({ "note.md": { ...prior, pendingDeletion: true } })
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.utimes(path.join(legacyRoot, "note.md"), new Date(), new Date());
+      // Removal's handover must restore the copy, not report "nothing to do"
+      // and delete the only remaining note with the child session.
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
+      const settled = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { created?: boolean; pendingDeletion?: boolean }
+        >
+      )["note.md"];
+      expect(settled).toMatchObject({ created: true });
+      expect(settled.pendingDeletion).toBeUndefined();
+    });
+
     it("keeps adopting a legacy note named __proto__ exactly once", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

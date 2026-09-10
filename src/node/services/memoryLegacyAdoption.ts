@@ -154,10 +154,27 @@ export async function createLegacyPathRemapper(args: {
   const remapPath = (filePath: string): string => {
     const relative = path.relative(legacyRoot, path.resolve(filePath));
     if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return filePath;
-    const record = adopted.get(relative.split(path.sep).join("/"));
-    if (record === undefined || record.pending === true) {
+    const relPath = relative.split(path.sep).join("/");
+    const record = adopted.get(relPath);
+    if (record === undefined) {
+      // A directory endpoint (a pre-sharing directory rename): the manifest
+      // records files only. Mappable when every adopted descendant landed at
+      // its own relPath in the owner store as this adoption's copy — the
+      // owner directory then IS the adopted directory. Descendants placed
+      // elsewhere (conflict imports) or owner-owned make the structural
+      // move ambiguous: refused.
+      const descendants = [...adopted].filter(([rel]) => rel.startsWith(`${relPath}/`));
+      if (
+        descendants.length > 0 &&
+        descendants.every(
+          ([rel, entry]) => entry.target === rel && entry.created === true && entry.pending !== true
+        )
+      ) {
+        return path.join(ownerRoot, ...relPath.split("/"));
+      }
       throw new LegacyPathNotAdoptedError(filePath, "not-adopted");
     }
+    if (record.pending === true) throw new LegacyPathNotAdoptedError(filePath, "not-adopted");
     if (record.created !== true) throw new LegacyPathNotAdoptedError(filePath, "owner-owned");
     return path.join(ownerRoot, ...record.target.split("/"));
   };

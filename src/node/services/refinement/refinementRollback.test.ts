@@ -998,6 +998,46 @@ describe("refinementRollback", () => {
     expect(
       await fsPromises.readFile(path.join(ownerSessionDir, "memory", "gone.md"), "utf-8")
     ).toBe("g1\n");
+    // A pre-sharing DIRECTORY rename: the manifest records files only, so the
+    // directory endpoints map through their adopted descendants (all landed
+    // at their own relPath as this adoption's copies).
+    await fixture.service.create(fixture.ctx, "/memories/workspace/olddir/a.md", "a\n", "agent");
+    await fixture.service.rename(
+      fixture.ctx,
+      "/memories/workspace/olddir",
+      "/memories/workspace/newdir",
+      "agent"
+    );
+    const dirRenameRow = await lastRow(fixture.sessionDir);
+    await fsPromises.mkdir(path.join(ownerSessionDir, "memory", "newdir"), { recursive: true });
+    await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "newdir", "a.md"), "a\n");
+    await fsPromises.writeFile(
+      path.join(fixture.sessionDir, "memory", ".adopted-into-shared-store.json"),
+      JSON.stringify({
+        "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
+        "same.md": { content: "x", sidecar: "", target: "same.md" },
+        "gone.md": { content: "x", sidecar: "", target: "gone.md", created: true, deleted: true },
+        "newdir/a.md": { content: "x", sidecar: "", target: "newdir/a.md", created: true },
+        "olddir/a.md": {
+          content: "x",
+          sidecar: "",
+          target: "olddir/a.md",
+          created: true,
+          deleted: true,
+        },
+      })
+    );
+    const undoneRename = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: dirRenameRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(undoneRename.success).toBe(true);
+    expect(
+      await fsPromises.readFile(path.join(ownerSessionDir, "memory", "olddir", "a.md"), "utf-8")
+    ).toBe("a\n");
+    expect(await pathExists(path.join(ownerSessionDir, "memory", "newdir"))).toBe(false);
   });
 
   it("journals the rollback row before releasing the target locks (no durable-order inversion)", async () => {

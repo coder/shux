@@ -1345,7 +1345,10 @@ export class MemoryService extends EventEmitter {
         if (
           previous?.content === record.content &&
           previous.sidecar === record.sidecar &&
-          previous.pending !== true
+          previous.pending !== true &&
+          // A deletion under way removed (or is about to remove) the copy: a
+          // source reappearing with the same bytes must be adopted anew.
+          previous.pendingDeletion !== true
         ) {
           continue; // folded in earlier, nothing changed since
         }
@@ -1570,9 +1573,10 @@ export class MemoryService extends EventEmitter {
             ([rel, record]) =>
               rel !== relPath && listed.has(rel) && record.target === previous.target
           );
-          // A target already gone while a deletion was pending was removed by
-          // the interrupted pass, not changed by the owner.
-          const removedByUs = previous.pendingDeletion === true && current === null;
+          // A target PROVEN absent (strict probe) while a deletion was pending
+          // was removed by the interrupted pass, not changed by the owner. A
+          // directory, symlink or over-cap file there is owner state.
+          const removedByUs = previous.pendingDeletion === true && targetKind === null;
           unchangedForTombstone = (unchanged || removedByUs) && successor === undefined;
           if (successor !== undefined) {
             // Only a copy still holding the adopted bytes is ours to hand
