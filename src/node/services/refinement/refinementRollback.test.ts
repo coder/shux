@@ -899,6 +899,33 @@ describe("refinementRollback", () => {
         "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
       })
     );
+    // The retargeted row was journaled against this session's private clock:
+    // against an overlapping row of the OWNER's journal its order is unknown,
+    // so the rollback is refused unless forced.
+    await sharedDurableEventJournal(ownerSessionDir).append({
+      workspaceId: "ws-owner",
+      kind: "refinement",
+      data: {
+        kind: "memory",
+        action: { op: "str_replace", path: "/memories/workspace/sub/note.md" },
+        inverse: {
+          op: "restore-files",
+          files: [{ path: path.join(ownerSessionDir, "memory", "sub", "note.md"), text: "v2\n" }],
+        },
+        sourceTs: 1,
+      },
+    });
+    const unordered = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+      listSharedWorkspaceMemoryPeerSessionDirs: () => [ownerSessionDir],
+    });
+    expect(unordered.success).toBe(false);
+    expect(unordered.success ? "" : unordered.error).toContain(
+      "order relative to this row is unknown"
+    );
     const result = await rollbackRefinement({
       sessionDir: fixture.sessionDir,
       id: editRow.id,

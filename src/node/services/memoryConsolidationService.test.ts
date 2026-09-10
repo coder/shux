@@ -1326,7 +1326,12 @@ describe("MemoryConsolidationService", () => {
     using fixture = await createFixture();
     await fixture.addWorkspace("ws-clean");
     await fixture.addWorkspace("ws-corrupt");
-    const seed = async (workspaceId: string, foreignTurn: number | null | undefined) => {
+    await fixture.addWorkspace("ws-unbounded");
+    const seed = async (
+      workspaceId: string,
+      foreignTurn: number | null | undefined,
+      options?: { withoutBound: boolean }
+    ) => {
       const reset = createMuxMessage("reset-1", "assistant", "", {
         compactionBoundary: true,
         compacted: "user",
@@ -1367,7 +1372,7 @@ describe("MemoryConsolidationService", () => {
         await fixture.historyService.appendToHistory(
           workspaceId,
           createMuxMessage("b-reply", "assistant", "Read-only output.", {
-            requestHistorySequence: closingEpoch - 1,
+            ...(options?.withoutBound === true ? {} : { requestHistorySequence: closingEpoch - 1 }),
             // `null` models a corrupted raw-JSON row.
             workspaceMemoryPolicyEpoch: foreignTurn as unknown as number,
           })
@@ -1403,6 +1408,12 @@ describe("MemoryConsolidationService", () => {
     // `null` is neither "no stamp" nor this epoch's: fail closed.
     const corrupt = await seed("ws-corrupt", null);
     expect(corrupt.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
+    // A foreign stamp refuses even when the row's request bound is missing
+    // or corrupt: its user row may be gone, so nothing else would surface it.
+    const unbounded = await seed("ws-unbounded", -1, { withoutBound: true });
+    expect(unbounded.success).toBe(false);
+    if (!unbounded.success) expect(unbounded.error).toContain("another epoch");
     expect(fixture.modelCalls).toHaveLength(0);
 
     // Without the foreign turn the copies alone refuse nothing, and the

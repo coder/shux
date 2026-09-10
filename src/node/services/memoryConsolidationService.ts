@@ -372,17 +372,20 @@ function epochHarvestRefusal(messages: readonly MuxMessage[], closingEpoch: numb
   const covered = new Set<string>();
   for (const message of messages) {
     if (message.role !== "assistant") continue;
-    const bound = message.metadata?.requestHistorySequence;
-    if (typeof bound !== "number") continue;
     const policyEpoch = message.metadata?.workspaceMemoryPolicyEpoch;
     // No stamp at all: a row that is no turn of this build (covers nothing).
     if (policyEpoch === undefined) continue;
     // History rows are raw JSON: a stamp that is present but not the integer
     // equal to the closing epoch — another epoch's, or a corrupted value such
     // as null — proves no policy for this epoch and refuses the harvest.
+    // Checked BEFORE the bound: a foreign-epoch turn whose bound is missing
+    // or corrupt must still refuse (its user row may be gone with the reset
+    // that made it foreign, so nothing else would surface it).
     if (!Number.isInteger(policyEpoch) || policyEpoch !== closingEpoch) {
       return "the compacted epoch holds a turn whose memory policy was recorded for another epoch; harvest refused (fail closed)";
     }
+    const bound = message.metadata?.requestHistorySequence;
+    if (typeof bound !== "number") continue;
     const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;
     if (anchor === undefined) continue;
     covered.add(anchor.id);

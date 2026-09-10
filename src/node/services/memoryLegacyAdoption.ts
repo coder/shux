@@ -41,6 +41,13 @@ export interface LegacyAdoptionRecord {
    */
   replacementContent?: string;
   /**
+   * Reconciliation of a deleted source is under way: the copy is about to be
+   * (or was just) removed. Set before the removal so a crash between the
+   * removal and the tombstone write is recovered as "removed by us" rather
+   * than "changed by the owner".
+   */
+  pendingDeletion?: boolean;
+  /**
    * The legacy source was deleted (or renamed away) on a downgraded build and
    * the copy reconciled. Kept rather than dropped: the child's pre-sharing
    * refinement rows for this note (a delete's restore inverse, a rename's

@@ -546,8 +546,14 @@ function isAfter(row: RefinementEvent, other: RefinementEvent): boolean {
  * journal-local `ts`/`seq`, incomparable with other journals' rows. Callers
  * fail closed — such a pair conflicts in either direction (force overrides).
  */
-function orderUnknown(row: RefinementEvent, other: RefinementEvent): boolean {
-  return row.data.orderUnknown === true || other.data.orderUnknown === true;
+function orderUnknown(
+  row: RefinementEvent,
+  target: RefinementEvent,
+  targetRetargeted: boolean
+): boolean {
+  if (row.data.orderUnknown === true || target.data.orderUnknown === true) return true;
+  // A retargeted target (see wasRetargeted) vs. a row of another journal.
+  return targetRetargeted && row.workspaceId !== target.workspaceId;
 }
 
 /**
@@ -619,10 +625,19 @@ async function readSharedMemoryPeerRows(
       // "<this workspace>:<row id>") while this session lives on. They are
       // this journal's rows seen twice, not later peer edits.
       if (row.data.migratedFrom?.startsWith(`${actingWorkspaceId}:`) === true) continue;
+      const original = RefinementInverseSchema.safeParse(row.data.inverse);
       const parsed = parseRemappedInverse(row, remap);
-      if (parsed === null) continue;
+      if (parsed === null || !original.success) continue;
       if (!inversePaths(parsed).some((p) => pathsOverlap(p, sharedRoot))) continue;
-      peerRows.push({ ...row, data: { ...row.data, inverse: parsed } });
+      // A retargeted peer row carries its private clock: order unknown.
+      peerRows.push({
+        ...row,
+        data: {
+          ...row.data,
+          inverse: parsed,
+          ...(wasRetargeted(original.data, parsed) ? { orderUnknown: true as const } : {}),
+        },
+      });
     }
   }
   return peerRows;
@@ -657,12 +672,22 @@ function parseRemappedInverse(
   }
 }
 
+/**
+ * Whether retargeting changed the inverse's paths: such a row was journaled
+ * against a PRIVATE store (pre-sharing), so its `ts`/`sourceTs` belong to
+ * that store's clock and are incomparable with the shared store's rows.
+ */
+function wasRetargeted(original: RefinementInverse, remapped: RefinementInverse): boolean {
+  return JSON.stringify(inversePaths(original)) !== JSON.stringify(inversePaths(remapped));
+}
+
 async function collectDivergence(
   rows: RefinementEvent[],
   target: RefinementEvent,
   inverse: RefinementInverse,
   readContent: InverseContentReader,
-  remap: RecordedPathRemapper
+  remap: RecordedPathRemapper,
+  targetRetargeted: boolean
 ): Promise<string[]> {
   const complaints: string[] = [];
   const targetPaths = inversePaths(inverse);
@@ -678,15 +703,15 @@ async function collectDivergence(
   );
   for (const row of rows) {
     if (row.id === target.id) continue;
-    if (!isAfter(row, target) && !orderUnknown(row, target)) continue;
+    if (!isAfter(row, target) && !orderUnknown(row, target, targetRetargeted)) continue;
     if (rolledBackIds.has(row.id)) continue; // Effect undone by a later rollback row.
-    if (!liveRowConflictsWithTarget(rows, row, target)) continue;
+    if (!liveRowConflictsWithTarget(rows, row, target, targetRetargeted)) continue;
     const parsed = parseRemappedInverse(row, remap);
     if (parsed === null) continue;
     const overlap = inversePaths(parsed).some((p) => targetPaths.some((t) => pathsOverlap(p, t)));
     if (overlap) {
       complaints.push(
-        orderUnknown(row, target)
+        orderUnknown(row, target, targetRetargeted)
           ? `refinement row ${row.id} (seq ${row.seq}) touched the same paths and its order relative to this row is unknown (its store clock write failed)`
           : `later refinement row ${row.id} (seq ${row.seq}) touched the same paths`
       );
@@ -801,7 +826,8 @@ async function collectPostStateDivergence(
 function liveRowConflictsWithTarget(
   rows: RefinementEvent[],
   row: RefinementEvent,
-  target: RefinementEvent
+  target: RefinementEvent,
+  targetRetargeted: boolean
 ): boolean {
   if (row.data.rollbackOf === undefined) {
     return true; // Plain later row: its edit is live on disk.
@@ -823,7 +849,7 @@ function liveRowConflictsWithTarget(
   }
   // Odd chain: rewound to just before root — a conflict unless the root is
   // provably after the target.
-  return !isAfter(current, target) || orderUnknown(current, target);
+  return !isAfter(current, target) || orderUnknown(current, target, targetRetargeted);
 }
 
 async function dirExists(target: string): Promise<boolean> {
@@ -982,6 +1008,11 @@ export async function rollbackRefinement(
       if (!(error instanceof LegacyPathNotAdoptedError)) throw error;
       throw new RollbackError(`Refusing rollback of '${opts.id}': ${error.message}`);
     }
+    // A retargeted target was journaled against this session's private
+    // clock: its order relative to OTHER journals' rows is unknown, so those
+    // are compared as order-unknown (conflict unless forced). Same-journal
+    // rows still order by their shared sequence.
+    const targetRetargeted = wasRetargeted(parsedInverse.data, inverse);
 
     // Confinement first — never overridable. A corrupted inverse must never
     // write outside the memory/skill roots (repo AGENTS.md, built-in skills,
@@ -1033,7 +1064,8 @@ export async function rollbackRefinement(
       target,
       inverse,
       readContent,
-      remap
+      remap,
+      targetRetargeted
     );
     if (divergence.length > 0 && opts.force !== true) {
       throw new RollbackError(
@@ -1105,7 +1137,8 @@ export async function rollbackRefinement(
           target,
           inverse,
           readContent,
-          remap
+          remap,
+          targetRetargeted
         );
         if (raced.length > 0) {
           throw new RollbackError(

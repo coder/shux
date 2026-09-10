@@ -1570,7 +1570,10 @@ export class MemoryService extends EventEmitter {
             ([rel, record]) =>
               rel !== relPath && listed.has(rel) && record.target === previous.target
           );
-          unchangedForTombstone = unchanged && successor === undefined;
+          // A target already gone while a deletion was pending was removed by
+          // the interrupted pass, not changed by the owner.
+          const removedByUs = previous.pendingDeletion === true && current === null;
+          unchangedForTombstone = (unchanged || removedByUs) && successor === undefined;
           if (successor !== undefined) {
             // Only a copy still holding the adopted bytes is ours to hand
             // over; one the owner edited since is the owner's, and the
@@ -1580,7 +1583,12 @@ export class MemoryService extends EventEmitter {
               manifestDirty = true;
             }
           } else if (unchanged) {
-            // Metadata first: a sidecar failure then aborts the pass with the
+            // Deletion provenance first: a crash after the removal but before
+            // the tombstone write must not make the retry read the missing
+            // copy as owner-changed (and drop the child's rollback mapping).
+            adopted.set(relPath, { ...previous, pendingDeletion: true });
+            await writeManifest();
+            // Metadata next: a sidecar failure then aborts the pass with the
             // file and manifest entry intact, so the retry repeats both;
             // the reverse order would strand the owner-key pin/usage once
             // the file was gone and the entry dropped.
@@ -1610,6 +1618,7 @@ export class MemoryService extends EventEmitter {
         // to delete or restore any more.
         adopted.set(relPath, {
           ...previous,
+          pendingDeletion: undefined,
           deleted: true,
           created: previous.created === true && unchangedForTombstone,
         });

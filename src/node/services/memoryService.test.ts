@@ -2356,6 +2356,48 @@ describe("MemoryService", () => {
       expect(await pathExists(path.join(ownerRoot, "note.md"))).toBe(false);
     });
 
+    it("recovers a deletion interrupted between the copy's removal and the tombstone", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const prior = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { content: string; sidecar: string; target: string; created?: boolean }
+        >
+      )["note.md"];
+      // The crash state: source deleted, deletion recorded as pending, copy
+      // already removed, tombstone never written.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(legacyRoot, "note.md"));
+      await fsPromises.rm(path.join(ownerRoot, "note.md"));
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({ "note.md": { ...prior, pendingDeletion: true } })
+      );
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).listIndexEntries({
+        ...fixture.ctx,
+      });
+      const tombstone = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { deleted?: boolean; created?: boolean; pendingDeletion?: boolean }
+        >
+      )["note.md"];
+      // Removed by us, not changed by the owner: destructive provenance kept,
+      // so the child's delete row still maps onto the shared store.
+      expect(tombstone).toMatchObject({ deleted: true, created: true });
+      expect(tombstone.pendingDeletion).toBeUndefined();
+    });
+
     it("keeps adopting a legacy note named __proto__ exactly once", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -2909,6 +2951,9 @@ describe("MemoryService", () => {
           postState: {
             files: [{ path: path.join(legacyRoot, "old.md"), sha256: sha256Hex("v2") }],
           },
+          // A self-fallback write's clock value: the child's PRIVATE store's,
+          // not the owner's — meaningless once the row is retargeted.
+          sourceTs: 42,
         },
       });
       // Also a legacy row for a note the shared store never took (unplaceable).
@@ -2943,8 +2988,8 @@ describe("MemoryService", () => {
       expect((copy.data.postState as { files: Array<{ path: string }> }).files[0].path).toBe(
         ownerCopy
       );
-      // No store-clock value existed for the pre-sharing row: its order is
-      // unknown, not its journal-local timestamp dressed up as a clock value.
+      // A retargeted row's clock value belonged to the private store: its
+      // order among the owner's rows is unknown, not that value.
       expect(copy.data.sourceTs).toBeUndefined();
       expect(copy.data.orderUnknown).toBe(true);
       const rolledBack = await rollbackRefinement({

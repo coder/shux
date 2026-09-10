@@ -189,6 +189,12 @@ export async function migrateSharedMemoryRefinementRows(args: {
       if (!parsedInverse.success) continue;
       const remapped = remapInverse(parsedInverse.data);
       if (remapped === null) continue;
+      // A row whose paths were retargeted was journaled against the child's
+      // PRIVATE store (pre-sharing, or a self-fallback while config.json was
+      // unreadable): any `sourceTs` it carries is that private clock's, not
+      // the owner's, so its order among the owner's rows is unknown.
+      const retargeted =
+        JSON.stringify(inversePaths(parsedInverse.data)) !== JSON.stringify(inversePaths(remapped));
       const inverse = { success: true as const, data: remapped };
       if (!inversePaths(inverse.data).every((p) => isInside(ownerMemoryRoot, p))) continue;
 
@@ -271,8 +277,8 @@ export async function migrateSharedMemoryRefinementRows(args: {
         // failed) has only a journal-local `ts`, incomparable with the
         // owner's clock-stamped rows: carried as order-unknown rather than
         // dressed up as a clock value.
-        ...(row.data.sourceTs !== undefined ? { sourceTs: row.data.sourceTs } : {}),
-        ...(row.data.orderUnknown === true || row.data.sourceTs === undefined
+        ...(row.data.sourceTs !== undefined && !retargeted ? { sourceTs: row.data.sourceTs } : {}),
+        ...(row.data.orderUnknown === true || row.data.sourceTs === undefined || retargeted
           ? { orderUnknown: true as const }
           : {}),
         ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),
