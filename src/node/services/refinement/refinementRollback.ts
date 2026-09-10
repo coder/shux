@@ -1264,25 +1264,29 @@ export async function rollbackRefinement(
       // partial rollback behind (no rollbackOf row, and a retry refuses on the
       // resulting divergence).
       const applied: RollbackApplied = { rollbackRowId: null, restored: [], deleted: [] };
-      // Retargeted apply (r74): the adopted copies rewritten, removed or —
-      // after a failed apply — compensated are new generations of the files;
-      // re-stamp them so the child's remaining rows over the same notes still
-      // map (createLegacyPathRemapper refuses a copy that is no longer the
-      // recorded generation). A rename keeps inode and mtime but moves the
-      // generation to the other endpoint's records (r75). Still under the
-      // owner-store lock.
+      // A sub-agent's apply on the shared store (r74): the adopted copies
+      // rewritten, removed or — after a failed apply — compensated are new
+      // generations of the files; re-stamp them so the child's remaining rows
+      // over the same notes still map (createLegacyPathRemapper refuses a copy
+      // that is no longer the recorded generation). A rename keeps inode and
+      // mtime but moves the generation to the other endpoint's records (r75).
+      // Not only retargeted inverses: the child's own rollback rows carry
+      // owner paths already, and re-applying one is the same lineage acting.
+      // Still under the owner-store lock.
       const restampAdoptedCopies = async (): Promise<void> => {
-        if (remap === identityRemapper) return;
-        assert(opts.sharedWorkspaceMemorySessionDir !== undefined);
+        if (
+          kind !== "memory" ||
+          opts.sharedWorkspaceMemorySessionDir === undefined ||
+          path.resolve(opts.sharedWorkspaceMemorySessionDir) === path.resolve(opts.sessionDir)
+        ) {
+          return;
+        }
         try {
           await refreshLegacyAdoptionTargetStamps({
             childSessionDir: opts.sessionDir,
             ownerSessionDir: opts.sharedWorkspaceMemorySessionDir,
-            paths: [
-              ...applied.restored,
-              ...applied.deleted,
-              ...(applied.renamed === undefined ? [] : [applied.renamed.from, applied.renamed.to]),
-            ],
+            paths: [...applied.restored, ...applied.deleted],
+            ...(applied.renamed === undefined ? {} : { renamed: applied.renamed }),
           });
         } catch (error) {
           // Stale stamps only refuse later rollbacks (force overrides).

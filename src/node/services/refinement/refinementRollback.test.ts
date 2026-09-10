@@ -1151,6 +1151,7 @@ describe("refinementRollback", () => {
     // post-rename names, so the inverse's destination (the vacated name) has
     // no record — it still maps beside the adopted copies (r75).
     await fixture.service.create(fixture.ctx, "/memories/workspace/dir2/b.md", "b\n", "agent");
+    const dir2CreateRow = await lastRow(fixture.sessionDir);
     await fixture.service.rename(
       fixture.ctx,
       "/memories/workspace/dir2",
@@ -1172,11 +1173,56 @@ describe("refinementRollback", () => {
     expect(undoneFirstUpgradeRename.success).toBe(true);
     expect(await fsPromises.readFile(path.join(ownerRoot, "dir2", "b.md"), "utf-8")).toBe("b\n");
     expect(await pathExists(path.join(ownerRoot, "dir3"))).toBe(false);
+    // The restored side had no record: the moved copy gets a tombstoned one
+    // (r76) carrying its generation, so the child's older rows there map.
+    const manifest = () =>
+      readLegacyAdoptionManifest(legacyAdoptionManifestPath(fixture.sessionDir));
+    expect((await manifest()).get("dir3/b.md")!.targetStamp).toBeUndefined();
+    const dir2Stamp =
+      (await adoptionTargetStamp(path.join(ownerRoot, "dir2", "b.md"))) ?? undefined;
+    expect((await manifest()).get("dir2/b.md")).toEqual({
+      content: "x",
+      sidecar: "",
+      target: "dir2/b.md",
+      created: true,
+      deleted: true,
+      targetStamp: dir2Stamp,
+    });
+    // Re-applying the rename through its rollback row (owner paths, no
+    // retargeting) moves the generation back; undoing that again restores it.
+    const renameRollbackRow = await lastRow(fixture.sessionDir);
     expect(
-      (await readLegacyAdoptionManifest(legacyAdoptionManifestPath(fixture.sessionDir))).get(
-        "dir3/b.md"
-      )!.targetStamp
-    ).toBeUndefined();
+      (
+        await rollbackRefinement({
+          sessionDir: fixture.sessionDir,
+          id: renameRollbackRow.id,
+          evidence: EVIDENCE,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        })
+      ).success
+    ).toBe(true);
+    expect((await manifest()).get("dir3/b.md")!.targetStamp).toBe(dir2Stamp);
+    expect((await manifest()).get("dir2/b.md")!.targetStamp).toBeUndefined();
+    const reapplyRow = await lastRow(fixture.sessionDir);
+    expect(
+      (
+        await rollbackRefinement({
+          sessionDir: fixture.sessionDir,
+          id: reapplyRow.id,
+          evidence: EVIDENCE,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        })
+      ).success
+    ).toBe(true);
+    expect((await manifest()).get("dir2/b.md")!.targetStamp).toBe(dir2Stamp);
+    const undoneDir2Create = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: dir2CreateRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(undoneDir2Create.success).toBe(true);
+    expect(await pathExists(path.join(ownerRoot, "dir2", "b.md"))).toBe(false);
   });
 
   it("journals the rollback row before releasing the target locks (no durable-order inversion)", async () => {

@@ -390,47 +390,86 @@ export async function createLegacyPathRemapper(args: {
 
 /**
  * Re-stamp adopted targets the rollback engine just rewrote or removed while
- * applying a RETARGETED inverse (createLegacyPathRemapper mapped the child's
- * legacy paths onto them): the write is the child's own lineage acting, so
+ * applying an inverse on the child's behalf (createLegacyPathRemapper mapped
+ * the child's legacy paths onto them, or the row is the child's own rollback
+ * row over the shared store): the write is the child's own lineage acting, so
  * the new generation stays mappable for the child's remaining rows over the
  * same note (create + edit unwind LIFO). `paths` may be directories (a rename
  * endpoint): every record whose target lies beneath is re-stamped, so after a
  * retargeted rename the vacated side's records lose their stamp and the
  * restored side's (tombstoned by the downgraded build's rename) take the
- * moved files' generation (r75). Runs under the owner store's mutation lock
- * the engine holds (the lock adoption passes take too). A target that is
- * gone loses its stamp — nothing maps there until adoption places the note
- * anew. Best-effort by contract: a failure here only leaves stale stamps,
+ * moved files' generation (r75). A rename whose restored side has NO record
+ * (the child renamed before the first upgrade, so adoption only ever saw the
+ * new names) gets tombstoned records for the moved copies (r76): keyed by the
+ * legacy path the child's older rows address, carrying the moved file's
+ * generation — `deleted` because no legacy source exists there (reconciliation
+ * skips tombstones; a later source is a fresh note), yet mappable while the
+ * copy is that generation or absent again. Runs under the owner store's
+ * mutation lock the engine holds (the lock adoption passes take too). A target
+ * that is gone loses its stamp — nothing maps there until adoption places the
+ * note anew. Best-effort by contract: a failure here only leaves stale stamps,
  * which refuse (never mutate) later.
  */
 export async function refreshLegacyAdoptionTargetStamps(args: {
   childSessionDir: string;
   ownerSessionDir: string;
   paths: readonly string[];
+  renamed?: { from: string; to: string };
 }): Promise<void> {
-  if (args.paths.length === 0) return;
   const ownerRoot = path.join(path.resolve(args.ownerSessionDir), "memory");
+  const ownerRel = (filePath: string): string | null => {
+    const relative = path.relative(ownerRoot, path.resolve(filePath));
+    if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+    return relative.split(path.sep).join("/");
+  };
   const touched = new Set<string>();
   for (const filePath of args.paths) {
-    const relative = path.relative(ownerRoot, path.resolve(filePath));
-    if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) continue;
-    touched.add(relative.split(path.sep).join("/"));
+    const rel = ownerRel(filePath);
+    if (rel !== null) touched.add(rel);
   }
+  const renamed =
+    args.renamed === undefined
+      ? null
+      : { from: ownerRel(args.renamed.from), to: ownerRel(args.renamed.to) };
+  if (renamed?.from != null) touched.add(renamed.from);
+  if (renamed?.to != null) touched.add(renamed.to);
   if (touched.size === 0) return;
+  const beneath = (target: string, rel: string): boolean =>
+    target === rel || target.startsWith(`${rel}/`);
   const manifestPath = legacyAdoptionManifestPath(path.resolve(args.childSessionDir));
   const adopted = await readLegacyAdoptionManifest(manifestPath, { strict: true });
   let dirty = false;
+  const stampOf = async (target: string): Promise<string | undefined> =>
+    (await adoptionTargetStamp(path.join(ownerRoot, ...target.split("/")))) ?? undefined;
   for (const record of adopted.values()) {
     if (record.created !== true || record.pending === true) continue;
-    const beneathTouched = [...touched].some(
-      (rel) => record.target === rel || record.target.startsWith(`${rel}/`)
-    );
-    if (!beneathTouched) continue;
-    const stamp =
-      (await adoptionTargetStamp(path.join(ownerRoot, ...record.target.split("/")))) ?? undefined;
+    if (![...touched].some((rel) => beneath(record.target, rel))) continue;
+    const stamp = await stampOf(record.target);
     if (stamp === record.targetStamp) continue;
     record.targetStamp = stamp;
     dirty = true;
+  }
+  if (renamed?.from != null && renamed.to != null) {
+    for (const [rel, record] of [...adopted]) {
+      // One-to-one copies only (the directory proof requires it; a lone file
+      // maps through its own record): the moved copy sits at the same
+      // relative position under the restored name.
+      if (record.created !== true || record.pending === true || record.target !== rel) continue;
+      if (!beneath(rel, renamed.from)) continue;
+      const movedRel = renamed.to + rel.slice(renamed.from.length);
+      if (adopted.has(movedRel)) continue;
+      const stamp = await stampOf(movedRel);
+      if (stamp === undefined) continue; // not moved after all: nothing to vouch for
+      adopted.set(movedRel, {
+        content: record.content,
+        sidecar: record.sidecar,
+        target: movedRel,
+        created: true,
+        deleted: true,
+        targetStamp: stamp,
+      });
+      dirty = true;
+    }
   }
   if (!dirty) return;
   await writeFileAtomic(manifestPath, JSON.stringify(Object.fromEntries(adopted)), {
