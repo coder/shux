@@ -1940,8 +1940,38 @@ describe("StreamManager - stopWhen configuration", () => {
         memoryWritable: true,
       });
       expect(settled.toolResultChars).toBeGreaterThan(40_000);
+      expect(settled.newContextRequested).toBe(false);
     }
   );
+
+  test("a settled successful new_context result is reported alongside its siblings", async () => {
+    const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
+      Promise.resolve("rollover")
+    );
+    const [, stop] = buildStopWhenForTests()({
+      hasQueuedMessages: () => false,
+      onStepSettled,
+      modelString: "anthropic:claude-sonnet-4-5",
+      tools: { session_history: tool({ inputSchema: z.object({}) }) },
+    });
+    const settle = (output: unknown) =>
+      stop({
+        steps: [
+          {
+            usage: { inputTokens: 90, outputTokens: 10, totalTokens: 100 },
+            toolResults: [
+              { toolName: "bash", output: "side effect done" },
+              { toolName: "new_context", output },
+            ],
+          },
+        ],
+      });
+    expect(await settle({ success: true, status: "scheduled", message: "ok" })).toBe(true);
+    expect(onStepSettled.mock.calls[0][0].newContextRequested).toBe(true);
+    // A failed or error-shaped result is not a request.
+    await settle({ success: false, error: "denied" });
+    expect(onStepSettled.mock.calls[1][0].newContextRequested).toBe(false);
+  });
 
   test("successful required completion wins over rollover while a failed tool still evaluates budget", async () => {
     const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>

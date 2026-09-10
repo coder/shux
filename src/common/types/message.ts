@@ -613,7 +613,7 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
     | {
         type: "context-window-rollover";
         rolloverId: string;
-        reason: "on-send" | "mid-stream" | "context-exceeded";
+        reason: "on-send" | "mid-stream" | "context-exceeded" | "model-requested";
         previousWindowId: string;
         flushOpportunity: boolean;
         contextTokens: number;

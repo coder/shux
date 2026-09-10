@@ -1,5 +1,6 @@
 import type { HistoryService } from "@/node/services/historyService";
 import { createSessionHistoryTool } from "@/node/services/tools/session_history";
+import { createNewContextTool } from "@/node/services/tools/new_context";
 import { xai } from "@ai-sdk/xai";
 import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
@@ -828,7 +829,10 @@ export async function getToolsForModel(
 
     web_fetch: wrap(createWebFetchTool(config)),
     ...(config.experiments?.tokenBudget
-      ? { session_history: wrap(createSessionHistoryTool(config)) }
+      ? {
+          session_history: wrap(createSessionHistoryTool(config)),
+          new_context: wrap(createNewContextTool(config)),
+        }
       : {}),
 
     // Agent memory (experiment-gated; off => no tool, no context cost)

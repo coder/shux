@@ -31,6 +31,7 @@ import {
   createContextBudgetWarning,
   currentContextWindowId,
   hasRolloverEligibleMessages,
+  hasUnconsumedNewContextRequest,
   estimateLastStepToolResults,
   type ContextWindowRollover,
 } from "./contextWindowRollover";
@@ -5814,15 +5815,22 @@ export class AgentSession {
       this.pendingRolloverSnapshot = undefined;
       this.contextBudgetFlushClaimed = false;
     }
+    // Durable model request: a successful new_context result in the window's last completed
+    // assistant row whose rollover has not happened yet (it would sit behind a boundary
+    // otherwise). Survives a restart that lost the in-memory intent and its queued
+    // continuation; an interrupted (partial) row or a manual reset cancels it.
+    const modelRequested =
+      this.pendingRollover == null && hasUnconsumedNewContextRequest(history.data);
     const shouldRollover =
       this.compactionMonitor.getThreshold() < 1 &&
-      (this.pendingRollover != null || decision.decision === "rollover");
+      (this.pendingRollover != null || decision.decision === "rollover" || modelRequested);
     const rollover: AgentSession["pendingRollover"] =
       shouldRollover && hasRolloverEligibleMessages(history.data)
         ? (this.pendingRollover ?? {
             type: "context-window-rollover",
             rolloverId: randomUUID(),
-            reason: "on-send",
+            reason:
+              modelRequested && decision.decision !== "rollover" ? "model-requested" : "on-send",
             previousWindowId: currentContextWindowId(history.data),
             flushOpportunity: decision.flushOpportunity,
             contextTokens: decision.projected,
@@ -5998,16 +6006,25 @@ export class AgentSession {
       // continuation seal the window.
       if (decision.decision === "continue") return "rollover";
     }
-    if (decision.decision === "continue") return "continue";
+    // A settled successful new_context result asks for a rollover regardless of usage. It is
+    // honored like a budget rollover (continuation queued after every sibling settled) so the
+    // model never re-executes side effects; the persisted tool result doubles as the durable
+    // receipt that prepareRolloverRequest recovers after a restart. Ignored when automatic
+    // rollover is disabled (threshold 100%): nothing could seal the window.
+    const modelRequested =
+      step.newContextRequested === true && threshold < 1 && context.contextBudgetFlushTurn !== true;
+    if (decision.decision === "continue" && !modelRequested) return "continue";
     let offerFlush = false;
-    if (decision.decision === "rollover") {
+    if (decision.decision === "rollover" || modelRequested) {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) throw new Error(history.error);
       if (this.activeStreamContext !== context || this.contextBudgetGeneration !== generation)
         return "continue";
       // Offer one final notes flush before sealing when a writing step still fits and the
-      // reset that follows can actually be admitted (session_history available).
+      // reset that follows can actually be admitted (session_history available). A model that
+      // asked for the reset itself has already had its chance to write notes.
       offerFlush =
+        decision.decision === "rollover" &&
         this.pendingRollover == null &&
         !this.contextBudgetFlushClaimed &&
         decision.flushOpportunity &&
@@ -6017,7 +6034,7 @@ export class AgentSession {
       this.pendingRollover ??= {
         type: "context-window-rollover",
         rolloverId: randomUUID(),
-        reason: "mid-stream",
+        reason: decision.decision === "rollover" ? "mid-stream" : "model-requested",
         previousWindowId: currentContextWindowId(history.data),
         flushOpportunity: decision.flushOpportunity,
         contextTokens: decision.projected,
@@ -6074,7 +6091,7 @@ export class AgentSession {
       );
       this.emitQueuedMessageChanged();
     }
-    return decision.decision;
+    return modelRequested ? "rollover" : decision.decision;
   }
 
   /**

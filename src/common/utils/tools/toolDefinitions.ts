@@ -2489,6 +2489,19 @@ export const TOOL_DEFINITIONS = {
       truncated: z.boolean().optional(),
     }),
   },
+  new_context: {
+    ptcExcluded: "Context lifecycle request; must settle with the top-level step",
+    description:
+      "Request a fresh context window (token-budget mode). Nothing happens immediately: the rollover is scheduled after this tool step settles, so sibling tool calls in the same step still complete and their results are persisted. " +
+      "The next window starts with a rollover marker and can retrieve earlier transcript data through session_history; workspace files, tasks, goals and costs are preserved, and this is not a privacy reset. " +
+      "Save durable notes with the memory tool first. A request in the current window is honored once; if automatic rollover is disabled (threshold 100%) the request is ignored.",
+    schema: z.object({}).strict(),
+    resultSchema: z.object({
+      success: z.boolean(),
+      status: z.literal("scheduled"),
+      message: z.string(),
+    }),
+  },
   memory: {
     resultSchema: MemoryToolResultSchema,
     ptcExcluded: "Top-level presence supplies the memory index and hot-set context",
@@ -3719,7 +3732,7 @@ export function getAvailableTools(
     "file_edit_replace_string",
     // "file_edit_replace_lines", // DISABLED: causes models to break repo state
     "file_edit_insert",
-    ...(options?.enableSessionHistory ? ["session_history"] : []),
+    ...(options?.enableSessionHistory ? ["session_history", "new_context"] : []),
     ...(enableMemory ? ["memory"] : []),
     ...(enableTimelineEvent ? ["timeline_event"] : []),
     ...(enableAdvisor ? ["advisor"] : []),

@@ -1092,6 +1092,92 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test("a settled new_context request seals the window once after its siblings, with no flush", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    // Far below the budget: only the explicit request drives the rollover.
+    expect(await h.requests[0].onStepSettled?.(step(20_000, { newContextRequested: true }))).toBe(
+      "rollover"
+    );
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    // A duplicate request in the same step batch/window coalesces into the pending intent.
+    expect(await h.requests[0].onStepSettled?.(step(20_500, { newContextRequested: true }))).toBe(
+      "rollover"
+    );
+    await h.finishAndDispatch();
+    const rows = await allRows(h);
+    const resets = rolloverRows(rows);
+    expect(resets).toHaveLength(1);
+    expect(resets[0].metadata?.muxMetadata).toMatchObject({ reason: "model-requested" });
+    expect(text(rows.at(-1)!)).toBe("Continue");
+    expect(
+      sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages).some((row) =>
+        text(row).includes("new_context")
+      )
+    ).toBe(true);
+    // The fresh window has no outstanding request: an ordinary settled step continues.
+    expect(await h.requests[1].onStepSettled?.(step(5_000))).toBe("continue");
+  });
+
+  test("a new_context request is ignored while automatic rollover is disabled", async () => {
+    const h = await setup();
+    h.session.setAutoCompactionThreshold(1);
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(await h.requests[0].onStepSettled?.(step(20_000, { newContextRequested: true }))).toBe(
+      "continue"
+    );
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
+  });
+
+  test("restart recovers an unconsumed new_context receipt but not an interrupted one", async () => {
+    for (const partial of [false, true]) {
+      const first = await setup();
+      const request = createMuxMessage("requester", "assistant", "Saving notes, then resetting", {
+        model,
+        ...(partial ? { partial: true } : {}),
+        contextUsage: { inputTokens: 20_000, outputTokens: 10, totalTokens: 20_010 },
+        stepStartPartIndices: [0, 1],
+      });
+      request.parts.push({
+        type: "dynamic-tool",
+        toolName: "new_context",
+        toolCallId: "nc",
+        state: "output-available",
+        input: {},
+        output: { success: true, status: "scheduled", message: "scheduled" },
+      });
+      expect(
+        (
+          await first.historyService.appendManyToHistory(workspaceId, [
+            createMuxMessage("old-user", "user", "Previous request"),
+            request,
+          ])
+        ).success
+      ).toBe(true);
+      // The in-memory intent and its queued continuation are gone after a restart.
+      await first.session.dispose();
+      const h = await setup({ previous: first });
+      expect((await h.session.sendMessage("Resume after restart", options)).success).toBe(true);
+      const rows = await allRows(h);
+      const resets = rolloverRows(rows);
+      if (partial) {
+        expect(resets).toHaveLength(0);
+      } else {
+        expect(resets).toHaveLength(1);
+        expect(resets[0].metadata?.muxMetadata).toMatchObject({ reason: "model-requested" });
+        // Consumed once: the next send in the fresh window does not reset again.
+        h.settleStream(0);
+        expect((await h.session.sendMessage("Keep going", options)).success).toBe(true);
+        expect(rolloverRows(await allRows(h))).toHaveLength(1);
+      }
+      await h.session.dispose();
+      await h.cleanup();
+      await first.cleanup();
+      harnesses.length = 0;
+    }
+  });
+
   test("restart recomputes pending rollover including a giant final tool result", async () => {
     const first = await setup();
     await seedHistory(first, 30_000, 300_000);

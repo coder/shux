@@ -263,6 +263,8 @@ export interface SettledStepBudget {
   toolResultTokens?: number;
   sessionHistoryAvailable: boolean;
   memoryWritable: boolean;
+  /** A successful `new_context` result settled in this step (its siblings included). */
+  newContextRequested?: boolean;
 }
 
 export type OnStepSettled = (
@@ -2436,6 +2438,9 @@ export class StreamManager {
             toolResultTokens,
             sessionHistoryAvailable: request.tools?.session_history != null,
             memoryWritable: request.contextBudgetMemoryWritable === true,
+            newContextRequested: step.toolResults.some(
+              (result) => result.toolName === "new_context" && isSuccessfulOutput(result.output)
+            ),
           });
           // All siblings have settled: stop before another provider step without discarding results.
           if (decision === "block")

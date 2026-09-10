@@ -258,6 +258,8 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   ask_user_question: MessageCircleQuestion,
   file_read: BookOpen,
   session_history: History,
+  // A model-requested fresh window: the same "start over" affordance as workflow_resume.
+  new_context: RotateCcw,
   memory: Brain,
   intuition: BrainCircuit,
   attach_file: Paperclip,
