@@ -4,6 +4,7 @@
 
 import { describe, test, expect, afterAll } from "bun:test";
 import { analyzeCode, disposeAnalysisContext } from "./staticAnalysis";
+import { CODE_EXECUTION_STRING_GUIDANCE } from "@/constants/codeExecution";
 
 afterAll(() => {
   disposeAnalysisContext();
@@ -46,6 +47,27 @@ describe("staticAnalysis", () => {
       `);
       expect(result.valid).toBe(false);
       expect(result.errors[0].type).toBe("syntax");
+    });
+
+    test.each([
+      'return "first\nsecond";',
+      "return 'first\nsecond';",
+      'return "first\r\nsecond";',
+      'return "unfinished',
+    ])("adds quoting guidance to unterminated strings: %j", async (code) => {
+      const result = await analyzeCode(code);
+      expect(result.valid).toBe(false);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]).toMatchObject({ type: "syntax", line: 1 });
+      // Test diagnostic routing, not the wording of the shared guidance.
+      expect(result.errors[0].message).toContain(CODE_EXECUTION_STRING_GUIDANCE);
+    });
+
+    test("does not add string guidance to unrelated syntax errors", async () => {
+      const result = await analyzeCode('const s = "valid string";\nreturn @;');
+      expect(result.valid).toBe(false);
+      expect(result.errors[0]).toMatchObject({ type: "syntax", line: 2 });
+      expect(result.errors[0].message).not.toContain(CODE_EXECUTION_STRING_GUIDANCE);
     });
 
     test("await expression gives clear error message", async () => {

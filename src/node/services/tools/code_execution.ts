@@ -23,6 +23,7 @@ import {
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 
 import { analyzeCode } from "@/node/services/ptc/staticAnalysis";
+import { CODE_EXECUTION_STRING_GUIDANCE } from "@/constants/codeExecution";
 import { log } from "@/node/services/log";
 import { getCachedXumTypes, clearTypeCache } from "@/node/services/ptc/typeGenerator";
 import {
@@ -575,7 +576,8 @@ ${xumTypes}
         .string()
         .min(1)
         .describe(
-          "JavaScript code to execute. xum.* calls are synchronous—do not use await. mux.* is a compatibility alias. Use 'return' for final result."
+          "JavaScript code to execute. xum.* calls are synchronous—do not use await. mux.* is a compatibility alias. Use 'return' for final result. " +
+            CODE_EXECUTION_STRING_GUIDANCE
         ),
       timeout_secs: z
         .number()

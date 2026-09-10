@@ -10,6 +10,7 @@
  */
 
 import ts from "typescript";
+import { CODE_EXECUTION_STRING_GUIDANCE } from "@/constants/codeExecution";
 import {
   newQuickJSAsyncWASMModuleFromVariant,
   type QuickJSAsyncContext,
@@ -166,6 +167,12 @@ async function validateSyntax(code: string): Promise<AnalysisError | null> {
       typeof errorObj.message === "string" ? errorObj.message : JSON.stringify(errorObj);
 
     const rawLine = typeof errorObj.lineNumber === "number" ? errorObj.lineNumber : undefined;
+
+    // QuickJS stops at the first raw newline in a quoted script. Keep rejecting
+    // malformed code, but explain how to retry without silently rewriting shell text.
+    if (message === "unexpected end of string") {
+      message += `. Unterminated JavaScript string. ${CODE_EXECUTION_STRING_GUIDANCE}`;
+    }
 
     // Enhance obtuse "expecting ';'" error when await expression is detected.
     // In non-async context, `await foo()` parses as identifier `await` + stray `foo()`,
