@@ -1429,14 +1429,15 @@ export class MemoryService extends EventEmitter {
             // A pending record is a copy this adoption wrote but could not
             // finish recording (crash or sidecar failure after the write):
             // the file holding exactly those bytes now is that write, so its
-            // current identity is the generation to bind. A settled record
-            // keeps the stamp it recorded — identical bytes in a different
-            // generation are the owner's (deletion then preserves).
+            // current identity is the generation to bind — also when the
+            // record carries a stamp, which is then the generation an
+            // interrupted in-place replacement OVERWROTE (r75). A settled
+            // record keeps the stamp it recorded — identical bytes in a
+            // different generation are the owner's (deletion then preserves).
             record.targetStamp =
-              previous.targetStamp ??
-              (previous.pending === true
+              previous.pending === true
                 ? ((await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined)
-                : undefined);
+                : previous.targetStamp;
           } else if (
             previous.created === true &&
             priorContent !== null &&

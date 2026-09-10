@@ -1059,6 +1059,7 @@ describe("refinementRollback", () => {
     // directory endpoints map through their adopted descendants (all landed
     // at their own relPath as this adoption's copies).
     await fixture.service.create(fixture.ctx, "/memories/workspace/olddir/a.md", "a\n", "agent");
+    const olddirCreateRow = await lastRow(fixture.sessionDir);
     await fixture.service.rename(
       fixture.ctx,
       "/memories/workspace/olddir",
@@ -1128,6 +1129,54 @@ describe("refinementRollback", () => {
       await fsPromises.readFile(path.join(ownerSessionDir, "memory", "olddir", "a.md"), "utf-8")
     ).toBe("a\n");
     expect(await pathExists(path.join(ownerSessionDir, "memory", "newdir"))).toBe(false);
+    // The generation moved with the file (r75): the vacated side's record
+    // loses its stamp, the tombstoned source record takes the moved file's —
+    // so the child's older rows at the restored name still map.
+    const afterRename = await readLegacyAdoptionManifest(
+      legacyAdoptionManifestPath(fixture.sessionDir)
+    );
+    expect(afterRename.get("newdir/a.md")!.targetStamp).toBeUndefined();
+    expect(afterRename.get("olddir/a.md")!.targetStamp).toBe(
+      (await adoptionTargetStamp(path.join(ownerRoot, "olddir", "a.md"))) ?? undefined
+    );
+    const undoneOlddirCreate = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: olddirCreateRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(undoneOlddirCreate.success).toBe(true);
+    expect(await pathExists(path.join(ownerRoot, "olddir", "a.md"))).toBe(false);
+    // A rename made BEFORE the first upgrade: adoption recorded only the
+    // post-rename names, so the inverse's destination (the vacated name) has
+    // no record — it still maps beside the adopted copies (r75).
+    await fixture.service.create(fixture.ctx, "/memories/workspace/dir2/b.md", "b\n", "agent");
+    await fixture.service.rename(
+      fixture.ctx,
+      "/memories/workspace/dir2",
+      "/memories/workspace/dir3",
+      "agent"
+    );
+    const firstUpgradeRenameRow = await lastRow(fixture.sessionDir);
+    await fsPromises.mkdir(path.join(ownerRoot, "dir3"), { recursive: true });
+    await fsPromises.writeFile(path.join(ownerRoot, "dir3", "b.md"), "b\n");
+    await writeManifest({
+      "dir3/b.md": { content: "x", sidecar: "", target: "dir3/b.md", created: true },
+    });
+    const undoneFirstUpgradeRename = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: firstUpgradeRenameRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(undoneFirstUpgradeRename.success).toBe(true);
+    expect(await fsPromises.readFile(path.join(ownerRoot, "dir2", "b.md"), "utf-8")).toBe("b\n");
+    expect(await pathExists(path.join(ownerRoot, "dir3"))).toBe(false);
+    expect(
+      (await readLegacyAdoptionManifest(legacyAdoptionManifestPath(fixture.sessionDir))).get(
+        "dir3/b.md"
+      )!.targetStamp
+    ).toBeUndefined();
   });
 
   it("journals the rollback row before releasing the target locks (no durable-order inversion)", async () => {

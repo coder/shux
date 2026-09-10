@@ -2606,6 +2606,44 @@ describe("MemoryService", () => {
       });
       expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v3");
       expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      // A crash after the replacement write but before the settled manifest:
+      // the pending record still carries the OVERWRITTEN generation's stamp.
+      // The retry binds the replacement on disk (r75) — settling the stale
+      // stamp would refuse the child's rollbacks as "replaced" and leave the
+      // copy behind when the source is deleted.
+      const settled2 = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { content: string; sidecar: string; target: string; targetStamp?: string }
+        >
+      )["note.md"];
+      expect(settled2.targetStamp).toBeDefined();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v3-replaced");
+      await fsPromises.writeFile(path.join(ownerRoot, "note.md"), "v3-replaced");
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({
+          "note.md": { ...settled2, pending: true, replacementContent: sha256Hex("v3-replaced") },
+        })
+      );
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).listIndexEntries({
+        ...fixture.ctx,
+      });
+      const rebound = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { pending?: boolean; targetStamp?: string }
+        >
+      )["note.md"];
+      expect(rebound.pending).toBeUndefined();
+      expect(rebound.targetStamp).not.toBe(settled2.targetStamp);
+      expect(rebound.targetStamp).toBe(
+        (await adoptionTargetStamp(path.join(ownerRoot, "note.md"))) ?? undefined
+      );
       // The opposite crash window: the replacement bytes landed but the final
       // manifest write did not, and the downgraded build deletes the source
       // before the retry. The pending record names both hashes, so the copy

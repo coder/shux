@@ -1268,8 +1268,9 @@ export async function rollbackRefinement(
       // after a failed apply — compensated are new generations of the files;
       // re-stamp them so the child's remaining rows over the same notes still
       // map (createLegacyPathRemapper refuses a copy that is no longer the
-      // recorded generation). A rename keeps inode and mtime, so it needs
-      // none. Still under the owner-store lock.
+      // recorded generation). A rename keeps inode and mtime but moves the
+      // generation to the other endpoint's records (r75). Still under the
+      // owner-store lock.
       const restampAdoptedCopies = async (): Promise<void> => {
         if (remap === identityRemapper) return;
         assert(opts.sharedWorkspaceMemorySessionDir !== undefined);
@@ -1277,7 +1278,11 @@ export async function rollbackRefinement(
           await refreshLegacyAdoptionTargetStamps({
             childSessionDir: opts.sessionDir,
             ownerSessionDir: opts.sharedWorkspaceMemorySessionDir,
-            paths: [...applied.restored, ...applied.deleted],
+            paths: [
+              ...applied.restored,
+              ...applied.deleted,
+              ...(applied.renamed === undefined ? [] : [applied.renamed.from, applied.renamed.to]),
+            ],
           });
         } catch (error) {
           // Stale stamps only refuse later rollbacks (force overrides).

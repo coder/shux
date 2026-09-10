@@ -289,12 +289,17 @@ export async function createLegacyPathRemapper(args: {
   // is current while its target stays absent — or holds the generation a
   // retargeted rollback recreated there (re-stamped below); anything else at
   // that path is the owner's.
-  const currentGeneration = new Set<string>();
+  // Value: whether that generation is a file on disk (a tombstoned record
+  // whose copy a rollback restored counts as present).
+  const currentGeneration = new Map<string, "present" | "absent">();
   for (const [rel, record] of adopted) {
     if (record.created !== true || record.pending === true) continue;
     const stamp = await adoptionTargetStamp(path.join(ownerRoot, ...record.target.split("/")));
-    const stampCurrent = record.targetStamp !== undefined && stamp === record.targetStamp;
-    if (stampCurrent || (record.deleted === true && stamp === null)) currentGeneration.add(rel);
+    if (record.targetStamp !== undefined && stamp === record.targetStamp) {
+      currentGeneration.set(rel, "present");
+    } else if (record.deleted === true && stamp === null) {
+      currentGeneration.set(rel, "absent");
+    }
   }
   const ownerSubtreeExact = new Map<string, boolean>();
   const directoryPrefixes = new Set<string>();
@@ -310,7 +315,7 @@ export async function createLegacyPathRemapper(args: {
       ([rel, entry]) => entry.target === rel && currentGeneration.has(rel)
     );
     const expected = new Set(
-      descendants.filter(([, entry]) => entry.deleted !== true).map(([rel]) => rel)
+      descendants.filter(([rel]) => currentGeneration.get(rel) === "present").map(([rel]) => rel)
     );
     ownerSubtreeExact.set(
       dirRel,
@@ -321,10 +326,14 @@ export async function createLegacyPathRemapper(args: {
         )
     );
   }
-  const remapPath = (filePath: string): string => {
+  const legacyRelPath = (filePath: string): string | null => {
     const relative = path.relative(legacyRoot, path.resolve(filePath));
-    if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return filePath;
-    const relPath = relative.split(path.sep).join("/");
+    if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+    return relative.split(path.sep).join("/");
+  };
+  const remapPath = (filePath: string): string => {
+    const relPath = legacyRelPath(filePath);
+    if (relPath === null) return filePath;
     const record = adopted.get(relPath);
     if (record === undefined) {
       // A directory endpoint (a pre-sharing directory rename): the manifest
@@ -343,14 +352,29 @@ export async function createLegacyPathRemapper(args: {
     if (!currentGeneration.has(relPath)) throw new LegacyPathNotAdoptedError(filePath, "replaced");
     return path.join(ownerRoot, ...record.target.split("/"));
   };
+  // The destination of a rename INVERSE is the name the child's rename
+  // vacated. A rename made before the first upgrade leaves no record for it
+  // (adoption saw only the post-rename names), yet the row is still
+  // rollbackable once its `from` side maps (r75): the vacated name lands
+  // beside the adopted copies. The engine requires it absent before moving,
+  // so an owner note there refuses like for any rename.
+  const remapRenameDestination = (filePath: string): string => {
+    const relPath = legacyRelPath(filePath);
+    if (relPath === null || adopted.has(relPath) || directoryPrefixes.has(relPath)) {
+      return remapPath(filePath);
+    }
+    return path.join(ownerRoot, ...relPath.split("/"));
+  };
   return {
     path: remapPath,
     inverse: (inverse) => {
       switch (inverse.op) {
         case "delete-files":
           return { ...inverse, paths: inverse.paths.map(remapPath) };
-        case "rename":
-          return { ...inverse, from: remapPath(inverse.from), to: remapPath(inverse.to) };
+        case "rename": {
+          const from = remapPath(inverse.from);
+          return { ...inverse, from, to: remapRenameDestination(inverse.to) };
+        }
         case "restore-files":
           return {
             ...inverse,
@@ -369,8 +393,12 @@ export async function createLegacyPathRemapper(args: {
  * applying a RETARGETED inverse (createLegacyPathRemapper mapped the child's
  * legacy paths onto them): the write is the child's own lineage acting, so
  * the new generation stays mappable for the child's remaining rows over the
- * same note (create + edit unwind LIFO). Runs under the owner store's mutation
- * lock the engine holds (the lock adoption passes take too). A target that is
+ * same note (create + edit unwind LIFO). `paths` may be directories (a rename
+ * endpoint): every record whose target lies beneath is re-stamped, so after a
+ * retargeted rename the vacated side's records lose their stamp and the
+ * restored side's (tombstoned by the downgraded build's rename) take the
+ * moved files' generation (r75). Runs under the owner store's mutation lock
+ * the engine holds (the lock adoption passes take too). A target that is
  * gone loses its stamp — nothing maps there until adoption places the note
  * anew. Best-effort by contract: a failure here only leaves stale stamps,
  * which refuse (never mutate) later.
@@ -394,7 +422,10 @@ export async function refreshLegacyAdoptionTargetStamps(args: {
   let dirty = false;
   for (const record of adopted.values()) {
     if (record.created !== true || record.pending === true) continue;
-    if (!touched.has(record.target)) continue;
+    const beneathTouched = [...touched].some(
+      (rel) => record.target === rel || record.target.startsWith(`${rel}/`)
+    );
+    if (!beneathTouched) continue;
     const stamp =
       (await adoptionTargetStamp(path.join(ownerRoot, ...record.target.split("/")))) ?? undefined;
     if (stamp === record.targetStamp) continue;
