@@ -230,4 +230,30 @@ describe("validateJsonSchemaSubset", () => {
       ],
     });
   });
+
+  test("does not retain compiled schemas in the Ajv registry", () => {
+    // Two different schemas that share an `$id` would collide in Ajv's registry
+    // if each compiled schema stayed registered after compilation.
+    const id = "urn:xum:test:shared-id";
+    expect(validateJsonSchemaSubset({ $id: id, type: "string" }, "text")).toEqual({
+      success: true,
+    });
+    expect(validateJsonSchemaSubset({ $id: id, type: "number" }, 1)).toEqual({ success: true });
+  });
+
+  test("keeps validating correctly once the compiled-validator cache has evicted entries", () => {
+    const first = { type: "object", properties: { keep: { const: "first" } } };
+    expect(validateJsonSchemaSubset(first, { keep: "first" })).toEqual({ success: true });
+
+    // More distinct schemas than the cache holds, so `first` is evicted and
+    // later recompiled.
+    for (let i = 0; i < 600; i += 1) {
+      expect(validateJsonSchemaSubset({ type: "integer", minimum: i }, i)).toEqual({
+        success: true,
+      });
+    }
+
+    expect(validateJsonSchemaSubset(first, { keep: "first" })).toEqual({ success: true });
+    expect(validateJsonSchemaSubset(first, { keep: "other" }).success).toBe(false);
+  });
 });

@@ -19,6 +19,13 @@ export function formatJsonSchemaValidationErrors(
 }
 
 const ajv = new Ajv({ allErrors: true, strict: false, validateSchema: true });
+
+// Compiled validators are reused by schema text so repeated validation of one
+// schema skips Ajv code generation. Schemas can come from third parties (an MCP
+// server may return fresh tool schemas on every catalog refresh), so the cache
+// is bounded: least-recently-used entries are evicted, and Ajv's own per-object
+// registry is released right after compilation so only this map retains code.
+const VALIDATOR_CACHE_MAX_ENTRIES = 512;
 const validatorCache = new Map<string, ValidateFunction>();
 
 export function validateJsonSchemaSubsetSchema(
@@ -84,10 +91,26 @@ function compileSchema(schema: unknown): ValidateFunction {
   const key = JSON.stringify(schema);
   const cached = validatorCache.get(key);
   if (cached != null) {
+    // Re-insert so Map iteration order doubles as recency order.
+    validatorCache.delete(key);
+    validatorCache.set(key, cached);
     return cached;
   }
-  const validate = ajv.compile(schema as AnySchema);
+  let validate: ValidateFunction;
+  try {
+    validate = ajv.compile(schema as AnySchema);
+  } finally {
+    // Ajv registers every compiled schema object (and its `$id`) for `$ref`
+    // resolution; `$ref` is rejected above, so the compiled closure stands alone.
+    ajv.removeSchema(schema as AnySchema);
+  }
   validatorCache.set(key, validate);
+  if (validatorCache.size > VALIDATOR_CACHE_MAX_ENTRIES) {
+    const oldest = validatorCache.keys().next().value;
+    if (oldest != null) {
+      validatorCache.delete(oldest);
+    }
+  }
   return validate;
 }
 
