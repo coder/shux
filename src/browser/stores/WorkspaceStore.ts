@@ -766,18 +766,13 @@ export class WorkspaceStore {
   // abort/error transitions (streaming=false without recency advance).
   private activityStreamingStartRecency = new Map<string, number>();
   private activityAbortController: AbortController | null = null;
-  // True once the initial activity.list() snapshot has been applied (or the
-  // subscription failed and we self-healed). Until then, "no other workspace
-  // is streaming" is merely unknown — the chat view's first-paint barrier
-  // (useChatViewDataReady) waits on this rather than treating unknown activity as idle.
-  private activityHydrated = false;
   private activityAuthoritative = false;
   // Workspace ids that received a live subscription delta while a bootstrap-retry
   // list() read was in flight (null while no retry read is pending). Those deltas
   // are newer than the pending list response, which must not overwrite or clear
   // them (see retryActivityBootstrapList).
   private activityDeltaTouchesDuringRetry: Set<string> | null = null;
-  private activityHydratedListeners = new Set<() => void>();
+  private activityAuthoritativeListeners = new Set<() => void>();
   // Workspaces whose persisted session usage fetch has settled (success or
   // failure). Distinguishes "usage unknown" from "no usage" for the same
   // first-paint barrier (CompactionWarning derives from usage).
@@ -3506,36 +3501,25 @@ export class WorkspaceStore {
   }
 
   /**
-   * Hydrated means the first-paint barrier may release — including the bootstrap
-   * FAILURE path, which self-heals without activity data. Authoritative is set only
-   * when a real activity snapshot list was applied ({} from an all-idle backend
-   * counts; the null read-failure signal does not), so consumers that must not
-   * mistake failure-path state for "no activity" (e.g. the Workflows tab
-   * auto-activation baseline) gate on it instead.
+   * Only a real activity list (including an empty one) establishes a baseline.
+   * Bootstrap failure must not be mistaken for "no activity" by the Workflows tab.
    */
-  private markActivityHydrated(authoritative: boolean): void {
-    const hydratedChanged = !this.activityHydrated;
-    const authoritativeChanged = authoritative && !this.activityAuthoritative;
-    if (!hydratedChanged && !authoritativeChanged) {
+  private markActivityAuthoritative(): void {
+    if (this.activityAuthoritative) {
       return;
     }
-    this.activityHydrated = true;
-    if (authoritative) {
-      this.activityAuthoritative = true;
-    }
-    for (const listener of this.activityHydratedListeners) {
+    this.activityAuthoritative = true;
+    for (const listener of this.activityAuthoritativeListeners) {
       listener();
     }
   }
 
-  isActivityHydrated = (): boolean => this.activityHydrated;
-
   isActivityAuthoritative = (): boolean => this.activityAuthoritative;
 
-  subscribeActivityHydrated = (listener: () => void): (() => void) => {
-    this.activityHydratedListeners.add(listener);
+  subscribeActivityAuthoritative = (listener: () => void): (() => void) => {
+    this.activityAuthoritativeListeners.add(listener);
     return () => {
-      this.activityHydratedListeners.delete(listener);
+      this.activityAuthoritativeListeners.delete(listener);
     };
   };
 
@@ -3567,8 +3551,10 @@ export class WorkspaceStore {
         if (attemptSignal.aborted) return { retryImmediately: true };
         queueMicrotask(() => {
           if (signal.aborted || attemptSignal.aborted) return;
-          if (snapshots != null) this.applyWorkspaceActivityList(snapshots);
-          this.markActivityHydrated(snapshots != null);
+          if (snapshots != null) {
+            this.applyWorkspaceActivityList(snapshots);
+            this.markActivityAuthoritative();
+          }
         });
         if (snapshots == null) void this.retryActivityBootstrapList(client, signal, attemptSignal);
         return { events: iterator, context: undefined };
@@ -3590,7 +3576,6 @@ export class WorkspaceStore {
             console.warn("[WorkspaceStore] activity subscription aborted; retrying...");
         } else if (!abortError) {
           console.warn("[WorkspaceStore] Error in activity subscription:", error);
-          this.markActivityHydrated(false);
         }
       },
     });
@@ -3654,7 +3639,7 @@ export class WorkspaceStore {
           return;
         }
         this.applyWorkspaceActivityList(appliedSnapshots, deltaTracker);
-        this.markActivityHydrated(true);
+        this.markActivityAuthoritative();
       });
       return;
     }
@@ -5252,22 +5237,13 @@ export function useSessionUsageKnown(workspaceId: string): boolean {
 }
 
 /**
- * True once the initial cross-workspace activity snapshot has been applied
- * (or its subscription self-healed after failure). See activityHydrated.
- */
-export function useWorkspaceActivityHydrated(): boolean {
-  const store = getStoreInstance();
-  return useSyncExternalStore(store.subscribeActivityHydrated, store.isActivityHydrated);
-}
-
-/**
  * True only after a REAL activity snapshot list was applied — never via the
  * failure-path self-heal. Gate logic that must not misread the empty failure-path
- * map as "no activity" (e.g. auto-activation baselines) on this, not on hydrated.
+ * map as "no activity" (e.g. auto-activation baselines) on this.
  */
 export function useWorkspaceActivityAuthoritative(): boolean {
   const store = getStoreInstance();
-  return useSyncExternalStore(store.subscribeActivityHydrated, store.isActivityAuthoritative);
+  return useSyncExternalStore(store.subscribeActivityAuthoritative, store.isActivityAuthoritative);
 }
 
 /** Rounded chrome value: identical raw-stat updates keep the snapshot primitive stable. */

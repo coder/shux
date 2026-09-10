@@ -3,10 +3,76 @@
 // behavior at module-eval time based on `globalThis.document`. Without this, running
 // this file first in a shared bun test process poisons those cached modules for every
 // later UI test file (see tests/ui/dom.ts bootstrap comment).
-import "../../../../tests/ui/dom";
+import { installDom } from "../../../../tests/ui/dom";
 
-import { describe, expect, test } from "bun:test";
-import { computeChatViewReveal } from "./useChatViewDataReady";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { cleanup, renderHook } from "@testing-library/react";
+import * as APIModule from "@/browser/contexts/API";
+import * as BackgroundBashStore from "@/browser/stores/BackgroundBashStore";
+import * as ProvidersConfigStore from "@/browser/stores/ProvidersConfigStore";
+import * as WorkspaceStore from "@/browser/stores/WorkspaceStore";
+import * as InstructionsStore from "@/browser/utils/additionalSystemContextStore";
+import { computeChatViewReveal, useChatViewDataReady } from "./useChatViewDataReady";
+
+describe("useChatViewDataReady", () => {
+  let cleanupDom: () => void;
+  let known: Record<"backgroundBash" | "providers" | "usage" | "instructions", boolean>;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    known = { backgroundBash: true, providers: true, usage: true, instructions: true };
+    spyOn(APIModule, "useAPI").mockReturnValue({
+      status: "connecting",
+      api: null,
+      error: null,
+      authenticate: mock(),
+      retry: mock(),
+    });
+    spyOn(BackgroundBashStore, "useBackgroundBashStateKnown").mockImplementation(
+      () => known.backgroundBash
+    );
+    spyOn(ProvidersConfigStore, "useProvidersConfigLoaded").mockImplementation(
+      () => known.providers
+    );
+    spyOn(WorkspaceStore, "useSessionUsageKnown").mockImplementation(() => known.usage);
+    spyOn(InstructionsStore, "useAdditionalSystemContextHydrated").mockImplementation(
+      () => known.instructions
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+    mock.restore();
+    cleanupDom();
+  });
+
+  test("reveals an empty chat immediately without initializing cross-workspace activity", () => {
+    // No WorkspaceStore singleton or activity subscription exists. Only layout-affecting
+    // decoration sources are ready; unrelated activity must not require the timeout fallback.
+    const { result } = renderHook(() => useChatViewDataReady("workspace"));
+    expect(result.current).toBe(true);
+    expect(
+      computeChatViewReveal({
+        isHydratingTranscript: false,
+        chatViewDataReady: result.current,
+        hasRenderableMessages: false,
+        shouldShowStreamingBarrier: false,
+      })
+    ).toEqual({ showHydrationPlaceholder: false, revealDecorations: true });
+  });
+
+  test.each(["backgroundBash", "providers", "usage", "instructions"] as const)(
+    "still waits for the %s decoration source",
+    (source) => {
+      known[source] = false;
+      const { result, rerender } = renderHook(() => useChatViewDataReady("workspace"));
+      expect(result.current).toBe(false);
+      known[source] = true;
+      rerender();
+      expect(result.current).toBe(true);
+    }
+  );
+});
 
 // These cover the reveal *decision* (the branching that makes the chat view
 // mount transcript + decorations in one commit); the per-source known-flags
