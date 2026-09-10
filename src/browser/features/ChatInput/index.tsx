@@ -289,7 +289,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isTranscriptCaughtUp =
     variant === "workspace" ? (props.isTranscriptCaughtUp ?? false) : false;
   const isStreamStarting = variant === "workspace" ? (props.isStreamStarting ?? false) : false;
-  const hasPendingSend = variant === "workspace" ? (props.hasPendingSend ?? false) : false;
   const isCompacting = variant === "workspace" ? (props.isCompacting ?? false) : false;
   const [isMobileTouch, setIsMobileTouch] = useState(
     () =>
@@ -766,12 +765,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Creation sends also pass through the async resolution phase guarded by
   // sendingCount, so include it alongside the creation-specific flag.
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
-  // Stream startup lets follow-ups queue behind a slow turn, but never while a send is still
-  // unacknowledged: a second send would replace the pending row.
   const sendInFlightBlocksInput =
-    variant === "workspace"
-      ? (isSendInFlight && !isStreamStarting) || hasPendingSend
-      : isSendInFlight;
+    variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -2048,7 +2043,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const preSendDraft = { ...getDraft(), attachments: sendAttachments };
       const preSendReviews = draftReviews;
       const editMessageForSend = editingMessageForUi;
-      let pendingSendId: string | null = null;
 
       try {
         // Prepare file parts if any
@@ -2157,20 +2151,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           inputRef.current.style.height = "";
         }
 
-        // Keep the message visible in the transcript tail until the backend echoes it back;
-        // otherwise it vanishes for the whole round-trip on a slow connection. A successful
-        // response must not clear it: the acknowledgement event can land a frame later.
-        pendingSendId = `pending-send-${Date.now()}`;
-        store.beginPendingSend(props.workspaceId, {
-          id: pendingSendId,
-          // Staged files only exist in the persisted text as the attachment notice.
-          content: appendStagedNoticeToUserMessage
-            ? appendStagedAttachmentNotice(messageText, sendAttachments)
-            : messageText,
-          fileParts: sendFileParts,
-          reviews: reviewsData,
-        });
-
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 
         const result = await api.workspace.sendMessage({
@@ -2185,12 +2165,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // Show error using enhanced toast
           setToast(createErrorToast(result.error));
           // Restore draft on error so user can try again
-          store.clearPendingSend(props.workspaceId, pendingSendId);
           setOptimisticallyDismissedEditId(null);
           setDraft(preSendDraft);
           setDraftReviews(preSendReviews);
         } else {
-          store.markPendingSendAccepted(props.workspaceId, pendingSendId);
           // Track telemetry for successful message send
           telemetry.messageSent(
             props.workspaceId,
@@ -2240,9 +2218,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           })
         );
         // Restore draft on error
-        if (pendingSendId !== null) {
-          store.clearPendingSend(props.workspaceId, pendingSendId);
-        }
         setOptimisticallyDismissedEditId(null);
         setDraft(preSendDraft);
         setDraftReviews(preSendReviews);

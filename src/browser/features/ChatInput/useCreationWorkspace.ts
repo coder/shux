@@ -503,7 +503,6 @@ export function useCreationWorkspace({
       );
 
       let createdWorkspaceId: string | null = null;
-      let pendingSendId: string | null = null;
 
       try {
         // Wait for identity generation to complete (blocks if still in progress)
@@ -691,34 +690,6 @@ export function useCreationWorkspace({
           markPendingInitialSend: initialSlashCommand == null,
         });
 
-        // SendMessageOptions.muxMetadata is a black box (z.any); the creation
-        // caller only ever passes XumMessageMetadata built in ChatInput.
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-        const overrideMuxMetadata: MuxMessageMetadata | undefined = optionsOverride?.muxMetadata;
-        const overrideRawCommand =
-          overrideMuxMetadata &&
-          "rawCommand" in overrideMuxMetadata &&
-          typeof overrideMuxMetadata.rawCommand === "string"
-            ? overrideMuxMetadata.rawCommand
-            : null;
-
-        // Runtime startup can take minutes; keep the initial message visible in the new
-        // transcript until the backend echoes it. Files awaiting staging show as inert chips
-        // until the staged notice replaces them below.
-        pendingSendId = `pending-send-${Date.now()}`;
-        const pendingDisplayText = overrideRawCommand ?? messageText;
-        if (initialSlashCommand == null) {
-          workspaceStore.beginPendingSend(metadata.id, {
-            id: pendingSendId,
-            content: pendingDisplayText,
-            fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
-            stagingFilenames:
-              pendingFilesToStage.length > 0
-                ? pendingFilesToStage.map((file) => file.filename)
-                : undefined,
-          });
-        }
-
         if (typeof draftId === "string" && draftId.trim().length > 0 && promoteWorkspaceDraft) {
           // UI-only: show the created workspace in-place where the draft was rendered.
           promoteWorkspaceDraft(projectPath, draftId, metadata);
@@ -736,16 +707,19 @@ export function useCreationWorkspace({
             : { staged: [], failures: [] };
         const stagingFailed = stagingOutcome.failures.length > 0;
 
-        if (stagingOutcome.staged.length > 0 && !stagingFailed) {
-          workspaceStore.updatePendingSend(metadata.id, {
-            id: pendingSendId,
-            content: appendStagedAttachmentNotice(pendingDisplayText, stagingOutcome.staged),
-            fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
-          });
-        }
+        // SendMessageOptions.muxMetadata is a black box (z.any); the creation
+        // caller only ever passes XumMessageMetadata built in ChatInput.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        const overrideMuxMetadata: MuxMessageMetadata | undefined = optionsOverride?.muxMetadata;
+        const overrideRawCommand =
+          overrideMuxMetadata &&
+          "rawCommand" in overrideMuxMetadata &&
+          typeof overrideMuxMetadata.rawCommand === "string"
+            ? overrideMuxMetadata.rawCommand
+            : null;
 
         if (stagingFailed) {
-          workspaceStore.clearPendingInitialSendState(metadata.id, pendingSendId);
+          workspaceStore.clearPendingInitialSendState(metadata.id);
           // Fail closed: a partial notice would misrepresent the workspace
           // contents. Transfer the draft (staged results kept, failed files
           // still pending) so the user can retry from the workspace composer.
@@ -798,7 +772,7 @@ export function useCreationWorkspace({
           setIsSending(false);
 
           if (commandResult.inputDisposition !== "consume") {
-            workspaceStore.clearPendingInitialSendState(metadata.id, pendingSendId);
+            workspaceStore.clearPendingInitialSendState(metadata.id);
             return { success: false };
           }
 
@@ -862,7 +836,7 @@ export function useCreationWorkspace({
 
         if (!sendResult.success) {
           if (createdWorkspaceId) {
-            workspaceStore.clearPendingInitialSendState(createdWorkspaceId, pendingSendId);
+            workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
           }
           if (stagingOutcome.staged.length > 0) {
             // The creation draft was already cleared; without a transferred
@@ -885,11 +859,10 @@ export function useCreationWorkspace({
           return { success: false, error: sendResult.error };
         }
 
-        workspaceStore.markPendingSendAccepted(metadata.id, pendingSendId);
         return { success: true };
       } catch (err) {
         if (createdWorkspaceId) {
-          workspaceStore.clearPendingInitialSendState(createdWorkspaceId, pendingSendId);
+          workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
         }
         const errorMessage = getErrorMessage(err);
         setToast({

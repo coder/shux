@@ -1,11 +1,6 @@
 import assert from "@/common/utils/assert";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
-import type {
-  MuxMessage,
-  DisplayedMessage,
-  PendingSendMessage,
-  QueuedMessage,
-} from "@/common/types/message";
+import type { MuxMessage, DisplayedMessage, QueuedMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal";
 import type {
@@ -192,7 +187,6 @@ export interface WorkspaceState {
   name: string; // User-facing workspace name (e.g., "feature-branch")
   messages: DisplayedMessage[];
   queuedMessage: QueuedMessage | null;
-  pendingSend: PendingSendMessage | null;
   canInterrupt: boolean;
   isCompacting: boolean;
   isStreamStarting: boolean;
@@ -364,35 +358,6 @@ export interface WorkflowToolLiveRunState {
   run?: WorkflowRunRecord;
 }
 
-interface PendingSendState {
-  message: PendingSendMessage;
-  /**
-   * User echoes already in the transcript when the send began; null when begun before catch-up,
-   * in which case only the request result can tell the echo apart from replayed history.
-   */
-  knownUserEchoIds: Set<string> | null;
-  /** The send request succeeded, so any later replay is guaranteed to contain its echo. */
-  accepted: boolean;
-  /** Visible queue payload size when the send began; growth by acceptance means it was queued. */
-  queueSizeAtBegin: number;
-  /** Queued card identity when the send began; a different card at equal size replaced it. */
-  queuedMessageIdAtBegin: string | null;
-  /** A synthetic user row (pre-send compaction) took the turn; the echo follows that turn. */
-  deferredBehindSyntheticTurn: boolean;
-}
-
-/**
- * A persisted user turn the backend emits in response to a send. Synthetic rows and
- * agent-initiated turns (hidden queue entries) are not echoes.
- */
-function isUserEcho(message: MuxMessage): boolean {
-  return (
-    message.role === "user" &&
-    message.metadata?.synthetic !== true &&
-    message.metadata?.retrySendOptions?.agentInitiated !== true
-  );
-}
-
 interface WorkspaceChatTransientState {
   caughtUp: boolean;
   isHydratingTranscript: boolean;
@@ -400,11 +365,6 @@ interface WorkspaceChatTransientState {
   pendingStreamEvents: WorkspaceChatMessage[];
   replayingHistory: boolean;
   queuedMessage: QueuedMessage | null;
-  /** Visible queue payload size from the last queue update, to tell drains from new enqueues. */
-  queuedMessageCount: number;
-  /** Dispatched queue entries whose user rows have not arrived yet; they are not send echoes. */
-  queueDispatchesAwaitingEcho: number;
-  pendingSend: PendingSendState | null;
   liveBashOutput: Map<string, LiveBashOutputInternal>;
   liveAdvisorOutput: Map<string, AdvisorLiveOutputState>;
   liveAdvisorReasoning: Map<string, AdvisorLiveReasoningState>;
@@ -516,9 +476,6 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     pendingStreamEvents: [],
     replayingHistory: false,
     queuedMessage: null,
-    queuedMessageCount: 0,
-    queueDispatchesAwaitingEcho: 0,
-    pendingSend: null,
     liveBashOutput: new Map(),
     liveAdvisorOutput: new Map(),
     liveAdvisorReasoning: new Map(),
@@ -932,8 +889,6 @@ export class WorkspaceStore {
     ) => void
   > = {
     "stream-start": (workspaceId, aggregator, data) => {
-      // Every dispatched entry echoes before its stream starts, so nothing is still owed.
-      this.assertChatTransientState(workspaceId).queueDispatchesAwaitingEcho = 0;
       applyWorkspaceChatEventToAggregator(aggregator, data);
       if (this.onModelUsed) {
         this.onModelUsed((data as { model: string }).model);
@@ -1025,7 +980,6 @@ export class WorkspaceStore {
       const streamAbortData = data as StreamAbortEvent;
       applyWorkspaceChatEventToAggregator(aggregator, streamAbortData);
       this.releaseStreamingMessageChannel(workspaceId);
-      this.retirePendingSendAfterAbandonedTurn(workspaceId);
 
       // Track stream interruption telemetry (get model from aggregator)
       const model = aggregator.getCurrentModel();
@@ -1206,32 +1160,11 @@ export class WorkspaceStore {
       // Mirror the queue signal onto active streams so response notifications follow
       // user-visible terminal turns instead of every intermediate handoff.
       aggregator.setActiveQueuedFollowUp(data.hasQueuedMessages ?? queuedMessage !== null);
-      const transient = this.assertChatTransientState(workspaceId);
-      transient.queuedMessage = queuedMessage;
-      const pending = transient.pendingSend;
-      // Attachment-only entries add no text, so size the queue by every visible payload kind.
-      const nextCount =
-        data.queuedMessages.length + (data.fileParts?.length ?? 0) + (data.reviews?.length ?? 0);
-      if (transient.caughtUp && !transient.replayingHistory) {
-        if (nextCount < transient.queuedMessageCount) {
-          // One dispatched entry per shrink, however many batched strings it carried.
-          transient.queueDispatchesAwaitingEcho += 1;
-        } else if (
-          pending &&
-          (nextCount > transient.queuedMessageCount || (pending.accepted && queuedMessage))
-        ) {
-          // The send landed in the backend queue; the queued card takes over from the pending row.
-          transient.pendingSend = null;
-        }
-      }
-      transient.queuedMessageCount = nextCount;
+      this.assertChatTransientState(workspaceId).queuedMessage = queuedMessage;
       this.states.bump(workspaceId);
     },
-    "restore-to-input": (workspaceId, _aggregator, data) => {
+    "restore-to-input": (_workspaceId, _aggregator, data) => {
       if (!isRestoreToInput(data)) return;
-
-      // The queue was cleared, not dispatched; the shrink that preceded this owes no echo.
-      this.assertChatTransientState(workspaceId).queueDispatchesAwaitingEcho = 0;
 
       // Use UPDATE_CHAT_INPUT event with mode="replace"
       window.dispatchEvent(
@@ -2368,7 +2301,6 @@ export class WorkspaceStore {
         name: metadata?.name ?? workspaceId, // Fall back to ID if metadata missing
         messages: displayedMessages,
         queuedMessage: transient.queuedMessage,
-        pendingSend: transient.pendingSend?.message ?? null,
         canInterrupt,
         isCompacting: aggregator.isCompacting(),
         isStreamStarting,
@@ -2707,15 +2639,6 @@ export class WorkspaceStore {
           mode: "append",
           skipDerivedState: true,
         });
-        // Older rows predate any pending send; never let a later replay mistake them for its echo.
-        const known = this.chatTransientState.get(workspaceId)?.pendingSend?.knownUserEchoIds;
-        if (known) {
-          for (const message of historicalMessages) {
-            if (isUserEcho(message)) {
-              known.add(message.id);
-            }
-          }
-        }
         this.consumerManager.scheduleCalculation(workspaceId, aggregator);
       }
 
@@ -3830,10 +3753,6 @@ export class WorkspaceStore {
     if (previousTransient?.isHydratingTranscript) {
       nextTransient.isHydratingTranscript = true;
     }
-    // A send begun before the first replay (new workspace) is retired by the replay itself.
-    nextTransient.pendingSend = previousTransient?.pendingSend ?? null;
-    // Dispatched entries still owe their echoes after the replay too.
-    nextTransient.queueDispatchesAwaitingEcho = previousTransient?.queueDispatchesAwaitingEcho ?? 0;
 
     this.chatTransientState.set(workspaceId, nextTransient);
 
@@ -4094,171 +4013,14 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
   }
 
-  clearPendingInitialSendState(workspaceId: string, pendingSendId?: string | null): void {
-    if (pendingSendId != null) {
-      this.clearPendingSend(workspaceId, pendingSendId);
-    }
-
-    // Only the optimistic barrier belongs to the creation send; an echoed later send owns it after.
+  clearPendingInitialSendState(workspaceId: string): void {
     const aggregator = this.aggregators.get(workspaceId);
-    if (
-      aggregator?.getPendingStreamStartTime() == null ||
-      !aggregator.isOptimisticPendingStreamStart()
-    ) {
+    if (aggregator?.getPendingStreamStartTime() == null) {
       return;
     }
 
     aggregator.clearPendingStreamStart();
     this.states.bump(workspaceId);
-  }
-
-  /**
-   * Show the composer content in the transcript tail while the send request is in flight.
-   * Retired by the backend acknowledgement (a user echo or a queue update), by a replay that
-   * must contain the echo, or by clearPendingSend after a failed send.
-   */
-  beginPendingSend(workspaceId: string, message: PendingSendMessage): void {
-    const transient = this.chatTransientState.get(workspaceId);
-    const aggregator = this.aggregators.get(workspaceId);
-    if (!transient || !aggregator) {
-      return;
-    }
-
-    transient.pendingSend = {
-      message,
-      knownUserEchoIds: transient.caughtUp
-        ? new Set(
-            aggregator
-              .getAllMessages()
-              .filter(isUserEcho)
-              .map((echo) => echo.id)
-          )
-        : null,
-      accepted: false,
-      queueSizeAtBegin: transient.queuedMessageCount,
-      queuedMessageIdAtBegin: transient.queuedMessage?.id ?? null,
-      deferredBehindSyntheticTurn: false,
-    };
-    this.states.bump(workspaceId);
-  }
-
-  /** Replace the displayed content of an in-flight pending send (e.g. once files are staged). */
-  updatePendingSend(workspaceId: string, message: PendingSendMessage): void {
-    const pending = this.chatTransientState.get(workspaceId)?.pendingSend;
-    if (pending?.message.id !== message.id) {
-      return;
-    }
-
-    pending.message = message;
-    this.states.bump(workspaceId);
-  }
-
-  /**
-   * Record that the backend accepted the send, so the next replay is known to contain its echo.
-   * A direct send's echo always precedes the response, so an echo displayed by now retires the
-   * row; a row still standing belongs to a queued send whose queue update is in flight. Without a
-   * baseline the echo cannot be told apart by id, so a caught-up transcript is trusted instead.
-   */
-  markPendingSendAccepted(workspaceId: string, id: string): void {
-    const transient = this.chatTransientState.get(workspaceId);
-    const aggregator = this.aggregators.get(workspaceId);
-    const pending = transient?.pendingSend;
-    if (!transient || !aggregator || pending?.message.id !== id) {
-      return;
-    }
-
-    pending.accepted = true;
-    // A queue that grew since the send began, or a same-size queue showing a different card
-    // (a replayed snapshot after a replacement), holds the accepted send.
-    const queued = transient.queuedMessage;
-    const queuedSinceBegin =
-      queued !== null &&
-      (transient.queuedMessageCount > pending.queueSizeAtBegin ||
-        (transient.queuedMessageCount === pending.queueSizeAtBegin &&
-          queued.id !== pending.queuedMessageIdAtBegin));
-    if (
-      transient.caughtUp &&
-      (pending.knownUserEchoIds === null ||
-        queuedSinceBegin ||
-        this.settleUnseenUserEchoes(transient, aggregator))
-    ) {
-      transient.pendingSend = null;
-      this.states.bump(workspaceId);
-    }
-  }
-
-  /** Remove the pending send row; a mismatched id means a newer send already replaced it. */
-  clearPendingSend(workspaceId: string, id: string): void {
-    const transient = this.chatTransientState.get(workspaceId);
-    if (transient?.pendingSend?.message.id !== id) {
-      return;
-    }
-
-    transient.pendingSend = null;
-    this.states.bump(workspaceId);
-  }
-
-  /**
-   * Whether an echo the pending send did not know about is displayed. Echoes still owed by
-   * dispatched queue entries are not this send's; they are consumed and remembered so a later
-   * replay cannot count them again.
-   */
-  private settleUnseenUserEchoes(
-    transient: WorkspaceChatTransientState,
-    aggregator: StreamingMessageAggregator
-  ): boolean {
-    const known = transient.pendingSend?.knownUserEchoIds;
-    if (!known) {
-      return false;
-    }
-    const unseen = aggregator
-      .getAllMessages()
-      .filter((message) => isUserEcho(message) && !known.has(message.id));
-    const owed = unseen.splice(0, Math.min(unseen.length, transient.queueDispatchesAwaitingEcho));
-    transient.queueDispatchesAwaitingEcho -= owed.length;
-    for (const echo of owed) {
-      known.add(echo.id);
-    }
-    return unseen.length > 0;
-  }
-
-  /**
-   * A live user row arrived. A synthetic pre-send compaction request defers the echo behind its
-   * turn, drained queue entries echo their own rows, and other non-echo rows (monitor wakes,
-   * continuations, agent-initiated turns) are unrelated; anything else is this send's echo.
-   */
-  private acknowledgePendingSendEcho(
-    transient: WorkspaceChatTransientState,
-    echo: MuxMessage
-  ): void {
-    if (!isUserEcho(echo)) {
-      if (
-        transient.pendingSend &&
-        echo.metadata?.synthetic === true &&
-        echo.metadata.muxMetadata?.type === "compaction-request"
-      ) {
-        transient.pendingSend.deferredBehindSyntheticTurn = true;
-      }
-      return;
-    }
-    if (transient.queueDispatchesAwaitingEcho > 0) {
-      transient.queueDispatchesAwaitingEcho -= 1;
-      transient.pendingSend?.knownUserEchoIds?.add(echo.id);
-      return;
-    }
-    transient.pendingSend = null;
-  }
-
-  /** A turn that took over the send (pre-send compaction) ended without echoing it. */
-  private retirePendingSendAfterAbandonedTurn(workspaceId: string): void {
-    const transient = this.chatTransientState.get(workspaceId);
-    if (
-      transient?.pendingSend?.deferredBehindSyntheticTurn &&
-      transient.caughtUp &&
-      !transient.replayingHistory
-    ) {
-      transient.pendingSend = null;
-    }
   }
 
   /**
@@ -4732,15 +4494,6 @@ export class WorkspaceStore {
       // Mark as caught up
       transient.caughtUp = true;
       transient.isHydratingTranscript = false;
-      // An accepted send is in the replayed history; an unaccepted one is only retired when
-      // the replay shows its echo, so a reconnect during preflight keeps the row.
-      const pendingSend = transient.pendingSend;
-      if (
-        pendingSend &&
-        (pendingSend.accepted || this.settleUnseenUserEchoes(transient, aggregator))
-      ) {
-        transient.pendingSend = null;
-      }
       this.lastUserPromptStore.bump(workspaceId);
       this.states.bump(workspaceId);
       this.checkAndBumpRecencyIfChanged(); // Messages loaded, update recency
@@ -4858,7 +4611,6 @@ export class WorkspaceStore {
       this.cancelPendingIdleBump(workspaceId);
       this.cancelPendingStreamingBump(workspaceId);
       this.releaseStreamingMessageChannel(workspaceId);
-      this.retirePendingSendAfterAbandonedTurn(workspaceId);
       this.states.bump(workspaceId);
       this.streamingStatsStore.bump(workspaceId);
       return;
@@ -4998,10 +4750,6 @@ export class WorkspaceStore {
         // Process live events immediately (after history loaded)
         applyWorkspaceChatEventToAggregator(aggregator, data);
 
-        if (data.role === "user") {
-          this.acknowledgePendingSendEcho(transient, data);
-        }
-
         const muxMeta = data.metadata?.muxMetadata as { type?: string } | undefined;
         const isCompactionBoundarySummary =
           data.role === "assistant" &&
@@ -5088,14 +4836,8 @@ export const workspaceStore = {
    */
   markPendingInitialSend: (workspaceId: string, pendingStreamModel: string | null) =>
     getStoreInstance().markPendingInitialSend(workspaceId, pendingStreamModel),
-  clearPendingInitialSendState: (workspaceId: string, pendingSendId?: string | null) =>
-    getStoreInstance().clearPendingInitialSendState(workspaceId, pendingSendId),
-  beginPendingSend: (workspaceId: string, message: PendingSendMessage) =>
-    getStoreInstance().beginPendingSend(workspaceId, message),
-  updatePendingSend: (workspaceId: string, message: PendingSendMessage) =>
-    getStoreInstance().updatePendingSend(workspaceId, message),
-  markPendingSendAccepted: (workspaceId: string, id: string) =>
-    getStoreInstance().markPendingSendAccepted(workspaceId, id),
+  clearPendingInitialSendState: (workspaceId: string) =>
+    getStoreInstance().clearPendingInitialSendState(workspaceId),
   /**
    * Set the active workspace for onChat subscription management.
    * Exposed for test helpers that bypass React routing effects.

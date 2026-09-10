@@ -80,7 +80,6 @@ import {
 } from "@/common/config/schemas/userPreferences";
 import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
-import type { SendMessageError } from "@/common/types/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 
@@ -221,11 +220,6 @@ export interface MockORPCClientOptions {
   onProjectRemove?: (
     projectPath: string
   ) => { success: true; data: undefined } | { success: false; error: ProjectRemoveError };
-  /** Override for workspace.sendMessage (default: immediate success) */
-  onSendMessage?: (input: {
-    workspaceId: string;
-    message: string;
-  }) => Promise<{ success: true; data: undefined } | { success: false; error: SendMessageError }>;
   /** Override for nameGeneration.generate result (default: success) */
   nameGenerationResult?: { success: false; error: NameGenerationError };
   /** Background processes per workspace */
@@ -397,7 +391,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     providersList = [],
     serverAuthSessions: initialServerAuthSessions = [],
     onProjectRemove,
-    onSendMessage,
     nameGenerationResult,
     backgroundProcesses = new Map<string, MockBackgroundProcess[]>(),
     sessionUsage = new Map<string, MockSessionUsage>(),
@@ -1673,8 +1666,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           data: { newWorkspaceId: input.workspaceId },
         }),
       fork: () => Promise.resolve({ success: false, error: "Not implemented in mock" }),
-      sendMessage: (input: { workspaceId: string; message: string }) =>
-        onSendMessage ? onSendMessage(input) : Promise.resolve({ success: true, data: undefined }),
+      sendMessage: () => Promise.resolve({ success: true, data: undefined }),
       resumeStream: () => Promise.resolve({ success: true, data: { started: true } }),
       setAutoRetryEnabled: () =>
         Promise.resolve({

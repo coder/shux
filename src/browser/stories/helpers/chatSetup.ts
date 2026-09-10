@@ -17,7 +17,6 @@ import { createWorkspace, groupWorkspacesByProject } from "../mocks/workspaces";
 import { createStaticChatHandler, createStreamingChatHandler } from "../mocks/chatHandlers";
 import type { GitStatusFixture } from "../mocks/git";
 import { createMockORPCClient, type MockSessionUsage } from "@/browser/stories/mocks/orpc";
-import type { MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import { collapseRightSidebar, selectWorkspace } from "./uiState";
 import { createGitStatusExecutor, type GitDiffFixture } from "./git";
 
@@ -69,8 +68,6 @@ export interface SimpleChatSetupOptions {
   >;
   /** Optional custom chat handler for emitting additional events (e.g., queued-message-changed) */
   onChat?: (workspaceId: string, emit: (msg: WorkspaceChatMessage) => void) => void;
-  /** Override for workspace.sendMessage (default: immediate success) */
-  onSendMessage?: MockORPCClientOptions["onSendMessage"];
   /** Idle compaction hours for context meter (null = disabled) */
   idleCompactionHours?: number | null;
   /** Route priority for routing-aware stories */
@@ -176,7 +173,6 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
     projects: groupWorkspacesByProject(workspaces),
     workspaces,
     onChat,
-    onSendMessage: opts.onSendMessage,
     executeBash,
     providersConfig: opts.providersConfig,
     agentAiDefaults: opts.agentAiDefaults,
