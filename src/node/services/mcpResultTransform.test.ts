@@ -38,6 +38,31 @@ describe("describeMCPErrorResult", () => {
     );
     expect(description).toEndWith("[MCP error details truncated]");
   });
+
+  it("surfaces structured-only error details instead of an empty content array", () => {
+    const structured = describeMCPErrorResult({
+      isError: true,
+      content: [],
+      structuredContent: { code: "NOT_FOUND", message: "Issue CODAGT-1 does not exist" },
+    });
+    expect(structured).toBe(
+      JSON.stringify({ code: "NOT_FOUND", message: "Issue CODAGT-1 does not exist" })
+    );
+
+    // Readable content parts still win over structured details.
+    expect(
+      describeMCPErrorResult({
+        isError: true,
+        content: [{ type: "text", text: "plain failure" }],
+        structuredContent: { code: "IGNORED" },
+      })
+    ).toBe("plain failure");
+
+    // With nothing else to show, the whole result beats a bare "[]".
+    expect(describeMCPErrorResult({ isError: true, content: [] })).toBe(
+      JSON.stringify({ isError: true, content: [] })
+    );
+  });
 });
 
 describe("transformMCPResult", () => {

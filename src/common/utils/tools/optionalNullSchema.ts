@@ -197,7 +197,7 @@ function isOmissionPlaceholder(propertySchema: unknown, value: unknown): boolean
 function stripProperties(
   value: Record<string, unknown>,
   properties: Record<string, unknown>,
-  required: Set<string>
+  required: ReadonlySet<string>
 ): Record<string, unknown> {
   const stripped = { ...value };
   for (const [propertyName, propertySchema] of Object.entries(properties)) {
@@ -275,6 +275,48 @@ function stripNode(
     return value;
   }
 
+  const stripped = stripObjectNode(schema, value, required);
+  const matched = stripMatchingUnionBranch(schema, stripped, required);
+  if (matched !== null) {
+    return matched;
+  }
+  // No branch accepts the stripped value. A sibling anyOf/oneOf branch can
+  // require a property the root declares optional (a discriminated "error"
+  // branch requiring `message`), so its `""` was never an omission placeholder.
+  // Retry with each branch's required properties treated as required and keep
+  // the first result that branch accepts.
+  for (const branch of getUnionBranches(schema)) {
+    if (!isRecord(branch)) {
+      continue;
+    }
+    const branchRequired = new Set([...required, ...getRequiredProperties(branch)]);
+    const candidate = stripNode(
+      branch,
+      stripObjectNode(schema, value, branchRequired),
+      branchRequired
+    );
+    if (schemaAcceptsValue(branch, candidate)) {
+      return candidate;
+    }
+  }
+  return stripped;
+}
+
+function getUnionBranches(schema: Record<string, unknown>): unknown[] {
+  const branches: unknown[] = [];
+  for (const keyword of ["anyOf", "oneOf"] as const) {
+    if (Array.isArray(schema[keyword])) {
+      branches.push(...(schema[keyword] as unknown[]));
+    }
+  }
+  return branches;
+}
+
+function stripObjectNode(
+  schema: Record<string, unknown>,
+  value: Record<string, unknown>,
+  required: ReadonlySet<string>
+): Record<string, unknown> {
   let stripped = { ...value };
   if (isRecord(schema.properties)) {
     stripped = stripProperties(stripped, schema.properties, required);
@@ -284,7 +326,7 @@ function stripNode(
       stripped = stripNode(subSchema, stripped, required) as Record<string, unknown>;
     }
   }
-  return stripMatchingUnionBranch(schema, stripped, required) ?? stripped;
+  return stripped;
 }
 
 /**

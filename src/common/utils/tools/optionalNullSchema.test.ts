@@ -207,6 +207,35 @@ describe("optional null JSON Schema contract", () => {
     expect(stripOmissionPlaceholders(source, { value: null })).toEqual({});
   });
 
+  test("preserves an empty string the selected union branch requires", () => {
+    const source = {
+      type: "object",
+      required: ["kind"],
+      properties: {
+        kind: { enum: ["ok", "error"] },
+        message: { type: "string" },
+        detail: { type: "string" },
+      },
+      oneOf: [
+        { properties: { kind: { const: "ok" } } },
+        { properties: { kind: { const: "error" } }, required: ["message"] },
+      ],
+    };
+
+    // Root marks `message` optional, but the "error" branch requires it, so
+    // `""` is a value there and not an omission placeholder.
+    expect(stripOmissionPlaceholders(source, { kind: "error", message: "", detail: "" })).toEqual({
+      kind: "error",
+      message: "",
+    });
+    // The "ok" branch does not require it, so the placeholder still goes.
+    expect(stripOmissionPlaceholders(source, { kind: "ok", message: "" })).toEqual({ kind: "ok" });
+    // Null placeholders on other properties do not block branch selection.
+    expect(stripOmissionPlaceholders(source, { kind: "error", message: "", detail: null })).toEqual(
+      { kind: "error", message: "" }
+    );
+  });
+
   test.each(["allOf", "anyOf"] as const)(
     "preserves a parent-required property declared inside %s",
     (keyword) => {

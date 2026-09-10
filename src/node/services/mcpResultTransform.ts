@@ -78,12 +78,17 @@ export function describeMCPErrorResult(result: MCPCallToolResult): string {
     }
     return [];
   });
+  // Servers may explain the failure only in structuredContent (spec) or the
+  // legacy toolResult and leave `content` empty; an empty array tells the
+  // model nothing, so fall through to the whole result instead.
   const description =
     readableParts.length > 0
       ? readableParts.join("\n")
       : binaryParts.length > 0
         ? binaryParts.join("\n")
-        : stringifyMCPErrorValue(result.toolResult ?? result.content ?? result);
+        : stringifyMCPErrorValue(
+            result.structuredContent ?? result.toolResult ?? (content.length > 0 ? content : result)
+          );
   // The error message enters history like any tool result text, so it gets the
   // same byte cap as a successful result.
   return truncateUtf8Bytes(
