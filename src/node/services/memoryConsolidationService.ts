@@ -711,26 +711,48 @@ export class MemoryConsolidationService extends EventEmitter {
     return Effect.promise(() => isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId));
   }
 
-  /** Register one run's removal controller; disposed when the run settles. */
-  private trackRunController(workspaceId: string): {
+  /**
+   * Register one run's removal controller; disposed when the run settles.
+   * A run made on a sub-agent's behalf over the OWNER's store (a redirected
+   * trigger, the post-harvest sweep) is registered under the acting child's
+   * id too: the child's removal drain (cancelInFlightConsolidation) must abort
+   * it — a cancelled child harvest deliberately falls through to this sweep,
+   * which could otherwise keep mutating the shared notebook for its whole
+   * run after the removal's bounded drain returned.
+   */
+  private trackRunController(
+    workspaceId: string,
+    actingWorkspaceId?: string
+  ): {
     controller: AbortController;
     dispose: () => void;
   } {
     const controller = new AbortController();
+    const ids = [
+      workspaceId,
+      ...(actingWorkspaceId !== undefined && actingWorkspaceId !== workspaceId
+        ? [actingWorkspaceId]
+        : []),
+    ];
     // r61: a run registered after teardown began (follow-on sweep/recovery
     // racing the entry checks) must start already aborted.
-    if (this.removalCancelled.has(workspaceId)) {
+    if (ids.some((id) => this.removalCancelled.has(id))) {
       controller.abort();
     }
-    const set = this.runControllers.get(workspaceId) ?? new Set<AbortController>();
-    set.add(controller);
-    this.runControllers.set(workspaceId, set);
+    const sets = ids.map((id) => {
+      const set = this.runControllers.get(id) ?? new Set<AbortController>();
+      set.add(controller);
+      this.runControllers.set(id, set);
+      return [id, set] as const;
+    });
     return {
       controller,
       dispose: () => {
-        set.delete(controller);
-        if (set.size === 0 && this.runControllers.get(workspaceId) === set) {
-          this.runControllers.delete(workspaceId);
+        for (const [id, set] of sets) {
+          set.delete(controller);
+          if (set.size === 0 && this.runControllers.get(id) === set) {
+            this.runControllers.delete(id);
+          }
         }
       },
     };
@@ -927,7 +949,11 @@ export class MemoryConsolidationService extends EventEmitter {
     // cancelInFlightConsolidation(child) marks only the child id, and an
     // owner-keyed run reserved after that would neither be refused by the
     // owner's check below nor be cancellable by the child's removal drain.
-    if (this.removalCancelled.has(workspaceId)) {
+    if (
+      this.removalCancelled.has(workspaceId) ||
+      (options.actingWorkspaceId !== undefined &&
+        this.removalCancelled.has(options.actingWorkspaceId))
+    ) {
       return Err("workspace is being removed; consolidation refused");
     }
     const ownerWorkspaceId = this.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
@@ -961,7 +987,7 @@ export class MemoryConsolidationService extends EventEmitter {
     // would otherwise also pass the check and start a second concurrent run
     // over the same directories. runPromise starts the fiber synchronously,
     // and the map is populated before this frame yields either way.
-    const removal = this.trackRunController(workspaceId);
+    const removal = this.trackRunController(workspaceId, options.actingWorkspaceId);
     const run = Effect.runPromise(
       this.runLockedEffect(workspaceId, trigger, options, removal.controller.signal)
     );
@@ -1278,10 +1304,13 @@ export class MemoryConsolidationService extends EventEmitter {
       }
 
       // A sub-agent's inbox lives in the owner's store: wait on and run the
-      // OWNER's consolidation (see maybeRun) so the harvest is actually swept.
+      // OWNER's consolidation (see maybeRun) so the harvest is actually swept —
+      // still as the acting CHILD, so the child's in-process cancellation,
+      // durable tombstone and removal drain bind the owner-keyed run too.
       return yield* Effect.promise(() =>
         self.runCompactionSweepAfterHarvest(
-          self.memoryService.resolveWorkspaceMemoryOwnerId(metadata.workspaceId)
+          self.memoryService.resolveWorkspaceMemoryOwnerId(metadata.workspaceId),
+          metadata.workspaceId
         )
       );
     });
@@ -1411,7 +1440,8 @@ export class MemoryConsolidationService extends EventEmitter {
   }
 
   private async runCompactionSweepAfterHarvest(
-    workspaceId: string
+    workspaceId: string,
+    actingWorkspaceId: string
   ): Promise<Result<MemoryConsolidationRecord, string>> {
     for (;;) {
       const active = this.inFlight.get(workspaceId);
@@ -1424,6 +1454,7 @@ export class MemoryConsolidationService extends EventEmitter {
       const result = await this.maybeRun(workspaceId, trigger, {
         skipWorkspaceDebounce: true,
         skipHarvestRecovery: true,
+        ...(actingWorkspaceId !== workspaceId ? { actingWorkspaceId } : {}),
       });
       if (!result.success && result.error === "a consolidation run is already in flight") {
         continue;

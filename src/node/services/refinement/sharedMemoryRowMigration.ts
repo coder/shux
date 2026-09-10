@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
+import { isValidSourceClock } from "@/common/types/durableEvent";
 import {
   MemoryRefinementActionSchema,
   RefinementEvidenceSchema,
@@ -286,8 +287,11 @@ export async function migrateSharedMemoryRefinementRows(args: {
         // failed) has only a journal-local `ts`, incomparable with the
         // owner's clock-stamped rows: carried as order-unknown rather than
         // dressed up as a clock value.
-        ...(row.data.sourceTs !== undefined && !retargeted ? { sourceTs: row.data.sourceTs } : {}),
-        ...(row.data.orderUnknown === true || row.data.sourceTs === undefined || retargeted
+        ...(isValidSourceClock(row.data.sourceTs) && !retargeted
+          ? { sourceTs: row.data.sourceTs }
+          : {}),
+        // A malformed clock value is copied as no clock at all (order unknown).
+        ...(row.data.orderUnknown === true || !isValidSourceClock(row.data.sourceTs) || retargeted
           ? { orderUnknown: true as const }
           : {}),
         ...(row.data.runtime === "remote" ? { runtime: "remote" as const } : {}),

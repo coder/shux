@@ -112,6 +112,10 @@ async function readMarkerRecord(
     ) {
       return null;
     }
+    // `wildcard` may be omitted (false) but, when present, must be a boolean:
+    // a corrupted `"true"` read as false would drop the only surviving deny
+    // of an epoch the `epochs` list does not name.
+    if (wildcard !== undefined && typeof wildcard !== "boolean") return null;
     return { epochs, wildcard: wildcard === true };
   } catch {
     return null;

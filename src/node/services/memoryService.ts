@@ -384,8 +384,12 @@ interface MemoryStore {
    * unreadable directory lists as empty; the walk stops past the per-scope
    * cap); `strict` throws on any traversal failure and is unbounded, for
    * callers whose decision must not rest on a possibly partial listing.
+   * Dot-entries are omitted unless `includeDotfiles`: listings and the index
+   * hide them, but the path grammar admits them, so a note such as `.note`
+   * is addressable — the legacy adoption pass must see it or removal would
+   * delete the only copy.
    */
-  listFiles(options?: { strict?: boolean }): Promise<string[]>;
+  listFiles(options?: { strict?: boolean; includeDotfiles?: boolean }): Promise<string[]>;
   /**
    * Kind of an entry, null when absent. Tolerant by default (any stat failure
    * reads as absent); `strict` throws unless the absence is proven (ENOENT /
@@ -451,7 +455,9 @@ async function legacyStoreStamp(childSessionDir: string, legacyRoot: string): Pr
     .stat(legacyRoot)
     .then((stat) => String(stat.mtimeMs))
     .catch(() => "missing");
-  const files = await new LocalMemoryStore(legacyRoot).listFiles().catch(() => []);
+  const files = await new LocalMemoryStore(legacyRoot)
+    .listFiles({ includeDotfiles: true })
+    .catch(() => []);
   const fileStamps = await Promise.all(
     files.map(async (relPath) => {
       const stamp = await fsPromises
@@ -529,7 +535,7 @@ class LocalMemoryStore implements MemoryStore {
     await fsPromises.mkdir(this.physicalRoot, { recursive: true });
   }
 
-  async listFiles(options?: { strict?: boolean }): Promise<string[]> {
+  async listFiles(options?: { strict?: boolean; includeDotfiles?: boolean }): Promise<string[]> {
     const results: string[] = [];
     const walk = async (dirRel: string): Promise<void> => {
       // Bounded walk: files may have been edited outside MemoryService. +1 lets
@@ -562,7 +568,7 @@ class LocalMemoryStore implements MemoryStore {
       for (const entry of entries) {
         // Per-entry cap: a single flat directory can exceed the cap on its own.
         if (options?.strict !== true && results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
-        if (entry.name.startsWith(".")) continue;
+        if (options?.includeDotfiles !== true && entry.name.startsWith(".")) continue;
         const childRel = dirRel === "" ? entry.name : `${dirRel}/${entry.name}`;
         if (entry.isDirectory()) {
           await walk(childRel);
@@ -1315,7 +1321,9 @@ export class MemoryService extends EventEmitter {
       // to adopt" (skipped stays 0) and removal would then delete its only
       // copy. A traversal failure fails the pass instead (access-time:
       // retried on the next access; removal: aborted, session intact).
-      const files = await legacy.listFiles({ strict: true });
+      // Dot-entries included: no listing shows them, but the path grammar
+      // admits them, so `.note` may be a real note of the downgraded child.
+      const files = await legacy.listFiles({ strict: true, includeDotfiles: true });
       // What was already folded in, kept in the child's session dir OUTSIDE
       // the legacy root (which is a downgraded build's model-writable
       // namespace; see legacyAdoptionManifestPath): per relPath the content
@@ -1356,6 +1364,10 @@ export class MemoryService extends EventEmitter {
           .then(() => this.readBoundedTextFile(legacy, relPath, relPath))
           .catch(() => null);
         if (content === null || content.includes("\uFFFD")) {
+          // An unrepresentable dot-entry (a stray `.DS_Store`, a binary) was
+          // never a note on any build — no listing showed it — so it neither
+          // moves nor holds up removal; an unrepresentable LISTED note does.
+          if (relPath.split("/").some((segment) => segment.startsWith("."))) continue;
           skipped++;
           continue;
         }
@@ -3082,7 +3094,7 @@ export class MemoryService extends EventEmitter {
         lastAccessedAt: stats?.lastAccessedAt ?? null,
       };
     });
-    return selectHotMemories({
+    const selected = await selectHotMemories({
       candidates,
       countTokens: options.countTokens,
       tokenBudgetActive: options.tokenBudgetActive,
@@ -3103,6 +3115,20 @@ export class MemoryService extends EventEmitter {
         return content;
       },
     });
+    // Selection keeps awaiting (token counting, repeatedly) after the last
+    // per-file gate: a tombstone published meanwhile must still withhold the
+    // buffered owner notes. Final check once selection is done; the workspace
+    // items are dropped (the scope reads as unavailable, like in the index).
+    const isWorkspaceItem = (item: MemoryHotSetItem): boolean =>
+      parseMemoryPath(item.path).scope === "workspace";
+    if (selected.some(isWorkspaceItem)) {
+      try {
+        await this.assertWorkspaceStoreReadable(ctx, this.getStore(ctx, "workspace"));
+      } catch {
+        return selected.filter((item) => !isWorkspaceItem(item));
+      }
+    }
+    return selected;
   }
 }
 

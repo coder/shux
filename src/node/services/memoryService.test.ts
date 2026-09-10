@@ -1504,6 +1504,22 @@ describe("MemoryService", () => {
         listIndex.mockRestore();
         await untombstone();
       }
+      // Selection keeps awaiting token counts after the file reads: a
+      // tombstone landing there still withholds the workspace items.
+      let counted = 0;
+      const hotAfterCount = await fixture.service.listHotMemories(fixture.ctx, {
+        countTokens: async (text) => {
+          if (counted++ === 0) {
+            await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+            await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+          }
+          return text.length;
+        },
+      });
+      expect(counted).toBeGreaterThan(0);
+      expect(hotAfterCount.some((item) => item.path === "/memories/workspace/n.md")).toBe(false);
+      expect(hotAfterCount.some((item) => item.path === "/memories/global/g.md")).toBe(true);
+      await untombstone();
     });
 
     it("refuses a pin toggle once the owner it was bound to is tombstoned", async () => {
@@ -1750,6 +1766,33 @@ describe("MemoryService", () => {
         "b.md",
         "c.md",
       ]);
+    });
+
+    it("adopts addressable dot-entry notes and ignores unrepresentable stray dot-entries", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      // The path grammar admits dotfiles, so a downgraded child may hold a
+      // real note at `.note` that no listing ever showed; a stray binary
+      // dot-entry (Finder's `.DS_Store`) was never a note on any build.
+      await fsPromises.mkdir(path.join(legacyRoot, ".hidden"), { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, ".note"), "dot note");
+      await fsPromises.writeFile(path.join(legacyRoot, ".hidden", "n.md"), "nested dot note");
+      await fsPromises.writeFile(
+        path.join(legacyRoot, ".DS_Store"),
+        Buffer.from([0, 0, 1, 255, 254])
+      );
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      expect(await fsPromises.readFile(path.join(ownerRoot, ".note"), "utf-8")).toBe("dot note");
+      expect(await fsPromises.readFile(path.join(ownerRoot, ".hidden", "n.md"), "utf-8")).toBe(
+        "nested dot note"
+      );
+      expect(await pathExists(path.join(ownerRoot, ".DS_Store"))).toBe(false);
+      // Still addressable through the shared store, like on the old build.
+      const viewed = await fixture.service.view(fixture.ctx, "/memories/workspace/.note");
+      expect(viewed.success).toBe(true);
+      if (viewed.success) expect(viewed.output).toContain("dot note");
     });
 
     it("adopts the legacy notebook for removal without any prior access, and throws instead of deferring", async () => {
@@ -2409,8 +2452,14 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe(
         "owner note"
       );
-      // Nothing listed in the legacy root: the real manifest was never written.
-      expect(await pathExists(legacyAdoptionManifestPath(path.dirname(legacyRoot)))).toBe(false);
+      // The planted file is just an (addressable) dot-entry note of the child:
+      // adopted as such, never read as provenance — the real manifest records
+      // that note and knows nothing of `note.md`.
+      const manifest = JSON.parse(
+        await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(legacyRoot)), "utf-8")
+      ) as Record<string, { created?: boolean }>;
+      expect(Object.keys(manifest)).toEqual([".adopted-into-shared-store.json"]);
+      expect(manifest[".adopted-into-shared-store.json"]).toMatchObject({ created: true });
     });
 
     it("recovers an interrupted in-place replacement without duplicating the note", async () => {
@@ -3403,6 +3452,54 @@ describe("MemoryService", () => {
       expect(await pathExists(path.join(ownerSessionDir, "memory", "n.md"))).toBe(false);
       // A third pass sees the usable copy: nothing more to do.
       expect(await migrate()).toBe(0);
+    });
+
+    it("treats a malformed store clock as order-unknown instead of 'earlier than everything'", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      // Owner renames a directory; the child then edits a file beneath the
+      // destination. The child row's clock is corrupted to -1 on disk: trusted,
+      // it would sort BEFORE the rename and the rollback would move the
+      // child's newer content silently.
+      await fixture.service.create(ownerCtx, "/memories/workspace/notes/a.md", "o1", "agent");
+      await fixture.service.rename(
+        ownerCtx,
+        "/memories/workspace/notes",
+        "/memories/workspace/moved",
+        "agent"
+      );
+      const ownerRename = (await readRefinementEvents(ownerSessionDir)).at(-1)!;
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/workspace/moved/a.md",
+        "o1",
+        "c2",
+        "agent"
+      );
+      const journalPath = path.join(childSessionDir, "durable-events.jsonl");
+      const rewritten = (await fsPromises.readFile(journalPath, "utf-8"))
+        .split("\n")
+        .map((line) => {
+          if (!line.includes('"sourceTs"')) return line;
+          const row = JSON.parse(line) as { data: { sourceTs: number } };
+          row.data.sourceTs = -1;
+          return JSON.stringify(row);
+        });
+      await fsPromises.writeFile(journalPath, rewritten.join("\n"));
+      const refused = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        listSharedWorkspaceMemoryPeerSessionDirs: () => [childSessionDir],
+        id: ownerRename.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("Refusing rollback");
+      expect(
+        await fsPromises.readFile(path.join(ownerSessionDir, "memory", "moved", "a.md"), "utf-8")
+      ).toBe("c2");
     });
 
     it("keeps a still-registered child's original row when its migrated copy is unusable", async () => {

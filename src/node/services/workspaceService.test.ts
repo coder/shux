@@ -9452,6 +9452,21 @@ describe("WorkspaceService initialize", () => {
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
       await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: -1 });
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+      // A present but non-boolean wildcard is corruption, not "false": read as
+      // malformed (deny for every epoch) rather than dropping the only
+      // surviving deny of an epoch the list does not name.
+      await fsPromises.writeFile(
+        workspaceMemoryDenyMarkerPath(sessionDir),
+        JSON.stringify({ epochs: [3], wildcard: "true" })
+      );
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 5)).toBe(true);
+      await fsPromises.writeFile(
+        workspaceMemoryDenyMarkerPath(sessionDir),
+        JSON.stringify({ epochs: [3] })
+      );
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 5)).toBe(false);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: 3 });
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
       // Unreadable is not malformed: a marker that cannot be read may hold a
       // newer epoch's deny, so the fenced clear refuses instead of deleting it.
       await writeWorkspaceMemoryDenyMarker(sessionDir, 9);

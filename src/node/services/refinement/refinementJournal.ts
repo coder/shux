@@ -18,6 +18,7 @@
 import { createHash } from "node:crypto";
 
 import assert from "@/common/utils/assert";
+import { isValidSourceClock } from "@/common/types/durableEvent";
 import {
   REFINEMENT_INVERSE_BLOB_QUOTA_BYTES,
   REFINEMENT_INVERSE_QUOTA_MIN_CHARGE_BYTES,
@@ -253,8 +254,11 @@ export async function reclaimExcessRefinementInverseBlobs(
         ts: number;
         data: { sourceTs?: number; migratedFrom?: string };
       }): number =>
-        event.data.sourceTs ??
-        (event.data.migratedFrom !== undefined ? Number.NEGATIVE_INFINITY : event.ts);
+        isValidSourceClock(event.data.sourceTs)
+          ? event.data.sourceTs
+          : event.data.migratedFrom !== undefined
+            ? Number.NEGATIVE_INFINITY
+            : event.ts;
       const events = (await journal.read())
         .filter((event) => event.kind === "refinement")
         .sort((left, right) => {

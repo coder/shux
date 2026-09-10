@@ -29,7 +29,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
-import type { DurableEvent } from "@/common/types/durableEvent";
+import { isValidSourceClock, type DurableEvent } from "@/common/types/durableEvent";
 import {
   MemoryRefinementActionSchema,
   RefinementInverseSchema,
@@ -535,16 +535,27 @@ interface InverseContentReader {
  * to the owner's own rows. Same-instant ties fall back to append sequence.
  */
 function isAfter(row: RefinementEvent, other: RefinementEvent): boolean {
-  const rowTs = row.data.sourceTs ?? row.ts;
-  const otherTs = other.data.sourceTs ?? other.ts;
+  const rowTs = isValidSourceClock(row.data.sourceTs) ? row.data.sourceTs : row.ts;
+  const otherTs = isValidSourceClock(other.data.sourceTs) ? other.data.sourceTs : other.ts;
   return rowTs > otherTs || (rowTs === otherTs && row.seq > other.seq);
+}
+
+/**
+ * A persisted `sourceTs` outside the clock's domain (zero, negative, a
+ * fraction, an unsafe integer): corruption, never order evidence — trusted,
+ * a later mutation corrupted to `-1` would sort before an older rename target
+ * and its file would move silently.
+ */
+function hasMalformedSourceClock(row: RefinementEvent): boolean {
+  return row.data.sourceTs !== undefined && !isValidSourceClock(row.data.sourceTs);
 }
 
 /**
  * Whether the order of two rows cannot be established: a row journaled while
  * the shared store's clock write failed (`orderUnknown`) has only
- * journal-local `ts`/`seq`, incomparable with other journals' rows. Callers
- * fail closed — such a pair conflicts in either direction (force overrides).
+ * journal-local `ts`/`seq`, incomparable with other journals' rows — as does
+ * a row whose clock value is malformed. Callers fail closed — such a pair
+ * conflicts in either direction (force overrides).
  */
 function orderUnknown(
   row: RefinementEvent,
@@ -552,6 +563,7 @@ function orderUnknown(
   targetRetargeted: boolean
 ): boolean {
   if (row.data.orderUnknown === true || target.data.orderUnknown === true) return true;
+  if (hasMalformedSourceClock(row) || hasMalformedSourceClock(target)) return true;
   // A retargeted target (see wasRetargeted) vs. a row of another journal.
   return targetRetargeted && row.workspaceId !== target.workspaceId;
 }

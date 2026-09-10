@@ -462,6 +462,46 @@ describe("MemoryConsolidationService", () => {
     await fixture.service.cancelInFlightConsolidation("ws-dream");
   });
 
+  it("a sub-agent's removal drain aborts the owner-keyed run made on its behalf", async () => {
+    // A child's trigger (and the post-harvest sweep) runs the OWNER's
+    // consolidation; a cancelled child harvest deliberately falls through to
+    // that sweep. The child's removal drain must still reach the owner-keyed
+    // run, or it would keep mutating the shared notebook after removal.
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => (streamStarted = resolve));
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            streamStarted();
+            return Promise.resolve({
+              stream: new ReadableStream<LanguageModelV3StreamPart>({
+                start(controller) {
+                  options.abortSignal?.addEventListener("abort", () => {
+                    controller.error(new Error("request aborted"));
+                  });
+                },
+              }),
+            });
+          },
+        }),
+    });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const run = fixture.service.maybeRun("ws-sub", "manual");
+    await started;
+    await fixture.service.cancelInFlightConsolidation("ws-sub");
+    const result = await run;
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("stream failed");
+    // Locally cancelled child: neither its own trigger nor an owner run made
+    // on its behalf may start while teardown is under way.
+    const refused = await fixture.service.maybeRun("ws-dream", "manual", {
+      actingWorkspaceId: "ws-sub",
+    });
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("being removed");
+  });
+
   it("runs, persists the journal record, and reports it via getRecord", async () => {
     using fixture = await createFixture();
     const result = await fixture.service.maybeRun("ws-dream", "compaction");

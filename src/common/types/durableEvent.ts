@@ -99,6 +99,9 @@ export const RefinementDataSchema = z.object({
    * mutation lock by every mutation (workspaceMemoryRevision.ts), so rows in
    * an owner's and its sub-agents' journals — whose `ts`/`seq` are not
    * comparable — still order totally; migrated rows keep their source value.
+   * Persisted rows are raw JSON: only a value isValidSourceClock accepts is
+   * order evidence; a present value outside that domain reads as order
+   * unknown (refinementRollback.ts), never as "earlier than everything".
    */
   sourceTs: z.number().optional(),
   /**
@@ -198,3 +201,12 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 export type DurableEventDraft = DistributiveOmit<DurableEvent, "v" | "seq" | "id" | "ts"> & {
   id?: string;
 };
+
+/**
+ * A usable shared-store clock value: the clock is `max(Date.now(), prev + 1)`
+ * (workspaceMemoryRevision.ts), so a genuine value is a positive safe integer.
+ * Zero, negatives, fractions, unsafe integers and non-numbers are corruption.
+ */
+export function isValidSourceClock(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
