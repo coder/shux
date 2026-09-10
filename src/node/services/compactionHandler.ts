@@ -1700,17 +1700,20 @@ export class CompactionHandler {
         // handed the closing epoch — that would present it to the next epoch
         // as current-policy content. History is raw JSON: a stamp that is
         // present but not a number stays unstamped (unknown). Only a row
-        // with no stamp at all is a synthetic payload/summary row (closing
-        // epoch) — or, with a bound, an older build's turn (unknown).
+        // with no stamp AND no bound at all is a synthetic payload/summary
+        // row (closing epoch); a row with a bound — present in any form,
+        // malformed included: it may be an older build's turn whose policy
+        // was never recorded — stays unstamped (unknown).
         const stamp: unknown = row.metadata?.workspaceMemoryPolicyEpoch;
+        const bound: unknown = row.metadata?.requestHistorySequence;
         epoch =
           stamp !== undefined
             ? typeof stamp === "number"
               ? stamp
               : undefined
-            : typeof row.metadata?.requestHistorySequence === "number"
-              ? undefined
-              : closingPolicyEpoch;
+            : bound === undefined
+              ? closingPolicyEpoch
+              : undefined;
       } else if (row.role !== "user" || isTokenBudgetInternalMessage(row)) {
         epoch = closingPolicyEpoch;
       } else {

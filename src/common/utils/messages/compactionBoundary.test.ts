@@ -424,7 +424,14 @@ describe("epochHasPriorTurnRows", () => {
           "warn",
           "user",
           "warning",
-          { muxMetadata: { type: "context-budget-warning", contextTokens: 1, maxTokens: 2 } },
+          {
+            muxMetadata: {
+              type: "context-budget-warning",
+              contextTokens: 1,
+              maxTokens: 2,
+              budgetTokens: 2,
+            },
+          },
         ],
         ["u-now", "user", "now"]
       )

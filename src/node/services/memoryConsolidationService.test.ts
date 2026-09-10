@@ -1466,6 +1466,45 @@ describe("MemoryConsolidationService", () => {
     expect(record?.error).toContain("never recorded");
   });
 
+  it("refuses an unstamped turn row even when no user row of its own survives", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    // An older/downgraded backend started a turn before a destructive reset
+    // and its assistant landed afterwards: the row keeps its request bound
+    // but has no policy stamp, and its user row is gone with the reset — so
+    // no uncovered user row would surface it. The row itself must refuse.
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("orphan-reply", "assistant", "Produced under an unknown policy.", {
+        requestHistorySequence: 0,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("compact-request", "user", "Please compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+    });
+    await fixture.historyService.appendToHistory("ws-dream", summary);
+    const result = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    expect(result.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.error).toContain("never recorded");
+  });
+
   it("covers a turn's request prelude rows by id, not by adjacency", async () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
     let previousBoundaryHistorySequence: number | undefined;

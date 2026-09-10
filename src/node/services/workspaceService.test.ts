@@ -9591,6 +9591,21 @@ describe("WorkspaceService initialize", () => {
         })
       ).toBe(true);
       expect(persistedFor(24)).toBe(false);
+      // A chain of tail compactions names several epochs: one recorded grant
+      // does not vouch for a sibling epoch with no record anywhere.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritableByEpoch = { "-1": true };
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 26,
+          carriedPolicyEpochs: [-1, 5],
+        })
+      ).toBe(true);
+      expect(persistedFor(26)).toBe(false);
       // A tail copy whose source epoch is unknown (persisted before the field
       // existed) carries a policy nobody can look up: denied, like unknown
       // history, even for an otherwise writable first turn.

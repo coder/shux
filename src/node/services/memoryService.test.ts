@@ -1433,6 +1433,25 @@ describe("MemoryService", () => {
       if (!file.success) expect(file.error).toContain("was removed");
       await untombstone();
 
+      // The usage record waits for the owner-store lock, which a removal
+      // holds while it publishes the tombstone: landing there, after the
+      // bytes were read, must still withhold them.
+      const usageService = fixture.service as unknown as {
+        recordUsage: (...args: unknown[]) => Promise<void>;
+      };
+      const originalUsage = usageService.recordUsage.bind(fixture.service);
+      const usage = spyOn(usageService, "recordUsage").mockImplementationOnce(async (...args) => {
+        await originalUsage(...args);
+        await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+        await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+      });
+      const lateFile = await fixture.service.view(fixture.ctx, "/memories/workspace/n.md");
+      expect(usage).toHaveBeenCalledTimes(1);
+      expect(lateFile.success).toBe(false);
+      if (!lateFile.success) expect(lateFile.error).toContain("was removed");
+      usage.mockRestore();
+      await untombstone();
+
       tombstoneAfterOpen();
       const dir = await fixture.service.view(fixture.ctx, "/memories/workspace");
       expect(dir.success).toBe(false);
@@ -3339,6 +3358,51 @@ describe("MemoryService", () => {
       });
       expect(rolledBack.success).toBe(true);
       expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
+    });
+
+    it("a retried removal re-copies a row whose earlier owner-side copy is unusable", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "v1", "agent");
+      const childRow = (await readRefinementEvents(childSessionDir)).at(-1)!;
+      const migrate = () =>
+        migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        });
+      expect(await migrate()).toBe(1);
+      // The copy's inverse is corrupted on disk before the removal is retried.
+      const journalPath = path.join(ownerSessionDir, "durable-events.jsonl");
+      const rewritten = (await fsPromises.readFile(journalPath, "utf-8"))
+        .split("\n")
+        .map((line) => {
+          if (!line.includes(`"migratedFrom":"ws-child:${childRow.id}"`)) return line;
+          const row = JSON.parse(line) as { data: { inverse: unknown } };
+          row.data.inverse = { op: "bogus" };
+          return JSON.stringify(row);
+        });
+      await fsPromises.writeFile(journalPath, rewritten.join("\n"));
+      // Not "already copied": the intact source is copied again, and the new
+      // copy is the one the owner can roll back.
+      expect(await migrate()).toBe(1);
+      const copies = (await readRefinementEvents(ownerSessionDir)).filter(
+        (row) => row.data.migratedFrom === `ws-child:${childRow.id}`
+      );
+      expect(copies).toHaveLength(2);
+      const usable = copies.find((row) => (row.data.inverse as { op: string }).op !== "bogus")!;
+      const undo = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: usable.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(undo.success).toBe(true);
+      expect(await pathExists(path.join(ownerSessionDir, "memory", "n.md"))).toBe(false);
+      // A third pass sees the usable copy: nothing more to do.
+      expect(await migrate()).toBe(0);
     });
 
     it("keeps a still-registered child's original row when its migrated copy is unusable", async () => {

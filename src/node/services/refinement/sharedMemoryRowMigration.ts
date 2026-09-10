@@ -153,12 +153,21 @@ export async function migrateSharedMemoryRefinementRows(args: {
   // identity on the owner side.
   await ownerJournal.withBlobLock(async () => {
     const ownerRows = await listRefinements(args.ownerSessionDir);
-    // Source identity → owner-journal id of its copy (earlier passes and this one).
+    // Source identity → owner-journal id of its copy (earlier passes and this
+    // one). Only a copy that is still a USABLE memory row counts — parseable
+    // action (memory or rollback) and inverse: a copy whose persisted state
+    // is corrupted would otherwise make a retried removal skip its intact
+    // source, delete the child session, and leave the owner with nothing
+    // but an unusable rollback record. Such a source is copied again (the
+    // corrupted row stays behind as an audit record).
     const ownerIdBySource = new Map<string, string>();
     for (const ownerRow of ownerRows) {
-      if (ownerRow.data.migratedFrom !== undefined) {
-        ownerIdBySource.set(ownerRow.data.migratedFrom, ownerRow.id);
-      }
+      if (ownerRow.data.migratedFrom === undefined || ownerRow.data.kind !== "memory") continue;
+      const usable =
+        RefinementInverseSchema.safeParse(ownerRow.data.inverse).success &&
+        (MemoryRefinementActionSchema.safeParse(ownerRow.data.action).success ||
+          RollbackRefinementActionSchema.safeParse(ownerRow.data.action).success);
+      if (usable) ownerIdBySource.set(ownerRow.data.migratedFrom, ownerRow.id);
     }
     // Owner rows already rolled back (by anyone): a second rollback row for
     // the same target would corrupt the lineage the rollback engine walks.

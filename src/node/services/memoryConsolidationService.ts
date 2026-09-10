@@ -352,15 +352,14 @@ class HarvestRefusedError extends Error {
  * turn's latest user message) and this turn's own row would be left without
  * a turn of its own — which is exactly what surfaces here as uncovered. Rows
  * are matched by exact id, never by adjacency, so no interleaved foreign row
- * can ride along. Assistant rows without the bound or without the epoch
- * stamp (a build that does not maintain the policy — e.g. turns run by a
- * downgraded build mid-epoch, which also left the durable accumulator
- * untouched; synthetic payload/summary rows that are no turn) cover nothing
- * (fail closed); a stamp that is present but malformed refuses like a foreign
- * epoch's. Token-budget control rows (rollover lead-in, budget
- * warning) need no turn: backend template text appended in the same durable
- * batch as the turn they precede, carrying neither agent nor repository
- * content.
+ * can ride along. Assistant rows without the bound and without the epoch
+ * stamp (synthetic payload/summary rows that are no turn) cover nothing; a
+ * stamp that is present but malformed refuses like a foreign
+ * epoch's; a row carrying a bound but no stamp is such a turn with no record
+ * at all and refuses too (its user row may be gone with a reset). Token-budget
+ * control rows (rollover lead-in, budget warning) need no turn: backend
+ * template text appended in the same durable batch as the turn they precede,
+ * carrying neither agent nor repository content.
  */
 function epochHarvestRefusal(messages: readonly MuxMessage[], closingEpoch: number): string | null {
   const userRows: Array<{ message: MuxMessage; sequence: number }> = [];
@@ -373,8 +372,17 @@ function epochHarvestRefusal(messages: readonly MuxMessage[], closingEpoch: numb
   for (const message of messages) {
     if (message.role !== "assistant") continue;
     const policyEpoch = message.metadata?.workspaceMemoryPolicyEpoch;
-    // No stamp at all: a row that is no turn of this build (covers nothing).
-    if (policyEpoch === undefined) continue;
+    if (policyEpoch === undefined) {
+      // No stamp: a synthetic payload/summary row (no request bound either)
+      // covers nothing. A row WITH a bound — present in any form — is a turn
+      // whose policy was never recorded (an older or downgraded build's,
+      // possibly started before a destructive reset that removed its user
+      // row, so no uncovered row would surface it below): refuse.
+      if (message.metadata?.requestHistorySequence !== undefined) {
+        return "the compacted epoch holds a turn whose memory policy was never recorded; harvest refused (fail closed)";
+      }
+      continue;
+    }
     // History rows are raw JSON: a stamp that is present but not the integer
     // equal to the closing epoch — another epoch's, or a corrupted value such
     // as null — proves no policy for this epoch and refuses the harvest.

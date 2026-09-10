@@ -4421,16 +4421,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const storedFor = (entry: WorkspaceConfigEntry): boolean | undefined =>
       workspaceMemoryWritableForEpoch(entry, policyEpoch);
     const stored = storedFor(before.workspace);
-    // Carried epochs whose policy was never recorded anywhere — no record
-    // under any carried key, none under this epoch's (where a completed
-    // carry would have moved it), no marker — are unknown history too: the
-    // tail copies ARE turns of those epochs (excluded from epochHasPriorTurns
-    // by design), e.g. the first tail compaction after upgrading a chat.
+    // A carried epoch whose policy was never recorded anywhere — no record
+    // under ITS key, none under this epoch's (where a completed carry would
+    // have moved it), no marker — is unknown history too: the tail copies ARE
+    // turns of that epoch (excluded from epochHasPriorTurns by design), e.g.
+    // the first tail compaction after upgrading a chat. EVERY carried epoch
+    // must be represented: with a chain like [-1, 5], a recorded -1 says
+    // nothing about 5, and one recorded grant must not mask the epoch whose
+    // record is missing. (The first turn recording a deny for this reason
+    // persists it under this epoch's key, so a later turn that finds a
+    // record here inherits the verdict rather than re-deriving it.)
     const carriedUnrecorded =
-      carriedPolicyEpochs.length > 0 &&
       stored === undefined &&
       !denyMarker &&
-      carriedFor(before.workspace) === undefined;
+      carriedPolicyEpochs.some(
+        (epoch) => workspaceMemoryWritableForEpoch(before.workspace, epoch) === undefined
+      );
     const unknownHistory =
       (stored === undefined && mirror === undefined && options.epochHasPriorTurns) ||
       options.carriedPolicyUnknown === true ||

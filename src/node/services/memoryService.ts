@@ -2312,11 +2312,14 @@ export class MemoryService extends EventEmitter {
       }
 
       const content = await this.readBoundedTextFile(store, parsed.relPath, virtualPath);
-      // Before recordUsage: its refusal is swallowed (usage is best-effort),
-      // so it cannot stand in for this gate.
-      await this.assertWorkspaceReadExposable(ctx, parsed.scope, store);
       const output = renderFileView(content, options);
       await this.recordUsage(ctx, parsed.scope, parsed.relPath, { write: false });
+      // AFTER recordUsage — the last await before the content leaves: a
+      // read-side usage record waits for the owner-store lock, which a
+      // removal holds for its handover before publishing the tombstone and
+      // releasing; recordUsage's own refusal is swallowed (usage is
+      // best-effort), so it cannot stand in for this gate.
+      await this.assertWorkspaceReadExposable(ctx, parsed.scope, store);
       return { success: true, output };
     });
   }

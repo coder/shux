@@ -1942,6 +1942,9 @@ describe("CompactionHandler", () => {
           workspaceMemoryPolicyEpoch: null as unknown as number,
         }),
         createMuxMessage("a8", "assistant", "synthetic payload"),
+        createMuxMessage("a9", "assistant", "old-build turn with a corrupted bound", {
+          requestHistorySequence: null as unknown as number,
+        }),
         createStampedCompactionRequest("compact-req-2", boundarySequence + 1)
       );
       expect(await handler.handleCompletion(createStreamEndEvent("Summary 2"))).toBe(true);
@@ -1964,6 +1967,7 @@ describe("CompactionHandler", () => {
         -1, // a6 (recorded stamp kept despite the missing bound)
         undefined, // a7 (malformed stamp)
         boundarySequence, // a8 (no stamp, no bound: synthetic payload row)
+        undefined, // a9 (no stamp, malformed bound: not a synthetic row)
       ]);
     });
 
