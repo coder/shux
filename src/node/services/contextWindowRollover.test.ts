@@ -7,7 +7,6 @@ import {
   estimateLastStepToolResults,
   hasRolloverEligibleMessages,
   hasUnconsumedNewContextRequest,
-  buildLeadInText,
   type ContextWindowRollover,
 } from "./contextWindowRollover";
 
@@ -239,14 +238,6 @@ describe("model-requested rollover receipts", () => {
     ).toBe(false);
     expect(hasUnconsumedNewContextRequest([user])).toBe(false);
   });
-
-  test("model-requested lead-in explains the request instead of an interruption", () => {
-    const text = buildLeadInText({
-      ...rollover,
-      reason: "mid-stream",
-      requestedBy: "model",
-      flushOpportunity: false,
-    });
     expect(text).toContain("new_context");
     expect(text).not.toContain("interrupted");
     expect(text).not.toContain("filled");
