@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type { AdvisorCallCompletedPayload } from "@/common/telemetry/payload";
 import { roundToBase2 } from "@/common/telemetry/utils";
-import { advisorCachePolicy, advisorUsageTelemetry } from "./advisorTelemetry";
+import {
+  advisorCachePolicy,
+  advisorWireCachePolicy,
+  advisorUsageTelemetry,
+} from "./advisorTelemetry";
 
 import { streamText, tool, type Tool } from "ai";
 
@@ -275,7 +279,9 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
           optionsProvidersConfig,
           optionsMuxProviderOptions,
           optionsRouteProvider,
-        } = await runtime.createModel(advisorModelString);
+        } = await runtime.createModel(advisorModelString, (requestBody) => {
+          cachePolicy = advisorWireCachePolicy(requestBody);
+        });
         // Keep the creation-time identity, including the actual Coder instance
         // and scoped aliases. buildProviderOptions resolves its wire namespace
         // from the same captured config and returns provider SDK option types;

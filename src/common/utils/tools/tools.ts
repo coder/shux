@@ -377,7 +377,10 @@ export interface ToolConfiguration {
      * Coder identities retain their actual instance and scoped aliases; option
      * construction resolves their wire from this snapshot, never live config.
      */
-    createModel: (modelString: string) => Promise<{
+    createModel: (
+      modelString: string,
+      onAnthropicRequest?: (requestBody: unknown) => void
+    ) => Promise<{
       model: LanguageModel;
       metadataModel?: string;
       optionsModelString: string;

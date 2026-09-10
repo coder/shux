@@ -517,7 +517,10 @@ function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void 
 export function wrapFetchWithAnthropicCacheControl(
   baseFetch: typeof fetch,
   cacheTtl?: AnthropicCacheTtl | null,
-  options?: { injectCacheControl?: boolean }
+  options?: {
+    injectCacheControl?: boolean;
+    onRequest?: (requestBody: unknown) => void;
+  }
 ): typeof fetch {
   const injectCacheControl = options?.injectCacheControl ?? true;
   const cachingFetch = async (
@@ -582,6 +585,12 @@ export function wrapFetchWithAnthropicCacheControl(
 
       // Update body with modified JSON
       const newBody = JSON.stringify(json);
+      // Observe the final markers, including injected markers and TTL overrides.
+      try {
+        options?.onRequest?.(json);
+      } catch (error) {
+        log.debug("Anthropic request observer failed", { error });
+      }
       const outHeaders = new Headers(init.headers);
       outHeaders.delete("content-length"); // Body size changed
       return baseFetch(input, { ...init, headers: outHeaders, body: newBody });
@@ -1177,6 +1186,7 @@ export interface PinnedModelOptions extends Pick<
 }
 
 interface CreateModelOptions {
+  onAnthropicRequest?: (requestBody: unknown) => void;
   agentInitiated?: boolean;
   workspaceId?: string;
   routeContext?: RouteContext;
@@ -1355,11 +1365,7 @@ export class ProviderModelFactory {
   private createModelCoreEffect(
     modelString: string,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: {
-      agentInitiated?: boolean;
-      routeContext?: RouteContext;
-      providersConfig?: ProvidersConfig;
-    }
+    opts?: CreateModelOptions
   ): Effect.Effect<Result<LanguageModel, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -1614,7 +1620,7 @@ export class ProviderModelFactory {
                 fetch: wrapFetchWithAnthropicCacheControl(
                   customAdapterFetch,
                   effectiveAnthropicCacheTtl,
-                  { injectCacheControl: !disableBeta }
+                  { injectCacheControl: !disableBeta, onRequest: opts?.onAnthropicRequest }
                 ),
               });
               return Ok(provider(modelId));
@@ -1657,7 +1663,7 @@ export class ProviderModelFactory {
           const fetchWithCacheControl = wrapFetchWithAnthropicCacheControl(
             baseFetch,
             effectiveAnthropicCacheTtl,
-            { injectCacheControl: !disableBeta }
+            { injectCacheControl: !disableBeta, onRequest: opts?.onAnthropicRequest }
           );
           const providerFetch = fetchWithCacheControl;
           const provider = createAnthropic({
@@ -2214,6 +2220,7 @@ export class ProviderModelFactory {
           const fetchWithCacheControl = isAnthropicModel
             ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl, {
                 injectCacheControl: !disableBeta,
+                onRequest: opts?.onAnthropicRequest,
               })
             : baseFetch;
           const fetchWithAutoLogout = wrapFetchWithMuxGatewayAutoLogout(
@@ -2557,7 +2564,7 @@ export class ProviderModelFactory {
             const providerFetch = wrapFetchWithAnthropicCacheControl(
               coderFetch,
               effectiveAnthropicCacheTtl,
-              { injectCacheControl: !disableBeta }
+              { injectCacheControl: !disableBeta, onRequest: opts?.onAnthropicRequest }
             );
             const { createAnthropic } = yield* Effect.promise(async () =>
               PROVIDER_REGISTRY.anthropic()
@@ -2668,6 +2675,7 @@ export class ProviderModelFactory {
     modelString: string,
     opts?: {
       thinkingLevel?: ThinkingLevel;
+      onAnthropicRequest?: (requestBody: unknown) => void;
       providerOptions?: MuxProviderOptions;
       agentInitiated?: boolean;
       workspaceId?: string;
@@ -2683,6 +2691,7 @@ export class ProviderModelFactory {
       {
         agentInitiated: opts?.agentInitiated,
         workspaceId: opts?.workspaceId,
+        onAnthropicRequest: opts?.onAnthropicRequest,
         providersConfig,
       }
     );
@@ -2733,7 +2742,10 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel | undefined,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
+    opts?: Pick<
+      CreateModelOptions,
+      "agentInitiated" | "workspaceId" | "providersConfig" | "onAnthropicRequest"
+    >
   ): Promise<Result<ResolveAndCreateModelResult, SendMessageError>> {
     return Effect.runPromise(
       this.resolveAndCreateModelEffect(modelString, thinkingLevel, muxProviderOptions, opts)
@@ -2744,7 +2756,10 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel | undefined,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
+    opts?: Pick<
+      CreateModelOptions,
+      "agentInitiated" | "workspaceId" | "providersConfig" | "onAnthropicRequest"
+    >
   ): Effect.Effect<Result<ResolveAndCreateModelResult, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;

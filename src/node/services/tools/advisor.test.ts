@@ -13,6 +13,7 @@ import type { ModelMessage } from "@/common/types/message";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AdvisorToolCallSnapshot, ToolModelUsageEvent } from "@/common/utils/tools/tools";
 import { log } from "@/node/services/log";
+import { wrapFetchWithAnthropicCacheControl } from "@/node/services/providerModelFactory";
 import { createAdvisorTool } from "./advisor";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 
@@ -102,9 +103,11 @@ function mockStreamTextSuccess(result: {
   chunks?: Array<{ type: string; text?: string; delta?: string; textDelta?: string }>;
   finishReason?: StreamTextFinishReason;
   streamError?: Error;
+  beforeText?: () => Promise<void>;
 }) {
   return spyOn(ai, "streamText").mockImplementation(((args: StreamTextArgs) => {
     const text = (async () => {
+      await result.beforeText?.();
       for (const chunk of result.chunks ?? []) {
         await args.onChunk?.({ chunk } as Parameters<NonNullable<typeof args.onChunk>>[0]);
       }
@@ -289,7 +292,7 @@ describe("advisor tool", () => {
     const tool = createAdvisorTool(config);
     const rawResult: unknown = await Promise.resolve(tool.execute!({}, mockToolCallOptions));
 
-    expect(createModel).toHaveBeenCalledWith(ADVISOR_MODEL);
+    expect(createModel).toHaveBeenCalledWith(ADVISOR_MODEL, expect.any(Function));
     expect(streamTextSpy).toHaveBeenCalledTimes(1);
     expect(rawResult).toEqual({
       type: "advice",
@@ -653,6 +656,71 @@ describe("advisor tool", () => {
   });
 
   describe("completion telemetry", () => {
+    it.each([
+      { ttl: undefined, marked: false, expectedTtl: "5m", expectedCount: 1 },
+      { ttl: "1h", marked: false, expectedTtl: "1h", expectedCount: 1 },
+      { ttl: "1h", marked: true, expectedTtl: "1h", expectedCount: 2 },
+    ] as const)(
+      "uses final wire cache markers: %j",
+      async ({ ttl, marked, expectedTtl, expectedCount }) => {
+        using tempDir = new TestTempDir("advisor-wire-cache-telemetry");
+        const reportTelemetry = mock((_event: AdvisorCallCompletedPayload) => undefined);
+        const { config, createModel } = createToolConfig(tempDir.path, { reportTelemetry });
+        let observeRequest: ((body: unknown) => void) | undefined;
+        const fakeFetch = Object.assign(() => Promise.resolve(new Response("{}")), fetch);
+        const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, ttl, {
+          onRequest: (body) => observeRequest?.(body),
+        });
+        mockStreamTextSuccess({
+          text: "Use a queue.",
+          usage: {
+            inputTokens: 1000,
+            outputTokens: 8,
+            totalTokens: 1008,
+            inputTokenDetails: { noCacheTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 1000 },
+          },
+          beforeText: async () => {
+            await wrapped("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              body: JSON.stringify({
+                ...(marked
+                  ? {
+                      system: [
+                        {
+                          type: "text",
+                          text: "Rules",
+                          cache_control: { type: "ephemeral", ttl: "1h" },
+                        },
+                      ],
+                    }
+                  : {}),
+                messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+              }),
+            });
+          },
+        });
+        const tool = createAdvisorTool({
+          ...config,
+          advisorRuntime: {
+            ...config.advisorRuntime,
+            createModel: (_model, onAnthropicRequest) => {
+              observeRequest = onAnthropicRequest;
+              return createModel();
+            },
+          },
+        });
+
+        await tool.execute!({}, mockToolCallOptions);
+
+        expect(reportTelemetry).toHaveBeenCalledTimes(1);
+        expect(reportTelemetry.mock.calls[0]?.[0]).toMatchObject({
+          cache_ttl: expectedTtl,
+          cache_marker_count: expectedCount,
+          input_cost_usd_b2: ttl === "1h" ? 2 ** -7 : 2 ** -8,
+        });
+      }
+    );
+
     it("reports SDK7 cache usage and first-token timing once", async () => {
       using tempDir = new TestTempDir("advisor-telemetry-sdk7");
       const reportTelemetry = mock((_event: AdvisorCallCompletedPayload) => undefined);

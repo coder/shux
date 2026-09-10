@@ -2167,7 +2167,11 @@ export class TurnRequestBuilder {
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
     // Share creation-time provider/pricing snapshots for both headless tools.
-    const createToolModel = async (ms: string, toolThinkingLevel?: ThinkingLevel) => {
+    const createToolModel = async (
+      ms: string,
+      toolThinkingLevel?: ThinkingLevel,
+      onAnthropicRequest?: (requestBody: unknown) => void
+    ) => {
       const toolModelString = ms.trim();
       assert(
         toolModelString.length > 0,
@@ -2175,7 +2179,7 @@ export class TurnRequestBuilder {
       );
       const created = await this.dependencies.providerModelFactory.createModelWithPinnedOptions(
         toolModelString,
-        { thinkingLevel: toolThinkingLevel, workspaceId, agentInitiated: true }
+        { thinkingLevel: toolThinkingLevel, workspaceId, agentInitiated: true, onAnthropicRequest }
       );
       if (!created.success) {
         throw new Error(`Failed to create tool model: ${getErrorMessage(created.error)}`);
@@ -2226,7 +2230,8 @@ export class TurnRequestBuilder {
                 assert(snapshot.toolName === "advisor", "advisor snapshot must belong to advisor");
                 return snapshot;
               },
-              createModel: createToolModel,
+              createModel: (ms, onAnthropicRequest) =>
+                createToolModel(ms, undefined, onAnthropicRequest),
               abortSignal: combinedAbortSignal,
             },
           }

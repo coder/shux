@@ -20,23 +20,35 @@ function rounded(value: number | null): number | null {
 
 /** Inspect explicit request markers without sending their content or cache keys. */
 export function advisorCachePolicy(messages: ModelMessage[], providerOptions?: unknown) {
+  return advisorWireCachePolicy({ messages, providerOptions });
+}
+
+/** Inspect effective wire markers after provider cache injection and TTL overrides. */
+export function advisorWireCachePolicy(requestBody: unknown) {
   let markerCount = 0;
   const ttls = new Set<"5m" | "1h" | "unknown">();
-  const inspect = (options: unknown) => {
-    const marker = record(record(record(options)?.anthropic)?.cacheControl);
+  const inspect = (value: unknown) => {
+    const marker = record(value);
     if (!marker) return;
     markerCount++;
     ttls.add(
       marker.ttl == null || marker.ttl === "5m" ? "5m" : marker.ttl === "1h" ? "1h" : "unknown"
     );
   };
-  inspect(providerOptions);
-  for (const message of messages) {
-    inspect(message.providerOptions);
-    if (Array.isArray(message.content)) {
-      for (const part of message.content) {
-        if ("providerOptions" in part) inspect(part.providerOptions);
-      }
+  const pending: unknown[] = [requestBody];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (Array.isArray(value)) {
+      for (const item of value) pending.push(item);
+      continue;
+    }
+    const entry = record(value);
+    if (!entry) continue;
+    inspect(entry.cache_control);
+    inspect(record(record(entry.providerOptions)?.anthropic)?.cacheControl);
+    // Do not treat tool input schemas or tool results as request cache markers.
+    for (const key of ["system", "messages", "prompt", "tools", "content"]) {
+      if (Array.isArray(entry[key])) pending.push(entry[key]);
     }
   }
   const ttl: AdvisorCallCompletedPayload["cache_ttl"] =
