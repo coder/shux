@@ -1658,8 +1658,10 @@ export class CompactionHandler {
    * one answered by a turn without a recorded policy (an older build's) —
    * which the policy sink reads as unknown (deny). Token-budget control rows
    * (backend template text, no agent or repository content) need no turn and
-   * belong to the closing epoch, as do non-turn assistant rows (payloads,
-   * summaries). Copies of copies keep their original epoch regardless.
+   * belong to the closing epoch, as do assistant rows that carry no policy
+   * stamp and no bound (synthetic payloads, summaries). An assistant row
+   * WITH a recorded stamp keeps it even when its bound is missing or
+   * malformed. Copies of copies keep their original epoch regardless.
    */
   private buildCoveredTailCopies(
     tailRows: MuxMessage[],
@@ -1689,13 +1691,31 @@ export class CompactionHandler {
       }
     }
     return tailRows.map((row) => {
-      const isTurnRow =
-        row.role === "assistant" && typeof row.metadata?.requestHistorySequence === "number";
-      const epoch = isTurnRow
-        ? row.metadata?.workspaceMemoryPolicyEpoch
-        : row.role !== "user" || isTokenBudgetInternalMessage(row)
-          ? closingPolicyEpoch
-          : coveredEpochById.get(row.id);
+      let epoch: number | undefined;
+      if (row.role === "assistant") {
+        // A recorded stamp is kept whatever the bound: a row that recorded
+        // its policy (possibly a read-only one, under a foreign epoch whose
+        // deny a destructive reset since discarded) but lost or corrupted its
+        // bound must not be reclassified as a synthetic non-turn row and
+        // handed the closing epoch — that would present it to the next epoch
+        // as current-policy content. History is raw JSON: a stamp that is
+        // present but not a number stays unstamped (unknown). Only a row
+        // with no stamp at all is a synthetic payload/summary row (closing
+        // epoch) — or, with a bound, an older build's turn (unknown).
+        const stamp: unknown = row.metadata?.workspaceMemoryPolicyEpoch;
+        epoch =
+          stamp !== undefined
+            ? typeof stamp === "number"
+              ? stamp
+              : undefined
+            : typeof row.metadata?.requestHistorySequence === "number"
+              ? undefined
+              : closingPolicyEpoch;
+      } else if (row.role !== "user" || isTokenBudgetInternalMessage(row)) {
+        epoch = closingPolicyEpoch;
+      } else {
+        epoch = coveredEpochById.get(row.id);
+      }
       return this.buildPreservedTailCopy(row, idMap, epoch);
     });
   }

@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
 
 import {
+  epochHasPriorTurnRows,
   findLatestCompactionBoundaryIndex,
   findLatestContextBoundaryIndex,
   hasProviderEligibleMessages,
@@ -376,5 +377,57 @@ describe("sliceMessagesFromLatestCompactionBoundary", () => {
 
     expect(sliced).toBe(messages);
     expect(sliced.map((msg) => msg.id)).toEqual(["u0", "summary-malformed", "u1"]);
+  });
+});
+
+describe("epochHasPriorTurnRows", () => {
+  const current = new Set(["u-now", "p-now"]);
+  const withRows = (...rows: Array<Parameters<typeof createMuxMessage>>) =>
+    epochHasPriorTurnRows(
+      rows.map((args) => createMuxMessage(...args)),
+      current
+    );
+
+  it("counts an earlier user turn but not the batch being started", () => {
+    expect(withRows(["u-now", "user", "now"], ["p-now", "user", "prelude"])).toBe(false);
+    expect(withRows(["u-old", "user", "earlier"], ["u-now", "user", "now"])).toBe(true);
+    expect(withRows(["a-old", "assistant", "answer"], ["u-now", "user", "now"])).toBe(false);
+  });
+
+  it("ignores rows that are no turn of the epoch: compaction requests, tail copies, token-budget internals", () => {
+    expect(
+      withRows(
+        [
+          "req",
+          "user",
+          "/compact",
+          { muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} } },
+        ],
+        ["u-now", "user", "now"]
+      )
+    ).toBe(false);
+    expect(
+      withRows(
+        ["copy", "user", "earlier", { rlmPreservedTailCopy: true }],
+        ["u-now", "user", "now"]
+      )
+    ).toBe(false);
+    expect(
+      withRows(
+        [
+          "lead",
+          "user",
+          "lead-in",
+          { muxMetadata: { type: "context-window-lead-in", rolloverId: "r1" } },
+        ],
+        [
+          "warn",
+          "user",
+          "warning",
+          { muxMetadata: { type: "context-budget-warning", contextTokens: 1, maxTokens: 2 } },
+        ],
+        ["u-now", "user", "now"]
+      )
+    ).toBe(false);
   });
 });

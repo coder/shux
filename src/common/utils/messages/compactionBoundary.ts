@@ -7,6 +7,7 @@ import { isPositiveInteger } from "@/common/utils/numbers";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
 
 import type { MuxMessage } from "@/common/types/message";
+import { isTokenBudgetInternalMessage } from "@/common/types/message";
 
 export { CONTEXT_BOUNDARY_KINDS };
 
@@ -193,4 +194,34 @@ export function sliceMessagesForProviderFromLatestContextBoundary(
   return boundaryKind === CONTEXT_BOUNDARY_KINDS.RESET
     ? messages.slice(boundaryIndex + 1)
     : messages.slice(boundaryIndex);
+}
+
+/**
+ * Whether the active epoch already holds a turn other than the one being
+ * started (`currentBatch`: the request's user row plus its prelude snapshot
+ * ids). Feeds the unknown-history rule of the workspace-memory write policy
+ * (WorkspaceService.recordWorkspaceMemoryWritable): an epoch with prior turns
+ * this process never recorded a policy for cannot be vouched for. Not turns:
+ * compaction request rows (they open an epoch), RLM keep-recent copies (the
+ * previous epoch's turns re-appended after the boundary; the harvest gate
+ * skips them too, and counting them would make another backend's first turn
+ * of the new epoch — racing the compacting backend's asynchronous policy
+ * carry — record an unknown-history deny for an all-writable epoch), and
+ * token-budget control rows (rollover lead-in, budget warning: backend
+ * template text prepended to the turn they precede; the harvest gate exempts
+ * them for the same reason, and counting one would record a false
+ * unknown-history deny for a fresh, otherwise writable epoch).
+ */
+export function epochHasPriorTurnRows(
+  activeContextMessages: readonly MuxMessage[],
+  currentBatch: ReadonlySet<string>
+): boolean {
+  return activeContextMessages.some(
+    (message) =>
+      message.role === "user" &&
+      !currentBatch.has(message.id) &&
+      message.metadata?.muxMetadata?.type !== "compaction-request" &&
+      message.metadata?.rlmPreservedTailCopy !== true &&
+      !isTokenBudgetInternalMessage(message)
+  );
 }

@@ -1931,6 +1931,17 @@ describe("CompactionHandler", () => {
           requestHistorySequence: boundarySequence + 9, // anchors on u4
         }),
         createMuxMessage("u5", "user", "unanswered question"),
+        // A row that recorded its policy under a foreign epoch but lost its
+        // request bound keeps that stamp (never the closing epoch); a present
+        // but malformed stamp stays unstamped; a synthetic payload row with
+        // neither belongs to the closing epoch.
+        createMuxMessage("a6", "assistant", "foreign-epoch answer without a bound", {
+          workspaceMemoryPolicyEpoch: -1,
+        }),
+        createMuxMessage("a7", "assistant", "corrupted stamp", {
+          workspaceMemoryPolicyEpoch: null as unknown as number,
+        }),
+        createMuxMessage("a8", "assistant", "synthetic payload"),
         createStampedCompactionRequest("compact-req-2", boundarySequence + 1)
       );
       expect(await handler.handleCompletion(createStreamEndEvent("Summary 2"))).toBe(true);
@@ -1950,6 +1961,9 @@ describe("CompactionHandler", () => {
         undefined, // u4
         undefined, // a4
         undefined, // u5
+        -1, // a6 (recorded stamp kept despite the missing bound)
+        undefined, // a7 (malformed stamp)
+        boundarySequence, // a8 (no stamp, no bound: synthetic payload row)
       ]);
     });
 

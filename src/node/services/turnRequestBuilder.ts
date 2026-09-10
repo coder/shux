@@ -37,7 +37,10 @@ import type { SendMessageError } from "@/common/types/errors";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
-import { latestContextBoundaryHistorySequence } from "@/common/utils/messages/compactionBoundary";
+import {
+  epochHasPriorTurnRows,
+  latestContextBoundaryHistorySequence,
+} from "@/common/utils/messages/compactionBoundary";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
@@ -1521,19 +1524,7 @@ export class TurnRequestBuilder {
               ...getRequestPreludeMessageIds(latestUserMessage.metadata?.requestPreludeMessageIds),
             ]
       );
-      // RLM keep-recent copies are the previous epoch's turns re-appended
-      // after the boundary (compactionHandler), not turns of this epoch: the
-      // harvest gate skips them too, and counting them would make another
-      // backend's first turn of the new epoch — racing the compacting
-      // backend's asynchronous policy carry — record an unknown-history
-      // deny for an all-writable epoch.
-      return activeContextMessages.some(
-        (message) =>
-          message.role === "user" &&
-          !currentBatch.has(message.id) &&
-          message.metadata?.muxMetadata?.type !== "compaction-request" &&
-          message.metadata?.rlmPreservedTailCopy !== true
-      );
+      return epochHasPriorTurnRows(activeContextMessages, currentBatch);
     })();
     // The compaction epoch this turn's policy accumulates over: the latest
     // durable boundary's history sequence (any kind), -1 before any boundary
