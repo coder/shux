@@ -18,7 +18,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  * uninterruptible in the service pipeline (see asAtomicMutation in
  * providerService.ts and startDesktopFlowEffect in muxGatewayOauthService.ts).
  */
-import { os } from "@orpc/server";
+import { ORPCError, os } from "@orpc/server";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
 import {
@@ -84,6 +84,8 @@ import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerat
 
 import {
   createAuthMiddleware,
+  extractBearerToken,
+  safeEq,
   extractClientIpAddress,
   extractCookieValues,
   getFirstHeaderValue,
@@ -100,6 +102,7 @@ import {
   subscribeBackgroundBashes,
   subscribeMemoryChanges,
   subscribeMetadata,
+  subscribeServerChanges,
   subscribeOpenSettings,
   subscribePolicyChanges,
   subscribeDesignExperiment,
@@ -234,6 +237,10 @@ export const router = (authToken?: string) => {
         .input(schemas.server.getLaunchProject.input)
         .output(schemas.server.getLaunchProject.output)
         .handler(async ({ context }) => context.serverService.getLaunchProject()),
+      onChanged: t
+        .input(schemas.server.onChanged.input)
+        .output(schemas.server.onChanged.output)
+        .handler(({ context, signal }) => subscribeServerChanges(context, signal)),
       getSshHost: t
         .input(schemas.server.getSshHost.input)
         .output(schemas.server.getSshHost.output)
@@ -252,6 +259,24 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) => setApiServerSettings(context, input)),
     },
     serverAuth: {
+      issueWebSocketTicket: t
+        .input(schemas.serverAuth.issueWebSocketTicket.input)
+        .output(schemas.serverAuth.issueWebSocketTicket.output)
+        .handler(({ context }) => {
+          const presented = extractBearerToken(context.headers?.authorization);
+          // Normal auth also accepts cookies. Never promote that revocable identity
+          // (or an invalid bearer alongside it) into a master-authority WS ticket.
+          if (
+            !authToken?.trim() ||
+            !presented ||
+            !safeEq(presented, authToken.trim()) ||
+            !context.issueWebSocketTicket
+          )
+            throw new ORPCError("UNAUTHORIZED", {
+              message: "WebSocket ticket requires master bearer authentication over HTTP POST",
+            });
+          return context.issueWebSocketTicket();
+        }),
       listSessions: t
         .input(schemas.serverAuth.listSessions.input)
         .output(schemas.serverAuth.listSessions.output)
@@ -1640,6 +1665,12 @@ export const router = (authToken?: string) => {
         .output(schemas.workspace.getRuntimeStatuses.output)
         .handler(async ({ context, input }) =>
           context.workspaceService.getRuntimeStatuses(input.workspaceIds)
+        ),
+      getProjectDiffs: t
+        .input(schemas.workspace.getProjectDiffs.input)
+        .output(schemas.workspace.getProjectDiffs.output)
+        .handler(async ({ context, input }) =>
+          context.workspaceService.getProjectDiffs(input.workspaceId)
         ),
       getProjectGitStatuses: t
         .input(schemas.workspace.getProjectGitStatuses.input)

@@ -138,7 +138,7 @@ docs/theme/pagetoc.js
 # Removed mobile/ Expo prototype: upgraded checkouts keep untracked leftovers
 # (node_modules, .expo, ios, android) that its deleted nested .gitignore used
 # to hide. Ignore the whole dead path so git status stays clean.
-mobile/
+/mobile/
 # Terminal-Bench leaderboard cache
 benchmarks/terminal_bench/.leaderboard_cache/
 # Terminal-Bench job output

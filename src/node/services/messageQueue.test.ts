@@ -1,6 +1,11 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import { MessageQueue } from "./messageQueue";
-import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  prepareUserMessageForSend,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
+import type { ReviewNoteData } from "@/common/types/review";
 import type { SendMessageOptions } from "@/common/orpc/types";
 
 describe("MessageQueue", () => {
@@ -8,6 +13,144 @@ describe("MessageQueue", () => {
 
   beforeEach(() => {
     queue = new MessageQueue();
+  });
+
+  describe("restore projection", () => {
+    const reviews: ReviewNoteData[] = ["first.ts", "second.ts"].map((filePath) => ({
+      filePath,
+      lineRange: "1",
+      selectedCode: "const value = 1;",
+      userNote: `Review ${filePath}`,
+    }));
+    const file = {
+      url: "data:text/plain;base64,dGV4dA==",
+      mediaType: "text/plain",
+      filename: "notes.txt",
+    };
+    const options = { model: "test-model", agentId: "exec" };
+
+    it.each([false, true])(
+      "restores each enqueue's reviews while preserving dispatch (sealed=%s)",
+      (sealed) => {
+        const bodies = ["First body\n<review>literal user XML</review>", "Second body"];
+        const prepared = bodies.map((text, index) =>
+          prepareUserMessageForSend({ text, reviews: [reviews[index]] })
+        );
+        prepared.forEach((message) =>
+          queue.add(
+            message.finalText,
+            { ...options, muxMetadata: message.metadata, fileParts: [file] },
+            { sealed }
+          )
+        );
+        expect(queue.entryCount()).toBe(sealed ? 2 : 1);
+        expect(queue.getVisibleDisplayText()).toBe(
+          prepared.map((message) => message.finalText).join("\n")
+        );
+        expect(queue.getVisibleReviews()).toEqual(sealed ? reviews : [reviews[0]]);
+        expect(queue.getVisibleRestoreText()).toBe(bodies.join("\n"));
+        expect(queue.getVisibleRestoreReviews()).toEqual(reviews);
+        expect(queue.getVisibleFileParts()).toEqual([file, file]);
+        const resend = prepareUserMessageForSend({
+          text: queue.getVisibleRestoreText(),
+          reviews: queue.getVisibleRestoreReviews(),
+        });
+        expect(resend).toEqual(prepareUserMessageForSend({ text: bodies.join("\n"), reviews }));
+        const first = queue.dequeueNext();
+        expect(first.message).toBe(
+          sealed ? prepared[0].finalText : prepared.map((message) => message.finalText).join("\n")
+        );
+        expect(first.options?.muxMetadata).toEqual(prepared[0].metadata);
+        expect(queue.getVisibleRestoreReviews()).toEqual(sealed ? [reviews[1]] : undefined);
+        queue.clear();
+        expect(queue.getVisibleRestoreText()).toBe("");
+        expect(queue.getVisibleRestoreReviews()).toBeUndefined();
+      }
+    );
+
+    it("strips one prepended prefix, not matching literal body text or later unreviewed adds", () => {
+      const prefix = prepareUserMessageForSend({ text: "", reviews }).finalText;
+      const body = `${prefix}\n\nLiteral repeated review, kept verbatim`;
+      const prepared = prepareUserMessageForSend({ text: body, reviews });
+      queue.add(prepared.finalText, { ...options, muxMetadata: prepared.metadata });
+      queue.add(body, options);
+      expect(queue.getVisibleRestoreText()).toBe(`${body}\n${body}`);
+      expect(queue.getVisibleRestoreReviews()).toEqual(reviews);
+    });
+
+    it("preserves raw text without the matching prefix and review-only/file-only payloads", () => {
+      const raw = "<review>literal</review>\n\nraw user input";
+      queue.add(raw, { ...options, muxMetadata: { reviews: [reviews[0]] } });
+      const prepared = prepareUserMessageForSend({ text: "", reviews: [reviews[1]] });
+      queue.add(prepared.finalText, { ...options, muxMetadata: prepared.metadata });
+      queue.add("", { ...options, fileParts: [file], muxMetadata: { reviews: [reviews[0]] } });
+      expect(queue.getVisibleRestoreText()).toBe(raw);
+      expect(queue.getVisibleRestoreReviews()).toEqual([...reviews, reviews[0]]);
+      expect(queue.getVisibleFileParts()).toEqual([file]);
+    });
+
+    it("keeps restore records aligned through partial dedupe removals and preserves hidden cancellation", () => {
+      reviews.forEach((review, index) => {
+        const prepared = prepareUserMessageForSend({ text: `body ${index}`, reviews: [review] });
+        queue.addOnce(
+          prepared.finalText,
+          { ...options, muxMetadata: prepared.metadata },
+          `review-${index}`
+        );
+      });
+      queue.add("tail", options);
+      queue.removeByDedupeKeyPrefix("review-0");
+      expect(queue.getVisibleRestoreText()).toBe("body 1\ntail");
+      expect(queue.getVisibleRestoreReviews()).toEqual([reviews[1]]);
+      queue.removeByDedupeKeyPrefix("review-1");
+      expect(queue.getVisibleRestoreText()).toBe("tail");
+      expect(queue.getVisibleRestoreReviews()).toBeUndefined();
+      const onCanceled = () => undefined;
+      const hidden = prepareUserMessageForSend({ text: "hidden", reviews });
+      queue.add(
+        hidden.finalText,
+        { ...options, muxMetadata: hidden.metadata },
+        { synthetic: true, onCanceled }
+      );
+      expect(queue.getVisibleRestoreText()).toBe("tail");
+      expect(queue.getVisibleRestoreReviews()).toBeUndefined();
+      expect(queue.getClearCallbacks()).toContainEqual({ onCanceled });
+    });
+
+    it("does not throw away input when unvalidated metadata contains malformed reviews", () => {
+      expect(queue.add("raw input", { ...options, muxMetadata: { reviews: [{}] } })).toBe(true);
+      expect(queue.getVisibleRestoreText()).toBe("raw input");
+      expect(queue.getVisibleRestoreReviews()).toBeUndefined();
+    });
+
+    it("validates display reviews per first-entry metadata without altering dispatch or later restore notes", () => {
+      const invalidMetadata = { reviews: [reviews[0], { ...reviews[1], selectedDiff: 42 }] };
+      queue.add("invalid first", { ...options, muxMetadata: invalidMetadata, fileParts: [file] });
+      queue.add("valid batched", { ...options, muxMetadata: { reviews: [reviews[1]] } });
+      expect(queue.getVisibleReviews()).toBeUndefined();
+      expect(queue.getVisibleRestoreReviews()).toEqual([reviews[1]]);
+      queue.add(
+        "valid separate",
+        { ...options, muxMetadata: { reviews: [reviews[0]] } },
+        { sealed: true }
+      );
+      expect(queue.getVisibleReviews()).toEqual([reviews[0]]);
+      expect(queue.getVisibleDisplayText()).toBe("invalid first\nvalid batched\nvalid separate");
+      const dispatched = queue.dequeueNext();
+      expect(dispatched.options?.muxMetadata).toBe(invalidMetadata);
+      expect(dispatched.options?.fileParts).toEqual([file]);
+    });
+
+    it("keeps raw commands for compaction and agent-skill restoration", () => {
+      for (const metadata of [
+        { type: "compaction-request", rawCommand: "/compact" },
+        { type: "agent-skill", rawCommand: "/skill", skillName: "skill", scope: "built-in" },
+      ]) {
+        queue.add("expanded prompt", { ...options, muxMetadata: metadata });
+        expect(queue.getVisibleRestoreText()).toBe(metadata.rawCommand);
+        queue.clear();
+      }
+    });
   });
 
   describe("authoredAtMs", () => {

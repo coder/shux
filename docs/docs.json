@@ -113,7 +113,11 @@
           },
           {
             "group": "Integrations",
-            "pages": ["integrations/vscode-extension", "integrations/acp"]
+            "pages": [
+              "integrations/vscode-extension",
+              "integrations/acp",
+              "integrations/mobile-app"
+            ]
           },
           {
             "group": "Reference",

@@ -97,12 +97,12 @@ import type { TurnCoordinator } from "@/node/services/turnCoordinator";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 
 /**
- * Independent field → tag listing for every ORPC context field (the production
+ * Independent field → tag listing for every service-backed ORPC context field (the production
  * mapping lives in the Layer files); `Record<keyof …>` keeps it exhaustive, so
  * a field added to `ORPCContext` without a tag fails to compile here.
  */
 const ORPC_FIELD_TAGS: Record<
-  keyof Omit<ORPCContext, "headers" | "effect/context" | "effect/wrap">,
+  keyof Omit<ORPCContext, "headers" | "issueWebSocketTicket" | "effect/context" | "effect/wrap">,
   Context.Key<AppTags, unknown>
 > = {
   config: ConfigTag,

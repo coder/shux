@@ -5,6 +5,11 @@
 // startup/streaming flags settle on adjacent renders.
 export const WORKSPACE_STREAMING_STATUS_TRANSITION_MS = 150;
 
+// Mobile batches only append deltas before rendering Markdown; control events flush immediately.
+export const MOBILE_STREAM_DISPLAY_BATCH_MS = 33;
+// Background timers can be throttled; cap pending event count without dropping text.
+export const MOBILE_STREAM_MAX_PENDING_DELTAS = 512;
+
 /**
  * Average character-per-token estimate used to convert tokens-per-second (from
  * the streaming TPS calculator) into characters-per-second (consumed by the

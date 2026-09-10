@@ -2474,6 +2474,47 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(usage.reasoning.cost_usd).toBeGreaterThan(0);
   });
 
+  it("passes current attempt capacity to the stream engine instead of historical retry preferences", async () => {
+    using xumHome = new DisposableTempDir("ai-service-request-context-capacity");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-context-capacity";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    const model = "anthropic:claude-sonnet-4-20250514";
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      anthropic: {
+        apiKey: "sk-test",
+        models: [{ id: model.slice("anthropic:".length), contextWindowTokens: 200_000 }],
+      },
+    });
+    const messages = [
+      createMuxMessage("latest-user", "user", "continue", {
+        retrySendOptions: {
+          model,
+          agentId: "exec",
+          thinkingLevel: "off",
+          providerOptions: { anthropic: { use1MContext: true } },
+        },
+      }),
+    ];
+    for (const disableBetaFeatures of [true, false]) {
+      const result = await harness.service.streamMessage({
+        messages,
+        workspaceId,
+        modelString: model,
+        thinkingLevel: "off",
+        muxProviderOptions: { anthropic: { use1MContext: true, disableBetaFeatures } },
+      });
+      expect(result.success).toBe(true);
+    }
+    expect(harness.startStreamCalls.map((call) => call.contextWindowTokens)).toEqual([
+      200_000, 1_000_000,
+    ]);
+    expect(harness.startStreamCalls[0].headers?.["anthropic-beta"]).toBeUndefined();
+    expect(harness.startStreamCalls[1].headers?.["anthropic-beta"]).toBeDefined();
+  });
+
   it("passes the resolved routeProvider into initial stream metadata", async () => {
     using xumHome = new DisposableTempDir("ai-service-route-provider-present");
     const projectPath = path.join(xumHome.path, "project");

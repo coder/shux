@@ -1,0 +1,21 @@
+{
+  "expo": {
+    "name": "Xum",
+    "slug": "xum-mobile",
+    "version": "0.1.0",
+    "orientation": "default",
+    "userInterfaceStyle": "dark",
+    "scheme": "xum-mobile",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.coder.xum.mobile",
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "Connect to your Xum server on your local network.",
+        "NSAppTransportSecurity": { "NSAllowsLocalNetworking": true }
+      }
+    },
+    "android": { "package": "com.coder.xum.mobile" },
+    "web": { "bundler": "metro", "output": "single", "name": "Xum Mobile" },
+    "plugins": ["expo-secure-store"]
+  }
+}

@@ -3,8 +3,8 @@ import {
   parseStagedAttachmentNotice,
 } from "@/browser/features/ChatInput/stagedAttachments";
 import type { StagedChatAttachment } from "@/browser/features/ChatInput/ChatAttachments";
-import type { DisplayedMessage, ReviewNoteDataForDisplay } from "@/common/types/message";
-import { formatReviewForModel } from "@/common/types/review";
+import type { DisplayedMessage } from "@/common/types/message";
+import { stripRenderedReviews } from "@/common/types/review";
 import type { BashOutputToolArgs } from "@/common/types/tools";
 
 export interface EditableUserMessageDraftContent {
@@ -26,27 +26,6 @@ export function getEditableUserMessageDraftContent(
       `edited-${message.historyId}`
     ),
   };
-}
-
-function stripRenderedReviews(content: string, reviews?: ReviewNoteDataForDisplay[]): string {
-  if (!reviews || reviews.length === 0) {
-    return content;
-  }
-
-  // Reviews are already stored in metadata; strip their rendered tags to avoid duplication on edit.
-  const reviewText = reviews.map(formatReviewForModel).join("\n\n");
-  if (!content.startsWith(reviewText)) {
-    return content;
-  }
-
-  const remainder = content.slice(reviewText.length);
-  if (remainder.startsWith("\n\n")) {
-    return remainder.slice(2);
-  }
-  if (remainder.startsWith("\n")) {
-    return remainder.slice(1);
-  }
-  return remainder;
 }
 
 /**

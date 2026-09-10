@@ -34,6 +34,7 @@ import type {
   ToolErrorResult,
 } from "@/common/types/tools";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
+import { parseAskUserQuestionAnswer } from "@/common/utils/tools/parseAskUserQuestionAnswer";
 import { getErrorMessage } from "@/common/utils/errors";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 
@@ -98,42 +99,11 @@ function isToolErrorResult(val: unknown): val is ToolErrorResult {
 }
 
 function parsePrefilledAnswer(question: AskUserQuestionQuestion, answer: string): DraftAnswer {
-  const trimmed = answer.trim();
-  if (trimmed.length === 0) {
-    return { selected: [], otherText: "" };
-  }
-
-  const optionLabels = new Set(question.options.map((o) => o.label));
-
-  if (!question.multiSelect) {
-    if (optionLabels.has(trimmed)) {
-      return { selected: [trimmed], otherText: "" };
-    }
-
-    return { selected: [OTHER_VALUE], otherText: trimmed };
-  }
-
-  const tokens = trimmed
-    .split(",")
-    .map((t) => t.trim())
-    .filter((t) => t.length > 0);
-
-  const selected: string[] = [];
-  const otherParts: string[] = [];
-
-  for (const token of tokens) {
-    if (optionLabels.has(token)) {
-      selected.push(token);
-    } else {
-      otherParts.push(token);
-    }
-  }
-
-  if (otherParts.length > 0) {
-    selected.push(OTHER_VALUE);
-  }
-
-  return { selected, otherText: otherParts.join(", ") };
+  const { optionLabels, customText } = parseAskUserQuestionAnswer(question, answer);
+  return {
+    selected: customText ? [...optionLabels, OTHER_VALUE] : optionLabels,
+    otherText: customText,
+  };
 }
 
 function isQuestionAnswered(_question: AskUserQuestionQuestion, draft: DraftAnswer): boolean {

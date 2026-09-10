@@ -102,6 +102,7 @@ Use this index to find a page's:
   - **Integrations**
     - VS Code Extension (`/integrations/vscode-extension`) → `references/docs/integrations/vscode-extension.mdx`: Pair Xum workspaces with VS Code and Cursor editors
     - ACP (Editor Integrations) (`/integrations/acp`) → `references/docs/integrations/acp.mdx`: Connect Xum to Zed, Neovim, and JetBrains via the Agent Client Protocol
+    - Mobile companion (`/integrations/mobile-app`) → `references/docs/integrations/mobile-app.md`: Develop the React Native Xum companion and connect it to your server.
   - **Reference**
     - Mux compatibility (`/reference/mux-compatibility`) → `references/docs/reference/mux-compatibility.mdx`: Upgrade, downgrade, storage, command, environment, and deep-link compatibility during the Xum rename
     - Debugging (`/reference/debugging`) → `references/docs/reference/debugging.mdx`: View live backend logs and diagnose issues

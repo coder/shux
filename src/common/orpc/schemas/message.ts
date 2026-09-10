@@ -6,6 +6,11 @@ import { StreamErrorTypeSchema } from "./errors";
 import { AgentSkillScopeSchema, SkillNameSchema } from "./agentSkill";
 import { WorkflowRunIdSchema, WorkflowRunRecordSchema } from "./workflow";
 
+export const ContextWindowTokensSchema = z.number().int().positive().nullable().meta({
+  description:
+    "Request-pinned effective context capacity; null means unknown, absent means legacy metadata",
+});
+
 export const FilePartSchema = z.object({
   url: z.string(),
   mediaType: z.string(),
@@ -166,6 +171,7 @@ export const MuxMessageSchema = z.object({
       timestamp: z.number().optional(),
       model: z.string().optional(),
       metadataModel: z.string().optional(),
+      contextWindowTokens: ContextWindowTokensSchema.optional().catch(undefined),
       thinkingLevel: ThinkingLevelSchema.optional(),
       routedThroughGateway: z.boolean().optional(),
       routeProvider: z.string().optional(), // Preserve replayed/non-stream route attribution.
@@ -199,6 +205,7 @@ export const MuxMessageSchema = z.object({
       disableWorkspaceAgents: z.boolean().optional(),
       retrySendOptions: z.any().optional(),
       agentId: AgentIdSchema.optional().catch(undefined),
+      userStopped: z.literal(true).optional().catch(undefined),
       partial: z.boolean().optional(),
       synthetic: z.boolean().optional(),
       uiVisible: z.boolean().optional(),

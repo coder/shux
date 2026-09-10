@@ -1,0 +1,747 @@
+import { useEffect, useRef, useState } from "react";
+import type { SetStateAction } from "react";
+import type { TextInputKeyPressEvent } from "react-native";
+import { FlatList, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import {
+  ArrowDown,
+  ArrowUp,
+  ChevronDown,
+  ClipboardList,
+  Settings,
+  GitCompareArrows,
+  ChevronLeft,
+  Square,
+} from "lucide-react-native";
+import type { MobileClient } from "../api";
+import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
+import { resolvePersistedAgentId } from "../../../../src/common/utils/agentIds";
+import { prepareUserMessageForSend } from "../../../../src/common/types/message";
+import type { MuxMessage } from "../../../../src/common/types/message";
+import { Button, IconButton, Loading, Notice } from "../components/Controls";
+import { KeyboardAvoidingView } from "../components/Keyboard";
+import { DraftExtras } from "../components/DraftExtras";
+import { EMPTY_DRAFT } from "../draft";
+import type { ChatDraft } from "../draft";
+import { Message } from "../components/Message";
+import { ContextUsage } from "../components/ContextUsage";
+import { getContextMeterData } from "../contextUsage";
+import { getWebComposerKeyAction } from "../composerKeyboard";
+import { useConversation } from "../useConversation";
+import { getVisibleMessages } from "../transcript";
+import { linkedAbortController } from "../useConnection";
+import {
+  getModelBlockReason,
+  getPolicyStateBlockReason,
+  modelName,
+  resolveSettings,
+} from "../settings";
+import type { ChatSettings } from "../settings";
+import { ModelSettings } from "./ModelSettings";
+import { colors, fontFamily, layout, radii, spacing, typography } from "../theme";
+import { THINKING_LEVEL_OFF } from "../../../../src/common/types/thinking";
+
+// RN Web reports scrollHeight, which cannot shrink a fixed-height textarea and
+// can expand hidden stack screens. Let the browser size content; native uses its intrinsic measurement.
+// Focus belongs on the rounded composer. Browser "auto" outlines can still paint at zero width.
+const webInputSizing = {
+  fieldSizing: "content",
+  height: "auto",
+  outlineStyle: "solid",
+  outlineWidth: 0,
+} as const;
+
+export function ConversationScreen(props: {
+  client: MobileClient;
+  serverLabel: string;
+  workspace: FrontendWorkspaceMetadata;
+  signal: AbortSignal;
+  connected: boolean;
+  onReconnect: () => Promise<void>;
+  onBack: () => void;
+  selection: ChatSettings | null;
+  onSelectionChange: (value: ChatSettings) => void;
+  draft: ChatDraft;
+  onDraftChange: (value: SetStateAction<ChatDraft>) => void;
+  onChanges: () => void;
+  onSettings: () => void;
+}) {
+  const { transcript, settings, error, settingsError, loadOlder, loadingOlder, historyError } =
+    useConversation(props.client, props.workspace.id, props.signal, (restored) => {
+      props.onDraftChange((current) => ({
+        text: [current.text, restored.text].filter(Boolean).join("\n\n"),
+        fileParts: [...current.fileParts, ...(restored.fileParts ?? [])],
+        reviews: [...current.reviews, ...(restored.reviews ?? [])],
+      }));
+    });
+  const draft = props.draft;
+  const hasDraft = Boolean(draft.text.trim() || draft.fileParts.length || draft.reviews.length);
+  const setDraft = props.onDraftChange;
+  const [inputFocused, setInputFocused] = useState(false);
+  const [inputHeight, setInputHeight] = useState(44);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [resumeMessageId, setResumeMessageId] = useState<string | null>(null);
+  const [startedResumeMessageId, setStartedResumeMessageId] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState<"model" | "agent" | null>(null);
+  const [atBottom, setAtBottom] = useState(true);
+  const [composerHeight, setComposerHeight] = useState(100);
+  const list = useRef<FlatList<MuxMessage>>(null);
+  const controller = useRef(new AbortController());
+  const pending = useRef(false);
+  // This component is keyed by workspace ID: both subscription and in-flight actions
+  // belong to one workspace, and a switch cannot expose the previous draft/history.
+  useEffect(() => {
+    const abort = linkedAbortController(props.signal);
+    controller.current = abort;
+    pending.current = false;
+    setStartedResumeMessageId(null);
+    setBusy(false);
+    return () => abort.abort();
+  }, [props.signal]);
+  const latestTranscript = useRef(transcript);
+  // Answer RPCs can outlive stream updates from another client. Consult the latest
+  // committed transcript before starting recovery, not the pre-answer render.
+  useEffect(() => {
+    // A resync after a dropped stream is authoritative too: if the started turn is not
+    // in the replay, manual recovery must be offered again.
+    if (transcript.streaming || !transcript.caughtUp) setStartedResumeMessageId(null);
+    latestTranscript.current = transcript;
+  }, [transcript]);
+  const agentId = resolvePersistedAgentId(props.workspace);
+  const modeLocked = props.workspace.parentWorkspaceId != null;
+  // Transcript access survives checkout removal; Git actions do not.
+  const transcriptOnly = props.workspace.transcriptOnly === true;
+  const options = settings
+    ? resolveSettings(
+        props.workspace,
+        settings,
+        props.selection?.agentId ?? agentId,
+        props.selection
+      )
+    : null;
+  const context = getContextMeterData(
+    transcript.messages,
+    options,
+    settings?.providers,
+    transcript.streamingMessageId
+  );
+  // Settings gate new AI work, not the ability to interrupt an existing live stream.
+  const ready = props.connected && !props.signal.aborted && transcript.caughtUp && !error;
+  const loadError = error ?? settingsError;
+  const modelBlockReason =
+    settings && options ? getModelBlockReason(settings, options.model) : null;
+  // The catalog includes non-selectable delegated agents, but excludes disabled ones.
+  const agentBlockReason =
+    settings && options && !settings.agents.some((agent) => agent.id === options.agentId)
+      ? "This agent is no longer available. Choose another mode or enable it on desktop."
+      : null;
+  const requestBlockReason = modelBlockReason ?? agentBlockReason;
+  const settingsReady = ready && settings !== null && !settingsError;
+  const canAct = settingsReady && !requestBlockReason && !transcriptOnly;
+  const latestSettings = useRef({ options, requestBlockReason, transcriptOnly });
+  useEffect(() => {
+    latestSettings.current = { options, requestBlockReason, transcriptOnly };
+  }, [options, requestBlockReason, transcriptOnly]);
+  const running = ready && transcript.streaming;
+  const actionDisabled = !ready || busy || (!running && (!canAct || !hasDraft || !options?.model));
+  // A live answer resolves the existing tool, not the next-turn model. Connection,
+  // settings and global policy blocks still apply; recovery needs a routable model too.
+  const canAnswer =
+    settingsReady && !transcriptOnly && (running ? !getPolicyStateBlockReason(settings) : canAct);
+  const expanded = inputFocused || hasDraft || running || showSettings !== null;
+
+  const lastMessage = transcript.messages.at(-1);
+  // Only the active stream or the latest persisted partial can still need input.
+  // Historical unanswered tools may have been abandoned by a later user turn.
+  const answerMessage = running
+    ? transcript.messages.find((message) => message.id === transcript.streamingMessageId)
+    : lastMessage?.role === "assistant" &&
+        lastMessage.metadata?.partial &&
+        !lastMessage.metadata.userStopped
+      ? lastMessage
+      : undefined;
+  // The saved tool result survives remount/reconnect even when the answer RPC's
+  // local recovery state does not. Only the latest interrupted turn is eligible.
+  const resumeTargetId =
+    lastMessage?.role === "assistant" &&
+    lastMessage.metadata?.partial &&
+    !lastMessage.metadata.userStopped &&
+    (resumeMessageId === lastMessage.id ||
+      lastMessage.parts.some(
+        (part) =>
+          part.type === "dynamic-tool" &&
+          part.toolName === "ask_user_question" &&
+          part.state === "output-available"
+      ))
+      ? lastMessage.id
+      : null;
+  const canResume =
+    canAct && !running && resumeTargetId !== null && resumeTargetId !== startedResumeMessageId;
+
+  async function handleComposerKeyPress(event: TextInputKeyPressEvent) {
+    if (actionDisabled || pending.current) return;
+    const action = getWebComposerKeyAction(event.nativeEvent);
+    // Modified Enter is only an idle send here: mobile does not offer turn queueing.
+    if (!action || (action === "send" ? running : !running)) return;
+    event.preventDefault();
+    if (action === "send") await send();
+    else await interrupt();
+  }
+
+  async function send() {
+    if (!canAct || !options?.model || !hasDraft || pending.current || running) return;
+    pending.current = true;
+    setBusy(true);
+    setActionError(null);
+    // All draft updates are immutable: only clear this sent version, never newer
+    // typing or another queue restoration that arrives while the request is pending.
+    const sent = draft;
+    const signal = controller.current.signal;
+    try {
+      const { finalText, metadata } = prepareUserMessageForSend(sent);
+      const result = await props.client.workspace.sendMessage(
+        {
+          workspaceId: props.workspace.id,
+          message: finalText,
+          options: {
+            ...options,
+            ...(sent.fileParts.length ? { fileParts: sent.fileParts } : {}),
+            ...(metadata ? { muxMetadata: metadata } : {}),
+          },
+        },
+        { signal }
+      );
+      if (signal.aborted) return;
+      if (!result.success)
+        throw new Error(
+          typeof result.error === "string" ? result.error : JSON.stringify(result.error)
+        );
+      setDraft((current) => (current === sent ? EMPTY_DRAFT : current));
+      // Content-size events resize cleared input without shrinking a newer draft.
+      list.current?.scrollToEnd({ animated: true });
+    } catch (cause) {
+      if (!signal.aborted)
+        setActionError(
+          `${cause instanceof Error ? cause.message : "Message could not be sent."} If the connection was lost, reload history before retrying to avoid sending twice.`
+        );
+    } finally {
+      if (controller.current.signal === signal) {
+        pending.current = false;
+        if (!signal.aborted) setBusy(false);
+      }
+    }
+  }
+
+  async function interrupt() {
+    if (!ready || pending.current) return;
+    pending.current = true;
+    setBusy(true);
+    setActionError(null);
+    const signal = controller.current.signal;
+    try {
+      const result = await props.client.workspace.interruptStream(
+        {
+          workspaceId: props.workspace.id,
+          // Match desktop User Stop: owed monitor output must not restart the stopped turn.
+          options: { retireBashMonitorAttention: true, disableAutoRetry: true },
+        },
+        { signal }
+      );
+      if (!result.success) throw new Error(result.error);
+    } catch (cause) {
+      if (!signal.aborted)
+        setActionError(cause instanceof Error ? cause.message : "Could not interrupt the agent.");
+    } finally {
+      if (controller.current.signal === signal) {
+        pending.current = false;
+        if (!signal.aborted) setBusy(false);
+      }
+    }
+  }
+
+  async function resumeAnsweredQuestion(messageId: string, signal: AbortSignal) {
+    const current = latestTranscript.current;
+    const latest = current.messages.at(-1);
+    // An unsynced transcript (stream being re-established) is not evidence; the
+    // replay will re-offer manual recovery if the turn is still waiting.
+    if (
+      signal.aborted ||
+      !current.caughtUp ||
+      current.streaming ||
+      latest?.id !== messageId ||
+      latest?.metadata?.userStopped ||
+      !latest.metadata?.partial
+    )
+      return;
+    const { options, requestBlockReason, transcriptOnly } = latestSettings.current;
+    // The answer is already durable and its form may disappear on tool-call-end.
+    // Keep resume failures outside that form, and retry only resume, never the answer.
+    setResumeMessageId(messageId);
+    // Settings or policy can change while the answer is saved. Preserve recovery
+    // while unavailable, but never resume with stale options or a prohibited route.
+    if (!options?.model || requestBlockReason || transcriptOnly) return;
+    try {
+      const result = await props.client.workspace.resumeStream(
+        { workspaceId: props.workspace.id, options },
+        { signal }
+      );
+      if (signal.aborted) return;
+      if (!result.success)
+        throw new Error(
+          typeof result.error === "string" ? result.error : JSON.stringify(result.error)
+        );
+      if (result.data.started) {
+        setResumeMessageId(null);
+        // The durable partial may replay before stream-start arrives. Do not offer
+        // a second start until stream activity or a fresh connection reconciles it.
+        if (!latestTranscript.current.streaming) setStartedResumeMessageId(messageId);
+      } else setActionError("Answers saved. The agent is busy; try resuming again.");
+    } catch (cause) {
+      if (!signal.aborted)
+        setActionError(
+          `Answers saved, but the agent could not resume: ${cause instanceof Error ? cause.message : "Unknown error"}`
+        );
+    }
+  }
+
+  async function retryResume() {
+    if (!canResume || !resumeTargetId || pending.current) return;
+    pending.current = true;
+    setBusy(true);
+    setActionError(null);
+    const signal = controller.current.signal;
+    try {
+      await resumeAnsweredQuestion(resumeTargetId, signal);
+    } finally {
+      if (controller.current.signal === signal) {
+        pending.current = false;
+        if (!signal.aborted) setBusy(false);
+      }
+    }
+  }
+
+  async function answer(toolCallId: string, answers: Record<string, string>) {
+    if (!ready) throw new Error("Reconnect before answering.");
+    if (!canAnswer)
+      throw new Error(requestBlockReason ?? settingsError ?? "Wait for settings before answering.");
+    if (pending.current) throw new Error("Another action is in progress.");
+    if (
+      !answerMessage ||
+      resumeMessageId === answerMessage.id ||
+      !answerMessage.parts.some(
+        (part) =>
+          part.type === "dynamic-tool" &&
+          part.toolName === "ask_user_question" &&
+          part.toolCallId === toolCallId &&
+          part.state === "input-available"
+      )
+    )
+      throw new Error("This question is no longer pending.");
+    if (!running && !options?.model) throw new Error("Choose a model before resuming.");
+    pending.current = true;
+    setBusy(true);
+    setActionError(null);
+    const signal = controller.current.signal;
+    try {
+      const result = await props.client.workspace.answerAskUserQuestion(
+        { workspaceId: props.workspace.id, toolCallId, answers },
+        { signal }
+      );
+      if (signal.aborted)
+        throw new Error("Connection changed. Reload history before answering again.");
+      if (!result.success) throw new Error(result.error);
+      if (!running) await resumeAnsweredQuestion(answerMessage.id, signal);
+    } finally {
+      if (controller.current.signal === signal) {
+        pending.current = false;
+        if (!signal.aborted) setBusy(false);
+      }
+    }
+  }
+
+  return (
+    <KeyboardAvoidingView
+      style={layout.fill}
+      behavior={Platform.OS === "ios" ? "padding" : "height"}
+    >
+      <View style={styles.header}>
+        <View style={styles.headerActions}>
+          <IconButton
+            label="Back to workspaces"
+            icon={ChevronLeft}
+            color={colors.text}
+            onPress={props.onBack}
+          />
+        </View>
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <Text accessibilityRole="header" style={styles.title} numberOfLines={1}>
+            {props.workspace.title ?? props.workspace.name}
+          </Text>
+          <Text style={styles.subtitle} numberOfLines={1}>
+            {props.workspace.kind === "scratch" ? "Scratch chat" : props.workspace.projectName} ·{" "}
+            {props.serverLabel}
+          </Text>
+        </View>
+        <View style={styles.headerActions}>
+          <IconButton
+            label="View changes"
+            icon={GitCompareArrows}
+            onPress={props.onChanges}
+            disabled={props.workspace.kind === "scratch" || transcriptOnly}
+          />
+          <IconButton label="Connection settings" icon={Settings} onPress={props.onSettings} />
+        </View>
+      </View>
+      <FlatList
+        ref={list}
+        data={getVisibleMessages(transcript.messages)}
+        keyExtractor={(message) => message.id}
+        contentContainerStyle={styles.messages}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+        ListHeaderComponent={
+          transcript.hasOlderHistory ? (
+            <View style={{ gap: 12 }}>
+              {historyError && <Notice>{historyError}</Notice>}
+              <Button
+                busy={loadingOlder}
+                disabled={!ready}
+                onPress={() => {
+                  setAtBottom(false);
+                  return loadOlder();
+                }}
+              >
+                Load older messages
+              </Button>
+            </View>
+          ) : null
+        }
+        onScroll={(event) => {
+          const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+          setAtBottom(contentSize.height - layoutMeasurement.height - contentOffset.y < 80);
+        }}
+        scrollEventThrottle={100}
+        onContentSizeChange={() => {
+          if (atBottom) list.current?.scrollToEnd({ animated: false });
+        }}
+        renderItem={({ item }) => (
+          <Message
+            message={item}
+            streaming={transcript.streamingMessageId === item.id && running}
+            canAnswer={
+              canAnswer && !busy && answerMessage?.id === item.id && resumeMessageId !== item.id
+            }
+            onAnswer={answer}
+          />
+        )}
+        ListEmptyComponent={
+          !ready && !loadError ? (
+            <Loading label="Syncing conversation…" />
+          ) : loadError ? null : (
+            <View style={styles.empty}>
+              <Text style={styles.emptyTitle}>What’s on your mind?</Text>
+              <Text style={[layout.muted, { textAlign: "center" }]}>
+                Ask a question, plan a change, or let an agent take it from here.
+              </Text>
+            </View>
+          )
+        }
+        ListFooterComponent={
+          <View style={{ gap: 12 }}>
+            {loadError && <Notice onRetry={props.onReconnect}>{loadError}</Notice>}
+            {transcript.error && <Notice>{transcript.error}</Notice>}
+            {canResume && (
+              <Button busy={busy} onPress={retryResume}>
+                Resume agent
+              </Button>
+            )}
+            {running && (
+              <Text style={[layout.muted, { color: colors.accent }]}>Agent is working…</Text>
+            )}
+          </View>
+        }
+      />
+      {!atBottom && (
+        <View style={[styles.latest, { bottom: composerHeight + 12 }]}>
+          <IconButton
+            icon={ArrowDown}
+            label="Jump to latest message"
+            onPress={() => list.current?.scrollToEnd({ animated: true })}
+          />
+        </View>
+      )}
+      {transcriptOnly ? (
+        <View
+          style={styles.composerWrap}
+          onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
+        >
+          <Text role="note" style={layout.muted}>
+            This workspace's worktree is no longer available. This is a read-only chat transcript.
+          </Text>
+          {actionError && <Notice>{actionError}</Notice>}
+          {/* A missing checkout blocks new work, not stopping a stream that is already live. */}
+          {running && (
+            <Button icon={Square} busy={busy} onPress={interrupt}>
+              Interrupt agent
+            </Button>
+          )}
+        </View>
+      ) : (
+        <View
+          style={styles.composerWrap}
+          onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
+        >
+          {requestBlockReason && (
+            <Notice onRetry={!settings?.policy ? props.onReconnect : undefined}>
+              {requestBlockReason}
+            </Notice>
+          )}
+          {actionError && (
+            <Notice
+              onRetry={() => {
+                setActionError(null);
+                return props.onReconnect();
+              }}
+            >
+              {actionError}
+            </Notice>
+          )}
+          <DraftExtras draft={draft} onChange={setDraft} />
+          {/* Keep the input bottommost. Pointer presses retain browser focus until click opens the picker, avoiding blur-driven movement. */}
+          <View style={styles.composerToolbar}>
+            <View style={styles.pickers}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Choose mode"
+                accessibilityState={{ disabled: modeLocked || !settings || !options }}
+                disabled={modeLocked || !settings || !options}
+                onPointerDown={
+                  Platform.OS === "web" ? (event) => event.preventDefault() : undefined
+                }
+                onPress={() => setShowSettings("agent")}
+                style={({ pressed }) => [
+                  styles.modelButton,
+                  { maxWidth: "45%" },
+                  pressed && { opacity: 0.6 },
+                ]}
+              >
+                {options?.agentId === "plan" ? (
+                  <ClipboardList size={15} color={colors.plan} />
+                ) : (
+                  <View style={styles.modeDot} />
+                )}
+                <Text numberOfLines={1} style={styles.modelLabel}>
+                  {settings?.agents.find((agent) => agent.id === options?.agentId)?.name ??
+                    options?.agentId ??
+                    "Mode"}
+                </Text>
+                <ChevronDown size={12} color={colors.muted} />
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Choose model"
+                accessibilityState={{ disabled: !settings || !options }}
+                disabled={!settings || !options}
+                onPointerDown={
+                  Platform.OS === "web" ? (event) => event.preventDefault() : undefined
+                }
+                onPress={() => setShowSettings("model")}
+                style={({ pressed }) => [styles.modelButton, pressed && { opacity: 0.6 }]}
+              >
+                <Text numberOfLines={1} style={styles.modelLabel}>
+                  {options?.model ? modelName(options.model) : "Model"}
+                </Text>
+                {options && (
+                  <Text style={styles.effortLabel}>
+                    {(options.thinkingLevel ?? THINKING_LEVEL_OFF).toUpperCase()}
+                  </Text>
+                )}
+                <ChevronDown size={12} color={colors.muted} />
+              </Pressable>
+            </View>
+            <ContextUsage data={context} />
+          </View>
+          <View
+            style={[
+              styles.composer,
+              expanded && styles.expandedComposer,
+              inputFocused && styles.focusedComposer,
+            ]}
+          >
+            <TextInput
+              accessibilityLabel="Message"
+              placeholder={
+                !ready ? "Reconnecting…" : running ? "Write your next message…" : "Message Xum…"
+              }
+              placeholderTextColor={colors.muted}
+              value={draft.text}
+              onChangeText={(text) => setDraft((current) => ({ ...current, text }))}
+              multiline
+              onKeyPress={Platform.OS === "web" ? handleComposerKeyPress : undefined}
+              onFocus={() => setInputFocused(true)}
+              onBlur={() => setInputFocused(false)}
+              onContentSizeChange={
+                Platform.OS === "web"
+                  ? undefined
+                  : (event) =>
+                      setInputHeight(
+                        Math.max(44, Math.min(132, event.nativeEvent.contentSize.height))
+                      )
+              }
+              style={[
+                styles.input,
+                expanded && styles.expandedInput,
+                Platform.OS === "web"
+                  ? webInputSizing
+                  : { height: expanded ? Math.max(72, inputHeight) : 44 },
+              ]}
+              selectionColor={colors.accent}
+            />
+            <View
+              style={[
+                styles.send,
+                (canAct || running) &&
+                  (running || hasDraft) && {
+                    backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent,
+                  },
+              ]}
+            >
+              <IconButton
+                label={running ? "Interrupt agent" : "Send message"}
+                icon={running ? Square : ArrowUp}
+                color={(canAct || running) && (running || hasDraft) ? colors.bright : colors.muted}
+                disabled={actionDisabled}
+                onPress={running ? interrupt : send}
+              />
+            </View>
+          </View>
+        </View>
+      )}
+      {showSettings &&
+        settings &&
+        options &&
+        !transcriptOnly &&
+        (!modeLocked || showSettings === "model") && (
+          <ModelSettings
+            initialPage={showSettings}
+            value={options}
+            data={settings}
+            workspace={props.workspace}
+            onClose={() => setShowSettings(null)}
+            onChange={props.onSelectionChange}
+          />
+        )}
+    </KeyboardAvoidingView>
+  );
+}
+
+const styles = StyleSheet.create({
+  header: {
+    minHeight: 72,
+    paddingHorizontal: spacing.md,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  headerActions: { flexDirection: "row", borderRadius: radii.pill, backgroundColor: colors.panel },
+  title: { ...typography.header, color: colors.bright },
+  subtitle: { ...typography.footnote, color: colors.muted, marginTop: 2 },
+  messages: {
+    paddingHorizontal: spacing.xl,
+    paddingTop: 20,
+    paddingBottom: spacing.xl,
+    width: "100%",
+    maxWidth: 760,
+    alignSelf: "center",
+    flexGrow: 1,
+  },
+  empty: {
+    flex: 1,
+    paddingVertical: 48,
+    paddingHorizontal: spacing.xl,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  emptyTitle: {
+    fontFamily,
+    color: colors.bright,
+    fontSize: 22,
+    fontWeight: "600",
+    letterSpacing: -0.4,
+  },
+  composerWrap: {
+    paddingHorizontal: spacing.md,
+    paddingTop: 8,
+    paddingBottom: 8,
+    width: "100%",
+    maxWidth: 760,
+    alignSelf: "center",
+    gap: 4,
+    backgroundColor: colors.background,
+  },
+  composer: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    borderRadius: radii.pill,
+    padding: 6,
+    backgroundColor: colors.panel,
+    borderColor: colors.border,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  expandedComposer: { borderRadius: radii.sheet },
+  focusedComposer: { borderColor: colors.selection },
+  expandedInput: { minHeight: 72 },
+  input: {
+    flex: 1,
+    fontFamily,
+    minWidth: 0,
+    color: colors.bright,
+    fontSize: 16,
+    lineHeight: 23,
+    minHeight: 44,
+    maxHeight: 132,
+    textAlignVertical: "top",
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+  },
+  composerToolbar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 4,
+    gap: 8,
+  },
+  pickers: { flex: 1, minWidth: 0, flexDirection: "row", gap: 6, alignItems: "center" },
+  modelButton: {
+    minHeight: 44,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    flexShrink: 1,
+    paddingHorizontal: 10,
+    backgroundColor: colors.panel,
+    borderRadius: radii.pill,
+  },
+  effortLabel: {
+    fontFamily,
+    color: colors.muted,
+    fontSize: 10,
+    fontWeight: "600",
+    flexShrink: 0,
+    paddingLeft: 6,
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderLeftColor: colors.border,
+  },
+  modeDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: colors.accent },
+  modelLabel: { fontFamily, color: colors.text, fontSize: 13, fontWeight: "500", flexShrink: 1 },
+  send: { borderRadius: 22, overflow: "hidden", backgroundColor: colors.elevated },
+  latest: {
+    position: "absolute",
+    right: 20,
+    backgroundColor: colors.elevated,
+    borderRadius: radii.sheet,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+  },
+});

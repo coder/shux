@@ -8,6 +8,7 @@ import type {
 
 import type {
   StreamStartEvent,
+  StreamMetadataEvent,
   StreamDeltaEvent,
   StreamEndEvent,
   StreamAbortEvent,
@@ -62,6 +63,7 @@ export type FrontendWorkspaceMetadataSchemaType = z.infer<
 // Server types (single source of truth - derived from schemas)
 export type ApiServerStatus = z.infer<typeof schemas.ApiServerStatusSchema>;
 export type ServerAuthSession = z.infer<typeof schemas.ServerAuthSessionSchema>;
+export type WebSocketTicket = z.infer<typeof schemas.serverAuth.issueWebSocketTicket.output>;
 // Experiment types (single source of truth - derived from schemas)
 
 // Policy types (single source of truth - derived from schemas)
@@ -85,6 +87,10 @@ export function isDeleteMessage(msg: WorkspaceChatMessage): msg is DeleteMessage
 
 export function isStreamStart(msg: WorkspaceChatMessage): msg is StreamStartEvent {
   return (msg as { type?: string }).type === "stream-start";
+}
+
+export function isStreamMetadata(msg: WorkspaceChatMessage): msg is StreamMetadataEvent {
+  return msg.type === "stream-metadata";
 }
 
 export function isStreamDelta(msg: WorkspaceChatMessage): msg is StreamDeltaEvent {

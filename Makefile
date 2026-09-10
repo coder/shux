@@ -369,6 +369,8 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 # Keep the default local path fast. Docs link crawling and lockfile-free bench-agent
 # verification stay in static-check-full so local validation remains responsive.
 static-check: lint typecheck fmt-check check-eager-imports check-code-docs-links lint-shellcheck lint-hadolint ## Run fast local static checks
+	@node packages/mobile/scripts/generateTheme.cjs --check
+	@bun test ./packages/mobile/scripts/generateTheme.test.ts
 
 static-check-full: static-check check-bench-agent check-docs-links ## Run the full CI static check suite
 
@@ -393,14 +395,14 @@ lint-zizmor: ## Run zizmor security analysis on GitHub Actions workflows
 # Prune any node_modules tree (not just ./node_modules) plus the removed mobile/
 # prototype: upgraded checkouts may keep stale untracked leftovers there (e.g.
 # CocoaPods .sh scripts under mobile/ios) that would otherwise be scanned.
-SHELL_SRC_FILES := $(shell find . -not \( -path '*/.git/*' -o -path '*/node_modules/*' -o -path './mobile/*' -o -path './build/*' -o -path './dist/*' -o -path './release/*' -o -path './benchmarks/terminal_bench/.leaderboard_cache/*' \) -type f -name '*.sh' 2>/dev/null)
+SHELL_SRC_FILES := $(shell find . -not \( -path '*/.git/*' -o -path '*/node_modules/*' -o -path './mobile/*' -o -path './packages/mobile/ios/*' -o -path './packages/mobile/android/*' -o -path './build/*' -o -path './dist/*' -o -path './release/*' -o -path './benchmarks/terminal_bench/.leaderboard_cache/*' \) -type f -name '*.sh' 2>/dev/null)
 
 lint-shellcheck: ## Run shellcheck on shell scripts
 	@echo "Running shellcheck on $(words $(SHELL_SRC_FILES)) shell scripts..."
 	@shellcheck --external-sources $(SHELL_SRC_FILES)
 
 # Dockerfiles to lint (excludes node_modules, build artifacts, .git)
-DOCKERFILES := $(shell find . -not \( -path '*/.git/*' -o -path '*/node_modules/*' -o -path './mobile/*' -o -path './build/*' -o -path './dist/*' -o -path './release/*' -o -path './benchmarks/terminal_bench/.leaderboard_cache/*' \) -type f -name 'Dockerfile' 2>/dev/null)
+DOCKERFILES := $(shell find . -not \( -path '*/.git/*' -o -path '*/node_modules/*' -o -path './mobile/*' -o -path './packages/mobile/ios/*' -o -path './packages/mobile/android/*' -o -path './build/*' -o -path './dist/*' -o -path './release/*' -o -path './benchmarks/terminal_bench/.leaderboard_cache/*' \) -type f -name 'Dockerfile' 2>/dev/null)
 
 lint-hadolint: ## Run hadolint on Dockerfiles
 	@echo "Running hadolint on $(words $(DOCKERFILES)) Dockerfiles..."
@@ -591,6 +593,59 @@ test-storybook: node_modules/.installed ## Run Storybook interaction tests (requ
 	$(check_node_version)
 	@# Storybook story transitions can exceed Jest's default 15s timeout on loaded CI runners.
 	@bun x test-storybook --testTimeout 30000
+
+## React Native companion (isolated Expo dependency graph)
+MOBILE_METRO_PORT ?= 8081
+
+.PHONY: mobile-install mobile-web mobile-native mobile-preview mobile-export mobile-export-ios mobile-typecheck mobile-test mobile-test-web mobile-lint mobile-fmt mobile-check
+mobile-install: packages/mobile/node_modules/.installed ## Install pinned mobile dependencies
+
+packages/mobile/node_modules/.installed: packages/mobile/package.json packages/mobile/bun.lock
+	@cd packages/mobile && bun install --frozen-lockfile
+	@touch $@
+
+# Node owns the preview's WebSocket upgrades; Bun's node:http compatibility can
+# accept the upgrade but stall forwarding oRPC frames.
+packages/mobile/.expo/preview.mjs: packages/mobile/scripts/preview.ts packages/mobile/src/endpoint.ts packages/mobile/node_modules/.installed
+	@mkdir -p packages/mobile/.expo
+	@bun build packages/mobile/scripts/preview.ts --target=node --format=esm --packages=external --outfile=$@
+
+mobile-web: mobile-install packages/mobile/.expo/preview.mjs ## Run RN Web + fixed-target proxy (set XUM_MOBILE_ENDPOINT)
+	@test -n "$$XUM_MOBILE_ENDPOINT" || (echo 'Set XUM_MOBILE_ENDPOINT to your Xum server URL'; exit 1)
+	@XUM_MOBILE_METRO=http://127.0.0.1:$(MOBILE_METRO_PORT) bun x concurrently -k \
+		"cd packages/mobile && BROWSER=none bun x expo start --web --port $(MOBILE_METRO_PORT)" \
+		"node packages/mobile/.expo/preview.mjs"
+
+mobile-native: mobile-install ## Start Expo for a native device or simulator
+	@cd packages/mobile && bun x expo start --port $(MOBILE_METRO_PORT)
+
+mobile-preview: mobile-install packages/mobile/.expo/preview.mjs ## Serve exported RN Web through the fixed-target proxy
+	@XUM_MOBILE_STATIC_DIR=$(CURDIR)/packages/mobile/dist node packages/mobile/.expo/preview.mjs
+
+mobile-export: mobile-install ## Export production React Native Web
+	@cd packages/mobile && bun x expo export --platform web
+
+mobile-export-ios: mobile-install ## Compile the iOS JS bundle (not a native simulator build)
+	@cd packages/mobile && bun x expo export --platform ios --output-dir dist-ios
+
+mobile-typecheck: mobile-install ## Typecheck the mobile app against shared Xum contracts
+	@cd packages/mobile && bun x tsc --noEmit
+
+mobile-test: mobile-install packages/mobile/.expo/preview.mjs ## Test mobile protocol, transcript, and preview safety
+	@cd packages/mobile && bun test src scripts
+
+mobile-test-web: mobile-install ## Test native-web navigation/layout against a disposable running preview
+	@cd packages/mobile && bun x playwright test
+
+mobile-lint: mobile-install ## Lint native components and mobile infrastructure
+	@cd packages/mobile && ../../node_modules/.bin/eslint . --max-warnings 0
+
+mobile-fmt: ## Format mobile source and configuration
+	@cd packages/mobile && ../../node_modules/.bin/prettier --write '**/*.{ts,tsx,json,mjs,cjs}'
+
+mobile-check: mobile-typecheck mobile-test mobile-lint ## Run mobile validation independently of desktop dependencies
+	@node packages/mobile/scripts/generateTheme.cjs --check
+	@cd packages/mobile && ../../node_modules/.bin/prettier --check '**/*.{ts,tsx,json,mjs,cjs}'
 
 ## Benchmarks
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)

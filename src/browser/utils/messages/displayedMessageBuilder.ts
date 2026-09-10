@@ -31,6 +31,10 @@ import {
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
+import { mergeAdjacentParts } from "@/common/utils/messages/mergeAdjacentParts";
+import { getNestedCallsForDisplay } from "@/common/utils/messages/nestedToolCalls";
+
+export { mergeAdjacentParts } from "@/common/utils/messages/mergeAdjacentParts";
 
 /**
  * Check if a tool result indicates success (for tools that return { success: boolean })
@@ -78,66 +82,6 @@ export function normalizeMessageRouteProvider(message: MuxMessage): MuxMessage {
       routeProvider,
     },
   };
-}
-
-/**
- * Merge adjacent text/reasoning parts using array accumulation + join().
- * Avoids O(n²) string allocations from repeated concatenation.
- * Tool parts are preserved as-is between merged text/reasoning runs.
- */
-export function mergeAdjacentParts(parts: MuxMessage["parts"]): MuxMessage["parts"] {
-  if (parts.length <= 1) return parts;
-
-  const merged: MuxMessage["parts"] = [];
-  let pendingTexts: string[] = [];
-  let pendingTextTimestamp: number | undefined;
-  let pendingReasonings: string[] = [];
-  let pendingReasoningTimestamp: number | undefined;
-
-  const flushText = () => {
-    if (pendingTexts.length > 0) {
-      merged.push({
-        type: "text",
-        text: pendingTexts.join(""),
-        timestamp: pendingTextTimestamp,
-      });
-      pendingTexts = [];
-      pendingTextTimestamp = undefined;
-    }
-  };
-
-  const flushReasoning = () => {
-    if (pendingReasonings.length > 0) {
-      merged.push({
-        type: "reasoning",
-        text: pendingReasonings.join(""),
-        timestamp: pendingReasoningTimestamp,
-      });
-      pendingReasonings = [];
-      pendingReasoningTimestamp = undefined;
-    }
-  };
-
-  for (const part of parts) {
-    if (part.type === "text") {
-      flushReasoning();
-      pendingTexts.push(part.text);
-      pendingTextTimestamp ??= part.timestamp;
-    } else if (part.type === "reasoning") {
-      flushText();
-      pendingReasonings.push(part.text);
-      pendingReasoningTimestamp ??= part.timestamp;
-    } else {
-      // Tool part - flush and keep as-is
-      flushText();
-      flushReasoning();
-      merged.push(part);
-    }
-  }
-  flushText();
-  flushReasoning();
-
-  return merged;
 }
 
 export function getTextPartContent(parts: ReadonlyArray<MuxMessage["parts"][number]>): string {
@@ -190,7 +134,6 @@ export interface BuildDisplayedMessagesForMessageOptions {
 }
 
 type ToolDisplayStatus = Extract<DisplayedMessage, { type: "tool" }>["status"];
-type NestedToolCalls = NonNullable<DynamicToolPart["nestedCalls"]>;
 
 function buildPlanDisplayMessages(
   message: MuxMessage,
@@ -549,66 +492,6 @@ function getToolDisplayStatus(part: DynamicToolPart, isPartial: boolean): ToolDi
         : "executing";
   }
   return "pending";
-}
-
-function getObjectField(value: unknown, field: string): unknown {
-  return typeof value === "object" && value !== null
-    ? (value as Record<string, unknown>)[field]
-    : undefined;
-}
-
-function reconstructCodeExecutionNestedCalls(part: DynamicToolPart): NestedToolCalls | undefined {
-  if (part.toolName !== "code_execution" || part.state !== "output-available") {
-    return undefined;
-  }
-
-  const toolCalls = getObjectField(part.output, "toolCalls");
-  if (!Array.isArray(toolCalls)) {
-    return undefined;
-  }
-
-  const nestedCalls: NestedToolCalls = [];
-  for (const [idx, toolCall] of toolCalls.entries()) {
-    if (typeof toolCall !== "object" || toolCall === null) {
-      continue;
-    }
-    const record = toolCall as Record<string, unknown>;
-    if (typeof record.toolName !== "string" || typeof record.duration_ms !== "number") {
-      continue;
-    }
-
-    const output =
-      record.result ??
-      (typeof record.error === "string"
-        ? // success:false matches the failure shape tool cards and
-          // isFailedToolOutput already understand, so the error stays
-          // visible (e.g. bash's ErrorBox) after reload.
-          { success: false, error: record.error }
-        : undefined);
-    // RLM kernel-mode compact record (r12): the full nested result never
-    // persists in the tool output, so degraded detail after reload is expected
-    // (live streaming keeps full detail via part.nestedCalls, which takes
-    // precedence). Failure travels out-of-band via `failed` instead of a
-    // synthetic output shape, so a real tool result can never be mistaken
-    // for a reconstruction stand-in.
-    const kernelFailure = output === undefined && record.ok === false;
-
-    nestedCalls.push({
-      toolCallId: `${part.toolCallId}-nested-${idx}`,
-      toolName: record.toolName,
-      input: record.args,
-      output,
-      ...(kernelFailure ? { failed: true } : {}),
-      state: "output-available",
-      timestamp: part.timestamp,
-    });
-  }
-
-  return nestedCalls.length > 0 ? nestedCalls : undefined;
-}
-
-function getNestedCallsForDisplay(part: DynamicToolPart): NestedToolCalls | undefined {
-  return part.nestedCalls ?? reconstructCodeExecutionNestedCalls(part);
 }
 
 function appendToolRows(

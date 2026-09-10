@@ -332,6 +332,8 @@ export interface WorkspaceUsageState {
    * it over re-resolving the raw model against a refreshed providers config.
    */
   liveMetadataModel?: string;
+  /** Backend-pinned active request capacity: null is unknown; undefined is legacy or idle. */
+  liveContextWindowTokens?: number | null;
 }
 
 /**
@@ -954,6 +956,11 @@ export class WorkspaceStore {
       // on stream-start makes the cache invariant: every new turn forces a
       // fresh recompute regardless of how the previous one was wound down.
       this.streamingStatsStore.bump(workspaceId);
+    },
+    "stream-metadata": (workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+      this.states.bump(workspaceId);
+      this.usageStore.bump(workspaceId);
     },
     "stream-lifecycle": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -2944,6 +2951,7 @@ export class WorkspaceStore {
       // re-resolving the raw model against the refreshed config would price
       // and bucket live usage differently from the backend ledger.
       const liveMetadataModel = aggregator.getActiveStreamMetadataModel();
+      const liveContextWindowTokens = aggregator.getActiveStreamContextWindowTokens();
       const rawContextUsage = activeStreamId
         ? aggregator.getActiveStreamUsage(activeStreamId)
         : undefined;
@@ -2985,6 +2993,7 @@ export class WorkspaceStore {
         liveUsage,
         liveCostUsage,
         liveMetadataModel,
+        liveContextWindowTokens,
       };
     });
   }
@@ -4528,6 +4537,7 @@ export class WorkspaceStore {
 
     return (
       data.type === "stream-start" ||
+      data.type === "stream-metadata" ||
       data.type === "stream-end" ||
       data.type === "stream-abort" ||
       data.type === "stream-error"

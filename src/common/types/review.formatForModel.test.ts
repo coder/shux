@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  stripRenderedReviews,
   formatReviewForModel,
   isPlanFilePath,
   normalizePlanFilePath,
@@ -13,6 +14,26 @@ const baseReviewData: ReviewNoteData = {
   selectedCode: "const value = 1;",
   userNote: "Please rename this variable.",
 };
+
+describe("stripRenderedReviews", () => {
+  const reviews = [baseReviewData];
+  const prefix = reviews.map(formatReviewForModel).join("\n\n");
+  test.each(["", "\n", "\n\n"])("removes one matching prefix with separator %j", (separator) => {
+    const body = `  ${prefix}\n\n<review>literal user text</review>\n `;
+    expect(stripRenderedReviews(`${prefix}${separator}${body}`, reviews)).toBe(body);
+  });
+  test("keeps nonmatching metadata and interior/literal blocks byte-for-byte", () => {
+    for (const body of [`before\n${prefix}`, ` ${prefix}`, "<review>other content</review>"]) {
+      expect(stripRenderedReviews(body, reviews)).toBe(body);
+    }
+    expect(stripRenderedReviews(prefix)).toBe(prefix);
+    expect(stripRenderedReviews(prefix, [])).toBe(prefix);
+    expect(stripRenderedReviews(prefix, [{ ...baseReviewData, userNote: "different" }])).toBe(
+      prefix
+    );
+    expect(stripRenderedReviews(prefix, reviews)).toBe("");
+  });
+});
 
 describe("formatReviewForModel", () => {
   test("formats standard code review notes with file path and line range", () => {

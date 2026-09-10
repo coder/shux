@@ -55,3 +55,6 @@ Thumbs.db
 !docs/**/*.md
 !docs/**/*.mdx
 LICENSE
+
+# Native companion is built separately from the desktop server.
+packages/mobile/

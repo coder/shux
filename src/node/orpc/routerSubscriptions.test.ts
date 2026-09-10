@@ -13,7 +13,11 @@ import { TestClock } from "effect/testing";
 import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/common/utils/withQueueHeartbeat";
 import { disposeAppRuntime, makeAppRuntime } from "@/node/services/di/appRuntime";
 import type { ORPCContext } from "./context";
-import { subscribeWorkspaceActivity, subscribeDesignExperiment } from "./routerSubscriptions";
+import {
+  subscribeDesignExperiment,
+  subscribeServerChanges,
+  subscribeWorkspaceActivity,
+} from "./routerSubscriptions";
 
 test("subscription handlers forward the oRPC runtime Clock", async () => {
   const app = makeAppRuntime(TestClock.layer());
@@ -95,4 +99,47 @@ test("Design subscriptions publish sibling changes only after client shutdown", 
     controller.abort();
     await stream.return(undefined);
   }
+});
+
+test("server change subscription fans in every control-plane source and releases them on abort", async () => {
+  const app = makeAppRuntime(TestClock.layer());
+  const workspaceService = new EventEmitter();
+  const listeners = {
+    config: new Set<() => void>(),
+    providers: new Set<() => void>(),
+    policy: new Set<() => void>(),
+  };
+  const source = (set: Set<() => void>) => (callback: () => void) => {
+    set.add(callback);
+    return () => set.delete(callback);
+  };
+  const context = {
+    "effect/context": app.context,
+    workspaceService,
+    config: { onConfigChanged: source(listeners.config) },
+    providerService: { onConfigChanged: source(listeners.providers) },
+    policyService: { onPolicyChanged: source(listeners.policy) },
+  } as unknown as ORPCContext;
+  const controller = new AbortController();
+  const events: unknown[] = [];
+  const stream = subscribeServerChanges(context, controller.signal);
+  const first = stream.next();
+  for (const set of Object.values(listeners)) expect(set.size).toBe(1);
+  listeners.policy.forEach((emit) => emit());
+  listeners.config.forEach((emit) => emit());
+  workspaceService.emit("metadata", { workspaceId: "w", metadata: null });
+  listeners.providers.forEach((emit) => emit());
+  events.push((await first).value);
+  for (let i = 0; i < 3; i++) events.push((await stream.next()).value);
+  expect(events).toEqual([
+    { type: "policy" },
+    { type: "config" },
+    { type: "metadata", workspaceId: "w", metadata: null },
+    { type: "providers" },
+  ]);
+  controller.abort();
+  await stream.next().catch(() => undefined);
+  await disposeAppRuntime(app.managed);
+  for (const set of Object.values(listeners)) expect(set.size).toBe(0);
+  expect(workspaceService.listenerCount("metadata")).toBe(0);
 });

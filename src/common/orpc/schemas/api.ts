@@ -1,3 +1,4 @@
+import { ORPC_WS_TICKET_PATTERN } from "@/common/constants/webSocketAuth";
 import {
   ClaudeDesignSettingsSchema,
   ClaudeDesignStatusSchema,
@@ -191,6 +192,18 @@ export const ProjectGitStatusResultSchema = z.object({
 });
 
 export type ProjectGitStatusResult = z.infer<typeof ProjectGitStatusResultSchema>;
+
+export const ProjectGitDiffResultSchema = ProjectRefSchema.and(
+  ResultSchema(
+    z.object({
+      diff: z.string(),
+      truncated: z.boolean(),
+      note: z.string().optional(),
+    }),
+    z.string()
+  )
+);
+export type ProjectGitDiffResult = z.infer<typeof ProjectGitDiffResultSchema>;
 
 export const BackgroundProcessMonitorInfoSchema = z.object({
   filter: z.string(),
@@ -1530,6 +1543,10 @@ export const workspace = {
     input: z.object({ workspaceIds: z.array(z.string()) }),
     output: z.record(z.string(), z.enum(["running", "stopped", "unknown", "unsupported"])),
   },
+  getProjectDiffs: {
+    input: z.object({ workspaceId: z.string() }),
+    output: z.array(ProjectGitDiffResultSchema),
+  },
   getProjectGitStatuses: {
     input: z.object({
       workspaceId: z.string(),
@@ -2479,6 +2496,18 @@ export const ServerAuthSessionSchema = z.object({
   isCurrent: z.boolean(),
 });
 
+export const ServerChangeEventSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("config") }),
+  z.object({ type: z.literal("providers") }),
+  z.object({ type: z.literal("policy") }),
+  z.object({
+    type: z.literal("metadata"),
+    workspaceId: z.string(),
+    metadata: FrontendWorkspaceMetadataSchema.nullable(),
+  }),
+]);
+export type ServerChangeEvent = z.infer<typeof ServerChangeEventSchema>;
+
 export const server = {
   getLaunchProject: {
     input: z.void(),
@@ -2504,9 +2533,29 @@ export const server = {
     }),
     output: ApiServerStatusSchema,
   },
+  /**
+   * Subscription: every control-plane change a thin client tracks, on one stream.
+   * HTTP clients hold one long-lived response per subscription, and browsers and
+   * mobile URLSession cap HTTP/1.1 connections per host at about six, so the
+   * separate config/providers/policy/metadata subscriptions would starve the
+   * unary calls that must read the changed snapshots.
+   */
+  onChanged: {
+    input: z.void(),
+    output: eventIterator(ServerChangeEventSchema),
+  },
 };
 
 export const serverAuth = {
+  issueWebSocketTicket: {
+    input: z.void(),
+    output: z
+      .object({
+        ticket: z.string().regex(ORPC_WS_TICKET_PATTERN),
+        expiresAtMs: z.number().int().nonnegative(),
+      })
+      .strict(),
+  },
   listSessions: {
     input: z.void(),
     output: z.array(ServerAuthSessionSchema),

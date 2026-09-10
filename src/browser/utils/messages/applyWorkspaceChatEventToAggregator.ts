@@ -23,6 +23,7 @@ import {
   isStreamEnd,
   isStreamError,
   isStreamStart,
+  isStreamMetadata,
   isToolCallDelta,
   isToolCallEnd,
   isToolCallExecutionStart,
@@ -36,6 +37,7 @@ import type {
   StreamDeltaEvent,
   StreamEndEvent,
   StreamStartEvent,
+  StreamMetadataEvent,
   ToolCallDeltaEvent,
   ToolCallEndEvent,
   ToolCallExecutionStartEvent,
@@ -64,6 +66,7 @@ export interface ApplyWorkspaceChatEventToAggregatorOptions {
  */
 export interface WorkspaceChatEventAggregator {
   handleStreamStart(data: StreamStartEvent): void;
+  handleStreamMetadata(data: StreamMetadataEvent): void;
   handleStreamDelta(data: StreamDeltaEvent): void;
   handleStreamEnd(data: StreamEndEvent): void;
   handleStreamAbort(data: StreamAbortEvent): void;
@@ -123,6 +126,11 @@ export function applyWorkspaceChatEventToAggregator(
 
   if (isStreamStart(event)) {
     aggregator.handleStreamStart(event);
+    return "immediate";
+  }
+
+  if (isStreamMetadata(event)) {
+    aggregator.handleStreamMetadata(event);
     return "immediate";
   }
 

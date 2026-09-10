@@ -368,3 +368,14 @@ export function formatReviewForModel(data: ReviewNoteData): string {
 
   return `<review>\nRe ${location}\n\`\`\`\n${data.selectedCode}\n\`\`\`\n> ${data.userNote.trim()}\n</review>`;
 }
+
+/** Remove one metadata-rendered prefix when restoring editable input; never scan body text. */
+export function stripRenderedReviews(content: string, reviews?: readonly ReviewNoteData[]): string {
+  if (!reviews || reviews.length === 0) return content;
+  const reviewText = reviews.map(formatReviewForModel).join("\n\n");
+  if (!content.startsWith(reviewText)) return content;
+  const remainder = content.slice(reviewText.length);
+  if (remainder.startsWith("\n\n")) return remainder.slice(2);
+  if (remainder.startsWith("\n")) return remainder.slice(1);
+  return remainder;
+}

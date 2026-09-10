@@ -296,6 +296,7 @@ import type {
   ArchivePreflightResult,
   ArchiveWorkspaceResult,
   BackgroundProcessInfo,
+  ProjectGitDiffResult,
 } from "@/common/orpc/schemas/api";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
@@ -9385,6 +9386,41 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
 
     return statuses;
+  }
+
+  async getProjectDiffs(workspaceId: string): Promise<ProjectGitDiffResult[]> {
+    assert(workspaceId.trim().length > 0, "getProjectDiffs requires a workspaceId");
+    const metadata = await this.aiService.getWorkspaceMetadata(workspaceId);
+    if (!metadata.success) throw new Error(`Failed to get workspace metadata: ${metadata.error}`);
+    if (metadata.data.kind === "scratch") return [];
+
+    // Return every repository in one IPC response; a failed checkout must not look clean.
+    return Promise.all(
+      getProjects(metadata.data).map(async (project): Promise<ProjectGitDiffResult> => {
+        try {
+          const result = await this.executeBash(
+            workspaceId,
+            "",
+            { cwdMode: "repo-root", repoRootProjectPath: project.projectPath, timeout_secs: 20 },
+            "git",
+            ["--no-pager", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "HEAD", "--"]
+          );
+          if (!result.success) return { ...project, ...Err(result.error) };
+          if (!result.data.success) return { ...project, ...Err(result.data.error) };
+          assert(!("backgroundProcessId" in result.data), "Git diff must finish in the foreground");
+          return {
+            ...project,
+            ...Ok({
+              diff: result.data.output,
+              truncated: result.data.truncated != null,
+              note: result.data.note,
+            }),
+          };
+        } catch (error) {
+          return { ...project, ...Err(getErrorMessage(error)) };
+        }
+      })
+    );
   }
 
   async getProjectGitStatuses(

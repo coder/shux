@@ -404,6 +404,67 @@ describe("TurnRequestBuilder tool scope", () => {
 });
 
 describe("TurnRequestBuilder model attempt preparation", () => {
+  it("pins context capacity from the actual request and refreshes it for a new attempt", async () => {
+    const harness = await createPreparationHarness();
+    try {
+      const model = "anthropic:claude-sonnet-4-20250514";
+      const providers: ProvidersConfigMap = {
+        anthropic: {
+          isConfigured: true,
+          isEnabled: true,
+          apiKeySet: true,
+          models: [{ id: model.slice("anthropic:".length), contextWindowTokens: 200_000 }],
+        },
+      };
+      const options = preparationOptions(providers, {
+        rawModelString: model,
+        canonicalModelString: model,
+        effectiveModelString: model,
+        optionsModelString: model,
+        muxProviderOptions: { anthropic: { use1MContextModels: [model] } },
+      });
+      const first = harness.builder.prepareModelAttempt(options);
+      expect(first.contextWindowTokens).toBe(1_000_000);
+      expect(first.requestHeaders?.["anthropic-beta"]).toBeDefined();
+      // A later resume/new attempt owns new options; earlier user retry metadata is irrelevant.
+      options.muxProviderOptions.anthropic!.disableBetaFeatures = true;
+      providers.anthropic.models = [
+        { id: model.slice("anthropic:".length), contextWindowTokens: 150_000 },
+      ];
+      const resumed = harness.builder.prepareModelAttempt(options);
+      expect(resumed.requestHeaders?.["anthropic-beta"]).toBeUndefined();
+      expect(resumed.contextWindowTokens).toBe(150_000);
+      expect(first.contextWindowTokens).toBe(1_000_000);
+      options.muxProviderOptions.anthropic!.disableBetaFeatures = false;
+      providers.openrouter = {
+        isConfigured: true,
+        isEnabled: true,
+        apiKeySet: true,
+        models: [
+          { id: `anthropic/${model.slice("anthropic:".length)}`, contextWindowTokens: 175_000 },
+        ],
+      };
+      const transformed = harness.builder.prepareModelAttempt({
+        ...options,
+        effectiveModelString: `openrouter:anthropic/${model.slice("anthropic:".length)}`,
+        routeProvider: "openrouter",
+      });
+      // Transforming gateways cannot carry the beta header, even with saved 1M intent.
+      expect(transformed.requestHeaders?.["anthropic-beta"]).toBeUndefined();
+      expect(transformed.contextWindowTokens).toBe(175_000);
+      const unknown = harness.builder.prepareModelAttempt({
+        ...options,
+        rawModelString: "local:unknown",
+        effectiveModelString: "local:unknown",
+        canonicalModelString: "local:unknown",
+        optionsModelString: "local:unknown",
+      });
+      expect(unknown.contextWindowTokens).toBeNull();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   it("merges call settings and provider extras at the resolved namespace", async () => {
     const harness = await createPreparationHarness();
     try {

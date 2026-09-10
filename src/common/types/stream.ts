@@ -19,6 +19,7 @@ import type {
   StreamDeltaEventSchema,
   StreamEndEventSchema,
   StreamStartEventSchema,
+  StreamMetadataEventSchema,
   ToolCallDeltaEventSchema,
   ToolCallEndEventSchema,
   ToolCallExecutionStartEventSchema,
@@ -40,6 +41,27 @@ import type {
 export type CompletedMessagePart = MuxReasoningPart | MuxTextPart | MuxToolPart;
 
 export type StreamStartEvent = z.infer<typeof StreamStartEventSchema>;
+export type StreamMetadataEvent = z.infer<typeof StreamMetadataEventSchema>;
+/**
+ * A fallback starts a new attempt in the same message. Replace its owned fields and
+ * discard refused-attempt usage; that spend already belongs to the session ledger.
+ */
+export function copyStreamMetadataSnapshot(metadata: StreamMetadataEvent["metadata"]) {
+  return {
+    model: metadata.model,
+    metadataModel: metadata.metadataModel,
+    contextWindowTokens: metadata.contextWindowTokens,
+    thinkingLevel: metadata.thinkingLevel,
+    routedThroughGateway: metadata.routedThroughGateway,
+    routeProvider: metadata.routeProvider ?? undefined,
+    modelFallback: metadata.modelFallback,
+    usage: undefined,
+    contextUsage: undefined,
+    providerMetadata: undefined,
+    contextProviderMetadata: undefined,
+  };
+}
+
 export type StreamDeltaEvent = z.infer<typeof StreamDeltaEventSchema>;
 export type StreamEndEvent = z.infer<typeof StreamEndEventSchema>;
 export type StreamAbortReason = z.infer<typeof StreamAbortReasonSchema>;

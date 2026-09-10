@@ -1,3 +1,4 @@
+import type { WebSocketTicket } from "@/common/orpc/types";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import type { IncomingHttpHeaders } from "http";
 import type {
@@ -126,5 +127,7 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   desktopTokenManager: DesktopTokenManager;
   desktopBridgeServer: DesktopBridgeServer;
   workflowRuntimeFactory: IJSRuntimeFactory;
+  /** Supplied only by this server's HTTP POST handler, never by WS/IPC or input. */
+  issueWebSocketTicket?: () => WebSocketTicket;
   headers?: IncomingHttpHeaders;
 }

@@ -13070,6 +13070,88 @@ describe("WorkspaceService getProjectGitStatuses", () => {
     return { workspaceService, executeBashMock, getWorkspaceMetadataMock };
   }
 
+  test("getProjectDiffs includes secondary repositories and keeps per-repo failures visible", async () => {
+    const metadata: WorkspaceMetadata = {
+      id: "ws-multi-diff",
+      name: "feature",
+      projectName: "primary",
+      projectPath: "/primary",
+      runtimeConfig: { type: "local" },
+      projects: [
+        { projectPath: "/primary", projectName: "primary" },
+        { projectPath: "/secondary", projectName: "secondary" },
+        { projectPath: "/offline", projectName: "offline" },
+      ],
+    };
+    const { workspaceService, executeBashMock } = createServiceHarness({
+      metadata,
+      executeBashImpl: (_id, _script, options) => {
+        if (options?.repoRootProjectPath === "/offline")
+          return Promise.reject(new Error("Repository unavailable"));
+        return Promise.resolve(
+          bashOk(options?.repoRootProjectPath === "/secondary" ? "secondary diff" : "")
+        );
+      },
+    });
+    const results = await workspaceService.getProjectDiffs(metadata.id);
+    expect(results).toEqual([
+      { ...metadata.projects![0], success: true, data: { diff: "", truncated: false } },
+      {
+        ...metadata.projects![1],
+        success: true,
+        data: { diff: "secondary diff", truncated: false },
+      },
+      { ...metadata.projects![2], success: false, error: "Repository unavailable" },
+    ]);
+    expect(executeBashMock).toHaveBeenCalledTimes(3);
+    expect(executeBashMock).toHaveBeenNthCalledWith(
+      2,
+      metadata.id,
+      "",
+      { cwdMode: "repo-root", repoRootProjectPath: "/secondary", timeout_secs: 20 },
+      "git",
+      ["--no-pager", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "HEAD", "--"]
+    );
+  });
+
+  test("getProjectDiffs skips scratch chats and preserves truncation for single repositories", async () => {
+    const metadata: WorkspaceMetadata = {
+      id: "ws-diff",
+      name: "feature",
+      projectName: "project",
+      projectPath: "/project",
+      runtimeConfig: { type: "local" },
+    };
+    const harness = createServiceHarness({
+      metadata,
+      executeBashImpl: () =>
+        Promise.resolve(
+          Ok({
+            success: true,
+            output: "partial diff",
+            exitCode: 0,
+            wall_duration_ms: 1,
+            truncated: { reason: "output limit", totalLines: 100 },
+            note: "limit",
+          })
+        ),
+    });
+    expect(await harness.workspaceService.getProjectDiffs(metadata.id)).toEqual([
+      {
+        projectPath: "/project",
+        projectName: "project",
+        success: true,
+        data: { diff: "partial diff", truncated: true, note: "limit" },
+      },
+    ]);
+    const scratch = createServiceHarness({
+      metadata: { ...metadata, kind: "scratch" },
+      executeBashImpl: () => Promise.reject(new Error("git should not run")),
+    });
+    expect(await scratch.workspaceService.getProjectDiffs(metadata.id)).toEqual([]);
+    expect(scratch.executeBashMock).not.toHaveBeenCalled();
+  });
+
   test("returns no entries for scratch workspaces without invoking git", async () => {
     const metadata: WorkspaceMetadata = {
       kind: "scratch",

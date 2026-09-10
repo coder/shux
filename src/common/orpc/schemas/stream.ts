@@ -5,6 +5,7 @@ import { AgentModeSchema } from "../../types/mode";
 import { ChatUsageDisplaySchema } from "./chatStats";
 import { StreamErrorTypeSchema } from "./errors";
 import {
+  ContextWindowTokensSchema,
   FilePartSchema,
   ModelFallbackRecordSchema,
   MuxMessageSchema,
@@ -175,6 +176,7 @@ export const StreamStartEventSchema = z.object({
         "frontends must prefer it over re-resolving the raw model against a " +
         "possibly refreshed providers config",
     }),
+  contextWindowTokens: ContextWindowTokensSchema.optional(),
   routedThroughGateway: z.boolean().optional(),
   routeProvider: z.string().optional(),
   historySequence: z.number().meta({
@@ -196,6 +198,23 @@ export const StreamStartEventSchema = z.object({
     .string()
     .optional()
     .meta({ description: "ACP prompt correlation id for matching stream events" }),
+});
+
+// Fallback-only attempt boundary: reset request usage before switching model identity.
+// Preserve accumulated parts, message lifecycle, and the separately recorded session ledger.
+export const StreamMetadataEventSchema = z.object({
+  type: z.literal("stream-metadata"),
+  workspaceId: z.string(),
+  messageId: z.string(),
+  metadata: z.object({
+    model: z.string(),
+    metadataModel: z.string(),
+    contextWindowTokens: ContextWindowTokensSchema,
+    thinkingLevel: ThinkingLevelSchema.optional(),
+    routedThroughGateway: z.boolean(),
+    routeProvider: z.string().nullable(),
+    modelFallback: ModelFallbackRecordSchema.optional(),
+  }),
 });
 
 export const StreamDeltaEventSchema = z.object({
@@ -257,6 +276,7 @@ export const StreamEndEventSchema = z.object({
     .object({
       model: z.string(),
       metadataModel: z.string().optional(),
+      contextWindowTokens: ContextWindowTokensSchema.optional(),
       agentId: AgentIdSchema.optional().catch(undefined),
       mode: AgentModeSchema.optional().catch(undefined),
       thinkingLevel: ThinkingLevelSchema.optional(),
@@ -689,6 +709,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   DeleteMessageSchema,
   StreamLifecycleEventSchema,
   StreamStartEventSchema,
+  StreamMetadataEventSchema,
   StreamDeltaEventSchema,
   StreamEndEventSchema,
   StreamAbortEventSchema,

@@ -35,6 +35,7 @@ import { Ok, Err } from "@/common/types/result";
 import { log, type Logger } from "./log";
 import type {
   StreamStartEvent,
+  StreamMetadataEvent,
   StreamDeltaEvent,
   StreamEndEvent,
   StreamAbortEvent,
@@ -198,6 +199,7 @@ type StreamToken = string & { __brand: "StreamToken" };
 
 export type TurnEngineEvent =
   | StreamStartEvent
+  | StreamMetadataEvent
   | StreamDeltaEvent
   | StreamEndEvent
   | StreamAbortEvent
@@ -295,6 +297,8 @@ interface StreamRequestOptions {
 }
 
 export interface TurnExecutionOptions extends StreamRequestOptions {
+  /** Effective capacity computed with the provider request; null is authoritative unknown. */
+  contextWindowTokens?: number | null;
   workspaceId: string;
   historySequence: number;
   runtime: Runtime;
@@ -379,6 +383,7 @@ interface StreamRequestConfig {
  * verbatim would leak provider-specific options/messages across providers).
  */
 interface PreparedModelFallback {
+  contextWindowTokens?: number | null;
   contextBudgetMemoryWritable?: boolean;
   contextBudgetLimit?: number;
   model: LanguageModel;
@@ -703,6 +708,7 @@ interface WorkspaceStreamInfo {
   model: string;
   /** Metadata model resolved from provider mapping for cost/token metadata lookups. */
   metadataModel: string;
+  contextWindowTokens: number | null;
   /** Effective thinking level after model policy clamping */
   thinkingLevel?: string;
   initialMetadata?: Partial<MuxMetadata>;
@@ -2831,6 +2837,7 @@ export class StreamManager {
       pendingToolExecutionStarts: new Map(),
       model: modelString,
       metadataModel,
+      contextWindowTokens: options.contextWindowTokens ?? null,
       thinkingLevel,
       initialMetadata,
       toolModelUsages: [],
@@ -3178,6 +3185,7 @@ export class StreamManager {
       // diverge from the backend ledger when a Coder catalog refresh
       // removes/retags the instance mid-stream.
       metadataModel: streamInfo.metadataModel,
+      contextWindowTokens: streamInfo.contextWindowTokens,
       routedThroughGateway,
       ...(routeProvider != null && { routeProvider }),
       historySequence,
@@ -3409,6 +3417,7 @@ export class StreamManager {
         ...streamInfo.initialMetadata,
         model: canonicalModel,
         metadataModel: streamInfo.metadataModel,
+        contextWindowTokens: streamInfo.contextWindowTokens,
         routedThroughGateway,
         ...(streamInfo.thinkingLevel && {
           thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel,
@@ -3713,6 +3722,7 @@ export class StreamManager {
     streamInfo.reasoningBackfillStartIndex = preserveParts ? streamInfo.parts.length : undefined;
 
     streamInfo.model = prepared.data.modelString;
+    streamInfo.contextWindowTokens = prepared.data.contextWindowTokens ?? null;
     streamInfo.metadataModel = this.resolveMetadataModel(
       prepared.data.modelString,
       prepared.data.providersConfig
@@ -3725,6 +3735,11 @@ export class StreamManager {
     streamInfo.initialMetadata = {
       ...streamInfo.initialMetadata,
       ...prepared.data.initialMetadataPatch,
+      // A direct/custom fallback must clear the previous gateway's attribution.
+      routeProvider: prepared.data.initialMetadataPatch?.routeProvider,
+      routedThroughGateway:
+        prepared.data.initialMetadataPatch?.routedThroughGateway ??
+        prepared.data.modelString.startsWith("mux-gateway:"),
       modelFallback: {
         requestedModel: fallbackState.requestedModel,
         refusedModels: [...fallbackState.refusedModels],
@@ -3736,6 +3751,22 @@ export class StreamManager {
     runLanguageModelCleanup(streamInfo.request.model);
     streamInfo.request = nextRequest;
     streamInfo.streamResult = nextStreamResult;
+    if (!streamInfo.abortController.signal.aborted) {
+      this.emitTurnEvent({
+        type: "stream-metadata",
+        workspaceId,
+        messageId: streamInfo.messageId,
+        metadata: {
+          model: metadataModelIdentity(streamInfo.model),
+          metadataModel: streamInfo.metadataModel,
+          contextWindowTokens: streamInfo.contextWindowTokens,
+          thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel | undefined,
+          routedThroughGateway: streamInfo.initialMetadata.routedThroughGateway ?? false,
+          routeProvider: streamInfo.initialMetadata.routeProvider ?? null,
+          modelFallback: streamInfo.initialMetadata.modelFallback,
+        },
+      });
+    }
     await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
     if (
       consumedSwap &&
@@ -4444,6 +4475,7 @@ export class StreamManager {
                 ...streamInfo.initialMetadata, // TurnRequestBuilder-provided metadata (systemMessageTokens, etc)
                 model: canonicalModel,
                 metadataModel: streamInfo.metadataModel,
+                contextWindowTokens: streamInfo.contextWindowTokens,
                 routedThroughGateway,
                 ...(streamInfo.thinkingLevel && {
                   thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel,
