@@ -1,3 +1,7 @@
+import {
+  SUBAGENT_FAILURE_FOOTER,
+  WORKSPACE_TURN_FAILURE_FOOTER,
+} from "@/common/utils/subagentFailureEnvelope";
 import type { StartupRecoveryState } from "./startupRecovery";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
@@ -193,8 +197,8 @@ export function formatSubagentFailureUserMessage(params: {
     params.errorMessage,
     "</error_message>",
     params.errorType.startsWith("workspace_turn_")
-      ? "This delegated workspace turn ended without a final report. Do not re-await this execution. Other workspace activity can continue."
-      : "This sub-agent task failed terminally and will not produce a report. Do not re-await it.",
+      ? WORKSPACE_TURN_FAILURE_FOOTER
+      : SUBAGENT_FAILURE_FOOTER,
     "</mux_subagent_failure>",
   ].join("\n");
 }

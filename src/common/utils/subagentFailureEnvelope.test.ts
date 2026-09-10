@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { formatSubagentFailureUserMessage } from "@/node/services/taskWorkspaceSeam";
-import { parseSubagentFailureEnvelope } from "./subagentFailureEnvelope";
+import {
+  parseSubagentFailureEnvelope,
+  SUBAGENT_FAILURE_FOOTER,
+  WORKSPACE_TURN_FAILURE_FOOTER,
+} from "./subagentFailureEnvelope";
 
 const failure = {
   childWorkspaceId: "task-123",
@@ -28,6 +32,25 @@ describe("parseSubagentFailureEnvelope", () => {
       });
     }
   });
+
+  test.each(["workspace_turn_incomplete", "workspace_turn_superseded", "process_exit"])(
+    "accepts current and legacy footers for %s without changing the diagnostic",
+    (errorType) => {
+      const current = formatSubagentFailureUserMessage({ ...failure, errorType });
+      const legacy = current.replace(WORKSPACE_TURN_FAILURE_FOOTER, SUBAGENT_FAILURE_FOOTER);
+      const expected = {
+        taskId: failure.childWorkspaceId,
+        agentType: failure.agentType,
+        errorType,
+        errorMessage: failure.errorMessage,
+      };
+      expect(parseSubagentFailureEnvelope(current)).toEqual(expected);
+      expect(parseSubagentFailureEnvelope(legacy)).toEqual(expected);
+      expect(
+        parseSubagentFailureEnvelope(legacy.replace(SUBAGENT_FAILURE_FOOTER, "Unknown footer"))
+      ).toBeNull();
+    }
+  );
 
   test("preserves delimiter examples and whitespace inside error messages", () => {
     const errorMessage = `    Diagnostic:\n${formatSubagentFailureUserMessage(failure)}\n  trailing  `;

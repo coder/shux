@@ -27346,11 +27346,16 @@ describe("TaskService", () => {
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
     };
-    await internal.handleStreamEnd(
-      workspaceTurnStreamEndEvent(parentId, "msg_truncated_direct_parent", "Truncated", {
+    const truncated = workspaceTurnStreamEndEvent(
+      parentId,
+      "msg_truncated_direct_parent",
+      "Truncated",
+      {
         finishReason: "length",
-      })
+      }
     );
+    truncated.metadata.historySequence = 1;
+    await internal.handleStreamEnd(truncated);
     const errored = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(errored, "errored handle must exist");
     expect(errored.status).toBe("error");
@@ -27371,7 +27376,10 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_quiet_direct_parent_cut"));
+    const successor = ownerFollowUpCutEvent(parentId, "msg_quiet_direct_parent_cut");
+    // Durable ordering proves this cut follows the truncated response.
+    successor.metadata.historySequence = 2;
+    await internal.handleStreamEnd(successor);
 
     const resettled = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(resettled, "resettled handle must exist");
