@@ -9,6 +9,7 @@ import { MCPServerManager } from "@/node/services/mcpServerManager";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { readMutationEpochToken } from "./journals";
+import * as treeHash from "./treeHash";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { shellQuote } from "@/common/utils/shell";
@@ -303,6 +304,32 @@ describe("AgentPluginInstallService", () => {
       expect(starts).toMatch(/^echo /);
       const stateFile = path.join(getPluginDataPath(muxRoot, id), "user-state");
       await fsPromises.writeFile(stateFile, "preserve me");
+      // Discover the same installed container through a distinct trusted-project
+      // alias. Saved global enablement/data and the running PID must survive.
+      const projectAlias = path.join(muxRoot, ".xum", "plugins");
+      await fsPromises.mkdir(path.dirname(projectAlias));
+      await fsPromises.symlink(pluginsDir(), projectAlias, "dir");
+      request.trusted = true;
+      const aliased = await manager.listServers(muxRoot, overrides, true, {
+        projectRoot: muxRoot,
+        projectKey: muxRoot,
+      });
+      expect(aliased[key("echo")]?.disabled).toBe(false);
+      const allViews = await configService.listServers(muxRoot, true, {
+        agentPlugins: { projectRoot: muxRoot, projectKey: muxRoot },
+      });
+      expect(
+        Object.values(allViews).some(
+          (info) => info.plugin?.sourceScope === "project" && info.plugin.serverName === "echo"
+        )
+      ).toBe(true);
+      expect(Object.values(aliased).some((info) => info.plugin?.serverName === "excluded")).toBe(
+        false
+      );
+      expect((await manager.getToolsForWorkspace(request)).stats.startedServerCount).toBe(2);
+      expect(await fsPromises.readFile(startsFile, "utf8")).toBe(starts);
+      expect(await fsPromises.readFile(siblingStartsFile, "utf8")).toBe(siblingStarts);
+      expect(await fsPromises.readFile(stateFile, "utf8")).toBe("preserve me");
       await service.addComponents({
         name: "demo-plugin",
         expectedLockedSha: preview.lockedSha,
@@ -431,6 +458,121 @@ describe("AgentPluginInstallService", () => {
     expect(
       await service.addComponents({ ...request, expectedContentHash: refreshed.contentHash })
     ).toEqual(accepted);
+  });
+
+  test.each(["stable", "same bytes", "changed bytes"])(
+    "symlinked installed roots support reviewed additions and reject retargets: %s",
+    async (retarget) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: {
+            echo: {
+              type: "stdio",
+              command: "node",
+              args: ["${PLUGIN_ROOT}/server.js"],
+              env: { DATA: "${PLUGIN_DATA}" },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, "data identity fixture");
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+        importedComponents: { skills: [], mcpServers: [] },
+      });
+      const logical = path.join(pluginsDir(), "demo-plugin");
+      const targetA = path.join(muxRoot, "physical-A");
+      const targetB = path.join(muxRoot, "physical-B");
+      await fsPromises.rename(logical, targetA);
+      await fsPromises.symlink(targetA, logical, "dir");
+      const reviewed = await service.getComponents({ name: "demo-plugin" });
+      expect(reviewed.skills.map((skill) => skill.name)).toEqual(["greet"]);
+      expect(reviewed.mcpServers[0].summary).toContain(path.join(logical, "server.js"));
+      expect(reviewed.mcpServers[0].summary).toContain(
+        getPluginDataPath(muxRoot, computePluginInstanceId(logical))
+      );
+      const request = {
+        name: "demo-plugin",
+        expectedLockedSha: reviewed.lockedSha,
+        expectedContentHash: reviewed.contentHash,
+        skills: ["greet"],
+        mcpServers: ["echo"],
+      };
+      if (retarget !== "stable") {
+        await fsPromises.cp(targetA, targetB, { recursive: true });
+        if (retarget === "changed bytes")
+          await fsPromises.writeFile(path.join(targetB, "server.js"), "changed executable");
+        await fsPromises.unlink(logical);
+        await fsPromises.symlink(targetB, logical, "dir");
+        const before = await fsPromises.readFile(registryFile(), "utf8");
+        expect((await service.addComponentsResult(request)).success).toBe(false);
+        expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(before);
+        const refreshed = await service.getComponents({ name: "demo-plugin" });
+        expect(refreshed.contentHash).not.toBe(reviewed.contentHash);
+        expect(refreshed.mcpServers).toEqual(reviewed.mcpServers);
+        request.expectedContentHash = refreshed.contentHash;
+      }
+      expect((await service.addComponents(request)).importedComponents).toEqual({
+        skills: ["greet"],
+        mcpServers: ["echo"],
+      });
+      const provider = createAgentPluginsMcpProvider({ xumHome: muxRoot, isEnabled: () => true });
+      const configService = new MCPConfigService(config, { agentPluginsMcpProvider: provider });
+      const servers = await configService.listServers(muxRoot, false);
+      const key = buildPluginServerKey(computePluginInstanceId(logical), "echo");
+      expect(Object.keys(servers)).toEqual([key]);
+      const server = servers[key];
+      if (server.transport !== "stdio") throw new Error("Expected the installed stdio server");
+      expect(server.env?.DATA).toBe(getPluginDataPath(muxRoot, computePluginInstanceId(logical)));
+    }
+  );
+
+  test("component inventory stays pinned through an A-to-B-to-A logical-root retarget", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: { skills: [], mcpServers: [] },
+    });
+    const logical = path.join(pluginsDir(), "demo-plugin");
+    const targetA = path.join(muxRoot, "physical-A");
+    const targetB = path.join(muxRoot, "physical-B");
+    await fsPromises.rename(logical, targetA);
+    await fsPromises.cp(targetA, targetB, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(targetB, "skills", "greet", "SKILL.md"),
+      "---\nname: greet\ndescription: Wrong tree\n---\nChanged\n"
+    );
+    await fsPromises.symlink(targetA, logical, "dir");
+    const reviewed = await service.getComponents({ name: "demo-plugin" });
+    const hash = treeHash.hashPluginTree;
+    let calls = 0;
+    const receipt = spyOn(treeHash, "hashPluginTree").mockImplementation(async (...args) => {
+      const call = ++calls;
+      if (call === 2) {
+        await fsPromises.unlink(logical);
+        await fsPromises.symlink(targetA, logical, "dir");
+      }
+      const result = await hash(...args);
+      if (call === 1) {
+        // Flip after the first real hash but before discovery, then restore
+        // before the confirming hash: descriptors must still come from A.
+        await fsPromises.unlink(logical);
+        await fsPromises.symlink(targetB, logical, "dir");
+      }
+      return result;
+    });
+    try {
+      const raced = await service.getComponents({ name: "demo-plugin" });
+      expect(calls).toBe(2);
+      expect(raced).toEqual(reviewed);
+    } finally {
+      receipt.mockRestore();
+    }
   });
 
   test("explicit imports reject unknown directory IDs, mismatched frontmatter and an unreviewed SHA", async () => {

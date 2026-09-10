@@ -196,6 +196,8 @@ export interface AgentPluginDiagnostic {
 
 export interface DiscoverAgentPluginsResult {
   plugins: AgentPluginInfo[];
+  /** Ordered baseline MCP registrations sharing the physical scan and import policy. */
+  mcpPlugins?: AgentPluginInfo[];
   diagnostics: AgentPluginDiagnostic[];
 }
 
@@ -597,33 +599,126 @@ export function setAgentPluginDiscoveryGate(gate: AgentPluginDiscoveryGate): voi
   discoveryGate = gate;
 }
 
+/** Missing containers stay optional; other identity failures must never become unmanaged scans. */
+export async function resolveAgentPluginContainerPath(
+  containerPath: string
+): Promise<string | undefined> {
+  try {
+    return await fsPromises.realpath(containerPath);
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return undefined;
+    throw error;
+  }
+}
+
 /** Canonical project plugins shadow same-named legacy copies during ordered scans. */
 export async function discoverAgentPlugins(
   containers: AgentPluginContainer[]
 ): Promise<DiscoverAgentPluginsResult> {
-  const gateSession = await discoveryGate(containers.map((container) => container.path));
-  const suppressedContainers = new Set(gateSession.suppressed);
   let plugins: AgentPluginInfo[] = [];
+  let mcpPlugins: AgentPluginInfo[] = [];
   let diagnostics: AgentPluginDiagnostic[] = [];
-
-  // Registry ownership belongs to the path, even when an earlier project
-  // occurrence wins scope/precedence over the marked global occurrence.
-  const registryPaths = new Map<string, string>();
-  for (const container of containers) {
-    if (container.registryPath !== undefined)
-      registryPaths.set(container.path, container.registryPath);
-  }
-  const canonicalProjectPluginNames = new Set<string>();
-  const seenContainers = new Set<string>();
+  // Consent and recovery belong to the physical container, not its spelling.
+  // Keep the first lexical descriptor for precedence and stable MCP IDs, but
+  // collect ownership and gate paths from every alias before reading plugins.
+  const groups = new Map<
+    string,
+    {
+      container: AgentPluginContainer;
+      paths: Set<string>;
+      registryPath?: string;
+      blocked?: boolean;
+    }
+  >();
+  const canonicalPaths = new Map<string, string>();
+  let unresolvedOwner = false;
   for (const container of containers) {
     if (!path.isAbsolute(container.path)) {
       throw new Error(`discoverAgentPlugins: container path must be absolute: ${container.path}`);
     }
-    if (seenContainers.has(container.path)) {
+    let canonicalPath: string | undefined;
+    try {
+      canonicalPath =
+        canonicalPaths.get(container.path) ??
+        (await resolveAgentPluginContainerPath(container.path));
+    } catch (error) {
+      if (container.registryPath !== undefined) unresolvedOwner = true;
+      diagnostics.push({
+        path: container.path,
+        scope: container.scope,
+        severity: "error",
+        message: `Plugin container identity could not be resolved: ${getErrorMessage(error)}`,
+      });
       continue;
     }
-    seenContainers.add(container.path);
-    if (suppressedContainers.has(container.path)) {
+    if (canonicalPath === undefined) continue;
+    canonicalPaths.set(container.path, canonicalPath);
+    let group = groups.get(canonicalPath);
+    if (group === undefined) {
+      // A physical target's parent may own another container's journals.
+      // Gate authority comes only from configured scan paths and actual owners.
+      group = { container, paths: new Set() };
+      groups.set(canonicalPath, group);
+    }
+    group.paths.add(container.path);
+    if (container.registryPath !== undefined) {
+      // A project-only scan can carry the registry through an alias without
+      // scanning the configured owner. Recovery recognizes that lexical path.
+      group.paths.add(path.join(path.dirname(container.registryPath), "plugins"));
+      try {
+        const ownerHome = await resolveAgentPluginContainerPath(
+          path.dirname(container.registryPath)
+        );
+        if (
+          ownerHome === undefined ||
+          (await resolveAgentPluginContainerPath(path.join(ownerHome, "plugins"))) !== canonicalPath
+        ) {
+          throw new Error("Managed plugin owner changed during container resolution.");
+        }
+        // The container itself may be a symlink: its canonical parent need
+        // not own the registry/journals. Pin the actual owner's parent too.
+        group.registryPath = path.join(ownerHome, path.basename(container.registryPath));
+        group.paths.add(path.join(ownerHome, "plugins"));
+      } catch (error) {
+        // A retargeted owner may now identify another unmarked group in this scan.
+        unresolvedOwner = true;
+        group.blocked = true;
+        diagnostics.push({
+          path: container.path,
+          scope: container.scope,
+          severity: "error",
+          message: getErrorMessage(error),
+        });
+      }
+    }
+  }
+  const gateSession = await discoveryGate([
+    ...new Set([...groups.values()].flatMap((group) => [...group.paths])),
+  ]);
+  const suppressedContainers = new Set(gateSession.suppressed);
+
+  const snapshots = new Map<
+    string,
+    {
+      entryNames: string[];
+      imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined;
+      plugins: Map<string, AgentPluginInfo | null>;
+    }
+  >();
+  for (const [canonicalPath, { container, paths, registryPath, blocked }] of groups) {
+    if (blocked) continue;
+    if (unresolvedOwner && registryPath === undefined) {
+      // If an owner's identity is unknown, no unmarked alias can safely be
+      // classified as unmanaged. Other established owners remain isolated.
+      diagnostics.push({
+        path: container.path,
+        scope: container.scope,
+        severity: "error",
+        message: "Plugin container skipped: managed registry ownership could not be resolved.",
+      });
+      continue;
+    }
+    if ([...paths].some((candidate) => suppressedContainers.has(candidate))) {
       diagnostics.push({
         path: container.path,
         scope: container.scope,
@@ -634,32 +729,55 @@ export async function discoverAgentPlugins(
       continue;
     }
 
-    const registryPath = registryPaths.get(container.path);
-    const imports =
-      registryPath !== undefined ? await readPluginComponentImports(registryPath) : undefined;
+    snapshots.set(canonicalPath, {
+      entryNames: await listChildDirectories(canonicalPath),
+      imports:
+        registryPath !== undefined ? await readPluginComponentImports(registryPath) : undefined,
+      plugins: new Map(),
+    });
+  }
+
+  // Replay original lexical registrations, not group order. MCP must retain
+  // existing project/global keys and data; raw duplicates and legacy shadowing
+  // still follow baseline precedence. Only the first eligible view reads a plugin.
+  const seenContainers = new Set<string>();
+  const canonicalProjectPluginNames = new Set<string>();
+  for (const container of containers) {
+    if (seenContainers.has(container.path)) continue;
+    seenContainers.add(container.path);
+    const canonicalPath = canonicalPaths.get(container.path);
+    const snapshot = canonicalPath !== undefined ? snapshots.get(canonicalPath) : undefined;
+    if (snapshot === undefined || canonicalPath === undefined) continue;
     const projectMetadataIndex =
       container.scope === "project"
         ? PROJECT_METADATA_DIR_NAMES.findIndex(
             (dirName) => dirName === path.basename(path.dirname(container.path))
           )
         : -1;
-    for (const entryName of await listChildDirectories(container.path)) {
+    for (const entryName of snapshot.entryNames) {
       if (projectMetadataIndex === 0) canonicalProjectPluginNames.add(entryName);
       else if (projectMetadataIndex === 1 && canonicalProjectPluginNames.has(entryName)) continue;
-      const plugin = await discoverPluginAt({
-        pluginDir: path.join(container.path, entryName),
-        containerPath: container.path,
-        dirName: entryName,
-        scope: container.scope,
-        diagnostics,
-      });
-      if (plugin) {
-        plugin.importedComponents =
-          imports === null || (imports?.hasUnidentifiedEntries && !imports.byName.has(entryName))
-            ? { skills: [], mcpServers: [] }
-            : imports?.byName.get(entryName);
-        plugins.push(plugin);
+      let plugin = snapshot.plugins.get(entryName);
+      if (plugin === undefined) {
+        plugin = await discoverPluginAt({
+          pluginDir: path.join(canonicalPath, entryName),
+          containerPath: container.path,
+          dirName: entryName,
+          scope: container.scope,
+          diagnostics,
+        });
+        snapshot.plugins.set(entryName, plugin);
+        if (plugin) {
+          const imports = snapshot.imports;
+          plugin.importedComponents =
+            imports === null || (imports?.hasUnidentifiedEntries && !imports.byName.has(entryName))
+              ? { skills: [], mcpServers: [] }
+              : imports?.byName.get(entryName);
+          plugins.push(plugin);
+        }
       }
+      if (plugin)
+        mcpPlugins.push({ ...plugin, containerPath: container.path, scope: container.scope });
     }
   }
 
@@ -670,11 +788,19 @@ export async function discoverAgentPlugins(
   // those containers' results rather than hand callers plugin content that
   // may already be rolled back.
   const overlapped = new Set(await gateSession.confirm());
-  for (const container of containers) {
-    if (!overlapped.has(container.path) || suppressedContainers.has(container.path)) {
+  for (const [canonicalPath, { container, paths }] of groups) {
+    if (
+      ![...paths].some((candidate) => overlapped.has(candidate)) ||
+      [...paths].some((candidate) => suppressedContainers.has(candidate))
+    ) {
       continue;
     }
-    plugins = plugins.filter((plugin) => plugin.containerPath !== container.path);
+    plugins = plugins.filter(
+      (plugin) => canonicalPaths.get(plugin.containerPath) !== canonicalPath
+    );
+    mcpPlugins = mcpPlugins.filter(
+      (plugin) => canonicalPaths.get(plugin.containerPath) !== canonicalPath
+    );
     diagnostics = diagnostics.filter(
       (diagnostic) =>
         diagnostic.path !== container.path && !diagnostic.path.startsWith(container.path + path.sep)
@@ -689,5 +815,5 @@ export async function discoverAgentPlugins(
     suppressedContainers.add(container.path);
   }
 
-  return { plugins, diagnostics };
+  return { plugins, mcpPlugins, diagnostics };
 }

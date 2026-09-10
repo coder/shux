@@ -473,11 +473,19 @@ describe("agent_skill_list", () => {
     });
   });
 
-  it.each([".xum", ".mux"])(
-    "combined tool-list containers retain managed imports when the project overlaps %s",
-    async (metadataDir) => {
+  it.each([
+    [".xum", false],
+    [".mux", false],
+    [".xum", true],
+    [".mux", true],
+  ] as const)(
+    "combined tool-list containers retain managed imports when the project overlaps %s (aliased home: %s)",
+    async (metadataDir, aliasHome) => {
       using home = new TestTempDir("plugin-tool-list-overlap");
-      const xumHome = path.join(home.path, metadataDir);
+      const physicalHome = path.join(home.path, metadataDir);
+      const xumHome = aliasHome ? path.join(home.path, "configured-home") : physicalHome;
+      await fs.mkdir(physicalHome, { recursive: true });
+      if (aliasHome) await fs.symlink(physicalHome, xumHome, "dir");
       await withHomeDir(home.path, async () => {
         await withMuxRoot(xumHome, async () => {
           await writePlugin(path.join(xumHome, "plugins"), "managed", [

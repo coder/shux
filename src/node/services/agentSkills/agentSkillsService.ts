@@ -44,6 +44,7 @@ import {
   discoverAgentPlugins,
   type AgentPluginContainer,
   readPluginFileWithinRootCapped,
+  resolveAgentPluginContainerPath,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
 } from "@/node/services/agentPlugins/discovery";
 import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
@@ -232,6 +233,18 @@ async function buildPluginScanCandidates(args: {
   const localRuntime = new LocalRuntime(args.workspacePath);
   const managedHome =
     args.managedHome !== undefined ? await localRuntime.resolvePath(args.managedHome) : undefined;
+  let managedContainerPath: string | undefined;
+  try {
+    if (managedHome !== undefined) {
+      managedContainerPath = await resolveAgentPluginContainerPath(
+        path.join(managedHome, "plugins")
+      );
+    }
+  } catch (error) {
+    // Without the owner's identity, an alias must not become an unmanaged scan.
+    log.warn(`Failed to resolve managed plugin container: ${getErrorMessage(error)}`);
+    return [];
+  }
   const resolvedContainers: AgentPluginContainer[] = [];
   for (const container of args.containers) {
     try {
@@ -240,7 +253,9 @@ async function buildPluginScanCandidates(args: {
       resolvedContainers.push({
         path: resolvedPath,
         scope: args.scope,
-        ...(managedHome !== undefined && resolvedPath === path.join(managedHome, "plugins")
+        ...(managedHome !== undefined &&
+        managedContainerPath !== undefined &&
+        (await resolveAgentPluginContainerPath(resolvedPath)) === managedContainerPath
           ? { registryPath: path.join(managedHome, PLUGIN_REGISTRY_FILE_NAME) }
           : {}),
       });

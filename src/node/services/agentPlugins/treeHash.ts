@@ -18,8 +18,8 @@ export async function hashPluginTree(
     new Error(
       "Installed plugin files changed during component review. Refresh the component inventory."
     );
-  if (!(await fs.lstat(root)).isDirectory()) throw changed();
   const rootReal = await fs.realpath(root);
+  if (!(await fs.lstat(rootReal)).isDirectory()) throw changed();
   const pending = [rootReal];
   const records: Array<[string, number, string]> = [];
   const buffer = Buffer.alloc(64 * 1024);

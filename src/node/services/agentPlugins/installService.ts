@@ -2680,11 +2680,21 @@ export class AgentPluginInstallService {
     entry: AgentPluginInstallEntry
   ): Promise<AgentPluginComponents> {
     const pluginDir = this.targetPathFor(entry.name);
-    const contentHash = await hashPluginTree(pluginDir, this.stagingQuota());
-    const { plugin } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
-    if (plugin === null || plugin.name !== entry.name)
+    // Pin reads to one tree even if the installed symlink changes A → B → A
+    // between the receipt hashes. Only keys/data paths retain the logical identity.
+    const canonicalPluginDir = await fsPromises.realpath(pluginDir);
+    const contentHash = await hashPluginTree(canonicalPluginDir, this.stagingQuota());
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: canonicalPluginDir,
+      scope: "global",
+    });
+    if (plugin === null || plugin.name !== entry.name || plugin.rootPath !== canonicalPluginDir)
       throw new Error(`Installed plugin '${entry.name}' is missing or invalid.`);
-    const components = await this.collectComponents(plugin);
+    const components = await this.collectComponents({
+      ...plugin,
+      containerPath: path.dirname(pluginDir),
+      dirName: entry.name,
+    });
     if ((await hashPluginTree(pluginDir, this.stagingQuota())) !== contentHash) {
       throw new Error(
         "Installed plugin files changed during component review. Refresh the component inventory."

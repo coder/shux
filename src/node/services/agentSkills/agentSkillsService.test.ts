@@ -1376,12 +1376,20 @@ describe("agentSkillsService agent plugins", () => {
     return pluginDir;
   }
 
-  test.each([".xum", ".mux"])(
-    "project-only skill scans retain managed import policy for %s overlap",
-    async (metadataDir) => {
+  test.each([
+    [".xum", false],
+    [".mux", false],
+    [".xum", true],
+    [".mux", true],
+  ] as const)(
+    "project-only skill scans retain managed import policy for %s overlap (aliased home: %s)",
+    async (metadataDir, aliasHome) => {
       using home = new DisposableTempDir("plugin-skill-container-overlap");
-      const xumHome = path.join(home.path, metadataDir);
-      const container = path.join(xumHome, "plugins");
+      const physicalHome = path.join(home.path, metadataDir);
+      const xumHome = aliasHome ? path.join(home.path, "configured-home") : physicalHome;
+      await fs.mkdir(physicalHome, { recursive: true });
+      if (aliasHome) await fs.symlink(physicalHome, xumHome, "dir");
+      const container = path.join(physicalHome, "plugins");
       await writePlugin(container, "managed", [
         { name: "allowed", description: "imported" },
         { name: "blocked", description: "not imported" },
@@ -1817,35 +1825,44 @@ describe("agentSkillsService agent plugins", () => {
     ).toBe(true);
   });
 
-  test("project plugin whose root escapes the project containment is skipped", async () => {
-    using project = new DisposableTempDir("agent-skills-plugin-root-escape");
-    using elsewhere = new DisposableTempDir("agent-skills-plugin-root-escape-target");
-    using global = new DisposableTempDir("agent-skills-plugin-root-escape-global");
+  test.each(["plugin", "container"])(
+    "project %s symlink escaping containment is skipped",
+    async (linkKind) => {
+      using project = new DisposableTempDir("agent-skills-plugin-root-escape");
+      using elsewhere = new DisposableTempDir("agent-skills-plugin-root-escape-target");
+      using global = new DisposableTempDir("agent-skills-plugin-root-escape-global");
 
-    // Plugin lives outside the project and is symlinked into .mux/plugins.
-    await writePlugin(elsewhere.path, "linked-plugin", [
-      { name: "linked-skill", description: "from outside" },
-    ]);
-    const container = path.join(project.path, ".mux", "plugins");
-    await fs.mkdir(container, { recursive: true });
-    await fs.symlink(
-      path.join(elsewhere.path, "linked-plugin"),
-      path.join(container, "linked-plugin")
-    );
+      // Plugin lives outside the project and is symlinked into .mux/plugins.
+      await writePlugin(elsewhere.path, "linked-plugin", [
+        { name: "linked-skill", description: "from outside" },
+      ]);
+      const container = path.join(project.path, ".mux", "plugins");
+      if (linkKind === "container") {
+        await fs.mkdir(path.dirname(container), { recursive: true });
+        await fs.symlink(elsewhere.path, container, "dir");
+      } else {
+        await fs.mkdir(container, { recursive: true });
+        await fs.symlink(
+          path.join(elsewhere.path, "linked-plugin"),
+          path.join(container, "linked-plugin"),
+          "dir"
+        );
+      }
 
-    const runtime = new LocalRuntime(project.path);
-    const roots = {
-      projectRoot: path.join(project.path, ".mux", "skills"),
-      globalRoot: global.path,
-      universalRoot: "",
-      projectPluginRoots: [container],
-    };
+      const runtime = new LocalRuntime(project.path);
+      const roots = {
+        projectRoot: path.join(project.path, ".mux", "skills"),
+        globalRoot: global.path,
+        universalRoot: "",
+        projectPluginRoots: [container],
+      };
 
-    const skills = await discoverAgentSkills(runtime, project.path, {
-      roots,
-      projectContainmentRoot: project.path,
-    });
+      const skills = await discoverAgentSkills(runtime, project.path, {
+        roots,
+        projectContainmentRoot: project.path,
+      });
 
-    expect(skills.find((s) => s.name === "linked-skill")).toBeUndefined();
-  });
+      expect(skills.find((s) => s.name === "linked-skill")).toBeUndefined();
+    }
+  );
 });

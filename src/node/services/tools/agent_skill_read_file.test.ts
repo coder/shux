@@ -110,11 +110,19 @@ describe("agent_skill_read_file", () => {
     });
   });
 
-  it.each([".xum", ".mux"])(
-    "overlapping %s project roots enforce managed sibling-file read imports",
-    async (metadataDir) => {
+  it.each([
+    [".xum", false],
+    [".mux", false],
+    [".xum", true],
+    [".mux", true],
+  ] as const)(
+    "overlapping %s project roots enforce managed sibling-file read imports (aliased home: %s)",
+    async (metadataDir, aliasHome) => {
       using home = new TestTempDir("plugin-read-file-overlap");
-      const xumHome = path.join(home.path, metadataDir);
+      const physicalHome = path.join(home.path, metadataDir);
+      const xumHome = aliasHome ? path.join(home.path, "configured-home") : physicalHome;
+      await fs.mkdir(physicalHome, { recursive: true });
+      if (aliasHome) await fs.symlink(physicalHome, xumHome, "dir");
       const pluginRoot = path.join(xumHome, "plugins", "managed");
       await fs.mkdir(pluginRoot, { recursive: true });
       await fs.writeFile(

@@ -435,6 +435,9 @@ jobs:
         shell: pwsh
         run: |
           bun test src/node/utils/paths.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts src/node/runtime/SSH2ConnectionPool.test.ts
+      - name: Verify Windows plugin path aliases
+        shell: pwsh
+        run: bun test src/node/services/agentPlugins/discovery.test.ts -t "coalesces Windows case aliases"
       - name: Run Windows integration smoke tests
         shell: pwsh
         run: |
