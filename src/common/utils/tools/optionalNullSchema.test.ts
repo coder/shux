@@ -226,6 +226,67 @@ describe("optional null JSON Schema contract", () => {
     });
   });
 
+  test("evaluates conditional and negated schemas when deciding nullability", () => {
+    const source = {
+      type: "object",
+      properties: {
+        // Rejects null only through the conditional.
+        conditional: { if: { const: null }, then: false },
+        // Accepts null only through the conditional.
+        nullableViaElse: { if: { type: "string" }, then: { minLength: 1 }, else: { const: null } },
+        negated: { not: { type: "null" } },
+      },
+    };
+
+    expect(widenOptionalPropertiesToNullable(source)).toMatchObject({
+      properties: {
+        conditional: { anyOf: [{ if: { const: null }, then: false }, { type: "null" }] },
+        nullableViaElse: source.properties.nullableViaElse,
+        negated: { anyOf: [{ not: { type: "null" } }, { type: "null" }] },
+      },
+    });
+    expect(
+      stripOmissionPlaceholders(
+        source,
+        { conditional: null, nullableViaElse: null, negated: null },
+        WORKFLOW
+      )
+    ).toEqual({ nullableViaElse: null });
+  });
+
+  test("restores array items declared inside allOf", () => {
+    const source = {
+      type: "object",
+      required: ["rows"],
+      properties: {
+        rows: {
+          type: "array",
+          allOf: [
+            {
+              items: {
+                type: "object",
+                properties: { note: { type: "string" } },
+              },
+            },
+          ],
+        },
+      },
+    };
+
+    expect(widenOptionalPropertiesToNullable(source)).toMatchObject({
+      properties: {
+        rows: {
+          allOf: [
+            { items: { properties: { note: { anyOf: [{ type: "string" }, { type: "null" }] } } } },
+          ],
+        },
+      },
+    });
+    expect(restoreMcp(source, { rows: [{ note: null }, { note: "kept" }] })).toEqual({
+      rows: [{}, { note: "kept" }],
+    });
+  });
+
   test.each(["$ref", "$dynamicRef", "$recursiveRef"])(
     "falls back to non-strict decoding for schemas with %s",
     (keyword) => {

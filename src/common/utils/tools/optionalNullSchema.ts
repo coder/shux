@@ -1,4 +1,7 @@
-import { validateJsonSchemaSubset } from "@/common/utils/jsonSchemaSubset";
+import {
+  validateJsonSchemaSubset,
+  validateJsonSchemaSubsetSchema,
+} from "@/common/utils/jsonSchemaSubset";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
@@ -36,66 +39,23 @@ function getRequiredProperties(schema: Record<string, unknown>): Set<string> {
   return required;
 }
 
-type Nullability = "allows" | "rejects" | "unknown";
-
-function combineAll(states: Nullability[]): Nullability {
-  if (states.includes("rejects")) {
-    return "rejects";
-  }
-  return states.includes("unknown") ? "unknown" : "allows";
-}
-
-function getNullability(schema: unknown): Nullability {
+/**
+ * Whether the schema provably rejects `null`. The validator evaluates every
+ * keyword it supports (type, enum, const, composition, not, if/then/else), so
+ * this is exact for resolvable schemas. A schema with an unresolved reference
+ * or outside the supported subset proves nothing, so it does not reject.
+ */
+function rejectsNull(schema: unknown): boolean {
   if (schema === true) {
-    return "allows";
+    return false;
   }
   if (schema === false) {
-    return "rejects";
+    return true;
   }
-  if (!isRecord(schema)) {
-    return "unknown";
+  if (containsReferenceKeyword(schema) || !validateJsonSchemaSubsetSchema(schema).success) {
+    return false;
   }
-
-  const constraints: Nullability[] = [];
-  if (Object.hasOwn(schema, "$ref")) {
-    constraints.push("unknown");
-  }
-  if (typeof schema.type === "string") {
-    constraints.push(schema.type === "null" ? "allows" : "rejects");
-  } else if (Array.isArray(schema.type)) {
-    constraints.push(schema.type.includes("null") ? "allows" : "rejects");
-  }
-  if (Array.isArray(schema.enum)) {
-    constraints.push(schema.enum.includes(null) ? "allows" : "rejects");
-  }
-  if (Object.hasOwn(schema, "const")) {
-    constraints.push(schema.const === null ? "allows" : "rejects");
-  }
-  if (Array.isArray(schema.anyOf)) {
-    const states = schema.anyOf.map(getNullability);
-    constraints.push(
-      states.includes("allows") ? "allows" : states.includes("unknown") ? "unknown" : "rejects"
-    );
-  }
-  if (Array.isArray(schema.oneOf)) {
-    const states = schema.oneOf.map(getNullability);
-    const allowedCount = states.filter((state) => state === "allows").length;
-    constraints.push(
-      states.includes("unknown") ? "unknown" : allowedCount === 1 ? "allows" : "rejects"
-    );
-  }
-  if (Array.isArray(schema.allOf)) {
-    constraints.push(combineAll(schema.allOf.map(getNullability)));
-  }
-  if (Object.hasOwn(schema, "not")) {
-    const state = getNullability(schema.not);
-    constraints.push(state === "allows" ? "rejects" : state === "rejects" ? "allows" : "unknown");
-  }
-  if (Object.hasOwn(schema, "if")) {
-    constraints.push("unknown");
-  }
-
-  return constraints.length === 0 ? "allows" : combineAll(constraints);
+  return !validateJsonSchemaSubset(schema, null).success;
 }
 
 function makeNullableSchema(schema: unknown): Record<string, unknown> {
@@ -117,7 +77,7 @@ function widenSchemaNode(schema: unknown, inheritedRequired = new Set<string>())
   if (isRecord(schema.properties)) {
     for (const [propertyName, propertySchema] of Object.entries(schema.properties)) {
       const modelSchema =
-        !required.has(propertyName) && getNullability(propertySchema) === "rejects"
+        !required.has(propertyName) && rejectsNull(propertySchema)
           ? makeNullableSchema(propertySchema)
           : propertySchema;
       schema.properties[propertyName] = modelSchema;
@@ -209,7 +169,7 @@ function isOmissionPlaceholder(
   if (value === "") {
     return options.emptyStringIsOmission;
   }
-  return value === null && getNullability(propertySchema) === "rejects";
+  return value === null && rejectsNull(propertySchema);
 }
 
 function stripProperties(
@@ -290,9 +250,13 @@ function stripNode(
   const required = new Set([...inheritedRequired, ...getRequiredProperties(schema)]);
   if (Array.isArray(value)) {
     const itemSchema = schema.items;
-    const stripped = Array.isArray(itemSchema)
+    let stripped = Array.isArray(itemSchema)
       ? value.map((item, index) => stripNode(itemSchema[index], item, new Set(), options))
       : value.map((item) => stripNode(itemSchema, item, new Set(), options));
+    // Widening visits `items` declared inside allOf branches, so restore must too.
+    for (const subSchema of getAllOfBranches(schema)) {
+      stripped = stripNode(subSchema, stripped, required, options) as unknown[];
+    }
     return stripMatchingUnionBranch(schema, stripped, required, options) ?? stripped;
   }
   if (!isRecord(value)) {
@@ -347,12 +311,14 @@ function stripObjectNode(
   if (isRecord(schema.properties)) {
     stripped = stripProperties(stripped, schema.properties, required, options);
   }
-  if (Array.isArray(schema.allOf)) {
-    for (const subSchema of schema.allOf) {
-      stripped = stripNode(subSchema, stripped, required, options) as Record<string, unknown>;
-    }
+  for (const subSchema of getAllOfBranches(schema)) {
+    stripped = stripNode(subSchema, stripped, required, options) as Record<string, unknown>;
   }
   return stripped;
+}
+
+function getAllOfBranches(schema: Record<string, unknown>): unknown[] {
+  return Array.isArray(schema.allOf) ? (schema.allOf as unknown[]) : [];
 }
 
 /**
