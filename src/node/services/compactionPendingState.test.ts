@@ -3,11 +3,8 @@ import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
+import { CHAT_FILE_NAME } from "@/common/constants/paths";
 import { createMuxMessage } from "@/common/types/message";
-import { isDurableContextBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import {
   CompactionPendingState,
   type CompactionPendingAttachments,
@@ -16,9 +13,7 @@ import {
   type CompactionPendingReceipt,
 } from "./compactionPendingState";
 import { HistoryService } from "./historyService";
-import { readProviderHistoryFromLatestBoundary } from "./historyScanner";
 import { createTestHistoryService } from "./testHistoryService";
-import { historyWriteLockPath, isWorkspaceRemovalTombstoned } from "./workspaceRemoval";
 
 describe("unactivated compaction pending-file protocol", () => {
   const workspaceId = "pending-protocol";
@@ -27,38 +22,14 @@ describe("unactivated compaction pending-file protocol", () => {
   let store: CompactionPendingState;
   let boundaryOverride: CompactionPendingBoundary | undefined;
 
-  // This test adapter uses the existing locks and real history/journal readers. Production
-  // activation must expose the equivalent transaction on HistoryService; it must not nest locks.
-  // Unsafe-floor cases supply scanner provenance explicitly; the real adapter tests the scan.
+  // Keep G1's explicit provenance cases while exercising the real adapter's locks and reads.
   function historyAdapter(history = h.historyService): CompactionPendingHistory {
+    const adapter = history.getCompactionPendingHistory(workspaceId);
     return {
       withLock: (operation) =>
-        workspaceFileLocks.withLock(workspaceId, async () => {
-          await using _lock = await acquireProcessFileLock({
-            lockPath: historyWriteLockPath(h.config.rootDir, workspaceId),
-            timeoutMs: 5000,
-            label: "pending protocol test",
-          });
-          if (await isWorkspaceRemovalTombstoned(h.config.rootDir, workspaceId))
-            throw new Error("Removed workspace");
-          const journal = history.getContinuousCompactionJournal(workspaceId);
-          const rows = await readProviderHistoryFromLatestBoundary(
-            {
-              chat: path.join(h.config.sessionsDir, workspaceId, CHAT_FILE_NAME),
-              archive: path.join(h.config.sessionsDir, workspaceId, CHAT_ARCHIVE_FILE_NAME),
-            },
-            0
-          );
-          const boundaryId = rows.findLast(isDurableContextBoundaryMarker)?.id;
-          return await operation({
-            generation: await journal.captureGenerationUnderHistoryLock(),
-            boundary:
-              boundaryOverride ??
-              (boundaryId ? { kind: "identified", messageId: boundaryId } : { kind: "none" }),
-            isPublicationCurrent: (publication) =>
-              journal.isPublicationCurrentUnderHistoryLock(publication),
-          });
-        }),
+        adapter.withLock((view) =>
+          operation({ ...view, boundary: boundaryOverride ?? view.boundary })
+        ),
     };
   }
 
