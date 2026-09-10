@@ -5718,10 +5718,14 @@ export class AgentSession {
       metadataModel: resolveModelForMetadata(options.model, providersConfig),
     };
     const recordedLimit = knownLimit ? maxTokens : Math.max(1, contextTokens);
-    const newRequestTokens = await estimateFreshRequestTokensForModel(
-      { userText, attachments, systemFloorTokens: 0, modelContextLimit: recordedLimit },
-      budgetModel
-    );
+    // The estimate only feeds the budget decision; without a limit there is nothing to compare
+    // against, so skip the (tokenizer-backed) work and its failure modes entirely.
+    const newRequestTokens = knownLimit
+      ? await estimateFreshRequestTokensForModel(
+          { userText, attachments, systemFloorTokens: 0, modelContextLimit: maxTokens },
+          budgetModel
+        )
+      : 0;
     const decision: StepBudgetEvaluation = knownLimit
       ? evaluateStepBudget({
           contextTokens: contextTokens + newRequestTokens,
