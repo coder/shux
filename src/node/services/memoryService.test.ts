@@ -3341,6 +3341,69 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
     });
 
+    it("keeps a still-registered child's original row when its migrated copy is unusable", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      // Owner renames a directory (a rename row carries no post-state hash, so
+      // a later edit beneath the destination is visible ONLY as a row), the
+      // child edits a file under the destination, then a removal of the child
+      // aborts after migrating the child's row (the child stays registered).
+      await fixture.service.create(ownerCtx, "/memories/workspace/notes/a.md", "o1", "agent");
+      await fixture.service.rename(
+        ownerCtx,
+        "/memories/workspace/notes",
+        "/memories/workspace/moved",
+        "agent"
+      );
+      const ownerRename = (await readRefinementEvents(ownerSessionDir)).at(-1)!;
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/workspace/moved/a.md",
+        "o1",
+        "c2",
+        "agent"
+      );
+      expect(
+        await migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        })
+      ).toBe(1);
+      // The copy's inverse is corrupted on disk (the row survives the
+      // self-healing read; only its inverse no longer parses).
+      const journalPath = path.join(ownerSessionDir, "durable-events.jsonl");
+      const lines = (await fsPromises.readFile(journalPath, "utf-8")).split("\n");
+      let corrupted = 0;
+      const rewritten = lines.map((line) => {
+        if (!line.includes('"migratedFrom":"ws-child:')) return line;
+        const row = JSON.parse(line) as { data: { inverse: unknown } };
+        row.data.inverse = { op: "bogus" };
+        corrupted++;
+        return JSON.stringify(row);
+      });
+      expect(corrupted).toBe(1);
+      await fsPromises.writeFile(journalPath, rewritten.join("\n"));
+      // Rolling back the owner's rename would move the child's newer content
+      // along: the child's intact original must still surface as the conflict
+      // the unusable copy can no longer report.
+      const refused = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        listSharedWorkspaceMemoryPeerSessionDirs: () => [childSessionDir],
+        id: ownerRename.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("Refusing rollback");
+      expect(
+        await fsPromises.readFile(path.join(ownerSessionDir, "memory", "moved", "a.md"), "utf-8")
+      ).toBe("c2");
+    });
+
     it("follows a row rolled back between the two handover passes with its rollback row", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

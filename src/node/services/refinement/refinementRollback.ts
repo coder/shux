@@ -591,9 +591,19 @@ async function readSharedMemoryPeerRows(
   // originals would count as separate later mutations of the very notes the
   // copies describe — and a retargeted original is `orderUnknown`, so the
   // copy could never be rolled back until the removal finally succeeds.
+  // Only a copy that still REPRESENTS its source stands in for it: a copy
+  // whose inverse is unparseable contributes nothing to divergence
+  // (collectDivergence skips it), so suppressing its intact original would
+  // let this rollback overwrite the peer mutation that original records.
   const migratedHere = new Set<string>();
   for (const row of await listRefinements(opts.sessionDir)) {
-    if (row.data.migratedFrom !== undefined) migratedHere.add(row.data.migratedFrom);
+    if (
+      row.data.migratedFrom !== undefined &&
+      row.data.kind === "memory" &&
+      RefinementInverseSchema.safeParse(row.data.inverse).success
+    ) {
+      migratedHere.add(row.data.migratedFrom);
+    }
   }
   const peerRows: RefinementEvent[] = [];
   for (const peerDir of peerDirs) {
@@ -1129,6 +1139,35 @@ export async function rollbackRefinement(
               `Refusing rollback of '${opts.id}': the workspace owning the shared memory store was removed`
             );
           }
+        }
+      }
+      // The remapper's directory proof (an adopted directory maps only while
+      // the owner's subtree is EXACTLY the adopted descendants) was computed
+      // before this lock: an owner note added beside the copies while the
+      // rollback waited would travel along with a legacy directory rename.
+      // Re-derive the mapping under the lock and require it to be identical;
+      // a mapping that no longer holds refuses like at plan time.
+      if (remap !== identityRemapper) {
+        assert(
+          opts.sharedWorkspaceMemorySessionDir !== undefined,
+          "a legacy remapper exists only for a sub-agent sharing its notebook"
+        );
+        let relocked: RefinementInverse;
+        try {
+          relocked = (
+            await createLegacyPathRemapper({
+              childSessionDir: opts.sessionDir,
+              ownerSessionDir: opts.sharedWorkspaceMemorySessionDir,
+            })
+          ).inverse(parsedInverse.data);
+        } catch (error) {
+          if (!(error instanceof LegacyPathNotAdoptedError)) throw error;
+          throw new RollbackError(`Refusing rollback of '${opts.id}': ${error.message}`);
+        }
+        if (JSON.stringify(inversePaths(relocked)) !== JSON.stringify(inversePaths(inverse))) {
+          throw new RollbackError(
+            `Refusing rollback of '${opts.id}': the shared-store mapping of its recorded paths changed while waiting for the target lock`
+          );
         }
       }
       // Re-verify INSIDE the lock, immediately before mutating: a writer that

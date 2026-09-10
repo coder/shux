@@ -1899,27 +1899,36 @@ describe("CompactionHandler", () => {
       // boundary's epoch — the chain stays visible to the policy conjunction.
       const boundarySequence = epoch[0].metadata?.historySequence;
       if (typeof boundarySequence !== "number") throw new Error("boundary lacks a sequence");
-      // A user row is covered by the assistant TURN row that answered it and
-      // carries THAT turn's recorded epoch: an OLDER one for a turn that
-      // straddled a boundary (u2/a2); none for a turn row WITHOUT a recorded
-      // policy (an older build's, u4/a4) — unknown, never vouched for; and
-      // none for an accepted batch no assistant ever answered (u5: stream
-      // never started or crashed first), whose repo-controlled content
-      // nobody vetted.
+      // A user row is covered by the assistant TURN row whose request bound
+      // anchors on it (the LAST user row at or below the bound) or that lists
+      // it as a prelude snapshot, and carries THAT turn's recorded epoch: an
+      // OLDER one for a turn that straddled a boundary (p2/u2/a2); none for a
+      // turn row WITHOUT a recorded policy (an older build's, u4/a4) —
+      // unknown, never vouched for; none for an accepted batch no assistant
+      // ever answered (u5: stream never started or crashed first); and none
+      // for another backend's row that landed between a turn's anchor and its
+      // assistant row (ux: the turn never consumed it, so "nearest later
+      // assistant" would vouch for repo-controlled content nobody vetted).
+      // Sequences: the boundary sits at boundarySequence, the two first-epoch
+      // copies at +1/+2, so the rows seeded here start at +3.
       await seedHistory(
-        createMuxMessage("u2", "user", "second question"),
+        createMuxMessage("p2", "user", "prelude snapshot"),
+        createMuxMessage("u2", "user", "second question", {
+          requestPreludeMessageIds: ["p2"],
+        }),
         createMuxMessage("a2", "assistant", "second answer", {
-          requestHistorySequence: boundarySequence + 1,
+          requestHistorySequence: boundarySequence + 4, // anchors on u2
           workspaceMemoryPolicyEpoch: -1,
         }),
         createMuxMessage("u3", "user", "third question"),
+        createMuxMessage("ux", "user", "foreign backend's batch"),
         createMuxMessage("a3", "assistant", "third answer", {
-          requestHistorySequence: boundarySequence + 3,
+          requestHistorySequence: boundarySequence + 6, // anchors on u3, not ux
           workspaceMemoryPolicyEpoch: boundarySequence,
         }),
         createMuxMessage("u4", "user", "old-build question"),
         createMuxMessage("a4", "assistant", "old-build answer", {
-          requestHistorySequence: boundarySequence + 5,
+          requestHistorySequence: boundarySequence + 9, // anchors on u4
         }),
         createMuxMessage("u5", "user", "unanswered question"),
         createStampedCompactionRequest("compact-req-2", boundarySequence + 1)
@@ -1930,15 +1939,17 @@ describe("CompactionHandler", () => {
       expect(
         secondEpoch.data.slice(1).map((copy) => copy.metadata?.rlmPreservedTailSourcePolicyEpoch)
       ).toEqual([
-        -1,
-        -1,
-        -1,
-        -1,
-        boundarySequence,
-        boundarySequence,
-        undefined,
-        undefined,
-        undefined,
+        -1, // copy(u1)
+        -1, // copy(a1)
+        -1, // p2 (prelude of u2)
+        -1, // u2
+        -1, // a2
+        boundarySequence, // u3
+        undefined, // ux
+        boundarySequence, // a3
+        undefined, // u4
+        undefined, // a4
+        undefined, // u5
       ]);
     });
 

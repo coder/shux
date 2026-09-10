@@ -1043,6 +1043,27 @@ describe("refinementRollback", () => {
       "not folded into the shared workspace store"
     );
     await fsPromises.rm(path.join(ownerSessionDir, "memory", "newdir", "owner.md"));
+    // The same note landing while the rollback waits for the target lock:
+    // the plan-time directory proof is re-derived under the lock.
+    const lateExtraFile = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: dirRenameRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+      testOnlyBeforeTargetLock: async () => {
+        await fsPromises.writeFile(
+          path.join(ownerSessionDir, "memory", "newdir", "late.md"),
+          "l\n"
+        );
+      },
+    });
+    expect(lateExtraFile.success).toBe(false);
+    expect(lateExtraFile.success ? "" : lateExtraFile.error).toContain(
+      "not folded into the shared workspace store"
+    );
+    expect(await pathExists(path.join(ownerSessionDir, "memory", "newdir", "late.md"))).toBe(true);
+    expect(await pathExists(path.join(ownerSessionDir, "memory", "olddir"))).toBe(false);
+    await fsPromises.rm(path.join(ownerSessionDir, "memory", "newdir", "late.md"));
     const undoneRename = await rollbackRefinement({
       sessionDir: fixture.sessionDir,
       id: dirRenameRow.id,
