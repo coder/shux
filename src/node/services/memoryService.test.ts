@@ -2441,6 +2441,79 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(path.join(ownerRoot, "note.md", "inner.md"), "utf-8")).toBe(
         "owner's"
       );
+      // Same for a containment failure: an escaping symlink at the target is
+      // owner state, not proof of absence.
+      await fsPromises.writeFile(path.join(legacyRoot, "link.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const linkPrior = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<string, unknown>
+      )["link.md"] as Record<string, unknown>;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(legacyRoot, "link.md"));
+      await fsPromises.rm(path.join(ownerRoot, "link.md"));
+      await fsPromises.symlink(
+        path.join(fixture.xumHome, "outside.md"),
+        path.join(ownerRoot, "link.md")
+      );
+      await fsPromises.writeFile(path.join(fixture.xumHome, "outside.md"), "outside");
+      const current = JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+        string,
+        unknown
+      >;
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({ ...current, "link.md": { ...linkPrior, pendingDeletion: true } })
+      );
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).listIndexEntries({
+        ...fixture.ctx,
+      });
+      const linkTombstone = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { deleted?: boolean; created?: boolean }
+        >
+      )["link.md"];
+      expect(linkTombstone.deleted).toBe(true);
+      expect(linkTombstone.created).not.toBe(true);
+      expect((await fsPromises.lstat(path.join(ownerRoot, "link.md"))).isSymbolicLink()).toBe(true);
+    });
+
+    it("reads malformed manifest lifecycle flags fail-closed", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const prior = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<string, unknown>
+      )["note.md"] as Record<string, unknown>;
+      // An interrupted adoption's `pending` corrupted to a string: the copy
+      // was never written. The record must not read as settled — removal's
+      // handover reconstructs the copy instead of reporting completion.
+      await fsPromises.rm(path.join(ownerRoot, "note.md"));
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({ "note.md": { ...prior, pending: "true" } })
+      );
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
+      const settled = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { created?: boolean; pending?: boolean }
+        >
+      )["note.md"];
+      expect(settled).toMatchObject({ created: true });
+      expect(settled.pending).toBeUndefined();
     });
 
     it("re-adopts a source that reappeared identically while its deletion was pending", async () => {

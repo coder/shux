@@ -7,6 +7,7 @@
  * rollback engine: refinement rows journaled before the upgrade address the
  * legacy files, while the note the user sees since is the owner copy.
  */
+import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { RefinementInverse } from "@/common/types/refinement";
@@ -58,14 +59,36 @@ export interface LegacyAdoptionRecord {
   deleted?: boolean;
 }
 
-function isLegacyAdoptionRecord(value: unknown): value is LegacyAdoptionRecord {
-  if (typeof value !== "object" || value === null) return false;
+/**
+ * Parse one manifest record. Lifecycle flags are raw JSON: a value that is
+ * neither absent nor boolean fails CLOSED — `pending`/`pendingDeletion` read
+ * as set (the pass is redone), `created`/`deleted` as unset (no destructive
+ * provenance; the source is reconciled as a plain unlisted note) — so a
+ * corrupted flag can never make an interrupted pass look settled.
+ */
+function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null {
+  if (typeof value !== "object" || value === null) return null;
   const record = value as Record<string, unknown>;
-  return (
-    typeof record.content === "string" &&
-    typeof record.sidecar === "string" &&
-    typeof record.target === "string"
-  );
+  if (
+    typeof record.content !== "string" ||
+    typeof record.sidecar !== "string" ||
+    typeof record.target !== "string"
+  ) {
+    return null;
+  }
+  const flag = (raw: unknown, malformed: boolean): boolean | undefined =>
+    raw === undefined ? undefined : typeof raw === "boolean" ? raw : malformed;
+  return {
+    content: record.content,
+    sidecar: record.sidecar,
+    target: record.target,
+    created: flag(record.created, false),
+    pending: flag(record.pending, true),
+    pendingDeletion: flag(record.pendingDeletion, true),
+    deleted: flag(record.deleted, false),
+    replacementContent:
+      typeof record.replacementContent === "string" ? record.replacementContent : undefined,
+  };
 }
 
 /**
@@ -98,13 +121,48 @@ export async function readLegacyAdoptionManifest(
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return new Map();
     return new Map(
-      Object.entries(parsed).filter((entry): entry is [string, LegacyAdoptionRecord] =>
-        isLegacyAdoptionRecord(entry[1])
-      )
+      Object.entries(parsed).flatMap(([relPath, raw]) => {
+        const record = parseLegacyAdoptionRecord(raw);
+        return record === null ? [] : [[relPath, record] as const];
+      })
     );
   } catch {
     return new Map();
   }
+}
+
+/**
+ * Every non-directory entry (files, symlinks, anything) under `absDir`,
+ * recursively, as relPaths prefixed with `dirRel`; empty when the directory
+ * is absent. Throws on any other traversal failure (the caller then refuses
+ * rather than guess).
+ */
+async function listEntriesUnder(absDir: string, dirRel: string): Promise<Set<string>> {
+  const found = new Set<string>();
+  const walk = async (abs: string, rel: string): Promise<void> => {
+    let entries: Dirent[];
+    try {
+      entries = await fsPromises.readdir(abs, { withFileTypes: true });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code === "ENOENT" || code === "ENOTDIR") return;
+      throw error;
+    }
+    for (const entry of entries) {
+      const childRel = `${rel}/${entry.name}`;
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        await walk(path.join(abs, entry.name), childRel);
+      } else {
+        found.add(childRel);
+      }
+    }
+  };
+  await walk(absDir, dirRel);
+  return found;
+}
+
+function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  return a.size === b.size && [...a].every((value) => b.has(value));
 }
 
 /** Thrown for a legacy path the shared store does not represent (see below). */
@@ -151,6 +209,36 @@ export async function createLegacyPathRemapper(args: {
     path.join(legacyRoot, LEGACY_ADOPTION_MANIFEST_FILE_NAME),
     { strict: args.strict === true }
   );
+  // Directory endpoints (pre-sharing directory renames) map only when the
+  // owner's on-disk subtree is EXACTLY the adopted descendants: a structural
+  // rename moves whatever is there, so an owner note added beside the
+  // adopted copies (no refinement row of its own) would travel along
+  // unnoticed. Precomputed for every directory prefix the manifest knows.
+  const ownerSubtreeExact = new Map<string, boolean>();
+  const directoryPrefixes = new Set<string>();
+  for (const rel of adopted.keys()) {
+    const parts = rel.split("/");
+    for (let depth = 1; depth < parts.length; depth++) {
+      directoryPrefixes.add(parts.slice(0, depth).join("/"));
+    }
+  }
+  for (const dirRel of directoryPrefixes) {
+    const descendants = [...adopted].filter(([rel]) => rel.startsWith(`${dirRel}/`));
+    const oneToOne = descendants.every(
+      ([rel, entry]) => entry.target === rel && entry.created === true && entry.pending !== true
+    );
+    const expected = new Set(
+      descendants.filter(([, entry]) => entry.deleted !== true).map(([rel]) => rel)
+    );
+    ownerSubtreeExact.set(
+      dirRel,
+      oneToOne &&
+        setsEqual(
+          expected,
+          await listEntriesUnder(path.join(ownerRoot, ...dirRel.split("/")), dirRel)
+        )
+    );
+  }
   const remapPath = (filePath: string): string => {
     const relative = path.relative(legacyRoot, path.resolve(filePath));
     if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return filePath;
@@ -163,13 +251,7 @@ export async function createLegacyPathRemapper(args: {
       // owner directory then IS the adopted directory. Descendants placed
       // elsewhere (conflict imports) or owner-owned make the structural
       // move ambiguous: refused.
-      const descendants = [...adopted].filter(([rel]) => rel.startsWith(`${relPath}/`));
-      if (
-        descendants.length > 0 &&
-        descendants.every(
-          ([rel, entry]) => entry.target === rel && entry.created === true && entry.pending !== true
-        )
-      ) {
+      if (ownerSubtreeExact.get(relPath) === true) {
         return path.join(ownerRoot, ...relPath.split("/"));
       }
       throw new LegacyPathNotAdoptedError(filePath, "not-adopted");

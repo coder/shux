@@ -1678,10 +1678,18 @@ export class CompactionHandler {
     // under the epoch this compaction closes. Copies from before the field
     // existed carry nothing forward — no policy record ever existed for
     // their epochs.
+    // An assistant TURN row (it carries the request bound) without a recorded
+    // policy epoch was produced by a build that did not maintain the policy:
+    // its copy stays unstamped, which the policy sink reads as unknown
+    // (deny) — stamping it with the closing epoch would vouch for a policy
+    // nobody recorded. Non-turn assistant rows (payloads, summaries) and
+    // user rows belong to the closing epoch.
     const sourcePolicyEpoch =
       source?.rlmPreservedTailCopy === true
         ? source.rlmPreservedTailSourcePolicyEpoch
-        : (source?.workspaceMemoryPolicyEpoch ?? closingPolicyEpoch);
+        : row.role === "assistant" && typeof source?.requestHistorySequence === "number"
+          ? source.workspaceMemoryPolicyEpoch
+          : closingPolicyEpoch;
     return {
       ...row,
       id: copyId,

@@ -1143,15 +1143,13 @@ export class AgentSession {
       path.join(this.config.sessionsDir, this.workspaceId),
       options
     );
-    // Strict load: an unreadable config.json would read as the empty default,
-    // in which this workspace has no records to clear — the reset would
-    // report success and leave the stale records behind. Throwing makes the
-    // boundary a retryable partial failure instead. (A genuinely absent file
-    // holds no records and is the empty default for real.)
-    const entry = findWorkspaceEntry(
-      this.config.loadConfigOrDefault({ throwOnError: true }),
-      this.workspaceId
-    );
+    // Strict load: an unreadable — or transiently ABSENT — config.json would
+    // read as the empty default, in which this workspace has no records to
+    // clear; the reset would report success and leave the stale records
+    // behind (a destructive boundary reuses epoch -1, so a surviving deny
+    // would pin the new segment). Throwing makes the boundary a retryable
+    // partial failure instead; a registered workspace always has a config.
+    const entry = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), this.workspaceId);
     if (entry?.workspace.workspaceMemoryWritableByEpoch === undefined) {
       this.workspaceMemoryWritable = undefined;
       return;
@@ -1185,10 +1183,7 @@ export class AgentSession {
     // boundary reuses epoch -1, and a surviving `-1: false` would pin the
     // new segment to the stored-false fast path once the mirror is cleared
     // below — so the mirror is cleared only after the durable state agrees.
-    const after = findWorkspaceEntry(
-      this.config.loadConfigOrDefault({ throwOnError: true }),
-      this.workspaceId
-    );
+    const after = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), this.workspaceId);
     const stale =
       after !== null &&
       (options === undefined
@@ -1229,10 +1224,7 @@ export class AgentSession {
     let carried: boolean | undefined;
     let failure: string | undefined;
     try {
-      const entry = findWorkspaceEntry(
-        this.config.loadConfigOrDefault({ throwOnError: true }),
-        this.workspaceId
-      );
+      const entry = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), this.workspaceId);
       const closingBefore =
         entry === null ? undefined : workspaceMemoryWritableForEpoch(entry.workspace, closingEpoch);
       if (closingBefore === undefined) return;
@@ -1252,10 +1244,7 @@ export class AgentSession {
       });
       // Consumed by another backend's boundary meanwhile: nothing to carry.
       if (carried === undefined) return;
-      const after = findWorkspaceEntry(
-        this.config.loadConfigOrDefault({ throwOnError: true }),
-        this.workspaceId
-      );
+      const after = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), this.workspaceId);
       if (
         after === null ||
         workspaceMemoryWritableForEpoch(after.workspace, nextEpoch) !== carried

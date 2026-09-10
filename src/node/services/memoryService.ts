@@ -1515,11 +1515,13 @@ export class MemoryService extends EventEmitter {
           // once the filesystem recovers. Keep the entry (and the pass
           // incomplete) so the next access reconciles it.
           let targetKind: MemoryEntryKind;
+          let targetContained = false;
           try {
-            targetKind = (await store.assertContained(previous.target).then(
+            targetContained = await store.assertContained(previous.target).then(
               () => true,
               () => false
-            ))
+            );
+            targetKind = targetContained
               ? await store.kind(previous.target, { strict: true })
               : null;
           } catch (error) {
@@ -1573,10 +1575,12 @@ export class MemoryService extends EventEmitter {
             ([rel, record]) =>
               rel !== relPath && listed.has(rel) && record.target === previous.target
           );
-          // A target PROVEN absent (strict probe) while a deletion was pending
-          // was removed by the interrupted pass, not changed by the owner. A
-          // directory, symlink or over-cap file there is owner state.
-          const removedByUs = previous.pendingDeletion === true && targetKind === null;
+          // A target PROVEN absent (contained path, strict probe ENOENT) while
+          // a deletion was pending was removed by the interrupted pass, not
+          // changed by the owner. A directory, symlink, escaping component or
+          // over-cap file there is owner state.
+          const removedByUs =
+            previous.pendingDeletion === true && targetContained && targetKind === null;
           unchangedForTombstone = (unchanged || removedByUs) && successor === undefined;
           if (successor !== undefined) {
             // Only a copy still holding the adopted bytes is ours to hand

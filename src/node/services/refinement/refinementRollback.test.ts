@@ -1027,6 +1027,21 @@ describe("refinementRollback", () => {
         },
       })
     );
+    // An owner note added beside the adopted copies (no refinement row of
+    // its own) would travel with a structural rename: refused until the
+    // subtree is exactly the adopted descendants again.
+    await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "newdir", "owner.md"), "o\n");
+    const extraFile = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: dirRenameRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(extraFile.success).toBe(false);
+    expect(extraFile.success ? "" : extraFile.error).toContain(
+      "not folded into the shared workspace store"
+    );
+    await fsPromises.rm(path.join(ownerSessionDir, "memory", "newdir", "owner.md"));
     const undoneRename = await rollbackRefinement({
       sessionDir: fixture.sessionDir,
       id: dirRenameRow.id,

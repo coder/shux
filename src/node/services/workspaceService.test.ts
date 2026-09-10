@@ -7563,8 +7563,11 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   });
 
   test("destructive clear waits for startup monitor recovery discovery", async () => {
-    const { historyService, workspaceService, cleanup } = await createServices();
+    const { config, historyService, workspaceService, cleanup } = await createServices();
     const workspaceId = "clear-waits-for-monitor-recovery";
+    // A destructive clear proves its policy reset against an EXISTING
+    // config.json (an absent one is a transient state, not the empty default).
+    await config.editConfig((cfg) => cfg);
     const recovery = createDeferred<void>();
     const internal = workspaceService as unknown as {
       bashMonitorRecoveryPromise: Promise<void>;

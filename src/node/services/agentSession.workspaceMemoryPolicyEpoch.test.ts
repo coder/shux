@@ -153,7 +153,8 @@ describe("AgentSession workspace memory policy epoch boundary", () => {
   });
 
   test("reset clears the mirror only once the durable clear is proven", async () => {
-    const { session, internals, records, setRecords, swallowNextWrite } = await createSession();
+    const { session, internals, records, setRecords, swallowNextWrite, config } =
+      await createSession();
     // Destructive boundary: every record goes, then the mirror.
     session.recordWorkspaceMemoryWritable(false);
     await setRecords({ "-1": false, "5": true });
@@ -172,6 +173,24 @@ describe("AgentSession workspace memory policy epoch boundary", () => {
     ).toMatch(/did not persist/);
     expect(records()).toEqual({ "-1": false });
     expect(session.workspaceMemoryWritableMirror()).toBe(false);
+
+    // An ABSENT config.json is not the empty default: a registered workspace
+    // always has one, so its absence is transient — the reset must fail
+    // (retryable) rather than clear the mirror over records it never saw.
+    session.recordWorkspaceMemoryWritable(false);
+    await setRecords({ "-1": false });
+    const configPath = path.join(config.rootDir, "config.json");
+    const savedConfig = await fsPromises.readFile(configPath);
+    await fsPromises.rm(configPath);
+    try {
+      expect(
+        await internals.resetWorkspaceMemoryWritable().then(() => null, getErrorMessage)
+      ).toMatch(/absent/);
+    } finally {
+      await fsPromises.writeFile(configPath, savedConfig);
+    }
+    expect(session.workspaceMemoryWritableMirror()).toBe(false);
+    expect(records()).toEqual({ "-1": false });
 
     // Compaction boundary, fenced to the closing epoch: the same proof.
     await setRecords({ "3": false, "8": true });
