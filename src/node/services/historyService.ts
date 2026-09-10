@@ -15,6 +15,7 @@ import {
   scanHistoryFilesBounded,
   readProviderHistoryFromLatestBoundary,
   readCompactionPendingHistoryBoundary,
+  readCompactionPendingHistoryObservation,
   readHistoryControlEvidenceFromLatestBoundary,
   type HistoryControlRow,
   type BoundedHistoryScanOptions,
@@ -27,7 +28,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { renameSync, unlinkSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import * as fs from "fs/promises";
-import type { CompactionPendingHistory } from "./compactionPendingState";
+import type {
+  CompactionPendingHistory,
+  CompactionPendingHistoryView,
+} from "./compactionPendingState";
 import {
   ContinuousCompactionJournalStore,
   publishCompactionFile,
@@ -232,13 +236,17 @@ function getCompactionMetadataToPreserve(
   }
 
   if (hasDurableCompactionBoundary(incomingMessage.metadata)) {
-    return null;
+    return incomingMessage.metadata?.compactionPublicationId === undefined &&
+      existingMetadata.compactionPublicationId
+      ? { compactionPublicationId: existingMetadata.compactionPublicationId }
+      : null;
   }
 
   const preserved: Partial<MuxMetadata> = {
     compacted: existingMetadata.compacted,
     compactionBoundary: true,
     compactionEpoch: existingMetadata.compactionEpoch,
+    compactionPublicationId: existingMetadata.compactionPublicationId,
   };
 
   if (
@@ -455,59 +463,125 @@ export class HistoryService {
   /** Inactive G1 adapter: pending-file I/O must finish before either history lock is released. */
   getCompactionPendingHistory(workspaceId: string): CompactionPendingHistory {
     return {
-      cleanupHeartbeat: (summary, isCurrent, onCommitted) =>
+      cleanupHeartbeat: (summary, isCurrent, onCommitted, reconcileUnderLock, beforeRollback) =>
         this.cleanupCompactionFollowUp(
           workspaceId,
           summary,
           "rollback-heartbeat",
           isCurrent,
-          onCommitted
+          onCommitted,
+          reconcileUnderLock,
+          beforeRollback
         ),
       withLock: (operation) =>
         this.fileLocks.withLock(workspaceId, () =>
           this.withCrossProcessWriteLock(workspaceId, async (assertStillOwned) => {
-            const journal = this.getContinuousCompactionJournal(workspaceId);
-            // Carry raw reset evidence: missing projected rows cannot prove legacy context safe.
-            // Avoid the public history reader: its lazy rotation would re-enter the lock.
-            const boundary = await readCompactionPendingHistoryBoundary({
-              chat: this.getChatHistoryPath(workspaceId),
-              archive: this.getChatArchivePath(workspaceId),
-            });
-            return await operation({
-              generation: await journal.captureGenerationUnderHistoryLock(),
-              assertStillOwned,
-              boundary,
-              isPublicationCurrent: (publication) =>
-                journal.isPublicationCurrentUnderHistoryLock(publication),
-              publishBoundary: async (input, onCommitted) => {
-                // The public partial reader treats errors as absence. Admission must refuse
-                // unreadable state, and cannot re-enter the history reader's lazy rotation.
-                const raw = await fs
-                  .readFile(this.getPartialPath(workspaceId), "utf8")
-                  .catch((error: unknown) => {
-                    if (isErrnoWithCode(error, "ENOENT")) return undefined;
-                    throw error;
-                  });
-                let partial: MuxMessage | null = null;
-                if (raw !== undefined) {
-                  const parsed: unknown = JSON.parse(raw);
-                  if (!isReadableHistoryMessage(parsed))
-                    throw new Error("Compaction partial is unreadable");
-                  partial = normalizeLegacyMuxMetadata(parsed);
-                }
-                return this.persistBoundaryWithTailCopiesUnderWriteLock(
-                  workspaceId,
-                  input.summaryMessage,
-                  input.tailCopies,
-                  input.updateExisting,
-                  (messages) => input.shouldPersist(messages, partial),
-                  { publication: input.publication, onCommitted },
-                  assertStillOwned
-                );
-              },
-            });
+            return await operation(
+              await this.compactionPendingViewUnderLock(workspaceId, assertStillOwned)
+            );
           })
         ),
+    };
+  }
+
+  private async compactionPendingViewUnderLock(
+    workspaceId: string,
+    assertStillOwned: () => Promise<void>,
+    activeRows?: HistoryRewriteRow[],
+    skippedBoundaries = 0
+  ): Promise<CompactionPendingHistoryView> {
+    const journal = this.getContinuousCompactionJournal(workspaceId);
+    const paths = {
+      chat: this.getChatHistoryPath(workspaceId),
+      archive: this.getChatArchivePath(workspaceId),
+    };
+    const { boundary, boundaryPublicationId } = await readCompactionPendingHistoryObservation(
+      paths,
+      skippedBoundaries
+    );
+    const rows = activeRows ?? (await this.readHistoryForRewrite(paths.chat)).rows;
+    const identityCounts = new Map<string, number>();
+    for (const row of rows) {
+      const message = row.message ?? row.protectedMessage;
+      if (message) identityCounts.set(message.id, (identityCounts.get(message.id) ?? 0) + 1);
+    }
+    let reachableBoundaryIds: Set<string | undefined> | undefined = new Set();
+    let suffix = 0;
+    for (const row of rows.toReversed()) {
+      if (!row.message) {
+        // Corruption cannot justify dropping a potentially rollbackable warm owner.
+        reachableBoundaryIds = undefined;
+        break;
+      }
+      if (!isDurableContextBoundaryMarker(row.message)) continue;
+      if (identityCounts.get(row.message.id) !== 1) {
+        reachableBoundaryIds = undefined;
+        break;
+      }
+      const metadata = row.message.metadata?.muxMetadata;
+      if (row.message.metadata?.compacted !== "heartbeat") break;
+      if (
+        !isCompactionSummaryMetadata(metadata) ||
+        (metadata.pendingFollowUp !== undefined &&
+          (!metadata.pendingFollowUp ||
+            typeof metadata.pendingFollowUp !== "object" ||
+            typeof metadata.pendingFollowUp.text !== "string" ||
+            typeof metadata.pendingFollowUp.model !== "string" ||
+            typeof metadata.pendingFollowUp.agentId !== "string"))
+      ) {
+        reachableBoundaryIds = undefined;
+        break;
+      }
+      if (metadata.pendingFollowUp === undefined) break;
+      reachableBoundaryIds.add(row.message.id);
+      suffix++;
+    }
+    if (reachableBoundaryIds) {
+      // One verified lookup finds the base, including when successful rotation archived it.
+      const base = suffix
+        ? await readCompactionPendingHistoryBoundary(paths, suffix + skippedBoundaries)
+        : boundary;
+      if (base.kind === "identified") reachableBoundaryIds.add(base.messageId);
+      if (base.kind === "none") reachableBoundaryIds.add(undefined);
+      // unreadable-reset is a verified raw reset floor, not an I/O failure: older
+      // boundaries cannot be exposed through it. Failed scans throw and prove no horizon.
+    }
+    const generation = await journal.captureGenerationUnderHistoryLock();
+    await assertStillOwned();
+    return {
+      generation,
+      assertStillOwned,
+      boundary,
+      boundaryPublicationId,
+      reachableBoundaryIds,
+      isPublicationCurrent: (publication) =>
+        journal.isPublicationCurrentUnderHistoryLock(publication),
+      publishBoundary: async (input, onCommitted) => {
+        // The public partial reader treats errors as absence. Admission must refuse
+        // unreadable state, and cannot re-enter the history reader's lazy rotation.
+        const raw = await fs
+          .readFile(this.getPartialPath(workspaceId), "utf8")
+          .catch((error: unknown) => {
+            if (isErrnoWithCode(error, "ENOENT")) return undefined;
+            throw error;
+          });
+        let partial: MuxMessage | null = null;
+        if (raw !== undefined) {
+          const parsed: unknown = JSON.parse(raw);
+          if (!isReadableHistoryMessage(parsed))
+            throw new Error("Compaction partial is unreadable");
+          partial = normalizeLegacyMuxMetadata(parsed);
+        }
+        return this.persistBoundaryWithTailCopiesUnderWriteLock(
+          workspaceId,
+          input.summaryMessage,
+          input.tailCopies,
+          input.updateExisting,
+          (messages) => input.shouldPersist(messages, partial),
+          { publication: input.publication, onCommitted },
+          assertStillOwned
+        );
+      },
     };
   }
 
@@ -3217,7 +3291,12 @@ export class HistoryService {
     action: "clear" | "rollback-heartbeat",
     isCurrent: () => boolean,
     // Unlike void, undefined rejects async observers that would outlive the held locks.
-    onCommitted?: () => undefined
+    onCommitted?: () => undefined,
+    reconcileUnderLock?: (
+      view: CompactionPendingHistoryView,
+      removedCurrentBoundary: boolean
+    ) => Promise<void>,
+    beforeRollback?: (restoredView: CompactionPendingHistoryView) => Promise<void>
   ): Promise<Result<CompactionFollowUpCleanupOutcome>> {
     const expected = summary.metadata?.muxMetadata;
     const sequence = summary.metadata?.historySequence;
@@ -3248,6 +3327,8 @@ export class HistoryService {
         if (
           !current ||
           current.role !== "assistant" ||
+          // Reused IDs/sequences do not transfer a handoff to a different publication.
+          current.metadata?.compactionPublicationId !== summary.metadata?.compactionPublicationId ||
           !isCompactionSummaryMetadata(metadata) ||
           !isDeepStrictEqual(metadata.pendingFollowUp, expected.pendingFollowUp) ||
           (action === "rollback-heartbeat" && current.metadata?.compacted !== "heartbeat") ||
@@ -3266,6 +3347,34 @@ export class HistoryService {
         const serialized = this.serializeHistoryRewrite(rows, workspaceId, (row) =>
           row === current ? replacement : row
         );
+        let removedCurrentBoundary = false;
+        if (action === "rollback-heartbeat") {
+          const boundary = await readCompactionPendingHistoryBoundary({
+            chat: historyPath,
+            archive: this.getChatArchivePath(workspaceId),
+          }).catch(() => undefined);
+          const latest = messages.findLast(isDurableContextBoundaryMarker);
+          removedCurrentBoundary =
+            boundary?.kind === "identified" &&
+            boundary.messageId === summary.id &&
+            latest === current &&
+            rows.filter((row) => (row.message ?? row.protectedMessage)?.id === summary.id)
+              .length === 1;
+          // Older active heartbeats cannot roll back through a later boundary's fallback.
+          if (!removedCurrentBoundary) return Ok("skipped");
+          // Only already-consumed ownership is retired here. If storage cannot establish
+          // that retirement, keep history unchanged so rollback can be retried honestly.
+          await beforeRollback?.(
+            await this.compactionPendingViewUnderLock(
+              workspaceId,
+              assertStillOwned,
+              rows.filter((row) => row.message !== current),
+              1
+            )
+          );
+          await assertStillOwned();
+          if (!isCurrent()) return Ok("skipped");
+        }
         const stagedPath = `${historyPath}.follow-up-${randomUUID()}`;
         let published = false;
         try {
@@ -3290,6 +3399,21 @@ export class HistoryService {
               workspaceId,
               Math.max(this.sequenceCounters.get(workspaceId) ?? 0, sequence + 1)
             );
+          }
+          if (reconcileUnderLock) {
+            try {
+              // Mandatory history is committed; finish this obligation before a successor can enter.
+              await reconcileUnderLock(
+                await this.compactionPendingViewUnderLock(
+                  workspaceId,
+                  assertStillOwned,
+                  rows.filter((row) => row.message !== current)
+                ),
+                removedCurrentBoundary
+              );
+            } catch (error) {
+              log.warn("Pending heartbeat reconciliation unavailable after history commit", error);
+            }
           }
           return Ok("applied");
         } finally {

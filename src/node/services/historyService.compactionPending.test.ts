@@ -815,4 +815,82 @@ describe("inactive compaction history transactions", () => {
       expect(await fs.readFile(chatPath, "utf8")).toBe(before);
     }
   );
+  it.each([
+    {
+      name: "rollbackable suffix",
+      metadata: {
+        type: "compaction-summary",
+        pendingFollowUp: { text: "Resume", model: "model", agentId: "exec" },
+      },
+      expected: ["C", "B", "A"],
+    },
+    { name: "cleared follow-up", metadata: { type: "compaction-summary" }, expected: ["C", "B"] },
+    { name: "future metadata", metadata: { type: "future-summary" }, expected: undefined },
+    {
+      name: "malformed follow-up",
+      metadata: { type: "compaction-summary", pendingFollowUp: null },
+      expected: undefined,
+    },
+    {
+      name: "incomplete follow-up",
+      metadata: { type: "compaction-summary", pendingFollowUp: {} },
+      expected: undefined,
+    },
+  ])("bounds retention only with proven $name history", async ({ metadata, expected }) => {
+    const heartbeat = (id: string) =>
+      createMuxMessage(id, "assistant", id, {
+        compacted: "heartbeat",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: { text: "Resume", model: "model", agentId: "exec" },
+        },
+      });
+    const b = heartbeat("B");
+    await fs.writeFile(archivePath, line(boundary("A")));
+    // Raw fixtures deliberately include future/invalid metadata that the history projection preserves.
+    await fs.writeFile(
+      chatPath,
+      JSON.stringify({ ...b, metadata: { ...b.metadata, muxMetadata: metadata } }) +
+        "\n" +
+        line(heartbeat("C"))
+    );
+    await transaction().withLock(async (view) => {
+      await view.assertStillOwned();
+      expect(view.boundary).toEqual({ kind: "identified", messageId: "C" });
+      expect(view.reachableBoundaryIds && [...view.reachableBoundaryIds]).toEqual(
+        expected && [...expected]
+      );
+    });
+  });
+
+  it("does not prune through duplicate active boundary identities", async () => {
+    await fs.writeFile(chatPath, line(boundary("A")) + line(boundary("A")));
+    await transaction().withLock(async (view) => {
+      await view.assertStillOwned();
+      expect(view.reachableBoundaryIds).toBeUndefined();
+    });
+  });
+  it("bounds the rollback horizon at a verified archived raw reset floor", async () => {
+    const heartbeat = createMuxMessage("C", "assistant", "C", {
+      compacted: "heartbeat",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+      muxMetadata: {
+        type: "compaction-summary",
+        pendingFollowUp: { text: "Resume", model: "model", agentId: "exec" },
+      },
+    });
+    await fs.writeFile(
+      archivePath,
+      line(boundary("A")) + '{"metadata":{"contextBoundaryKind":"reset"},broken\n'
+    );
+    await fs.writeFile(chatPath, line(heartbeat));
+    await transaction().withLock(async (view) => {
+      await view.assertStillOwned();
+      expect(view.boundary).toEqual({ kind: "identified", messageId: "C" });
+      expect(view.reachableBoundaryIds && [...view.reachableBoundaryIds]).toEqual(["C"]);
+    });
+  });
 });

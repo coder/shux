@@ -94,6 +94,39 @@ describe("unactivated compaction pending-file protocol", () => {
     await h.cleanup();
   });
 
+  it("qualifies only authenticated receipts for the same write and generation", async () => {
+    const a = await prepare("A");
+    await boundary("A");
+    const reloaded = await store.load(() => true);
+    const foreign = await restart().load(() => true);
+    assert(reloaded && foreign);
+    expect(store.isSameReceipt(a, reloaded)).toBe(true);
+    expect(store.isSameReceipt(a, foreign)).toBe(false);
+    expect(store.isSameReceipt(foreign, a)).toBe(false);
+    expect(store.isSameReceipt(a, structuredClone(a))).toBe(false);
+    expect(store.belongsToBoundary(structuredClone(a), "A")).toBe(false);
+    const replacement = await prepare("A");
+    expect(store.belongsToBoundary(a, "A")).toBe(true);
+    expect(store.belongsToBoundary(replacement, "A")).toBe(true);
+    expect(store.isSameReceipt(a, replacement)).toBe(false);
+    expect(await store.isCurrent(a, "pending", () => true)).toBe(false);
+  });
+
+  it("does not equate a reused boundary and write ID on opposite sides of a reset", async () => {
+    const before = await prepare("A");
+    await boundary("A");
+    const persisted = JSON.parse(await bytes()) as Record<string, unknown>;
+    assert((await h.historyService.clearHistory(workspaceId)).success);
+    await boundary("A");
+    persisted.publicationGeneration = await h.historyService
+      .getContinuousCompactionJournal(workspaceId)
+      .captureGeneration();
+    await fs.writeFile(filePath, JSON.stringify(persisted));
+    const after = await store.load(() => true);
+    assert(after);
+    expect(store.isSameReceipt(before, after)).toBe(false);
+  });
+
   it("loads old V1 files, sanitizes individual attachments, and consumes across reload", async () => {
     await fs.writeFile(
       filePath,

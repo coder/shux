@@ -1046,6 +1046,8 @@ export interface MuxMetadata {
    * This lets downstream logic identify compaction boundaries without mutating history.
    */
   compactionBoundary?: boolean;
+  /** Exact composed publication occurrence, shared with the pending file writeId. */
+  compactionPublicationId?: string;
   /** Durable provider-context boundary kind. Existing compaction rows are also boundaries via compactionBoundary. */
   contextBoundaryKind?: PersistedContextBoundaryKind;
   toolPolicy?: ToolPolicy; // Tool policy active when this message was sent (user messages only)

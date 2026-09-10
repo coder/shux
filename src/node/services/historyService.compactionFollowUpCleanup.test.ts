@@ -200,13 +200,15 @@ describe("conditional compaction follow-up cleanup", () => {
           action,
           () => true
         )
-      ).toEqual(Ok("applied"));
+      ).toEqual(Ok(action === "clear" ? "applied" : "skipped"));
       const history = await store.historyService.getLastMessages(workspaceId, 2);
       assert(history.success, "Expected history after cleanup");
-      expect(history.data).toHaveLength(action === "clear" ? 2 : 1);
+      expect(history.data).toHaveLength(2);
       expect(history.data.at(-1)).toMatchObject(unrelated);
       if (action === "clear") {
         expect(history.data[0].metadata?.muxMetadata).not.toHaveProperty("pendingFollowUp");
+      } else {
+        expect(history.data[0]).toMatchObject(expected);
       }
     });
 

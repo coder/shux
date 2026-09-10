@@ -200,6 +200,7 @@ function historyFileStamp(
 
 interface LocatedHistoryBoundary {
   offset: number;
+  boundaryPublicationId?: string;
   boundary: Exclude<PendingBoundary, { kind: "none" }>;
 }
 type ProviderHistoryStart =
@@ -244,6 +245,7 @@ async function findProviderHistoryStart(
       if (durableBoundary || (includeReadableResetFloor && message))
         return {
           offset: start,
+          boundaryPublicationId: message.metadata?.compactionPublicationId,
           boundary: durableBoundary
             ? { kind: "identified", messageId: message.id }
             : { kind: "unreadable-reset" },
@@ -253,7 +255,11 @@ async function findProviderHistoryStart(
       return { offset: unreadableRunEnd ?? rowEnd, boundary: { kind: "unreadable-reset" } };
     }
     if (durableBoundary) {
-      oldestBoundary = { offset: start, boundary: { kind: "identified", messageId: message.id } };
+      oldestBoundary = {
+        offset: start,
+        boundary: { kind: "identified", messageId: message.id },
+        boundaryPublicationId: message.metadata?.compactionPublicationId,
+      };
       if (boundaryCount++ === skip) return oldestBoundary;
     }
     if (message) {
@@ -293,8 +299,9 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
   paths: Record<HistoryArtifact, string>,
   skip: number,
   project?: (value: unknown) => Row | null,
-  includeReadableResetFloor = false
-): Promise<{ messages: Row[]; boundary: PendingBoundary }> {
+  includeReadableResetFloor = false,
+  clampToOldest = true
+): Promise<{ messages: Row[]; boundary: PendingBoundary; boundaryPublicationId?: string }> {
   assert(Number.isSafeInteger(skip) && skip >= 0, "provider boundary skip must be non-negative");
   const files = new Map<HistoryArtifact, { handle: fs.FileHandle; size: number; stamp: string }>();
   try {
@@ -342,20 +349,24 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
     const chat = await locate("chat", skip);
     let messages: Row[];
     let boundary: PendingBoundary = { kind: "none" };
+    let boundaryPublicationId: string | undefined;
     if (chat.kind === "start") {
       boundary = chat.boundary;
+      boundaryPublicationId = chat.boundaryPublicationId;
       messages = await readTail("chat", chat.offset);
     } else {
       const archive = await locate("archive", skip - chat.boundaryCount);
-      if (archive.kind === "start" || archive.oldestBoundary !== null) {
+      if (archive.kind === "start" || (clampToOldest && archive.oldestBoundary !== null)) {
         const location = archive.kind === "start" ? archive : archive.oldestBoundary!;
         boundary = location.boundary;
+        boundaryPublicationId = location.boundaryPublicationId;
         messages = [
           ...(await readTail("archive", location.offset)),
           ...(await readTail("chat", 0)),
         ];
-      } else if (chat.oldestBoundary !== null) {
+      } else if (clampToOldest && chat.oldestBoundary !== null) {
         boundary = chat.oldestBoundary.boundary;
+        boundaryPublicationId = chat.oldestBoundary.boundaryPublicationId;
         messages = await readTail("chat", chat.oldestBoundary.offset);
       } else messages = [...(await readTail("archive", 0)), ...(await readTail("chat", 0))];
     }
@@ -370,7 +381,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
         throw new Error("History changed during provider read");
       }
     }
-    return { messages, boundary };
+    return { messages, boundary, boundaryPublicationId };
   } finally {
     await Promise.all([...files.values()].map((file) => file.handle.close()));
   }
@@ -392,13 +403,31 @@ export function readProviderHistoryFromLatestBoundary(
   ).then((view) => view.messages);
 }
 
+/** Exact occurrence evidence shares the verified boundary scan; never persist it in legacy fallback tags. */
+export async function readCompactionPendingHistoryObservation(
+  paths: Record<HistoryArtifact, string>,
+  skip = 0
+) {
+  const { boundary, boundaryPublicationId } = await readHistoryProjectionFromLatestBoundary(
+    paths,
+    skip,
+    undefined,
+    false,
+    false
+  );
+  return { boundary, boundaryPublicationId };
+}
+
 /** Inactive pending-state evidence from the same raw locator and snapshot verification as reads. */
 export async function readCompactionPendingHistoryBoundary(
-  paths: Record<HistoryArtifact, string>
+  paths: Record<HistoryArtifact, string>,
+  skip = 0
 ): Promise<PendingBoundary> {
   // Known absence requires exhausting BOTH files; an unreadable reset never becomes absence.
   // No row projection is needed, so the verified location does not re-read the active tail.
-  return (await readHistoryProjectionFromLatestBoundary(paths, 0)).boundary;
+  // Retention needs the actual exposed base; provider reads may clamp excessive skips to the oldest window.
+  return (await readHistoryProjectionFromLatestBoundary(paths, skip, undefined, false, false))
+    .boundary;
 }
 
 /** Ordered lifecycle evidence, not a provider message or a source of repaired IDs. */
