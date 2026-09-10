@@ -769,10 +769,8 @@ export function createAgentPluginsMcpProvider(ctx: {
 
     const merged: Record<string, MCPServerInfo> = {};
     try {
-      const { plugins, mcpPlugins } = await discoverAgentPlugins(containers);
-      // Each baseline lexical registration keeps its own key/data and containment
-      // check, while every alias shares the pinned tree and managed import policy.
-      for (const plugin of mcpPlugins ?? plugins) {
+      const { plugins } = await discoverAgentPlugins(containers);
+      for (const plugin of plugins) {
         if (plugin.mcpConfigPath === undefined) {
           continue;
         }

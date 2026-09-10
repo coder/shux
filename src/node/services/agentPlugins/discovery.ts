@@ -195,9 +195,8 @@ export interface AgentPluginDiagnostic {
 }
 
 export interface DiscoverAgentPluginsResult {
+  /** Baseline ordered logical registrations; aliases share physical reads and import policy. */
   plugins: AgentPluginInfo[];
-  /** Ordered baseline MCP registrations sharing the physical scan and import policy. */
-  mcpPlugins?: AgentPluginInfo[];
   diagnostics: AgentPluginDiagnostic[];
 }
 
@@ -600,9 +599,7 @@ export function setAgentPluginDiscoveryGate(gate: AgentPluginDiscoveryGate): voi
 }
 
 /** Missing containers stay optional; other identity failures must never become unmanaged scans. */
-export async function resolveAgentPluginContainerPath(
-  containerPath: string
-): Promise<string | undefined> {
+async function resolveAgentPluginContainerPath(containerPath: string): Promise<string | undefined> {
   try {
     return await fsPromises.realpath(containerPath);
   } catch (error) {
@@ -613,14 +610,17 @@ export async function resolveAgentPluginContainerPath(
 
 /** Canonical project plugins shadow same-named legacy copies during ordered scans. */
 export async function discoverAgentPlugins(
-  containers: AgentPluginContainer[]
+  containers: AgentPluginContainer[],
+  options?: {
+    /** Ownership and recovery authority only; never scanned or registered as MCP views. */
+    managedHome?: string;
+  }
 ): Promise<DiscoverAgentPluginsResult> {
   let plugins: AgentPluginInfo[] = [];
-  let mcpPlugins: AgentPluginInfo[] = [];
   let diagnostics: AgentPluginDiagnostic[] = [];
   // Consent and recovery belong to the physical container, not its spelling.
-  // Keep the first lexical descriptor for precedence and stable MCP IDs, but
-  // collect ownership and gate paths from every alias before reading plugins.
+  // Keep baseline lexical registrations for precedence and stable identities,
+  // but collect ownership and gate paths from every alias before reading plugins.
   const groups = new Map<
     string,
     {
@@ -628,21 +628,95 @@ export async function discoverAgentPlugins(
       paths: Set<string>;
       registryPath?: string;
       blocked?: boolean;
+      hasScanCandidate: boolean;
     }
   >();
-  const canonicalPaths = new Map<string, string>();
+  const canonicalPaths = new Map<string, string | undefined>();
+  const resolveCachedPath = async (input: string) => {
+    if (!canonicalPaths.has(input)) {
+      canonicalPaths.set(input, await resolveAgentPluginContainerPath(input));
+    }
+    return canonicalPaths.get(input);
+  };
+  const groupFor = (canonicalPath: string, container: AgentPluginContainer) => {
+    let group = groups.get(canonicalPath);
+    if (group === undefined) {
+      // A physical target's parent is not registry/journal authority.
+      group = { container, paths: new Set<string>(), hasScanCandidate: false };
+      groups.set(canonicalPath, group);
+    }
+    return group;
+  };
+  const owners = new Map<
+    string,
+    {
+      container: AgentPluginContainer;
+      canonicalPath?: string;
+      ownerHome?: string;
+    }
+  >();
   let unresolvedOwner = false;
+
+  // Establish ownership BEFORE classifying candidates. Otherwise an owner alias
+  // retargeting between caller-side realpaths can turn a managed tree into import-all.
+  const ownerDescriptors: AgentPluginContainer[] = [...containers];
+  if (options?.managedHome !== undefined) {
+    ownerDescriptors.unshift({
+      path: path.join(options.managedHome, "plugins"),
+      scope: "global",
+      registryPath: path.join(options.managedHome, PLUGIN_REGISTRY_FILE_NAME),
+    });
+  }
+  for (const descriptor of ownerDescriptors) {
+    if (descriptor.registryPath === undefined || owners.has(descriptor.registryPath)) continue;
+    if (!path.isAbsolute(descriptor.path) || !path.isAbsolute(descriptor.registryPath)) {
+      throw new Error(
+        `discoverAgentPlugins: registry owner paths must be absolute: ${descriptor.path}`
+      );
+    }
+    const logicalHome = path.dirname(descriptor.registryPath);
+    const owner = { ...descriptor, path: path.join(logicalHome, "plugins") };
+    const binding: { container: AgentPluginContainer; canonicalPath?: string; ownerHome?: string } =
+      { container: owner };
+    owners.set(descriptor.registryPath, binding);
+    try {
+      binding.canonicalPath = await resolveCachedPath(owner.path);
+      binding.ownerHome = await resolveCachedPath(logicalHome);
+      if (
+        (binding.ownerHome === undefined && binding.canonicalPath !== undefined) ||
+        (binding.ownerHome !== undefined &&
+          (await resolveCachedPath(path.join(binding.ownerHome, "plugins"))) !==
+            binding.canonicalPath)
+      ) {
+        throw new Error("Managed plugin owner changed during container resolution.");
+      }
+      if (binding.canonicalPath !== undefined && binding.ownerHome !== undefined) {
+        const group = groupFor(binding.canonicalPath, owner);
+        group.registryPath = path.join(binding.ownerHome, path.basename(descriptor.registryPath));
+        group.paths.add(owner.path);
+        group.paths.add(path.join(binding.ownerHome, "plugins"));
+      }
+    } catch (error) {
+      unresolvedOwner = true;
+      if (binding.canonicalPath !== undefined)
+        groupFor(binding.canonicalPath, owner).blocked = true;
+      diagnostics.push({
+        path: owner.path,
+        scope: owner.scope,
+        severity: "error",
+        message: getErrorMessage(error),
+      });
+    }
+  }
+
   for (const container of containers) {
     if (!path.isAbsolute(container.path)) {
       throw new Error(`discoverAgentPlugins: container path must be absolute: ${container.path}`);
     }
     let canonicalPath: string | undefined;
     try {
-      canonicalPath =
-        canonicalPaths.get(container.path) ??
-        (await resolveAgentPluginContainerPath(container.path));
+      canonicalPath = await resolveCachedPath(container.path);
     } catch (error) {
-      if (container.registryPath !== undefined) unresolvedOwner = true;
       diagnostics.push({
         path: container.path,
         scope: container.scope,
@@ -652,50 +726,72 @@ export async function discoverAgentPlugins(
       continue;
     }
     if (canonicalPath === undefined) continue;
-    canonicalPaths.set(container.path, canonicalPath);
-    let group = groups.get(canonicalPath);
-    if (group === undefined) {
-      // A physical target's parent may own another container's journals.
-      // Gate authority comes only from configured scan paths and actual owners.
-      group = { container, paths: new Set() };
-      groups.set(canonicalPath, group);
-    }
+    const group = groupFor(canonicalPath, container);
+    if (!group.hasScanCandidate) group.container = container;
+    group.hasScanCandidate = true;
     group.paths.add(container.path);
-    if (container.registryPath !== undefined) {
-      // A project-only scan can carry the registry through an alias without
-      // scanning the configured owner. Recovery recognizes that lexical path.
-      group.paths.add(path.join(path.dirname(container.registryPath), "plugins"));
-      try {
-        const ownerHome = await resolveAgentPluginContainerPath(
-          path.dirname(container.registryPath)
-        );
-        if (
-          ownerHome === undefined ||
-          (await resolveAgentPluginContainerPath(path.join(ownerHome, "plugins"))) !== canonicalPath
-        ) {
-          throw new Error("Managed plugin owner changed during container resolution.");
-        }
-        // The container itself may be a symlink: its canonical parent need
-        // not own the registry/journals. Pin the actual owner's parent too.
-        group.registryPath = path.join(ownerHome, path.basename(container.registryPath));
-        group.paths.add(path.join(ownerHome, "plugins"));
-      } catch (error) {
-        // A retargeted owner may now identify another unmarked group in this scan.
-        unresolvedOwner = true;
-        group.blocked = true;
-        diagnostics.push({
-          path: container.path,
-          scope: container.scope,
-          severity: "error",
-          message: getErrorMessage(error),
-        });
-      }
+    if (
+      container.registryPath !== undefined &&
+      owners.get(container.registryPath)?.canonicalPath !== canonicalPath
+    ) {
+      unresolvedOwner = true;
+      group.blocked = true;
+      diagnostics.push({
+        path: container.path,
+        scope: container.scope,
+        severity: "error",
+        message: "Managed plugin owner changed during container resolution.",
+      });
     }
   }
+
+  const revalidateOwners = async () => {
+    for (const [registryPath, binding] of owners) {
+      try {
+        // Bypass the operation cache: newly resolved candidates must not inherit
+        // an unmanaged classification from an owner that moved (or disappeared).
+        const canonicalPath = await resolveAgentPluginContainerPath(binding.container.path);
+        const ownerHome = await resolveAgentPluginContainerPath(path.dirname(registryPath));
+        if (
+          canonicalPath !== binding.canonicalPath ||
+          ownerHome !== binding.ownerHome ||
+          (ownerHome !== undefined &&
+            (await resolveAgentPluginContainerPath(path.join(ownerHome, "plugins"))) !==
+              canonicalPath)
+        ) {
+          throw new Error("Managed plugin owner changed during discovery.");
+        }
+      } catch {
+        // An established pinned owner still governs its old tree; uncertainty
+        // must deny otherwise-unowned targets, not drop the old policy or unrelated owners.
+        // Affected scan groups report the ownership failure below.
+        unresolvedOwner = true;
+      }
+      if (binding.canonicalPath !== undefined && binding.ownerHome !== undefined) {
+        try {
+          if (
+            (await resolveAgentPluginContainerPath(binding.ownerHome)) !== binding.ownerHome ||
+            (await resolveAgentPluginContainerPath(path.join(binding.ownerHome, "plugins"))) !==
+              binding.canonicalPath
+          ) {
+            throw new Error("Pinned plugin owner no longer identifies the scanned tree.");
+          }
+        } catch {
+          // A missing pinned home would make its registry read look like a legacy
+          // import-all directory even when the separately stored plugin tree survives.
+          unresolvedOwner = true;
+          const group = groups.get(binding.canonicalPath);
+          if (group !== undefined) group.blocked = true;
+        }
+      }
+    }
+  };
   const gateSession = await discoveryGate([
     ...new Set([...groups.values()].flatMap((group) => [...group.paths])),
   ]);
   const suppressedContainers = new Set(gateSession.suppressed);
+  await revalidateOwners();
+  const unownedSuppressedBeforeScan = unresolvedOwner;
 
   const snapshots = new Map<
     string,
@@ -705,8 +801,11 @@ export async function discoverAgentPlugins(
       plugins: Map<string, AgentPluginInfo | null>;
     }
   >();
-  for (const [canonicalPath, { container, paths, registryPath, blocked }] of groups) {
-    if (blocked) continue;
+  for (const [
+    canonicalPath,
+    { container, paths, registryPath, blocked, hasScanCandidate },
+  ] of groups) {
+    if (blocked || !hasScanCandidate) continue;
     if (unresolvedOwner && registryPath === undefined) {
       // If an owner's identity is unknown, no unmarked alias can safely be
       // classified as unmanaged. Other established owners remain isolated.
@@ -737,9 +836,9 @@ export async function discoverAgentPlugins(
     });
   }
 
-  // Replay original lexical registrations, not group order. MCP must retain
-  // existing project/global keys and data; raw duplicates and legacy shadowing
-  // still follow baseline precedence. Only the first eligible view reads a plugin.
+  // Every consumer needs logical views: an escaped project view must not hide
+  // a valid global fallback. Replay baseline raw deduplication and shadowing,
+  // while only the first eligible view reads each physical plugin.
   const seenContainers = new Set<string>();
   const canonicalProjectPluginNames = new Set<string>();
   for (const container of containers) {
@@ -773,11 +872,10 @@ export async function discoverAgentPlugins(
             imports === null || (imports?.hasUnidentifiedEntries && !imports.byName.has(entryName))
               ? { skills: [], mcpServers: [] }
               : imports?.byName.get(entryName);
-          plugins.push(plugin);
         }
       }
       if (plugin)
-        mcpPlugins.push({ ...plugin, containerPath: container.path, scope: container.scope });
+        plugins.push({ ...plugin, containerPath: container.path, scope: container.scope });
     }
   }
 
@@ -788,17 +886,19 @@ export async function discoverAgentPlugins(
   // those containers' results rather than hand callers plugin content that
   // may already be rolled back.
   const overlapped = new Set(await gateSession.confirm());
-  for (const [canonicalPath, { container, paths }] of groups) {
+  await revalidateOwners();
+  for (const [canonicalPath, { container, paths, registryPath, blocked }] of groups) {
+    const lostOwnership =
+      blocked === true ||
+      (!unownedSuppressedBeforeScan && unresolvedOwner && registryPath === undefined);
     if (
-      ![...paths].some((candidate) => overlapped.has(candidate)) ||
+      !snapshots.has(canonicalPath) ||
+      (!lostOwnership && ![...paths].some((candidate) => overlapped.has(candidate))) ||
       [...paths].some((candidate) => suppressedContainers.has(candidate))
     ) {
       continue;
     }
     plugins = plugins.filter(
-      (plugin) => canonicalPaths.get(plugin.containerPath) !== canonicalPath
-    );
-    mcpPlugins = mcpPlugins.filter(
       (plugin) => canonicalPaths.get(plugin.containerPath) !== canonicalPath
     );
     diagnostics = diagnostics.filter(
@@ -809,11 +909,12 @@ export async function discoverAgentPlugins(
       path: container.path,
       scope: container.scope,
       severity: "warning",
-      message:
-        "Managed plugin container skipped: a plugin install/update/uninstall overlapped this scan; its plugins are unavailable until the next scan.",
+      message: lostOwnership
+        ? "Plugin container skipped: managed registry ownership changed during this scan."
+        : "Managed plugin container skipped: a plugin install/update/uninstall overlapped this scan; its plugins are unavailable until the next scan.",
     });
     suppressedContainers.add(container.path);
   }
 
-  return { plugins, mcpPlugins, diagnostics };
+  return { plugins, diagnostics };
 }

@@ -2,7 +2,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 
 import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
 import { SkillNameSchema } from "@/common/orpc/schemas";
@@ -1443,6 +1443,60 @@ describe("agentSkillsService agent plugins", () => {
       ).rejects.toThrow("not found");
     }
   );
+
+  test("project-only skill scans cannot lose ownership when the configured home retargets", async () => {
+    using tmp = new DisposableTempDir("plugin-skill-owner-association");
+    const homeA = path.join(tmp.path, "A");
+    const homeB = path.join(tmp.path, "B");
+    const configured = path.join(tmp.path, "configured");
+    const owner = path.join(configured, "plugins");
+    for (const home of [homeA, homeB]) {
+      await writePlugin(path.join(home, "plugins"), "managed", [
+        { name: "blocked", description: "not imported" },
+      ]);
+      await fs.writeFile(
+        path.join(home, "plugins.json"),
+        JSON.stringify({
+          plugins: [createTestPluginInstallEntry("managed", { skills: [], mcpServers: [] })],
+        })
+      );
+    }
+    await fs.symlink(homeA, configured, "dir");
+    const runtime = new LocalRuntime(tmp.path);
+    const options = {
+      roots: {
+        projectRoot: "",
+        universalRoot: "",
+        globalRoot: path.join(configured, "skills"),
+        projectPluginRoots: [owner],
+        globalPluginRoots: [],
+      },
+    };
+    const realpath = fs.realpath;
+    const intercepted = spyOn(fs, "realpath").mockReturnValueOnce(
+      (async () => {
+        const canonical = await realpath(owner);
+        await fs.unlink(configured);
+        await fs.symlink(homeB, configured, "dir");
+        return canonical;
+      })()
+    );
+    try {
+      const raced = await discoverAgentSkills(runtime, tmp.path, options);
+      expect(intercepted.mock.calls[0][0]).toBe(owner);
+      expect(raced.some((skill) => skill.name === "blocked")).toBe(false);
+    } finally {
+      intercepted.mockRestore();
+    }
+    expect(
+      (await discoverAgentSkills(runtime, tmp.path, options)).some(
+        (skill) => skill.name === "blocked"
+      )
+    ).toBe(false);
+    await expect(
+      readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("blocked"), options)
+    ).rejects.toThrow("not found");
+  });
 
   test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {
     using tmp = new DisposableTempDir("plugin-selected-skills");

@@ -108,10 +108,8 @@ describe("discoverAgentPlugins", () => {
         { path: owner, scope: "global", registryPath },
       ]);
       expect(result.diagnostics).toEqual([]);
-      expect(result.plugins).toHaveLength(1);
-      expect(result.plugins[0].importedComponents).toEqual(selection);
-      expect(result.mcpPlugins).toHaveLength(2);
-      for (const plugin of result.mcpPlugins ?? []) {
+      expect(result.plugins.map((plugin) => plugin.scope)).toEqual(["project", "global"]);
+      for (const plugin of result.plugins) {
         expect(plugin.importedComponents).toEqual(selection);
       }
     }
@@ -166,27 +164,38 @@ describe("discoverAgentPlugins", () => {
         { path: alias, scope: "project" as const },
         { path: owner, scope: "global" as const, registryPath },
       ];
+      const manifestPath = await fs.realpath(path.join(owner, "managed", "plugin.json"));
       const reads = spyOn(fs, "readFile");
       try {
         const { plugins } = await discoverAgentPlugins(containers);
-        expect(plugins).toHaveLength(1);
+        expect(plugins).toHaveLength(2);
         expect(plugins[0]).toMatchObject({
           scope: "project",
           containerPath: alias,
           rootPath: await fs.realpath(path.join(owner, "managed")),
           importedComponents: selection,
         });
+        expect(plugins[1]).toMatchObject({
+          scope: "global",
+          containerPath: owner,
+          importedComponents: selection,
+        });
+        expect(plugins[0].rootPath).toBe(plugins[1].rootPath);
         expect(reads.mock.calls.filter(([file]) => file === registryPath)).toHaveLength(1);
+        expect(reads.mock.calls.filter(([file]) => file === manifestPath)).toHaveLength(1);
       } finally {
         reads.mockRestore();
       }
       await fs.writeFile(registryPath, "{");
       const corrupt = await discoverAgentPlugins(containers);
-      expect(corrupt.plugins).toHaveLength(1);
-      expect(corrupt.plugins[0].importedComponents).toEqual({ skills: [], mcpServers: [] });
+      expect(corrupt.plugins).toHaveLength(2);
+      expect(corrupt.plugins.map((plugin) => plugin.importedComponents)).toEqual([
+        { skills: [], mcpServers: [] },
+        { skills: [], mcpServers: [] },
+      ]);
 
       const globalFirst = await discoverAgentPlugins([...containers].reverse());
-      expect(globalFirst.plugins).toHaveLength(1);
+      expect(globalFirst.plugins).toHaveLength(2);
       expect(globalFirst.plugins[0]).toMatchObject({ scope: "global", containerPath: owner });
     }
   );
@@ -216,7 +225,6 @@ describe("discoverAgentPlugins", () => {
           },
         ]);
         expect(result.plugins).toEqual([]);
-        expect(result.mcpPlugins).toEqual([]);
         expect(result.diagnostics).toHaveLength(1);
         expect(result.diagnostics[0]).toMatchObject({ path: alias, scope: "project" });
       } finally {
@@ -255,7 +263,6 @@ describe("discoverAgentPlugins", () => {
           },
         ]);
         expect(result.plugins).toEqual([]);
-        expect(result.mcpPlugins).toEqual([]);
         expect(result.diagnostics).toHaveLength(1);
         expect(result.diagnostics[0]).toMatchObject({ path: alias, scope: "project" });
       } finally {
@@ -299,7 +306,6 @@ describe("discoverAgentPlugins", () => {
           },
         ]);
         expect(result.plugins).toEqual([]);
-        expect(result.mcpPlugins).toEqual([]);
         expect(result.diagnostics).toHaveLength(1);
       } finally {
         setAgentPluginDiscoveryGate(journalDerivedDiscoveryGate);
@@ -329,9 +335,6 @@ describe("discoverAgentPlugins", () => {
         expect(result.plugins.map((plugin) => plugin.containerPath)).toEqual(
           phase === "initial" ? [legacy] : []
         );
-        expect(result.mcpPlugins?.map((plugin) => plugin.containerPath)).toEqual(
-          phase === "initial" ? [legacy] : []
-        );
       } finally {
         setAgentPluginDiscoveryGate(journalDerivedDiscoveryGate);
       }
@@ -358,6 +361,195 @@ describe("discoverAgentPlugins", () => {
     expect(result.plugins.map((plugin) => plugin.name)).toEqual(["managed"]);
     expect(result.diagnostics).toEqual([]);
   });
+
+  test("ownership-only descriptors restrict scanned aliases without adding logical views", async () => {
+    using tmp = new DisposableTempDir("plugin-discovery-ownership-only");
+    const home = path.join(tmp.path, "managed-home");
+    const owner = path.join(home, "plugins");
+    const alias = path.join(tmp.path, "project-alias");
+    await writePlugin(owner, "managed");
+    await fs.symlink(owner, alias, "dir");
+    const selection = { skills: [], mcpServers: [] };
+    const registryPath = path.join(home, "plugins.json");
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({ plugins: [createTestPluginInstallEntry("managed", selection)] })
+    );
+    const options = { managedHome: home };
+    const reads = spyOn(fs, "readdir");
+    try {
+      const empty = await discoverAgentPlugins([], options);
+      expect(empty.plugins).toEqual([]);
+      expect(reads.mock.calls.some(([input]) => input === owner)).toBe(false);
+      const scanned = await discoverAgentPlugins([{ path: alias, scope: "project" }], options);
+      expect(scanned.plugins).toHaveLength(1);
+      expect(scanned.plugins.map((plugin) => [plugin.containerPath, plugin.scope])).toEqual([
+        [alias, "project"],
+      ]);
+      expect(scanned.plugins[0].importedComponents).toEqual(selection);
+    } finally {
+      reads.mockRestore();
+    }
+  });
+
+  test.each(["gate", "post-scan", "home-only"])(
+    "fresh owner validation after %s retarget keeps pinned policies and rejects unowned aliases",
+    async (phase) => {
+      using tmp = new DisposableTempDir("plugin-discovery-fresh-owner");
+      const homeA = path.join(tmp.path, "A");
+      const homeB = path.join(tmp.path, "B");
+      const homeC = path.join(tmp.path, "C");
+      const configured = path.join(tmp.path, "configured");
+      const aliasB = path.join(tmp.path, "new-alias");
+      const denied = { skills: [], mcpServers: [] };
+      const healthy = { skills: ["allowed"], mcpServers: [] };
+      for (const [home, name, selection] of [
+        [homeA, "managed", denied],
+        [homeB, "unselected", denied],
+        [homeC, "healthy", healthy],
+      ] as const) {
+        await writePlugin(path.join(home, "plugins"), name);
+        await fs.writeFile(
+          path.join(home, "plugins.json"),
+          JSON.stringify({ plugins: [createTestPluginInstallEntry(name, selection)] })
+        );
+      }
+      await fs.symlink(homeA, configured, "dir");
+      await fs.symlink(path.join(homeB, "plugins"), aliasB, "dir");
+      const owner = path.join(configured, "plugins");
+      const retarget = async () => {
+        if (phase === "home-only") {
+          const sharedHome = path.join(tmp.path, "shared-home");
+          await fs.mkdir(sharedHome);
+          await fs.symlink(path.join(homeA, "plugins"), path.join(sharedHome, "plugins"), "dir");
+          await fs.unlink(configured);
+          await fs.symlink(sharedHome, configured, "dir");
+        } else {
+          await fs.unlink(configured);
+          await fs.symlink(homeB, configured, "dir");
+        }
+      };
+      setAgentPluginDiscoveryGate(async () => {
+        if (phase !== "post-scan") await retarget();
+        return {
+          suppressed: [],
+          confirm: async () => {
+            if (phase === "post-scan") await retarget();
+            return [];
+          },
+        };
+      });
+      try {
+        const result = await discoverAgentPlugins(
+          [
+            { path: owner, scope: "project" },
+            { path: aliasB, scope: "project" },
+            {
+              path: path.join(homeC, "plugins"),
+              scope: "global",
+              registryPath: path.join(homeC, "plugins.json"),
+            },
+          ],
+          {
+            managedHome: configured,
+          }
+        );
+        expect(result.plugins.map((plugin) => plugin.name)).toEqual(["managed", "healthy"]);
+        expect(result.plugins.map((plugin) => [plugin.name, plugin.scope])).toEqual([
+          ["managed", "project"],
+          ["healthy", "global"],
+        ]);
+        expect(result.plugins.map((plugin) => plugin.importedComponents)).toEqual([
+          denied,
+          healthy,
+        ]);
+      } finally {
+        setAgentPluginDiscoveryGate(journalDerivedDiscoveryGate);
+      }
+    }
+  );
+
+  test("losing the pinned registry home cannot turn its surviving target into import-all", async () => {
+    using tmp = new DisposableTempDir("plugin-discovery-lost-pinned-owner");
+    const physical = path.join(tmp.path, "storage", "version-A");
+    const home = path.join(tmp.path, "owner-home");
+    const owner = path.join(home, "plugins");
+    await writePlugin(physical, "managed");
+    await fs.mkdir(home);
+    await fs.symlink(physical, owner, "dir");
+    const registryPath = path.join(home, "plugins.json");
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({
+        plugins: [createTestPluginInstallEntry("managed", { skills: [], mcpServers: [] })],
+      })
+    );
+    setAgentPluginDiscoveryGate(async () => {
+      await fs.rm(home, { recursive: true });
+      return { suppressed: [], confirm: () => Promise.resolve([]) };
+    });
+    try {
+      const result = await discoverAgentPlugins([{ path: physical, scope: "project" }], {
+        managedHome: home,
+      });
+      expect(result.plugins).toEqual([]);
+    } finally {
+      setAgentPluginDiscoveryGate(journalDerivedDiscoveryGate);
+    }
+  });
+
+  test.each(["appeared", "removed", "unreadable"])(
+    "an owner that %s during setup cannot release an unmarked candidate",
+    async (change) => {
+      using tmp = new DisposableTempDir("plugin-discovery-owner-availability");
+      const configured = path.join(tmp.path, "configured");
+      const homeA = path.join(tmp.path, "A");
+      const homeB = path.join(tmp.path, "B");
+      await fs.mkdir(homeA);
+      await writePlugin(path.join(homeB, "plugins"), "managed");
+      await fs.writeFile(
+        path.join(homeB, "plugins.json"),
+        JSON.stringify({
+          plugins: [createTestPluginInstallEntry("managed", { skills: [], mcpServers: [] })],
+        })
+      );
+      await fs.symlink(change === "appeared" ? homeA : homeB, configured, "dir");
+      const unrelated = path.join(tmp.path, "unmarked", "plugins");
+      await writePlugin(unrelated, "unmarked");
+      const resolution = spyOn(fs, "realpath");
+      setAgentPluginDiscoveryGate(async () => {
+        if (change === "unreadable")
+          resolution.mockRejectedValueOnce(Object.assign(new Error("denied"), { code: "EACCES" }));
+        else {
+          await fs.unlink(configured);
+          if (change === "appeared") await fs.symlink(homeB, configured, "dir");
+        }
+        return { suppressed: [], confirm: () => Promise.resolve([]) };
+      });
+      try {
+        const result = await discoverAgentPlugins(
+          [
+            { path: path.join(homeB, "plugins"), scope: "project" },
+            { path: unrelated, scope: "project" },
+          ],
+          {
+            managedHome: configured,
+          }
+        );
+        if (change === "appeared") {
+          expect(result.plugins).toEqual([]);
+        } else {
+          // The coherent pre-existing owner retains its pinned restrictive policy.
+          expect(result.plugins.map((plugin) => plugin.importedComponents)).toEqual([
+            { skills: [], mcpServers: [] },
+          ]);
+        }
+      } finally {
+        resolution.mockRestore();
+        setAgentPluginDiscoveryGate(journalDerivedDiscoveryGate);
+      }
+    }
+  );
 
   test("an owner retarget cannot expose an unmarked target or suppress another known owner", async () => {
     using tmp = new DisposableTempDir("plugin-discovery-duplicate-retarget");
@@ -401,22 +593,20 @@ describe("discoverAgentPlugins", () => {
     try {
       const result = await discover();
       expect(result.plugins.map((plugin) => plugin.name)).toEqual(["healthy"]);
-      expect(result.mcpPlugins?.map((plugin) => plugin.name)).toEqual(["healthy"]);
       expect(result.plugins[0].importedComponents).toEqual(healthy);
-      expect(result.mcpPlugins?.[0].importedComponents).toEqual(healthy);
     } finally {
       resolution.mockRestore();
     }
     const stable = await discover();
-    expect(stable.plugins.map((plugin) => plugin.name)).toEqual(["managed", "healthy"]);
+    expect(stable.plugins.map((plugin) => plugin.name)).toEqual(["managed", "managed", "healthy"]);
     expect(stable.plugins[0].importedComponents).toEqual(denied);
-    expect(stable.mcpPlugins?.filter((plugin) => plugin.name === "managed")).toHaveLength(2);
-    for (const plugin of stable.mcpPlugins ?? []) {
+    expect(stable.plugins.filter((plugin) => plugin.name === "managed")).toHaveLength(2);
+    for (const plugin of stable.plugins) {
       expect(plugin.importedComponents).toEqual(plugin.name === "managed" ? denied : healthy);
     }
   });
 
-  test("MCP logical views retain original interleaved order while physical containers coalesce", async () => {
+  test("logical views retain original interleaved order while physical containers coalesce", async () => {
     using tmp = new DisposableTempDir("plugin-discovery-registration-order");
     const projectA = path.join(tmp.path, "project-A");
     const projectB = path.join(tmp.path, "project-B");
@@ -433,8 +623,8 @@ describe("discoverAgentPlugins", () => {
       { path: globalB, scope: "global" },
       { path: projectA, scope: "global" },
     ]);
-    expect(result.plugins).toHaveLength(2);
-    expect(result.mcpPlugins?.map((plugin) => [plugin.containerPath, plugin.scope])).toEqual([
+    expect(result.plugins).toHaveLength(4);
+    expect(result.plugins.map((plugin) => [plugin.containerPath, plugin.scope])).toEqual([
       [projectA, "project"],
       [projectB, "project"],
       [globalA, "global"],
@@ -459,7 +649,7 @@ describe("discoverAgentPlugins", () => {
       { path: global, scope: "global" },
     ]);
     expect(
-      result.mcpPlugins?.map((plugin) => [plugin.name, plugin.scope, plugin.containerPath])
+      result.plugins.map((plugin) => [plugin.name, plugin.scope, plugin.containerPath])
     ).toEqual([
       ["shared", "project", canonical],
       ["invalid", "global", global],
@@ -540,7 +730,7 @@ describe("discoverAgentPlugins", () => {
         const result = await discoverAgentPlugins(
           retarget === "project alias" ? [{ path: alias, scope: "project" }, owner] : [owner]
         );
-        expect(result.plugins).toHaveLength(1);
+        expect(result.plugins).toHaveLength(retarget === "project alias" ? 2 : 1);
         expect(result.plugins[0]).toMatchObject({
           rootPath: await fs.realpath(path.join(homeA, "plugins", "managed")),
           importedComponents: selection,
@@ -572,7 +762,7 @@ describe("discoverAgentPlugins", () => {
         },
       ]);
       expect(result.plugins).toEqual([]);
-      expect(result.diagnostics.some((entry) => entry.path === alias)).toBe(true);
+      expect(result.diagnostics.some((entry) => entry.severity === "error")).toBe(true);
     } finally {
       resolution.mockRestore();
     }
