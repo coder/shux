@@ -5559,6 +5559,8 @@ export class AgentSession {
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
+        contextBudgetRolloverAvailable:
+          this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
         onStepSettled: (step) => this.onContextBudgetStepSettled(step),
         requestAssemblySnapshot: snapshot,
       });
@@ -5665,10 +5667,12 @@ export class AgentSession {
       providersConfig,
       { openaiWireFormat: options.providerOptions?.openai?.wireFormat }
     );
-    if (maxTokens == null || maxTokens <= 0) {
+    // Without a known limit the budget cannot be evaluated, but an already pending or durably
+    // requested (new_context) rollover must still seal the window; the row then records the
+    // observed usage as its limit.
+    const knownLimit = maxTokens != null && maxTokens > 0;
+    if (!knownLimit)
       log.warn("Token budget has no known model context limit", { model: options.model });
-      return Ok({ prefix: [] });
-    }
     const lastAssistant = history.data.findLast(
       (row) => row.role === "assistant" && row.metadata?.contextUsage
     );
@@ -5713,18 +5717,26 @@ export class AgentSession {
       model: options.model,
       metadataModel: resolveModelForMetadata(options.model, providersConfig),
     };
+    const recordedLimit = knownLimit ? maxTokens : Math.max(1, contextTokens);
     const newRequestTokens = await estimateFreshRequestTokensForModel(
-      { userText, attachments, systemFloorTokens: 0, modelContextLimit: maxTokens },
+      { userText, attachments, systemFloorTokens: 0, modelContextLimit: recordedLimit },
       budgetModel
     );
-    const decision = evaluateStepBudget({
-      contextTokens: contextTokens + newRequestTokens,
-      outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
-      ...estimateLastStepToolResults(lastAssistant),
-      modelContextLimit: maxTokens,
-      threshold: this.compactionMonitor.getThreshold(),
-      warningEmitted: this.contextBudgetWarningClaimed,
-    });
+    const decision: StepBudgetEvaluation = knownLimit
+      ? evaluateStepBudget({
+          contextTokens: contextTokens + newRequestTokens,
+          outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
+          ...estimateLastStepToolResults(lastAssistant),
+          modelContextLimit: maxTokens,
+          threshold: this.compactionMonitor.getThreshold(),
+          warningEmitted: this.contextBudgetWarningClaimed,
+        })
+      : {
+          decision: "continue",
+          flushOpportunity: true,
+          projected: contextTokens + newRequestTokens,
+          hardCeiling: undefined,
+        };
     // The queued flush entry must be recognized before the rollover logic below, which
     // `pendingRollover` would otherwise pre-empt. Re-check the headroom and the tool gates
     // with on-send numbers; degrade to an ordinary continuation when any no longer holds.
@@ -5784,7 +5796,7 @@ export class AgentSession {
           prefix: [
             createContextBudgetWarning({
               contextTokens: decision.projected,
-              maxTokens,
+              maxTokens: recordedLimit,
               budgetTokens: this.pendingRollover.budgetTokens,
               memoryWritable: true,
               sessionHistoryAvailable: true,
@@ -5841,9 +5853,9 @@ export class AgentSession {
             previousWindowId: currentContextWindowId(history.data),
             flushOpportunity: decision.flushOpportunity,
             contextTokens: decision.projected,
-            maxTokens,
+            maxTokens: recordedLimit,
             budgetTokens: getContextBudgetRolloverPoint(
-              maxTokens,
+              recordedLimit,
               this.compactionMonitor.getThreshold()
             ),
           })
@@ -5903,9 +5915,9 @@ export class AgentSession {
         prefix: [
           createContextBudgetWarning({
             contextTokens: decision.projected,
-            maxTokens,
+            maxTokens: recordedLimit,
             budgetTokens: getContextBudgetRolloverPoint(
-              maxTokens,
+              recordedLimit,
               this.compactionMonitor.getThreshold()
             ),
             memoryWritable: this.contextBudgetMemoryWritable,
@@ -6019,6 +6031,7 @@ export class AgentSession {
     // Rollover metadata records the limit the window was measured against; an unknown limit is
     // recorded as the observed usage so the row stays valid for display and downgrade parsing.
     const recordedLimit = knownLimit ? maxTokens : Math.max(1, contextTokens);
+    // "block" only exists at threshold 100%, where requests are not offered and never honored.
     if (decision.decision === "block") return "block";
     if (context.contextBudgetFlushTurn === true) {
       if (this.compactionMonitor.getThreshold() >= 1) {
@@ -6049,6 +6062,7 @@ export class AgentSession {
       // reset that follows can actually be admitted (session_history available). A model that
       // asked for the reset itself has already had its chance to write notes.
       offerFlush =
+        !modelRequested &&
         decision.decision === "rollover" &&
         this.pendingRollover == null &&
         !this.contextBudgetFlushClaimed &&
@@ -6060,7 +6074,7 @@ export class AgentSession {
         type: "context-window-rollover",
         rolloverId: randomUUID(),
         reason: "mid-stream",
-        ...(decision.decision === "rollover" ? {} : { requestedBy: "model" as const }),
+        ...(modelRequested ? { requestedBy: "model" as const } : {}),
         previousWindowId: currentContextWindowId(history.data),
         flushOpportunity: decision.flushOpportunity,
         contextTokens: decision.projected,
@@ -7451,6 +7465,8 @@ export class AgentSession {
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
+        contextBudgetRolloverAvailable:
+          this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
         requestAssemblySnapshot: requestAssemblySnapshot ?? resumedFlushSnapshot,
         // A flush turn stays bounded to one step even when token-budget mode was disabled
         // after its trigger was persisted (the callback then only stops it).

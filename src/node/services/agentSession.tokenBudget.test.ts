@@ -1158,6 +1158,37 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(
       await h.requests[0].onStepSettled?.(step(20_000, { model: "custom:unknown-limit-model" }))
     ).toBe("continue");
+    // The queued continuation seals the window even though no limit is known.
+    await h.finishAndDispatch();
+    const [reset] = rolloverRows(await allRows(h));
+    expect(reset?.metadata?.muxMetadata).toMatchObject({ requestedBy: "model" });
+    expect(h.requests[1].messages.some((row) => row.id === reset.id)).toBe(true);
+  });
+
+  test("an explicit request wins over the flush offer and over a hard block", async () => {
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    // Threshold crossed AND requested: seal directly (no flush pair), attributed to the model.
+    expect(await h.requests[0].onStepSettled?.(step(110_000, { newContextRequested: true }))).toBe(
+      "rollover"
+    );
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    await h.finishAndDispatch();
+    expect(rolloverRows(await allRows(h))[0]?.metadata?.muxMetadata).toMatchObject({
+      reason: "mid-stream",
+      requestedBy: "model",
+    });
+    // A hard block (only possible with automatic rollover disabled) stays authoritative: the
+    // tool is not offered there, and a stray request cannot bypass it.
+    const blocked = await setup();
+    blocked.session.setAutoCompactionThreshold(1);
+    expect((await blocked.session.sendMessage("Work", options)).success).toBe(true);
+    expect(
+      await blocked.requests[0].onStepSettled?.(
+        step(120_000, { toolResultChars: 2_000_000, newContextRequested: true })
+      )
+    ).toBe("block");
   });
 
   test("a persisted receipt is not honored while the policy disables session_history", async () => {

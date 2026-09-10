@@ -296,6 +296,12 @@ export interface StreamMessageOptions {
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   onStepSettled?: OnStepSettled;
+  /**
+   * Whether a token-budget rollover could actually be sealed for this request (mode active and
+   * automatic rollover threshold below 100%). Gates the new_context tool so a request that
+   * nothing could honor is never persisted as a scheduled receipt.
+   */
+  contextBudgetRolloverAvailable?: boolean;
   /** Internal rollover admission contract; never serialized into send options/history. */
   requestAssemblySnapshot?: RequestAssemblySnapshot;
   muxMetadata?: MuxMessageMetadata;
@@ -841,6 +847,7 @@ export class TurnRequestBuilder {
       disableWorkspaceAgents,
       hasQueuedMessages,
       onStepSettled,
+      contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
       muxMetadata,
@@ -2276,6 +2283,7 @@ export class TurnRequestBuilder {
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess,
       ...(contextBudgetFlushTurn ? { memoryWritePath: CONTEXT_NOTES_MEMORY_PATH } : {}),
+      contextBudgetRolloverAvailable,
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {
         ...experiments,

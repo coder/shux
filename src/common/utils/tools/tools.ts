@@ -319,6 +319,12 @@ export interface ToolConfiguration {
     /** agent-plugins: discover Agent Plugins skills from .xum/plugins, .agents/plugins and their global counterparts (read-only). */
     agentPlugins?: boolean;
   };
+  /**
+   * Stream-time knowledge of whether a token-budget rollover can be sealed (mode active,
+   * automatic rollover enabled). Undefined for non-stream tool builds, which fall back to the
+   * experiment gates alone.
+   */
+  contextBudgetRolloverAvailable?: boolean;
   /** Available sub-agents for the task tool description (dynamic context) */
   availableSubagents?: AgentDefinitionDescriptor[];
   /** Available skills for the agent_skill_read tool description (dynamic context) */
@@ -834,8 +840,10 @@ export async function getToolsForModel(
       ? {
           session_history: wrap(createSessionHistoryTool(config)),
           // Continuous compaction and PTC+RLM take precedence over token-budget rollover
-          // (AgentSession.isTokenBudgetActive); a request nothing could honor is not offered.
-          ...(config.experiments.continuousCompaction !== true &&
+          // (AgentSession.isTokenBudgetActive), and a 100% threshold disables sealing; a
+          // request nothing could honor is not offered, so no stale receipt can be persisted.
+          ...(config.contextBudgetRolloverAvailable !== false &&
+          config.experiments.continuousCompaction !== true &&
           !(config.experiments.programmaticToolCalling === true && config.experiments.rlm === true)
             ? { new_context: wrap(createNewContextTool(config)) }
             : {}),
