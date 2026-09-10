@@ -6,6 +6,7 @@ import {
   currentContextWindowId,
   estimateLastStepToolResults,
   hasRolloverEligibleMessages,
+  hasUnconsumedNewContextRequest,
   type ContextWindowRollover,
 } from "./contextWindowRollover";
 
@@ -19,6 +20,37 @@ const rollover: ContextWindowRollover = {
   maxTokens: 128_000,
 };
 
+describe("context budget warnings", () => {
+  test.each([
+    [90_000, 94, false],
+    [100_000, 104, false],
+    [110_000, 115, true],
+  ] as const)(
+    "reports %d tokens against the rollover budget, even when already exceeded",
+    (contextTokens, percent, final) => {
+      const warning = createContextBudgetWarning({
+        contextTokens,
+        maxTokens: 128_000,
+        budgetTokens: 96_000,
+        final,
+        memoryWritable: true,
+        sessionHistoryAvailable: true,
+      });
+      const text = warning.parts
+        .flatMap((part) => (part.type === "text" ? [part.text] : []))
+        .join("\n");
+      expect(text).toContain(`${percent}%`);
+      expect(text).toContain("of 96000");
+      expect(text).not.toContain("of 128000");
+      expect(warning.metadata?.muxMetadata).toMatchObject({
+        contextTokens,
+        maxTokens: 128_000,
+        budgetTokens: 96_000,
+      });
+    }
+  );
+});
+
 describe("context window rollover recovery", () => {
   test("internal rows alone cannot make an already-reset window eligible for another rollover", () => {
     const old = createMuxMessage("old", "user", "Previous window work");
@@ -26,9 +58,22 @@ describe("context window rollover recovery", () => {
     expect(hasRolloverEligibleMessages([old])).toBe(true);
     expect(hasRolloverEligibleMessages([old, boundary])).toBe(false);
     expect(hasRolloverEligibleMessages([old, boundary, leadIn])).toBe(false);
-    const warning = createContextBudgetWarning(80_000, 128_000, true, true);
+    const warning = createContextBudgetWarning({
+      contextTokens: 80_000,
+      maxTokens: 128_000,
+      budgetTokens: 96_000,
+      memoryWritable: true,
+      sessionHistoryAvailable: true,
+    });
     expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning])).toBe(false);
-    const finalFlush = createContextBudgetWarning(110_000, 128_000, true, true, true);
+    const finalFlush = createContextBudgetWarning({
+      contextTokens: 110_000,
+      maxTokens: 128_000,
+      budgetTokens: 96_000,
+      memoryWritable: true,
+      sessionHistoryAvailable: true,
+      final: true,
+    });
     expect(warning.metadata?.muxMetadata).not.toHaveProperty("final");
     expect(finalFlush.metadata?.muxMetadata).toMatchObject({
       type: "context-budget-warning",
@@ -55,7 +100,13 @@ describe("context window rollover recovery", () => {
       currentContextWindowId([
         first,
         second,
-        createContextBudgetWarning(80_000, 128_000, true, true),
+        createContextBudgetWarning({
+          contextTokens: 80_000,
+          maxTokens: 128_000,
+          budgetTokens: 96_000,
+          memoryWritable: true,
+          sessionHistoryAvailable: true,
+        }),
       ])
     ).toBe("w:12");
     expect(currentContextWindowId([first])).not.toBe(currentContextWindowId([second]));
@@ -154,5 +205,37 @@ describe("context window rollover recovery", () => {
       finalStep.toolResultChars
     );
     expect(estimateLastStepToolResults(undefined)).toEqual({ toolResultChars: 0, imageParts: 0 });
+  });
+});
+
+describe("model-requested rollover receipts", () => {
+  const request = (output: unknown, metadata?: Record<string, unknown>) =>
+    createMuxMessage("assistant", "assistant", "", metadata, [
+      {
+        type: "dynamic-tool",
+        toolCallId: "nc",
+        toolName: "new_context",
+        state: "output-available",
+        input: {},
+        output,
+      },
+    ]);
+  const user = createMuxMessage("user", "user", "Continue");
+
+  test("only a completed assistant row with a successful new_context result is a receipt", () => {
+    expect(hasUnconsumedNewContextRequest([user, request({ success: true })])).toBe(true);
+    // Interrupted (partial) rows cancel the request durably.
+    expect(
+      hasUnconsumedNewContextRequest([user, request({ success: true }, { partial: true })])
+    ).toBe(false);
+    expect(hasUnconsumedNewContextRequest([user, request({ success: false })])).toBe(false);
+    // Only the LAST assistant row counts: a later completed answer without the tool supersedes.
+    expect(
+      hasUnconsumedNewContextRequest([
+        request({ success: true }),
+        createMuxMessage("later", "assistant", "kept working"),
+      ])
+    ).toBe(false);
+    expect(hasUnconsumedNewContextRequest([user])).toBe(false);
   });
 });

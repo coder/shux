@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import type { LanguageModelV4, LanguageModelV4CallOptions } from "@ai-sdk/provider";
 import type { XaiProviderOptions } from "@ai-sdk/xai";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
@@ -24,7 +25,8 @@ import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
 import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
+import { ServiceTierSchema, type XAIServiceTier } from "@/common/config/schemas/providersConfig";
+import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
@@ -231,27 +233,37 @@ export function resolveOpenAIWebSocketResponsesUrl(baseURL: unknown): string | u
  * hit the upstream store=true default. Explicit request-level store wins.
  */
 function injectGrokStoreDefault(
+  model: Parameters<typeof injectProviderOptionsDefaults>[0],
+  configuredStore: unknown
+): void {
+  injectProviderOptionsDefaults(model, "xai", {
+    store: typeof configuredStore === "boolean" ? configuredStore : false,
+  });
+}
+
+/** Keep creation-time defaults on the model for callers that omit providerOptions. */
+function injectProviderOptionsDefaults(
   model: {
     doStream: (options: never) => unknown;
     doGenerate: (options: never) => unknown;
   },
-  configuredStore: unknown
+  namespace: string,
+  defaults: Record<string, unknown>
 ): void {
-  const defaultStore = typeof configuredStore === "boolean" ? configuredStore : false;
   interface CallOptions {
     providerOptions?: Record<string, unknown>;
   }
-  const injectStoreFlag = <T extends CallOptions>(options: T): T => {
-    const xaiOpts = (options.providerOptions?.xai as Record<string, unknown> | undefined) ?? {};
-    return {
-      ...options,
-      providerOptions: {
-        ...options.providerOptions,
-        // Request-level store wins; otherwise force the ZDR-safe default.
-        xai: { store: defaultStore, ...xaiOpts },
+  const injectDefaults = <T extends CallOptions>(options: T): T => ({
+    ...options,
+    providerOptions: {
+      ...options.providerOptions,
+      // Request-level values win over the model's pinned defaults.
+      [namespace]: {
+        ...defaults,
+        ...(options.providerOptions?.[namespace] as Record<string, unknown> | undefined),
       },
-    };
-  };
+    },
+  });
 
   // LanguageModelV4 method types are invariant on options; cast through a local
   // structural type so we can wrap doStream/doGenerate without dragging AI SDK
@@ -262,8 +274,8 @@ function injectGrokStoreDefault(
   };
   const originalDoStream = mutableModel.doStream.bind(mutableModel);
   const originalDoGenerate = mutableModel.doGenerate.bind(mutableModel);
-  mutableModel.doStream = (options) => originalDoStream(injectStoreFlag(options));
-  mutableModel.doGenerate = (options) => originalDoGenerate(injectStoreFlag(options));
+  mutableModel.doStream = (options) => originalDoStream(injectDefaults(options));
+  mutableModel.doGenerate = (options) => originalDoGenerate(injectDefaults(options));
 }
 
 /**
@@ -274,6 +286,10 @@ export function wrapFetchWithXAIServiceTier(
   baseFetch: typeof fetch,
   serviceTier?: XAIServiceTier
 ): typeof fetch {
+  return wrapFetchWithServiceTier(baseFetch, serviceTier);
+}
+
+function wrapFetchWithServiceTier(baseFetch: typeof fetch, serviceTier?: string): typeof fetch {
   if (serviceTier == null) {
     return baseFetch;
   }
@@ -301,6 +317,48 @@ export function wrapFetchWithXAIServiceTier(
   };
 
   return Object.assign(tieredFetch, baseFetch) as typeof fetch;
+}
+
+/** Preserve tiers for OpenAI-wire aliases without rewriting their routing identity. */
+function createOpenAIModelWithServiceTier(
+  createModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
+  baseFetch: typeof fetch,
+  serviceTierAvailable: boolean
+): LanguageModelV4 {
+  const model = createModel(baseFetch);
+  if (!serviceTierAvailable) return model;
+
+  const createTieredCall = (params: LanguageModelV4CallOptions) => {
+    const tier = ServiceTierSchema.optional().parse(params.providerOptions?.openai?.serviceTier);
+    if (tier == null) return undefined;
+    // The SDK drops tiers for opaque gateway aliases. Preserve the raw
+    // model/endpoint and serialize the tier after SDK capability checks.
+    // Per-call adapters keep concurrent requests' overrides independent.
+    return {
+      model: createModel(wrapFetchWithServiceTier(baseFetch, tier)),
+      params: {
+        ...params,
+        providerOptions: {
+          ...params.providerOptions,
+          openai: { ...params.providerOptions?.openai, serviceTier: undefined },
+        },
+      },
+    };
+  };
+  return wrapLanguageModel({
+    model,
+    middleware: {
+      specificationVersion: "v4",
+      wrapGenerate: ({ params, doGenerate }) => {
+        const call = createTieredCall(params);
+        return call ? call.model.doGenerate(call.params) : doGenerate();
+      },
+      wrapStream: ({ params, doStream }) => {
+        const call = createTieredCall(params);
+        return call ? call.model.doStream(call.params) : doStream();
+      },
+    },
+  });
 }
 
 type FetchWithBunExtensions = typeof fetch & {
@@ -1305,6 +1363,7 @@ export class ProviderModelFactory {
   ): Effect.Effect<Result<LanguageModel, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
+    let serviceTierDefault: { namespace: string; option: string; value: string } | undefined;
     // The explicit annotation restores the contextual typing the old async
     // signature provided, so the wire-error literals below stay narrowed.
     const pipeline: Effect.Effect<Result<LanguageModel, SendMessageError>> = Effect.gen(
@@ -1417,6 +1476,31 @@ export class ProviderModelFactory {
         const effectiveAnthropicCacheTtl =
           muxProviderOptions?.anthropic?.cacheTtl ?? configAnthropicCacheTtl;
 
+        // Fast is one OpenAI preference across direct and forwarding gateways.
+        // Resolve it after routing, from the model's config snapshot, so pinned
+        // requests cannot change tier midway through creation or on fallback.
+        const serviceTier = ServiceTierSchema.safeParse(
+          muxProviderOptions?.openai?.serviceTier ?? providersConfig.openai?.serviceTier
+        );
+        const serviceTierAvailable = openaiServiceTierAvailable(modelString, {
+          providersConfig: self.providerService.getConfig(providersConfig),
+          openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+        });
+        if (serviceTier.success && serviceTierAvailable) {
+          serviceTierDefault = {
+            namespace: "openai",
+            option: "serviceTier",
+            value: serviceTier.data,
+          };
+          muxProviderOptions ??= {};
+          muxProviderOptions.openai = {
+            ...muxProviderOptions.openai,
+            serviceTier: serviceTier.data,
+          };
+        } else if (muxProviderOptions?.openai) {
+          delete muxProviderOptions.openai.serviceTier;
+        }
+
         // OpenAI-specific: merge global store setting into muxProviderOptions.
         // Coder instances classify by the instance's exact TYPE ("openai" =
         // the real OpenAI Responses upstream, where ZDR store applies): a
@@ -1499,13 +1583,22 @@ export class ProviderModelFactory {
               const { createOpenAI } = yield* Effect.promise(async () =>
                 PROVIDER_REGISTRY.openai()
               );
-              const provider = createOpenAI({
-                baseURL: normalizeOpenAICompatibleBaseURL(credentials.baseURL),
-                apiKey: isolatedApiKey,
-                headers: { ...muxAttributionHeaders },
-                fetch: customAdapterFetch,
-              });
-              return Ok(provider.responses(modelId));
+              const createCustomModel = (fetch: typeof customAdapterFetch) => {
+                const provider = createOpenAI({
+                  baseURL: normalizeOpenAICompatibleBaseURL(credentials.baseURL),
+                  apiKey: isolatedApiKey,
+                  headers: { ...muxAttributionHeaders },
+                  fetch,
+                });
+                return provider.responses(modelId);
+              };
+              return Ok(
+                createOpenAIModelWithServiceTier(
+                  createCustomModel,
+                  customAdapterFetch,
+                  serviceTierAvailable
+                )
+              );
             }
             case "anthropic-messages": {
               const { createAnthropic } = yield* Effect.promise(async () =>
@@ -1666,25 +1759,14 @@ export class ProviderModelFactory {
             ...(creds.organization && { organization: creds.organization }),
           };
 
-          // Extract serviceTier and wireFormat from config to pass through to buildProviderOptions.
-          // Initialize muxProviderOptions if absent so config values aren't silently dropped
-          // when call sites omit options (e.g. TaskService, WorkspaceTitleGenerator).
-          const configServiceTier = providerConfig.serviceTier as string | undefined;
-          const configWireFormat = providerConfig.wireFormat as string | undefined;
-          if (configServiceTier || configWireFormat) {
+          // The stored direct wire format wins over request-level preferences.
+          const configWireFormat = providerConfig.wireFormat;
+          if (configWireFormat === "responses" || configWireFormat === "chatCompletions") {
             muxProviderOptions ??= {};
-            if (configServiceTier && muxProviderOptions.openai?.serviceTier == null) {
-              muxProviderOptions.openai = {
-                ...muxProviderOptions.openai,
-                serviceTier: configServiceTier as ServiceTier,
-              };
-            }
-            if (configWireFormat === "responses" || configWireFormat === "chatCompletions") {
-              muxProviderOptions.openai = {
-                ...muxProviderOptions.openai,
-                wireFormat: configWireFormat,
-              };
-            }
+            muxProviderOptions.openai = {
+              ...muxProviderOptions.openai,
+              wireFormat: configWireFormat,
+            };
           }
 
           // Resolve effective wireFormat once — used by both fetch wrapper and model selection.
@@ -1814,18 +1896,26 @@ export class ProviderModelFactory {
 
           // Lazy-load OpenAI provider to reduce startup time
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
-          const provider = createOpenAI({
-            ...configWithCreds,
-            // Cast is safe: our fetch implementation is compatible with the SDK's fetch type.
-            // The preconnect method is optional in our implementation but required by the SDK type.
-            fetch: webSocketTransport.fetch,
-          });
-          // OpenAI reasoning state is preserved via explicit history, so no extra
-          // middleware is needed beyond the provider's standard Responses handling.
-          const model =
-            effectiveWireFormat === "chatCompletions"
+          const createNativeModel = (fetch: typeof webSocketTransport.fetch) => {
+            const provider = createOpenAI({ ...configWithCreds, fetch });
+            return effectiveWireFormat === "chatCompletions"
               ? provider.chat(modelId)
               : provider.responses(modelId);
+          };
+          // Reuse the same transport across per-call adapters. Inject tiers before
+          // its HTTP/WebSocket dispatch, and keep OAuth's normalization unchanged.
+          // Mappings are metadata, not authority over the raw/proxy model's tier support.
+          // Explicit mappings forward the requested tier for upstream validation;
+          // only unmapped native IDs retain the SDK's name-based restrictions.
+          const isMappedAlias =
+            resolveModelForMetadata(fullModelId, providersConfig) !== fullModelId;
+          const model = shouldRouteThroughCodexOauth
+            ? createNativeModel(webSocketTransport.fetch)
+            : createOpenAIModelWithServiceTier(
+                createNativeModel,
+                webSocketTransport.fetch,
+                serviceTierAvailable && isMappedAlias
+              );
           if (webSocketTransport.active) {
             attachLanguageModelCleanup(model, webSocketTransport.close);
           }
@@ -1954,6 +2044,10 @@ export class ProviderModelFactory {
 
         // Handle OpenRouter provider
         if (providerName === "openrouter") {
+          if (serviceTierDefault) {
+            serviceTierDefault.namespace = "openrouter";
+            serviceTierDefault.option = "service_tier";
+          }
           // Resolve credentials from config + env (single source of truth)
           const creds = resolveProviderCredentials("openrouter", providerConfig);
           if (!creds.isConfigured) {
@@ -2243,17 +2337,9 @@ export class ProviderModelFactory {
             headers.set("Authorization", `Bearer ${resolvedApiKey ?? ""}`);
             headers.set("Openai-Intent", "conversation-edits");
 
-            const urlString = getFetchInputUrl(input);
-
-            const method = (
-              init?.method ?? (input instanceof Request ? input.method : "GET")
-            ).toUpperCase();
-            // normalizeCodexResponsesBody() applies only to the stock OpenAI provider's
-            // /v1/responses path (used by Codex OAuth). The custom CopilotResponsesLanguageModel
-            // posts directly to /responses, intentionally bypassing this normalization.
-            const isResponsesRequest = /\/v1\/responses(\?|$)/.test(urlString);
-
-            let nextInit: Parameters<typeof fetch>[1] = { ...init, headers };
+            // Copilot's custom Responses serializer already builds its request.
+            // Codex OAuth pruning would strip Fast, including at custom /v1 URLs.
+            const nextInit: Parameters<typeof fetch>[1] = { ...init, headers };
 
             // Resolve request body text for billing classification.
             // Standard AI SDK path: init.body is a JSON string.
@@ -2267,20 +2353,6 @@ export class ProviderModelFactory {
                 originalBodyText = await input.clone().text();
               } catch {
                 // Fall back to undefined so classifyCopilotInitiator defaults to "user".
-              }
-            }
-
-            if (typeof originalBodyText === "string" && method === "POST" && isResponsesRequest) {
-              try {
-                const normalizedBody = normalizeCodexResponsesBody(originalBodyText);
-                headers.delete("content-length");
-                nextInit = {
-                  ...nextInit,
-                  headers,
-                  body: normalizedBody,
-                };
-              } catch {
-                // If body isn't JSON, keep the original request body for Copilot.
               }
             }
 
@@ -2302,6 +2374,9 @@ export class ProviderModelFactory {
           log.debug(`GitHub Copilot model ${modelId} using ${apiMode} API mode`);
 
           if (apiMode === "responses") {
+            if (serviceTierDefault) {
+              serviceTierDefault.namespace = "github-copilot";
+            }
             // Copilot Codex models use a custom Responses language model
             // that handles Copilot's SSE stream quirks (rotating item_id,
             // text arriving via output_text.delta rather than inline).
@@ -2319,15 +2394,33 @@ export class ProviderModelFactory {
             "github-copilot"
           );
           const provider = createOpenAI({
-            // Keep the SDK provider name aligned with buildProviderOptions() so
-            // Copilot-routed OpenAI reasoning settings land under the namespace
-            // that @ai-sdk/openai actually reads.
+            // Preserve Copilot's provider identity for usage and diagnostics.
             name: providerOptionsNamespace,
             baseURL,
             apiKey: "copilot", // placeholder, actual auth via custom fetch
             fetch: providerFetch,
           });
-          return Ok(provider.chat(outboundCopilotModelId));
+          return Ok(
+            wrapLanguageModel({
+              model: provider.chat(outboundCopilotModelId),
+              middleware: {
+                specificationVersion: "v4",
+                // OpenAI's Chat parser reads "openai" even on a named provider.
+                // Keep Copilot's public namespace, translating only at the adapter.
+                transformParams: ({ params }) =>
+                  Promise.resolve({
+                    ...params,
+                    providerOptions: {
+                      ...params.providerOptions,
+                      openai: {
+                        ...params.providerOptions?.openai,
+                        ...params.providerOptions?.[providerOptionsNamespace],
+                      },
+                    },
+                  }),
+              },
+            })
+          );
         }
 
         // Coder AI Bridge: per-origin endpoints under <deployment>/api/v2/aibridge,
@@ -2478,20 +2571,20 @@ export class ProviderModelFactory {
           }
 
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
-          const provider = createOpenAI({
-            apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
-            baseURL: gatewayBaseUrl,
-            fetch: coderFetch,
-          });
-          // The gateway intercepts both /responses and /chat/completions. Real
-          // OpenAI upstreams get the Responses API to match Xum's default OpenAI
-          // wire format; the other OpenAI-wire provider types front
-          // OpenAI-compatible upstreams where only /chat/completions can be
-          // assumed (see coderGatewayWireProtocol).
-          return Ok(
-            wire === "openai-responses"
+          const createCoderModel = (fetch: typeof coderFetch) => {
+            const provider = createOpenAI({
+              apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
+              baseURL: gatewayBaseUrl,
+              fetch,
+            });
+            // The gateway intercepts both /responses and /chat/completions. Real
+            // OpenAI upstreams use Responses; compatible upstreams use Chat.
+            return wire === "openai-responses"
               ? provider.responses(originModelId)
-              : provider.chat(originModelId)
+              : provider.chat(originModelId);
+          };
+          return Ok(
+            createOpenAIModelWithServiceTier(createCoderModel, coderFetch, serviceTierAvailable)
           );
         }
 
@@ -2546,6 +2639,16 @@ export class ProviderModelFactory {
       }
     );
     return pipeline.pipe(
+      Effect.map((result) => {
+        if (result.success && serviceTierDefault && typeof result.data !== "string") {
+          // Headless callers may never rebuild providerOptions. Pin the validated
+          // creation-time tier on both model methods, without rereading config.
+          injectProviderOptionsDefaults(result.data, serviceTierDefault.namespace, {
+            [serviceTierDefault.option]: serviceTierDefault.value,
+          });
+        }
+        return result;
+      }),
       // Parity with the pre-Effect whole-pipeline try/catch: any throw —
       // synchronous (SDK constructors, URL parsing) or a rejected provider
       // module import — folds into the same "unknown" wire error. Defects

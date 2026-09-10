@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { describe, it, expect } from "bun:test";
+import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
 import { AgentSkillReadFileToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { createAgentSkillReadFileTool } from "./agent_skill_read_file";
 import {
@@ -52,6 +53,131 @@ function createRemoteRuntimeConfig(tempDirPath: string) {
 }
 
 describe("agent_skill_read_file", () => {
+  it("enforces managed skill imports on referenced-file reads and preserves same-name source fallback", async () => {
+    using tmp = new TestTempDir("plugin-read-file-imports");
+    const container = path.join(tmp.path, "plugins");
+    for (const [plugin, names] of [
+      ["a-managed", ["allowed", "blocked", "shared"]],
+      ["b-unmanaged", ["shared"]],
+    ] as const) {
+      const root = path.join(container, plugin);
+      await fs.mkdir(root, { recursive: true });
+      await fs.writeFile(
+        path.join(root, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: plugin,
+        })
+      );
+      for (const name of names) {
+        const dir = path.join(root, "skills", name);
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(
+          path.join(dir, "SKILL.md"),
+          `---\nname: ${name}\ndescription: fixture\n---\nBody\n`
+        );
+        await fs.writeFile(path.join(dir, "data.txt"), plugin);
+      }
+    }
+    await fs.writeFile(
+      path.join(tmp.path, "plugins.json"),
+      JSON.stringify({
+        plugins: [
+          createTestPluginInstallEntry("a-managed", { skills: ["allowed"], mcpServers: [] }),
+        ],
+      })
+    );
+    const tool = createAgentSkillReadFileTool({
+      ...createTestToolConfig(tmp.path, {
+        workspaceId: GLOBAL_WORKSPACE_ID,
+        xumScope: { type: "global", xumHome: tmp.path },
+      }),
+      experiments: { agentPlugins: true },
+    });
+    expect(await executeReadFile(tool, { name: "blocked", filePath: "data.txt" })).toMatchObject({
+      success: false,
+    });
+    expect(
+      await executeReadFile(tool, { name: "allowed", filePath: "../blocked/data.txt" })
+    ).toMatchObject({ success: false });
+    expect(await executeReadFile(tool, { name: "allowed", filePath: "data.txt" })).toMatchObject({
+      success: true,
+      content: "1\ta-managed",
+    });
+    expect(await executeReadFile(tool, { name: "shared", filePath: "data.txt" })).toMatchObject({
+      success: true,
+      content: "1\tb-unmanaged",
+    });
+  });
+
+  it.each([
+    [".xum", false],
+    [".mux", false],
+    [".xum", true],
+    [".mux", true],
+  ] as const)(
+    "overlapping %s project roots enforce managed sibling-file read imports (aliased home: %s)",
+    async (metadataDir, aliasHome) => {
+      using home = new TestTempDir("plugin-read-file-overlap");
+      const physicalHome = path.join(home.path, metadataDir);
+      const xumHome = aliasHome ? path.join(home.path, "configured-home") : physicalHome;
+      await fs.mkdir(physicalHome, { recursive: true });
+      if (aliasHome) await fs.symlink(physicalHome, xumHome, "dir");
+      const pluginRoot = path.join(xumHome, "plugins", "managed");
+      await fs.mkdir(pluginRoot, { recursive: true });
+      await fs.writeFile(
+        path.join(pluginRoot, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: "managed",
+        })
+      );
+      for (const name of ["allowed", "blocked"]) {
+        const skillDir = path.join(pluginRoot, "skills", name);
+        await fs.mkdir(skillDir, { recursive: true });
+        await fs.writeFile(
+          path.join(skillDir, "SKILL.md"),
+          `---\nname: ${name}\ndescription: fixture\n---\nBody\n`
+        );
+        await fs.writeFile(path.join(skillDir, "data.txt"), name);
+      }
+      const registryPath = path.join(xumHome, "plugins.json");
+      await fs.writeFile(
+        registryPath,
+        JSON.stringify({
+          plugins: [
+            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+          ],
+        })
+      );
+      const tool = createAgentSkillReadFileTool({
+        ...createTestToolConfig(home.path, {
+          xumScope: {
+            type: "project",
+            xumHome,
+            projectRoot: home.path,
+            projectStorageAuthority: "host-local",
+          },
+        }),
+        experiments: { agentPlugins: true },
+      });
+      expect(await executeReadFile(tool, { name: "blocked", filePath: "data.txt" })).toMatchObject({
+        success: false,
+      });
+      expect(
+        await executeReadFile(tool, { name: "allowed", filePath: "../blocked/data.txt" })
+      ).toMatchObject({ success: false });
+      expect(await executeReadFile(tool, { name: "allowed", filePath: "data.txt" })).toMatchObject({
+        success: true,
+        content: "1\tallowed",
+      });
+      await fs.writeFile(registryPath, "{");
+      expect(await executeReadFile(tool, { name: "allowed", filePath: "data.txt" })).toMatchObject({
+        success: false,
+      });
+    }
+  );
+
   it("allows reading built-in skill files", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-file-global-scope");
     const baseConfig = createTestToolConfig(tempDir.path, {

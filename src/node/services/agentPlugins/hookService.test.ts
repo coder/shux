@@ -279,6 +279,47 @@ describe("AgentPluginHookService", () => {
     expect(otherWorkspace.executed).toBe(true);
   });
 
+  test("hooks retain a valid global view after rejecting an outward project alias", async () => {
+    const harness = await createHarness();
+    const project = path.join(harness.tmp.path, "checkout");
+    const alias = path.join(project, ".xum", "plugins");
+    await writeHookPlugin(
+      harness.container,
+      "fallback-guard",
+      `({
+      "tool.execute.before": () => ({ deny: "Global fallback is active" }),
+    })`,
+      { tools: ["file_read"] }
+    );
+    await fs.mkdir(path.dirname(alias), { recursive: true });
+    await fs.symlink(harness.container, alias, "dir");
+    const service = new AgentPluginHookService({
+      spine: harness.spine,
+      sandboxHost: harness.sandboxHost,
+      computeContainers: () => [
+        { path: alias, scope: "project" },
+        { path: harness.container, scope: "global" },
+      ],
+    });
+    try {
+      await service.ensureWorkspaceHooks({
+        workspaceId: WORKSPACE_ID,
+        sessionDir: harness.sessionDir,
+        journal: harness.journal,
+        enabled: true,
+        xumHome: harness.tmp.path,
+        projectRoot: project,
+        projectTrusted: true,
+      });
+      const ctx = makeToolCtx("file_read", { path: "/repo/secret.txt" });
+      await runTool(harness.spine, ctx);
+      expect(ctx.executed).toBe(false);
+      expect(blockedError(ctx)).toContain("Global fallback is active");
+    } finally {
+      await service.disposeWorkspace(WORKSPACE_ID);
+    }
+  });
+
   test("before-hook visibility and mutation are bounded to granted tools", async () => {
     const harness = await createHarness();
     await writeHookPlugin(

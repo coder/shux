@@ -9,6 +9,8 @@ import type {
   LanguageModelV2Usage,
 } from "@ai-sdk/provider";
 
+import { ServiceTierSchema } from "@/common/config/schemas/providersConfig";
+
 export interface CopilotResponsesConfig {
   modelId: string;
   fetch: typeof globalThis.fetch;
@@ -107,6 +109,10 @@ export class CopilotResponsesLanguageModel implements LanguageModelV2 {
 }
 
 function buildRequestBody(modelId: string, options: LanguageModelV2CallOptions, stream: boolean) {
+  // Fast mode uses the same gateway option as Chat, but Responses sends snake_case.
+  const serviceTier = ServiceTierSchema.optional().parse(
+    options.providerOptions?.["github-copilot"]?.serviceTier
+  );
   const instructions: string[] = [];
   const input: unknown[] = [];
 
@@ -167,6 +173,7 @@ function buildRequestBody(modelId: string, options: LanguageModelV2CallOptions, 
   return {
     model: modelId,
     stream,
+    ...(serviceTier != null ? { service_tier: serviceTier } : {}),
     ...(instructions.length > 0 ? { instructions: instructions.join("\n\n") } : {}),
     ...(input.length > 0 ? { input } : {}),
     ...(options.tools ? { tools: options.tools.flatMap(mapToolDefinition) } : {}),

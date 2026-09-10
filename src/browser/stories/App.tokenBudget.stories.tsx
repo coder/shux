@@ -39,7 +39,12 @@ function setupTokenBudgetStory(inputTokens = 2400) {
       timestamp: STABLE_TIMESTAMP - 30_000,
       synthetic: true,
       uiVisible: true,
-      muxMetadata: { type: "context-budget-warning", contextTokens: 650_000, maxTokens: 1_000_000 },
+      muxMetadata: {
+        type: "context-budget-warning",
+        contextTokens: 650_000,
+        maxTokens: 1_000_000,
+        budgetTokens: 750_000,
+      },
     }),
     createMuxMessage("final-flush", "user", FINAL_FLUSH, {
       historySequence: 3,
@@ -50,6 +55,7 @@ function setupTokenBudgetStory(inputTokens = 2400) {
         type: "context-budget-warning",
         contextTokens: 690_000,
         maxTokens: 1_000_000,
+        budgetTokens: 750_000,
         final: true,
       },
     }),
@@ -294,16 +300,16 @@ export const ExperimentSettings: AppStory = {
       await userEvent.click(canvas.getByRole("button", { name: "Open sidebar menu" }));
     }
     await userEvent.click(await canvas.findByTestId("settings-button"));
-    await userEvent.click(await canvas.findByRole("button", { name: "Experiments" }));
-    const toggle = await canvas.findByRole("switch", {
-      name: "Toggle Token-budget context windows",
-    });
-    toggle.scrollIntoView({ block: "center" });
-    await expect(toggle).toBeChecked();
-    await userEvent.click(toggle);
-    await expect(toggle).not.toBeChecked();
-    await userEvent.click(toggle);
-    await expect(toggle).toBeChecked();
+    const strategy = await canvas.findByRole("combobox", { name: "Compaction strategy" });
+    strategy.scrollIntoView({ block: "center" });
+    await expect(strategy).toHaveTextContent("Token Budget");
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(strategy);
+    await userEvent.click(await page.findByRole("option", { name: "Summarize" }));
+    await expect(strategy).toHaveTextContent("Summarize");
+    await userEvent.click(strategy);
+    await userEvent.click(await page.findByRole("option", { name: "Token Budget" }));
+    await expect(strategy).toHaveTextContent("Token Budget");
   },
 };
 

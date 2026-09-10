@@ -1,3 +1,4 @@
+import { AgentPluginImportedComponentsSchema } from "@/common/config/schemas/agentPluginInstalls";
 import {
   ClaudeDesignSettingsSchema,
   ClaudeDesignStatusSchema,
@@ -132,6 +133,7 @@ import {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
   AgentPluginInstallPreviewSchema,
+  AgentPluginComponentsSchema,
   AgentPluginListItemSchema,
   AgentPluginUpdateCheckSchema,
   AgentPluginUpdateConsentSchema,
@@ -1069,12 +1071,25 @@ export const agentPlugins = {
       source: AgentPluginGitSourceSchema,
       /** SHA from the preview the user consented to. */
       expectedSha: z.string(),
+      importedComponents: AgentPluginImportedComponentsSchema.optional(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
   },
   list: {
     input: z.void(),
     output: ResultSchema(z.array(AgentPluginListItemSchema), z.string()),
+  },
+  getComponents: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginComponentsSchema, z.string()),
+  },
+  addComponents: {
+    input: AgentPluginImportedComponentsSchema.extend({
+      name: z.string(),
+      expectedLockedSha: z.string(),
+      expectedContentHash: z.string(),
+    }),
+    output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
   },
   /** Display path of the ACTIVE managed plugin container (config-derived root; never hardcode it in UI). */
   containerLocation: {
@@ -2997,7 +3012,7 @@ export const update = {
     output: z.void(),
   },
   install: {
-    input: z.void(),
+    input: z.object({ force: z.boolean().optional() }).optional(),
     output: z.void(),
   },
   onStatus: {

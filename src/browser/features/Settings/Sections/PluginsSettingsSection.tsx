@@ -15,11 +15,13 @@ import { Button } from "@/browser/components/Button/Button";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { cn } from "@/common/lib/utils";
 import type {
+  AgentPluginComponents,
   AgentPluginInstallPreview,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
   AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
+import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
 import { getErrorMessage } from "@/common/utils/errors";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
@@ -67,6 +69,256 @@ const Badge: React.FC<{
   </span>
 );
 
+/** Only skills/MCP are selective; keep full-package consent below this shared chooser. */
+const ComponentChooser: React.FC<{
+  inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">;
+  selected: AgentPluginImportedComponents;
+  imported?: AgentPluginImportedComponents;
+  disabled: boolean;
+  onChange: (selection: AgentPluginImportedComponents) => void;
+}> = (props) => (
+  <div className="space-y-3">
+    {(["skills", "mcpServers"] as const).map((group) => {
+      const label = group === "skills" ? "Skills" : "MCP servers";
+      const entries =
+        group === "skills"
+          ? props.inventory.skills.map((skill) => ({ name: skill.name, detail: skill.description }))
+          : props.inventory.mcpServers.map((server) => ({
+              name: server.serverName,
+              detail: `${server.transport} · ${server.summary}`,
+            }));
+      const imported = props.imported?.[group] ?? [];
+      const selectable = entries
+        .map((entry) => entry.name)
+        .filter((name) => !imported.includes(name));
+      const count = entries.filter(
+        ({ name }) => imported.includes(name) || props.selected[group].includes(name)
+      ).length;
+      const change = (names: string[]) => props.onChange({ ...props.selected, [group]: names });
+      return (
+        <fieldset
+          key={group}
+          aria-label={label}
+          className="min-w-0 space-y-1"
+          disabled={props.disabled}
+        >
+          <legend className="text-foreground text-xs font-medium">
+            {label}{" "}
+            <span className="counter-nums">
+              ({count} of {entries.length} selected)
+            </span>
+          </legend>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={props.disabled || count === entries.length}
+              onClick={() => change(selectable)}
+            >
+              Select all
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={props.disabled || props.selected[group].length === 0}
+              onClick={() => change([])}
+            >
+              Clear
+            </Button>
+          </div>
+          {entries.length === 0 && <p className="text-muted text-xs">None available</p>}
+          {entries.map(({ name, detail }) => (
+            <label key={name} className="flex items-start gap-2 text-xs">
+              <Checkbox
+                aria-label={name}
+                checked={imported.includes(name) || props.selected[group].includes(name)}
+                disabled={props.disabled || imported.includes(name)}
+                onCheckedChange={(checked) =>
+                  change(
+                    checked === true
+                      ? [...props.selected[group], name]
+                      : props.selected[group].filter((value) => value !== name)
+                  )
+                }
+              />
+              <span className="min-w-0 break-words">
+                <span className="text-foreground font-mono break-all">{name}</span>
+                {imported.includes(name) && <span className="text-muted"> — imported</span>}
+                {detail && (
+                  <span className="text-muted block break-all whitespace-pre-wrap">{detail}</span>
+                )}
+              </span>
+            </label>
+          ))}
+        </fieldset>
+      );
+    })}
+    <p className="text-muted text-[11px]">
+      Importing MCP servers only makes them available; they stay disabled until enabled per
+      workspace.
+    </p>
+    <p className="text-muted hidden text-[11px] md:block">
+      Tab to navigate · Space to select · Enter to activate buttons
+    </p>
+  </div>
+);
+
+const AddComponentsPanel: React.FC<{
+  name: string;
+  onAdded: () => Promise<void>;
+  onClose: () => void;
+}> = (props) => {
+  const { api } = useAPI();
+  const [inventory, setInventory] = useState<AgentPluginComponents | null>(null);
+  const [selected, setSelected] = useState<AgentPluginImportedComponents>({
+    skills: [],
+    mcpServers: [],
+  });
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(true);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [added, setAdded] = useState(false);
+  const name = props.name;
+
+  useEffect(() => {
+    let ignore = false;
+    if (!api) return;
+    api.agentPlugins.getComponents({ name }).then(
+      (result) => {
+        if (ignore) return;
+        if (result.success) setInventory(result.data);
+        else setError(result.error);
+        setBusy(false);
+      },
+      (err: unknown) => {
+        if (!ignore) {
+          setError(getErrorMessage(err));
+          setBusy(false);
+        }
+      }
+    );
+    return () => {
+      ignore = true;
+    };
+  }, [api, name, loadAttempt]);
+
+  const handleAdd = async () => {
+    if (!api || !inventory || busy || selected.skills.length + selected.mcpServers.length === 0)
+      return;
+    setBusy(true);
+    setError(null);
+    setAdded(false);
+    try {
+      const result = await api.agentPlugins.addComponents({
+        name,
+        expectedLockedSha: inventory.lockedSha,
+        expectedContentHash: inventory.contentHash,
+        ...selected,
+      });
+      if (!result.success) throw new Error(result.error);
+      setInventory({ ...inventory, importedComponents: result.data.importedComponents });
+      setSelected({ skills: [], mcpServers: [] });
+      setAdded(true);
+      publishAgentPluginsMutated();
+      await props.onAdded();
+    } catch (err) {
+      setError(getErrorMessage(err));
+      // Compare receipts rather than parsing backend error prose. Never retry choices
+      // against a different installed version without another explicit selection.
+      try {
+        const current = await api.agentPlugins.getComponents({ name });
+        if (
+          current.success &&
+          (current.data.lockedSha !== inventory.lockedSha ||
+            current.data.contentHash !== inventory.contentHash)
+        ) {
+          setInventory(current.data);
+          setSelected({ skills: [], mcpServers: [] });
+          setError(
+            "The installed plugin changed. Inventory refreshed; select components again before confirming."
+          );
+        }
+      } catch {
+        /* Keep the original mutation error and choices when the inventory is unreachable. */
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+  const imported = inventory?.importedComponents ?? {
+    skills: inventory?.skills.map((skill) => skill.name) ?? [],
+    mcpServers: inventory?.mcpServers.map((server) => server.serverName) ?? [],
+  };
+  const allImported =
+    inventory &&
+    inventory.skills.every((skill) => imported.skills.includes(skill.name)) &&
+    inventory.mcpServers.every((server) => imported.mcpServers.includes(server.serverName));
+  return (
+    <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
+      <p className="text-foreground text-xs">
+        Add components from the installed version
+        {inventory ? ` · ${inventory.lockedSha.slice(0, 12)}` : ""}. No remote fetch.
+      </p>
+      {busy && (
+        <p role="status" className="text-muted text-xs">
+          {inventory ? "Adding components…" : "Loading components…"}
+        </p>
+      )}
+      {error && (
+        <p role="alert" className="text-destructive text-xs break-words">
+          {error}
+        </p>
+      )}
+      {added && (
+        <p role="status" className="text-accent text-xs">
+          Components imported.
+        </p>
+      )}
+      {inventory && (
+        <ComponentChooser
+          inventory={inventory}
+          imported={imported}
+          selected={selected}
+          disabled={busy}
+          onChange={(selection) => {
+            setSelected(selection);
+            setAdded(false);
+          }}
+        />
+      )}
+      {allImported && (
+        <p className="text-muted text-xs">All available components are already imported.</p>
+      )}
+      <div className="flex flex-wrap gap-2">
+        {inventory ? (
+          <Button
+            size="sm"
+            disabled={busy || selected.skills.length + selected.mcpServers.length === 0}
+            onClick={() => void handleAdd()}
+          >
+            Import selected
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            disabled={busy}
+            onClick={() => {
+              setError(null);
+              setBusy(true);
+              setLoadAttempt((attempt) => attempt + 1);
+            }}
+          >
+            Retry inventory
+          </Button>
+        )}
+        <Button variant="ghost" size="sm" disabled={busy} onClick={props.onClose}>
+          {added ? "Done" : "Cancel"}
+        </Button>
+      </div>
+    </div>
+  );
+};
+
 /** Two-phase add flow: source input → consent preview → install. */
 const AddPluginPanel: React.FC<{
   onInstalled: () => void;
@@ -78,6 +330,10 @@ const AddPluginPanel: React.FC<{
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<AgentPluginInstallPreview | null>(null);
+  const [selected, setSelected] = useState<AgentPluginImportedComponents>({
+    skills: [],
+    mcpServers: [],
+  });
 
   const handlePreview = async () => {
     if (!api || input.trim().length === 0 || busy) return;
@@ -90,6 +346,11 @@ const AddPluginPanel: React.FC<{
       });
       if (result.success) {
         setPreview(result.data);
+        // An accepted preview starts a new consent decision; failed attempts retain choices.
+        setSelected({
+          skills: result.data.skills.map((skill) => skill.name),
+          mcpServers: result.data.mcpServers.map((server) => server.serverName),
+        });
       } else {
         setError(result.error);
       }
@@ -108,6 +369,7 @@ const AddPluginPanel: React.FC<{
       const result = await api.agentPlugins.install({
         source: preview.source,
         expectedSha: preview.lockedSha,
+        importedComponents: selected,
       });
       if (result.success) {
         // Mounted composers cache contributed slash-command/skill
@@ -164,7 +426,10 @@ const AddPluginPanel: React.FC<{
             />
           </div>
           {error && (
-            <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
+            <div
+              role="alert"
+              className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+            >
               <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
               <span className="break-words">{error}</span>
             </div>
@@ -225,49 +490,20 @@ const AddPluginPanel: React.FC<{
             </div>
           )}
 
-          <div>
-            <h4 className="text-foreground mb-1 text-xs font-medium">
-              Skills ({preview.skills.length})
-            </h4>
-            {preview.skills.length === 0 ? (
-              <p className="text-muted text-xs">None</p>
-            ) : (
-              <ul className="space-y-0.5">
-                {preview.skills.map((skill) => (
-                  <li key={skill.name} className="text-xs">
-                    <span className="text-foreground font-mono">{skill.name}</span>
-                    {skill.description && (
-                      <span className="text-muted"> — {skill.description}</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-
-          <div>
-            <h4 className="text-foreground mb-1 text-xs font-medium">
-              MCP servers ({preview.mcpServers.length})
-            </h4>
-            {preview.mcpServers.length === 0 ? (
-              <p className="text-muted text-xs">None</p>
-            ) : (
-              <ul className="space-y-1">
-                {preview.mcpServers.map((server) => (
-                  <li key={server.serverName} className="text-xs">
-                    <span className="text-foreground font-mono">{server.serverName}</span>{" "}
-                    <Badge tone="muted">{server.transport}</Badge>
-                    <pre className="bg-modal-bg border-border-medium mt-0.5 overflow-x-auto rounded border px-2 py-1 font-mono text-[11px] break-all whitespace-pre-wrap">
-                      {server.summary}
-                    </pre>
-                  </li>
-                ))}
-              </ul>
-            )}
-            <p className="text-muted mt-1 text-[11px]">
-              MCP servers stay disabled until you enable them per workspace.
-            </p>
-          </div>
+          <ComponentChooser
+            inventory={preview}
+            selected={selected}
+            disabled={busy}
+            onChange={setSelected}
+          />
+          <p className="text-warning text-xs">
+            {selected.skills.length + selected.mcpServers.length === 0
+              ? "No skills or MCP servers selected. "
+              : ""}
+            Selection does not affect agents, workflows, slash commands, or hooks below: these
+            remain part of the install, even when neither group is selected. Skipped files stay on
+            disk; this is not a filesystem sandbox.
+          </p>
 
           {preview.agents.length > 0 && (
             <div>
@@ -338,7 +574,10 @@ const AddPluginPanel: React.FC<{
           )}
 
           {error && (
-            <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
+            <div
+              role="alert"
+              className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+            >
               <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
               <span className="break-words">{error}</span>
             </div>
@@ -418,6 +657,7 @@ const UninstallConfirm: React.FC<{
  */
 const UpdateReviewPanel: React.FC<{
   review: AgentPluginUpdateReview;
+  selective: boolean;
   busy: boolean;
   onConfirm: () => void;
   onCancel: () => void;
@@ -427,6 +667,12 @@ const UpdateReviewPanel: React.FC<{
       This update{props.review.version ? ` (v${props.review.version})` : ""} changes what the plugin
       can do. Review the changes before applying it:
     </p>
+    {props.selective && (
+      <p className="text-warning text-xs">
+        Your imported selection is preserved. Newly disclosed skills and MCP servers stay unimported
+        until you add them; this review still covers the full package.
+      </p>
+    )}
     <ul className="space-y-2">
       {props.review.changes.map((change) => (
         <li key={change.summary} className="text-xs">
@@ -505,6 +751,10 @@ export const PluginsSettingsSection: React.FC = () => {
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(
     initialIntent?.type === "confirm-uninstall" ? initialIntent.name : null
   );
+  const [componentsTarget, setComponentsTarget] = useState<string | null>(
+    initialIntent?.type === "add-components" ? initialIntent.name : null
+  );
+  const [installSucceeded, setInstallSucceeded] = useState(false);
   /** Name of the plugin with an update/uninstall in flight. */
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
   /** Pending update whose capability changes await the user's confirmation. */
@@ -514,6 +764,12 @@ export const PluginsSettingsSection: React.FC = () => {
   /** Monotonic ids of the latest list/update-check requests; stale responses must not commit state. */
   const listGenerationRef = useRef(0);
   const checkGenerationRef = useRef(0);
+
+  const openAddPanel = () => {
+    // Feedback belongs to the completed install, not the next attempt from any entry point.
+    setInstallSucceeded(false);
+    setAddOpen(true);
+  };
 
   const refresh = async () => {
     if (!api) return;
@@ -583,7 +839,10 @@ export const PluginsSettingsSection: React.FC = () => {
     return subscribePluginsSectionIntents((intent: PluginsSectionIntent) => {
       switch (intent.type) {
         case "open-add-panel":
-          setAddOpen(true);
+          openAddPanel();
+          break;
+        case "add-components":
+          setComponentsTarget(intent.name);
           break;
         case "confirm-uninstall":
           setUninstallTarget(intent.name);
@@ -735,7 +994,7 @@ export const PluginsSettingsSection: React.FC = () => {
               Check for updates
             </Button>
             {!addOpen && (
-              <Button size="sm" onClick={() => setAddOpen(true)}>
+              <Button size="sm" onClick={openAddPanel}>
                 <Plus className="h-3.5 w-3.5" />
                 Add plugin
               </Button>
@@ -748,6 +1007,7 @@ export const PluginsSettingsSection: React.FC = () => {
             <AddPluginPanel
               onInstalled={() => {
                 setAddOpen(false);
+                setInstallSucceeded(true);
                 void refresh();
                 void checkForUpdates();
               }}
@@ -756,6 +1016,11 @@ export const PluginsSettingsSection: React.FC = () => {
           </div>
         )}
 
+        {installSucceeded && (
+          <p role="status" className="text-accent mb-3 text-xs">
+            Plugin installed.
+          </p>
+        )}
         {error && (
           <div className="bg-destructive/10 text-destructive mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm">
             <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -820,10 +1085,10 @@ export const PluginsSettingsSection: React.FC = () => {
                       {/* break-all: locations/sources can contain unbreakable
                           64-char tokens (max-length plugin names) that would
                           otherwise overflow the card at phone widths. */}
-                      <p className="text-muted mt-0.5 text-[11px] break-all">
-                        {item.skillCount} skill{item.skillCount === 1 ? "" : "s"} ·{" "}
-                        {item.mcpServerCount} MCP server{item.mcpServerCount === 1 ? "" : "s"} ·{" "}
-                        <code>{item.location}</code>
+                      <p className="text-muted counter-nums mt-0.5 text-[11px] break-all">
+                        {item.importedSkillCount ?? item.skillCount} of {item.skillCount} skills
+                        imported · {item.importedMcpServerCount ?? item.mcpServerCount} of{" "}
+                        {item.mcpServerCount} MCP servers imported · <code>{item.location}</code>
                       </p>
                       {formatSource(item) && (
                         <p className="text-muted mt-0.5 text-[11px] break-all">
@@ -840,7 +1105,19 @@ export const PluginsSettingsSection: React.FC = () => {
                     </div>
 
                     {item.managed && (
-                      <div className="flex shrink-0 gap-1">
+                      <div className="flex flex-wrap gap-1">
+                        {item.present && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2 text-xs"
+                            disabled={busyPlugin !== null}
+                            onClick={() => setComponentsTarget(item.name)}
+                            aria-label={`Add components to ${item.name}`}
+                          >
+                            Add components
+                          </Button>
+                        )}
                         {updateAvailable && (
                           <Button
                             variant="outline"
@@ -881,9 +1158,18 @@ export const PluginsSettingsSection: React.FC = () => {
                       unmanaged plugin. The backend uninstall is keyed by
                       managed-registry name, so the managed row is the one
                       identity-correct anchor. */}
+                  {item.managed && item.present && componentsTarget === item.name && (
+                    <AddComponentsPanel
+                      key={item.name}
+                      name={item.name}
+                      onAdded={refresh}
+                      onClose={() => setComponentsTarget(null)}
+                    />
+                  )}
                   {item.managed && updateReview?.name === item.name && (
                     <UpdateReviewPanel
                       review={updateReview}
+                      selective={item.importedComponents !== undefined}
                       busy={isBusy}
                       onConfirm={() => void handleConfirmUpdate(updateReview)}
                       onCancel={() => setUpdateReview(null)}

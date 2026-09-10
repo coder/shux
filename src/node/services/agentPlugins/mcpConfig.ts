@@ -619,6 +619,12 @@ export async function loadPluginMcpServers(
   };
 
   for (const [serverName, entry] of Object.entries(raw.mcpServers)) {
+    // Filter before registration: saved workspace overrides cannot resurrect an unimported server.
+    if (
+      plugin.importedComponents != null &&
+      !plugin.importedComponents.mcpServers.includes(serverName)
+    )
+      continue;
     const reportEntry = (severity: "warning" | "error", message: string): void => {
       const fullMessage = `mcp.json server '${serverName}': ${message}; skipping this server`;
       log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);

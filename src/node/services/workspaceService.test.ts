@@ -46,6 +46,7 @@ import type { ProjectsConfig } from "@/common/types/project";
 import type { Config, SecretsStore } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { SessionTimingService } from "./sessionTimingService";
 import { SessionUsageService } from "./sessionUsageService";
 import type { AIService } from "./aiService";
@@ -9196,6 +9197,22 @@ describe("WorkspaceService initialize", () => {
     });
   });
 
+  test("contains pending-compaction recovery failures as per-task results", async () => {
+    const h = await createAgentSessionHarness({ workspaceId: "task" });
+    workspaceService.registerSession("task", h.session);
+    spyOn(h.session, "dispatchPendingCompactionFollowUpIfNeeded").mockRejectedValueOnce(
+      new Error("provider unavailable")
+    );
+    try {
+      expect(await workspaceService.dispatchPendingCompactionFollowUp("task")).toEqual(
+        Err("provider unavailable")
+      );
+    } finally {
+      await workspaceService.disposeSession("task");
+      await h.cleanup();
+    }
+  });
+
   test("schedules startup recovery for non-task, non-archived chats", async () => {
     const liveWorkspace = createFrontendWorkspaceMetadata({
       id: "live-ws",
@@ -9204,7 +9221,7 @@ describe("WorkspaceService initialize", () => {
     const taskWorkspace = createFrontendWorkspaceMetadata({
       id: "task-ws",
       name: "Task Workspace",
-      taskStatus: "running",
+      parentWorkspaceId: "live-ws",
     });
     const archivedWorkspace = createFrontendWorkspaceMetadata({
       id: "archived-ws",
@@ -9267,7 +9284,10 @@ describe("WorkspaceService initialize", () => {
     await workspaceService.initialize();
 
     expect(startStartupRecoverySpy).toHaveBeenCalledTimes(1);
-    expect(startStartupRecoverySpy).toHaveBeenCalledWith("live-ws");
+    expect(startStartupRecoverySpy).toHaveBeenCalledWith(
+      "live-ws",
+      expect.objectContaining({ id: "live-ws" })
+    );
   });
 
   test("swallows startup metadata lookup failures", async () => {
@@ -10307,6 +10327,263 @@ describe("WorkspaceService rename lock", () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error).toContain("stream is active");
+    }
+  });
+});
+
+test.each([
+  { source: "partial", live: false },
+  { source: "history", live: true },
+])(
+  "restored question guidance queues without dispatch and dedupes live sends (%j)",
+  async ({ source, live }) => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "restored-question";
+    const projectPath = path.join(config.rootDir, "repo");
+    await saveWorkspaces(config, projectPath, [
+      projectWorkspace(projectPath, "child", workspaceId),
+    ]);
+    const { session, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      config,
+      historyService,
+    });
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: aiService as unknown as AIService,
+    });
+    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      workspaceId,
+      session
+    );
+    const question = createMuxMessage("question", "assistant", "", {}, [
+      {
+        type: "dynamic-tool",
+        state: "input-available",
+        toolCallId: "ask-restored",
+        toolName: "ask_user_question",
+        input: {
+          questions: [
+            {
+              header: "Choice",
+              question: "Which option?",
+              options: [
+                { label: "First", description: "Use first" },
+                { label: "Second", description: "Use second" },
+              ],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+    ]);
+    await historyService.appendToHistory(workspaceId, createMuxMessage("user", "user", "Work"));
+    if (source === "partial") await historyService.writePartial(workspaceId, question);
+    else await historyService.appendToHistory(workspaceId, question);
+    const queue = spyOn(session, "queueMessage");
+    const send = spyOn(session, "sendMessage");
+    const drain = spyOn(session, "drainQueuedMessagesIfIdle");
+    const busy = spyOn(session, "isBusy").mockReturnValue(live);
+    const accepted = mock(() => undefined);
+    const internal = {
+      synthetic: true,
+      agentInitiated: true,
+      queueDedupeKey: "durable-guidance",
+      onAccepted: accepted,
+    };
+    const options = {
+      model: "openai:gpt-5.2",
+      agentId: "exec",
+      queueDispatchMode: "turn-end" as const,
+    };
+    try {
+      expect(
+        await workspaceService.sendMessage(workspaceId, "Correction", options, {
+          ...internal,
+          restoreQueued: !live,
+        })
+      ).toEqual(Ok(undefined));
+      if (!live) expect(drain).not.toHaveBeenCalled();
+      busy.mockReturnValue(false);
+      const drainsBeforeRestore = drain.mock.calls.length;
+      for (const restoreQueued of [true, true, false]) {
+        expect(
+          await workspaceService.sendMessage(workspaceId, "Correction", options, {
+            ...internal,
+            restoreQueued,
+          })
+        ).toEqual(Ok(undefined));
+      }
+      expect(queue).toHaveBeenCalledTimes(1);
+      expect(queue.mock.calls[0]?.[1]?.queueDispatchMode).toBe("turn-end");
+      expect(drain).toHaveBeenCalledTimes(drainsBeforeRestore);
+      expect(send).not.toHaveBeenCalled();
+      expect(accepted).not.toHaveBeenCalled();
+      const readQuestion = async () => {
+        if (source === "partial") return historyService.readPartial(workspaceId);
+        const history = await historyService.getLastMessages(workspaceId, 1);
+        expect(history.success).toBe(true);
+        return history.success ? history.data[0] : undefined;
+      };
+      expect((await readQuestion())?.parts[0]).toMatchObject({ state: "input-available" });
+      expect(
+        await workspaceService.answerAskUserQuestion(workspaceId, "ask-restored", {
+          "Which option?": "First",
+        })
+      ).toEqual(Ok(undefined));
+      expect((await readQuestion())?.parts[0]).toMatchObject({ state: "output-available" });
+      expect(session.hasQueuedDedupeKey(internal.queueDedupeKey)).toBe(true);
+      expect(accepted).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      busy.mockRestore();
+      await session.dispose();
+      await cleanup();
+    }
+  }
+);
+
+describe("WorkspaceService transient startup probes", () => {
+  async function setupProbe() {
+    const h = await createAgentSessionHarness({ workspaceId: "legacy-child" });
+    const allListeners = () =>
+      h.aiEmitter.eventNames().reduce((total, name) => total + h.aiEmitter.listenerCount(name), 0);
+    const sessionListeners = allListeners();
+    await h.historyService.appendToHistory(
+      "legacy-child",
+      createMuxMessage("done", "assistant", "Finished", { finishReason: "stop" })
+    );
+    const service = createWorkspaceServiceForTest({
+      config: h.config,
+      historyService: h.historyService,
+      aiService: h.aiService as unknown as AIService,
+    });
+    const access = service as unknown as {
+      createSession: (id: string) => AgentSession;
+      sessions: Map<string, AgentSession>;
+      transientStartupRecoverySessions: Map<string, AgentSession>;
+      pendingWorkspaceCleanup: Set<Promise<void>>;
+    };
+    const create = spyOn(access, "createSession").mockReturnValueOnce(h.session);
+    const serviceListeners = allListeners() - sessionListeners;
+    const listenerCount = () => allListeners() - serviceListeners;
+    const cleanup = async () => {
+      await Promise.all(access.pendingWorkspaceCleanup);
+      await service.disposeSession("legacy-child");
+      await h.session.dispose();
+      await h.cleanup();
+    };
+    return { h, service, access, create, listenerCount, sessionListeners, cleanup };
+  }
+
+  test("idle legacy probes and empty compaction checks release their real listeners", async () => {
+    const p = await setupProbe();
+    try {
+      expect(p.listenerCount()).toBeGreaterThan(0);
+      expect(p.service.clearQueue("legacy-child")).toEqual(Ok(undefined));
+      expect(p.create).not.toHaveBeenCalled();
+      expect(await p.service.getStartupRecoveryState("legacy-child")).toBe("idle");
+      await Promise.all(p.access.pendingWorkspaceCleanup);
+      expect(p.listenerCount()).toBe(0);
+      expect(await p.service.dispatchPendingCompactionFollowUp("legacy-child")).toEqual(Ok(false));
+      await Promise.all(p.access.pendingWorkspaceCleanup);
+      expect(p.create).toHaveBeenCalledTimes(2);
+      expect(p.access.sessions.size).toBe(0);
+      expect(p.access.transientStartupRecoverySessions.size).toBe(0);
+      expect(p.listenerCount()).toBe(0);
+    } finally {
+      await p.cleanup();
+    }
+  });
+
+  test.each(["registered", "transient"] as const)(
+    "probes preserve existing %s sessions",
+    async (kind) => {
+      const p = await setupProbe();
+      try {
+        if (kind === "registered") p.service.registerSession("legacy-child", p.h.session);
+        else p.access.transientStartupRecoverySessions.set("legacy-child", p.h.session);
+        expect(await p.service.getStartupRecoveryState("legacy-child")).toBe("idle");
+        expect(p.create).not.toHaveBeenCalled();
+        expect(p.h.session.closingSignal.aborted).toBe(false);
+        expect(p.listenerCount()).toBeGreaterThan(0);
+        expect(p.access.pendingWorkspaceCleanup.size).toBe(0);
+      } finally {
+        await p.cleanup();
+      }
+    }
+  );
+
+  test("a client can adopt an in-flight probe without its session being disposed", async () => {
+    const p = await setupProbe();
+    const reading = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const read = p.h.historyService.getLastMessages.bind(p.h.historyService);
+    spyOn(p.h.historyService, "getLastMessages").mockImplementationOnce(async (...args) => {
+      reading.resolve();
+      await release.promise;
+      return read(...args);
+    });
+    try {
+      const probe = p.service.getStartupRecoveryState("legacy-child");
+      await reading.promise;
+      expect(p.service.getOrCreateSession("legacy-child")).toBe(p.h.session);
+      release.resolve();
+      expect(await probe).toBe("idle");
+      expect(p.access.sessions.get("legacy-child")).toBe(p.h.session);
+      expect(p.h.session.closingSignal.aborted).toBe(false);
+      expect(p.access.pendingWorkspaceCleanup.size).toBe(0);
+    } finally {
+      release.resolve();
+      await p.cleanup();
+    }
+  });
+
+  test("a timed-out physical read is disposed off-startup without deleting its replacement", async () => {
+    const p = await setupProbe();
+    const release = Promise.withResolvers<void>();
+    const read = p.h.historyService.getLastMessages.bind(p.h.historyService);
+    spyOn(p.h.historyService, "getLastMessages").mockImplementationOnce(async (...args) => {
+      await release.promise;
+      return read(...args);
+    });
+    const probeState = p.h.session.getStartupRecoveryState.bind(p.h.session);
+    spyOn(p.h.session, "getStartupRecoveryState").mockImplementation(() => probeState(10));
+    try {
+      // The read is still held open after the admission deadline. Cleanup must own its lease,
+      // not block this answer or release resources while the physical read is still using them.
+      expect(await p.service.getStartupRecoveryState("legacy-child")).toBe("blocked");
+      expect(p.access.transientStartupRecoverySessions.size).toBe(0);
+      expect(p.access.pendingWorkspaceCleanup.size).toBe(1);
+      expect(p.h.session.closingSignal.aborted).toBe(true);
+      expect(p.listenerCount()).toBeGreaterThan(0);
+      const replacement = p.service.getOrCreateSession("legacy-child");
+      expect(replacement).not.toBe(p.h.session);
+      release.resolve();
+      await Promise.all(p.access.pendingWorkspaceCleanup);
+      expect(p.access.sessions.get("legacy-child")).toBe(replacement);
+      expect(replacement.closingSignal.aborted).toBe(false);
+      expect(p.listenerCount()).toBe(p.sessionListeners);
+    } finally {
+      release.resolve();
+      await p.cleanup();
+    }
+  });
+
+  test("a failed probe still disposes its unadopted session", async () => {
+    const p = await setupProbe();
+    spyOn(p.h.session, "getStartupRecoveryState").mockRejectedValueOnce(new Error("Probe failed"));
+    try {
+      const result = await p.service
+        .getStartupRecoveryState("legacy-child")
+        .catch((error: unknown) => error);
+      expect(result).toMatchObject({ message: "Probe failed" });
+      await Promise.all(p.access.pendingWorkspaceCleanup);
+      expect(p.access.transientStartupRecoverySessions.size).toBe(0);
+      expect(p.listenerCount()).toBe(0);
+    } finally {
+      await p.cleanup();
     }
   });
 });

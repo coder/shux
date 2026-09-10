@@ -7,7 +7,8 @@ import React, {
   useDeferredValue,
   useMemo,
 } from "react";
-import { Lightbulb, Loader2 } from "lucide-react";
+import { Lightbulb } from "lucide-react";
+import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
 import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
@@ -73,7 +74,7 @@ import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import {
   ConcurrentLocalWarningDecoration,
-  useConcurrentLocalStreamingWorkspaceName,
+  useConcurrentLocalAgentCount,
 } from "../ConcurrentLocalWarning/ConcurrentLocalWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
@@ -364,7 +365,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       : null;
   const shouldShowQueuedAgentTaskPrompt =
     Boolean(queuedAgentTaskPrompt) && (workspaceState?.messages.length ?? 0) === 0;
-  const concurrentLocalStreamingWorkspaceName = useConcurrentLocalStreamingWorkspaceName({
+  const concurrentLocalAgentCount = useConcurrentLocalAgentCount({
     workspaceId,
     projectPath,
     runtimeConfig,
@@ -1439,10 +1440,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // `w-full` is required in the centered mode because auto cross-axis
                 // margins disable flex-item stretch.
                 chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-4xl mx-auto w-full",
-                // `flex-1` pushes the dock to the scrollport bottom for short
-                // transcripts. Keep a permanent gutter for the loading overlay so
-                // even compact tail rows remain unobscured without resizing on catch-up.
-                "flex-1 pb-8",
+                // Push the dock to the bottom for short transcripts without reserving
+                // loading space: cached replay overlays the dock edge, not transcript rows.
+                "flex-1",
                 // Only the empty/centered placeholder fills height (as a flex column
                 // so the placeholder's flex-1 centering works). The hydration
                 // skeleton renders in normal top-aligned transcript flow so it sits
@@ -1675,6 +1675,21 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   className="bg-surface-primary sticky bottom-0 z-10 mx-[-15px] break-normal whitespace-normal"
                   style={COMPOSER_DOCK_STYLE}
                 >
+                  {isHydratingTranscript &&
+                    !showTranscriptHydrationPlaceholder &&
+                    !shouldMountStreamingBarrier && (
+                      <div
+                        role="status"
+                        data-testid="transcript-loading-status"
+                        className="pointer-events-none absolute inset-x-0 top-0 z-20 h-1 overflow-hidden"
+                      >
+                        <Skeleton
+                          variant="shimmer"
+                          className="bg-muted/30 block h-full w-full rounded-none"
+                        />
+                        <span className="sr-only">Loading messages...</span>
+                      </div>
+                    )}
                   {!autoScroll && (
                     <button
                       onClick={handleJumpToBottom}
@@ -1688,24 +1703,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                         ({formatKeybind(KEYBINDS.JUMP_TO_BOTTOM)})
                       </span>
                     </button>
-                  )}
-                  {/* Replay feedback must not resize the in-flow dock: even a brief
-                      catch-up would otherwise shift cached transcript rows on workspace switches.
-                      Keep it above the dock for both editable and read-only transcripts,
-                      yielding to Jump to bottom while scrolled up so they cannot overlap on phones. */}
-                  {isHydratingTranscript && !shouldMountStreamingBarrier && autoScroll && (
-                    <div className="pointer-events-none absolute inset-x-0 bottom-full">
-                      <ChatDockSurface>
-                        <div
-                          role={showTranscriptHydrationPlaceholder ? undefined : "status"}
-                          data-testid="transcript-loading-status"
-                          className="text-muted bg-surface-primary flex w-fit items-center gap-2 rounded px-3 py-1 text-xs"
-                        >
-                          <Loader2 aria-hidden="true" className="size-3 shrink-0 animate-spin" />
-                          <span>Loading messages...</span>
-                        </div>
-                      </ChatDockSurface>
-                    </div>
                   )}
                   {transcriptOnly ? (
                     // Transcript-only workspaces keep their historical transcript, but the whole
@@ -1728,7 +1725,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       isCompacting={isCompacting}
                       shouldShowPinnedTodoList={shouldShowPinnedTodoList}
                       shouldShowReviewsBanner={shouldShowReviewsBanner}
-                      concurrentLocalStreamingWorkspaceName={concurrentLocalStreamingWorkspaceName}
+                      concurrentLocalAgentCount={concurrentLocalAgentCount}
                       canInterrupt={canInterrupt}
                       autoCompactionResult={autoCompactionResult}
                       shouldShowCompactionWarning={shouldShowCompactionWarning}
@@ -1804,7 +1801,7 @@ interface ChatInputPaneProps {
   isTranscriptCaughtUp: boolean;
   shouldShowPinnedTodoList: boolean;
   shouldShowReviewsBanner: boolean;
-  concurrentLocalStreamingWorkspaceName: string | null;
+  concurrentLocalAgentCount: number;
   canInterrupt: boolean;
   autoCompactionResult: ReturnType<typeof checkAutoCompaction>;
   shouldShowCompactionWarning: boolean;
@@ -1899,14 +1896,10 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   // message insert above a live tail row, so bottom-lock had to correct after layout and
   // visibly flashed while another local agent was active. Pin it with composer decorations
   // instead; new transcript rows no longer move the warning.
-  if (props.concurrentLocalStreamingWorkspaceName) {
+  if (props.concurrentLocalAgentCount) {
     addDecorationEntry({
       key: "concurrent-local-warning",
-      node: (
-        <ConcurrentLocalWarningDecoration
-          streamingWorkspaceName={props.concurrentLocalStreamingWorkspaceName}
-        />
-      ),
+      node: <ConcurrentLocalWarningDecoration agentCount={props.concurrentLocalAgentCount} />,
     });
   }
 

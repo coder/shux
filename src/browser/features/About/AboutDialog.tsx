@@ -95,7 +95,9 @@ export function AboutDialog() {
   const [channel, setChannel] = useState<UpdateChannel | null>(null);
   const [supportedChannels, setSupportedChannels] = useState<UpdateChannel[]>([]);
   const [channelLoading, setChannelLoading] = useState(false);
-  const [pendingAction, setPendingAction] = useState<"check" | "download" | "install" | null>(null);
+  const [pendingAction, setPendingAction] = useState<
+    "check" | "download" | "install" | "force-install" | null
+  >(null);
   const channelRequestTokenRef = useRef(0);
 
   useEffect(() => {
@@ -199,16 +201,18 @@ export function AboutDialog() {
       .finally(() => setPendingAction((prev) => (prev === "download" ? null : prev)));
   };
 
-  const handleInstall = () => {
+  const installPending = pendingAction === "install" || pendingAction === "force-install";
+  const handleInstall = (options?: { force: boolean }) => {
     if (!api) {
       return;
     }
 
-    setPendingAction("install");
+    const action = options?.force ? "force-install" : "install";
+    setPendingAction(action);
     api.update
-      .install(undefined)
+      .install(options)
       .catch(console.error)
-      .finally(() => setPendingAction((prev) => (prev === "install" ? null : prev)));
+      .finally(() => setPendingAction((prev) => (prev === action ? null : prev)));
   };
 
   return (
@@ -323,7 +327,7 @@ export function AboutDialog() {
                   <div className="text-foreground min-w-0 text-xs break-words">
                     Ready to install: <span className="font-mono">{updateStatus.info.version}</span>
                   </div>
-                  <Button size="sm" onClick={handleInstall} disabled={pendingAction === "install"}>
+                  <Button size="sm" onClick={() => handleInstall()} disabled={installPending}>
                     {pendingAction === "install" ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
                     ) : (
@@ -335,17 +339,35 @@ export function AboutDialog() {
               )}
 
               {updateStatus.type === "install-blocked" && (
-                <div className="text-muted space-y-1 text-xs" role="status">
-                  <div>Finish or stop this work, then retry the restart:</div>
-                  <ul>
-                    {updateStatus.blockers.map((blocker) => (
-                      <li key={blocker.kind}>
-                        {blockerLabels[blocker.kind]}:{" "}
-                        <span className="counter-nums">{blocker.count}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+                <>
+                  <div className="text-muted space-y-1 text-xs" role="status">
+                    <div>Finish or stop this work, then retry the restart:</div>
+                    <ul>
+                      {updateStatus.blockers.map((blocker) => (
+                        <li key={blocker.kind}>
+                          {blockerLabels[blocker.kind]}:{" "}
+                          <span className="counter-nums">{blocker.count}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleInstall({ force: true })}
+                      disabled={installPending}
+                    >
+                      {pendingAction === "force-install" ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="h-3.5 w-3.5" />
+                      )}
+                      Restart anyway
+                    </Button>
+                    <span className="text-muted text-xs">Interrupts the work listed above.</span>
+                  </div>
+                </>
               )}
 
               {updateStatus.type === "up-to-date" && (
@@ -383,7 +405,7 @@ export function AboutDialog() {
                     {updateStatus.phase === "install" && (
                       <Button
                         size="sm"
-                        onClick={handleInstall}
+                        onClick={() => handleInstall()}
                         disabled={pendingAction === "install"}
                       >
                         {pendingAction === "install" ? (

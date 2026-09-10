@@ -42,6 +42,7 @@ import { getBuiltInSkillByName, getBuiltInSkillDescriptors } from "./builtInSkil
 import type { ProjectSkillContainment } from "./skillStorageContext";
 import {
   discoverAgentPlugins,
+  type AgentPluginContainer,
   readPluginFileWithinRootCapped,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
 } from "@/node/services/agentPlugins/discovery";
@@ -204,6 +205,7 @@ interface AgentSkillScanCandidate {
   pluginRoot?: string;
   /** Agent Plugins only: contributing plugin name for descriptor attribution. */
   pluginName?: string;
+  importedSkills?: string[];
 }
 
 /**
@@ -213,6 +215,7 @@ interface AgentSkillScanCandidate {
 async function buildPluginScanCandidates(args: {
   containers: string[];
   scope: "project" | "global";
+  managedHome?: string;
   workspacePath: string;
   /**
    * Project scope: plugin roots must additionally stay inside the project
@@ -226,12 +229,15 @@ async function buildPluginScanCandidates(args: {
   }
 
   const localRuntime = new LocalRuntime(args.workspacePath);
-  const resolvedContainers: Array<{ path: string; scope: "project" | "global" }> = [];
+  const managedHome =
+    args.managedHome !== undefined ? await localRuntime.resolvePath(args.managedHome) : undefined;
+  const resolvedContainers: AgentPluginContainer[] = [];
   for (const container of args.containers) {
     try {
       // Container paths may be tilde-form (e.g. ~/.agents/plugins).
+      const resolvedPath = await localRuntime.resolvePath(container);
       resolvedContainers.push({
-        path: await localRuntime.resolvePath(container),
+        path: resolvedPath,
         scope: args.scope,
       });
     } catch (err) {
@@ -239,7 +245,7 @@ async function buildPluginScanCandidates(args: {
     }
   }
 
-  const { plugins } = await discoverAgentPlugins(resolvedContainers);
+  const { plugins } = await discoverAgentPlugins(resolvedContainers, { managedHome });
 
   const candidates: AgentSkillScanCandidate[] = [];
   for (const plugin of plugins) {
@@ -264,6 +270,7 @@ async function buildPluginScanCandidates(args: {
       runtime: localRuntime,
       pluginRoot: plugin.rootPath,
       pluginName: plugin.name,
+      importedSkills: plugin.importedComponents?.skills,
     });
   }
 
@@ -277,6 +284,8 @@ async function buildScanCandidates(
   containment: ProjectSkillContainment
 ): Promise<AgentSkillScanCandidate[]> {
   const globalRuntime = resolveGlobalRuntime(runtime, workspacePath);
+  // Both scans can encounter the configured home, e.g. a project rooted at the user's home.
+  const managedHome = roots.globalRoot ? path.dirname(roots.globalRoot) : undefined;
 
   // Plugin skills sit at the lowest precedence within each scope, after the
   // standard (and .claude compat) roots of that scope.
@@ -284,6 +293,7 @@ async function buildScanCandidates(
     containers: roots.projectPluginRoots ?? [],
     scope: "project",
     workspacePath,
+    managedHome,
     // Project plugin roots ALWAYS keep the repo-symlink posture: even callers
     // without project containment (UI list/get default discovery) must not
     // resolve a committed .xum/plugins/<name> symlink outside the checkout —
@@ -297,6 +307,7 @@ async function buildScanCandidates(
     containers: roots.globalPluginRoots ?? [],
     scope: "global",
     workspacePath,
+    managedHome,
   });
 
   return [
@@ -627,6 +638,7 @@ export async function discoverAgentSkills(
       }
 
       const directoryName = nameParsed.data;
+      if (scan.importedSkills != null && !scan.importedSkills.includes(directoryName)) continue;
 
       if (dedupeByName && byName.has(directoryName)) {
         continue;
@@ -771,6 +783,7 @@ export async function discoverAgentSkillsDiagnostics(
       }
 
       const directoryName = nameParsed.data;
+      if (scan.importedSkills != null && !scan.importedSkills.includes(directoryName)) continue;
 
       if (byName.has(directoryName)) {
         continue;
@@ -983,6 +996,7 @@ export async function readAgentSkill(
   const candidates = await buildScanCandidates(runtime, workspacePath, roots, containment);
 
   for (const candidate of candidates) {
+    if (candidate.importedSkills != null && !candidate.importedSkills.includes(name)) continue;
     let resolvedRoot: string;
     try {
       resolvedRoot = await candidate.runtime.resolvePath(candidate.root);

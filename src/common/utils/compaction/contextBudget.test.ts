@@ -10,6 +10,7 @@ import {
 import {
   evaluateStepBudget,
   getContextBudgetHardCeiling,
+  getContextBudgetRolloverPoint,
   estimateFreshRequestTokens,
   estimateAssembledRequestTokens,
   estimateToolResultSize,
@@ -29,6 +30,30 @@ function evaluate(overrides: Partial<StepBudgetInput> = {}) {
     ...overrides,
   });
 }
+
+describe("rollover point", () => {
+  test.each([
+    [100_000, 0.7, 75_000],
+    [100_000, 0.99, 100_000 - OUTPUT_RESERVE_TOKENS],
+    [4096, 0.7, 3072],
+    [200_000, 0.5, 110_000],
+    [1_050_000, 0.3, 367_500],
+  ])(
+    "matches the decision boundary for limit %d and threshold %s",
+    (modelContextLimit, threshold, expected) => {
+      const point = getContextBudgetRolloverPoint(modelContextLimit, threshold);
+      expect(point).toBe(expected);
+      // A prior warning avoids the separate early rollover when warning headroom runs out.
+      const input = { modelContextLimit, threshold, warningEmitted: true };
+      expect(evaluate({ ...input, contextTokens: point }).decision).toBe("rollover");
+      expect(evaluate({ ...input, contextTokens: point - 1 }).decision).not.toBe("rollover");
+    }
+  );
+
+  test.each([0, -1, 1, NaN, Infinity])("rejects disabled or invalid threshold %s", (threshold) => {
+    expect(() => getContextBudgetRolloverPoint(100_000, threshold)).toThrow();
+  });
+});
 
 describe("step budget decisions", () => {
   test.each([

@@ -122,6 +122,84 @@ describe("CopilotResponsesLanguageModel", () => {
     }
   });
 
+  it("rejects an invalid service tier before sending a request", async () => {
+    let requests = 0;
+    const model = new CopilotResponsesLanguageModel({
+      modelId: "gpt-5.4",
+      fetch: Object.assign(() => {
+        requests++;
+        return Promise.resolve(createJsonResponse({}));
+      }, globalThis.fetch),
+    });
+    const options: LanguageModelV2CallOptions = {
+      prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      providerOptions: { "github-copilot": { serviceTier: "invalid" } },
+    };
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun mistypes rejection matchers.
+    await expect(model.doGenerate(options)).rejects.toThrow();
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun mistypes rejection matchers.
+    await expect(model.doStream(options)).rejects.toThrow();
+    expect(requests).toBe(0);
+  });
+
+  it.each(["auto", "default", "flex", "priority", undefined] as const)(
+    "serializes service tier %s for generate and stream independently of reasoning",
+    async (serviceTier) => {
+      const capturedBodies: Array<Record<string, unknown>> = [];
+      const response = createCompletedResponse("stop");
+      const model = new CopilotResponsesLanguageModel({
+        modelId: "copilot-test",
+        fetch: Object.assign(
+          (_url: RequestInfo | URL, init?: RequestInit) => {
+            if (!init) {
+              throw new Error("Expected request init");
+            }
+            const body = getJsonBody(init);
+            capturedBodies.push(body);
+            return Promise.resolve(
+              body.stream
+                ? createSseResponse([
+                    { event: "response.completed", data: { type: "response.completed", response } },
+                  ])
+                : createJsonResponse(response)
+            );
+          },
+          { preconnect: globalThis.fetch.preconnect.bind(globalThis.fetch) }
+        ),
+      });
+      for (const reasoningEffort of [undefined, "medium"] as const) {
+        const options: LanguageModelV2CallOptions = {
+          prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          providerOptions: {
+            "github-copilot": {
+              ...(serviceTier && { serviceTier }),
+              ...(reasoningEffort && { reasoningEffort }),
+            },
+            // Other namespaces must never supply a fallback tier.
+            openai: { serviceTier: "priority" },
+            anthropic: { serviceTier: "priority" },
+            google: { serviceTier: "priority" },
+          },
+        };
+        await model.doGenerate(options);
+        const result = await model.doStream(options);
+        await collectStreamParts(result.stream);
+      }
+      expect(capturedBodies).toHaveLength(4);
+      for (const body of capturedBodies) {
+        expect(body.service_tier).toBe(serviceTier);
+        expect(body).not.toHaveProperty("serviceTier");
+        if (serviceTier === undefined) {
+          expect(body).not.toHaveProperty("service_tier");
+        }
+      }
+      expect(capturedBodies[0]).not.toHaveProperty("reasoning");
+      expect(capturedBodies[1]).not.toHaveProperty("reasoning");
+      expect(capturedBodies[2].reasoning).toEqual({ effort: "medium" });
+      expect(capturedBodies[3].reasoning).toEqual({ effort: "medium" });
+    }
+  );
+
   it("shapes the outbound request body for streaming calls", async () => {
     let capturedBody: Record<string, unknown> | undefined;
     restoreFetchers.push(

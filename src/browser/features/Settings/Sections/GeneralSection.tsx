@@ -10,8 +10,12 @@ import {
 import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
 import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useAPI } from "@/browser/contexts/API";
+import { useExperiment, useExperimentValue } from "@/browser/contexts/ExperimentsContext";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import assert from "@/common/utils/assert";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
   EDITOR_CONFIG_KEY,
@@ -101,6 +105,13 @@ function getTerminalFontAvailabilityWarning(config: TerminalFontConfig): string 
   return undefined;
 }
 
+const COMPACTION_STRATEGIES = [
+  { value: "summarize", label: "Summarize" },
+  { value: "continuous", label: "Continuous" },
+  { value: "token-budget", label: "Token Budget" },
+] as const;
+type CompactionStrategy = (typeof COMPACTION_STRATEGIES)[number]["value"];
+
 const EDITOR_OPTIONS: Array<{ value: EditorType; label: string }> = [
   { value: "vscode", label: "VS Code" },
   { value: "cursor", label: "Cursor" },
@@ -163,6 +174,58 @@ const isBrowserMode = typeof window !== "undefined" && !window.api;
 export function GeneralSection() {
   const { themePreference, setTheme } = useTheme();
   const { api } = useAPI();
+  const telemetry = useTelemetry();
+  const [continuousCompaction, setContinuousCompaction] = useExperiment(
+    EXPERIMENT_IDS.CONTINUOUS_COMPACTION
+  );
+  const [tokenBudget, setTokenBudget] = useExperiment(EXPERIMENT_IDS.TOKEN_BUDGET);
+  const ptc = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+  const rlm = useExperimentValue(EXPERIMENT_IDS.RLM);
+  // Preserve legacy both-enabled precedence without rewriting preferences on load.
+  const compactionStrategy: CompactionStrategy = continuousCompaction
+    ? "continuous"
+    : tokenBudget
+      ? "token-budget"
+      : "summarize";
+  const tokenBudgetInactive = compactionStrategy === "token-budget" && ptc && rlm;
+  const [compactionOpen, setCompactionOpen] = useState(false);
+  const sameStrategyActivation = useRef<CompactionStrategy | null>(null);
+  const markCompactionActivation = (value: CompactionStrategy) => {
+    if (value !== compactionStrategy) return;
+    // Radix omits onValueChange for an unchanged value. Only normalize if its
+    // activation also closes the menu, not on Escape or a typeahead-only Space.
+    sameStrategyActivation.current = value;
+    queueMicrotask(() => {
+      sameStrategyActivation.current = null;
+    });
+  };
+  const handleCompactionStrategyChange = (value: string) => {
+    assert(
+      value === "summarize" || value === "continuous" || value === "token-budget",
+      `Unexpected compaction strategy: ${value}`
+    );
+    switch (value) {
+      case "continuous":
+        setContinuousCompaction(true);
+        setTokenBudget(false);
+        break;
+      case "token-budget":
+        setTokenBudget(true);
+        setContinuousCompaction(false);
+        break;
+      case "summarize":
+        setTokenBudget(false);
+        setContinuousCompaction(false);
+        break;
+      default: {
+        const exhaustive: never = value;
+        return exhaustive;
+      }
+    }
+    // Retain the override events previously emitted by the individual experiment switches.
+    telemetry.experimentOverridden(EXPERIMENT_IDS.CONTINUOUS_COMPACTION, value === "continuous");
+    telemetry.experimentOverridden(EXPERIMENT_IDS.TOKEN_BUDGET, value === "token-budget");
+  };
   const [launchBehavior, setLaunchBehavior] = usePersistedState<LaunchBehavior>(
     LAUNCH_BEHAVIOR_KEY,
     "dashboard"
@@ -722,6 +785,58 @@ export function GeneralSection() {
             </Select>
           </div>
         </div>
+      </div>
+
+      <div className="border-border-light border-t pt-6">
+        <h3 className="text-foreground mb-4 text-sm font-medium">Compaction</h3>
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <div className="text-foreground text-sm">Compaction strategy</div>
+            <div className="text-muted text-xs">How to manage context as conversations grow.</div>
+          </div>
+          <Select
+            value={compactionStrategy}
+            onValueChange={handleCompactionStrategyChange}
+            open={compactionOpen}
+            onOpenChange={(open) => {
+              setCompactionOpen(open);
+              const activated = sameStrategyActivation.current;
+              sameStrategyActivation.current = null;
+              if (!open && activated) handleCompactionStrategyChange(activated);
+            }}
+          >
+            <SelectTrigger
+              aria-label="Compaction strategy"
+              aria-describedby={tokenBudgetInactive ? "token-budget-inactive" : undefined}
+              className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto shrink-0 cursor-pointer rounded-md border px-3 text-sm transition-colors"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {COMPACTION_STRATEGIES.map((strategy) => (
+                <SelectItem
+                  key={strategy.value}
+                  value={strategy.value}
+                  onPointerUp={() => markCompactionActivation(strategy.value)}
+                  onClick={() => markCompactionActivation(strategy.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      markCompactionActivation(strategy.value);
+                    }
+                  }}
+                >
+                  {strategy.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        {tokenBudgetInactive && (
+          <div id="token-budget-inactive" role="status" className="text-warning mt-2 text-xs">
+            Token Budget is saved but inactive while Programmatic Tool Calling and RLM Mode are both
+            enabled. Disable either in Experiments to use it.
+          </div>
+        )}
       </div>
 
       <div className="border-border-light border-t pt-6">

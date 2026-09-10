@@ -50,13 +50,17 @@ if [[ "$INPUT" =~ ^[0-9]{1,5}$ ]]; then
   # Get the latest failed non-visual-review run for this PR. Pixel review statuses are
   # intentionally ignored for merge readiness, so they should not drive log extraction.
   JQ_DEFS=$(visual_check_jq_defs)
-  RUN_ID=$(gh pr checks "$PR_NUMBER" --json name,link,state,bucket,workflow,description --jq "$JQ_DEFS .[] | select((is_visual_review_check | not) and is_failed_check) | .link" | sed -nE 's|.*/runs/([0-9]+).*|\1|p' | head -1 || echo "")
+  if ! CHECKS=$(fetch_pr_checks "$PR_NUMBER"); then
+    echo "❌ Failed to get complete PR checks for PR #$PR_NUMBER" >&2
+    exit 1
+  fi
+  RUN_ID=$(jq -r "$JQ_DEFS [ .[] | select((is_visual_review_check | not) and is_failed_check) | .link | capture(\"/runs/(?<id>[0-9]+)\")? | .id ][0] // empty" <<<"$CHECKS")
 
   if [[ -z "$RUN_ID" ]]; then
     echo "❌ No failed non-visual-review runs found for PR #$PR_NUMBER" >&2
     echo "" >&2
     echo "Current non-visual-review check status:" >&2
-    gh pr checks "$PR_NUMBER" --json name,state,bucket,workflow,link,description --jq "$JQ_DEFS .[] | select(is_visual_review_check | not) | check_line" 2>&1 || true
+    jq -r "$JQ_DEFS .[] | select(is_visual_review_check | not) | check_line" <<<"$CHECKS" >&2
     exit 1
   fi
 
@@ -79,7 +83,7 @@ fi
 
 # Filter to failed jobs only (unless specific pattern requested)
 if [[ -z "$JOB_PATTERN" ]]; then
-  FAILED_JOBS=$(echo "$JOBS" | jq -r 'select(.conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or .conclusion == "CANCELLED")')
+  FAILED_JOBS=$(echo "$JOBS" | jq -r 'select(.conclusion // "" | ascii_upcase | IN("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"))')
   if [[ -n "$FAILED_JOBS" ]]; then
     echo "🎯 Showing only failed jobs (use job_pattern to see others)" >&2
     JOBS="$FAILED_JOBS"
@@ -144,7 +148,7 @@ for JOB_ID in $JOB_IDS; do
 
   while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
     # Use gh api to fetch logs (works for individual completed jobs even if run is in progress)
-    if gh api "/repos/coder/mux/actions/jobs/$JOB_ID/logs" 2>/dev/null; then
+    if gh api "repos/{owner}/{repo}/actions/jobs/$JOB_ID/logs" 2>/dev/null; then
       break
     else
       RETRY_COUNT=$((RETRY_COUNT + 1))

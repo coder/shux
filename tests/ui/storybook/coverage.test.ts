@@ -85,14 +85,6 @@ describe("Storybook coverage contract", () => {
   });
 
   describe("Story-specific visual contracts", () => {
-    test("chat loading phone story pins Pixel and local mobile viewports", () => {
-      const content = readFileSync("src/browser/stories/App.chatLoading.stories.tsx", "utf-8");
-      const phoneStory = content.slice(content.indexOf("export const Phone"));
-      expect(phoneStory).toMatch(/viewports:\s*\["phone"\]/);
-      expect(phoneStory).toMatch(/viewport:\s*\{\s*value:\s*"mobile1"/);
-      expect(phoneStory).toMatch(/width:\s*390/);
-    });
-
     test("plan ToC story pins a wide Pixel viewport", () => {
       const content = readFileSync(PLAN_TOC_STORY_PATH, "utf-8");
 

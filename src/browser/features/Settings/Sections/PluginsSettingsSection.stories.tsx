@@ -334,9 +334,9 @@ export const AddPluginConsentPreview: Story = {
     await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
 
     // Consent card: manifest + every skill + every MCP command line before install.
-    await canvas.findByText("Skills (2)");
-    await canvas.findByText("grill-lite");
-    await canvas.findByText("MCP servers (1)");
+    await canvas.findByRole("group", { name: "Skills" });
+    await canvas.findByRole("checkbox", { name: "grill-lite" });
+    await canvas.findByRole("group", { name: "MCP servers" });
     await canvas.findByText(/server\.js --db/);
     // Every activatable component type is disclosed, not just skills/MCP.
     await canvas.findByText("Agents (1)");

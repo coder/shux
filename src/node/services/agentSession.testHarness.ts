@@ -129,8 +129,16 @@ function createMockAiService(args: {
         Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
       )
     ),
-    getWorkspaceMetadata: mock(() =>
-      Promise.resolve(Err("Test AI service has no workspace metadata"))
+    getWorkspaceMetadata: mock((workspaceId: string) =>
+      Promise.resolve(
+        Ok({
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "project",
+          projectPath: "/tmp/project",
+          runtimeConfig: { type: "local" as const },
+        })
+      )
     ),
     getProvidersConfig: mock(() => null),
     isExperimentEnabled: mock((_experimentId) => false),

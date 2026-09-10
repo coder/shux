@@ -143,15 +143,16 @@ else:
 
     def test_security_headings_do_not_hide_findings(self):
         clean = FIXTURES["security_no_findings"]["body"]
-        for header in (
+        headers = (
             "### 🛡️ Codex Security Review\n\n",
             "### 🛡️ Codex Security Review · _Automatically triggered_\n\n",
-        ):
+        )
+        for header in headers:
             for body, expected in (
                 (clean, 0),
                 (clean + "\n\n[P1] A security issue still needs fixing.", 1),
                 ("Security review completed. Found a P1 credential disclosure.", 1),
-                (header + clean, 1),
+                *((duplicate + clean, 1) for duplicate in headers),
             ):
                 with self.subTest(header=header, body=body):
                     self.assert_gate(expected, snapshot([comment(header + body)]))
@@ -217,6 +218,9 @@ else:
                 "No security issues were found in this pull request.",
                 "Found a P1 credential disclosure.",
             ),
+            FIXTURES["security_no_findings_titled"]["body"].replace(
+                "Automatically triggered", "[P1] A finding in the heading"
+            ),
             FIXTURES["security_no_findings"]["body"].replace(
                 "</details>", "[P1] A finding inside the footer.\n</details>"
             ),
@@ -270,12 +274,13 @@ else:
 
     def test_informational_comments_do_not_hide_findings_or_account_errors(self):
         request = comment("@codex review", "maintainer", REQUEST)
-        for name in ("summary", "security_no_findings"):
+        for name in ("summary", "security_no_findings", "security_no_findings_titled"):
             comments = [request, comment(FIXTURES[name]["body"])]
             for extra_comments, threads in (
                 ([comment("[P1] Fix authorization")], []),
                 ([], [thread("[P1] Fix authorization")]),
                 ([comment("Please create a Codex account to review.")], []),
+                ([comment("Codex usage limits have been reached.")], []),
             ):
                 with self.subTest(name=name, comments=extra_comments, threads=threads):
                     self.assert_gate(

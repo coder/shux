@@ -99,6 +99,7 @@ export const CommandIds = {
 
   // Agent Plugin commands (agent-plugins experiment)
   pluginsInstall: () => "plugins:install" as const,
+  pluginsAddComponents: () => "plugins:add-components" as const,
   pluginsUninstall: () => "plugins:uninstall" as const,
   pluginsCheckUpdates: () => "plugins:check-updates" as const,
   pluginsUpdateAll: () => "plugins:update-all" as const,
@@ -110,6 +111,7 @@ export const CommandIds = {
   updateCheck: () => "update:check" as const,
   updateDownload: () => "update:download" as const,
   updateInstall: () => "update:install" as const,
+  updateInstallForce: () => "update:install-force" as const,
   updateChannel: (channel: string) => `update:channel:${channel}` as const,
 } as const;
 

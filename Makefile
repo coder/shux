@@ -434,9 +434,12 @@ check-deadcode: node_modules/.installed ## Check for potential dead code (manual
 		|| echo "✓ No obvious dead code found"
 
 ## Testing
-.PHONY: test-codex-comments
+.PHONY: test-codex-comments test-pr-checks
 test-codex-comments: ## Test Codex comment gates with offline GitHub fixtures
 	@python3 scripts/check_codex_comments_test.py
+
+test-pr-checks: ## Test PR check discovery and readiness with offline GitHub fixtures
+	@python3 scripts/pr_checks_test.py
 
 test-integration: node_modules/.installed build-main ## Run all tests (unit + integration)
 	@bun test src

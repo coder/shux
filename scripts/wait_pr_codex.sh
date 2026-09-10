@@ -466,7 +466,7 @@ CHECK_CODEX_STATUS_ONCE() {
     include "codex_comments";
     [.[] | select(.author.login == $bot and .createdAt > $request_at)
       | select(
-          ((.body | startswith("<!-- codex-pull-request-review-summary -->") or startswith("Security review completed."))
+          ((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->") or startswith("Security review completed."))
             and codex_comment_is_informational($bot)) | not
         )] | length
   ')

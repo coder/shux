@@ -2333,31 +2333,20 @@ export class TaskService implements AgentTaskIntegration {
       (task) => task.taskStatus === "starting" && typeof task.id === "string"
     );
     if (staleStartingTasks.length > 0) {
-      const recoveries = new Map<
-        string,
-        { status: Extract<AgentTaskStatus, "queued" | "running">; acceptedPrompt: boolean }
-      >();
+      let acceptedPromptCount = 0;
       for (const task of staleStartingTasks) {
         assert(task.id != null && task.id.length > 0, "stale starting task id is required");
         const isStreaming = this.aiService.isStreaming(task.id);
-        recoveries.set(task.id, {
-          status: isStreaming ? "running" : "queued",
-          acceptedPrompt: !isStreaming && (await this.hasAcceptedInitialTaskPrompt(task.id)),
-        });
-      }
-
-      for (const task of staleStartingTasks) {
-        assert(task.id != null && task.id.length > 0, "stale starting task id is required");
-        const recovery = recoveries.get(task.id);
-        assert(recovery != null, "stale starting task recovery is required");
+        const acceptedPrompt = !isStreaming && (await this.hasAcceptedInitialTaskPrompt(task.id));
+        if (acceptedPrompt) acceptedPromptCount += 1;
         try {
           await this.editActiveWorkspaceEntry(
             task.id,
             (workspace) => {
               if (workspace.taskStatus !== "starting") return;
-              workspace.taskStatus = recovery.status;
+              workspace.taskStatus = isStreaming ? "running" : "queued";
               // History already owns accepted prompts; do not duplicate them on restart.
-              if (recovery.acceptedPrompt) workspace.taskPrompt = undefined;
+              if (acceptedPrompt) workspace.taskPrompt = undefined;
             },
             { allowMissing: true }
           );
@@ -2367,56 +2356,87 @@ export class TaskService implements AgentTaskIntegration {
       }
       log.info("[startup] Recovered stale starting agent tasks", {
         count: staleStartingTasks.length,
-        acceptedPromptCount: [...recoveries.values()].filter((recovery) => recovery.acceptedPrompt)
-          .length,
+        acceptedPromptCount,
       });
     }
 
+    let config = this.config.loadConfigOrDefault();
+    let taskIndex = this.buildAgentTaskIndex(config);
+    const startupTasks = () =>
+      this.listAgentTaskWorkspaces(config).filter(
+        (task) => task.id && ["running", "awaiting_report"].includes(task.taskStatus ?? "running")
+      );
+
+    // Workflow cancellation is authoritative even when a child has its own Stop or question.
+    for (const task of startupTasks()) {
+      await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+        task.id!,
+        config,
+        "startup-inactive-workflow-owner-prepass",
+        taskIndex,
+        { scheduleQueueDrain: false }
+      );
+    }
+    config = this.config.loadConfigOrDefault();
+    const candidates = startupTasks();
+    const states = new Map(
+      await Promise.all(
+        candidates.map(
+          async (task) =>
+            [task.id, await this.workspaceService.getStartupRecoveryState(task.id!)] as const
+        )
+      )
+    );
+    for (const task of candidates) {
+      const id = task.id!;
+      if (states.get(id) !== "stopped") continue;
+      await this.withTaskTreeLifecycleLock(id, async () => {
+        if (this.aiService.isStreaming(id) || this.workspaceService.isBusyForMessage(id)) return;
+        const stopped = await this.stopDescendantAgentTaskUnderLifecycleLock(
+          task.parentWorkspaceId!,
+          id,
+          false
+        );
+        if (!stopped.success) throw new Error(stopped.error);
+      }).catch((error: unknown) => {
+        log.warn("Failed to settle stopped task on startup", { taskId: id, error });
+      });
+    }
+
+    // Normalize stopped capacity before launching siblings; newly launched work is not part of
+    // the recovery snapshot and must never be interrupted by an old Stop or opt-out.
     const maybeStartQueuedTasksStartedAt = Date.now();
     await this.maybeStartQueuedTasks();
     const maybeStartQueuedTasksMs = Date.now() - maybeStartQueuedTasksStartedAt;
 
-    let config = this.config.loadConfigOrDefault();
-    let taskIndex = this.buildAgentTaskIndex(config);
-    // Recompute the startup recovery candidate lists from a config snapshot. Hoisted into a
-    // closure so the post-interrupt refresh below reuses the exact same status filters.
-    const listStartupRecoveryCandidates = (
-      sourceConfig: ProjectsConfig
-    ): {
-      awaitingReportTasks: AgentTaskWorkspaceEntry[];
-      runningTasks: AgentTaskWorkspaceEntry[];
-    } => ({
-      awaitingReportTasks: this.listAgentTaskWorkspaces(sourceConfig).filter(
-        (t) => t.taskStatus === "awaiting_report"
-      ),
-      runningTasks: this.listAgentTaskWorkspaces(sourceConfig).filter(
-        (t) => t.taskStatus === "running"
-      ),
-    });
-    let { awaitingReportTasks, runningTasks } = listStartupRecoveryCandidates(config);
+    // Recovery awaits and queue draining can change task status: re-read before replaying intent.
+    config = this.config.loadConfigOrDefault();
+    taskIndex = this.buildAgentTaskIndex(config);
+    const eligible = startupTasks().filter(
+      (task) => states.has(task.id) && !["blocked", "stopped"].includes(states.get(task.id)!)
+    );
+    const awaitingReportTasks = eligible.filter(
+      (task) => task.taskStatus === "awaiting_report" && states.get(task.id) !== "question"
+    );
+    const runningTasks = eligible.filter(
+      (task) => (task.taskStatus ?? "running") === "running" || states.get(task.id) === "question"
+    );
 
-    let interruptedInactiveWorkflowOwnerAtStartup = false;
-    for (const task of [...awaitingReportTasks, ...runningTasks]) {
-      if (!task.id) continue;
+    const admitRecovery = async (task: (typeof eligible)[number], reason: string) => {
       if (
-        await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-          task.id,
+        !(await this.admitTaskDesktopRecovery(task.id!)) ||
+        (await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+          task.id!,
           config,
-          "startup-inactive-workflow-owner-prepass",
-          taskIndex,
-          { scheduleQueueDrain: false }
-        )
-      ) {
-        interruptedInactiveWorkflowOwnerAtStartup = true;
-      }
-    }
-    if (interruptedInactiveWorkflowOwnerAtStartup) {
-      // Refresh before descendant checks so a parent awaiting_report task does not stay
-      // blocked by a child that this startup pass just interrupted.
-      config = this.config.loadConfigOrDefault();
-      taskIndex = this.buildAgentTaskIndex(config);
-      ({ awaitingReportTasks, runningTasks } = listStartupRecoveryCandidates(config));
-    }
+          reason,
+          taskIndex
+        ))
+      )
+        return false;
+      // Earlier recovery awaits can finish other candidates; verify live status at each dispatch.
+      const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), task.id!)?.workspace;
+      return latest != null && latest.taskStatus === task.taskStatus;
+    };
 
     let resumedAwaitingReportCount = 0;
     let skippedAwaitingReportDueToActiveDescendants = 0;
@@ -2424,18 +2444,7 @@ export class TaskService implements AgentTaskIntegration {
 
     for (const task of awaitingReportTasks) {
       if (!task.id) continue;
-      if (!(await this.admitTaskDesktopRecovery(task.id))) continue;
-
-      if (
-        await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-          task.id,
-          config,
-          "startup-awaiting-report",
-          taskIndex
-        )
-      ) {
-        continue;
-      }
+      if (!(await admitRecovery(task, "startup-awaiting-report"))) continue;
 
       // Avoid resuming a task while it still has blocking active descendants (it shouldn't report yet).
       const hasBlockingActiveDescendants =
@@ -2445,6 +2454,10 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
 
+      const followUp = await this.workspaceService.dispatchPendingCompactionFollowUp(task.id);
+      if (!followUp.success) failedAwaitingReportCount += 1;
+      else if (followUp.data) resumedAwaitingReportCount += 1;
+      if (!followUp.success || followUp.data) continue;
       const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
         reason: "startup",
       });
@@ -2463,57 +2476,56 @@ export class TaskService implements AgentTaskIntegration {
 
     for (const task of runningTasks) {
       if (!task.id) continue;
-      if (!(await this.admitTaskDesktopRecovery(task.id))) continue;
-      if (
-        await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-          task.id,
-          config,
-          "startup-running",
-          taskIndex
-        )
-      ) {
+      if (!(await admitRecovery(task, "startup-running"))) continue;
+
+      const pendingGuidance = task.taskPendingGuidance ?? [];
+      const queueOnly = states.get(task.id) === "question";
+      if (queueOnly && pendingGuidance.length === 0) continue;
+      const alreadyStreaming = this.aiService.isStreaming(task.id);
+      // Guidance must queue even for active tasks; generic restart nudges must not.
+      if (alreadyStreaming && pendingGuidance.length === 0) {
+        skippedRunningAlreadyStreaming += 1;
+        continue;
+      }
+      const hasBlockingActiveDescendants =
+        this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(taskIndex, task.id).length > 0;
+      if (hasBlockingActiveDescendants && pendingGuidance.length === 0) {
+        skippedRunningDueToActiveDescendants += 1;
         continue;
       }
 
-      const pendingGuidance = task.taskPendingGuidance ?? [];
+      // Restore compaction intent before new guidance/nudges make its tail stale.
+      // Guidance then queues behind that continuation without losing either payload.
+      const followUp =
+        alreadyStreaming || queueOnly
+          ? Ok(false)
+          : await this.workspaceService.dispatchPendingCompactionFollowUp(task.id);
+      if (!followUp.success) failedRunningCount += 1;
+      else if (followUp.data && pendingGuidance.length === 0) resumedRunningCount += 1;
+      if (!followUp.success || (followUp.data && pendingGuidance.length === 0)) continue;
+      const model = task.taskModelString ?? defaultModel;
+      const agentId = resolveTaskAgentIdForResume(task);
+      const sendOptions = {
+        model,
+        agentId,
+        thinkingLevel: task.taskThinkingLevel,
+        reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
+        experiments: task.taskExperiments,
+      };
       if (pendingGuidance.length > 0) {
-        // Pending corrections outrank generic restart recovery and must replay even when this task
-        // still has active descendants. Otherwise the descendant gate below can strand the durable
-        // reservation forever after the in-memory queue is lost on restart.
-        const pendingGuidanceIds = new Set(pendingGuidance.map((guidance) => guidance.id));
-        const model = task.taskModelString ?? defaultModel;
-        const agentId = resolveTaskAgentIdForResume(task);
-        const clearAcceptedPendingGuidance = async (): Promise<void> => {
-          await this.editWorkspaceEntry(
-            task.id!,
-            (workspace) => {
-              const remaining = (workspace.taskPendingGuidance ?? []).filter(
-                (guidance) => !pendingGuidanceIds.has(guidance.id)
-              );
-              workspace.taskPendingGuidance = remaining.length > 0 ? remaining : undefined;
-            },
-            { allowMissing: true }
+        let sendResult: Result<void, SendMessageError> = Ok(undefined);
+        for (const guidance of pendingGuidance) {
+          sendResult = await this.workspaceService.sendMessage(
+            task.id,
+            `Updated guidance from parent:\n\n${guidance.message}`,
+            { ...sendOptions, queueDispatchMode: guidance.queueDispatchMode },
+            {
+              ...this.taskGuidanceSendOptions(task.id, guidance.id, task.taskStatus ?? "running"),
+              restoreQueued: queueOnly,
+            }
           );
-        };
-        const sendResult = await this.workspaceService.sendMessage(
-          task.id,
-          "Xum restarted before these parent guidance updates could run. Apply them in order and continue:\n\n" +
-            pendingGuidance
-              .map((guidance, index) => `${index + 1}. ${guidance.message}`)
-              .join("\n\n"),
-          {
-            model,
-            agentId,
-            thinkingLevel: task.taskThinkingLevel,
-            reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
-            experiments: task.taskExperiments,
-          },
-          {
-            synthetic: true,
-            agentInitiated: true,
-            onAccepted: clearAcceptedPendingGuidance,
-          }
-        );
+          if (!sendResult.success) break;
+        }
         if (!sendResult.success) {
           failedRunningCount += 1;
           log.error("Failed to replay pending task guidance on startup", {
@@ -2526,37 +2538,22 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
 
-      // The queue drain above can have launched this task already; nudging it again would queue
-      // a spurious "Xum restarted" turn behind its first stream.
-      if (this.aiService.isStreaming(task.id)) {
-        skippedRunningAlreadyStreaming += 1;
-        continue;
-      }
-
-      // Best-effort: if xum restarted mid-stream, nudge the agent to continue and report.
-      // Only do this when the task has no blocking running descendants, to avoid duplicate spawns.
-      const hasBlockingActiveDescendants =
-        this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(taskIndex, task.id).length > 0;
-      if (hasBlockingActiveDescendants) {
-        skippedRunningDueToActiveDescendants += 1;
-        continue;
-      }
-
+      // Legacy tasks lack active-status evidence. Durable compaction/guidance above still wins.
+      if (task.taskStatus == null && states.get(task.id) !== "interrupted") continue;
       const isPlanLike = await this.isPlanLikeTaskWorkspace({
         projectPath: task.projectPath,
         workspace: task,
       });
 
-      const model = task.taskModelString ?? defaultModel;
-      const agentId = resolveTaskAgentIdForResume(task);
-      log.info("[startup] Resuming running task", {
+      const logContext = {
         taskId: task.id,
         taskName: task.name,
         projectPath: task.projectPath,
         model,
         agentId,
         isPlanLike,
-      });
+      };
+      log.info("[startup] Resuming running task", logContext);
       const resumeStartedAt = Date.now();
       const restartCompletionInstruction = isPlanLike
         ? "When you have a final plan, call propose_plan exactly once."
@@ -2565,25 +2562,14 @@ export class TaskService implements AgentTaskIntegration {
         task.id,
         "Xum restarted while this task was running. Continue where you left off. " +
           restartCompletionInstruction,
-        {
-          model,
-          agentId,
-          thinkingLevel: task.taskThinkingLevel,
-          reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
-          experiments: task.taskExperiments,
-        },
+        sendOptions,
         { synthetic: true, agentInitiated: true }
       );
       const durationMs = Date.now() - resumeStartedAt;
       if (!sendResult.success) {
         failedRunningCount += 1;
         log.error("Failed to resume running task on startup", {
-          taskId: task.id,
-          taskName: task.name,
-          projectPath: task.projectPath,
-          model,
-          agentId,
-          isPlanLike,
+          ...logContext,
           durationMs,
           error: sendResult.error,
         });
@@ -2591,21 +2577,7 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       resumedRunningCount += 1;
-      log.info("[startup] Resumed running task", {
-        taskId: task.id,
-        taskName: task.name,
-        projectPath: task.projectPath,
-        model,
-        agentId,
-        isPlanLike,
-        durationMs,
-      });
-    }
-
-    if (interruptedInactiveWorkflowOwnerAtStartup) {
-      // Startup queue draining already ran before these interruptions freed slots.
-      // Run it once more after recovery prompts so unrelated queued work is not stranded.
-      await this.maybeStartQueuedTasks();
+      log.info("[startup] Resumed running task", { ...logContext, durationMs });
     }
 
     log.info("[startup] TaskService.recoverInterruptedTasks completed", {
@@ -4670,17 +4642,14 @@ export class TaskService implements AgentTaskIntegration {
         await this.editActiveWorkspaceEntry(
           taskId,
           (workspace) => {
-            workspace.taskPendingGuidance = [
-              ...(workspace.taskPendingGuidance ?? []),
-              {
-                id: guidanceId,
-                // Startup-recovery replay presents reservations as parent guidance, so
-                // non-default labels (sibling messages) must keep their attribution in
-                // the durable record.
-                message: options?.messageLabel != null ? labeledMessage : trimmedMessage,
-                queueDispatchMode,
-              },
-            ];
+            (workspace.taskPendingGuidance ??= []).push({
+              id: guidanceId,
+              // Startup-recovery replay presents reservations as parent guidance, so
+              // non-default labels (sibling messages) must keep their attribution in
+              // the durable record.
+              message: options?.messageLabel != null ? labeledMessage : trimmedMessage,
+              queueDispatchMode,
+            });
             if (workspace.taskStatus == null || previousStatus === "awaiting_report") {
               // Persist the legacy implicit-running state so startup recovery can replay this durable
               // guidance if Xum exits before the replacement turn accepts it.
@@ -4690,29 +4659,6 @@ export class TaskService implements AgentTaskIntegration {
           { allowMissing: true }
         );
 
-        const clearGuidanceReservation = async (restoreAfterFailure: boolean): Promise<void> => {
-          await this.editWorkspaceEntry(
-            taskId,
-            (workspace) => {
-              const remainingGuidance = (workspace.taskPendingGuidance ?? []).filter(
-                (guidance) => guidance.id !== guidanceId
-              );
-              workspace.taskPendingGuidance =
-                remainingGuidance.length > 0 ? remainingGuidance : undefined;
-              if (
-                restoreAfterFailure &&
-                remainingGuidance.length === 0 &&
-                workspace.taskStatus === "running"
-              ) {
-                workspace.taskStatus = this.aiService.isStreaming(taskId)
-                  ? previousStatus
-                  : "awaiting_report";
-              }
-            },
-            { allowMissing: true }
-          );
-        };
-
         const activeAgentId = resolveTaskAgentIdForResume(entry.workspace);
         const activeAiSettings = this.resolveWorkspaceAISettings(entry.workspace, activeAgentId);
         // Parent guidance continues the delegated execution, rather than superseding it and
@@ -4721,6 +4667,18 @@ export class TaskService implements AgentTaskIntegration {
           await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
             taskId
           );
+        const guidance = this.taskGuidanceSendOptions(taskId, guidanceId, previousStatus);
+        const settleFailure = async (status: "interrupted" | "error", reason: string) => {
+          await guidance.onCanceled();
+          if (workspaceTurnMuxMetadata != null) {
+            await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
+              taskId,
+              workspaceTurnMuxMetadata,
+              status,
+              reason
+            );
+          }
+        };
         let accepted = false;
         const sendResult = await this.workspaceService.sendMessage(
           taskId,
@@ -4740,54 +4698,29 @@ export class TaskService implements AgentTaskIntegration {
             ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
           },
           {
-            synthetic: true,
-            agentInitiated: true,
-            startStreamInBackground: true,
+            ...guidance,
             workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
-            ...(workspaceTurnMuxMetadata != null
-              ? {
-                  onCanceled: async (reason: string) => {
-                    await clearGuidanceReservation(true);
-                    await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-                      taskId,
-                      workspaceTurnMuxMetadata,
-                      "interrupted",
-                      reason
-                    );
-                  },
-                }
-              : {}),
+            onCanceled: (reason) => settleFailure("interrupted", reason),
             // Live target: pre-turn rows ride the send through AgentSession
             // turn admission (queued with the trigger when the target is busy).
             preTurnMessages: options?.preTurnMessages,
-            onAcceptedPreStreamFailure: async (error: SendMessageError) => {
-              // If the replacement turn cannot start, remove the settlement reservation and restore
-              // an idle child to completion recovery instead of leaving it permanently running.
-              await clearGuidanceReservation(true);
-              if (workspaceTurnMuxMetadata != null) {
-                await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-                  taskId,
-                  workspaceTurnMuxMetadata,
-                  "error",
-                  formatSendMessageError(error).message
-                );
-              }
-            },
+            // If the replacement turn cannot start, remove the settlement reservation and restore
+            // an idle child to completion recovery instead of leaving it permanently running.
+            onAcceptedPreStreamFailure: (error) =>
+              settleFailure("error", formatSendMessageError(error).message),
             onAccepted: async () => {
-              await clearGuidanceReservation(false);
+              await guidance.onAccepted();
               accepted = true;
             },
             // r54: persistence is signaled at the rollback horizon, not at
             // acceptance — acceptance can fail after the pre-turn batch is
             // already irrevocable, and the budget charge must stick then.
-            onPreTurnRowsPersisted: () => {
-              options?.onPreTurnPersisted?.();
-            },
+            onPreTurnRowsPersisted: options?.onPreTurnPersisted,
           }
         );
 
         if (!sendResult.success) {
-          await clearGuidanceReservation(true);
+          await guidance.onCanceled();
           return Err({
             code: "send_failed" as const,
             message: formatSendMessageError(sendResult.error).message,
@@ -4797,6 +4730,41 @@ export class TaskService implements AgentTaskIntegration {
         return Ok(accepted ? { delivery: "accepted" } : { delivery: "queued", queueDispatchMode });
       })
     );
+  }
+
+  private taskGuidanceSendOptions(
+    taskId: string,
+    guidanceId: string,
+    previousStatus: AgentTaskStatus
+  ) {
+    const clear = async (failed = false): Promise<void> => {
+      await this.editWorkspaceEntry(
+        taskId,
+        (workspace) => {
+          const remaining = (workspace.taskPendingGuidance ?? []).filter(
+            (guidance) => guidance.id !== guidanceId
+          );
+          workspace.taskPendingGuidance = remaining.length > 0 ? remaining : undefined;
+          if (failed && remaining.length === 0 && workspace.taskStatus === "running") {
+            workspace.taskStatus = this.aiService.isStreaming(taskId)
+              ? previousStatus
+              : "awaiting_report";
+          }
+        },
+        { allowMissing: true }
+      );
+    };
+    const onCanceled = () => clear(true);
+    // Live and restored guidance must share the same handoff and settlement lifecycle.
+    return {
+      synthetic: true,
+      agentInitiated: true,
+      startStreamInBackground: true,
+      queueDedupeKey: guidanceId,
+      onAccepted: () => clear(),
+      onCanceled,
+      onAcceptedPreStreamFailure: onCanceled,
+    };
   }
 
   /**
@@ -5591,7 +5559,8 @@ export class TaskService implements AgentTaskIntegration {
 
   private async stopDescendantAgentTaskUnderLifecycleLock(
     ancestorWorkspaceId: string,
-    taskId: string
+    taskId: string,
+    drainQueue = true
   ): Promise<Result<{ stoppedTaskIds: string[] }, string>> {
     const stoppedTaskIds: string[] = [];
     const metadataToEmit = new Set<string>();
@@ -5646,10 +5615,15 @@ export class TaskService implements AgentTaskIntegration {
             continue;
           }
 
+          // Stop cancels the durable queue too, but never guidance authored after this snapshot.
+          const canceledGuidance = new Set(
+            current.workspace.taskPendingGuidance?.map((entry) => entry.id)
+          );
           for (const handle of activeHandles) {
             const interrupted = await this.getWorkspaceTurnManager().interruptWorkspaceTurn(
               handle.ownerWorkspaceId,
-              handle.handleId
+              handle.handleId,
+              { scheduleQueueDrain: false }
             );
             if (!interrupted.success) {
               return Err(interrupted.error);
@@ -5683,6 +5657,10 @@ export class TaskService implements AgentTaskIntegration {
             (workspace) => {
               const previousStatus = workspace.taskStatus;
               parentWorkspaceId = workspace.parentWorkspaceId;
+              workspace.taskPendingGuidance = workspace.taskPendingGuidance?.filter(
+                (entry) => !canceledGuidance.has(entry.id)
+              );
+              if (workspace.taskPendingGuidance?.length === 0) delete workspace.taskPendingGuidance;
               const mutation = this.applyInterruptedTaskStatus(workspace);
               transitioned = mutation === "interrupted" && previousStatus !== "interrupted";
             },
@@ -5713,7 +5691,7 @@ export class TaskService implements AgentTaskIntegration {
     for (const id of metadataToEmit) {
       await this.emitWorkspaceMetadata(id);
     }
-    await this.maybeStartQueuedTasks();
+    if (drainQueue) await this.maybeStartQueuedTasks();
     return Ok({ stoppedTaskIds });
   }
 
@@ -9669,6 +9647,35 @@ export class TaskService implements AgentTaskIntegration {
       hasAncestorWorkspaceId(reports.artifactsByChildTaskId[taskId], ancestorWorkspaceId) ||
       hasAncestorWorkspaceId(failures.failuresByChildTaskId[taskId], ancestorWorkspaceId)
     );
+  }
+
+  /**
+   * Locate a live descendant's branch root: the direct child of `ancestorWorkspaceId` on the
+   * parent chain leading to `taskId` (the task itself for a direct child). Callers that must
+   * respect the ancestor's privacy floor prove that this branch root was created inside the
+   * ancestor's current context segment; verified ancestry then extends the proof to the whole
+   * branch. Tasks that were removed (tombstone/report evidence only) have no live chain.
+   */
+  async resolveDescendantAgentTaskBranchRoot(
+    ancestorWorkspaceId: string,
+    taskId: string
+  ): Promise<{ status: "live"; branchRootTaskId: string } | { status: "removed" | "unrelated" }> {
+    assert(
+      ancestorWorkspaceId.length > 0,
+      "resolveDescendantAgentTaskBranchRoot: ancestor required"
+    );
+    assert(taskId.length > 0, "resolveDescendantAgentTaskBranchRoot: taskId required");
+    const parentById = this.buildAgentTaskIndex(this.config.loadConfigOrDefault()).parentById;
+    let current = taskId;
+    for (let i = 0; i < 32; i++) {
+      const parent = parentById.get(current);
+      if (!parent) break;
+      if (parent === ancestorWorkspaceId) return { status: "live", branchRootTaskId: current };
+      current = parent;
+    }
+    return (await this.isDescendantAgentTask(ancestorWorkspaceId, taskId))
+      ? { status: "removed" }
+      : { status: "unrelated" };
   }
 
   isDescendantAgentTaskUsingParentById(

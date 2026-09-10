@@ -16,6 +16,7 @@ import type { AgentSkillListToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
 import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
 import {
   discoverAgentSkills,
@@ -229,6 +230,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           skillsRoot: string;
           containmentRoot: string;
           scope: "global" | "project";
+          importedSkills?: readonly string[];
         }> = [
           {
             skillsRoot: path.join(xumScope.xumHome, "skills"),
@@ -285,7 +287,11 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
                   },
                 ]
               : []),
-            { path: path.join(xumScope.xumHome, "plugins"), scope: "global" as const },
+            {
+              path: path.join(xumScope.xumHome, "plugins"),
+              scope: "global" as const,
+              registryPath: path.join(xumScope.xumHome, PLUGIN_REGISTRY_FILE_NAME),
+            },
             { path: path.join(userHome, ".agents", "plugins"), scope: "global" as const },
           ];
           const { plugins } = await discoverAgentPlugins(pluginContainers);
@@ -310,13 +316,14 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               skillsRoot: plugin.skillsDir,
               containmentRoot: plugin.rootPath,
               scope: plugin.scope,
+              importedSkills: plugin.importedComponents?.skills,
             });
           }
         }
 
         const skills: AgentSkillDescriptor[] = [];
         const seenByScope = new Set<string>();
-        for (const { skillsRoot, containmentRoot, scope } of roots) {
+        for (const { skillsRoot, containmentRoot, scope, importedSkills } of roots) {
           let skillsRootReal: string;
           try {
             skillsRootReal = await fsPromises.realpath(skillsRoot);
@@ -338,6 +345,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
 
           const directoryNames = await listSkillDirectories(skillsRootReal);
           for (const directoryName of directoryNames) {
+            // Skipped plugin skills must not claim a same-named fallback in this manual scan.
+            if (importedSkills != null && !importedSkills.includes(directoryName)) continue;
             // SECURITY: symlinked skill directories are allowed only through
             // readSkillDescriptor's realpath containment check, which rejects
             // entries resolving outside the containment root. This matches the

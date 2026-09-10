@@ -263,6 +263,8 @@ export interface SettledStepBudget {
   toolResultTokens?: number;
   sessionHistoryAvailable: boolean;
   memoryWritable: boolean;
+  /** A successful `new_context` result settled in this step (its siblings included). */
+  newContextRequested?: boolean;
 }
 
 export type OnStepSettled = (
@@ -2408,6 +2410,10 @@ export class StreamManager {
       return (
         lastStep?.toolResults?.some(
           (toolResult) =>
+            // A context-lifecycle request is never a terminal completion, even if a policy
+            // lists it as required; otherwise its success would end the stream before the
+            // settled-step callback could schedule the rollover it promised.
+            toolResult.toolName !== "new_context" &&
             requiredPatterns.some((pattern) => pattern.test(toolResult.toolName)) &&
             isSuccessfulOutput(toolResult.output)
         ) ?? false
@@ -2436,6 +2442,9 @@ export class StreamManager {
             toolResultTokens,
             sessionHistoryAvailable: request.tools?.session_history != null,
             memoryWritable: request.contextBudgetMemoryWritable === true,
+            newContextRequested: step.toolResults.some(
+              (result) => result.toolName === "new_context" && isSuccessfulOutput(result.output)
+            ),
           });
           // All siblings have settled: stop before another provider step without discarding results.
           if (decision === "block")

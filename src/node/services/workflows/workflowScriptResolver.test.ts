@@ -393,6 +393,36 @@ describe("resolveWorkflowScript", () => {
       expect(resolved.source).toContain("plugin-flow");
     });
 
+    test("plugin workflows retain a global fallback after rejecting an outward project alias", async () => {
+      using tempDir = new TestTempDir("workflow-plugin-global-alias");
+      const project = path.join(tempDir.path, "checkout");
+      const globalContainer = path.join(tempDir.path, "global", "plugins");
+      const alias = path.join(project, ".xum", "plugins");
+      await writePluginWithWorkflow(globalContainer, "fallback-plugin", "release.js");
+      await fs.mkdir(path.dirname(alias), { recursive: true });
+      await fs.symlink(globalContainer, alias, "dir");
+      const input = {
+        scriptPath: "plugin://fallback-plugin/release.js",
+        runtime: new LocalRuntime(project),
+        workspacePath: project,
+        projectTrusted: true,
+        includeAgentPlugins: true,
+        roots: {
+          ...createIsolatedAgentSkillsRoots(tempDir.path),
+          projectPluginRoots: [alias],
+          globalPluginRoots: [globalContainer],
+        },
+      };
+      const resolved = await resolveWorkflowScript(input);
+      expect(resolved.scope).toBe("global");
+      expect(resolved.resolvedPath).toBe(
+        await fs.realpath(path.join(globalContainer, "fallback-plugin", "workflows", "release.js"))
+      );
+      await expect(
+        resolveWorkflowScript({ ...input, roots: { ...input.roots, globalPluginRoots: [] } })
+      ).rejects.toThrow("not found");
+    });
+
     test("rejects plugin workflows without the agent-plugins experiment", async () => {
       using tempDir = new TestTempDir("workflow-script-plugin-gated");
       const container = path.join(tempDir.path, ".mux", "plugins");

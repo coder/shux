@@ -1501,6 +1501,14 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["update", "upgrade", "restart"],
         run: updateCommand((api) => api.update.install()),
       },
+      {
+        id: CommandIds.updateInstallForce(),
+        title: "Install Update and Restart Anyway",
+        subtitle: "Interrupts active work",
+        section: section.help,
+        keywords: ["update", "upgrade", "restart", "force"],
+        run: updateCommand((api) => api.update.install({ force: true })),
+      },
       ...p.supportedUpdateChannels.map((channel) => ({
         id: CommandIds.updateChannel(channel),
         title: `Update Channel: ${UPDATE_CHANNEL_LABELS[channel]}`,
@@ -1731,6 +1739,41 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 // Open the section with the add-plugin form already expanded.
                 publishPluginsSectionIntent({ type: "open-add-panel" });
                 openSettings("plugins");
+              },
+            },
+            {
+              id: CommandIds.pluginsAddComponents(),
+              title: "Add Plugin Components…",
+              subtitle: "Import more skills or MCP servers from the installed version",
+              section: section.settings,
+              keywords: ["plugin", "add", "import", "skill", "mcp", "components"],
+              run: () => undefined,
+              prompt: {
+                title: "Add Plugin Components",
+                fields: [
+                  {
+                    type: "select",
+                    name: "pluginName",
+                    label: "Installed managed plugin",
+                    placeholder: "Search installed plugins…",
+                    getOptions: async () => {
+                      const result = await p.api?.agentPlugins.list();
+                      return result?.success
+                        ? result.data
+                            .filter((item) => item.managed && item.present)
+                            .map((item) => ({
+                              id: item.name,
+                              label: item.name,
+                              keywords: [item.name, item.location],
+                            }))
+                        : [];
+                    },
+                  },
+                ],
+                onSubmit: (values) => {
+                  publishPluginsSectionIntent({ type: "add-components", name: values.pluginName });
+                  openSettings("plugins");
+                },
               },
             },
             {

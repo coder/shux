@@ -39,6 +39,7 @@ import {
   isGeminiFlashThinkingLevelModelName,
 } from "@/common/utils/thinking/policy";
 import { openaiExplicitPromptCachingAvailable } from "@/common/utils/ai/cacheStrategy";
+import { openaiServiceTierAvailable } from "./openaiProviderOptionsAvailability";
 import { openaiProModeAvailable } from "./proMode";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
@@ -115,6 +116,7 @@ function resolveOptionsCanonicalModel(
  */
 interface OpenRouterReasoningOptions {
   [key: string]: JSONValue | undefined;
+  service_tier?: OpenAIResponsesProviderOptions["serviceTier"];
   reasoning?: {
     enabled?: boolean;
     exclude?: boolean;
@@ -126,7 +128,7 @@ interface OpenRouterReasoningOptions {
 
 type OpenAICompatibleGatewayProviderOptions = Pick<
   OpenAIResponsesProviderOptions,
-  "reasoningEffort"
+  "reasoningEffort" | "serviceTier"
 >;
 
 /**
@@ -336,6 +338,15 @@ export function buildProviderOptions(
   const formatProvider =
     providerOptionsNamespaceKey === origin ? origin : (routeProvider ?? origin);
 
+  // Fast mode follows the actual route/wire, not capability aliases or thinking.
+  const serviceTier = openaiServiceTierAvailable(modelString, {
+    providersConfig,
+    resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
+    openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+  })
+    ? muxProviderOptions?.openai?.serviceTier
+    : undefined;
+
   // Resolve aliases to their base model for capability detection while keeping
   // the original modelString for provider routing and metadata lookups.
   // Custom-provider model entries (mappedToModel aliases) live under the raw
@@ -474,7 +485,6 @@ export function buildProviderOptions(
     const cacheScope = promptCacheScope ?? workspaceId;
     const promptCacheKey = cacheScope ? `mux-v1-${cacheScope}` : undefined;
 
-    const serviceTier = muxProviderOptions?.openai?.serviceTier;
     const wireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
     const store = muxProviderOptions?.openai?.store;
     const isResponses = wireFormat === "responses";
@@ -650,16 +660,19 @@ export function buildProviderOptions(
       thinkingLevel: effectiveThinking,
     });
 
-    // Only add reasoning config if thinking is enabled
-    if (reasoningEffort) {
+    // OpenRouter spreads this namespace directly into the HTTP body.
+    if (reasoningEffort || serviceTier != null) {
       const options = {
         openrouter: {
-          reasoning: {
-            enabled: true,
-            effort: reasoningEffort,
-            // Don't exclude reasoning content - we want to display it in the UI
-            exclude: false,
-          },
+          ...(serviceTier != null && { service_tier: serviceTier }),
+          ...(reasoningEffort && {
+            reasoning: {
+              enabled: true,
+              effort: reasoningEffort,
+              // Don't exclude reasoning content - we want to display it in the UI
+              exclude: false,
+            },
+          }),
         },
       } satisfies { openrouter: OpenRouterReasoningOptions };
       log.debug("buildProviderOptions: Returning OpenRouter options", options);
@@ -720,20 +733,27 @@ export function buildProviderOptions(
     return options;
   }
 
-  if (origin === "openai" && formatProvider !== origin) {
+  if (
+    (origin === "openai" && formatProvider !== origin) ||
+    (providerOptionsNamespaceKey === "github-copilot" && serviceTier != null)
+  ) {
     // capabilityModel keeps mapped aliases consistent with raw ids on the same route.
     // Copilot's Chat Completions upstream has not published native-max or
     // explicit-none support, so degrade native-max models' (GPT-5.6 family, GPT-6
     // Astra) "max" to xhigh (the pre-5.6 top effort) and GPT-5.6's "none" back to
     // omission instead of risking a rejection.
-    const nativeReasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
+    // Explicit Copilot IDs gain the tier only; don't reinterpret their reasoning capabilities.
+    const nativeReasoningEffort =
+      origin === "openai"
+        ? getOpenAIReasoningEffort(effectiveThinking, capabilityModel)
+        : undefined;
     const reasoningEffort =
       nativeReasoningEffort === "max"
         ? "xhigh"
         : nativeReasoningEffort === "none"
           ? undefined
           : nativeReasoningEffort;
-    if (!reasoningEffort) {
+    if (!reasoningEffort && serviceTier == null) {
       log.debug(
         "buildProviderOptions: OpenAI-compatible gateway (thinking off, no provider options)",
         {
@@ -748,7 +768,8 @@ export function buildProviderOptions(
 
     const options = {
       "github-copilot": {
-        reasoningEffort,
+        ...(reasoningEffort && { reasoningEffort }),
+        ...(serviceTier != null && { serviceTier }),
       },
     } satisfies { "github-copilot": OpenAICompatibleGatewayProviderOptions };
     log.debug("buildProviderOptions: Returning OpenAI-compatible gateway options", options);

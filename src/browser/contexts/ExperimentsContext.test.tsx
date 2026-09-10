@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { GlobalWindow } from "happy-dom";
 import {
   EXPERIMENT_IDS,
+  type ExperimentId,
   getExperimentKey,
   getLegacyPtcExclusiveExperimentKey,
 } from "@/common/constants/experiments";
@@ -266,6 +267,116 @@ describe("ExperimentsProvider", () => {
     await waitFor(() => expect(view.getByText("false")).toBeDefined());
     expect(setOverride).not.toHaveBeenCalled();
   });
+
+  test.each([false, true])(
+    "compaction writes stay FIFO across rapid selections and consumer remounts (failure=%s)",
+    async (failFirstWrite) => {
+      const continuous = EXPERIMENT_IDS.CONTINUOUS_COMPACTION;
+      const budget = EXPERIMENT_IDS.TOKEN_BUDGET;
+      const backend: Partial<Record<ExperimentId, boolean>> = {};
+      const pending: Array<{ finish: () => void; fail: () => void }> = [];
+      const setOverride = mock(
+        ({ experimentId, enabled }: Parameters<APIClient["experiments"]["setOverride"]>[0]) =>
+          new Promise<void>((resolve, reject) => {
+            if (typeof enabled !== "boolean") throw new Error("Expected an explicit override");
+            pending.push({
+              finish: () => {
+                backend[experimentId] = enabled;
+                resolve();
+              },
+              fail: () => reject(new Error("offline")),
+            });
+          })
+      );
+      currentClientMock = {
+        experiments: { setOverride, getOverrides: () => Promise.resolve({ ...backend }) },
+      };
+      // Start a reconnect upload before any selection; it must not overtake later choices.
+      window.localStorage.setItem(getExperimentKey(continuous), "true");
+      function Settings() {
+        const [continuousEnabled, setContinuous] = useExperiment(continuous);
+        const [budgetEnabled, setBudget] = useExperiment(budget);
+        const [, setUnrelated] = useExperiment(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
+        return (
+          <>
+            <output>{`${continuousEnabled}/${budgetEnabled}`}</output>
+            <button
+              onClick={() => {
+                setBudget(true);
+                setContinuous(false);
+              }}
+            >
+              budget
+            </button>
+            <button
+              onClick={() => {
+                setContinuous(true);
+                setBudget(false);
+              }}
+            >
+              continuous
+            </button>
+            <button
+              onClick={() => {
+                setBudget(false);
+                setContinuous(false);
+              }}
+            >
+              summarize
+            </button>
+            <button onClick={() => setUnrelated(true)}>unrelated</button>
+          </>
+        );
+      }
+      const tree = (showSettings: boolean) => (
+        <APIProvider client={currentClientMock as APIClient}>
+          <ExperimentsProvider>{showSettings && <Settings />}</ExperimentsProvider>
+        </APIProvider>
+      );
+      const view = render(tree(true));
+      await waitFor(() => expect(setOverride).toHaveBeenCalledTimes(1));
+      fireEvent.click(view.getByText("budget"));
+      fireEvent.click(view.getByText("continuous"));
+      view.rerender(tree(false));
+      view.rerender(tree(true));
+      fireEvent.click(view.getByText("summarize"));
+      expect(view.getByRole("status").textContent).toBe("false/false");
+      expect(setOverride).toHaveBeenCalledTimes(1);
+
+      // Unrelated flags retain their immediate dispatch even while compaction is blocked.
+      fireEvent.click(view.getByText("unrelated"));
+      expect(setOverride).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        pending[1].finish();
+        await Promise.resolve();
+      });
+      for (let index = 0; index < 7; index++) {
+        const pendingIndex = index === 0 ? 0 : index + 1;
+        await act(async () => {
+          if (index === 0 && failFirstWrite) pending[pendingIndex].fail();
+          else pending[pendingIndex].finish();
+          await Promise.resolve();
+        });
+        expect(setOverride).toHaveBeenCalledTimes(Math.min(index + 3, 8));
+      }
+      expect(setOverride.mock.calls.map(([input]) => input)).toEqual([
+        { experimentId: continuous, enabled: true },
+        { experimentId: EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES, enabled: true },
+        { experimentId: budget, enabled: true },
+        { experimentId: continuous, enabled: false },
+        { experimentId: continuous, enabled: true },
+        { experimentId: budget, enabled: false },
+        { experimentId: budget, enabled: false },
+        { experimentId: continuous, enabled: false },
+      ]);
+      expect(backend).toEqual({
+        [continuous]: false,
+        [budget]: false,
+        [EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES]: true,
+      });
+      expect(view.getByRole("status").textContent).toBe("false/false");
+    }
+  );
 
   test("syncs existing local overrides to the backend on connect", async () => {
     globalThis.window.localStorage.setItem(

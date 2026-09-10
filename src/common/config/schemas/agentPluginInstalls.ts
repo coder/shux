@@ -23,7 +23,7 @@ import {
  * resolves ref → SHA and records both; the runtime never follows a branch
  * implicitly — updates apply only on explicit user action.
  *
- * The registry only annotates installs. Plugin discovery
+ * The registry records provenance and optional component imports. Plugin discovery
  * (src/node/services/agentPlugins/discovery.ts) remains the source of truth
  * for what loads, so drift between registry and disk self-heals: directories
  * without a registry entry show as "unmanaged", entries without a directory
@@ -57,6 +57,13 @@ export const AgentPluginInstallSourceSchema = z.discriminatedUnion("type", [
   AgentPluginGitSourceSchema,
 ]);
 
+/** Absent on legacy installs (import everything); present arrays are exact allowlists. */
+export const AgentPluginImportedComponentsSchema = z.object({
+  skills: z.array(z.string()),
+  mcpServers: z.array(z.string()),
+});
+export type AgentPluginImportedComponents = z.infer<typeof AgentPluginImportedComponentsSchema>;
+
 export const AgentPluginInstallEntrySchema = z.object({
   /**
    * plugin.json `name`; also the directory name under `~/.mux/plugins`.
@@ -86,6 +93,7 @@ export const AgentPluginInstallEntrySchema = z.object({
       description: z.string().optional(),
     })
     .optional(),
+  importedComponents: AgentPluginImportedComponentsSchema.optional(),
   /** Reserved: per-plugin opt-in auto-update. Unused in v1 — updates are badge + manual. */
   autoUpdate: z.boolean().optional(),
 });

@@ -16,8 +16,16 @@ import {
 
 export default { ...appMeta, title: "App/ChatLoading" };
 
-function getLoadingStatus(canvasElement: HTMLElement) {
-  return canvasElement.querySelector<HTMLElement>('[data-testid="transcript-loading-status"]');
+async function checkPhoneViewport(context: Parameters<NonNullable<AppStory["play"]>>[0]) {
+  // Check composed metadata and actual layout, not which spread syntax a story used.
+  await expect(context.parameters).toMatchObject({
+    pixel: { matrix: { viewports: expect.arrayContaining(["phone"]) } },
+  });
+  await waitFor(() =>
+    expect(
+      within(context.canvasElement).getByTestId("chat-loading-phone").getBoundingClientRect().width
+    ).toBe(390)
+  );
 }
 
 async function switchWorkspace(canvasElement: HTMLElement, workspaceId: string) {
@@ -33,28 +41,38 @@ async function switchWorkspace(canvasElement: HTMLElement, workspaceId: string) 
   collapseLeftSidebar();
 }
 
-async function checkLoadingLayout(canvasElement: HTMLElement) {
+async function checkTranscriptLayout(canvasElement: HTMLElement, loading = true) {
+  const canvas = within(canvasElement);
   await waitFor(async () => {
-    const status = getLoadingStatus(canvasElement);
-    await expect(status).toBeVisible();
-    const dock = status!.closest('[data-component="ChatDockSurface"]')!;
+    const transcript = canvas.getByRole("log");
+    await expect(transcript).toBeVisible();
+    await expect(transcript).toHaveAttribute("aria-busy", String(loading));
+    await expect(canvas.getByTestId("message-window")).toHaveAttribute(
+      "data-loaded",
+      String(!loading)
+    );
+    // Loading feedback must not reserve a gutter after hydration or cover compact tail rows.
+    await expect(getComputedStyle(transcript).paddingBottom).toBe("0px");
+    const replayStatus = canvas.queryByTestId("transcript-loading-status");
+    if (loading && !canvas.queryByTestId("transcript-hydration-placeholder")) {
+      await expect(replayStatus).toBeVisible();
+      await expect(replayStatus).toHaveAttribute("role", "status");
+      const statusRect = replayStatus!.getBoundingClientRect();
+      const dockRect = canvas.getByTestId("chat-composer-dock").getBoundingClientRect();
+      // Feedback lives inside the existing dock edge, never over the transcript tail.
+      await expect(statusRect.top).toBe(dockRect.top);
+      await expect(statusRect.height).toBeGreaterThan(0);
+      await expect(statusRect.bottom).toBeLessThanOrEqual(dockRect.bottom);
+    } else {
+      await expect(replayStatus).toBeNull();
+    }
     const composer = canvasElement.querySelector(
       '[data-component="ChatInputSurface"], [data-testid="chat-composer-dock"] [role="note"]'
     )!;
-    const statusRect = status!.getBoundingClientRect();
-    const dockRect = dock.getBoundingClientRect();
     const composerRect = composer.getBoundingClientRect();
-    const transcript = within(canvasElement).getByRole("log");
-    const transcriptContentBottom =
-      transcript.getBoundingClientRect().bottom -
-      Number.parseFloat(getComputedStyle(transcript).paddingBottom);
-    // The badge must stay inside the permanent gutter, even when the final row
-    // has no extra margin (e.g. a compact tool or reasoning row).
-    await expect(statusRect.top).toBeGreaterThanOrEqual(transcriptContentBottom);
-    await expect(statusRect.bottom).toBeLessThanOrEqual(composerRect.top);
-    await expect(Math.abs(dockRect.left - composerRect.left)).toBeLessThan(1);
-    await expect(Math.abs(dockRect.right - composerRect.right)).toBeLessThan(1);
-    await expect(status!.scrollWidth).toBeLessThanOrEqual(status!.clientWidth);
+    await expect(composerRect.left).toBeGreaterThanOrEqual(
+      canvasElement.getBoundingClientRect().left
+    );
     await expect(composerRect.right).toBeLessThanOrEqual(
       canvasElement.getBoundingClientRect().right
     );
@@ -76,9 +94,14 @@ async function finishReplayWithoutLayoutShift(
     messageTop: message.getBoundingClientRect().top,
     scrollHeight: scrollport.scrollHeight,
   };
+  const tail = canvas.getByText("Compact tail reasoning.");
+  await expect(tail).toBeVisible();
+  await expect(tail.getBoundingClientRect().bottom).toBeLessThanOrEqual(
+    dock.getBoundingClientRect().top
+  );
   finishReplay();
-  await waitFor(() => expect(getLoadingStatus(canvasElement)).toBeNull());
-  // Let layout and the native scroll/resize observers process the removal.
+  await checkTranscriptLayout(canvasElement, false);
+  // Let layout and the native scroll/resize observers process catch-up.
   await new Promise<void>((resolve) =>
     requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
   );
@@ -121,6 +144,8 @@ function createHydrationStory(workspaceId: string): AppStory {
     ) + "\n\nPreviously loaded response.",
     { historySequence: 1 }
   );
+  // A compact tail must remain clear of the dock without a permanent loading gutter.
+  history.parts.push({ type: "reasoning", text: "Compact tail reasoning." });
   let emitChat: (event: WorkspaceChatMessage) => void;
   let subscriptions = 0;
   let transcriptSubscriptions = 0;
@@ -190,7 +215,7 @@ function createHydrationStory(workspaceId: string): AppStory {
     const exposedStatuses = () =>
       within(canvas.getByTestId("message-window")).queryAllByRole("status");
     await step("First fetch is visible before the transcript and decorations reveal", async () => {
-      await checkLoadingLayout(canvasElement);
+      await checkTranscriptLayout(canvasElement);
       await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
       await expect(exposedStatuses()).toHaveLength(1);
       await expect(exposedStatuses()[0]).toBe(
@@ -203,7 +228,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         hasOlderHistory: false,
         cursor: { history: { messageId: history.id, historySequence: 1 } },
       });
-      await waitFor(() => expect(getLoadingStatus(canvasElement)).toBeNull());
+      await checkTranscriptLayout(canvasElement, false);
       await expect(
         await canvas.findByText("Previously loaded response.", {}, { timeout: 5000 })
       ).toBeVisible();
@@ -211,30 +236,30 @@ function createHydrationStory(workspaceId: string): AppStory {
     });
 
     await step(
-      "Switching away clears the status; revisiting keeps cached rows while replaying",
+      "Switching away settles the transcript; revisiting preserves cached rows during replay",
       async () => {
         await switchWorkspace(canvasElement, otherWorkspace.id);
         await expect(
           await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
         ).toBeVisible();
-        await expect(getLoadingStatus(canvasElement)).toBeNull();
+        await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
         await switchWorkspace(canvasElement, workspace.id);
         await waitFor(() => expect(subscriptions).toBe(2));
-        await checkLoadingLayout(canvasElement);
+        await checkTranscriptLayout(canvasElement);
         await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
         await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
         await expect(exposedStatuses()).toHaveLength(1);
-        await expect(exposedStatuses()[0]).toBe(getLoadingStatus(canvasElement));
-        // The loading badge must yield to navigation instead of overlapping it on phones.
+        await expect(exposedStatuses()[0]).toBe(canvas.getByTestId("transcript-loading-status"));
+        // Replay stays visible while navigation remains available, including on phones.
         const scrollport = canvas.getByTestId("message-window");
         await expect(scrollport.scrollHeight).toBeGreaterThan(scrollport.clientHeight);
         scrollport.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
         scrollport.scrollTop = 0;
         scrollport.dispatchEvent(new Event("scroll"));
         const jumpToBottom = await canvas.findByRole("button", { name: /Jump to bottom/ });
-        await expect(getLoadingStatus(canvasElement)).toBeNull();
+        await checkTranscriptLayout(canvasElement);
         await userEvent.click(jumpToBottom);
-        await checkLoadingLayout(canvasElement);
+        await checkTranscriptLayout(canvasElement);
         await finishReplayWithoutLayoutShift(canvasElement, () => {
           emitChat(history);
           emitChat({
@@ -249,11 +274,11 @@ function createHydrationStory(workspaceId: string): AppStory {
         await expect(await canvas.findByText("Another workspace response.")).toBeVisible();
         await switchWorkspace(canvasElement, workspace.id);
         await waitFor(() => expect(subscriptions).toBe(3));
-        await checkLoadingLayout(canvasElement);
+        await checkTranscriptLayout(canvasElement);
       }
     );
 
-    await step("Running init and stream preparation suppress the competing status", async () => {
+    await step("Running init and stream preparation retain their active feedback", async () => {
       emitChat({
         type: "init-start",
         hookPath: "/project/.xum/init",
@@ -267,16 +292,21 @@ function createHydrationStory(workspaceId: string): AppStory {
         timestamp: STABLE_TIMESTAMP,
         replay: true,
       });
-      await waitFor(() => expect(getLoadingStatus(canvasElement), "running init").toBeNull());
+      await expect((await canvas.findAllByText(/Running init hook/))[0]).toBeVisible();
+      await expect(await canvas.findByText("Preparing workspace")).toBeVisible();
+      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat({ type: "init-end", exitCode: 0, timestamp: STABLE_TIMESTAMP, replay: true });
-      await checkLoadingLayout(canvasElement);
+      await expect(await canvas.findByText(/Init hook completed/)).toBeVisible();
+      await checkTranscriptLayout(canvasElement);
       emitChat({
         type: "stream-lifecycle",
         workspaceId: workspace.id,
         phase: "preparing",
         hadAnyOutput: false,
       });
-      await waitFor(() => expect(getLoadingStatus(canvasElement), "preparing stream").toBeNull());
+      await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat({
         type: "stream-start",
         workspaceId: workspace.id,
@@ -286,7 +316,8 @@ function createHydrationStory(workspaceId: string): AppStory {
         startTime: STABLE_TIMESTAMP,
       });
       await expect(await canvas.findByText(/streaming\.\.\./)).toBeVisible();
-      await expect(getLoadingStatus(canvasElement)).toBeNull();
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat(history);
       emitChat({
         type: "caught-up",
@@ -303,7 +334,8 @@ function createHydrationStory(workspaceId: string): AppStory {
         timestamp: STABLE_TIMESTAMP,
       });
       await expect(await canvas.findByText("Live response.")).toBeVisible();
-      await expect(getLoadingStatus(canvasElement)).toBeNull();
+      await expect(canvas.getByRole("log")).toHaveAttribute("aria-busy", "true");
+      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat({
         type: "stream-end",
         workspaceId: workspace.id,
@@ -319,25 +351,26 @@ function createHydrationStory(workspaceId: string): AppStory {
       });
     });
 
-    await step("A monitor barrier suppresses duplicate replay status", async () => {
+    await step("A monitor barrier takes priority over the hydration skeleton", async () => {
       await switchWorkspace(canvasElement, monitorWorkspace.id);
       await expect(
         await canvas.findByText(/Waiting on background bash monitor/, {}, { timeout: 5000 })
       ).toBeVisible();
-      await expect(getLoadingStatus(canvasElement)).toBeNull();
+      await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
     });
 
-    await step("Read-only cached transcripts retain aligned replay feedback", async () => {
+    await step("Read-only cached transcripts stay stable during replay", async () => {
       await switchWorkspace(canvasElement, transcriptWorkspace.id);
       await expect(
         await canvas.findByText("Previously loaded response.", {}, { timeout: 5000 })
       ).toBeVisible();
-      await expect(getLoadingStatus(canvasElement)).toBeNull();
+      await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       await switchWorkspace(canvasElement, otherWorkspace.id);
       await expect(await canvas.findByText("Another workspace response.")).toBeVisible();
       await switchWorkspace(canvasElement, transcriptWorkspace.id);
       await waitFor(() => expect(transcriptSubscriptions).toBe(2));
-      await checkLoadingLayout(canvasElement);
+      await checkTranscriptLayout(canvasElement);
       await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       await expect(canvas.queryByRole("textbox")).toBeNull();
@@ -350,12 +383,12 @@ function createHydrationStory(workspaceId: string): AppStory {
           cursor: { history: { messageId: history.id, historySequence: 1 } },
         });
       });
-      await waitFor(() => expect(getLoadingStatus(canvasElement)).toBeNull());
+      await checkTranscriptLayout(canvasElement, false);
       await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
     });
 
     await step(
-      "A later replay shows the same aligned status without clearing cached messages",
+      "A later replay remains busy without shifting or clearing previously cached messages",
       async () => {
         await switchWorkspace(canvasElement, otherWorkspace.id);
         await expect(
@@ -363,7 +396,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         ).toBeVisible();
         await switchWorkspace(canvasElement, workspace.id);
         await waitFor(() => expect(subscriptions).toBe(4));
-        await checkLoadingLayout(canvasElement);
+        await checkTranscriptLayout(canvasElement);
         await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
       }
     );
@@ -377,15 +410,38 @@ export const Replay: AppStory = {
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
 };
 
+const phoneHydration = createHydrationStory("ws-loading-phone");
+
 export const Phone: AppStory = {
-  ...createHydrationStory("ws-loading-phone"),
+  ...phoneHydration,
+  play: async (context) => {
+    await checkPhoneViewport(context);
+    await phoneHydration.play!(context);
+  },
   decorators: [
     (Story) => (
-      <div style={{ width: 390, maxWidth: "100%", height: 844, overflow: "hidden" }}>
+      <div
+        data-testid="chat-loading-phone"
+        style={{ width: 390, maxWidth: "100%", height: "100vh", overflow: "hidden" }}
+      >
         <Story />
       </div>
     ),
   ],
   globals: { viewport: { value: "mobile1", isRotated: false } },
   parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+};
+
+// Keep the first-load shimmer frozen so Pixel also captures the empty-history state.
+export const InitialLoadingPhone: AppStory = {
+  ...Phone,
+  ...createHydrationStory("ws-loading-initial-phone"),
+  play: async (context) => {
+    await checkPhoneViewport(context);
+    await checkTranscriptLayout(context.canvasElement);
+    const skeleton = within(context.canvasElement).getByTestId("transcript-hydration-placeholder");
+    await expect(skeleton).toBeVisible();
+    // A fixed-height phone canvas can autofocus-scroll the initial shimmer out of view.
+    await expect(skeleton.getBoundingClientRect().top).toBeGreaterThanOrEqual(0);
+  },
 };

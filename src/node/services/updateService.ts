@@ -10,7 +10,7 @@ import type { LayoutResult } from "./serverUpdate/installLayout";
 interface UpdaterImpl {
   checkForUpdates(options?: { source?: "auto" | "manual" }): void | Promise<void>;
   downloadUpdate(): Promise<void>;
-  installUpdate(): void | Promise<void>;
+  installUpdate(options?: { force?: boolean }): void | Promise<void>;
   beginShutdown?(): Promise<void>;
   subscribe(callback: (status: UpdateStatus) => void): () => void;
   getStatus(): UpdateStatus;
@@ -111,9 +111,9 @@ export class UpdateService {
     }
   }
 
-  async install(): Promise<void> {
+  async install(options?: { force?: boolean }): Promise<void> {
     if (this.impl) {
-      await this.impl.installUpdate();
+      await this.impl.installUpdate(options);
     }
   }
 

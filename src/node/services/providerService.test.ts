@@ -15,6 +15,8 @@ import { log } from "@/node/services/log";
 import { PolicyService } from "@/node/services/policyService";
 import { ProviderService } from "./providerService";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
+import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import { getFastModeProvider } from "@/browser/utils/fastModeServiceTier";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { getAllowedProvidersForUi, isGatewayModelAccessibleForUi } from "@/browser/utils/policyUi";
 
@@ -1844,6 +1846,74 @@ describe("ProviderService.setConfig", () => {
         new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.baseUrl
       ).toBeUndefined();
     });
+  });
+
+  it("persists gateway Fast preferences without configuring a direct OpenAI provider", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        openrouter: { apiKey: "gateway-key" },
+      });
+      expect(
+        (await service.setConfig("openai", ["fastModePreviousServiceTier"], "unset")).success
+      ).toBe(true);
+      expect((await service.setConfig("openai", ["serviceTier"], "priority")).success).toBe(true);
+      const reloaded = new ProviderService(config);
+      withProviderEnv({}, () => {
+        expect(reloaded.getConfig().openai).toMatchObject({
+          serviceTier: "priority",
+          fastModePreviousServiceTier: "unset",
+          isConfigured: false,
+          apiKeySet: false,
+        });
+      });
+      expect((await reloaded.setConfig("openai", ["serviceTier"], "")).success).toBe(true);
+      expect(
+        (await reloaded.setConfig("openai", ["fastModePreviousServiceTier"], "")).success
+      ).toBe(true);
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.serviceTier
+      ).toBeUndefined();
+    });
+  });
+
+  it("offers gateway Fast only when policy permits writing its shared preference", async () => {
+    for (const allowOpenAI of [true, false]) {
+      await withTempPolicyProviderService(
+        {
+          policy_format_version: "0.1",
+          provider_access: [{ id: "coder" }, ...(allowOpenAI ? [{ id: "openai" }] : [])],
+        },
+        async (config, service) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openai: { serviceTier: "priority" },
+            coder: {
+              deploymentUrl: "https://coder.example.com",
+              coderOauth: {
+                type: "oauth",
+                sessionId: "sess",
+                deploymentUrl: "https://coder.example.com",
+                access: "at",
+                refresh: "rt",
+                expires: Date.now() + 3_600_000,
+                clientId: "c",
+                clientSecret: "s",
+              },
+            },
+          });
+          const providersConfig = service.getConfig();
+          expect(providersConfig.coder.isConfigured).toBe(true);
+          expect(providersConfig.openai != null).toBe(allowOpenAI);
+          expect((await service.setConfig("openai", ["serviceTier"], "priority")).success).toBe(
+            allowOpenAI
+          );
+          for (const model of ["coder:openai/gpt-6-astra", "openai:gpt-6-astra"]) {
+            const options = { providersConfig, resolvedRouteProvider: "coder" };
+            expect(getFastModeProvider(model, options)).toBe(allowOpenAI ? "openai" : null);
+            expect(openaiServiceTierAvailable(model, options)).toBe(allowOpenAI);
+          }
+        }
+      );
+    }
   });
 
   it("removes OpenAI serviceTier when set to an empty string", async () => {

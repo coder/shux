@@ -1,3 +1,4 @@
+import type { StartupRecoveryState } from "./startupRecovery";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type { ExperimentId } from "@/common/constants/experiments";
@@ -364,6 +365,8 @@ export interface SendMessageInternalOptions {
   workspaceTurnContinuation?: boolean;
   /** Coalescing for queued sends: drop the message when the same key is already queued. */
   queueDedupeKey?: string;
+  /** Restore durable guidance behind a restarted question without dispatching a turn. */
+  restoreQueued?: boolean;
   /** Keep this dedupe-keyed queue entry isolated so it can be selectively superseded. */
   removableQueueDedupeKey?: boolean;
   /**
@@ -415,6 +418,8 @@ export interface WorkspaceTurnHost {
 }
 
 export interface TurnAdmissionHost {
+  getStartupRecoveryState(workspaceId: string): Promise<StartupRecoveryState>;
+  dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>>;
   isBusyForMessage(workspaceId: string): boolean;
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;

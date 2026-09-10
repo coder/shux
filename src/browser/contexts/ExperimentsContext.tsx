@@ -39,6 +39,13 @@ function subscribeToExperiment(experimentId: ExperimentId, callback: () => void)
   };
 }
 
+function isCompactionExperiment(experimentId: ExperimentId): boolean {
+  return (
+    experimentId === EXPERIMENT_IDS.CONTINUOUS_COMPACTION ||
+    experimentId === EXPERIMENT_IDS.TOKEN_BUDGET
+  );
+}
+
 function getCurrentDesktopPlatform(): NodeJS.Platform | undefined {
   return window.api?.platform;
 }
@@ -187,19 +194,30 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
     Record<ExperimentId, boolean>
   > | null>(null);
 
+  // The strategy is stored as two legacy flags. Order their actual writes (including
+  // reconnect uploads) so rapid choices cannot persist a stale pair. Provider ownership
+  // keeps the queue alive when Settings closes; this is not a cross-client transaction.
+  const compactionWrites = useRef(Promise.resolve(true));
   const persistOverride = useCallback(
-    async (experimentId: ExperimentId, enabled: boolean) => {
-      // A degraded (slow) connection still has a usable api; only a missing api means offline.
-      if (!apiState.api) {
-        return false;
-      }
+    (experimentId: ExperimentId, enabled: boolean) => {
+      const persist = async () => {
+        // A degraded (slow) connection still has a usable api; only a missing api means offline.
+        if (!apiState.api) {
+          return false;
+        }
 
-      try {
-        await apiState.api.experiments.setOverride({ experimentId, enabled });
-        return true;
-      } catch {
-        return false;
+        try {
+          await apiState.api.experiments.setOverride({ experimentId, enabled });
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      if (isCompactionExperiment(experimentId)) {
+        compactionWrites.current = compactionWrites.current.then(persist);
+        return compactionWrites.current;
       }
+      return persist();
     },
     [apiState.api]
   );
@@ -252,9 +270,12 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
       // legitimately be empty, so it must never clear overrides another client set.
       try {
         await Promise.all(
-          Object.entries(getExplicitLocalExperimentOverrides()).map(([experimentId, enabled]) =>
-            api.experiments.setOverride({ experimentId: experimentId as ExperimentId, enabled })
-          )
+          Object.entries(getExplicitLocalExperimentOverrides()).map(([id, enabled]) => {
+            const experimentId = id as ExperimentId;
+            return isCompactionExperiment(experimentId)
+              ? persistOverride(experimentId, enabled)
+              : api.experiments.setOverride({ experimentId, enabled });
+          })
         );
       } catch {
         // Best effort
@@ -311,7 +332,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
       cancelled = true;
       controller.abort();
     };
-  }, [apiState.api]);
+  }, [apiState.api, persistOverride]);
 
   return (
     <ExperimentsContext.Provider value={{ setExperiment, backendOverrides, designRevision }}>

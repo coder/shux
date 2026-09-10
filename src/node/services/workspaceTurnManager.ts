@@ -3116,6 +3116,8 @@ export class WorkspaceTurnManager {
     ownerWorkspaceId: string,
     handleId: string,
     options?: {
+      /** Task-tree stops drain once after the complete batch, not once per handle. */
+      scheduleQueueDrain?: boolean;
       /**
        * Skip the disposable-workspace removal that normally follows interruption. The archive
        * lifecycle path sets this: it interrupts turns in order to ARCHIVE (retain) the target,
@@ -3225,7 +3227,7 @@ export class WorkspaceTurnManager {
       if (interruptedRecord != null && options?.suppressDisposableCleanup !== true) {
         await this.cleanupDisposableWorkspaceTurn(interruptedRecord);
       }
-      this.taskHost.scheduleMaybeStartQueuedTasks();
+      if (options?.scheduleQueueDrain !== false) this.taskHost.scheduleMaybeStartQueuedTasks();
       return result;
     } finally {
       releaseStopLatch?.();

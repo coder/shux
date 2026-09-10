@@ -311,13 +311,65 @@ export class HistoryService {
     return new HistoryAppendProvenance(this.getSessionDir(workspaceId));
   }
 
-  /** One bounded page under both history locks; never performs mutation recovery. */
-  scanHistoryBounded(workspaceId: string, options: BoundedHistoryScanOptions) {
-    assert(workspaceId.trim().length > 0, "history scan requires workspaceId");
+  /**
+   * Hold a workspace's history locks across a composite read-only operation, e.g. a descendant
+   * read that must keep the caller's privacy floor frozen while a separate target scan runs.
+   * Nested scans inside `operation` must target DESCENDANT workspaces only, so lock order
+   * always follows the task tree and cannot deadlock with another caller's composite read.
+   */
+  withHistoryScanLocks<T>(workspaceId: string, operation: () => Promise<T>): Promise<T> {
+    assert(workspaceId.trim().length > 0, "history scan locks require workspaceId");
     return this.fileLocks.withLock(workspaceId, () =>
-      this.withHistoryWriteFileLock(workspaceId, async () => {
+      this.withHistoryWriteFileLock(workspaceId, () => operation())
+    );
+  }
+
+  /** One bounded page under both history locks; never performs mutation recovery. */
+  scanHistoryBounded(
+    workspaceId: string,
+    options: Parameters<HistoryService["scanHistoryBoundedUnderLocks"]>[1]
+  ) {
+    return this.withHistoryScanLocks(workspaceId, () =>
+      this.scanHistoryBoundedUnderLocks(workspaceId, options)
+    );
+  }
+
+  /** The page itself; the caller must already hold `withHistoryScanLocks(workspaceId)`. */
+  async scanHistoryBoundedUnderLocks(
+    workspaceId: string,
+    options: BoundedHistoryScanOptions & {
+      /**
+       * Foreign (descendant) targets must already have retained history: fail with
+       * `session_unavailable` instead of creating a session directory for them.
+       * Removal publishes its tombstone under this same history lock before
+       * deleting files, so this check cannot race a concurrent removal.
+       */
+      requireExistingHistory?: boolean;
+      /** Remaining page budget when one tool call chains several scans (authorization + target). */
+      budget?: { maxBytes: number; maxRows: number };
+    }
+  ) {
+    assert(workspaceId.trim().length > 0, "history scan requires workspaceId");
+    {
+      {
         if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
-          throw new Error("stale_cursor");
+          throw new Error(options.requireExistingHistory ? "session_unavailable" : "stale_cursor");
+        if (options.requireExistingHistory) {
+          // Either artifact counts as retained history (mirrors hasHistory): an archive-only
+          // session is a recoverable state the scanner already reads.
+          const isFile = (file: string) =>
+            fs.stat(file).then(
+              (stat) => stat.isFile(),
+              (error: NodeJS.ErrnoException) => {
+                if (error.code !== "ENOENT") throw error;
+                return false;
+              }
+            );
+          const retained =
+            (await isFile(this.getChatHistoryPath(workspaceId))) ||
+            (await isFile(this.getChatArchivePath(workspaceId)));
+          if (!retained) throw new Error("session_unavailable");
+        }
         // Recovery rewrites history and takes the write lock. This read-only tool
         // must instead fail closed while a truncate transaction is unresolved.
         const assertNoTruncate = async () => {
@@ -345,13 +397,18 @@ export class HistoryService {
           },
           options,
           receipt.epoch,
-          SESSION_HISTORY_MAX_SCAN_BYTES - 2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES
+          Math.max(
+            0,
+            (options.budget?.maxBytes ?? SESSION_HISTORY_MAX_SCAN_BYTES) -
+              2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES
+          ),
+          options.budget?.maxRows
         );
         result.bytesRead += bytesRead + (await provenance.validatePage(receipt));
         await assertNoTruncate();
         return result;
-      })
-    );
+      }
+    }
   }
 
   private readonly CHAT_FILE = CHAT_FILE_NAME;
@@ -2245,18 +2302,24 @@ export class HistoryService {
 
   /**
    * Read the partial message for a workspace, if it exists.
+   * Startup admission must distinguish unreadable state from an absent partial.
    */
-  async readPartial(workspaceId: string): Promise<MuxMessage | null> {
+  async readPartial(
+    workspaceId: string,
+    options?: { throwOnError?: boolean }
+  ): Promise<MuxMessage | null> {
     try {
       const partialPath = this.getPartialPath(workspaceId);
       const data = await fs.readFile(partialPath, "utf-8");
-      const message = JSON.parse(data) as MuxMessage;
-      return normalizeLegacyMuxMetadata(message);
+      const message: unknown = JSON.parse(data);
+      return isReadableHistoryMessage(message) ? normalizeLegacyMuxMetadata(message) : null;
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return null;
       }
 
+      // Parse corruption cannot heal on retry; discard it instead of bricking task recovery.
+      if (options?.throwOnError && !(error instanceof SyntaxError)) throw error;
       log.error("Error reading partial:", error);
       return null;
     }

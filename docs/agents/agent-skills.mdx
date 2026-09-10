@@ -65,7 +65,18 @@ Enable the **Agent Plugins** experiment (Settings → Experiments) to also disco
 
 Plugin skills have the lowest precedence within their scope and are read-only. A broken plugin (or a broken skill inside one) never affects other plugins or skills. Plugins can also ship MCP servers; see [MCP servers](/config/mcp-servers#agent-plugins-servers-experiment).
 
-Global plugins can be installed from git via **Settings → Plugins** (paste a git URL or `owner/repo[@ref]`); the install preview lists every skill the plugin would contribute before anything is written.
+Global plugins can be installed from git via **Settings → Plugins** (paste a git URL or `owner/repo[@ref]`). The preview lists the full package before anything is written. Select which skills and MCP servers to import; both groups start with all current items selected and support **Select all** and **Clear**. You can install with neither group selected. Agents, workflows, slash commands, and hooks are unaffected by this choice; review their disclosures too. Imported MCP servers remain disabled until you enable them per workspace.
+
+Installed rows show imported-of-available counts. For a managed, present plugin, choose **Add components** (or **Add Plugin Components…** in the command palette) to import more from its locked installed version without fetching the remote. Previously imported components are checked and read-only. Select additions and confirm, or cancel without changing anything. If the installed version changes during review, the inventory refreshes and you must select again. Removing imports is not supported by this flow.
+
+Updates preserve explicit selections: newly available skills and MCP servers stay unimported until you add them. Updates still require consent for full-package capability changes, including unimported components. Older managed installs without a saved selection continue importing everything, including new components on update. Unmanaged and project-local plugins are unchanged.
+
+<Warning>
+  Import selection controls discovery, not filesystem access: skipped files remain in the plugin
+  directory and can still be read. It is not a filesystem sandbox. Older Xum versions may ignore the
+  selection field and expose every component. Losing the install registry also loses selection; the
+  remaining directory cannot be distinguished from an unmanaged plugin and may expose everything.
+</Warning>
 
 ## Skill layout
 

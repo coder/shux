@@ -1,5 +1,6 @@
 import type { HistoryService } from "@/node/services/historyService";
 import { createSessionHistoryTool } from "@/node/services/tools/session_history";
+import { createNewContextTool } from "@/node/services/tools/new_context";
 import { xai } from "@ai-sdk/xai";
 import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
@@ -307,6 +308,8 @@ export interface ToolConfiguration {
     advisorTool?: boolean;
     dynamicWorkflows?: boolean;
     tokenBudget?: boolean;
+    /** Continuous compaction takes precedence over token-budget rollover (new_context). */
+    continuousCompaction?: boolean;
     memory?: boolean;
     timeline?: boolean;
     workspaceHeartbeats?: boolean;
@@ -316,6 +319,12 @@ export interface ToolConfiguration {
     /** agent-plugins: discover Agent Plugins skills from .xum/plugins, .agents/plugins and their global counterparts (read-only). */
     agentPlugins?: boolean;
   };
+  /**
+   * Stream-time knowledge of whether a token-budget rollover can be sealed (mode active,
+   * automatic rollover enabled). Undefined for non-stream tool builds, which fall back to the
+   * experiment gates alone.
+   */
+  contextBudgetRolloverAvailable?: boolean;
   /** Available sub-agents for the task tool description (dynamic context) */
   availableSubagents?: AgentDefinitionDescriptor[];
   /** Available skills for the agent_skill_read tool description (dynamic context) */
@@ -828,7 +837,17 @@ export async function getToolsForModel(
 
     web_fetch: wrap(createWebFetchTool(config)),
     ...(config.experiments?.tokenBudget
-      ? { session_history: wrap(createSessionHistoryTool(config)) }
+      ? {
+          session_history: wrap(createSessionHistoryTool(config)),
+          // Continuous compaction and PTC+RLM take precedence over token-budget rollover
+          // (AgentSession.isTokenBudgetActive), and a 100% threshold disables sealing; a
+          // request nothing could honor is not offered, so no stale receipt can be persisted.
+          ...(config.contextBudgetRolloverAvailable !== false &&
+          config.experiments.continuousCompaction !== true &&
+          !(config.experiments.programmaticToolCalling === true && config.experiments.rlm === true)
+            ? { new_context: wrap(createNewContextTool(config)) }
+            : {}),
+        }
       : {}),
 
     // Agent memory (experiment-gated; off => no tool, no context cost)
