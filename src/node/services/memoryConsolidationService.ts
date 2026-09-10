@@ -1064,11 +1064,18 @@ export class MemoryConsolidationService extends EventEmitter {
       }
 
       const projectPath = resolveConsolidationProjectPath(workspace);
+      // A child's redirected run sweeps under the owner's identity; the
+      // child's own removal tombstone still refuses every read and commit of
+      // the run (MemoryScopeContext.guardedWorkspaceId) — a remover in another
+      // backend cannot abort this controller.
       const ctx: MemoryScopeContext = {
         runtime: null,
         checkoutCwd: "",
         workspaceId,
         projectPath,
+        ...(options.actingWorkspaceId !== undefined && options.actingWorkspaceId !== workspaceId
+          ? { guardedWorkspaceId: options.actingWorkspaceId }
+          : {}),
       };
 
       const result = yield* Effect.promise(async () =>

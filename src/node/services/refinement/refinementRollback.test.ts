@@ -1223,6 +1223,56 @@ describe("refinementRollback", () => {
     });
     expect(undoneDir2Create.success).toBe(true);
     expect(await pathExists(path.join(ownerRoot, "dir2", "b.md"))).toBe(false);
+    // Same for a lone file whose adopted copy is a conflict import under
+    // imported/<child>/ (the owner already had different content at the
+    // post-rename name): the moved copy gets its tombstoned record too (r77).
+    await fixture.service.create(fixture.ctx, "/memories/workspace/c.md", "c\n", "agent");
+    const cCreateRow = await lastRow(fixture.sessionDir);
+    await fixture.service.rename(
+      fixture.ctx,
+      "/memories/workspace/c.md",
+      "/memories/workspace/d.md",
+      "agent"
+    );
+    const fileRenameRow = await lastRow(fixture.sessionDir);
+    await fsPromises.mkdir(path.join(ownerRoot, "imported", "child"), { recursive: true });
+    await fsPromises.writeFile(path.join(ownerRoot, "imported", "child", "d.md"), "c\n");
+    await fsPromises.writeFile(path.join(ownerRoot, "d.md"), "owner's own d\n");
+    await writeManifest({
+      "d.md": { content: "x", sidecar: "", target: "imported/child/d.md", created: true },
+    });
+    expect(
+      (
+        await rollbackRefinement({
+          sessionDir: fixture.sessionDir,
+          id: fileRenameRow.id,
+          evidence: EVIDENCE,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        })
+      ).success
+    ).toBe(true);
+    expect(await fsPromises.readFile(path.join(ownerRoot, "c.md"), "utf-8")).toBe("c\n");
+    expect(await pathExists(path.join(ownerRoot, "imported", "child", "d.md"))).toBe(false);
+    expect(await fsPromises.readFile(path.join(ownerRoot, "d.md"), "utf-8")).toBe(
+      "owner's own d\n"
+    );
+    expect((await manifest()).get("c.md")).toMatchObject({
+      target: "c.md",
+      created: true,
+      deleted: true,
+      targetStamp: (await adoptionTargetStamp(path.join(ownerRoot, "c.md"))) ?? undefined,
+    });
+    expect(
+      (
+        await rollbackRefinement({
+          sessionDir: fixture.sessionDir,
+          id: cCreateRow.id,
+          evidence: EVIDENCE,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        })
+      ).success
+    ).toBe(true);
+    expect(await pathExists(path.join(ownerRoot, "c.md"))).toBe(false);
   });
 
   it("journals the rollback row before releasing the target locks (no durable-order inversion)", async () => {

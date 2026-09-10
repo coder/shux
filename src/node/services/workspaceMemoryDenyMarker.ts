@@ -10,16 +10,16 @@
  * reads EVERY message of the epoch) would carry the refused turn's rows into
  * the shared notebook. This marker lives in the session dir — the same
  * durability domain as chat.jsonl — and is ANDed into the accumulator wherever
- * it is consulted; it is cleared only at the epoch boundary that clears the
- * config bit.
+ * it is consulted; it is cleared only at the destructive boundary that clears
+ * the config records.
  *
  * Like the config records, the marker is bound to its compaction epoch (the
  * opening boundary's history sequence, -1 before any boundary) and holds one
- * entry per epoch (the newest few): a reader consulting it for another epoch
- * ignores it, so a backend starting the new epoch before this one's boundary
- * reset landed cannot inherit a stale deny — and a deny that backend records
- * for the new epoch cannot displace the closing epoch's deny before the
- * compacting backend observes it (see workspaceMemoryPolicyEpochs.ts).
+ * entry per epoch: a reader consulting it for another epoch ignores it, so a
+ * backend starting the new epoch cannot inherit a stale deny — and a deny that
+ * backend records for the new epoch cannot displace the closing epoch's deny
+ * before every compacting backend observes it (see
+ * workspaceMemoryPolicyEpochs.ts).
  *
  * Fail-closed by construction: a missing marker (or one without an entry for
  * this epoch) is "no deny"; a present entry for this epoch, a wildcard entry
@@ -56,8 +56,8 @@ export async function writeWorkspaceMemoryDenyMarker(
   // possibly the only evidence of some other backend's read-only turn in
   // the closing epoch. This writer, recording a deny for its own epoch,
   // cannot know which epoch that was, so the well-formed file it leaves
-  // behind carries the deny forward as a wildcard until a boundary
-  // observation clears it (clearWorkspaceMemoryDenyMarker).
+  // behind carries the deny forward as a wildcard until a destructive
+  // boundary clears it (clearWorkspaceMemoryDenyMarker).
   const epochs = record === "absent" || record === null ? [] : record.epochs;
   const wildcard = record === null || (record !== "absent" && record.wildcard);
   await writeMarkerRecord(markerPath, [...epochs.filter((e) => e !== epoch), epoch], wildcard);
@@ -72,8 +72,8 @@ async function writeMarkerRecord(
   epochs: readonly number[],
   wildcard: boolean
 ): Promise<void> {
-  // Entries are removed only by the boundary observation that consumes them
-  // (clear/carry), never by count — see workspaceMemoryPolicyEpochs.ts.
+  // Entries are removed only by a destructive boundary, never by count or by
+  // the observation of a compaction boundary — see workspaceMemoryPolicyEpochs.ts.
   const retained = [...new Set(epochs)].sort((a, b) => b - a);
   await writeFileAtomic(
     markerPath,
@@ -158,51 +158,25 @@ export async function readWorkspaceMemoryDenyMarkerForEpochs(
 }
 
 /**
- * Epoch boundary: remove the closing epoch's deny, durable-or-throw (verified
- * absent). `closingEpoch` fences the clear to that epoch's entry: a deny
- * another backend recorded for the NEW epoch in the meantime must survive,
- * so the file is removed only once no entry is left. Only a well-formed
- * marker can hold other epochs' entries; a truncated or malformed one is
- * stale state from some earlier epoch (every reader already treated it as a
- * deny for as long as it existed) and is healed here — otherwise one corrupt
- * file would force every later epoch's accumulator to false until a
- * destructive history clear. Without `closingEpoch` (destructive boundary),
- * every epoch's deny goes.
+ * Destructive boundary (/clear, context reset, history replace): every
+ * epoch's deny goes, durable-or-throw (verified absent). Compaction boundaries
+ * clear nothing: the closing epoch's entry may still be observed by another
+ * backend's boundary closing the same epoch (r77; see
+ * AgentSession.resetWorkspaceMemoryWritable), and a malformed marker stays a
+ * deny for every epoch until the transcript it may describe is discarded.
+ * Unreadable is not malformed: a marker that cannot be read is refused rather
+ * than deleted (the caller's reset fails and is retried).
  */
 export async function clearWorkspaceMemoryDenyMarker(
   rootDir: string,
-  sessionDir: string,
-  options?: { closingEpoch: number }
+  sessionDir: string
 ): Promise<void> {
   const markerPath = workspaceMemoryDenyMarkerPath(sessionDir);
-  // Read-check-delete under the session-dir target lock the writer holds
-  // (WorkspaceService.recordWorkspaceMemoryWritable's fallback), so the fence
-  // cannot go stale between the read and the rm: a new-epoch deny written in
-  // that gap — possibly the only durable record of it — would otherwise be
-  // deleted right after its writer verified it.
+  // Under the session-dir target lock the writer holds
+  // (WorkspaceService.recordWorkspaceMemoryWritable's fallback).
   await withTargetMutationLock(rootDir, sessionDir, async () => {
-    if (options !== undefined) {
-      const record = await readMarkerRecord(markerPath);
-      if (record === "absent") return;
-      // Unreadable is not malformed: the file may hold a newer epoch's deny
-      // (possibly the only durable record of a read-only turn). Refuse; the
-      // caller's reset fails and is retried rather than deleting unknown state.
-      if (record === "unreadable") {
-        throw new Error(`Workspace memory deny marker is unreadable at ${markerPath}`);
-      }
-      if (record !== null) {
-        // This boundary observed the closing epoch (deny included): the
-        // epoch-less wildcard, if any, is consumed with it.
-        const remaining = record.epochs.filter((epoch) => epoch !== options.closingEpoch);
-        if (remaining.length === record.epochs.length && !record.wildcard) return;
-        if (remaining.length > 0) {
-          await writeMarkerRecord(markerPath, remaining, false);
-          if (await readWorkspaceMemoryDenyMarker(sessionDir, options.closingEpoch)) {
-            throw new Error(`Workspace memory deny marker could not be cleared at ${markerPath}`);
-          }
-          return;
-        }
-      }
+    if ((await readMarkerRecord(markerPath)) === "unreadable") {
+      throw new Error(`Workspace memory deny marker is unreadable at ${markerPath}`);
     }
     await fsPromises.rm(markerPath, { force: true });
     if (await readWorkspaceMemoryDenyMarker(sessionDir)) {
@@ -235,14 +209,15 @@ export async function carryWorkspaceMemoryDenyMarker(
     }
     if (record === "absent" || record === null) return;
     if (!record.wildcard && !record.epochs.includes(closingEpoch)) return;
-    // The wildcard denied the closing epoch; carried as the new epoch's deny.
+    // The closing entry (or the wildcard, which denied the closing epoch too)
+    // is copied, not moved: another backend's boundary closing the same
+    // epoch must still find it (r77). The wildcard stays a deny of unknown
+    // epoch — narrowing it to this boundary's epochs would drop the deny
+    // for whichever epoch it actually recorded.
     await writeMarkerRecord(
       markerPath,
-      [
-        ...record.epochs.filter((epoch) => epoch !== closingEpoch && epoch !== nextEpoch),
-        nextEpoch,
-      ],
-      false
+      [...record.epochs.filter((epoch) => epoch !== nextEpoch), nextEpoch],
+      record.wildcard
     );
     if (!(await readWorkspaceMemoryDenyMarker(sessionDir, nextEpoch))) {
       throw new Error(`Workspace memory deny marker did not persist at ${markerPath}`);

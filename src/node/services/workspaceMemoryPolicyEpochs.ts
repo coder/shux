@@ -10,13 +10,16 @@
  * value. A single slot would be overwritten by the new epoch's grant, dropping
  * a deny recorded for the closing epoch — and the compacting backend's own
  * mirror (writable) would then grant the harvest of a read-only turn. A
- * record is removed only by the observation that consumes it — the
- * compacting session's boundary reset/carry (AgentSession) or a destructive
- * boundary — never by count: a backend suspended between persisting its
- * boundary and observing the closing policy must still find the record
- * however many epochs other backends opened meanwhile. Records of a boundary
- * whose observer never ran (crash in between) linger until the next
- * destructive boundary; that residue is bounded by such crashes.
+ * record is removed only by a destructive boundary (AgentSession.
+ * resetWorkspaceMemoryWritable), never by a compaction boundary's observation
+ * and never by count: two backends can each commit a boundary closing the
+ * same epoch, and a backend suspended between persisting its boundary and
+ * observing the closing policy must still find the record however many
+ * epochs other backends opened meanwhile. Readers key strictly by epoch and
+ * epoch keys (boundary history sequences; -1 only before the first boundary
+ * of a segment) never recur before the destructive boundary that drops every
+ * record, so retained records are inert — one boolean per compaction epoch
+ * in config.json until then.
  */
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import assert from "@/common/utils/assert";
@@ -73,24 +76,4 @@ export function setWorkspaceMemoryWritableForEpoch(
     ...(policyRecords(entry) === null ? {} : entry.workspaceMemoryWritableByEpoch),
     [epochKey(epoch)]: writable,
   };
-}
-
-/** Forget `epoch`'s record; removes the field once no record is left. */
-export function deleteWorkspaceMemoryWritableForEpoch(
-  entry: WorkspaceConfigEntry,
-  epoch: number
-): void {
-  const current = policyRecords(entry);
-  if (current === undefined) return;
-  if (current === null) {
-    // Malformed container: nothing recoverable in it, heal by dropping it.
-    delete entry.workspaceMemoryWritableByEpoch;
-    return;
-  }
-  const key = epochKey(epoch);
-  if (!Object.hasOwn(current, key)) return;
-  const next = { ...entry.workspaceMemoryWritableByEpoch };
-  delete next[key];
-  if (Object.keys(next).length === 0) delete entry.workspaceMemoryWritableByEpoch;
-  else entry.workspaceMemoryWritableByEpoch = next;
 }

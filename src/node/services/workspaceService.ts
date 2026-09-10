@@ -145,7 +145,10 @@ import {
   startRemovalTombstoneLease,
   TombstoneNotDurableError,
 } from "@/node/services/workspaceRemoval";
-import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
+import {
+  pinDescendantWorkspaceMemoryOwners,
+  resolveWorkspaceMemoryOwnerId,
+} from "@/node/services/memoryWorkspaceOwner";
 import {
   readWorkspaceMemoryDenyMarkerForEpochs,
   readWorkspaceMemoryDenyMarker,
@@ -6357,27 +6360,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;
         if (sharedMemoryOwnerId !== workspaceId) {
           try {
-            const pinOwner = (cfg: ReturnType<Config["loadConfigOrDefault"]>): string[] => {
-              const pinned: string[] = [];
-              for (const project of cfg.projects.values()) {
-                for (const workspace of project.workspaces) {
-                  if (workspace.parentWorkspaceId === workspaceId) {
-                    workspace.memoryOwnerWorkspaceId ??= sharedMemoryOwnerId;
-                    if (workspace.id !== undefined) pinned.push(workspace.id);
-                  }
-                }
-              }
-              return pinned;
-            };
-            let pinnedIds: string[] = [];
+            let pinnedOwners = new Map<string, string>();
             await this.config.editConfig((cfg) => {
-              pinnedIds = pinOwner(cfg);
+              pinnedOwners = pinDescendantWorkspaceMemoryOwners(cfg, workspaceId);
               return cfg;
             });
             const persisted = this.config.loadConfigOrDefault();
-            for (const id of pinnedIds) {
+            for (const [id, owner] of pinnedOwners) {
               const entry = findWorkspaceEntry(persisted, id);
-              if (!entry?.workspace.memoryOwnerWorkspaceId) {
+              if (entry?.workspace.memoryOwnerWorkspaceId !== owner) {
                 throw new Error(`memory owner pin for descendant ${id} did not persist`);
               }
             }

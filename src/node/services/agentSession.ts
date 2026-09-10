@@ -111,7 +111,6 @@ import {
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import {
-  deleteWorkspaceMemoryWritableForEpoch,
   setWorkspaceMemoryWritableForEpoch,
   workspaceMemoryWritableForEpoch,
 } from "@/node/services/workspaceMemoryPolicyEpochs";
@@ -1131,75 +1130,51 @@ export class AgentSession {
   }
 
   /**
-   * Start a fresh policy epoch: the in-memory mirror and the durable
-   * accumulator both forget the previous epoch's turns. Durable-or-throw like
-   * the other boundary invalidations: a stale persisted deny would refuse
-   * harvests of the new, possibly all-writable epoch forever (and a stale
-   * grant is never left behind by this path — grants are re-recorded per
-   * turn). Nothing to do when the field is already absent.
+   * Destructive boundary (/clear, context reset, history replace): the
+   * in-memory mirror and every durable epoch record forget the discarded
+   * transcript. Durable-or-throw like the other boundary invalidations: a
+   * stale persisted deny would refuse harvests of the new, possibly
+   * all-writable epoch forever (a destructive boundary reuses epoch -1, so a
+   * surviving `-1: false` would pin the new segment). Nothing to do when the
+   * field is already absent.
+   *
+   * A COMPACTION boundary clears nothing durable (r77): its closing epoch's
+   * record and deny marker stay until the next destructive boundary. Two
+   * backends can each commit a boundary closing the same epoch, and each
+   * completion observes that epoch's verdict — the first observer consuming
+   * the record would leave the second reading only its own stale mirror and
+   * harvesting a read-only turn. Readers key by epoch and epoch keys never
+   * recur before a destructive boundary, so retained records are inert; the
+   * cost is one boolean per compaction epoch in config.json until then.
    */
-  private async resetWorkspaceMemoryWritable(options?: { closingEpoch: number }): Promise<void> {
-    // Compaction (closing epoch given): the completion callback already
-    // forgot the mirror synchronously. Destructive boundary: the mirror is
-    // forgotten only once the durable clear below completed — a reset that
-    // reports success while the persisted `-1` deny survives would pin the
-    // whole new segment to the stored-false fast path.
-    if (options !== undefined) this.workspaceMemoryWritable = undefined;
-    // The session-dir deny marker (fallback for an unwritable config.json)
-    // belongs to the closing epoch too. Same fence idea as below: a deny
-    // recorded for the new epoch survives.
+  private async resetWorkspaceMemoryWritable(): Promise<void> {
+    // The mirror is forgotten only once the durable clear below completed —
+    // a reset that reports success while the persisted `-1` deny survives
+    // would pin the whole new segment to the stored-false fast path.
     await clearWorkspaceMemoryDenyMarker(
       this.config.rootDir,
-      path.join(this.config.sessionsDir, this.workspaceId),
-      options
+      path.join(this.config.sessionsDir, this.workspaceId)
     );
     // Strict load: an unreadable — or transiently ABSENT — config.json would
     // read as the empty default, in which this workspace has no records to
     // clear; the reset would report success and leave the stale records
-    // behind (a destructive boundary reuses epoch -1, so a surviving deny
-    // would pin the new segment). Throwing makes the boundary a retryable
-    // partial failure instead; a registered workspace always has a config.
+    // behind. Throwing makes the boundary a retryable partial failure
+    // instead; a registered workspace always has a config.
     const entry = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), this.workspaceId);
     if (entry?.workspace.workspaceMemoryWritableByEpoch === undefined) {
       this.workspaceMemoryWritable = undefined;
       return;
     }
-    if (
-      options !== undefined &&
-      workspaceMemoryWritableForEpoch(entry.workspace, options.closingEpoch) === undefined
-    ) {
-      return;
-    }
     await this.config.editConfig((cfg) => {
       const current = findWorkspaceEntry(cfg, this.workspaceId);
       if (current === null) return cfg;
-      // Fenced to the epoch being closed: another backend may already have
-      // recorded the first turn of the NEW epoch between the completion and
-      // this locked write; its record (a different epoch's) must survive.
-      // Records are per epoch and readers key by epoch anyway
-      // (WorkspaceService.recordWorkspaceMemoryWritable), so this delete is
-      // hygiene, not the correctness boundary. A destructive boundary
-      // (no closing epoch: /clear, reset, history replace) discards every
-      // epoch's transcript and so every record.
-      if (options !== undefined) {
-        deleteWorkspaceMemoryWritableForEpoch(current.workspace, options.closingEpoch);
-      } else {
-        delete current.workspace.workspaceMemoryWritableByEpoch;
-      }
+      delete current.workspace.workspaceMemoryWritableByEpoch;
       return cfg;
     });
     // Verified read-back: Config.saveConfig swallows write failures, so the
-    // awaited edit alone does not prove the clear landed. A destructive
-    // boundary reuses epoch -1, and a surviving `-1: false` would pin the
-    // new segment to the stored-false fast path once the mirror is cleared
-    // below — so the mirror is cleared only after the durable state agrees.
+    // awaited edit alone does not prove the clear landed.
     const after = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), this.workspaceId);
-    const stale =
-      after !== null &&
-      (options === undefined
-        ? after.workspace.workspaceMemoryWritableByEpoch !== undefined
-        : workspaceMemoryWritableForEpoch(after.workspace, options.closingEpoch) !== undefined);
-    if (stale) {
+    if (after?.workspace.workspaceMemoryWritableByEpoch !== undefined) {
       throw new Error(
         `Workspace memory policy reset did not persist for ${this.workspaceId} (config write swallowed?)`
       );
@@ -1212,8 +1187,9 @@ export class AgentSession {
    * closing epoch's policy, so its accumulator carries into the new epoch —
    * durably, by re-binding the config value and the deny marker recorded for
    * `closingEpoch` to `nextEpoch` (another backend's first turn of the new
-   * epoch reads by epoch and would otherwise see nothing). Fenced like the
-   * reset: a value already bound to another epoch is left alone.
+   * epoch reads by epoch and would otherwise see nothing). The closing
+   * epoch's value is copied, never consumed (see resetWorkspaceMemoryWritable):
+   * another backend's boundary closing the same epoch observes it too.
    */
   private async carryWorkspaceMemoryWritable(
     closingEpoch: number,
@@ -1249,10 +1225,9 @@ export class AgentSession {
         const next = workspaceMemoryWritableForEpoch(current.workspace, nextEpoch);
         carried = next === undefined ? closing : next && closing;
         setWorkspaceMemoryWritableForEpoch(current.workspace, nextEpoch, carried);
-        deleteWorkspaceMemoryWritableForEpoch(current.workspace, closingEpoch);
         return cfg;
       });
-      // Consumed by another backend's boundary meanwhile: nothing to carry.
+      // Gone meanwhile (a destructive boundary): nothing to carry.
       if (carried === undefined) return;
       const after = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), this.workspaceId);
       if (
@@ -1455,14 +1430,15 @@ export class AgentSession {
         );
         // New epoch. A preserved tail copies messages produced under this
         // epoch's policy into the next one, so the fail-closed accumulator
-        // carries over with them (re-bound to the new epoch key, durably);
+        // carries over with them (copied to the new epoch key, durably);
         // otherwise the next normal turn restarts it. The mirror forgets the
-        // closing epoch right here, synchronously; the durable reset runs
+        // closing epoch right here, synchronously; the durable carry runs
         // AFTER the completion observation settled (it reads the closing
         // epoch's marker/config) and is awaited by this session's next turn
-        // (settleWorkspaceMemoryPolicyEpoch). Other backends need no such
-        // wait: every durable value is bound to its epoch, so the closing
-        // epoch's value is invisible to their new-epoch turns regardless.
+        // (settleWorkspaceMemoryPolicyEpoch). The closing epoch's durable
+        // records are left in place (resetWorkspaceMemoryWritable explains
+        // why); every durable value is bound to its epoch, so they are
+        // invisible to the new epoch's turns on any backend.
         const closingEpoch = metadata.previousBoundaryHistorySequence ?? -1;
         const preservedTail = (metadata.preservedTailMessageCount ?? 0) > 0;
         if (!preservedTail) this.workspaceMemoryWritable = undefined;
@@ -1471,7 +1447,7 @@ export class AgentSession {
           .then(() =>
             preservedTail
               ? this.carryWorkspaceMemoryWritable(closingEpoch, metadata.summaryHistorySequence)
-              : this.resetWorkspaceMemoryWritable({ closingEpoch })
+              : undefined
           )
           .catch((error: unknown) => {
             log.warn("Failed to reset the workspace memory policy epoch", {

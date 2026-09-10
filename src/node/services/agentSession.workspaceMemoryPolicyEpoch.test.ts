@@ -5,7 +5,11 @@ import type { Config } from "@/node/config";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { getErrorMessage } from "@/common/utils/errors";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
-import { readWorkspaceMemoryDenyMarker } from "@/node/services/workspaceMemoryDenyMarker";
+import {
+  readWorkspaceMemoryDenyMarker,
+  workspaceMemoryDenyMarkerPath,
+  writeWorkspaceMemoryDenyMarker,
+} from "@/node/services/workspaceMemoryDenyMarker";
 import { AgentSession } from "./agentSession";
 import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
@@ -21,7 +25,7 @@ import { createTestHistoryService } from "./testHistoryService";
  * falls back to the session-dir marker.
  */
 interface SessionInternals {
-  resetWorkspaceMemoryWritable(options?: { closingEpoch: number }): Promise<void>;
+  resetWorkspaceMemoryWritable(): Promise<void>;
   carryWorkspaceMemoryWritable(closingEpoch: number, nextEpoch: number): Promise<void>;
 }
 
@@ -116,11 +120,15 @@ describe("AgentSession workspace memory policy epoch boundary", () => {
   test("carry re-binds the closing epoch's value and proves it, falling back to the deny marker", async () => {
     const { internals, sessionDir, records, setRecords, swallowNextWrite, config } =
       await createSession();
-    // Proven carry: the closing deny moves to the new epoch key.
+    // Proven carry: the closing deny is copied to the new epoch key — and
+    // kept under its own, for another backend's boundary closing the same
+    // epoch (its completion observes the closing verdict too).
     await setRecords({ "-1": false });
     await internals.carryWorkspaceMemoryWritable(-1, 7);
-    expect(records()).toEqual({ "7": false });
+    expect(records()).toEqual({ "-1": false, "7": false });
     expect(await readWorkspaceMemoryDenyMarker(sessionDir, 7)).toBe(false);
+    await internals.carryWorkspaceMemoryWritable(-1, 8);
+    expect(records()).toEqual({ "-1": false, "7": false, "8": false });
 
     // Swallowed write: the deny never reached epoch 9 in config, so the
     // session-dir marker denies epoch 9 instead of nothing.
@@ -191,16 +199,28 @@ describe("AgentSession workspace memory policy epoch boundary", () => {
     }
     expect(session.workspaceMemoryWritableMirror()).toBe(false);
     expect(records()).toEqual({ "-1": false });
+  });
 
-    // Compaction boundary, fenced to the closing epoch: the same proof.
-    await setRecords({ "3": false, "8": true });
-    swallowNextWrite();
-    expect(
-      await internals
-        .resetWorkspaceMemoryWritable({ closingEpoch: 3 })
-        .then(() => null, getErrorMessage)
-    ).toMatch(/did not persist/);
-    await internals.resetWorkspaceMemoryWritable({ closingEpoch: 3 });
-    expect(records()).toEqual({ "8": true });
+  test("a compaction boundary consumes neither the closing epoch's marker nor its wildcard", async () => {
+    const { internals, sessionDir } = await createSession();
+    // Two backends' boundaries close epoch 3: each carry finds the entry.
+    await writeWorkspaceMemoryDenyMarker(sessionDir, 3);
+    await internals.carryWorkspaceMemoryWritable(3, 8);
+    await internals.carryWorkspaceMemoryWritable(3, 10);
+    for (const epoch of [3, 8, 10]) {
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, epoch)).toBe(true);
+    }
+    expect(await readWorkspaceMemoryDenyMarker(sessionDir, 9)).toBe(false);
+    // A wildcard (inherited from a malformed marker) is a deny of unknown
+    // epoch: the carry copies it to the new epoch and keeps it as-is.
+    await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
+    await writeWorkspaceMemoryDenyMarker(sessionDir, 12);
+    await internals.carryWorkspaceMemoryWritable(3, 14);
+    for (const epoch of [3, 14, 99]) {
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, epoch)).toBe(true);
+    }
+    // The destructive boundary is the only clear.
+    await internals.resetWorkspaceMemoryWritable();
+    expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
   });
 });

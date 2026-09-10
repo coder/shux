@@ -91,6 +91,38 @@ export function workspaceMemoryOwnerResolver(cfg: ProjectsConfig): (workspaceId:
 }
 
 /**
+ * Removal of `removedWorkspaceId`: pin each surviving direct child to the
+ * owner it resolves to NOW, so the notebook it uses stays the same once the
+ * chain through the removed node dangles. A child's own valid pin already
+ * decides its owner and is kept; one that is absent — or stale (its owner
+ * gone, which the resolver walks past today but could not once this node is
+ * gone: the child would drop to a private store) — is replaced by the walk
+ * through the removed node (r77). Mutates the entries in place; returns the
+ * pins written, for the caller's verified read-back.
+ */
+export function pinDescendantWorkspaceMemoryOwners(
+  cfg: ProjectsConfig,
+  removedWorkspaceId: string
+): Map<string, string> {
+  assert(removedWorkspaceId.length > 0, "pinDescendantWorkspaceMemoryOwners requires an id");
+  const resolve = workspaceMemoryOwnerResolver(cfg);
+  const pinned = new Map<string, string>();
+  for (const project of cfg.projects.values()) {
+    for (const workspace of project.workspaces) {
+      if (workspace.parentWorkspaceId !== removedWorkspaceId || workspace.id === undefined) {
+        continue;
+      }
+      // Resolved before this loop mutates anything: every child's chain runs
+      // through the removed node, never through a sibling being pinned.
+      const owner = resolve(workspace.id);
+      workspace.memoryOwnerWorkspaceId = owner;
+      pinned.set(workspace.id, owner);
+    }
+  }
+  return pinned;
+}
+
+/**
  * Session dirs of the OTHER registered members of `workspaceId`'s task tree —
  * every workspace resolving to the same owner (the owner itself, siblings,
  * descendants). They journal their own mutations of the shared

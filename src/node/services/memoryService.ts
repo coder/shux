@@ -99,6 +99,15 @@ export interface MemoryScopeContext {
    * and sidecar logical keys; empty when no project identity is available.
    */
   projectPath: string;
+  /**
+   * A further workspace on whose behalf this context acts, guarded like the
+   * acting one: a sub-agent's consolidation run sweeps the OWNER's notebook
+   * under the owner's identity (`workspaceId`), and the child's removal —
+   * possibly by another backend, which cannot abort this run — must refuse
+   * every read and commit of that run at the tombstone check, not only its
+   * start (r77).
+   */
+  guardedWorkspaceId?: string;
 }
 
 export type MemoryActor = "agent" | "user";
@@ -1826,7 +1835,15 @@ export class MemoryService extends EventEmitter {
   /** Acting workspace plus the store's owner: both must be alive to touch the store. */
   private guardedWorkspaceIds(ctx: MemoryScopeContext, store: MemoryStore): string[] {
     const owner = this.storeOwnerWorkspaceId(store);
-    return [...new Set(owner === null ? [ctx.workspaceId] : [ctx.workspaceId, owner])];
+    return [
+      ...new Set([
+        ctx.workspaceId,
+        ...(owner === null ? [] : [owner]),
+        ...(ctx.guardedWorkspaceId === undefined || ctx.guardedWorkspaceId === ""
+          ? []
+          : [ctx.guardedWorkspaceId]),
+      ]),
+    ];
   }
 
   /**

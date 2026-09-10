@@ -116,10 +116,20 @@ export async function migrateSharedMemoryRefinementRows(args: {
   };
   // Liveness follows the whole rollback chain (rollback → rollback of the
   // rollback re-applies): an original row is live when it has been rolled
-  // back an even number of times. Rollback rows themselves are never copied.
+  // back an even number of times. Only a rollback row this migration could
+  // itself carry (parseable rollback action AND inverse) counts (r77): a
+  // corrupted one is skipped below, and letting it also kill its intact
+  // target would delete the child journal with neither inverse preserved.
+  // The copied target is then live on the owner side; its divergence checks
+  // refuse a re-apply that no longer matches the tree (force overrides).
   const rollbackByTarget = new Map(
     rows
-      .filter((row) => row.data.rollbackOf !== undefined)
+      .filter(
+        (row) =>
+          row.data.rollbackOf !== undefined &&
+          RollbackRefinementActionSchema.safeParse(row.data.action).success &&
+          RefinementInverseSchema.safeParse(row.data.inverse).success
+      )
       .map((row) => [row.data.rollbackOf!, row] as const)
   );
   // Returns null on a corrupted (cyclic / absurdly long) lineage: such a row

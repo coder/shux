@@ -9432,25 +9432,23 @@ describe("WorkspaceService initialize", () => {
         true
       );
       expect(persisted()).toBe(false);
-      // Malformed marker still denies; an epoch boundary — even the fenced
-      // compaction one, since a malformed file cannot claim to be a newer
-      // deny — heals it and the next epoch can become writable again.
+      // Malformed marker still denies; only a DESTRUCTIVE boundary heals it
+      // (a compaction boundary clears nothing: another backend's boundary
+      // closing the same epoch must still find every entry).
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
       // Another backend's new-epoch deny write must not heal the malformed
       // marker away (it may be the only evidence of a read-only turn in the
-      // closing epoch): the deny is carried as a wildcard until the closing
-      // boundary observes and clears it.
+      // closing epoch): the deny is carried as a wildcard, denying every
+      // epoch, until the destructive boundary.
       await writeWorkspaceMemoryDenyMarker(sessionDir, 7);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir, -1)).toBe(true);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir, 3)).toBe(true);
-      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: -1 });
-      expect(await readWorkspaceMemoryDenyMarker(sessionDir, -1)).toBe(false);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir, 7)).toBe(true);
-      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: 7 });
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
-      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: -1 });
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
       // A present but non-boolean wildcard is corruption, not "false": read as
       // malformed (deny for every epoch) rather than dropping the only
@@ -9465,23 +9463,24 @@ describe("WorkspaceService initialize", () => {
         JSON.stringify({ epochs: [3] })
       );
       expect(await readWorkspaceMemoryDenyMarker(sessionDir, 5)).toBe(false);
-      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: 3 });
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
-      // Unreadable is not malformed: a marker that cannot be read may hold a
-      // newer epoch's deny, so the fenced clear refuses instead of deleting it.
+      // Unreadable is not malformed: a marker that cannot be read may hold
+      // denies, so the clear refuses instead of deleting it.
       await writeWorkspaceMemoryDenyMarker(sessionDir, 9);
       const unreadableMarker = spyOn(fsPromises, "readFile").mockImplementationOnce((() =>
         Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))) as never);
-      const refusedClear = await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, {
-        closingEpoch: -1,
-      }).then(
+      const refusedClear = await clearWorkspaceMemoryDenyMarker(
+        realConfig.rootDir,
+        sessionDir
+      ).then(
         () => null,
         (error: unknown) => (error instanceof Error ? error.message : String(error))
       );
       expect(refusedClear).toContain("unreadable");
       unreadableMarker.mockRestore();
       expect(await readWorkspaceMemoryDenyMarker(sessionDir, 9)).toBe(true);
-      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: 9 });
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
       await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "{}");
       await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
@@ -9494,18 +9493,14 @@ describe("WorkspaceService initialize", () => {
         true
       );
       expect(persisted()).toBe(true);
-      // The fenced clear (compaction boundary) keeps a deny recorded for the
-      // NEW epoch; readers of any other epoch ignore that deny. A new-epoch
-      // deny written before the clear does not displace the closing one.
+      // Entries of several epochs coexist; readers of any other epoch ignore
+      // each, and all of them go together at the destructive boundary.
       await writeWorkspaceMemoryDenyMarker(sessionDir, -1);
       await writeWorkspaceMemoryDenyMarker(sessionDir, 7);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir, -1)).toBe(true);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir, 7)).toBe(true);
-      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: -1 });
-      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 7)).toBe(true);
-      expect(await readWorkspaceMemoryDenyMarker(sessionDir, -1)).toBe(false);
-      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
-      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: 7 });
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 5)).toBe(false);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
       expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
 
       // The durable bit is bound to its epoch too: the closing epoch's
@@ -9575,7 +9570,7 @@ describe("WorkspaceService initialize", () => {
         })
       ).toBe(true);
       expect(persistedFor(16)).toBe(false);
-      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, { closingEpoch: 12 });
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
       // A carried grant (or no carried record at all) changes nothing.
       await realConfig.editConfig((cfg) => {
         const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
@@ -9861,23 +9856,24 @@ describe("WorkspaceService initialize", () => {
       const sessionDir = path.join(realConfig.sessionsDir, "policy-lock");
       await writeWorkspaceMemoryDenyMarker(sessionDir, -1);
       // Another backend's deny writer holds the session-dir lock while the
-      // boundary reset starts its read-check-delete: the reset must queue
-      // behind it and then see (and keep) the new epoch's marker.
+      // destructive boundary reset starts: the reset must queue behind it
+      // (a write landing between its rm and its verification would read as
+      // a failed removal) and then discard that deny with the rest of the
+      // discarded transcript's entries.
       let cleared = false;
       let clear: Promise<void> | undefined;
       await withTargetMutationLock(realConfig.rootDir, sessionDir, async () => {
-        clear = clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir, {
-          closingEpoch: -1,
-        }).then(() => {
+        clear = clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir).then(() => {
           cleared = true;
         });
         await new Promise((resolve) => setTimeout(resolve, 20));
         expect(cleared).toBe(false);
         await writeWorkspaceMemoryDenyMarker(sessionDir, 5);
+        expect(await readWorkspaceMemoryDenyMarker(sessionDir, 5)).toBe(true);
       });
       await clear;
       expect(cleared).toBe(true);
-      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 5)).toBe(true);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
     } finally {
       await cleanup();
     }

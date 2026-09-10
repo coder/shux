@@ -1365,6 +1365,10 @@ export async function rollbackRefinement(
         await fileLock.assertStillOwned();
       } catch (error) {
         await compensateApplied(applied, newInverse);
+        // The stamps above described the applied state; the compensated
+        // files are new generations again (r77). A reversed rename re-stamps
+        // both endpoints (nothing is synthesized: the restored side is empty).
+        await restampAdoptedCopies();
         throw error;
       }
       if (opts.testOnlyBeforeRollbackJournal !== undefined) {

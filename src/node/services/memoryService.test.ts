@@ -1420,6 +1420,42 @@ describe("MemoryService", () => {
       }
     });
 
+    it("guards a context acting on a removed child's behalf like the child itself", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      // A child's consolidation run sweeps under the OWNER's identity; the
+      // child's removal by another backend (tombstone, no local signal) must
+      // still refuse that run's reads and commits in every scope.
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner", guardedWorkspaceId: "ws-child" };
+      await fixture.service.create(ownerCtx, "/memories/workspace/n.md", "shared", "agent");
+      await fixture.service.create(ownerCtx, "/memories/global/g.md", "global", "agent");
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-child");
+      await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+      for (const attempt of [
+        () => fixture.service.view(ownerCtx, "/memories/workspace/n.md"),
+        () =>
+          fixture.service.strReplace(ownerCtx, "/memories/workspace/n.md", "shared", "x", "agent"),
+        () => fixture.service.strReplace(ownerCtx, "/memories/global/g.md", "global", "x", "agent"),
+        () => fixture.service.create(ownerCtx, "/memories/project/p.md", "p", "agent"),
+      ]) {
+        const result = await attempt();
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("ws-child was removed");
+      }
+      expect(
+        await fsPromises.readFile(
+          path.join(fixture.config.sessionsDir, "ws-owner", "memory", "n.md"),
+          "utf-8"
+        )
+      ).toBe("shared");
+      // The owner's own contexts are unaffected.
+      const plainOwner = { ...fixture.ctx, workspaceId: "ws-owner" };
+      expect((await fixture.service.view(plainOwner, "/memories/workspace/n.md")).success).toBe(
+        true
+      );
+    });
+
     it("refuses a read whose workspace was tombstoned while the legacy adoption pass ran", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -3564,6 +3600,41 @@ describe("MemoryService", () => {
       expect(await migrate()).toBe(0);
     });
 
+    it("migrates a row whose only rollback record is malformed instead of dropping both", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "v1", "agent");
+      const [createRow] = await readRefinementEvents(childSessionDir);
+      // A rollback row that names the create but whose action and inverse
+      // are unusable: it cannot be copied, so counting it as a completed
+      // rollback would delete the child journal with neither inverse kept.
+      await sharedDurableEventJournal(childSessionDir).append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "bogus" },
+          inverse: { op: "bogus" },
+          rollbackOf: createRow.id,
+        },
+      });
+      expect(
+        await migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        })
+      ).toBe(1);
+      const copy = (await readRefinementEvents(ownerSessionDir)).find(
+        (row) => row.data.migratedFrom === `ws-child:${createRow.id}`
+      );
+      expect(copy).toBeDefined();
+      expect(copy!.data.rollbackOf).toBeUndefined();
+    });
+
     it("treats a malformed store clock as order-unknown instead of 'earlier than everything'", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -4133,6 +4204,19 @@ describe("MemoryService", () => {
           id,
           evidence: { toolName: "test", actor: "user" },
         });
+      // An apply that loses the rollback lock at the commit point is
+      // compensated; the compensated file is yet another generation, and the
+      // record follows that one too (r77) — otherwise the retry would refuse.
+      const lostLock = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        id: childEdit.id,
+        evidence: { toolName: "test", actor: "user" },
+        testOnlyBeforeCommit: () => Promise.reject(new Error("lost the rollback lock")),
+      });
+      expect(lostLock.success).toBe(false);
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v2");
+      expect(await recordStamp()).toBe((await adoptionTargetStamp(ownerCopy)) ?? undefined);
       // Rolling the edit back rewrites the copy: a new generation, but this
       // lineage's own — the record follows it, so the create still maps.
       expect((await rollback(childEdit.id)).success).toBe(true);

@@ -450,14 +450,19 @@ export async function refreshLegacyAdoptionTargetStamps(args: {
     dirty = true;
   }
   if (renamed?.from != null && renamed.to != null) {
-    for (const [rel, record] of [...adopted]) {
-      // One-to-one copies only (the directory proof requires it; a lone file
-      // maps through its own record): the moved copy sits at the same
-      // relative position under the restored name.
-      if (record.created !== true || record.pending === true || record.target !== rel) continue;
-      if (!beneath(rel, renamed.from)) continue;
-      const movedRel = renamed.to + rel.slice(renamed.from.length);
-      if (adopted.has(movedRel)) continue;
+    const targets = new Set([...adopted.values()].map((record) => record.target));
+    for (const record of [...adopted.values()]) {
+      // Every copy beneath the vacated endpoint — at its own relPath (the
+      // directory proof requires one-to-one) or a lone file's conflict import
+      // under imported/<child>/ (r77) — now sits at the same relative
+      // position under the restored name. The restored name IS the legacy
+      // path the child's older rows address: a restored side without a record
+      // mapped one-to-one (remapRenameDestination); one that had a record
+      // (any target) is re-stamped above and gets no second record.
+      if (record.created !== true || record.pending === true) continue;
+      if (!beneath(record.target, renamed.from)) continue;
+      const movedRel = renamed.to + record.target.slice(renamed.from.length);
+      if (adopted.has(movedRel) || targets.has(movedRel)) continue;
       const stamp = await stampOf(movedRel);
       if (stamp === undefined) continue; // not moved after all: nothing to vouch for
       adopted.set(movedRel, {
