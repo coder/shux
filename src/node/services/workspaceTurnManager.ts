@@ -2836,22 +2836,20 @@ export class WorkspaceTurnManager {
           });
         }
         const recovered = this.buildTerminalWorkspaceTurnRecordFromEvent(record, event, {
-          // Repair preserves — never invents — a supersede classification.
-          // History order is not causal queue-dispatch evidence (an unrelated
-          // later user message must not upgrade an error settlement), while the
-          // persisted supersede stays authoritative when rebuilding from the
-          // SAME correlated final that settled it: the superseding queued input
-          // may not have appended its user message yet, and that absence must
-          // not downgrade the supersede to a truncation error. Only a different
-          // correlated final (contradictory same-turn evidence) may resettle.
-          // "preserved" keeps whichever flavor (generic or owner follow-up) was
-          // persisted verbatim, so repair cannot downgrade the quiet flavor.
+          // Explicit stop causes survive recovery. Without one, preserve only the same final's
+          // existing supersession; later unrelated history cannot prove a queue stop.
           supersedeEvidence:
-            isSupersededWorkspaceTurnInterrupt(record) &&
-            event.messageId === record.messageId &&
-            record.error != null
-              ? { kind: "preserved", error: record.error }
-              : null,
+            event.metadata.stopCause != null
+              ? this.getQueueCutSupersedeEvidence(event, record, {
+                  activeStream: undefined,
+                  cutter: undefined,
+                  hasPendingQueuedOrPreparingTurn: false,
+                })
+              : isSupersededWorkspaceTurnInterrupt(record) &&
+                  event.messageId === record.messageId &&
+                  record.error != null
+                ? { kind: "preserved", error: record.error }
+                : null,
         });
         if (
           !options.repairFromHistory ||
@@ -4835,6 +4833,14 @@ export class WorkspaceTurnManager {
         this.getQueueCutSupersedeEvidence(event, record, queueCutSnapshot) == null)
     ) {
       const history = await this.historyService.getHistoryFromLatestBoundary(event.workspaceId);
+      // A continuation can start during the read before its assistant row reaches history.
+      if (
+        this.hasSameTurnContinuation(event, metadata) ||
+        this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)
+      ) {
+        await this.markWorkspaceTurnStreamEndDeferred(event);
+        return true;
+      }
       if (history.success) {
         const index = history.data.findIndex((message) => message.id === event.messageId);
         if (index >= 0) {

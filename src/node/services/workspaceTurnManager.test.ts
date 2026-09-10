@@ -4741,6 +4741,64 @@ describe("WorkspaceTurnManager", () => {
   );
 
   test.each([false, true])(
+    "continuation arriving during history read keeps execution active (legacy=%s)",
+    async (legacy) => {
+      const pending = mock(() => false);
+      const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest({
+        hasPendingWorkspaceTurnContinuation: pending,
+      });
+      const event = intermediateStopEvent(parentId);
+      if (legacy) delete event.metadata.stopCause;
+      await persistStopEvent(historyService, event);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const readHistory = historyService.getHistoryFromLatestBoundary.bind(historyService);
+      spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(
+        async (...args) => {
+          const snapshot = await readHistory(...args);
+          entered.resolve();
+          await release.promise;
+          return snapshot;
+        }
+      );
+      const finalizing = finalizeWorkspaceTurnStreamEndForTest(taskService, event);
+      await entered.promise;
+      pending.mockReturnValue(true);
+      release.resolve();
+      await finalizing;
+      expect(
+        await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+      ).toMatchObject({
+        status: "running",
+        deferredMessageIds: [event.messageId],
+      });
+    }
+  );
+
+  test.each([false, true])(
+    "settled repair honors explicit replacement cause (sameOwner=%s)",
+    async (sameOwner) => {
+      const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+      const event = intermediateStopEvent(parentId);
+      event.metadata.stopCause = {
+        kind: "queued-input",
+        entryId: "replacement-entry",
+        ...(sameOwner ? { muxMetadata: workspaceTurnMuxMetadata(parentId, "wst_successor") } : {}),
+      };
+      await persistStopEvent(historyService, event);
+      await new TaskHandleStore(config).upsertWorkspaceTurn(
+        workspaceTurnRecord(parentId, "childworkspace", "wst_handle", "error", {
+          messageId: "earlier-error",
+          error: "Earlier provider failure",
+        })
+      );
+      const repaired = await workspaceTurnSnapshot(taskService, parentId);
+      expect(repaired).toMatchObject({ status: "interrupted", messageId: event.messageId });
+      if (sameOwner) expect(repaired?.error).toContain("wst_successor");
+    }
+  );
+
+  test.each([false, true])(
     "recovery preserves pending same-execution continuation (legacy=%s)",
     async (legacy) => {
       const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest({
