@@ -1,75 +1,42 @@
-import React, { useRef, useSyncExternalStore } from "react";
+import React from "react";
 import { AlertTriangle } from "lucide-react";
-import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
-import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
-import { useWorkspaceStreamingStatusPhase } from "@/browser/hooks/useWorkspaceStreamingStatusPhase";
+import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
+import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
 import { useChatDockColumnWidthClass } from "@/browser/components/ChatPane/chatDockColumn";
 import { cn } from "@/common/lib/utils";
 import { isLocalProjectRuntime } from "@/common/types/runtime";
-import type { RuntimeConfig } from "@/common/types/runtime";
 
-interface ConcurrentLocalWarningProps {
-  workspaceId: string;
-  projectPath: string;
-  runtimeConfig?: RuntimeConfig;
-}
+/** Warn about checkout sharing, not momentary stream activity. */
+export function ConcurrentLocalWarning(props: { workspaceId: string }) {
+  const { workspaceMetadata } = useWorkspaceMetadata();
+  const current = workspaceMetadata.get(props.workspaceId);
+  if (
+    !current ||
+    !hasWorkspaceRepository(current) ||
+    current.transcriptOnly ||
+    !isLocalProjectRuntime(current.runtimeConfig)
+  ) {
+    return null;
+  }
 
-/**
- * Counts unrelated local agents sharing this checkout, without cycling their identities.
- */
-export function useConcurrentLocalAgentCount(props: ConcurrentLocalWarningProps): number {
-  const isLocalProject = isLocalProjectRuntime(props.runtimeConfig);
-  const { workspaceMetadata } = useWorkspaceContext();
-  const store = useWorkspaceStoreRaw();
-
-  // Sub-agents share their family's checkout intentionally, not as competing local agents.
-  const rootWorkspaceId =
-    workspaceMetadata.get(props.workspaceId)?.rootWorkspaceId ?? props.workspaceId;
-  const otherLocalWorkspaces = Array.from(workspaceMetadata.values()).filter(
+  // User rationale: activity can drop between requests, retries, and tool/agent handoffs.
+  // No timeout can make an activity-gated warning flash-free. Checkout sharing is durable:
+  // keep one static warning until metadata removes the conflict, even while agents are idle.
+  // The metadata context contains only unarchived workspaces; same-family sharing is intentional.
+  const rootWorkspaceId = current.rootWorkspaceId ?? props.workspaceId;
+  const sharesCheckout = Array.from(workspaceMetadata.values()).some(
     (meta) =>
-      isLocalProject &&
-      meta.projectPath === props.projectPath &&
+      hasWorkspaceRepository(meta) &&
+      !meta.transcriptOnly &&
+      meta.projectPath === current.projectPath &&
       isLocalProjectRuntime(meta.runtimeConfig) &&
       (meta.rootWorkspaceId ?? meta.id) !== rootWorkspaceId
   );
-
-  const streamingCount = useSyncExternalStore(
-    (listener) => {
-      const unsubscribers = otherLocalWorkspaces.map((meta) =>
-        store.subscribeKey(meta.id, listener)
-      );
-      return () => unsubscribers.forEach((unsubscribe) => unsubscribe());
-    },
-    () =>
-      otherLocalWorkspaces.filter((meta) => {
-        try {
-          return store.getWorkspaceSidebarState(meta.id).canInterrupt;
-        } catch {
-          // Workspace may not be registered yet, skip.
-          return false;
-        }
-      }).length,
-    () => 0
-  );
-  const scope = JSON.stringify([
-    rootWorkspaceId,
-    props.projectPath,
-    otherLocalWorkspaces.map((meta) => meta.id).sort(),
-  ]);
-  const heldCount = useRef({ scope, count: streamingCount });
-  if (streamingCount > 0) heldCount.current = { scope, count: streamingCount };
-  const { displayPhase } = useWorkspaceStreamingStatusPhase(
-    streamingCount > 0 ? "streaming" : null
-  );
-
-  // Hold brief handoffs, but clear immediately when eligibility changes rather than
-  // carrying a stale warning into another family, project, or isolated checkout.
-  return displayPhase && heldCount.current.scope === scope ? heldCount.current.count : 0;
+  return sharesCheckout ? <ConcurrentLocalWarningDecoration /> : null;
 }
 
 interface ConcurrentLocalWarningViewProps {
-  agentCount: number;
   className?: string;
 }
 
@@ -91,10 +58,7 @@ export const ConcurrentLocalWarningDecoration: React.FC<ConcurrentLocalWarningVi
         )}
       >
         <AlertTriangle aria-hidden="true" className="text-warning size-3.5 shrink-0" />
-        <span className="counter-nums min-w-0 truncate">
-          {props.agentCount} other local agent{props.agentCount === 1 ? "" : "s"} running — may
-          interfere
-        </span>
+        <span className="min-w-0 truncate">Shared local checkout — agents may interfere</span>
       </div>
     </div>
   );

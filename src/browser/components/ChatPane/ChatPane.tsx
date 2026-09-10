@@ -72,10 +72,7 @@ import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
-import {
-  ConcurrentLocalWarningDecoration,
-  useConcurrentLocalAgentCount,
-} from "../ConcurrentLocalWarning/ConcurrentLocalWarning";
+import { ConcurrentLocalWarning } from "../ConcurrentLocalWarning/ConcurrentLocalWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
@@ -330,7 +327,6 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
 const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const {
     workspaceId,
-    projectPath,
     projectName,
     workspaceName,
     namedWorkspacePath,
@@ -365,11 +361,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       : null;
   const shouldShowQueuedAgentTaskPrompt =
     Boolean(queuedAgentTaskPrompt) && (workspaceState?.messages.length ?? 0) === 0;
-  const concurrentLocalAgentCount = useConcurrentLocalAgentCount({
-    workspaceId,
-    projectPath,
-    runtimeConfig,
-  });
 
   const { has1MContext } = useProviderOptions();
   // Resolve 1M context per-model (uses the pending model for the current workspace)
@@ -1725,7 +1716,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       isCompacting={isCompacting}
                       shouldShowPinnedTodoList={shouldShowPinnedTodoList}
                       shouldShowReviewsBanner={shouldShowReviewsBanner}
-                      concurrentLocalAgentCount={concurrentLocalAgentCount}
                       canInterrupt={canInterrupt}
                       autoCompactionResult={autoCompactionResult}
                       shouldShowCompactionWarning={shouldShowCompactionWarning}
@@ -1801,7 +1791,6 @@ interface ChatInputPaneProps {
   isTranscriptCaughtUp: boolean;
   shouldShowPinnedTodoList: boolean;
   shouldShowReviewsBanner: boolean;
-  concurrentLocalAgentCount: number;
   canInterrupt: boolean;
   autoCompactionResult: ReturnType<typeof checkAutoCompaction>;
   shouldShowCompactionWarning: boolean;
@@ -1896,12 +1885,10 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   // message insert above a live tail row, so bottom-lock had to correct after layout and
   // visibly flashed while another local agent was active. Pin it with composer decorations
   // instead; new transcript rows no longer move the warning.
-  if (props.concurrentLocalAgentCount) {
-    addDecorationEntry({
-      key: "concurrent-local-warning",
-      node: <ConcurrentLocalWarningDecoration agentCount={props.concurrentLocalAgentCount} />,
-    });
-  }
+  addDecorationEntry({
+    key: "concurrent-local-warning",
+    node: <ConcurrentLocalWarning workspaceId={props.workspaceId} />,
+  });
 
   if (props.shouldShowPinnedTodoList) {
     addDecorationEntry({

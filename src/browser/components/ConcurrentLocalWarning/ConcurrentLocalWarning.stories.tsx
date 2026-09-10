@@ -8,6 +8,7 @@ const meta = {
   ...lightweightMeta,
   title: "App/Chat/Components/ConcurrentLocalWarning",
   component: ConcurrentLocalWarningDecoration,
+  tags: ["concurrent-local-warning"],
   play: async ({ canvasElement }) => checkComposerLayout(canvasElement),
 } satisfies Meta<typeof ConcurrentLocalWarningDecoration>;
 
@@ -23,7 +24,6 @@ async function checkComposerLayout(canvasElement: HTMLElement) {
   const input = canvas.getByTestId("concurrency-input");
   await expect(status).toBeVisible();
   await expect(label.scrollWidth).toBeLessThanOrEqual(label.clientWidth);
-  await expect(getComputedStyle(label).fontVariantNumeric).toContain("tabular-nums");
   await expect(status.getBoundingClientRect().bottom).toBeLessThanOrEqual(
     input.getBoundingClientRect().top
   );
@@ -44,8 +44,8 @@ function renderComposerDecoration(args: ComponentProps<typeof ConcurrentLocalWar
             Can you keep working while I ask another agent to inspect the same checkout?
           </div>
           <div className="border-border bg-background-secondary text-muted rounded-lg border px-3 py-2">
-            I&apos;ll continue here, but there is another local workspace actively running in this
-            project directory.
+            I&apos;ll continue here, but there is another local workspace sharing this checkout,
+            even between agent turns.
           </div>
         </div>
       </div>
@@ -65,11 +65,7 @@ function renderComposerDecoration(args: ComponentProps<typeof ConcurrentLocalWar
 }
 
 export const ComposerDecoration: Story = {
-  args: {
-    agentCount: 1,
-  },
   render: renderComposerDecoration,
-  tags: ["concurrent-local-warning"],
   parameters: {
     docs: {
       description: {
@@ -80,15 +76,7 @@ export const ComposerDecoration: Story = {
   },
 };
 
-export const MultipleAgents: Story = {
-  ...ComposerDecoration,
-  args: { agentCount: 3 },
-};
-
 export const PhoneComposerDecoration: Story = {
-  args: {
-    agentCount: 12,
-  },
   render: renderComposerDecoration,
   decorators: [
     (Story) => (
