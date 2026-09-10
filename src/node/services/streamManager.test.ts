@@ -1968,9 +1968,31 @@ describe("StreamManager - stopWhen configuration", () => {
       });
     expect(await settle({ success: true, status: "scheduled", message: "ok" })).toBe(true);
     expect(onStepSettled.mock.calls[0][0].newContextRequested).toBe(true);
+    // Even a policy that "requires" new_context cannot turn its success into a terminal
+    // completion that would skip the settled-step callback.
+    const [, stopRequired, required] = buildStopWhenForTests()({
+      hasQueuedMessages: () => false,
+      onStepSettled,
+      modelString: "anthropic:claude-sonnet-4-5",
+      tools: { session_history: tool({ inputSchema: z.object({}) }) },
+      toolPolicy: [{ regex_match: "new_context", action: "require" }],
+    });
+    const requiredSteps = {
+      steps: [
+        {
+          usage: { inputTokens: 90, outputTokens: 10, totalTokens: 100 },
+          toolResults: [
+            { toolName: "new_context", output: { success: true, status: "scheduled" } },
+          ],
+        },
+      ],
+    };
+    expect(required(requiredSteps)).toBe(false);
+    expect(await stopRequired(requiredSteps)).toBe(true);
+    expect(onStepSettled.mock.calls.at(-1)?.[0].newContextRequested).toBe(true);
     // A failed or error-shaped result is not a request.
     await settle({ success: false, error: "denied" });
-    expect(onStepSettled.mock.calls[1][0].newContextRequested).toBe(false);
+    expect(onStepSettled.mock.calls.at(-1)?.[0].newContextRequested).toBe(false);
   });
 
   test("successful required completion wins over rollover while a failed tool still evaluates budget", async () => {

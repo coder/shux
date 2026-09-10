@@ -22,6 +22,7 @@ import {
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
+  type StepBudgetEvaluation,
   getContextBudgetHardCeiling,
   getContextBudgetRolloverPoint,
   resolveContextBudgetFlushThinking,
@@ -5979,23 +5980,45 @@ export class AgentSession {
       context.providersConfig ?? null,
       { openaiWireFormat: context.options?.providerOptions?.openai?.wireFormat }
     );
-    if (maxTokens == null || maxTokens <= 0) {
-      log.warn("Token budget has no known model context limit", { model: step.model });
-      return "continue";
-    }
     const threshold = this.compactionMonitor.getThreshold();
-    const decision = evaluateStepBudget({
-      contextTokens: usage
-        ? usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens
-        : 0,
-      outputTokens: step.usage?.outputTokens ?? 0,
-      toolResultChars: step.toolResultChars,
-      imageParts: step.imageParts,
-      toolResultTokens: step.toolResultTokens,
-      modelContextLimit: maxTokens,
-      threshold,
-      warningEmitted: this.contextBudgetWarningClaimed,
-    });
+    const contextTokens = usage
+      ? usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens
+      : 0;
+    // A settled successful new_context result asks for a rollover regardless of usage. Without
+    // session_history nothing could be retrieved from the sealed window (and the reset could not
+    // be admitted), and with automatic rollover disabled nothing could seal it, so such requests
+    // are ignored rather than left to fail every send.
+    const modelRequested =
+      step.newContextRequested === true &&
+      step.sessionHistoryAvailable &&
+      threshold < 1 &&
+      context.contextBudgetFlushTurn !== true;
+    const knownLimit = maxTokens != null && maxTokens > 0;
+    if (!knownLimit) {
+      log.warn("Token budget has no known model context limit", { model: step.model });
+      // Budget evaluation is impossible, but an explicit request needs no limit to be honored.
+      if (!modelRequested) return "continue";
+    }
+    const decision: StepBudgetEvaluation = knownLimit
+      ? evaluateStepBudget({
+          contextTokens,
+          outputTokens: step.usage?.outputTokens ?? 0,
+          toolResultChars: step.toolResultChars,
+          imageParts: step.imageParts,
+          toolResultTokens: step.toolResultTokens,
+          modelContextLimit: maxTokens,
+          threshold,
+          warningEmitted: this.contextBudgetWarningClaimed,
+        })
+      : {
+          decision: "continue",
+          flushOpportunity: true,
+          projected: contextTokens,
+          hardCeiling: undefined,
+        };
+    // Rollover metadata records the limit the window was measured against; an unknown limit is
+    // recorded as the observed usage so the row stays valid for display and downgrade parsing.
+    const recordedLimit = knownLimit ? maxTokens : Math.max(1, contextTokens);
     if (decision.decision === "block") return "block";
     if (context.contextBudgetFlushTurn === true) {
       if (this.compactionMonitor.getThreshold() >= 1) {
@@ -6012,18 +6035,9 @@ export class AgentSession {
       // continuation seal the window.
       if (decision.decision === "continue") return "rollover";
     }
-    // A settled successful new_context result asks for a rollover regardless of usage. It is
-    // honored like a budget rollover (continuation queued after every sibling settled) so the
-    // model never re-executes side effects; the persisted tool result doubles as the durable
-    // receipt that prepareRolloverRequest recovers after a restart. Ignored when automatic
-    // rollover is disabled (threshold 100%): nothing could seal the window.
-    // Without session_history nothing could be retrieved from the sealed window (and the reset
-    // could not be admitted), so such a request is ignored rather than left to fail every send.
-    const modelRequested =
-      step.newContextRequested === true &&
-      step.sessionHistoryAvailable &&
-      threshold < 1 &&
-      context.contextBudgetFlushTurn !== true;
+    // A model request is honored like a budget rollover (continuation queued after every sibling
+    // settled) so the model never re-executes side effects; the persisted tool result doubles as
+    // the durable receipt that prepareRolloverRequest recovers after a restart.
     if (decision.decision === "continue" && !modelRequested) return "continue";
     let offerFlush = false;
     if (decision.decision === "rollover" || modelRequested) {
@@ -6050,8 +6064,8 @@ export class AgentSession {
         previousWindowId: currentContextWindowId(history.data),
         flushOpportunity: decision.flushOpportunity,
         contextTokens: decision.projected,
-        maxTokens,
-        budgetTokens: getContextBudgetRolloverPoint(maxTokens, threshold),
+        maxTokens: recordedLimit,
+        budgetTokens: getContextBudgetRolloverPoint(recordedLimit, threshold),
       };
     } else {
       this.contextBudgetWarningClaimed = true;

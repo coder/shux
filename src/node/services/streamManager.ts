@@ -2410,6 +2410,10 @@ export class StreamManager {
       return (
         lastStep?.toolResults?.some(
           (toolResult) =>
+            // A context-lifecycle request is never a terminal completion, even if a policy
+            // lists it as required; otherwise its success would end the stream before the
+            // settled-step callback could schedule the rollover it promised.
+            toolResult.toolName !== "new_context" &&
             requiredPatterns.some((pattern) => pattern.test(toolResult.toolName)) &&
             isSuccessfulOutput(toolResult.output)
         ) ?? false

@@ -1142,6 +1142,24 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(false);
   });
 
+  test("a new_context request is honored even when the model's context limit is unknown", async () => {
+    const h = await setup();
+    expect(
+      (await h.session.sendMessage("Work", { ...options, model: "custom:unknown-limit-model" }))
+        .success
+    ).toBe(true);
+    expect(
+      await h.requests[0].onStepSettled?.(
+        step(20_000, { model: "custom:unknown-limit-model", newContextRequested: true })
+      )
+    ).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    // Budget evaluation alone still cannot run without a limit.
+    expect(
+      await h.requests[0].onStepSettled?.(step(20_000, { model: "custom:unknown-limit-model" }))
+    ).toBe("continue");
+  });
+
   test("a persisted receipt is not honored while the policy disables session_history", async () => {
     const h = await setup();
     const request = createMuxMessage("requester", "assistant", "", {
