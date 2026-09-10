@@ -72,7 +72,6 @@ import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
-import { ConcurrentLocalWarning } from "../ConcurrentLocalWarning/ConcurrentLocalWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
@@ -1881,14 +1880,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       ),
     });
   }
-  // User rationale: keeping this warning inside the transcript tail made every appended
-  // message insert above a live tail row, so bottom-lock had to correct after layout and
-  // visibly flashed while another local agent was active. Pin it with composer decorations
-  // instead; new transcript rows no longer move the warning.
-  addDecorationEntry({
-    key: "concurrent-local-warning",
-    node: <ConcurrentLocalWarning workspaceId={props.workspaceId} />,
-  });
+  // Match Codex’s behavior: shared local checkouts intentionally have no concurrency warning.
 
   if (props.shouldShowPinnedTodoList) {
     addDecorationEntry({

@@ -769,8 +769,7 @@ export class WorkspaceStore {
   // True once the initial activity.list() snapshot has been applied (or the
   // subscription failed and we self-healed). Until then, "no other workspace
   // is streaming" is merely unknown — the chat view's first-paint barrier
-  // (useChatViewDataReady) waits on this so cross-workspace decorations like
-  // the concurrent-local warning can't pop in after the transcript reveals.
+  // (useChatViewDataReady) waits on this rather than treating unknown activity as idle.
   private activityHydrated = false;
   private activityAuthoritative = false;
   // Workspace ids that received a live subscription delta while a bootstrap-retry
