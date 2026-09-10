@@ -141,8 +141,12 @@ function createSessionForHistory(historyService: HistoryService, sessionDir: str
     sessionsDir: path.dirname(sessionDir),
     srcDir: "/tmp",
     // A context boundary resets the durable memory-policy accumulator, which
-    // looks this workspace up in the config snapshot.
+    // looks this workspace up in the config snapshot (existence-requiring
+    // load; the mock delegates so the strict-mode override below propagates).
     loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+    loadExistingConfigOrThrow(this: Config) {
+      return this.loadConfigOrDefault({ throwOnError: true });
+    },
   } as unknown as Config;
 
   return new AgentSession({

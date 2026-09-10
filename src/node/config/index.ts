@@ -1336,14 +1336,22 @@ export class Config {
    * empty, valid config), which fail-closed callers — workspace removal's
    * shared-memory handover, the workspace-memory policy accumulator — must
    * not mistake for "this workspace is not registered" while the file is
-   * merely mid-rewrite. Stat before and after the read: a file present at
-   * both is taken as present during it.
+   * merely mid-rewrite. Stat before and after the read, and require the SAME
+   * stamp at both: a file present at both with one stamp is taken as present
+   * and unchanged during the read, while a replacement landing in between
+   * (another backend's atomic rewrite) means the bytes read may belong to
+   * neither snapshot's topology — the caller retries from one stable
+   * snapshot rather than act on a torn view.
    */
   loadExistingConfigOrThrow(): ProjectsConfig {
     const before = this.configFileStamp();
     const config = this.loadConfigOrDefault({ throwOnError: true });
-    if (before === "missing" || this.configFileStamp() === "missing") {
+    const after = this.configFileStamp();
+    if (before === "missing" || after === "missing") {
       throw new Error(`config.json is absent at ${this.configFile}`);
+    }
+    if (before !== after) {
+      throw new Error(`config.json at ${this.configFile} was replaced during the read`);
     }
     return config;
   }

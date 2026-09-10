@@ -923,6 +923,35 @@ describe("Config", () => {
       expect(loaded.projects.size).toBe(0);
     });
 
+    describe("loadExistingConfigOrThrow", () => {
+      it("throws for an absent config.json even though strict loads read it as empty", () => {
+        const config = new Config(tempDir);
+        expect(() => config.loadConfigOrDefault({ throwOnError: true })).not.toThrow();
+        expect(() => config.loadExistingConfigOrThrow()).toThrow(/absent/);
+      });
+
+      it("rejects a config.json replaced during the read instead of returning a torn view", () => {
+        const configFile = path.join(tempDir, "config.json");
+        fs.writeFileSync(configFile, JSON.stringify({ defaultProjectDir: "/tmp" }));
+        const config = new Config(tempDir);
+        expect(config.loadExistingConfigOrThrow().projects.size).toBe(0);
+        // Another backend's atomic rewrite lands between the pre-read stamp
+        // and the post-read one (a different size guarantees a new stamp).
+        const original = config.loadConfigOrDefault.bind(config);
+        const load = spyOn(config, "loadConfigOrDefault").mockImplementation((options) => {
+          const loaded = original(options);
+          fs.writeFileSync(configFile, JSON.stringify({ defaultProjectDir: "/tmp/replaced" }));
+          return loaded;
+        });
+        try {
+          expect(() => config.loadExistingConfigOrThrow()).toThrow(/replaced during the read/);
+        } finally {
+          load.mockRestore();
+        }
+        expect(() => config.loadExistingConfigOrThrow()).not.toThrow();
+      });
+    });
+
     it("keeps the canonical legacy identity when a secondary alias file is unreadable in lenient loads", async () => {
       // An id-less legacy entry with a HEALTHY canonical (generated-legacy)
       // metadata file and an unreadable basename-backed second candidate:

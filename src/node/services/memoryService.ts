@@ -1776,6 +1776,24 @@ export class MemoryService extends EventEmitter {
     }
   }
 
+  /**
+   * Post-read gate for workspace-scope reads. openWorkspaceStore checks the
+   * tombstones BEFORE the read; another backend can publish the acting
+   * workspace's (or the owner's) removal tombstone while the read is in
+   * flight, and the bytes would then be exposed on behalf of a workspace that
+   * no longer exists. Re-checked after every read whose result leaves the
+   * service (view, listings, index/hot-set builds, UI reads), before the
+   * result is returned. Other scopes are never shared and have no tombstone.
+   */
+  private async assertWorkspaceReadExposable(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    store: MemoryStore
+  ): Promise<void> {
+    if (scope !== "workspace") return;
+    await this.assertWorkspaceStoreReadable(ctx, store);
+  }
+
   private requireFilePath(parsed: ParsedMemoryPath, virtualPath: string): MemoryScope {
     if (parsed.scope === null || parsed.relPath === "") {
       throw new MemoryCommandError(
@@ -2230,6 +2248,7 @@ export class MemoryService extends EventEmitter {
             // Read-only: never create roots just to list (missing ⇒ empty).
             await store.assertRootSafe();
             const files = await store.listFiles();
+            await this.assertWorkspaceReadExposable(ctx, scope, store);
             sections.push(...renderTree(files, MEMORY_VIEW_MAX_DEPTH - 1, "  "));
           } catch (error) {
             // Self-healing: an unavailable scope must not break the whole view.
@@ -2246,6 +2265,7 @@ export class MemoryService extends EventEmitter {
       // write — but the scope itself always exists in the protocol.
       if (kind === "dir" || (kind === null && parsed.relPath === "")) {
         const files = await store.listFiles();
+        await this.assertWorkspaceReadExposable(ctx, parsed.scope, store);
         const prefix = parsed.relPath === "" ? "" : `${parsed.relPath}/`;
         const scopedFiles = files
           .filter((file) => file.startsWith(prefix))
@@ -2261,6 +2281,9 @@ export class MemoryService extends EventEmitter {
       }
 
       const content = await this.readBoundedTextFile(store, parsed.relPath, virtualPath);
+      // Before recordUsage: its refusal is swallowed (usage is best-effort),
+      // so it cannot stand in for this gate.
+      await this.assertWorkspaceReadExposable(ctx, parsed.scope, store);
       const output = renderFileView(content, options);
       await this.recordUsage(ctx, parsed.scope, parsed.relPath, { write: false });
       return { success: true, output };
@@ -2822,6 +2845,7 @@ export class MemoryService extends EventEmitter {
       const scope = this.requireFilePath(parsed, virtualPath);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
       const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
+      await this.assertWorkspaceReadExposable(ctx, scope, store);
       // Deliberately NOT recorded as a use: this is a human browsing the
       // Memory tab/settings, and usage stats must reflect agent reads only so
       // UI browsing never inflates hot-set ranking. (UI saves still count —
@@ -2921,6 +2945,10 @@ export class MemoryService extends EventEmitter {
   async listIndexEntries(ctx: MemoryScopeContext): Promise<MemoryIndexEntry[]> {
     const entries: MemoryIndexEntry[] = [];
     for (const scope of MEMORY_SCOPES) {
+      // Per-scope buffer: the scope's entries join the result only once the
+      // post-read gate below passed, so a tombstone published mid-enumeration
+      // drops the whole scope rather than a prefix of it.
+      const scopeEntries: MemoryIndexEntry[] = [];
       try {
         const store = this.getStore(ctx, scope);
         // Prompt context is a read of the (possibly shared) store: a removed
@@ -2975,8 +3003,10 @@ export class MemoryService extends EventEmitter {
           } catch {
             // Unreadable file: list it without a description.
           }
-          entries.push({ path: toVirtualPath(scope, relPath), scope, relPath, description });
+          scopeEntries.push({ path: toVirtualPath(scope, relPath), scope, relPath, description });
         }
+        await this.assertWorkspaceReadExposable(ctx, scope, store);
+        entries.push(...scopeEntries);
       } catch (error) {
         log.debug("[MemoryService] skipping scope in memory index", { scope, error });
       }
@@ -3015,17 +3045,20 @@ export class MemoryService extends EventEmitter {
       countTokens: options.countTokens,
       tokenBudgetActive: options.tokenBudgetActive,
       onlyContextNotes: options.onlyContextNotes,
-      readFile: (virtualPath) => {
+      readFile: async (virtualPath) => {
         const parsed = parseMemoryPath(virtualPath);
         const scope = this.requireFilePath(parsed, virtualPath);
         // Paths come from listIndexEntries (already enumerated under the scope
         // roots), so no extra containment walk is needed for these reads.
         // Bounded prefix: selection truncates to MEMORY_HOT_SET_MAX_ITEM_BYTES
         // anyway; +1 byte preserves its over-budget (truncation marker) check.
-        return this.getStore(ctx, scope).readFilePrefix(
+        const store = this.getStore(ctx, scope);
+        const content = await store.readFilePrefix(
           parsed.relPath,
           MEMORY_HOT_SET_MAX_ITEM_BYTES + 1
         );
+        await this.assertWorkspaceReadExposable(ctx, scope, store);
+        return content;
       },
     });
   }

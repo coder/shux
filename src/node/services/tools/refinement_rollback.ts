@@ -12,6 +12,7 @@ import {
   LegacyPathNotAdoptedError,
 } from "@/node/services/memoryLegacyAdoption";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { SharedWorkspaceMemoryTopology } from "@/node/services/memoryWorkspaceOwner";
 
 interface RefinementRollbackToolArgs {
   id: string;
@@ -85,13 +86,6 @@ async function refuseReadOnlyMemoryRollback(
   return null;
 }
 
-export interface SharedWorkspaceMemoryTopology {
-  /** Owner session dir when the workspace is a sub-agent sharing its notebook. */
-  ownerSessionDir: string | undefined;
-  /** Other live task-tree members' session dirs (see RollbackRefinementOptions). */
-  peerSessionDirs: string[];
-}
-
 export type SharedWorkspaceMemoryTopologyResolver = () => SharedWorkspaceMemoryTopology;
 
 export function createRefinementRollbackTool(ctx: {
@@ -124,6 +118,9 @@ export function createRefinementRollbackTool(ctx: {
       { id, reason }: RefinementRollbackToolArgs,
       { toolCallId }
     ): Promise<RefinementRollbackToolResult> => {
+      // Resolved once here for the owner root (stable for the session's
+      // lifetime) and the policy gate; peers are re-resolved by the engine per
+      // check through the same resolver (a throw there refuses too).
       let topology: SharedWorkspaceMemoryTopology;
       try {
         topology = ctx.sharedWorkspaceMemory?.() ?? {
@@ -148,7 +145,8 @@ export function createRefinementRollbackTool(ctx: {
       const result = await rollbackRefinement({
         sessionDir: ctx.sessionDir,
         sharedWorkspaceMemorySessionDir: topology.ownerSessionDir,
-        listSharedWorkspaceMemoryPeerSessionDirs: () => topology.peerSessionDirs,
+        listSharedWorkspaceMemoryPeerSessionDirs: () =>
+          ctx.sharedWorkspaceMemory?.().peerSessionDirs ?? [],
         id,
         reason,
         evidence: { toolName: "refinement_rollback", toolCallId, actor: "agent" },

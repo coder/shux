@@ -121,10 +121,7 @@ import {
 } from "@/common/utils/providers/customProviders";
 import type { MCPServerManager, MCPWorkspaceStats } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
-import {
-  resolveWorkspaceMemoryOwnerId,
-  sharedWorkspaceMemoryPeerSessionDirs,
-} from "@/node/services/memoryWorkspaceOwner";
+import { resolveSharedWorkspaceMemoryTopology } from "@/node/services/memoryWorkspaceOwner";
 import { memoryScopeContextFromToolConfig } from "@/node/services/tools/memory";
 import type { TaskService } from "@/node/services/taskService";
 import { READ_ONLY_ACCESS, resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
@@ -2525,32 +2522,14 @@ export class TurnRequestBuilder {
         // and announce its direct-to-disk writes through MemoryService so the
         // shared store's readers refresh. Resolved per rollback (not per
         // turn): tree membership changes as sub-agents are spawned and removed
-        // while the tool instance lives. Strict AND existence-requiring load,
-        // from one snapshot for owner and peers: a config.json that is
-        // unreadable or absent (mid-rewrite) must refuse the rollback (see
-        // RollbackRefinementOptions), not read as a fresh install in which
-        // the child owns its notebook — that "self" fallback would omit the
-        // owner root (a pre-sharing row's inverse then lands on the hidden
-        // legacy notebook instead of the owner's adopted copy) and the peer
-        // list (conflicting sibling rows go unseen).
+        // while the tool instance lives; a topology that cannot be proven
+        // refuses the rollback (see resolveSharedWorkspaceMemoryTopology).
         const memoryService = this.dependencies.bindings.memoryService;
         const sessionsDir = this.dependencies.config.sessionsDir;
         const sharedWorkspaceMemory =
           memoryService === undefined
             ? undefined
-            : () => {
-                const cfg = this.dependencies.config.loadExistingConfigOrThrow();
-                const ownerId = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
-                return {
-                  ownerSessionDir:
-                    ownerId === workspaceId ? undefined : path.join(sessionsDir, ownerId),
-                  peerSessionDirs: sharedWorkspaceMemoryPeerSessionDirs(
-                    cfg,
-                    sessionsDir,
-                    workspaceId
-                  ),
-                };
-              };
+            : () => resolveSharedWorkspaceMemoryTopology(this.dependencies.config, workspaceId);
         // Built anew for EVERY attempt (prepareModelRequest runs per primary /
         // fallback request) from the never-mutated policy: refinement_rollback
         // reads it by reference, and the request.assemble demotion below only

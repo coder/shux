@@ -115,3 +115,34 @@ export function sharedWorkspaceMemoryPeerSessionDirs(
   }
   return peers;
 }
+
+/** Owner root and live peers of a workspace sharing its notebook (rollback). */
+export interface SharedWorkspaceMemoryTopology {
+  /** Owner session dir when the workspace is a sub-agent sharing its notebook. */
+  ownerSessionDir: string | undefined;
+  /** Other live task-tree members' session dirs (see RollbackRefinementOptions). */
+  peerSessionDirs: string[];
+}
+
+/**
+ * The rollback topology from ONE config snapshot that must prove itself:
+ * `loadExistingConfigOrThrow` throws when config.json is unreadable OR
+ * absent (mid-rewrite), so callers refuse instead of degrading to the
+ * fresh-install view in which the workspace owns its notebook — that "self"
+ * fallback would omit the owner root (a pre-sharing row's inverse then lands
+ * on the hidden legacy notebook instead of the owner's adopted copy) and the
+ * peer list (conflicting sibling rows go unseen). Peers are re-resolved per
+ * check by the engine (a member registered while waiting for the store lock
+ * must count), so callers hand it a callback that calls this again.
+ */
+export function resolveSharedWorkspaceMemoryTopology(
+  config: Pick<Config, "loadExistingConfigOrThrow" | "sessionsDir">,
+  workspaceId: string
+): SharedWorkspaceMemoryTopology {
+  const cfg = config.loadExistingConfigOrThrow();
+  const ownerId = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
+  return {
+    ownerSessionDir: ownerId === workspaceId ? undefined : path.join(config.sessionsDir, ownerId),
+    peerSessionDirs: sharedWorkspaceMemoryPeerSessionDirs(cfg, config.sessionsDir, workspaceId),
+  };
+}

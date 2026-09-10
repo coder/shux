@@ -102,13 +102,17 @@ function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null 
 }
 
 /**
- * Self-healing read of the adoption manifest: a missing or malformed file
- * reads as "nothing adopted" (malformed content IS the file's state; the next
- * pass rewrites it). An UNREADABLE file (EACCES, EIO) says nothing about that
- * state: tolerant callers read it as empty too, `strict` callers throw — the
- * removal handover decides what may be deleted from the manifest, and an
- * empty substitute would delete the child session with the only provenance
- * for a stale owner copy. A Map, not a plain object: a legacy note may
+ * Read of the adoption manifest. A MISSING file reads as "nothing adopted"
+ * for every caller. Tolerant callers also read an unreadable (EACCES, EIO)
+ * or malformed file — bad JSON, a non-object, a record missing its string
+ * fields — as empty (self-healing: the next pass rewrites it). `strict`
+ * callers throw on all of those: the adoption pass and the removal handover
+ * decide what may be deleted on the manifest's authority, and an empty
+ * substitute would drop provenance — a malformed record whose downgraded
+ * source is already gone can no longer be reconciled (its target is in the
+ * bad record), and removal would delete the child session while the
+ * adoption-created owner copy stays visible for good. A Map, not a plain
+ * object: a legacy note may
  * legitimately be named `__proto__` (any store-valid relPath), and assigning
  * that key on an ordinary object hits the prototype setter instead of
  * creating an entry the serialization would carry — the note would then be
@@ -127,18 +131,28 @@ export async function readLegacyAdoptionManifest(
     if (options?.strict === true && code !== "ENOENT" && code !== "ENOTDIR") throw error;
     return new Map();
   }
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return new Map();
-    return new Map(
-      Object.entries(parsed).flatMap(([relPath, raw]) => {
-        const record = parseLegacyAdoptionRecord(raw);
-        return record === null ? [] : [[relPath, record] as const];
-      })
-    );
-  } catch {
+  const malformed = (detail: string): Map<string, LegacyAdoptionRecord> => {
+    if (options?.strict === true) {
+      throw new Error(`the legacy adoption manifest at ${manifestPath} is malformed (${detail})`);
+    }
     return new Map();
+  };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return malformed("not JSON");
   }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return malformed("not an object");
+  }
+  const entries: Array<[string, LegacyAdoptionRecord]> = [];
+  for (const [relPath, value] of Object.entries(parsed)) {
+    const record = parseLegacyAdoptionRecord(value);
+    if (record === null) return malformed(`record '${relPath}'`);
+    entries.push([relPath, record]);
+  }
+  return new Map(entries);
 }
 
 /**

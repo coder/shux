@@ -197,6 +197,18 @@ export async function createAgentSessionHarness(
   const historyService = options.historyService ?? testHistory!.historyService;
   const config = options.config ?? testHistory?.config ?? createAgentSessionTestConfig();
   const cleanup = testHistory?.cleanup ?? (() => Promise.resolve());
+  // A registered workspace always has a config.json in production, and the
+  // session's compaction/reset boundaries require one to exist (an absent
+  // file reads as mid-rewrite, not as a fresh install). Persist the empty
+  // default so harness sessions do not fail those boundaries spuriously.
+  // Some suites pass a partial mock config (cast) without these methods.
+  if (
+    typeof config.configFileStamp === "function" &&
+    typeof config.editConfig === "function" &&
+    config.configFileStamp() === "missing"
+  ) {
+    await config.editConfig((cfg) => cfg);
+  }
   const { aiEmitter, aiService } = options.aiService
     ? { aiEmitter: options.aiEmitter ?? new EventEmitter(), aiService: options.aiService }
     : createMockAiService({

@@ -1,9 +1,10 @@
 import * as path from "path";
-import { defaultConfig } from "@/node/config";
+import { defaultConfig, type Config } from "@/node/config";
 import {
-  resolveWorkspaceMemoryOwnerId,
-  sharedWorkspaceMemoryPeerSessionDirs,
+  resolveSharedWorkspaceMemoryTopology,
+  type SharedWorkspaceMemoryTopology,
 } from "@/node/services/memoryWorkspaceOwner";
+import { getErrorMessage } from "@/common/utils/errors";
 import {
   MemoryRefinementActionSchema,
   RollbackRefinementActionSchema,
@@ -41,6 +42,8 @@ export interface RefinementsCommandOptions {
   force?: boolean;
   /** Test seam: bypass ~/.mux session resolution for fixture sessions. */
   sessionDir?: string;
+  /** Test seam: the config whose task tree resolves shared-memory ownership. */
+  config?: Pick<Config, "loadExistingConfigOrThrow" | "sessionsDir">;
 }
 
 /**
@@ -55,28 +58,31 @@ export async function refinementsCommand(
 
   if (opts.rollback !== undefined) {
     // Sub-agents journal workspace-scope rows that point into the owner's
-    // session dir; admit that root the same way the in-app tool does.
-    // Strict: a tolerant read of an unreadable config.json would resolve a
-    // sub-agent to ITSELF, and the rollback would then mutate its hidden
-    // legacy notebook (no owner root, no adoption remap) and report success.
-    const cfg = defaultConfig.loadConfigOrDefault({ throwOnError: true });
-    const memoryOwnerId = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
+    // session dir; admit that root the same way the in-app tool does, from a
+    // config that must EXIST and read: a tolerant (or fresh-install) view
+    // would resolve a sub-agent to ITSELF, and the rollback would then mutate
+    // its hidden legacy notebook (no owner root, no adoption remap) and
+    // report success. Throws → the command fails before touching anything.
+    const config = opts.config ?? defaultConfig;
+    let topology: SharedWorkspaceMemoryTopology;
+    try {
+      topology = resolveSharedWorkspaceMemoryTopology(config, workspaceId);
+    } catch (error) {
+      console.error(
+        `Refusing rollback of '${opts.rollback}': shared-memory ownership could not be resolved (${getErrorMessage(error)})`
+      );
+      process.exitCode = 1;
+      return;
+    }
     const result = await rollbackRefinement({
       sessionDir,
-      sharedWorkspaceMemorySessionDir:
-        memoryOwnerId === workspaceId
-          ? undefined
-          : path.join(defaultConfig.sessionsDir, memoryOwnerId),
+      sharedWorkspaceMemorySessionDir: topology.ownerSessionDir,
       // Reloaded per check (plan-time and in-lock), not from the snapshot
       // above: a live backend may register a new tree member while this
       // process waits for the shared-store lock, and its rows must count.
-      // Strict: an unreadable config refuses the rollback (empty tree = guess).
+      // Same existence-requiring load: an unproven tree refuses the rollback.
       listSharedWorkspaceMemoryPeerSessionDirs: () =>
-        sharedWorkspaceMemoryPeerSessionDirs(
-          defaultConfig.loadConfigOrDefault({ throwOnError: true }),
-          defaultConfig.sessionsDir,
-          workspaceId
-        ),
+        resolveSharedWorkspaceMemoryTopology(config, workspaceId).peerSessionDirs,
       id: opts.rollback,
       force: opts.force,
       evidence: { toolName: "debug-cli", actor: "user" },
