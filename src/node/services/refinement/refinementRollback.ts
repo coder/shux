@@ -62,6 +62,7 @@ import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import {
   createLegacyPathRemapper,
   LegacyPathNotAdoptedError,
+  refreshLegacyAdoptionTargetStamps,
 } from "@/node/services/memoryLegacyAdoption";
 
 export type RefinementEvent = Extract<DurableEvent, { kind: "refinement" }>;
@@ -1263,6 +1264,29 @@ export async function rollbackRefinement(
       // partial rollback behind (no rollbackOf row, and a retry refuses on the
       // resulting divergence).
       const applied: RollbackApplied = { rollbackRowId: null, restored: [], deleted: [] };
+      // Retargeted apply (r74): the adopted copies rewritten, removed or —
+      // after a failed apply — compensated are new generations of the files;
+      // re-stamp them so the child's remaining rows over the same notes still
+      // map (createLegacyPathRemapper refuses a copy that is no longer the
+      // recorded generation). A rename keeps inode and mtime, so it needs
+      // none. Still under the owner-store lock.
+      const restampAdoptedCopies = async (): Promise<void> => {
+        if (remap === identityRemapper) return;
+        assert(opts.sharedWorkspaceMemorySessionDir !== undefined);
+        try {
+          await refreshLegacyAdoptionTargetStamps({
+            childSessionDir: opts.sessionDir,
+            ownerSessionDir: opts.sharedWorkspaceMemorySessionDir,
+            paths: [...applied.restored, ...applied.deleted],
+          });
+        } catch (error) {
+          // Stale stamps only refuse later rollbacks (force overrides).
+          log.warn("[refinement] failed to re-stamp adopted legacy copies after a rollback", {
+            id: opts.id,
+            error,
+          });
+        }
+      };
       switch (inverse.op) {
         case "delete-files":
           try {
@@ -1272,6 +1296,7 @@ export async function rollbackRefinement(
             }
           } catch (error) {
             await compensatePartialApply(applied.deleted, newInverse);
+            await restampAdoptedCopies();
             throw error;
           }
           break;
@@ -1305,6 +1330,7 @@ export async function rollbackRefinement(
             }
           } catch (error) {
             await compensatePartialApply([...applied.restored, ...applied.deleted], newInverse);
+            await restampAdoptedCopies();
             throw error;
           }
           break;
@@ -1316,6 +1342,7 @@ export async function rollbackRefinement(
           applied.renamed = { from: inverse.from, to: inverse.to };
           break;
       }
+      await restampAdoptedCopies();
 
       // Commit point: even if two processes double-entered the critical section
       // (theoretically possible — plain POSIX files cannot make the guard's

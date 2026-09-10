@@ -10,6 +10,7 @@
 import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
+import writeFileAtomic from "write-file-atomic";
 import type { RefinementInverse } from "@/common/types/refinement";
 
 /**
@@ -224,11 +225,13 @@ function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
 
 /** Thrown for a legacy path the shared store does not represent (see below). */
 export class LegacyPathNotAdoptedError extends Error {
-  constructor(legacyPath: string, reason: "not-adopted" | "owner-owned") {
+  constructor(legacyPath: string, reason: "not-adopted" | "owner-owned" | "replaced") {
     super(
       reason === "owner-owned"
         ? `'${legacyPath}' addresses this sub-agent's pre-sharing private notebook; the shared workspace store holds an identical note the owner already had (adoption created nothing), so a rollback there would alter the owner's own note`
-        : `'${legacyPath}' addresses this sub-agent's pre-sharing private notebook, and that note was not folded into the shared workspace store (never adopted, or unplaceable there): the shared notebook does not show it, so rolling it back there would change nothing visible`
+        : reason === "replaced"
+          ? `'${legacyPath}' addresses this sub-agent's pre-sharing private notebook; its adopted copy in the shared workspace store was since replaced (rewritten, or deleted and recreated) outside this sub-agent's rows, so the file there is the owner's own and a rollback would alter or remove it`
+          : `'${legacyPath}' addresses this sub-agent's pre-sharing private notebook, and that note was not folded into the shared workspace store (never adopted, or unplaceable there): the shared notebook does not show it, so rolling it back there would change nothing visible`
     );
     this.name = "LegacyPathNotAdoptedError";
   }
@@ -247,6 +250,16 @@ export class LegacyPathNotAdoptedError extends Error {
  * owner already had an identical note of its own): the child's rows never
  * touched that file, and applying their inverses there — a create row's
  * delete-files in particular — would alter or remove the owner's own note.
+ * Likewise a created record whose target is no longer THIS adoption's
+ * generation of the file (`targetStamp`, the same rule deletion
+ * reconciliation applies): an owner save is unjournaled and may keep the
+ * bytes, so neither peer rows nor post-state hashes would notice — the
+ * replacement is the owner's, and the mapping is refused (r74). The stamps
+ * are read when the remapper is created; callers create it under the store's
+ * mutation lock (the rollback engine re-derives it there), and the engine
+ * re-stamps the targets its own retargeted applies rewrite
+ * (refreshLegacyAdoptionTargetStamps) so the child's remaining rows for the
+ * same note stay mappable.
  * Only the manifest's `target` is trusted for the destination's relPath;
  * callers re-run their confinement checks on the mapped result. `strict`
  * (removal's row migration) throws on an unreadable manifest instead of
@@ -271,6 +284,18 @@ export async function createLegacyPathRemapper(args: {
   // rename moves whatever is there, so an owner note added beside the
   // adopted copies (no refinement row of its own) would travel along
   // unnoticed. Precomputed for every directory prefix the manifest knows.
+  // Created records whose owner target is still this lineage's generation
+  // (see LegacyAdoptionRecord.targetStamp). A record reconciled as deleted
+  // is current while its target stays absent — or holds the generation a
+  // retargeted rollback recreated there (re-stamped below); anything else at
+  // that path is the owner's.
+  const currentGeneration = new Set<string>();
+  for (const [rel, record] of adopted) {
+    if (record.created !== true || record.pending === true) continue;
+    const stamp = await adoptionTargetStamp(path.join(ownerRoot, ...record.target.split("/")));
+    const stampCurrent = record.targetStamp !== undefined && stamp === record.targetStamp;
+    if (stampCurrent || (record.deleted === true && stamp === null)) currentGeneration.add(rel);
+  }
   const ownerSubtreeExact = new Map<string, boolean>();
   const directoryPrefixes = new Set<string>();
   for (const rel of adopted.keys()) {
@@ -282,7 +307,7 @@ export async function createLegacyPathRemapper(args: {
   for (const dirRel of directoryPrefixes) {
     const descendants = [...adopted].filter(([rel]) => rel.startsWith(`${dirRel}/`));
     const oneToOne = descendants.every(
-      ([rel, entry]) => entry.target === rel && entry.created === true && entry.pending !== true
+      ([rel, entry]) => entry.target === rel && currentGeneration.has(rel)
     );
     const expected = new Set(
       descendants.filter(([, entry]) => entry.deleted !== true).map(([rel]) => rel)
@@ -315,6 +340,7 @@ export async function createLegacyPathRemapper(args: {
     }
     if (record.pending === true) throw new LegacyPathNotAdoptedError(filePath, "not-adopted");
     if (record.created !== true) throw new LegacyPathNotAdoptedError(filePath, "owner-owned");
+    if (!currentGeneration.has(relPath)) throw new LegacyPathNotAdoptedError(filePath, "replaced");
     return path.join(ownerRoot, ...record.target.split("/"));
   };
   return {
@@ -336,4 +362,47 @@ export async function createLegacyPathRemapper(args: {
       }
     },
   };
+}
+
+/**
+ * Re-stamp adopted targets the rollback engine just rewrote or removed while
+ * applying a RETARGETED inverse (createLegacyPathRemapper mapped the child's
+ * legacy paths onto them): the write is the child's own lineage acting, so
+ * the new generation stays mappable for the child's remaining rows over the
+ * same note (create + edit unwind LIFO). Runs under the owner store's mutation
+ * lock the engine holds (the lock adoption passes take too). A target that is
+ * gone loses its stamp — nothing maps there until adoption places the note
+ * anew. Best-effort by contract: a failure here only leaves stale stamps,
+ * which refuse (never mutate) later.
+ */
+export async function refreshLegacyAdoptionTargetStamps(args: {
+  childSessionDir: string;
+  ownerSessionDir: string;
+  paths: readonly string[];
+}): Promise<void> {
+  if (args.paths.length === 0) return;
+  const ownerRoot = path.join(path.resolve(args.ownerSessionDir), "memory");
+  const touched = new Set<string>();
+  for (const filePath of args.paths) {
+    const relative = path.relative(ownerRoot, path.resolve(filePath));
+    if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) continue;
+    touched.add(relative.split(path.sep).join("/"));
+  }
+  if (touched.size === 0) return;
+  const manifestPath = legacyAdoptionManifestPath(path.resolve(args.childSessionDir));
+  const adopted = await readLegacyAdoptionManifest(manifestPath, { strict: true });
+  let dirty = false;
+  for (const record of adopted.values()) {
+    if (record.created !== true || record.pending === true) continue;
+    if (!touched.has(record.target)) continue;
+    const stamp =
+      (await adoptionTargetStamp(path.join(ownerRoot, ...record.target.split("/")))) ?? undefined;
+    if (stamp === record.targetStamp) continue;
+    record.targetStamp = stamp;
+    dirty = true;
+  }
+  if (!dirty) return;
+  await writeFileAtomic(manifestPath, JSON.stringify(Object.fromEntries(adopted)), {
+    encoding: "utf-8",
+  });
 }

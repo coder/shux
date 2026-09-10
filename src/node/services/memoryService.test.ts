@@ -19,7 +19,11 @@ import {
   type PinnedFileMutation,
 } from "./memoryService";
 import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
-import { legacyAdoptionManifestPath } from "./memoryLegacyAdoption";
+import {
+  adoptionTargetStamp,
+  legacyAdoptionManifestPath,
+  readLegacyAdoptionManifest,
+} from "./memoryLegacyAdoption";
 import {
   MemoryRefinementActionSchema,
   REFINEMENT_CAPTURE_MAX_FILES,
@@ -4044,6 +4048,83 @@ describe("MemoryService", () => {
       expect(await pathExists(ownerCopy)).toBe(false);
     });
 
+    it("re-stamps an adopted copy a retargeted rollback rewrites, refusing one the owner replaced", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const legacyRoot = path.join(childSessionDir, "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "old.md"), "v2");
+      const childJournal = sharedDurableEventJournal(childSessionDir);
+      await childJournal.append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "create", path: "/memories/workspace/old.md" },
+          inverse: { op: "delete-files", paths: [path.join(legacyRoot, "old.md")] },
+          postState: {
+            files: [{ path: path.join(legacyRoot, "old.md"), sha256: sha256Hex("v1") }],
+          },
+        },
+      });
+      await childJournal.append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "str_replace", path: "/memories/workspace/old.md" },
+          inverse: {
+            op: "restore-files",
+            files: [{ path: path.join(legacyRoot, "old.md"), text: "v1" }],
+          },
+        },
+      });
+      const [childCreate, childEdit] = await readRefinementEvents(childSessionDir);
+      await fixture.service.listIndexEntries({ ...fixture.ctx }); // adoption
+      const ownerCopy = path.join(ownerSessionDir, "memory", "old.md");
+      const manifestPath = legacyAdoptionManifestPath(childSessionDir);
+      const recordStamp = async () =>
+        (await readLegacyAdoptionManifest(manifestPath)).get("old.md")!.targetStamp;
+      expect(await recordStamp()).toBe((await adoptionTargetStamp(ownerCopy)) ?? undefined);
+      const rollback = (id: string) =>
+        rollbackRefinement({
+          sessionDir: childSessionDir,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+          id,
+          evidence: { toolName: "test", actor: "user" },
+        });
+      // Rolling the edit back rewrites the copy: a new generation, but this
+      // lineage's own — the record follows it, so the create still maps.
+      expect((await rollback(childEdit.id)).success).toBe(true);
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
+      expect(await recordStamp()).toBe((await adoptionTargetStamp(ownerCopy)) ?? undefined);
+      // An owner save meanwhile (Memory tab: unjournaled, bytes unchanged)
+      // makes the copy the owner's: the create's delete-files is refused,
+      // force or not, and the note stays.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fixture.service.saveFile(
+        { ...fixture.ctx, workspaceId: "ws-owner" },
+        "/memories/workspace/old.md",
+        "v1",
+        sha256Hex("v1"),
+        "user"
+      );
+      for (const force of [false, true]) {
+        const refused = await rollbackRefinement({
+          sessionDir: childSessionDir,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+          id: childCreate.id,
+          force,
+          evidence: { toolName: "test", actor: "user" },
+        });
+        expect(refused.success).toBe(false);
+        expect(refused.success ? "" : refused.error).toContain("since replaced");
+      }
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
+    });
+
     it("orders owner and child rows of the shared store by one store clock, advanced by rollbacks too", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -4356,13 +4437,21 @@ describe("MemoryService", () => {
       const legacyRoot = path.join(childSessionDir, "memory");
       await fsPromises.mkdir(legacyRoot, { recursive: true });
       await fsPromises.writeFile(path.join(legacyRoot, "legacy.md"), "v2");
+      await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "legacy.md"), "v2");
       await fsPromises.writeFile(
         legacyAdoptionManifestPath(path.dirname(legacyRoot)),
         JSON.stringify({
-          "legacy.md": { content: "x", sidecar: "", target: "legacy.md", created: true },
+          "legacy.md": {
+            content: "x",
+            sidecar: "",
+            target: "legacy.md",
+            created: true,
+            targetStamp: await adoptionTargetStamp(
+              path.join(ownerSessionDir, "memory", "legacy.md")
+            ),
+          },
         })
       );
-      await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "legacy.md"), "v2");
       await sharedDurableEventJournal(childSessionDir).append({
         workspaceId: "ws-child",
         kind: "refinement",
