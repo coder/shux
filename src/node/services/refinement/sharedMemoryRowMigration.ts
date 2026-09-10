@@ -259,7 +259,7 @@ export async function migrateSharedMemoryRefinementRows(args: {
       }
       const evidence = RefinementEvidenceSchema.safeParse(row.data.evidence);
       const postState = RefinementPostStateSchema.safeParse(row.data.postState);
-      const origin = refinementRowOrigin(row);
+      const origin = refinementRowOrigin(row, args.childWorkspaceId);
       // Throws: this is the only durable copy once the child's journal goes.
       const appended = await appendRefinementEventUnderBlobLock(ownerJournal, {
         sessionDir: args.ownerSessionDir,

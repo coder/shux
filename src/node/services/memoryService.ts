@@ -1408,6 +1408,10 @@ export class MemoryService extends EventEmitter {
           continue; // folded in earlier, nothing changed since
         }
         let target: { relPath: string; write: boolean; replaces?: boolean } | null = null;
+        // A child's pin toggle folds into the copy only while the copy is
+        // this adoption's generation (see below); an owner-owned file keeps
+        // the owner's pin.
+        let foldChildPin = true;
         if (previous !== undefined) {
           // The recorded target is reused only while it still holds bytes
           // this adoption put there — the owner may have edited, replaced or
@@ -1434,7 +1438,6 @@ export class MemoryService extends EventEmitter {
           }
           if (priorContent === content) {
             target = { relPath: previous.target, write: false };
-            record.created = previous.created === true;
             // A pending record is a copy this adoption wrote but could not
             // finish recording (crash or sidecar failure after the write):
             // the file holding exactly those bytes now is that write, so its
@@ -1442,11 +1445,23 @@ export class MemoryService extends EventEmitter {
             // record carries a stamp, which is then the generation an
             // interrupted in-place replacement OVERWROTE (r75). A settled
             // record keeps the stamp it recorded — identical bytes in a
-            // different generation are the owner's (deletion then preserves).
-            record.targetStamp =
-              previous.pending === true
-                ? ((await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined)
+            // different generation are the owner's (r79: the same rule
+            // deletion reconciliation and the rollback remapper apply), so
+            // the record stops claiming the copy and the child's sidecar
+            // changes no longer reach it.
+            const currentStamp =
+              (await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined;
+            const ours =
+              previous.created === true &&
+              (previous.pending === true ||
+                (previous.targetStamp !== undefined && previous.targetStamp === currentStamp));
+            record.created = ours;
+            record.targetStamp = !ours
+              ? undefined
+              : previous.pending === true
+                ? currentStamp
                 : previous.targetStamp;
+            foldChildPin = previous.created !== true || ours;
           } else if (
             previous.created === true &&
             priorContent !== null &&
@@ -1537,7 +1552,7 @@ export class MemoryService extends EventEmitter {
                 projectPath: ctx.projectPath,
                 workspaceId: owner,
               }),
-              { pinned: childPinChanged ? "source" : "target" }
+              { pinned: childPinChanged && foldChildPin ? "source" : "target" }
             );
           } catch (error) {
             log.warn(

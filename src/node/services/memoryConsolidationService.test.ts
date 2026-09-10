@@ -1367,10 +1367,11 @@ describe("MemoryConsolidationService", () => {
     await fixture.addWorkspace("ws-clean");
     await fixture.addWorkspace("ws-corrupt");
     await fixture.addWorkspace("ws-unbounded");
+    await fixture.addWorkspace("ws-fractional");
     const seed = async (
       workspaceId: string,
       foreignTurn: number | null | undefined,
-      options?: { withoutBound: boolean }
+      options?: { withoutBound?: boolean; fractionalBound?: boolean }
     ) => {
       const reset = createMuxMessage("reset-1", "assistant", "", {
         compactionBoundary: true,
@@ -1399,7 +1400,10 @@ describe("MemoryConsolidationService", () => {
       await fixture.historyService.appendToHistory(
         workspaceId,
         createMuxMessage("reply-1", "assistant", "Noted.", {
-          requestHistorySequence: prompt.metadata?.historySequence,
+          requestHistorySequence:
+            options?.fractionalBound === true
+              ? (prompt.metadata?.historySequence ?? 0) + 0.5
+              : prompt.metadata?.historySequence,
           workspaceMemoryPolicyEpoch: closingEpoch,
         })
       );
@@ -1452,6 +1456,13 @@ describe("MemoryConsolidationService", () => {
     // A foreign stamp refuses even when the row's request bound is missing
     // or corrupt: its user row may be gone, so nothing else would surface it.
     const unbounded = await seed("ws-unbounded", -1, { withoutBound: true });
+    expect(unbounded.success).toBe(false);
+    // A bound outside the sequence domain (fractional) covers no user row:
+    // the turn stays uncovered and refuses (r79).
+    const fractional = await seed("ws-fractional", undefined, { fractionalBound: true });
+    expect(fractional.success).toBe(false);
+    if (!fractional.success) expect(fractional.error).toContain("harvest refused");
+    expect(fixture.modelCalls).toHaveLength(0);
     expect(unbounded.success).toBe(false);
     if (!unbounded.success) expect(unbounded.error).toContain("another epoch");
     expect(fixture.modelCalls).toHaveLength(0);

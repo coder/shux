@@ -393,7 +393,10 @@ function epochHarvestRefusal(messages: readonly MuxMessage[], closingEpoch: numb
       return "the compacted epoch holds a turn whose memory policy was recorded for another epoch; harvest refused (fail closed)";
     }
     const bound = message.metadata?.requestHistorySequence;
-    if (typeof bound !== "number") continue;
+    // Persisted rows are raw JSON: only a history sequence in the clock's
+    // domain covers anything (r79); a fractional or negative value leaves the
+    // turn uncovered and the refusal below fails closed.
+    if (typeof bound !== "number" || !Number.isSafeInteger(bound) || bound < 0) continue;
     const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;
     if (anchor === undefined) continue;
     covered.add(anchor.id);

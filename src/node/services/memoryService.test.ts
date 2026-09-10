@@ -2262,6 +2262,25 @@ describe("MemoryService", () => {
       await fixture.metaService.setPinned(childKey, true);
       await fixture.service.listIndexEntries({ ...fixture.ctx });
       expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      // ...but not once the copy is the OWNER's generation (deleted and
+      // recreated with identical bytes): a later child toggle no longer folds
+      // in (r79), and the record stops claiming the copy — the same rule
+      // deletion reconciliation and the rollback remapper apply.
+      const ownerCopy = path.join(fixture.config.sessionsDir, "ws-owner", "memory", "note.md");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(ownerCopy);
+      await fsPromises.writeFile(ownerCopy, "v1");
+      await fixture.metaService.setPinned(childKey, false);
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      const record = (
+        await readLegacyAdoptionManifest(
+          legacyAdoptionManifestPath(path.join(fixture.config.sessionsDir, "ws-child"))
+        )
+      ).get("note.md")!;
+      expect(record.created).toBe(false);
+      expect(record.targetStamp).toBeUndefined();
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
     });
 
     it("keeps adoption provenance when the pass is interrupted between copy and manifest", async () => {
@@ -3729,19 +3748,54 @@ describe("MemoryService", () => {
           rollbackOf: childEdit.id,
         },
       });
-      const refused = await rollbackRefinement({
-        sessionDir: ownerSessionDir,
-        id: ownerRename.id,
-        listSharedWorkspaceMemoryPeerSessionDirs: () => [childSessionDir],
-        evidence: { toolName: "test", actor: "user" },
+      const attempt = () =>
+        rollbackRefinement({
+          sessionDir: ownerSessionDir,
+          id: ownerRename.id,
+          listSharedWorkspaceMemoryPeerSessionDirs: () => [childSessionDir],
+          evidence: { toolName: "test", actor: "user" },
+        });
+      const expectRefused = async () => {
+        const refused = await attempt();
+        expect(refused.success).toBe(false);
+        expect(refused.success ? "" : refused.error).toContain(
+          `later refinement row ${childEdit.id}`
+        );
+        expect(
+          await fsPromises.readFile(path.join(ownerSessionDir, "memory", "moved", "a.md"), "utf-8")
+        ).toBe("c2");
+      };
+      await expectRefused();
+      // Lineage fields that disagree (a well-formed rollback action naming
+      // another row) are corrupt too (r79).
+      const childJournalPath = path.join(childSessionDir, "durable-events.jsonl");
+      const rewriteChildRows = async (edit: (row: Record<string, unknown>) => void) => {
+        const rewritten = (await fsPromises.readFile(childJournalPath, "utf-8"))
+          .split("\n")
+          .map((line) => {
+            if (line.trim() === "") return line;
+            const row = JSON.parse(line) as Record<string, unknown>;
+            edit(row);
+            return JSON.stringify(row);
+          });
+        await fsPromises.writeFile(childJournalPath, rewritten.join("\n"));
+      };
+      await rewriteChildRows((row) => {
+        const data = row.data as { rollbackOf?: string; action: unknown };
+        if (data.rollbackOf === childEdit.id) data.action = { op: "rollback", of: "other-row" };
       });
-      expect(refused.success).toBe(false);
-      expect(refused.success ? "" : refused.error).toContain(
-        `later refinement row ${childEdit.id}`
-      );
+      await expectRefused();
+      // A peer row whose persisted workspaceId was corrupted to the OWNER's
+      // must not be ordered by the owner journal's sequence (r79): the origin
+      // binds to the journal the row was read from, so the row falls back to
+      // the store clock and still reads as the later mutation.
+      await rewriteChildRows((row) => {
+        row.workspaceId = "ws-owner";
+      });
       expect(
-        await fsPromises.readFile(path.join(ownerSessionDir, "memory", "moved", "a.md"), "utf-8")
-      ).toBe("c2");
+        (await readRefinementEvents(childSessionDir)).every((row) => row.workspaceId === "ws-owner")
+      ).toBe(true);
+      await expectRefused();
     });
 
     it("treats a malformed store clock as order-unknown instead of 'earlier than everything'", async () => {

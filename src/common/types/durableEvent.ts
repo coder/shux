@@ -234,15 +234,24 @@ export interface RefinementRowOrigin {
 /**
  * The journal position that orders a refinement row against rows of the same
  * origin (RefinementDataSchema.originJournal). A native row is positioned by
- * its own journal; a migrated copy only by a carried, well-formed origin —
- * anything else about a copy is no order evidence (null).
+ * the journal it was READ from (`journalWorkspaceId`, the session's workspace
+ * id — the caller's knowledge, never the row's own `workspaceId`, which is
+ * persisted data a corrupt row could carry equal to another journal's; r79)
+ * and only while the row agrees with it. A migrated copy is positioned only
+ * by a carried, well-formed origin. Anything else is no order evidence (null).
  */
-export function refinementRowOrigin(row: {
-  workspaceId: string;
-  seq: number;
-  data: { migratedFrom?: string; originJournal?: unknown; originSeq?: unknown };
-}): RefinementRowOrigin | null {
-  if (row.data.migratedFrom === undefined) return { journal: row.workspaceId, seq: row.seq };
+export function refinementRowOrigin(
+  row: {
+    workspaceId: string;
+    seq: number;
+    data: { migratedFrom?: string; originJournal?: unknown; originSeq?: unknown };
+  },
+  journalWorkspaceId: string | undefined
+): RefinementRowOrigin | null {
+  if (row.data.migratedFrom === undefined) {
+    if (journalWorkspaceId === undefined || row.workspaceId !== journalWorkspaceId) return null;
+    return { journal: journalWorkspaceId, seq: row.seq };
+  }
   const { originJournal, originSeq } = row.data;
   if (
     typeof originJournal !== "string" ||

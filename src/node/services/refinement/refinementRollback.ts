@@ -77,9 +77,14 @@ export type RefinementEvent = Extract<DurableEvent, { kind: "refinement" }>;
  * conflict detection then sees the original as live (fail closed).
  */
 export function isUsableRollbackRow(row: RefinementEvent): boolean {
+  if (row.data.rollbackOf === undefined) return false;
+  const action = RollbackRefinementActionSchema.safeParse(row.data.action);
+  // The two lineage fields must agree (r79): a row whose action names one
+  // target while `rollbackOf` names another is corrupt, and trusting either
+  // side would hide a live mutation behind the other.
   return (
-    row.data.rollbackOf !== undefined &&
-    RollbackRefinementActionSchema.safeParse(row.data.action).success &&
+    action.success &&
+    action.data.of === row.data.rollbackOf &&
     RefinementInverseSchema.safeParse(row.data.inverse).success
   );
 }
@@ -88,8 +93,19 @@ export function isUsableRollbackRow(row: RefinementEvent): boolean {
 export async function listRefinements(sessionDir: string): Promise<RefinementEvent[]> {
   assert(sessionDir.length > 0, "listRefinements requires a session dir");
   const events = await sharedDurableEventJournal(sessionDir).read();
-  return events.filter((event): event is RefinementEvent => event.kind === "refinement");
+  const rows = events.filter((event): event is RefinementEvent => event.kind === "refinement");
+  const journalWorkspaceId = path.basename(path.resolve(sessionDir));
+  for (const row of rows) journalOfRow.set(row, journalWorkspaceId);
+  return rows;
 }
+
+/**
+ * The journal (session workspace id) each row object was read from, recorded
+ * by listRefinements: origin comparisons (sameOriginOrder) must not trust a
+ * row's persisted `workspaceId` for that (r79). Rows obtained any other way
+ * have no known journal and compare as order-unknown.
+ */
+const journalOfRow = new WeakMap<RefinementEvent, string>();
 
 export interface RollbackRefinementOptions {
   sessionDir: string;
@@ -562,8 +578,8 @@ function sameOriginOrder(
   row: RefinementEvent,
   other: RefinementEvent
 ): { rowAfter: boolean } | null {
-  const rowOrigin = refinementRowOrigin(row);
-  const otherOrigin = refinementRowOrigin(other);
+  const rowOrigin = refinementRowOrigin(row, journalOfRow.get(row));
+  const otherOrigin = refinementRowOrigin(other, journalOfRow.get(other));
   if (rowOrigin === null || otherOrigin === null || rowOrigin.journal !== otherOrigin.journal) {
     return null;
   }
