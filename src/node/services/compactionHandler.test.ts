@@ -1839,10 +1839,14 @@ describe("CompactionHandler", () => {
         onCompactionComplete,
       });
 
+      // A real turn row: it carries its request bound and the epoch it
+      // recorded the workspace-memory policy under (none before any boundary).
       const tailAssistant = createMuxMessage("a1", "assistant", "tail answer", {
         model: "claude-x",
         usage: { inputTokens: 500, outputTokens: 100, totalTokens: 600 },
         contextUsage: { inputTokens: 500, outputTokens: 100, totalTokens: 600 },
+        requestHistorySequence: 2,
+        workspaceMemoryPolicyEpoch: -1,
       });
       await seedHistory(
         createMuxMessage("u0", "user", "old head question"),
@@ -1880,8 +1884,8 @@ describe("CompactionHandler", () => {
         expect(copy.metadata?.contextUsage).toBeUndefined();
         // Copies must never masquerade as boundaries.
         expect(copy.metadata?.compactionBoundary).toBeUndefined();
-        // The epoch the row was produced under (none before this boundary):
-        // its workspace-memory write policy governs the copy.
+        // The epoch the turn that covered the row recorded its policy under
+        // (none before this boundary): that policy governs the copy.
         expect(copy.metadata?.rlmPreservedTailSourcePolicyEpoch).toBe(-1);
       }
       // Informational metadata survives.
@@ -1895,10 +1899,13 @@ describe("CompactionHandler", () => {
       // boundary's epoch — the chain stays visible to the policy conjunction.
       const boundarySequence = epoch[0].metadata?.historySequence;
       if (typeof boundarySequence !== "number") throw new Error("boundary lacks a sequence");
-      // An assistant TURN row (it carries the request bound) that recorded
-      // its policy under an OLDER epoch (a turn that straddled a boundary)
-      // keeps that epoch on its copy; a turn row WITHOUT a recorded policy
-      // (an older build's) stays unstamped — unknown, never vouched for.
+      // A user row is covered by the assistant TURN row that answered it and
+      // carries THAT turn's recorded epoch: an OLDER one for a turn that
+      // straddled a boundary (u2/a2); none for a turn row WITHOUT a recorded
+      // policy (an older build's, u4/a4) — unknown, never vouched for; and
+      // none for an accepted batch no assistant ever answered (u5: stream
+      // never started or crashed first), whose repo-controlled content
+      // nobody vetted.
       await seedHistory(
         createMuxMessage("u2", "user", "second question"),
         createMuxMessage("a2", "assistant", "second answer", {
@@ -1914,6 +1921,7 @@ describe("CompactionHandler", () => {
         createMuxMessage("a4", "assistant", "old-build answer", {
           requestHistorySequence: boundarySequence + 5,
         }),
+        createMuxMessage("u5", "user", "unanswered question"),
         createStampedCompactionRequest("compact-req-2", boundarySequence + 1)
       );
       expect(await handler.handleCompletion(createStreamEndEvent("Summary 2"))).toBe(true);
@@ -1924,11 +1932,12 @@ describe("CompactionHandler", () => {
       ).toEqual([
         -1,
         -1,
-        boundarySequence,
+        -1,
         -1,
         boundarySequence,
         boundarySequence,
-        boundarySequence,
+        undefined,
+        undefined,
         undefined,
       ]);
     });

@@ -881,6 +881,37 @@ export class MemoryService extends EventEmitter {
     });
   }
 
+  /**
+   * Consolidation's pin protection (pinned files are editable but never
+   * deleted/renamed; a directory counts when anything under it is pinned),
+   * evaluated INSIDE the mutation lock against the owner the command's store
+   * is bound to: logicalKeyFor and getStore share this command's owner
+   * resolution (ownerWorkspaceIdFor), so the key checked is the key of the
+   * file about to be removed. A guard run before the command against a
+   * separately resolved owner (the private-store fallback while config.json
+   * was unreadable) would check the wrong sidecar entries and let an
+   * owner-pinned note go. Strict sidecar read: an unreadable pin file must
+   * refuse, not read as "nothing pinned".
+   */
+  private async assertNotPinnedForRemoval(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    relPath: string,
+    virtualPath: string
+  ): Promise<void> {
+    const key = this.logicalKeyFor(ctx, scope, relPath);
+    if (key === null) return;
+    const subtreePrefix = `${key}/`;
+    for (const [entryKey, entry] of await this.metaService.getEntriesOrThrow()) {
+      if (entry.pinned !== true) continue;
+      if (entryKey === key || entryKey.startsWith(subtreePrefix)) {
+        throw new MemoryCommandError(
+          `${virtualPath} is pinned by the user (directly or via a pinned file inside it); pinned files may be edited but never deleted or renamed.`
+        );
+      }
+    }
+  }
+
   private async recordUsage(
     ctx: MemoryScopeContext,
     scope: MemoryScope,
@@ -2665,7 +2696,8 @@ export class MemoryService extends EventEmitter {
     actor: MemoryActor,
     toolCallId?: string,
     expectedFingerprint?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    options?: { rejectPinned?: boolean }
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -2675,6 +2707,9 @@ export class MemoryService extends EventEmitter {
         const kind = await store.kind(parsed.relPath);
         if (kind === null) {
           throw new MemoryCommandError(`No memory file or directory at ${virtualPath}`);
+        }
+        if (options?.rejectPinned === true) {
+          await this.assertNotPinnedForRemoval(ctx, scope, parsed.relPath, virtualPath);
         }
         // r55: staged refine deletes were approved against the target's
         // staging-time state — a target edited between staging and apply
@@ -2725,7 +2760,8 @@ export class MemoryService extends EventEmitter {
     newVirtualPath: string,
     actor: MemoryActor,
     toolCallId?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    options?: { rejectPinned?: boolean }
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const oldParsed = parseMemoryPath(oldVirtualPath);
@@ -2744,6 +2780,9 @@ export class MemoryService extends EventEmitter {
         const oldKind = await store.kind(oldParsed.relPath);
         if (oldKind === null) {
           throw new MemoryCommandError(`No memory file or directory at ${oldVirtualPath}`);
+        }
+        if (options?.rejectPinned === true) {
+          await this.assertNotPinnedForRemoval(ctx, scope, oldParsed.relPath, oldVirtualPath);
         }
         // Pre-flight (mirrored in validateMutation): store.rename would mkdir
         // the destination parent INSIDE the source before the filesystem

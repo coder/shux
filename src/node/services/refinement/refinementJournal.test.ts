@@ -60,6 +60,53 @@ describe("reclaimExcessRefinementInverseBlobs", () => {
     deleteSpy.mockRestore();
   });
 
+  test("the recovery sweep ranks unordered migrated rows behind the owner's dated rows", async () => {
+    using tmp = new DisposableTempDir("refinement-journal-test");
+    const journal = new DurableEventJournal(tmp.path);
+    // Owner rows carry the shared store clock as sourceTs; the migrated row
+    // (a removed child's pre-sharing history, retargeted, private clock
+    // dropped) is appended LAST — its envelope `ts` is the newest of all.
+    const appendRow = async (
+      content: string,
+      extra: { sourceTs?: number; migratedFrom?: string; orderUnknown?: true }
+    ): Promise<BlobRef> =>
+      await journal.withBlobLock(async () => {
+        const { ref } = await journal.blobs.put(content);
+        await journal.append({
+          workspaceId: "ws-owner",
+          kind: "refinement",
+          data: {
+            kind: "memory",
+            action: { op: "str_replace", path: "/memories/workspace/n.md" },
+            inverse: { op: "restore-files", files: [{ path: "/m/n.md", blobRef: ref }] },
+            evidence: { workspaceId: "ws-owner", toolName: "test" },
+            ...extra,
+          },
+        });
+        return ref;
+      });
+    const ownerOld = await appendRow("owner-old", { sourceTs: 10 });
+    const ownerNew = await appendRow("owner-new", { sourceTs: 20 });
+    const migrated = await appendRow("child-legacy", {
+      migratedFrom: "ws-child:row-1",
+      orderUnknown: true,
+    });
+    // Each payload charged at 0.4x quota: only two survive the sweep.
+    const size = spyOn(journal.blobs, "size").mockResolvedValue(
+      Math.ceil(REFINEMENT_INVERSE_BLOB_QUOTA_BYTES * 0.4)
+    );
+    try {
+      await reclaimExcessRefinementInverseBlobs(journal, [], { resweep: true });
+    } finally {
+      size.mockRestore();
+    }
+    // The owner's genuinely recent payloads stay; the unordered migrated
+    // history is evicted first despite its newer append time.
+    expect(await journal.blobs.has(ownerOld)).toBe(true);
+    expect(await journal.blobs.has(ownerNew)).toBe(true);
+    expect(await journal.blobs.has(migrated)).toBe(false);
+  });
+
   test("a payload hash shared with another event kind survives eviction", async () => {
     using tmp = new DisposableTempDir("refinement-journal-test");
     const journal = new DurableEventJournal(tmp.path);

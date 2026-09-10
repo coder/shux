@@ -585,6 +585,16 @@ async function readSharedMemoryPeerRows(
   );
   const ownerSessionDir = path.dirname(sharedRoot);
   const actingWorkspaceId = path.basename(path.resolve(opts.sessionDir));
+  // The same duplicate seen from the other side: a removal that aborted after
+  // its pre-teardown pass leaves THIS (owner) journal holding copies of a
+  // still-registered child's rows. Read as that child's peer rows, the
+  // originals would count as separate later mutations of the very notes the
+  // copies describe — and a retargeted original is `orderUnknown`, so the
+  // copy could never be rolled back until the removal finally succeeds.
+  const migratedHere = new Set<string>();
+  for (const row of await listRefinements(opts.sessionDir)) {
+    if (row.data.migratedFrom !== undefined) migratedHere.add(row.data.migratedFrom);
+  }
   const peerRows: RefinementEvent[] = [];
   for (const peerDir of peerDirs) {
     assert(
@@ -618,6 +628,7 @@ async function readSharedMemoryPeerRows(
         );
       }
     }
+    const peerWorkspaceId = path.basename(path.resolve(peerDir));
     for (const row of await listRefinements(peerDir)) {
       if (row.data.kind !== "memory") continue;
       // A removal that aborted after its pre-teardown pass leaves the owner
@@ -625,6 +636,8 @@ async function readSharedMemoryPeerRows(
       // "<this workspace>:<row id>") while this session lives on. They are
       // this journal's rows seen twice, not later peer edits.
       if (row.data.migratedFrom?.startsWith(`${actingWorkspaceId}:`) === true) continue;
+      // ...and the originals of copies this journal already holds (above).
+      if (migratedHere.has(`${peerWorkspaceId}:${row.id}`)) continue;
       const original = RefinementInverseSchema.safeParse(row.data.inverse);
       const parsed = parseRemappedInverse(row, remap);
       if (parsed === null || !original.success) continue;

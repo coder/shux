@@ -86,6 +86,15 @@ function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null 
   ) {
     return null;
   }
+  // A present but non-string replacement hash is a malformed RECORD (not a
+  // flag to fail closed on): without it, a replacement pass that crashed
+  // after writing the new owner bytes leaves a copy reconciliation cannot
+  // recognize as this adoption's — a later source deletion would tombstone
+  // it as owner-owned and removal would report a complete handover while the
+  // adoption-created note stays visible without provenance.
+  if (record.replacementContent !== undefined && typeof record.replacementContent !== "string") {
+    return null;
+  }
   const flag = (raw: unknown, malformed: boolean): boolean | undefined =>
     raw === undefined ? undefined : typeof raw === "boolean" ? raw : malformed;
   return {
@@ -96,8 +105,7 @@ function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null 
     pending: flag(record.pending, true),
     pendingDeletion: flag(record.pendingDeletion, true),
     deleted: flag(record.deleted, false),
-    replacementContent:
-      typeof record.replacementContent === "string" ? record.replacementContent : undefined,
+    replacementContent: record.replacementContent,
   };
 }
 

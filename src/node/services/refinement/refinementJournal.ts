@@ -242,14 +242,25 @@ export async function reclaimExcessRefinementInverseBlobs(
       // Recovery sweep: walk refinement rows newest-first — by SOURCE time
       // (`data.sourceTs ?? ts`, append sequence as tie-breaker), so migrated
       // rows sit at their real chronological position — and re-derive the
-      // retained set. Rows never recorded payload sizes, so stat the blobs;
-      // a missing blob was already evicted (or never landed) — skip it.
+      // retained set. A migrated row WITHOUT a source time (pre-sharing or
+      // private-clock history; the migration omits the incomparable value and
+      // marks it orderUnknown) has only its append-time `ts`, which would rank
+      // that old history as the newest and let it evict the owner's genuinely
+      // recent payloads: rank it behind every dated row instead (evicted
+      // first). Rows never recorded payload sizes, so stat the blobs; a
+      // missing blob was already evicted (or never landed) — skip it.
+      const retentionTs = (event: {
+        ts: number;
+        data: { sourceTs?: number; migratedFrom?: string };
+      }): number =>
+        event.data.sourceTs ??
+        (event.data.migratedFrom !== undefined ? Number.NEGATIVE_INFINITY : event.ts);
       const events = (await journal.read())
         .filter((event) => event.kind === "refinement")
         .sort((left, right) => {
-          const leftTs = left.data.sourceTs ?? left.ts;
-          const rightTs = right.data.sourceTs ?? right.ts;
-          return leftTs !== rightTs ? leftTs - rightTs : left.seq - right.seq;
+          const leftTs = retentionTs(left);
+          const rightTs = retentionTs(right);
+          return leftTs !== rightTs ? (leftTs < rightTs ? -1 : 1) : left.seq - right.seq;
         });
       entries = [];
       for (let i = events.length - 1; i >= 0; i--) {

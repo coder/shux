@@ -1798,6 +1798,12 @@ describe("MemoryService", () => {
         ["not JSON", "{nope"],
         ["not an object", "[]"],
         ["record 'note.md'", JSON.stringify({ "note.md": { content: 1 } })],
+        [
+          "record 'late.md'",
+          JSON.stringify({
+            "late.md": { content: "x", sidecar: "", target: "late.md", replacementContent: 5 },
+          }),
+        ],
       ] as const) {
         await fsPromises.writeFile(manifestPath, body);
         expect(
@@ -3280,6 +3286,54 @@ describe("MemoryService", () => {
       expect(copy.data.orderUnknown).toBe(true);
       const rolledBack = await rollbackRefinement({
         sessionDir: ownerSessionDir,
+        id: copy.id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(rolledBack.success).toBe(true);
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
+    });
+
+    it("an owner rollback of a migrated copy ignores the still-registered child's original row", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const legacyRoot = path.join(childSessionDir, "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "old.md"), "v2");
+      await sharedDurableEventJournal(childSessionDir).append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "str_replace", path: "/memories/workspace/old.md" },
+          inverse: {
+            op: "restore-files",
+            files: [{ path: path.join(legacyRoot, "old.md"), text: "v1" }],
+          },
+          postState: {
+            files: [{ path: path.join(legacyRoot, "old.md"), sha256: sha256Hex("v2") }],
+          },
+        },
+      });
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const ownerCopy = path.join(ownerSessionDir, "memory", "old.md");
+      expect(
+        await migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        })
+      ).toBe(1);
+      // Removal aborted after the pre-teardown pass: the child stays
+      // registered (a peer of the owner) with its original row in place.
+      const copy = (await readRefinementEvents(ownerSessionDir)).find(
+        (row) => row.data.migratedFrom?.startsWith("ws-child:") === true
+      )!;
+      const rolledBack = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        listSharedWorkspaceMemoryPeerSessionDirs: () => [childSessionDir],
         id: copy.id,
         evidence: { toolName: "test", actor: "user" },
       });
