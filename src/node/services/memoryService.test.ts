@@ -3635,6 +3635,115 @@ describe("MemoryService", () => {
       expect(copy!.data.rollbackOf).toBeUndefined();
     });
 
+    it("re-copies a rollback row whose earlier copy was corrupted instead of treating the target as rolled back", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "v1", "agent");
+      const [createRow] = await readRefinementEvents(childSessionDir);
+      const rollback = async (id: string) => {
+        const result = await rollbackRefinement({
+          sessionDir: childSessionDir,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+          id,
+          evidence: { toolName: "test", actor: "user" },
+        });
+        expect(result.success).toBe(true);
+        return (await readRefinementEvents(childSessionDir)).at(-1)!;
+      };
+      // create → rolled back → re-applied: the create is live, both rollback
+      // rows are its lineage.
+      const undo = await rollback(createRow.id);
+      await rollback(undo.id);
+      const migrate = () =>
+        migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        });
+      expect(await migrate()).toBe(3);
+      // The first ROLLBACK's copy is corrupted before the removal is retried.
+      // Its bare `rollbackOf` must not block re-copying the intact source
+      // rollback: the owner would keep an unusable rollback record over a
+      // target the engine then reads as live.
+      const journalPath = path.join(ownerSessionDir, "durable-events.jsonl");
+      const rewritten = (await fsPromises.readFile(journalPath, "utf-8"))
+        .split("\n")
+        .map((line) => {
+          if (!line.includes(`"migratedFrom":"ws-child:${undo.id}"`)) return line;
+          const row = JSON.parse(line) as { data: { action: unknown } };
+          row.data.action = { op: "bogus" };
+          return JSON.stringify(row);
+        });
+      await fsPromises.writeFile(journalPath, rewritten.join("\n"));
+      expect(await migrate()).toBe(1);
+      const ownerRows = await readRefinementEvents(ownerSessionDir);
+      const createCopy = ownerRows.find(
+        (row) => row.data.migratedFrom === `ws-child:${createRow.id}`
+      )!;
+      const undoCopies = ownerRows.filter((row) => row.data.migratedFrom === `ws-child:${undo.id}`);
+      expect(undoCopies).toHaveLength(2);
+      expect(
+        undoCopies.filter((row) => (row.data.action as { op: string }).op === "rollback")
+      ).toHaveLength(1);
+      expect(undoCopies.every((row) => row.data.rollbackOf === createCopy.id)).toBe(true);
+    });
+
+    it("a peer's corrupt rollback row does not hide the peer's live edit from conflict detection", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      await fixture.service.create(ownerCtx, "/memories/workspace/dir/a.md", "o1", "agent");
+      await fixture.service.rename(
+        ownerCtx,
+        "/memories/workspace/dir",
+        "/memories/workspace/moved",
+        "agent"
+      );
+      const ownerRename = (await readRefinementEvents(ownerSessionDir)).at(-1)!;
+      // The child edits beneath the renamed destination (later by the store
+      // clock), then a rollback row naming that edit lands with a corrupt
+      // action: the edit is still on disk.
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/workspace/moved/a.md",
+        "o1",
+        "c2",
+        "agent"
+      );
+      const childEdit = (await readRefinementEvents(childSessionDir)).at(-1)!;
+      await sharedDurableEventJournal(childSessionDir).append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "bogus" },
+          inverse: {
+            op: "restore-files",
+            files: [{ path: path.join(ownerSessionDir, "memory", "moved", "a.md"), text: "c2" }],
+          },
+          rollbackOf: childEdit.id,
+        },
+      });
+      const refused = await rollbackRefinement({
+        sessionDir: ownerSessionDir,
+        id: ownerRename.id,
+        listSharedWorkspaceMemoryPeerSessionDirs: () => [childSessionDir],
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(refused.success).toBe(false);
+      expect(refused.success ? "" : refused.error).toContain(
+        `later refinement row ${childEdit.id}`
+      );
+      expect(
+        await fsPromises.readFile(path.join(ownerSessionDir, "memory", "moved", "a.md"), "utf-8")
+      ).toBe("c2");
+    });
+
     it("treats a malformed store clock as order-unknown instead of 'earlier than everything'", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

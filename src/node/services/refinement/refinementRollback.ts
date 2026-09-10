@@ -67,6 +67,23 @@ import {
 
 export type RefinementEvent = Extract<DurableEvent, { kind: "refinement" }>;
 
+/**
+ * A rollback row the engine (and shared-memory row migration) may trust for
+ * lineage: `rollbackOf` set AND a parseable rollback action AND a parseable
+ * inverse (r78). Persisted rows are raw JSON, so a row can name a target while
+ * its payload is corrupt; counting such a row as "target rolled back" would
+ * hide a mutation that is still live on disk (its rollback row cannot itself
+ * be rolled back or copied), so it is treated like no rollback at all —
+ * conflict detection then sees the original as live (fail closed).
+ */
+export function isUsableRollbackRow(row: RefinementEvent): boolean {
+  return (
+    row.data.rollbackOf !== undefined &&
+    RollbackRefinementActionSchema.safeParse(row.data.action).success &&
+    RefinementInverseSchema.safeParse(row.data.inverse).success
+  );
+}
+
 /** All refinement rows in the session journal (byId-deduped, seq order). */
 export async function listRefinements(sessionDir: string): Promise<RefinementEvent[]> {
   assert(sessionDir.length > 0, "listRefinements requires a session dir");
@@ -765,7 +782,7 @@ async function collectDivergence(
   // live rollback chain only conflicts when its net effect differs from the
   // state the target left behind (see liveRowConflictsWithTarget).
   const rolledBackIds = new Set(
-    rows.map((row) => row.data.rollbackOf).filter((id): id is string => id !== undefined)
+    rows.filter(isUsableRollbackRow).map((row) => row.data.rollbackOf!)
   );
   for (const row of rows) {
     if (row.id === target.id) continue;
@@ -902,6 +919,9 @@ function liveRowConflictsWithTarget(
   let current: RefinementEvent = row;
   const seen = new Set<string>([row.id]);
   while (current.data.rollbackOf !== undefined) {
+    // A corrupt rollback row anywhere in the chain (isUsableRollbackRow): the
+    // chain's net effect cannot be established — assume conflict.
+    if (!isUsableRollbackRow(current)) return true;
     const original = rows.find((r) => r.id === current.data.rollbackOf);
     if (original === undefined || seen.has(original.id)) {
       return true; // Corrupt chain (missing root or cycle): assume conflict.
@@ -1037,7 +1057,13 @@ export async function rollbackRefinement(
         `Row '${opts.id}' was produced by a remote (SSH/Docker) workspace runtime; its paths are not addressable on this host. Remote skill rollbacks are not supported.`
       );
     }
-    const existingRollback = rows.find((row) => row.data.rollbackOf === opts.id);
+    // Same predicate as liveness (isUsableRollbackRow): a corrupt rollback
+    // row cannot be rolled back "instead", and lineage treats its target as
+    // still live — so the target itself stays rollbackable (the divergence
+    // checks below decide whether the tree still matches its inverse).
+    const existingRollback = rows.find(
+      (row) => row.data.rollbackOf === opts.id && isUsableRollbackRow(row)
+    );
     if (existingRollback !== undefined) {
       throw new RollbackError(
         `Row '${opts.id}' was already rolled back by row '${existingRollback.id}'. Roll back that row instead to re-apply.`

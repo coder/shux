@@ -21,7 +21,7 @@ import {
   type RefinementFileReference,
   type RefinementInverseDraft,
 } from "./refinementJournal";
-import { listRefinements } from "./refinementRollback";
+import { isUsableRollbackRow, listRefinements } from "./refinementRollback";
 import {
   createLegacyPathRemapper,
   LegacyPathNotAdoptedError,
@@ -123,14 +123,7 @@ export async function migrateSharedMemoryRefinementRows(args: {
   // The copied target is then live on the owner side; its divergence checks
   // refuse a re-apply that no longer matches the tree (force overrides).
   const rollbackByTarget = new Map(
-    rows
-      .filter(
-        (row) =>
-          row.data.rollbackOf !== undefined &&
-          RollbackRefinementActionSchema.safeParse(row.data.action).success &&
-          RefinementInverseSchema.safeParse(row.data.inverse).success
-      )
-      .map((row) => [row.data.rollbackOf!, row] as const)
+    rows.filter(isUsableRollbackRow).map((row) => [row.data.rollbackOf!, row] as const)
   );
   // Returns null on a corrupted (cyclic / absurdly long) lineage: such a row
   // is treated as non-migratable instead of hanging removal.
@@ -182,8 +175,13 @@ export async function migrateSharedMemoryRefinementRows(args: {
     }
     // Owner rows already rolled back (by anyone): a second rollback row for
     // the same target would corrupt the lineage the rollback engine walks.
+    // Only usable rollback rows count (r78): a corrupted rollback copy is
+    // excluded from ownerIdBySource above, so its intact source is copied
+    // again — and must not be blocked here by the bare `rollbackOf` of that
+    // very corruption, or the retry would leave the owner with an unusable
+    // rollback record over a target the engine then reads as live.
     const ownerRollbackTargets = new Set(
-      ownerRows.map((ownerRow) => ownerRow.data.rollbackOf).filter((id) => id !== undefined)
+      ownerRows.filter(isUsableRollbackRow).map((ownerRow) => ownerRow.data.rollbackOf!)
     );
     for (const row of rows) {
       if (row.data.kind !== "memory") continue;
